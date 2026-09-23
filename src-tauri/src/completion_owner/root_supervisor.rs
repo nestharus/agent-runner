@@ -185,6 +185,10 @@ impl RootSupervisor {
         })
     }
 
+    pub(super) fn set_kernel_pinned(&mut self, pinned: bool) {
+        self.original.set_kernel_pinned(pinned);
+    }
+
     pub(super) fn replace_driver(&mut self, driver: UnixStream) -> Result<(), String> {
         driver
             .set_nonblocking(true)

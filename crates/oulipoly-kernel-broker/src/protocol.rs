@@ -1,6 +1,6 @@
-//! One connection, one challenged request. The entry may supply only the
-//! broker-issued root ID and its direct child's PID for the prepare step;
-//! executable, UID, namespace, and mount choices are absent.
+//! One connection, one challenged request. Entry operations cannot select an
+//! executable, UID, namespace, or mount. The accepted-work guardian operation
+//! carries the initiator's already pinned executable and accepted descriptors.
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
@@ -48,6 +48,65 @@ pub struct ProcessWitness {
     pub host_pid: i32,
     pub boot_id: String,
     pub starttime_ticks: u64,
+}
+
+/// A host guardian's positive acceptance. The broker reads the receipt and
+/// intent from the accompanying descriptors; these fields bind the guardian's
+/// in-memory decision to those exact bytes. This operation only prepares debt.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptedWorkSpec {
+    pub root_id: String,
+    pub work_id: String,
+    pub request_sha256: String,
+    pub accepted_sha256: String,
+    pub owner_generation: String,
+}
+
+/// Descriptor order: accepted initiator executable, intent, cwd, state directory,
+/// and the exclusively created acceptance receipt. No arbitrary argv is sent.
+pub fn prepare_accepted_work_at(
+    path: &Path,
+    spec: &AcceptedWorkSpec,
+    descriptors: [RawFd; 5],
+) -> io::Result<String> {
+    let body = serde_json::to_vec(spec)?;
+    if body.len() > 2048 {
+        return Err(io::Error::other("accepted-work request too large"));
+    }
+    let mut stream = checked_connection(path)?;
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let mut request = Vec::with_capacity(17 + body.len());
+    request.push(b'H');
+    request.extend_from_slice(&challenge);
+    request.extend_from_slice(&body);
+    let mut iov = libc::iovec {
+        iov_base: request.as_mut_ptr().cast(),
+        iov_len: request.len(),
+    };
+    let mut control = [0u8; 64];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen =
+        unsafe { libc::CMSG_SPACE(std::mem::size_of_val(&descriptors) as _) } as usize;
+    unsafe {
+        let header = libc::CMSG_FIRSTHDR(&msg);
+        (*header).cmsg_level = libc::SOL_SOCKET;
+        (*header).cmsg_type = libc::SCM_RIGHTS;
+        (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(&descriptors) as _) as usize;
+        std::ptr::copy_nonoverlapping(descriptors.as_ptr(), libc::CMSG_DATA(header).cast(), 5);
+    }
+    if unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) }
+        != request.len() as isize
+    {
+        return Err(io::Error::other(
+            "short accepted-work request; outcome uncertain",
+        ));
+    }
+    read_response(stream)
 }
 
 /// Only CLI surfaces that dispatch without native service bootstrap may enter

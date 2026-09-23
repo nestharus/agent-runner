@@ -1,11 +1,12 @@
 //! Original-work-v1 authority hosted by the existing completion guardian.
 //!
 //! Durable intent lives in the exact agent-bash handle directory before this
-//! module can accept a request.  Acceptance is exclusive and effects-possible
-//! acceptance is never replayed.  The in-memory root owns worker launch, causal
-//! child closure, cancellation, exact terminal integration, and physical drain.
+//! module can accept a request. Acceptance is exclusive and effects-possible
+//! acceptance is never replayed. The unpinned guardian owns legacy worker
+//! custody; the broker-pinned guardian prepares a grant but cannot fork work.
 
 use super::linux::identity;
+use oulipoly_kernel_broker::protocol::{self, AcceptedWorkSpec};
 use oulipoly_state::completion_continuation::SourceProcessIdentity;
 use oulipoly_state::diagnostic_recorder::{
     DiagnosticPhase, PhaseObservation, SpanStart, process_recorder,
@@ -557,9 +558,13 @@ pub(super) struct OriginalWorkSupervisor {
     active: Vec<OriginalOperation>,
     never_forked: Vec<NeverForkedOperation>,
     adopted_child_live: bool,
+    kernel_pinned: bool,
 }
 
 impl OriginalWorkSupervisor {
+    pub fn set_kernel_pinned(&mut self, pinned: bool) {
+        self.kernel_pinned = pinned;
+    }
     pub fn set_adopted_child_gate(&mut self, live: bool) {
         self.adopted_child_live = live;
     }
@@ -838,6 +843,39 @@ impl OriginalWorkSupervisor {
                 }
                 return Err(error);
             }
+        }
+        if self.kernel_pinned {
+            // This branch is deliberately the only post-acceptance path for a
+            // broker-bound guardian. Until the nested PID1/control/drain
+            // interface exists, preparing a positive grant cannot release a
+            // second worker through the legacy direct-spawn path.
+            let prepared = prepare_kernel_grant(
+                owner,
+                &request.submission,
+                &acceptance,
+                &executable,
+                &intent_fd,
+                &cwd,
+                &state_dir,
+            );
+            let detail = match prepared {
+                Ok(grant) => {
+                    format!("kernel accepted grant {grant} prepared; nested launch is disabled")
+                }
+                Err(error) => format!("kernel accepted grant preparation uncertain: {error}"),
+            };
+            self.never_forked.push(NeverForkedOperation {
+                submission: request.submission.clone(),
+                intent,
+                state_dir,
+                result_nonce: new_capability(),
+                detail: detail.clone(),
+                handle_terminalized: false,
+                result_written: false,
+                result_failure_recorded: false,
+                result_retry: RetrySchedule::default(),
+            });
+            return Err(detail);
         }
         let executable_fd = executable.as_raw_fd();
         let intent_raw = intent_fd.as_raw_fd();
@@ -1800,6 +1838,59 @@ fn validate_peer_executable(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the exact accepted descriptors and owner are an indivisible grant request"
+)]
+fn prepare_kernel_grant(
+    owner: &CompletionDomainOwner,
+    submission: &WorkSubmission,
+    acceptance: &AcceptanceReceipt,
+    executable: &OwnedFd,
+    intent: &OwnedFd,
+    cwd: &OwnedFd,
+    state_dir: &OwnedFd,
+) -> Result<String, String> {
+    let accepted_fd = unsafe {
+        libc::openat(
+            state_dir.as_raw_fd(),
+            c"root-work-accepted-v1.json".as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if accepted_fd < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let accepted = unsafe { OwnedFd::from_raw_fd(accepted_fd) };
+    let mut bytes = serde_json::to_vec(acceptance).map_err(|error| error.to_string())?;
+    bytes.push(b'\n');
+    let spec = AcceptedWorkSpec {
+        root_id: submission.root_authority.root_id.clone(),
+        work_id: submission.work_id.clone(),
+        request_sha256: submission.request_sha256.clone(),
+        accepted_sha256: hex_digest(&bytes),
+        owner_generation: owner.owner_generation.clone(),
+    };
+    let response = protocol::prepare_accepted_work_at(
+        &super::linux::owner_broker_socket(),
+        &spec,
+        [
+            executable.as_raw_fd(),
+            intent.as_raw_fd(),
+            cwd.as_raw_fd(),
+            state_dir.as_raw_fd(),
+            accepted.as_raw_fd(),
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    let grant = response
+        .trim_end()
+        .strip_prefix("prepared-work ")
+        .ok_or_else(|| format!("broker grant preparation refused: {}", response.trim()))?;
+    uuid::Uuid::parse_str(grant).map_err(|_| "broker returned invalid grant ID".to_owned())?;
+    Ok(grant.to_owned())
+}
+
 fn read_bounded(fd: &OwnedFd, max: u64) -> Result<Vec<u8>, String> {
     let file = File::from(fd.try_clone().map_err(|error| error.to_string())?);
     let size = file.metadata().map_err(|error| error.to_string())?.len();
@@ -2506,6 +2597,7 @@ mod tests {
             active: vec![parent, child],
             never_forked: Vec::new(),
             adopted_child_live: false,
+            kernel_pinned: false,
         };
         let deadline = Instant::now() + Duration::from_secs(2);
         while !supervisor.active[0].terminal_observed {
@@ -2600,6 +2692,7 @@ mod tests {
             active: vec![operation],
             never_forked: Vec::new(),
             adopted_child_live: false,
+            kernel_pinned: false,
         };
         let requester = identity(i64::from(std::process::id())).unwrap();
         let now = Instant::now();
@@ -2663,6 +2756,7 @@ mod tests {
             active: vec![operation],
             never_forked: Vec::new(),
             adopted_child_live: false,
+            kernel_pinned: false,
         };
         supervisor.tick_at(&owner, now);
         assert!(supervisor.active[0].cancellation_cause.is_none());
@@ -2702,6 +2796,7 @@ mod tests {
             active: vec![operation],
             never_forked: Vec::new(),
             adopted_child_live: false,
+            kernel_pinned: false,
         };
 
         let (bad_socket, mut bad_reply) = UnixStream::pair().unwrap();

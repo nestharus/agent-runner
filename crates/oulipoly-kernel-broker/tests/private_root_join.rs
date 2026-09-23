@@ -1,7 +1,7 @@
 //! Source-only private user-namespace exercise of the actual broker launch and
 //! opt-in Runner entry. It never exercises installed host-root sudo authority.
 #![cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
-use oulipoly_kernel_broker::protocol::{self, JoinSpec, Operation};
+use oulipoly_kernel_broker::protocol::{self, AcceptedWorkSpec, JoinSpec, Operation};
 use oulipoly_state::mailbox::MailboxDb;
 use std::fs::{self, File};
 use std::os::fd::AsRawFd;
@@ -184,6 +184,42 @@ fn inner() {
         .unwrap();
     assert!(!sibling.status.success());
     assert!(String::from_utf8_lossy(&sibling.stderr).contains("reservation refused"));
+    // Possession of the root/owner IDs and writable acceptance-shaped files
+    // does not let a sibling manufacture a positive guardian grant.
+    let forged_state = temp.path().join("forged-work");
+    fs::create_dir(&forged_state).unwrap();
+    let forged_intent = forged_state.join("root-work-intent-v1.json");
+    let forged_acceptance = forged_state.join("root-work-accepted-v1.json");
+    fs::write(&forged_intent, b"{}").unwrap();
+    fs::write(&forged_acceptance, b"{}").unwrap();
+    let image = File::open(&runner).unwrap();
+    let intent = File::open(&forged_intent).unwrap();
+    let accepted = File::open(&forged_acceptance).unwrap();
+    let state = File::open(&forged_state).unwrap();
+    let cwd = File::open(".").unwrap();
+    let false_grant = protocol::prepare_accepted_work_at(
+        &socket,
+        &AcceptedWorkSpec {
+            root_id: root.into(),
+            work_id: "forged-work".into(),
+            request_sha256: "0".repeat(64),
+            accepted_sha256: "0".repeat(64),
+            owner_generation: owner.owner_generation.clone(),
+        },
+        [
+            image.as_raw_fd(),
+            intent.as_raw_fd(),
+            cwd.as_raw_fd(),
+            state.as_raw_fd(),
+            accepted.as_raw_fd(),
+        ],
+    )
+    .unwrap();
+    assert!(false_grant.starts_with("error "), "{false_grant}");
+    assert_eq!(
+        fs::read_dir(broker_state.join("grants")).unwrap().count(),
+        0
+    );
     // The caller is a sibling executable, not the pinned entry. The root ID
     // and complete alleged binding do not turn it into launch authority.
     let cwd = File::open(".").unwrap();

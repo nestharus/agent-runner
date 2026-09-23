@@ -1,7 +1,6 @@
-//! Durable, one-use accepted-work preparation. This has deliberately no
-//! socket operation or worker launch: the host guardian must transfer its
-//! accepted descriptors into a gated nested launch before this may authorize
-//! execution. A record here is debt, never proof of physical drain.
+//! Durable, one-use accepted-work preparation. The host guardian can submit
+//! its exact positive receipt, but no worker launch consumes this grant yet.
+//! A record here is debt, never proof of execution or physical drain.
 use crate::entry_registry::{EntryRegistry, ProcessStamp};
 use crate::identity::{PeerIdentity, PinnedProcess};
 use crate::registry::RootRegistry;
@@ -56,6 +55,13 @@ struct IntentIdentity {
     work_id: String,
     root_id: String,
     handle: String,
+    state_root: PathBuf,
+    meta: IntentMeta,
+}
+
+#[derive(Deserialize)]
+struct IntentMeta {
+    cwd: PathBuf,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -69,13 +75,75 @@ pub struct GrantRecord {
     pub supervisor_authority_id: String,
     pub owner_generation: String,
     pub guardian: ProcessStamp,
+    /// The original broker-attested Runner join remains an exact historical
+    /// owner binding even if that child exits before long-lived nested work.
+    pub joined_child: ProcessStamp,
     pub work_id: String,
+    pub parent_grant_id: Option<String>,
     pub parent_work_incarnation: Option<String>,
     pub accepted_sha256: String,
     pub request_sha256: String,
     pub initiator: SourceIdentity,
+    pub artifacts: GrantArtifacts,
     /// Fsynced before any future namespace fork. Never reset on timeout.
     pub consumed: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileStamp {
+    pub device: u64,
+    pub inode: u64,
+}
+
+impl FileStamp {
+    fn of(file: &File) -> io::Result<Self> {
+        let metadata = file.metadata()?;
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantArtifacts {
+    pub executable: FileStamp,
+    pub intent: FileStamp,
+    pub cwd: FileStamp,
+    pub state_dir: FileStamp,
+    pub accepted: FileStamp,
+}
+
+impl GrantArtifacts {
+    fn pinned(
+        executable: &File,
+        intent: &File,
+        cwd: &File,
+        state_dir: &File,
+        accepted: &File,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            executable: FileStamp::of(executable)?,
+            intent: FileStamp::of(intent)?,
+            cwd: FileStamp::of(cwd)?,
+            state_dir: FileStamp::of(state_dir)?,
+            accepted: FileStamp::of(accepted)?,
+        })
+    }
+
+    fn valid(&self) -> bool {
+        [
+            &self.executable,
+            &self.intent,
+            &self.cwd,
+            &self.state_dir,
+            &self.accepted,
+        ]
+        .iter()
+        .all(|stamp| stamp.inode != 0)
+    }
 }
 
 #[derive(Debug)]
@@ -94,6 +162,13 @@ fn valid_digest(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn valid_stamp(stamp: &ProcessStamp) -> bool {
+    stamp.host_pid > 0
+        && !stamp.boot_id.is_empty()
+        && stamp.starttime_ticks > 0
+        && stamp.pidns_ino > 0
 }
 
 fn read_bounded(file: &File) -> io::Result<Vec<u8>> {
@@ -191,7 +266,7 @@ impl GrantRegistry {
                 return Err(io::Error::other("unrecognized accepted grant entry"));
             }
             let record: GrantRecord = serde_json::from_slice(&fs::read(entry.path())?)?;
-            if record.version != 1
+            if record.version != 2
                 || uuid::Uuid::parse_str(&record.grant_id).is_err()
                 || format!("{}.json", record.grant_id) != name
                 || uuid::Uuid::parse_str(&record.root_id).is_err()
@@ -205,10 +280,19 @@ impl GrantRegistry {
                 || record.initiator.pid <= 0
                 || record.initiator.starttime_ticks <= 0
                 || record.initiator.boot_id.is_empty()
+                || !valid_stamp(&record.root_init)
+                || !valid_stamp(&record.guardian)
+                || !valid_stamp(&record.joined_child)
+                || !record.artifacts.valid()
                 || record
                     .parent_work_incarnation
                     .as_ref()
                     .is_some_and(|parent| uuid::Uuid::parse_str(parent).is_err())
+                || record
+                    .parent_grant_id
+                    .as_ref()
+                    .is_some_and(|parent| uuid::Uuid::parse_str(parent).is_err())
+                || record.parent_grant_id.is_some() != record.parent_work_incarnation.is_some()
                 || !ids.insert(record.grant_id.clone())
                 || !works.insert((record.root_id.clone(), record.work_id.clone()))
             {
@@ -249,6 +333,8 @@ impl GrantRegistry {
         caller: &PeerIdentity,
         host_namespace: &File,
         runner_image: &File,
+        executable: &File,
+        cwd: &File,
         state_dir: &File,
         accepted: &File,
         intent: &File,
@@ -268,6 +354,8 @@ impl GrantRegistry {
                 .any(|record| record.root_id == root_id && record.work_id == work_id)
             || !caller.process.in_namespace(host_namespace)?
             || !caller.process.same_executable_as(runner_image)?
+            || !cwd.metadata()?.is_dir()
+            || !executable.metadata()?.is_file()
             || !state_dir.metadata()?.is_dir()
             || !same_file_in_directory(state_dir, ACCEPTED, accepted)?
             || !same_file_in_directory(state_dir, INTENT, intent)?
@@ -292,13 +380,6 @@ impl GrantRegistry {
             return Err(io::Error::other("caller is not bound host guardian"));
         }
         let joined = entry.joined_child.as_ref().unwrap();
-        let joined_live = PinnedProcess::open(joined.host_pid)?;
-        if ProcessStamp::from(&joined_live) != *joined
-            || !joined_live.in_namespace(root.init.namespace())?
-            || !joined_live.direct_child_of(&root.init)?
-        {
-            return Err(io::Error::other("joined owner is not live"));
-        }
         let supervisor = entry.supervisor_authority_id.as_ref().unwrap();
         let accepted_bytes = read_bounded(accepted)?;
         let intent_bytes = read_bounded(intent)?;
@@ -312,8 +393,39 @@ impl GrantRegistry {
             owner_generation,
             supervisor,
         )?;
+        let intent_identity: IntentIdentity = serde_json::from_slice(&intent_bytes)?;
+        let expected_state =
+            fs::metadata(intent_identity.state_root.join(&intent_identity.handle))?;
+        let expected_cwd = fs::metadata(intent_identity.meta.cwd)?;
+        let actual_state = state_dir.metadata()?;
+        let actual_cwd = cwd.metadata()?;
+        if (expected_state.dev(), expected_state.ino()) != (actual_state.dev(), actual_state.ino())
+            || (expected_cwd.dev(), expected_cwd.ino()) != (actual_cwd.dev(), actual_cwd.ino())
+        {
+            return Err(io::Error::other("accepted state or cwd descriptor changed"));
+        }
+        // The accepted receipt carries the original source incarnation, not a
+        // free-standing work UUID. Pin that live process in the host observer
+        // before recording a grant. Namespace-local PID confusion refuses the
+        // request until explicit PID-domain transport is integrated.
+        let source_pid = i32::try_from(receipt.initiator.pid)
+            .map_err(|_| io::Error::other("invalid source host PID"))?;
+        let source = PinnedProcess::open(source_pid)?;
+        if source.boot_id != receipt.initiator.boot_id
+            || source.starttime_ticks
+                != u64::try_from(receipt.initiator.starttime_ticks)
+                    .map_err(|_| io::Error::other("invalid source starttime"))?
+            || !source.same_executable_as(executable)?
+        {
+            return Err(io::Error::other("accepted source incarnation changed"));
+        }
         let parent = match &receipt.registration {
-            Registration::Root => None,
+            Registration::Root => {
+                if !source.in_namespace(root.init.namespace())? {
+                    return Err(io::Error::other("source is outside exact root namespace"));
+                }
+                None
+            }
             Registration::Nested { parent_work_id, .. } => {
                 let parent = self
                     .records
@@ -338,14 +450,22 @@ impl GrantRegistry {
                 if parent.root_init != ProcessStamp::from(&root.init) {
                     return Err(io::Error::other("causal parent root changed"));
                 }
-                Some(parent_work.record.work_incarnation.clone())
+                if !source.in_namespace(parent_work.init.namespace())? {
+                    return Err(io::Error::other(
+                        "source is outside causal parent namespace",
+                    ));
+                }
+                Some((
+                    parent.grant_id.clone(),
+                    parent_work.record.work_incarnation.clone(),
+                ))
             }
         };
         caller.process.verify()?;
         root.init.verify()?;
-        joined_live.verify()?;
+        source.verify()?;
         let record = GrantRecord {
-            version: 1,
+            version: 2,
             grant_id: uuid::Uuid::new_v4().to_string(),
             root_id: root_id.to_owned(),
             root_init: ProcessStamp::from(&root.init),
@@ -353,11 +473,14 @@ impl GrantRegistry {
             supervisor_authority_id: supervisor.clone(),
             owner_generation: owner_generation.to_owned(),
             guardian: ProcessStamp::from(&caller.process),
+            joined_child: joined.clone(),
             work_id: work_id.to_owned(),
-            parent_work_incarnation: parent,
+            parent_grant_id: parent.as_ref().map(|parent| parent.0.clone()),
+            parent_work_incarnation: parent.map(|parent| parent.1),
             accepted_sha256: digest(&accepted_bytes),
             request_sha256: request_sha256.to_owned(),
             initiator: receipt.initiator,
+            artifacts: GrantArtifacts::pinned(executable, intent, cwd, state_dir, accepted)?,
             consumed: false,
         };
         self.create(record.clone())?;
@@ -388,17 +511,23 @@ impl GrantRegistry {
     /// Check the original host guardian and live root again immediately before
     /// the irreversible pre-fork transition. A lost response or failed fork
     /// retains the consumed record and can never replay this grant.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the caller, root, entry, and causal work registries are independent trust checks"
+    )]
     pub fn consume(
         &mut self,
         grant_id: &str,
         roots: &RootRegistry,
         entries: &EntryRegistry,
+        works: &WorkRegistry,
         caller: &PeerIdentity,
         host_namespace: &File,
         runner_image: &File,
     ) -> io::Result<GrantRecord> {
         if roots.has_debt()
             || entries.has_debt()
+            || works.has_debt()
             || !caller.process.in_namespace(host_namespace)?
             || !caller.process.same_executable_as(runner_image)?
         {
@@ -424,24 +553,30 @@ impl GrantRegistry {
                 != Some(record.supervisor_authority_id.as_str())
             || record.root_init != ProcessStamp::from(&root.init)
             || record.guardian != ProcessStamp::from(&caller.process)
+            || entry.joined_child.as_ref() != Some(&record.joined_child)
         {
             return Err(io::Error::other("accepted grant binding changed"));
         }
-        let joined = entry
-            .joined_child
-            .as_ref()
-            .ok_or_else(|| io::Error::other("joined owner absent"))?;
-        let joined_live = PinnedProcess::open(joined.host_pid)?;
-        if *joined != ProcessStamp::from(&joined_live)
-            || !joined_live.in_namespace(root.init.namespace())?
-            || !joined_live.direct_child_of(&root.init)?
+        if let (Some(parent_grant_id), Some(parent_incarnation)) =
+            (&record.parent_grant_id, &record.parent_work_incarnation)
         {
-            return Err(io::Error::other(
-                "joined owner changed before grant consumption",
-            ));
+            let parent_grant = self
+                .records
+                .iter()
+                .find(|parent| parent.grant_id == *parent_grant_id && parent.consumed)
+                .ok_or_else(|| io::Error::other("causal parent grant changed"))?;
+            let parent_work = works.live_works().find(|work| {
+                work.record.root_id == record.root_id
+                    && work.record.work_incarnation == *parent_incarnation
+                    && work.record.accepted_grant_id.as_deref() == Some(parent_grant_id.as_str())
+            });
+            if parent_grant.root_init != record.root_init
+                || parent_work.is_none_or(|work| work.init.verify().is_err())
+            {
+                return Err(io::Error::other("causal parent namespace changed"));
+            }
         }
         root.init.verify()?;
-        joined_live.verify()?;
         self.consume_record(grant_id, &caller.process)
     }
 
@@ -500,7 +635,8 @@ mod tests {
         let generation = uuid::Uuid::new_v4().to_string();
         let intent = serde_json::to_vec(&json!({
             "protocol": "original-work-v1", "work_id": "work-a",
-            "root_id": root, "handle": "work-a", "meta": {"cwd": "/tmp"}
+            "root_id": root, "handle": "work-a", "state_root": "/tmp",
+            "meta": {"cwd": "/tmp"}
         }))
         .unwrap();
         let accepted = serde_json::to_vec(&json!({
@@ -622,7 +758,7 @@ mod tests {
 
     fn record(guardian: &PinnedProcess) -> GrantRecord {
         GrantRecord {
-            version: 1,
+            version: 2,
             grant_id: uuid::Uuid::new_v4().to_string(),
             root_id: uuid::Uuid::new_v4().to_string(),
             root_init: ProcessStamp::from(guardian),
@@ -630,7 +766,9 @@ mod tests {
             supervisor_authority_id: uuid::Uuid::new_v4().to_string(),
             owner_generation: uuid::Uuid::new_v4().to_string(),
             guardian: ProcessStamp::from(guardian),
+            joined_child: ProcessStamp::from(guardian),
             work_id: "accepted-a".into(),
+            parent_grant_id: None,
             parent_work_incarnation: None,
             accepted_sha256: digest(b"accepted"),
             request_sha256: digest(b"intent"),
@@ -639,6 +777,14 @@ mod tests {
                 boot_id: "boot".into(),
                 starttime_ticks: 7,
             },
+            artifacts: GrantArtifacts::pinned(
+                &File::open("/proc/self/exe").unwrap(),
+                &File::open("/dev/null").unwrap(),
+                &File::open("/tmp").unwrap(),
+                &File::open("/tmp").unwrap(),
+                &File::open("/dev/null").unwrap(),
+            )
+            .unwrap(),
             consumed: false,
         }
     }
@@ -677,6 +823,30 @@ mod tests {
         let duplicate = dir.path().join(format!("{}.json", uuid::Uuid::new_v4()));
         fs::write(duplicate, serde_json::to_vec(&record).unwrap()).unwrap();
         assert!(GrantRegistry::open(dir.path()).is_err());
+
+        // The older ledger lacked descriptor inode bindings. Refuse it on
+        // restart instead of silently upgrading an unbound accepted grant.
+        let old = tempfile::tempdir().unwrap();
+        let mut old_record = record;
+        old_record.version = 1;
+        fs::write(
+            old.path().join(format!("{}.json", old_record.grant_id)),
+            serde_json::to_vec(&old_record).unwrap(),
+        )
+        .unwrap();
+        assert!(GrantRegistry::open(old.path()).is_err());
+
+        let unpaired = tempfile::tempdir().unwrap();
+        let mut unpaired_record = self::record(&guardian);
+        unpaired_record.parent_grant_id = Some(uuid::Uuid::new_v4().to_string());
+        fs::write(
+            unpaired
+                .path()
+                .join(format!("{}.json", unpaired_record.grant_id)),
+            serde_json::to_vec(&unpaired_record).unwrap(),
+        )
+        .unwrap();
+        assert!(GrantRegistry::open(unpaired.path()).is_err());
     }
 
     #[test]

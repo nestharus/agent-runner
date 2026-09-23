@@ -113,7 +113,7 @@ pub(super) fn verify_kernel_owner_socket(
         .map_err(|error| error.to_string())
 }
 
-fn owner_broker_socket() -> PathBuf {
+pub(super) fn owner_broker_socket() -> PathBuf {
     #[cfg(feature = "age319-private-broker-fixture")]
     if unsafe { libc::geteuid() } == 0
         && std::fs::read_link("/proc/self/ns/user").ok()
@@ -609,6 +609,7 @@ fn guardian(
         publish_driver_owner(&mut driver_channel, &owner)?;
     }
     let mut root_supervisor = super::root_supervisor::RootSupervisor::new(path, driver_channel)?;
+    root_supervisor.set_kernel_pinned(pinned.is_some());
     // Open a distinct description after close_except: never reuse the
     // bootstrap parent's inherited flock description.
     let admission = admission_gate(endpoint)?;

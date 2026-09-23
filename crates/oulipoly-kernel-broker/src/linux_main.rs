@@ -4,7 +4,7 @@ mod root_join;
 use oulipoly_kernel_broker::accepted_grant::GrantRegistry;
 use oulipoly_kernel_broker::entry_registry::{EntryRegistry, ProcessStamp};
 use oulipoly_kernel_broker::identity::{PeerIdentity, PinnedProcess};
-use oulipoly_kernel_broker::protocol::{JoinSpec, OwnerWitness, ProcessWitness};
+use oulipoly_kernel_broker::protocol::{AcceptedWorkSpec, JoinSpec, OwnerWitness, ProcessWitness};
 use oulipoly_kernel_broker::registry::RootRegistry;
 use oulipoly_kernel_broker::work_registry::{Scope, WorkRegistry, classify_scope};
 use std::fs::{self, File};
@@ -80,6 +80,10 @@ enum RequestPayload {
     VerifyOwner {
         witness: OwnerWitness,
         socket: File,
+    },
+    PrepareAcceptedWork {
+        spec: AcceptedWorkSpec,
+        descriptors: [File; 5],
     },
 }
 
@@ -191,7 +195,7 @@ fn recv_request(
     }
     if invalid_ancillary
         || match request[0] {
-            b'J' => descriptors.len() != 5,
+            b'J' | b'H' => descriptors.len() != 5,
             b'V' => descriptors.len() != 1,
             _ => !descriptors.is_empty(),
         }
@@ -234,6 +238,12 @@ fn recv_request(
         b'V' if read > 17 && read <= 2048 + 17 => RequestPayload::VerifyOwner {
             witness: serde_json::from_slice(&request[17..read as usize])?,
             socket: descriptors.remove(0),
+        },
+        b'H' if read > 17 && read <= 2048 + 17 => RequestPayload::PrepareAcceptedWork {
+            spec: serde_json::from_slice(&request[17..read as usize])?,
+            descriptors: descriptors
+                .try_into()
+                .map_err(|_| io::Error::other("accepted-work descriptors"))?,
         },
         _ => RequestPayload::None,
     };
@@ -519,8 +529,8 @@ fn serve() -> io::Result<()> {
         checked_root_path(&entries_path, true)?;
     }
     let mut entries = EntryRegistry::open(&entries_path)?;
-    // This ledger is recovery-validated now, but no socket operation prepares
-    // or consumes it until the guardian's gated worker handoff is integrated.
+    // Prepared grants remain durable debt. No socket operation can consume a
+    // grant or launch a worker until the nested gate/drain handoff is complete.
     let grants_path = Path::new(&state).join("grants");
     if !grants_path.exists() {
         use std::os::unix::fs::DirBuilderExt;
@@ -529,7 +539,7 @@ fn serve() -> io::Result<()> {
     if !fixture {
         checked_root_path(&grants_path, true)?;
     }
-    let _grants = GrantRegistry::open(&grants_path)?;
+    let mut grants = GrantRegistry::open(&grants_path)?;
     if let Ok(meta) = fs::symlink_metadata(&socket) {
         if !meta.file_type().is_socket() || meta.uid() != 0 {
             return Err(io::Error::other("unsafe existing socket"));
@@ -571,6 +581,30 @@ fn serve() -> io::Result<()> {
                     return Err(io::Error::other("invalid owner witness payload"));
                 };
                 verify_owner_socket(witness, socket, &peer, &runner_image, &registry, &entries)
+            } else if operation == b'H' {
+                let RequestPayload::PrepareAcceptedWork { spec, descriptors } = payload else {
+                    return Err(io::Error::other("invalid accepted-work payload"));
+                };
+                let [executable, intent, cwd, state_dir, accepted] = descriptors;
+                let grant = grants.prepare(
+                    &registry,
+                    &entries,
+                    &works,
+                    &peer,
+                    &host_namespace,
+                    &runner_image,
+                    &executable,
+                    &cwd,
+                    &state_dir,
+                    &accepted,
+                    &intent,
+                    &spec.root_id,
+                    &spec.work_id,
+                    &spec.request_sha256,
+                    &spec.accepted_sha256,
+                    &spec.owner_generation,
+                )?;
+                Ok(format!("prepared-work {}\n", grant.grant_id))
             } else {
                 dispatch_authenticated(
                     operation,
