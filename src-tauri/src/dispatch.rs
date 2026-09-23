@@ -95,6 +95,21 @@ pub(crate) use predicate::{
 /// runtime-service construction, and primary SQLite access.
 pub(crate) fn run_offline_entry(cli: &Cli) -> Result<Option<i32>, String> {
     let code = match &cli.command {
+        Some(Subcommands::Notify { command }) => match command {
+            NotifySubcommands::RecoveryList { session_id, cursor } => {
+                crate::commands::notify_continuation::recovery_list(
+                    session_id.as_deref(),
+                    cursor.as_deref(),
+                )
+            }
+            NotifySubcommands::RecoveryRead { event_id, output } => {
+                crate::commands::notify_continuation::recovery_read(event_id, output.as_deref())
+            }
+            NotifySubcommands::RecoveryAttempts { event_id, cursor } => {
+                crate::commands::notify_continuation::recovery_attempts(event_id, cursor)
+            }
+            _ => return Ok(None),
+        },
         Some(Subcommands::Diagnostics { command }) => match command {
             DiagnosticsSubcommands::Recent {
                 limit,
@@ -496,6 +511,11 @@ fn dispatch_subcommand(
 
 fn dispatch_notify_subcommand(command: NotifySubcommands) -> Result<i32, String> {
     match command {
+        NotifySubcommands::RecoveryList { .. }
+        | NotifySubcommands::RecoveryRead { .. }
+        | NotifySubcommands::RecoveryAttempts { .. } => {
+            unreachable!("manual recovery runs before startup recovery")
+        }
         NotifySubcommands::Listen {
             registration_file,
             session_id,

@@ -419,6 +419,35 @@ pub(crate) enum MaintenanceSubcommands {
 
 #[derive(Clone, Debug, Subcommand)]
 pub(crate) enum NotifySubcommands {
+    /// Discover accepted v2 completions for a local session, including response-only events.
+    #[command(name = "agent-bash-recovery-list")]
+    RecoveryList {
+        #[arg(long)]
+        session_id: Option<String>,
+        /// Opaque next_cursor from the preceding list page.
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+
+    /// Verify one accepted selected output and optionally copy exact raw bytes.
+    #[command(name = "agent-bash-recovery-read")]
+    RecoveryRead {
+        #[arg(long)]
+        event_id: String,
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+
+    /// Continue the bounded physical attempt search for an accepted completion.
+    #[command(name = "agent-bash-recovery-attempts")]
+    RecoveryAttempts {
+        #[arg(long)]
+        event_id: String,
+        /// Opaque next_attempt_cursor from a recovery read or attempt page.
+        #[arg(long)]
+        cursor: String,
+    },
+
     /// Admit this live actor's later listener to an already committed v2 source.
     #[command(name = "agent-bash-listen")]
     Listen {

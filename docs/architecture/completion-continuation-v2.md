@@ -56,6 +56,25 @@ unreleased gate; CD loss before attachment can also leave that genuine original
 AC receipt. AC exec failure or loss of both receipt producers is not covered by
 that counterexample. Retained accepted uncertainty is not completed recovery.
 
+## Activation source association
+
+An activation claim can batch legacy completion rows and several accepted v2
+sources for one receiver. The v25 sidecar records one retained attempt/source
+row for every accepted v2 source in the claim, in the reservation transaction.
+The attempt's older `source_registration_id` field names only the first source
+and is kept for identity compatibility; it is not the complete source set.
+ACK and physical claim deletion leave the attempt/source rows intact. Status
+`outstanding_attempt_ids` and recovery `physical_drain.attempts` carry
+`association_completeness` (`known` or `unknown`). A pre-v25 activation has
+unknown completeness even if its scalar names this source; a deleted claim
+cannot establish whether another source shared it. An unknown status list can
+therefore omit historical attempts and must not be read as exhaustive. The
+source-level status marker is `unknown` for every source registration inherited
+by the v25 migration and `known` for registrations made afterward. The old
+registration set is conservatively unknown even when no historical activation
+can be found: proving its absence would require a history scan on status read.
+The marker is stored on the source row, so status reads are point lookups.
+
 ## Synchronous presentation policy
 
 Synchronous completion is presented through the command/tool response, not a
@@ -100,15 +119,17 @@ Ready registration accepts a genuine pre-sentinel `exit_root` / `exit_tree` with
 matching scope, raw terminal wait/rc and output closure (plus Tree drain for Tree).
 It requires null `ready_sentinel`; a successful rc alone is not sentinel success.
 
-Small snapshot output remains an inline JSON string. Full supported output can
-instead be an explicit `retained-output-v1` object with exactly:
+New snapshots describe output at every size, including empty output, as a
+`retained-output-v1` object with exactly:
 
 - `relative: "completion-output-v2.bin"`
 - `sha256`: SHA-256 of the complete frozen **raw** log bytes
 - `byte_len`: exact length, at most 1 GiB (the supported raw log ceiling)
-- `encoding: "utf8-lossy"`: complete raw bytes are interpreted with the existing
-  UTF-8 replacement semantics, not modified or truncated during retention
+- `encoding: "raw"`: complete raw bytes are retained without UTF-8 replacement
 - `representation: "retained-output-v1"`
+
+Runner also accepts older `encoding: "utf8-lossy"` artifact descriptors as raw
+files. Older inline JSON strings retain their lossy UTF-8 semantics.
 
 Bash freezes and syncs the immutable file before publishing its descriptor.
 Runner streams no-follow regular-file verification and copies it to its domain's
@@ -148,14 +169,25 @@ Boundaries:
 | `attempt-before-attachment` | CD received AC PID, before State custodian/adopter attachment |
 | `adopter-before-ac-release` | Original CD grant received after attachment, before forwarding grant to AC |
 | `driver-reaped-echild` | Actual original CD reap loop observed ECHILD; fixture observation only, never attempt discharge |
+| `wake-child-before-claim-admission` | Automatic receiver has the inherited claim token but has not opened the sidecar to validate/admit it |
+| `manual-after-claim-coordination-NativeBusy` | Real manual resume completed State-first sidecar coordination and observed native custody while that receiver is held |
 
 `src-tauri/tests/age360_completion_continuation.rs` uses private user/network/PID/
 mount namespaces and an external-process local provider. `native_` cases do not
-claim Bash/source pairing. Four paired cases require explicit
+claim Bash/source pairing. Paired cases require explicit
 `AGE360_AGENT_BASH_BIN`, reject a missing executable, and never select an installed
-or simulated fallback. The two added paired cases discriminate early exit and
+or simulated fallback. The early-exit and artifact cases discriminate early exit and
 complete artifact output. The full root-owned paired fault matrix remains larger
-than these four cases; no fixture or feature flag proves that matrix ran.
+than these cases; no fixture or feature flag proves that matrix ran.
+
+The feature-gated paired manual-overlap case holds the automatic receiver before
+claim admission, settles an unrelated completed-turn tail through the real CLI,
+then holds a real manual resume after its State-first sidecar coordination returns
+`NativeBusy`. It checks the accepted source and exact activation claim before
+either hold is released, then checks one recipient, its byte receipt and ACK,
+retained claim during live descendant custody, and both source and activation
+physical integration. A manual retry may later refuse a newly pending completed
+turn; the test does not treat that refusal as its overlap witness.
 
 `fixtures/age360/custody_faults.rs` discriminates those native pre-attachment and
 combined attempt-owner loss orders. Tests named `observes_unresolved_*` are

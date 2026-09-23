@@ -76,8 +76,24 @@ def launch(request):
             runner = os.environ["AGENT_BASH_AGENT_RUNNER_BIN"]
             listed = subprocess.run([runner,"mailbox","list","--session-id",known,"--all","--json"],capture_output=True,check=True,timeout=10)
             rows = json.loads(listed.stdout)["rows"]
+            if case == "two_source":
+                assert len(rows) == 2, rows
+                second = rows[1]
+                assert second["handle"] in prompt
+                second_payload = json.loads(second["payload_json"])
+                second_output = second_payload["snapshot"]["output"]
+                assert second_output["representation"] == "retained-output-v1"
+                assert second_output["encoding"] == "raw"
+                second_artifact = second_payload["output_artifact"]
+                second_raw = pathlib.Path(second_artifact["path"]).read_bytes()
+                assert second_raw == b"paired-source-output"
+                assert len(second_raw) == second_output["byte_len"] == second_artifact["byte_len"]
+                assert hashlib.sha256(second_raw).hexdigest() == second_output["sha256"] == second_artifact["sha256"]
+                pathlib.Path(os.environ["AGE360_ROOT"]).joinpath("recipient-second-byte-receipt.json").write_text(json.dumps({"seq": second["seq"], "handle": second["handle"], "byte_len": len(second_raw), "sha256": hashlib.sha256(second_raw).hexdigest()}))
+                rows = rows[:1]
             assert len(rows) == 1
             received_output = None
+            received_artifact = False
             if os.environ.get("AGE365_LEGACY_WAKE") == "1":
                 assert rows[0]["handle"] == "age365-legacy-mailbox"
                 assert rows[0]["handle"] in prompt
@@ -105,7 +121,24 @@ def launch(request):
                     received_output = {"missing_original_output": True, "proof": missing}
                 elif case not in ("large_output", "hash_cancel"):
                     payload = json.loads(rows[0]["payload_json"])
-                    raw = payload["snapshot"]["output"].encode("utf-8")
+                    selected = payload["snapshot"]["output"]
+                    if isinstance(selected, str):
+                        # Older inline snapshots carry a lossy UTF-8 string.
+                        assert payload.get("output_artifact") is None
+                        raw = selected.encode("utf-8")
+                    else:
+                        # The v2 source freezes raw bytes; both descriptor
+                        # encodings name the retained file's original bytes.
+                        artifact = payload["output_artifact"]
+                        assert selected["representation"] == "retained-output-v1"
+                        assert selected["relative"] == "completion-output-v2.bin"
+                        assert selected["encoding"] in ("raw", "utf8-lossy")
+                        assert artifact["encoding"] == selected["encoding"]
+                        raw = pathlib.Path(artifact["path"]).read_bytes()
+                        assert len(raw) == selected["byte_len"] == artifact["byte_len"]
+                        digest = hashlib.sha256(raw).hexdigest()
+                        assert digest == selected["sha256"] == artifact["sha256"]
+                        received_artifact = True
                     if case in ("publication_error", "publication_io_error"):
                         live = pathlib.Path(rows[0]["log_path"]).read_bytes()
                         assert len(live) >= len(raw) + 1024 * 1024
@@ -130,13 +163,18 @@ def launch(request):
                         assert pathlib.Path(artifact["path"]).read_bytes() == b"\0" * (16 * 1024 * 1024) + b"READY\n"
                     assert digest.hexdigest() == artifact["sha256"]
                     received_output = {"byte_len": size, "sha256": digest.hexdigest()}
+                    received_artifact = True
                 if rows[0].get("payload_file_path"):
                     payload = pathlib.Path(rows[0]["payload_file_path"]).read_bytes()
                     assert hashlib.sha256(payload).hexdigest() == rows[0]["payload_sha256"]
-            pathlib.Path(os.environ["AGE360_ROOT"]).joinpath("recipient-byte-receipt.json").write_text(json.dumps({"seq": rows[0]["seq"], "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(), "output_checked": case != "owner_only", "artifact": case in ("large_output", "hash_cancel"), "output": received_output}))
+            pathlib.Path(os.environ["AGE360_ROOT"]).joinpath("recipient-byte-receipt.json").write_text(json.dumps({"seq": rows[0]["seq"], "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(), "output_checked": case != "owner_only", "artifact": received_artifact, "output": received_output}))
             sequence = str(rows[0]["seq"])
             ack = subprocess.run([runner,"mailbox","ack","--session-id",known,"--from-seq",sequence,"--to-seq",sequence,"--json"],capture_output=True,check=True,timeout=10)
             pathlib.Path(os.environ["AGE360_ROOT"]).joinpath("recipient-exact-ack.json").write_bytes(ack.stdout)
+            if case == "two_source":
+                second_seq = str(second["seq"])
+                second_ack = subprocess.run([runner,"mailbox","ack","--session-id",known,"--from-seq",second_seq,"--to-seq",second_seq,"--json"],capture_output=True,check=True,timeout=10)
+                pathlib.Path(os.environ["AGE360_ROOT"]).joinpath("recipient-second-exact-ack.json").write_bytes(second_ack.stdout)
         root = pathlib.Path(os.environ["AGE360_ROOT"])
         if root.joinpath("native-channel-mode").exists():
             channel = os.environ["OULIPOLY_RETURN_CHANNEL"]
@@ -281,6 +319,11 @@ printf paired-source-output'''
             (root / "bash-dispatch.stderr").write_bytes(result.stderr)
             allowed = (0, 37) if os.environ["AGE360_CASE"] == "early_exit" else (0,)
             if result.returncode not in allowed: raise RuntimeError("actual paired Bash dispatch failed: " + result.stderr.decode(errors="replace"))
+            if case == "two_source":
+                second = subprocess.run([os.environ["AGE360_AGENT_BASH_BIN"], "run", "--delivery", "async", "--completion-scope", "tree", "--", "/bin/sh", "-c", workload], env=env, capture_output=True, timeout=30)
+                (root / "bash-second-dispatch.stdout").write_bytes(second.stdout)
+                (root / "bash-second-dispatch.stderr").write_bytes(second.stderr)
+                if second.returncode != 0: raise RuntimeError("second native Bash dispatch failed: " + second.stderr.decode(errors="replace"))
             (root / "provider-dispatched").touch()
             if case in ("publication_race", "publication_error", "publication_io_error", "hash_cancel", "missing_selection", "missing_pin", "missing_short"):
                 # Actual original owner issues cancellation through the exact Bash
