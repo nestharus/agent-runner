@@ -11,7 +11,8 @@ use oulipoly_kernel_broker::identity::{
 use oulipoly_kernel_broker::protocol::{
     AcceptedWorkSpec, JoinSpec, JoinedChildWitness, LaunchAcceptedWorkSpec, NativeKSpec,
     NativePrepareSpec, OwnerWitness, ProcessWitness, SourceControlUse, SourceScope,
-    SourceSocketWitness, SourceTicketUse,
+    SourceSocketWitness, SourceTicketUse, StateGenerationSpec, StateReadSpec, StateWriteAction,
+    StateWriteSpec,
 };
 use oulipoly_kernel_broker::registry::RootRegistry;
 use oulipoly_kernel_broker::work_registry::{Scope, WorkRegistry, classify_scope};
@@ -127,6 +128,15 @@ enum RequestPayload {
     CancelAcceptedWork {
         grant_id: String,
     },
+    StateRead {
+        spec: StateReadSpec,
+    },
+    StateWrite {
+        spec: StateWriteSpec,
+    },
+    StateGeneration {
+        spec: StateGenerationSpec,
+    },
 }
 
 fn recv_request(
@@ -228,7 +238,7 @@ fn recv_request(
         b'Q' | b'Z' => read == 33,
         b'A' => read == 33,
         b'J' => (18..=48 * 1024 + 17).contains(&read),
-        b'V' | b'S' | b's' | b'T' | b'H' | b'K' | b'B' | b'N' | b'k' => {
+        b'V' | b'S' | b's' | b'T' | b'H' | b'K' | b'B' | b'N' | b'k' | b'R' | b'W' | b'Y' => {
             (18..=2048 + 17).contains(&read)
         }
         _ => read == 17,
@@ -329,6 +339,15 @@ fn recv_request(
                 .try_into()
                 .map_err(|_| io::Error::other("accepted launch descriptors"))?,
         },
+        b'R' => RequestPayload::StateRead {
+            spec: serde_json::from_slice(&request[17..read as usize])?,
+        },
+        b'W' => RequestPayload::StateWrite {
+            spec: serde_json::from_slice(&request[17..read as usize])?,
+        },
+        b'Y' => RequestPayload::StateGeneration {
+            spec: serde_json::from_slice(&request[17..read as usize])?,
+        },
         _ => RequestPayload::None,
     };
     Ok((request[0], payload, credentials, process))
@@ -351,6 +370,326 @@ fn root_launch_admitted(peer: &PeerIdentity, scope: &Scope, host_namespace: &Fil
     matches!(scope, Scope::Outside)
         && (peer.uid >= 1000 || private_fixture() && peer.uid == 0)
         && matches!(peer.process.in_namespace(host_namespace), Ok(true))
+}
+
+fn state_actor_matches(
+    peer: &PeerIdentity,
+    guardian: &PinnedProcess,
+    guardian_stamp: &ProcessStamp,
+    owner: &oulipoly_state::mailbox::CompletionDomainOwner,
+    runner_image: &File,
+) -> io::Result<bool> {
+    let exact_guardian = oulipoly_state::completion_continuation::SourceProcessIdentity {
+        pid: i64::from(guardian.host_pid),
+        boot_id: guardian.boot_id.clone(),
+        starttime_ticks: i64::try_from(guardian.starttime_ticks)
+            .map_err(|_| io::Error::other("guardian starttime overflow"))?,
+    };
+    if owner.guardian_identity != exact_guardian {
+        return Ok(false);
+    }
+    if ProcessStamp::from(&peer.process) == *guardian_stamp {
+        return Ok(true);
+    }
+    Ok(peer.process.direct_child_of(guardian)?
+        && peer.process.same_executable_as(runner_image)?
+        && owner.driver_identity.pid == i64::from(peer.process.host_pid)
+        && owner.driver_identity.boot_id == peer.process.boot_id
+        && owner.driver_identity.starttime_ticks
+            == i64::try_from(peer.process.starttime_ticks)
+                .map_err(|_| io::Error::other("driver starttime overflow"))?)
+}
+
+/// Registry and kernel process identity select the State actor. A claimed
+/// root/owner UUID or matching UID cannot turn a sibling into that actor.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "independent broker and State authority inputs"
+)]
+fn read_broker_state(
+    spec: StateReadSpec,
+    peer: &PeerIdentity,
+    host_namespace: &File,
+    runner_image: &File,
+    roots: &RootRegistry,
+    works: &WorkRegistry,
+    entries: &EntryRegistry,
+    sidecar: &BrokerSidecar,
+) -> io::Result<oulipoly_state::mailbox::BrokerContinuationReadback> {
+    if spec.protocol != "broker-state-read-v1"
+        || roots.has_debt()
+        || entries.has_uncertain_write()
+        || works.has_debt()
+        || !matches!(
+            classify_scope(peer, host_namespace, roots, works),
+            Scope::Outside
+        )
+    {
+        return Err(io::Error::other("broker State read admission refused"));
+    }
+    let root = roots
+        .live_roots()
+        .find(|root| root.record.root_id == spec.root_id)
+        .ok_or_else(|| io::Error::other("broker State root absent"))?;
+    let entry = entries
+        .record(&spec.root_id)
+        .ok_or_else(|| io::Error::other("broker State entry absent"))?;
+    if !entry.join_consumed
+        || entry.joined_child.is_none()
+        || entry.owner_uid != peer.uid
+        || root.record.owner_uid != peer.uid
+        || entry.domain_id.is_none()
+        || entry.supervisor_authority_id.is_none()
+    {
+        return Err(io::Error::other("broker State root binding absent"));
+    }
+    root.init.verify()?;
+    let guardian_stamp = entry
+        .guardian
+        .as_ref()
+        .ok_or_else(|| io::Error::other("broker State guardian absent"))?;
+    let guardian = PinnedProcess::open(guardian_stamp.host_pid)?;
+    if ProcessStamp::from(&guardian) != *guardian_stamp || !guardian.in_namespace(host_namespace)? {
+        return Err(io::Error::other("broker State guardian changed"));
+    }
+    let readback = sidecar
+        .read_exact_continuation(
+            &spec.source_generation,
+            &spec.root_id,
+            entry.domain_id.as_deref().unwrap(),
+            entry.supervisor_authority_id.as_deref().unwrap(),
+            &spec.owner_generation,
+            spec.attempt_id.as_deref(),
+        )
+        .map_err(io::Error::other)?;
+    if !state_actor_matches(
+        peer,
+        &guardian,
+        guardian_stamp,
+        &readback.owner,
+        runner_image,
+    )? {
+        return Err(io::Error::other(
+            "broker State caller is not exact guardian or driver",
+        ));
+    }
+    guardian.verify()?;
+    peer.process.verify()?;
+    Ok(readback)
+}
+
+fn encode_state_readback(
+    readback: &oulipoly_state::mailbox::BrokerContinuationReadback,
+) -> io::Result<String> {
+    let mut response = serde_json::to_string(readback)?;
+    response.push('\n');
+    if response.len() > 4096 {
+        return Err(io::Error::other("broker State readback too large"));
+    }
+    Ok(response)
+}
+
+fn broker_state_generation(
+    spec: StateGenerationSpec,
+    peer: &PeerIdentity,
+    host_namespace: &File,
+    roots: &RootRegistry,
+    works: &WorkRegistry,
+    entries: &EntryRegistry,
+    sidecar: &BrokerSidecar,
+) -> io::Result<String> {
+    if spec.protocol != "broker-state-generation-v1"
+        || roots.has_debt()
+        || entries.has_uncertain_write()
+        || works.has_debt()
+        || !matches!(
+            classify_scope(peer, host_namespace, roots, works),
+            Scope::Outside
+        )
+    {
+        return Err(io::Error::other(
+            "broker State generation admission refused",
+        ));
+    }
+    let root = roots
+        .live_roots()
+        .find(|root| root.record.root_id == spec.root_id)
+        .ok_or_else(|| io::Error::other("broker State root absent"))?;
+    let entry = entries
+        .record(&spec.root_id)
+        .ok_or_else(|| io::Error::other("broker State entry absent"))?;
+    if !entry.join_consumed
+        || entry.joined_child.is_none()
+        || root.record.owner_uid != peer.uid
+        || entry.owner_uid != peer.uid
+        || entry.domain_id.is_none()
+        || entry.supervisor_authority_id.is_none()
+        || entry.guardian.as_ref() != Some(&ProcessStamp::from(&peer.process))
+    {
+        return Err(io::Error::other(
+            "broker State generation requires exact guardian",
+        ));
+    }
+    root.init.verify()?;
+    peer.process.verify()?;
+    Ok(format!(
+        "state-generation {}\n",
+        sidecar.source_generation()
+    ))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "independent broker and State authority inputs"
+)]
+fn write_broker_state(
+    spec: StateWriteSpec,
+    peer: &PeerIdentity,
+    host_namespace: &File,
+    runner_image: &File,
+    roots: &RootRegistry,
+    works: &WorkRegistry,
+    entries: &EntryRegistry,
+    sidecar: &mut BrokerSidecar,
+) -> io::Result<oulipoly_state::mailbox::BrokerContinuationReadback> {
+    if spec.protocol != "broker-state-write-v1"
+        || spec.source_generation != sidecar.source_generation()
+    {
+        return Err(io::Error::other(
+            "broker State write version/generation conflict",
+        ));
+    }
+    let read_spec = |attempt_id: Option<String>| StateReadSpec {
+        protocol: "broker-state-read-v1".into(),
+        source_generation: spec.source_generation.clone(),
+        root_id: spec.root_id.clone(),
+        owner_generation: spec.owner_generation.clone(),
+        attempt_id,
+    };
+    match spec.action {
+        StateWriteAction::Publish {
+            driver_pid,
+            endpoint,
+        } => {
+            if roots.has_debt()
+                || entries.has_uncertain_write()
+                || works.has_debt()
+                || !matches!(
+                    classify_scope(peer, host_namespace, roots, works),
+                    Scope::Outside
+                )
+                || endpoint.is_empty()
+                || endpoint.len() > 1024
+            {
+                return Err(io::Error::other(
+                    "broker owner publication admission refused",
+                ));
+            }
+            let root = roots
+                .live_roots()
+                .find(|root| root.record.root_id == spec.root_id)
+                .ok_or_else(|| io::Error::other("broker owner root absent"))?;
+            let entry = entries
+                .record(&spec.root_id)
+                .ok_or_else(|| io::Error::other("broker owner entry absent"))?;
+            if !entry.join_consumed
+                || entry.joined_child.is_none()
+                || entry.owner_uid != peer.uid
+                || root.record.owner_uid != peer.uid
+                || entry.guardian.as_ref() != Some(&ProcessStamp::from(&peer.process))
+            {
+                return Err(io::Error::other(
+                    "broker owner caller is not bound guardian",
+                ));
+            }
+            root.init.verify()?;
+            let driver = PinnedProcess::open(driver_pid)?;
+            if !driver.direct_child_of(&peer.process)?
+                || !driver.same_executable_as(runner_image)?
+                || !driver.in_namespace(host_namespace)?
+            {
+                return Err(io::Error::other("broker owner driver is not exact child"));
+            }
+            let identity = |process: &PinnedProcess| -> io::Result<_> {
+                Ok(
+                    oulipoly_state::completion_continuation::SourceProcessIdentity {
+                        pid: i64::from(process.host_pid),
+                        boot_id: process.boot_id.clone(),
+                        starttime_ticks: i64::try_from(process.starttime_ticks)
+                            .map_err(|_| io::Error::other("process starttime overflow"))?,
+                    },
+                )
+            };
+            let owner = oulipoly_state::mailbox::CompletionDomainOwner {
+                protocol: oulipoly_state::completion_continuation::PROTOCOL.into(),
+                domain_id: entry
+                    .domain_id
+                    .clone()
+                    .ok_or_else(|| io::Error::other("entry domain absent"))?,
+                supervisor_authority_id: entry
+                    .supervisor_authority_id
+                    .clone()
+                    .ok_or_else(|| io::Error::other("entry supervisor absent"))?,
+                owner_generation: spec.owner_generation,
+                guardian_identity: identity(&peer.process)?,
+                driver_identity: identity(&driver)?,
+                endpoint,
+            };
+            peer.process.verify()?;
+            driver.verify()?;
+            sidecar
+                .publish_exact_owner(&owner, &spec.root_id)
+                .map_err(io::Error::other)
+        }
+        StateWriteAction::Reserve { attempt } => {
+            let before = read_broker_state(
+                read_spec(None),
+                peer,
+                host_namespace,
+                runner_image,
+                roots,
+                works,
+                entries,
+                sidecar,
+            )?;
+            if !before.broker_owned
+                || attempt.owner_generation != spec.owner_generation
+                || before.owner.guardian_identity.pid == i64::from(peer.process.host_pid)
+                || before.owner.driver_identity.pid != i64::from(peer.process.host_pid)
+            {
+                return Err(io::Error::other("broker reservation requires exact driver"));
+            }
+            sidecar
+                .reserve_exact_attempt(&before.owner, &spec.root_id, &attempt)
+                .map_err(io::Error::other)
+        }
+        StateWriteAction::Accept { attempt_id } => {
+            let before = read_broker_state(
+                read_spec(Some(attempt_id)),
+                peer,
+                host_namespace,
+                runner_image,
+                roots,
+                works,
+                entries,
+                sidecar,
+            )?;
+            if !before.broker_owned
+                || before.owner.guardian_identity.pid != i64::from(peer.process.host_pid)
+            {
+                return Err(io::Error::other(
+                    "broker acceptance requires exact guardian",
+                ));
+            }
+            let attempt = before
+                .attempt
+                .ok_or_else(|| io::Error::other("broker attempt absent"))?;
+            let (_, readback) = sidecar
+                .accept_exact_attempt(&before.owner, &spec.root_id, &attempt)
+                .map_err(io::Error::other)?;
+            Ok(readback)
+        }
+    }
 }
 
 fn witness_matches(witness: &ProcessWitness, process: &PinnedProcess) -> io::Result<bool> {
@@ -1098,7 +1437,7 @@ fn serve() -> io::Result<()> {
     // A staged cutover is all-or-nothing at broker restart. Retain the exact
     // v30 connection for future broker State operations, while legacy native
     // N/k remains nonlaunching until the writer protocol is migrated.
-    let broker_sidecar = match fs::symlink_metadata(&sidecar_directory) {
+    let mut broker_sidecar = match fs::symlink_metadata(&sidecar_directory) {
         Ok(_) => {
             let path = sidecar_directory.join("pid-identity.db");
             Some(BrokerSidecar::open_existing(&path, Path::new(&state)).map_err(io::Error::other)?)
@@ -1371,6 +1710,58 @@ fn serve() -> io::Result<()> {
                     &works,
                     &grants,
                 )
+            } else if operation == b'R' {
+                let RequestPayload::StateRead { spec } = payload else {
+                    return Err(io::Error::other("invalid broker State read payload"));
+                };
+                let sidecar = broker_sidecar
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("broker State cutover absent"))?;
+                let readback = read_broker_state(
+                    spec,
+                    &peer,
+                    &host_namespace,
+                    &runner_image,
+                    &registry,
+                    &works,
+                    &entries,
+                    sidecar,
+                )?;
+                encode_state_readback(&readback)
+            } else if operation == b'W' {
+                let RequestPayload::StateWrite { spec } = payload else {
+                    return Err(io::Error::other("invalid broker State write payload"));
+                };
+                let sidecar = broker_sidecar
+                    .as_mut()
+                    .ok_or_else(|| io::Error::other("broker State cutover absent"))?;
+                let readback = write_broker_state(
+                    spec,
+                    &peer,
+                    &host_namespace,
+                    &runner_image,
+                    &registry,
+                    &works,
+                    &entries,
+                    sidecar,
+                )?;
+                encode_state_readback(&readback)
+            } else if operation == b'Y' {
+                let RequestPayload::StateGeneration { spec } = payload else {
+                    return Err(io::Error::other("invalid broker State generation payload"));
+                };
+                let sidecar = broker_sidecar
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("broker State cutover absent"))?;
+                broker_state_generation(
+                    spec,
+                    &peer,
+                    &host_namespace,
+                    &registry,
+                    &works,
+                    &entries,
+                    sidecar,
+                )
             } else {
                 dispatch_authenticated(
                     operation,
@@ -1407,6 +1798,120 @@ mod tests {
     use std::io::Read;
     use std::process::Command;
     use std::thread;
+
+    #[test]
+    fn state_read_requires_exact_live_guardian_not_same_uid_sibling_or_copied_owner() {
+        let current = PinnedProcess::open(std::process::id() as i32).unwrap();
+        let peer = PeerIdentity {
+            uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
+            process: PinnedProcess::open(std::process::id() as i32).unwrap(),
+        };
+        let identity = oulipoly_state::completion_continuation::SourceProcessIdentity {
+            pid: i64::from(current.host_pid),
+            boot_id: current.boot_id.clone(),
+            starttime_ticks: current.starttime_ticks as i64,
+        };
+        let mut owner = oulipoly_state::mailbox::CompletionDomainOwner {
+            protocol: oulipoly_state::completion_continuation::PROTOCOL.into(),
+            domain_id: uuid::Uuid::new_v4().to_string(),
+            supervisor_authority_id: uuid::Uuid::new_v4().to_string(),
+            owner_generation: uuid::Uuid::new_v4().to_string(),
+            guardian_identity: identity.clone(),
+            driver_identity: identity,
+            endpoint: "/fixture".into(),
+        };
+        let image = File::open(std::env::current_exe().unwrap()).unwrap();
+        assert!(
+            state_actor_matches(
+                &peer,
+                &current,
+                &ProcessStamp::from(&current),
+                &owner,
+                &image
+            )
+            .unwrap()
+        );
+        owner.guardian_identity.pid += 1;
+        assert!(
+            !state_actor_matches(
+                &peer,
+                &current,
+                &ProcessStamp::from(&current),
+                &owner,
+                &image
+            )
+            .unwrap()
+        );
+        owner.guardian_identity.pid -= 1;
+        let mut sibling = Command::new("sleep").arg("5").spawn().unwrap();
+        let sibling_process = PinnedProcess::open(sibling.id() as i32).unwrap();
+        assert!(
+            !state_actor_matches(
+                &peer,
+                &sibling_process,
+                &ProcessStamp::from(&sibling_process),
+                &owner,
+                &image
+            )
+            .unwrap()
+        );
+        sibling.kill().unwrap();
+        sibling.wait().unwrap();
+    }
+
+    #[test]
+    fn state_read_replayed_challenge_is_rejected_before_dispatch() {
+        let (mut server, mut client) = UnixStream::pair().unwrap();
+        let receiver = thread::spawn(move || recv_request(&mut server));
+        let mut challenge = [0u8; 16];
+        client.read_exact(&mut challenge).unwrap();
+        let spec = StateReadSpec {
+            protocol: "broker-state-read-v1".into(),
+            source_generation: uuid::Uuid::new_v4().to_string(),
+            root_id: uuid::Uuid::new_v4().to_string(),
+            owner_generation: uuid::Uuid::new_v4().to_string(),
+            attempt_id: None,
+        };
+        let mut frame = vec![b'R'];
+        frame.extend_from_slice(&[0u8; 16]);
+        frame.extend_from_slice(&serde_json::to_vec(&spec).unwrap());
+        client.write_all(&frame).unwrap();
+        assert!(receiver.join().unwrap().is_err());
+    }
+
+    #[test]
+    fn state_write_frame_is_challenged_and_carries_no_path_or_row_authority() {
+        let (mut server, mut client) = UnixStream::pair().unwrap();
+        let receiver = thread::spawn(move || recv_request(&mut server));
+        let mut challenge = [0u8; 16];
+        client.read_exact(&mut challenge).unwrap();
+        let spec = StateWriteSpec {
+            protocol: "broker-state-write-v1".into(),
+            source_generation: uuid::Uuid::new_v4().to_string(),
+            root_id: uuid::Uuid::new_v4().to_string(),
+            owner_generation: uuid::Uuid::new_v4().to_string(),
+            action: StateWriteAction::Accept {
+                attempt_id: uuid::Uuid::new_v4().to_string(),
+            },
+        };
+        let mut frame = vec![b'W'];
+        frame.extend_from_slice(&challenge);
+        frame.extend_from_slice(&serde_json::to_vec(&spec).unwrap());
+        client.write_all(&frame).unwrap();
+        let (operation, payload, _, pinned) = receiver.join().unwrap().unwrap();
+        assert_eq!(operation, b'W');
+        assert_eq!(pinned.host_pid, std::process::id() as i32);
+        assert!(matches!(
+            payload,
+            RequestPayload::StateWrite {
+                spec: StateWriteSpec {
+                    action: StateWriteAction::Accept { .. },
+                    ..
+                }
+            }
+        ));
+    }
 
     #[test]
     fn production_dispatch_reserves_pre_fork_and_binds_only_prepared_guardian() {

@@ -710,6 +710,16 @@ pub(super) fn validate_broker_owned(conn: &Connection) -> Result<String, String>
     if definition != BROKER_AUTHORITY_SCHEMA {
         return Err("broker authority schema changed".into());
     }
+    let owner_definition: String = tx
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='broker_completion_owner'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("broker owner schema missing: {error}"))?;
+    if owner_definition != BROKER_OWNER_SCHEMA {
+        return Err("broker owner schema changed".into());
+    }
     let generation: String = tx
         .query_row(
             "SELECT source_generation FROM broker_sidecar_authority WHERE singleton=1",
@@ -728,6 +738,14 @@ pub(super) const BROKER_AUTHORITY_SCHEMA: &str = "CREATE TABLE broker_sidecar_au
     singleton INTEGER PRIMARY KEY CHECK(singleton=1),
     source_generation TEXT NOT NULL,
     activated_at TEXT NOT NULL
+)";
+
+pub(super) const BROKER_OWNER_SCHEMA: &str = "CREATE TABLE broker_completion_owner (
+    owner_generation TEXT PRIMARY KEY REFERENCES completion_continuation_owner(generation),
+    source_generation TEXT NOT NULL,
+    root_id TEXT NOT NULL,
+    guardian_identity TEXT NOT NULL,
+    driver_identity TEXT NOT NULL
 )";
 
 fn create_fresh_schema(conn: &Connection) -> Result<(), String> {
@@ -1141,7 +1159,7 @@ fn session_has_nonterminal_generation(conn: &Connection, session_id: &str) -> Re
     .map_err(|err| format!("Failed to inspect promoted runtime session: {err}"))
 }
 
-fn sidecar_version(conn: &Connection) -> Result<i64, String> {
+pub(super) fn sidecar_version(conn: &Connection) -> Result<i64, String> {
     conn.query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(|err| format!("Failed to read PID mailbox sidecar schema version: {err}"))
 }

@@ -8,6 +8,145 @@ use std::path::Path;
 
 pub const INSTALLED_SOCKET: &str = "/run/oulipoly-kernel-broker/control.sock";
 
+/// Opt-in v1 readback. The broker derives the domain and supervisor from its
+/// durable entry registry; these IDs never authorize a request by themselves.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateReadSpec {
+    pub protocol: String,
+    pub source_generation: String,
+    pub root_id: String,
+    pub owner_generation: String,
+    pub attempt_id: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateGenerationSpec {
+    pub protocol: String,
+    pub root_id: String,
+}
+
+/// Discover the active source generation only for an already bound guardian.
+/// The returned value must accompany every later State read or write.
+pub fn state_generation_at(path: &Path, root_id: &str) -> io::Result<String> {
+    let spec = StateGenerationSpec {
+        protocol: "broker-state-generation-v1".into(),
+        root_id: root_id.into(),
+    };
+    let body = serde_json::to_vec(&spec)?;
+    let mut stream = checked_connection(path)?;
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let mut frame = Vec::with_capacity(17 + body.len());
+    frame.push(b'Y');
+    frame.extend_from_slice(&challenge);
+    frame.extend_from_slice(&body);
+    if unsafe {
+        libc::send(
+            stream.as_raw_fd(),
+            frame.as_ptr().cast(),
+            frame.len(),
+            libc::MSG_NOSIGNAL,
+        )
+    } != frame.len() as isize
+    {
+        return Err(io::Error::other("short State generation request"));
+    }
+    let response = read_response(stream)?;
+    let generation = response
+        .trim_end()
+        .strip_prefix("state-generation ")
+        .ok_or_else(|| io::Error::other("State generation refused"))?;
+    let parsed =
+        uuid::Uuid::parse_str(generation).map_err(|_| io::Error::other("bad State generation"))?;
+    if parsed.to_string() != generation {
+        return Err(io::Error::other("noncanonical State generation"));
+    }
+    Ok(generation.into())
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateWriteSpec {
+    pub protocol: String,
+    pub source_generation: String,
+    pub root_id: String,
+    pub owner_generation: String,
+    pub action: StateWriteAction,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum StateWriteAction {
+    Publish {
+        driver_pid: i32,
+        endpoint: String,
+    },
+    Reserve {
+        attempt: oulipoly_state::mailbox::ContinuationAttempt,
+    },
+    Accept {
+        attempt_id: String,
+    },
+}
+
+/// A committed write reply can be lost. Reconcile by `read_state_at` using the
+/// same source/root/owner/attempt identity before any retry or launch decision.
+pub fn write_state_at(
+    path: &Path,
+    spec: &StateWriteSpec,
+) -> io::Result<oulipoly_state::mailbox::BrokerContinuationReadback> {
+    send_state_request_at(path, b'W', spec)
+}
+
+pub fn read_state_at(
+    path: &Path,
+    spec: &StateReadSpec,
+) -> io::Result<oulipoly_state::mailbox::BrokerContinuationReadback> {
+    send_state_request_at(path, b'R', spec)
+}
+
+fn send_state_request_at<T: serde::Serialize>(
+    path: &Path,
+    opcode: u8,
+    spec: &T,
+) -> io::Result<oulipoly_state::mailbox::BrokerContinuationReadback> {
+    let body = serde_json::to_vec(spec)?;
+    if body.len() > 2048 {
+        return Err(io::Error::other("State read request too large"));
+    }
+    let mut stream = checked_connection(path)?;
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let mut request = Vec::with_capacity(17 + body.len());
+    request.push(opcode);
+    request.extend_from_slice(&challenge);
+    request.extend_from_slice(&body);
+    if unsafe {
+        libc::send(
+            stream.as_raw_fd(),
+            request.as_ptr().cast(),
+            request.len(),
+            libc::MSG_NOSIGNAL,
+        )
+    } != request.len() as isize
+    {
+        return Err(io::Error::other("short State read request"));
+    }
+    let mut response = Vec::new();
+    stream.take(4097).read_to_end(&mut response)?;
+    if response.len() > 4096 || !response.ends_with(b"\n") {
+        return Err(io::Error::other("invalid State read response"));
+    }
+    if response.starts_with(b"error ") {
+        return Err(io::Error::other(
+            String::from_utf8_lossy(&response).into_owned(),
+        ));
+    }
+    serde_json::from_slice(&response).map_err(io::Error::other)
+}
+
 #[derive(Clone, Copy)]
 pub enum Operation {
     Classify,

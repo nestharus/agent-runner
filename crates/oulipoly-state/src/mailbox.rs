@@ -46,7 +46,7 @@ mod completion_continuation;
 mod finalization;
 mod native_publication;
 mod retention;
-pub use broker_authority::BrokerSidecar;
+pub use broker_authority::{BrokerContinuationReadback, BrokerSidecar};
 pub use native_publication::NativePublication;
 #[path = "mailbox/schema.rs"]
 mod schema;

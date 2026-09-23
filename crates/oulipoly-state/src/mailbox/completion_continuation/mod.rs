@@ -572,7 +572,11 @@ pub(in crate::mailbox) fn domain_on(conn: &Connection) -> Result<Option<String>,
     if !exists {
         return Ok(None);
     }
-    validate_schema_on(conn)?;
+    if super::schema::sidecar_version(conn)? == super::schema::BROKER_OWNED_VERSION {
+        validate_broker_schema_on(conn)?;
+    } else {
+        validate_schema_on(conn)?;
+    }
     conn.query_row("SELECT domain_id FROM completion_continuation_domain WHERE singleton=1 AND lineage='main-native-completion-v2'", [], |r| r.get(0)).optional().map_err(|e| e.to_string())
 }
 
