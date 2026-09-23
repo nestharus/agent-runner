@@ -2,6 +2,7 @@
 //! database, an installed broker, provider traffic, or host-root sudo.
 #![cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
 
+use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -57,6 +58,232 @@ fn one_file(dir: &Path) -> PathBuf {
         .collect();
     assert_eq!(entries.len(), 1, "expected one file in {}", dir.display());
     entries[0].clone()
+}
+
+fn recipient_cli(runner: &Path, data: &Path, args: &[&str]) -> serde_json::Value {
+    let output = Command::new(runner)
+        .args(args)
+        .env_clear()
+        .env("HOME", data.parent().unwrap().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("OULIPOLY_DATA_DIR", data)
+        .env(
+            "OULIPOLY_CONFIG_HOME",
+            data.parent().unwrap().join("config"),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "recipient CLI {:?}: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn recipient() {
+    use oulipoly_state::{InvocationStart, ProviderSessionBinding, StateDb};
+
+    let data = PathBuf::from(std::env::var_os("AGE319_RECIPIENT_DATA").unwrap());
+    let runner = PathBuf::from(std::env::var_os("AGE319_RECIPIENT_RUNNER").unwrap());
+    let session = std::env::var("AGE319_RECIPIENT_SESSION").unwrap();
+    let handle = std::env::var("AGE319_RECIPIENT_HANDLE").unwrap();
+    let source_invocation = std::env::var("AGE319_SOURCE_INVOCATION").unwrap();
+    let receipt_path = PathBuf::from(std::env::var_os("AGE319_RECIPIENT_RECEIPT").unwrap());
+    let recipient_invocation = uuid::Uuid::new_v4().to_string();
+    assert_ne!(recipient_invocation, source_invocation);
+
+    // The recipient is a separate process and a separate State invocation in
+    // the same provider session. It receives no source registration authority.
+    let state = StateDb::open(&data.join("state.db")).unwrap();
+    let row_id = state
+        .start_invocation(&InvocationStart {
+            invocation_uuid: recipient_invocation.clone(),
+            model_name: "age319-private-mailbox-recipient".into(),
+            provider_name: "manual-mailbox-recipient".into(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        })
+        .unwrap();
+    state
+        .bind_invocation_provider_session_start(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            row_id,
+            &ProviderSessionBinding {
+                provider_session_id: session.clone(),
+                capture_method: "age319-private-manual-recipient",
+                resume_input_id: None,
+                provider_session_resolved_account: None,
+            },
+        )
+        .unwrap();
+    drop(state);
+
+    let listed = recipient_cli(
+        &runner,
+        &data,
+        &["mailbox", "list", "--session-id", &session, "--json"],
+    );
+    let rows = listed["rows"].as_array().unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "recipient must receive exactly one pending row"
+    );
+    let seq = rows[0]["seq"].as_i64().unwrap();
+    assert_eq!(rows[0]["handle"], handle);
+    assert_eq!(rows[0]["session_id"], session);
+    assert_eq!(rows[0]["owner_invocation_uuid"], source_invocation);
+    assert!(rows[0]["delivered_at"].is_null());
+    let seq_arg = seq.to_string();
+    let shown = recipient_cli(
+        &runner,
+        &data,
+        &[
+            "mailbox",
+            "show",
+            "--session-id",
+            &session,
+            "--seq",
+            &seq_arg,
+            "--json",
+        ],
+    );
+    assert_eq!(shown["row"], rows[0]);
+    let payload_path = Path::new(rows[0]["payload_file_path"].as_str().unwrap());
+    let payload_bytes = fs::read(payload_path).unwrap();
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&payload_bytes)),
+        rows[0]["payload_sha256"]
+    );
+    assert_eq!(
+        i64::try_from(payload_bytes.len()).unwrap(),
+        rows[0]["payload_byte_len"]
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).unwrap();
+    assert_eq!(payload["handle"], handle);
+    assert_eq!(payload["completion_protocol"], "completion-continuation-v2");
+    fs::write(
+        &receipt_path,
+        serde_json::to_vec(&serde_json::json!({
+            "recipient_invocation_uuid": recipient_invocation,
+            "source_invocation_uuid": source_invocation,
+            "session_id": session,
+            "handle": handle,
+            "seq": seq,
+            "payload_sha256": rows[0]["payload_sha256"],
+            "consumed": true
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // A different session cannot ACK this row, even with the exact sequence.
+    let foreign = recipient_cli(
+        &runner,
+        &data,
+        &[
+            "mailbox",
+            "ack",
+            "--session-id",
+            "age319-foreign-session",
+            "--from-seq",
+            &seq_arg,
+            "--to-seq",
+            &seq_arg,
+            "--delivered-by",
+            &recipient_invocation,
+            "--json",
+        ],
+    );
+    assert_eq!(foreign["acknowledged_count"], 0);
+    let before =
+        oulipoly_state::mailbox::MailboxDb::open_read_only(&data.join("pid-identity.db")).unwrap();
+    assert_eq!(before.list_pending(&session).unwrap().len(), 1);
+    assert!(
+        before
+            .completion_event_listeners(&handle)
+            .unwrap()
+            .iter()
+            .all(|listener| listener.acknowledged_at.is_none())
+    );
+    drop(before);
+
+    // Discard the CLI reply. Durable readback, not the response, proves ACK.
+    let ack_status = Command::new(&runner)
+        .args([
+            "mailbox",
+            "ack",
+            "--session-id",
+            &session,
+            "--from-seq",
+            &seq_arg,
+            "--to-seq",
+            &seq_arg,
+            "--delivered-by",
+            &recipient_invocation,
+            "--json",
+        ])
+        .env_clear()
+        .env("HOME", data.parent().unwrap().join("home"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("OULIPOLY_DATA_DIR", &data)
+        .env(
+            "OULIPOLY_CONFIG_HOME",
+            data.parent().unwrap().join("config"),
+        )
+        .stdout(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(ack_status.success());
+    let readback = recipient_cli(
+        &runner,
+        &data,
+        &[
+            "mailbox",
+            "list",
+            "--session-id",
+            &session,
+            "--all",
+            "--json",
+        ],
+    );
+    let delivered = &readback["rows"][0];
+    assert_eq!(delivered["seq"], seq);
+    assert_eq!(
+        delivered["delivered_by_invocation_uuid"],
+        recipient_invocation
+    );
+    assert!(delivered["delivered_at"].as_str().is_some());
+    assert!(
+        recipient_cli(
+            &runner,
+            &data,
+            &["mailbox", "list", "--session-id", &session, "--json"]
+        )["rows"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let replay = recipient_cli(
+        &runner,
+        &data,
+        &[
+            "mailbox",
+            "ack",
+            "--session-id",
+            &session,
+            "--from-seq",
+            &seq_arg,
+            "--to-seq",
+            &seq_arg,
+            "--delivered-by",
+            &recipient_invocation,
+            "--json",
+        ],
+    );
+    assert_eq!(replay["acknowledged_count"], 0);
 }
 
 #[test]
@@ -369,23 +596,108 @@ fn inner() {
     assert_eq!(release["release_protocol"], "source-retention-release-v1");
     let mailbox =
         oulipoly_state::mailbox::MailboxDb::open_read_only(&data.join("pid-identity.db")).unwrap();
-    let listeners = mailbox
-        .completion_event_listeners(source["handle"].as_str().unwrap())
+    let source_handle = source["handle"].as_str().unwrap();
+    let listeners_before = mailbox.completion_event_listeners(source_handle).unwrap();
+    assert_eq!(listeners_before.len(), 1);
+    let seq = listeners_before[0].mailbox_seq.unwrap();
+    assert!(listeners_before[0].acknowledged_at.is_none());
+    let pending = mailbox.list_pending(session).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].seq, seq);
+    assert_eq!(pending[0].handle, source_handle);
+    assert!(pending[0].delivered_at.is_none());
+    drop(mailbox);
+
+    // Paired negative: the live source handle and exact root exist, but a
+    // missing or sibling work claim cannot invoke Runner activation.
+    for claim in [None, Some("sibling-work")] {
+        let mut probe = Command::new(&runner);
+        probe
+            .args(["notify", "agent-bash-activate", "--handle", source_handle])
+            .env_clear()
+            .env("HOME", &home)
+            .env("OULIPOLY_DATA_DIR", &data)
+            .env("OULIPOLY_CONFIG_HOME", &config)
+            .env(
+                "OULIPOLY_KERNEL_EXPECTED_ROOT_V1",
+                work_record["root_id"].as_str().unwrap(),
+            );
+        if let Some(claim) = claim {
+            probe.env("AGENT_BASH_OWNER_WORK_ID_V1", claim);
+        }
+        let output = probe.output().unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("pinned owner work ID conflict"));
+    }
+    assert_eq!(fs::read_to_string(&ran).unwrap(), "executed\n");
+
+    let consumption_receipt = temp_path.join("recipient-consumption.json");
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "real_bash_source_reaches_guardian_h_k_q",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env_remove("AGE319_PRIVATE_PAIRED_INNER")
+        .env("AGE319_PRIVATE_RECIPIENT_INNER", "1")
+        .env("AGE319_RECIPIENT_DATA", &data)
+        .env("AGE319_RECIPIENT_RUNNER", &runner)
+        .env("AGE319_RECIPIENT_SESSION", session)
+        .env("AGE319_RECIPIENT_HANDLE", source_handle)
+        .env("AGE319_SOURCE_INVOCATION", invocation)
+        .env("AGE319_RECIPIENT_RECEIPT", &consumption_receipt)
+        .output()
         .unwrap();
+    assert!(
+        output.status.success(),
+        "recipient stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let consumed = json(&consumption_receipt);
+    assert_eq!(consumed["consumed"], true);
+    assert_eq!(consumed["seq"], seq);
+    assert_eq!(consumed["session_id"], session);
+    assert_eq!(consumed["handle"], source_handle);
+    assert_ne!(consumed["recipient_invocation_uuid"], invocation);
+    let recipient_bound_session: String = state
+        .query_row(
+            "SELECT provider_session_id FROM invocations WHERE invocation_uuid=?1",
+            [consumed["recipient_invocation_uuid"].as_str().unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recipient_bound_session, session);
+    let mailbox =
+        oulipoly_state::mailbox::MailboxDb::open_historical(&data.join("pid-identity.db")).unwrap();
+    let delivered = mailbox.list_mailbox(session, true).unwrap();
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0].seq, seq);
+    assert!(delivered[0].delivered_at.is_some());
+    assert_eq!(
+        delivered[0].delivered_by_invocation_uuid.as_deref(),
+        consumed["recipient_invocation_uuid"].as_str()
+    );
+    let listeners = mailbox.completion_event_listeners(source_handle).unwrap();
     assert!(
         !listeners.is_empty()
             && listeners
                 .iter()
                 .all(|listener| listener.acknowledged_at.is_some()),
-        "recipient ACK missing after distinct source release, Runner result and Q: listeners={listeners:?}"
+        "recipient ACK missing after consumption: listeners={listeners:?}"
     );
     stop(&mut entry);
     stop(&mut broker);
 }
 
 #[test]
-#[ignore = "recipient ACK and paired adversarial controls unproved"]
+#[ignore = "paired preaccept and sealed-helper V adversarial controls remain unproved"]
 fn real_bash_source_reaches_guardian_h_k_q() {
+    if std::env::var_os("AGE319_PRIVATE_RECIPIENT_INNER").is_some() {
+        recipient();
+        return;
+    }
     if std::env::var_os("AGE319_PRIVATE_PAIRED_INNER").is_some() {
         inner();
         return;
