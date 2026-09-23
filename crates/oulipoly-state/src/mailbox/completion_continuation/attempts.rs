@@ -9,6 +9,37 @@ thread_local! {
 pub(super) fn crash_after_native_update_once() {
     CRASH_AFTER_NATIVE_UPDATE.with(|flag| flag.set(true));
 }
+
+/// Reject a connection whose opened main database is no longer at SQLite's
+/// canonical name. This does not expose that file's identity, attest the WAL,
+/// or prevent a later name replacement; native K still needs a VFS-backed
+/// descriptor proof before it can release a worker.
+#[cfg(target_os = "linux")]
+fn native_main_file_must_be_named(conn: &Connection) -> Result<(), String> {
+    let mut moved: std::ffi::c_int = -1;
+    // SAFETY: the Connection owns the SQLite handle for this call, `main` is
+    // NUL-terminated, and SQLite writes one C int to the live stack slot.
+    let status = unsafe {
+        rusqlite::ffi::sqlite3_file_control(
+            conn.handle(),
+            c"main".as_ptr(),
+            rusqlite::ffi::SQLITE_FCNTL_HAS_MOVED,
+            (&mut moved as *mut std::ffi::c_int).cast(),
+        )
+    };
+    if status != rusqlite::ffi::SQLITE_OK || moved != 0 {
+        return Err(format!(
+            "native acceptance SQLite main file moved or cannot be verified: status={status}, moved={moved}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn native_main_file_must_be_named(_conn: &Connection) -> Result<(), String> {
+    Err("native acceptance requires Linux SQLite file verification".into())
+}
+
 use crate::diagnostic_recorder::{
     OutcomeCertainty, SqliteAccessClass, SqliteMeasurementGap, SqlitePhaseEvidence,
     SqliteQueryPlanEvidence, SqliteTransactionPhase,
@@ -1017,6 +1048,7 @@ impl MailboxDb {
             return Err("invalid native grant binding proposal".into());
         }
         require_exact_live_guardian(&accepted.guardian_identity)?;
+        native_main_file_must_be_named(&self.conn)?;
         let accepted_snapshot_sha256 = crate::completion_continuation::sha256(
             &serde_json::to_vec(accepted).map_err(|error| error.to_string())?,
         );
@@ -1026,6 +1058,7 @@ impl MailboxDb {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
+        native_main_file_must_be_named(&tx)?;
         require_exact_attempt(&tx, &accepted.attempt)?;
         let changed = tx
             .execute(
@@ -1080,7 +1113,9 @@ impl MailboxDb {
         if readback != expected {
             return Err("native grant binding readback conflict".into());
         }
+        native_main_file_must_be_named(&tx)?;
         tx.commit().map_err(|error| error.to_string())?;
+        native_main_file_must_be_named(&self.conn)?;
         Ok(readback)
     }
 
@@ -1108,7 +1143,12 @@ impl MailboxDb {
         {
             return Err("native acceptance owner/root conflict".into());
         }
+        // This is a stale-connection rejection, not file provenance. SQLite's
+        // Unix VFS compares its own open main file with its canonical name;
+        // the caller must not substitute a pathname stat for that comparison.
+        native_main_file_must_be_named(&self.conn)?;
         let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+        native_main_file_must_be_named(&tx)?;
         let changed = tx
             .execute(
                 "UPDATE completion_continuation_attempt SET phase='accepted',revision=revision+1
@@ -1213,7 +1253,9 @@ impl MailboxDb {
         {
             return Err("native acceptance exact readback conflict".into());
         }
+        native_main_file_must_be_named(&tx)?;
         tx.commit().map_err(|e| e.to_string())?;
+        native_main_file_must_be_named(&self.conn)?;
         Ok(AcceptedNativeGrantSnapshot {
             attempt: stored,
             domain_id: domain,

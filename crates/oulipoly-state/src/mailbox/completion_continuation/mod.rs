@@ -1512,6 +1512,98 @@ mod tests {
         assert_eq!(phase(&db), ("accepted".into(), 2));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_acceptance_rejects_stale_sqlite_connection_after_copied_file_swap() {
+        use std::os::unix::fs::MetadataExt;
+
+        let (dir, mut db, old_owner) = fixture();
+        let path = dir.path().join("pid-identity.db");
+        let held = dir.path().join("held-pid-identity.db");
+        let copied = dir.path().join("copied-pid-identity.db");
+        let root = uuid::Uuid::new_v4().to_string();
+        let mut owner = old_owner;
+        owner.owner_generation = uuid::Uuid::new_v4().to_string();
+        owner.supervisor_authority_id = uuid::Uuid::new_v4().to_string();
+        db.publish_completion_owner_with_kernel_root(&owner, Some(&root))
+            .unwrap();
+        let attempt = reservation(&mut db, &owner);
+        db.conn
+            .execute("VACUUM INTO ?1", [copied.to_str().unwrap()])
+            .unwrap();
+
+        // The copied database contains the exact reservation and owner rows.
+        // Their equality cannot make it the file used by this live connection.
+        let copied_row: (String, i64) = rusqlite::Connection::open_with_flags(
+            &copied,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap()
+        .query_row(
+            "SELECT phase,revision FROM completion_continuation_attempt WHERE attempt_id=?1",
+            [&attempt.attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+        assert_eq!(copied_row, ("reserved".into(), 1));
+        let original_inode = std::fs::metadata(&path).unwrap().ino();
+        std::fs::rename(&path, &held).unwrap();
+        std::fs::rename(&copied, &path).unwrap();
+        assert_ne!(std::fs::metadata(&path).unwrap().ino(), original_inode);
+        let error = db
+            .accept_exact_native_attempt(&attempt, &owner, &root)
+            .unwrap_err();
+        assert!(error.contains("SQLite main file moved"), "{error}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_binding_rejects_name_replaced_after_acceptance_with_copied_row() {
+        use std::os::unix::fs::MetadataExt;
+
+        let (dir, mut db, old_owner) = fixture();
+        let path = dir.path().join("pid-identity.db");
+        let held = dir.path().join("held-pid-identity.db");
+        let copied = dir.path().join("copied-pid-identity.db");
+        let root = uuid::Uuid::new_v4().to_string();
+        let mut owner = old_owner;
+        owner.owner_generation = uuid::Uuid::new_v4().to_string();
+        owner.supervisor_authority_id = uuid::Uuid::new_v4().to_string();
+        db.publish_completion_owner_with_kernel_root(&owner, Some(&root))
+            .unwrap();
+        let attempt = reservation(&mut db, &owner);
+        let accepted = db
+            .accept_exact_native_attempt(&attempt, &owner, &root)
+            .unwrap();
+        db.conn
+            .execute("VACUUM INTO ?1", [copied.to_str().unwrap()])
+            .unwrap();
+        let copied_row: (String, i64) = rusqlite::Connection::open_with_flags(
+            &copied,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap()
+        .query_row(
+            "SELECT phase,revision FROM completion_continuation_attempt WHERE attempt_id=?1",
+            [&attempt.attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+        assert_eq!(copied_row, ("accepted".into(), 2));
+        let original_inode = std::fs::metadata(&path).unwrap().ino();
+        std::fs::rename(&path, &held).unwrap();
+        std::fs::rename(&copied, &path).unwrap();
+        assert_ne!(std::fs::metadata(&path).unwrap().ino(), original_inode);
+        let error = db
+            .bind_exact_native_grant(
+                &accepted,
+                &uuid::Uuid::new_v4().to_string(),
+                &"b".repeat(64),
+            )
+            .unwrap_err();
+        assert!(error.contains("SQLite main file moved"), "{error}");
+    }
+
     #[test]
     fn native_grant_binding_is_exact_one_to_one_and_survives_reply_loss() {
         let (dir, mut db, old_owner) = fixture();
