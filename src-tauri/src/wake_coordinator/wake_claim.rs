@@ -63,6 +63,10 @@ fn validate_auto_wake_child_claim(
     session_id: &str,
     claim_token: &str,
 ) -> Result<Option<i32>, String> {
+    #[cfg(feature = "age360-fault-fixtures")]
+    oulipoly_state::completion_continuation::age360_fault_barrier(
+        "wake-child-before-claim-admission",
+    );
     let Some(mut db) = MailboxDb::open_default_if_exists()? else {
         return Ok(Some(0));
     };
@@ -84,13 +88,20 @@ pub(super) fn coordinate_manual_resume_at(
     // The sidecar and State share the data root. Do not hold a sidecar handle
     // while opening State: namespace ordering is State -> sidecar as well.
     let state = oulipoly_state::StateDb::open_existing(&mailbox_path.with_file_name("state.db"))?;
-    match resolved {
+    let observation = match resolved {
         Some(resolved) if resolved.active_session_id == session_id => {
             state.coordinate_resolved_manual_resume(resolved)
         }
         Some(_) => Err("manual_resume_identity_session_mismatch".into()),
         None => state.coordinate_manual_resume(session_id),
+    };
+    #[cfg(feature = "age360-fault-fixtures")]
+    if let Ok(value) = &observation {
+        oulipoly_state::completion_continuation::age360_fault_barrier(&format!(
+            "manual-after-claim-coordination-{value:?}"
+        ));
     }
+    observation
 }
 
 pub(crate) fn reset_manual_resume_wake_claim(

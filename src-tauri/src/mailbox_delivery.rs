@@ -1751,7 +1751,59 @@ fn sanitize(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    fn remove_record_timestamp_contract_for_legacy_fixture(connection: &rusqlite::Connection) {
+        connection
+            .execute_batch(
+                "DROP TRIGGER IF EXISTS mailbox_timestamp_after_insert;
+             DROP TRIGGER IF EXISTS mailbox_timestamp_after_delivery;
+             DROP TRIGGER IF EXISTS mailbox_timestamp_after_terminal_error;
+             DROP TRIGGER IF EXISTS mailbox_enqueued_at_immutable;
+             DROP TRIGGER IF EXISTS mailbox_closed_at_immutable;
+             DROP TRIGGER IF EXISTS mailbox_delivered_at_immutable;
+             DROP TRIGGER IF EXISTS mailbox_delivery_attempt_timestamp_after_insert;
+             DROP TRIGGER IF EXISTS mailbox_delivery_attempt_timestamp_after_update;
+             DROP TRIGGER IF EXISTS mailbox_delivery_attempt_created_at_immutable;
+             DROP TRIGGER IF EXISTS mailbox_delivery_attempt_resolved_at_immutable;
+             DROP TRIGGER IF EXISTS completion_event_timestamp_after_trigger;
+             DROP TRIGGER IF EXISTS completion_event_triggered_at_immutable;
+             DROP TRIGGER IF EXISTS completion_event_created_at_immutable;
+             DROP TRIGGER IF EXISTS completion_event_terminal_reopen_forbidden;
+             DROP TRIGGER IF EXISTS completion_listener_timestamp_after_reactivation;
+             DROP TRIGGER IF EXISTS completion_listener_timestamp_after_retirement;
+             DROP TRIGGER IF EXISTS completion_listener_created_at_immutable;
+             DROP TRIGGER IF EXISTS completion_listener_closed_at_immutable;
+             DROP TRIGGER IF EXISTS runtime_generation_timestamp_after_transition;
+             DROP TRIGGER IF EXISTS runtime_generation_created_at_immutable;
+             DROP TRIGGER IF EXISTS runtime_generation_exited_at_immutable;
+             DROP TRIGGER IF EXISTS runtime_generation_terminal_reopen_forbidden;
+             DROP INDEX IF EXISTS idx_mailbox_retention_eligible_v23;
+             DROP INDEX IF EXISTS idx_mailbox_delivery_attempt_retention_v23;
+             DROP INDEX IF EXISTS idx_completion_event_retention_v23;
+             DROP INDEX IF EXISTS idx_completion_event_listener_retention_v23;
+             DROP INDEX IF EXISTS idx_runtime_generation_retention_v23;
+             ALTER TABLE mailbox DROP COLUMN retention_status;
+             ALTER TABLE mailbox DROP COLUMN retention_eligible_at;
+             ALTER TABLE mailbox DROP COLUMN closed_at;
+             ALTER TABLE mailbox_delivery_attempts DROP COLUMN retention_status;
+             ALTER TABLE mailbox_delivery_attempts DROP COLUMN retention_eligible_at;
+             ALTER TABLE mailbox_delivery_attempts DROP COLUMN updated_at;
+             ALTER TABLE completion_event DROP COLUMN retention_status;
+             ALTER TABLE completion_event DROP COLUMN retention_eligible_at;
+             ALTER TABLE completion_event DROP COLUMN closed_at;
+             ALTER TABLE completion_event DROP COLUMN updated_at;
+             ALTER TABLE completion_event_listener DROP COLUMN retention_status;
+             ALTER TABLE completion_event_listener DROP COLUMN retention_eligible_at;
+             ALTER TABLE completion_event_listener DROP COLUMN closed_at;
+             ALTER TABLE completion_event_listener DROP COLUMN updated_at;
+             ALTER TABLE runtime_generation DROP COLUMN retention_status;
+             ALTER TABLE runtime_generation DROP COLUMN retention_eligible_at;
+             ALTER TABLE runtime_generation DROP COLUMN updated_at;
+             DROP TABLE sidecar_timestamp_repairs;",
+            )
+            .unwrap();
+    }
     fn remove_continuation_schema_for_legacy_fixture(connection: &rusqlite::Connection) {
+        remove_record_timestamp_contract_for_legacy_fixture(connection);
         connection
             .execute_batch(
                 "DROP TRIGGER completion_owner_supervisor_authority_insert;
@@ -1770,6 +1822,7 @@ mod tests {
         DROP TABLE mailbox_completed_turn_tails;
         DROP TRIGGER completion_continuation_notification_ack;
         DROP TABLE completion_continuation_notification;
+        DROP TABLE completion_continuation_attempt_source;
         DROP TABLE completion_continuation_attempt;
         DROP TABLE completion_continuation_source;
         DROP TABLE completion_continuation_context;
@@ -2261,6 +2314,9 @@ mod tests {
         connection
             .execute_batch("DROP INDEX idx_mailbox_receipt_scan_candidates;")
             .unwrap();
+        // Restore the actual v4 shape before removing columns: v23 timestamp
+        // triggers still name those columns on a current-schema fixture.
+        remove_continuation_schema_for_legacy_fixture(&connection);
         for column in [
             "headless_submission_state",
             "observation_progress",
@@ -2278,7 +2334,6 @@ mod tests {
         }
         // Existing v4 fixture: remove later continuation/notification objects before lowering version.
         // This is synthetic fixture construction, not a production downgrade.
-        remove_continuation_schema_for_legacy_fixture(&connection);
         connection.pragma_update(None, "user_version", 4).unwrap();
         drop(connection);
 
@@ -2422,6 +2477,7 @@ mod tests {
         connection
             .execute_batch("DROP INDEX idx_mailbox_receipt_scan_candidates;")
             .unwrap();
+        remove_continuation_schema_for_legacy_fixture(&connection);
         for column in [
             "headless_submission_state",
             "observation_progress",
@@ -2439,7 +2495,6 @@ mod tests {
         }
         // Existing v4 fixture: remove later continuation/notification objects before lowering version.
         // This is synthetic fixture construction, not a production downgrade.
-        remove_continuation_schema_for_legacy_fixture(&connection);
         connection.pragma_update(None, "user_version", 4).unwrap();
         drop(connection);
 
