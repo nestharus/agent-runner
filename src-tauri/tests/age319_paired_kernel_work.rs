@@ -227,7 +227,24 @@ fn inner() {
         || fs::read_to_string(&err).unwrap_or_default(),
     );
     let work_record = json(one_file(&broker_state.join("works")));
-    let grant = json(one_file(&broker_state.join("grants")));
+    // The shared registry may also contain a separate v4 native prepare for
+    // this Runner invocation. Only the v3 original-work grant can authorize
+    // Bash's consumed K work or its sealed helper at V.
+    let grant_records: Vec<_> = fs::read_dir(broker_state.join("grants"))
+        .unwrap()
+        .map(|entry| json(entry.unwrap().path()))
+        .collect();
+    let (original_grants, native_grants): (Vec<_>, Vec<_>) = grant_records
+        .into_iter()
+        .partition(|record| record["version"] == 3);
+    assert_eq!(original_grants.len(), 1, "expected one Bash v3 grant");
+    assert!(native_grants.iter().all(|record| {
+        record["version"] == 4
+            && record["kind"] == "native-continuation-v1"
+            && record["state"] == "prepared"
+            && record.get("sealed_helper").is_none()
+    }));
+    let grant = &original_grants[0];
     assert_eq!(grant["consumed"], true, "K must consume exactly one grant");
     assert_eq!(work_record["accepted_grant_id"], grant["grant_id"]);
     assert_eq!(work_record["work_id"], grant["work_id"]);
