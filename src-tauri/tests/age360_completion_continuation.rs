@@ -484,8 +484,13 @@ fn native_unmarked_nested_entry_cannot_elect_descendant_owner() {
 
 fn paired_case(mode: &'static str) {
     let f = Fixture::new(mode);
-    if mode == "ack_before_drain" {
+    if matches!(mode, "ack_before_drain" | "manual_overlap") {
         f.gate("test-descendant-enabled");
+    }
+    #[cfg(feature = "age360-fault-fixtures")]
+    if mode == "manual_overlap" {
+        f.gate("wake-child-before-claim-admission.hold");
+        f.gate("manual-after-claim-coordination-NativeBusy.hold");
     }
     #[cfg(feature = "age360-fault-fixtures")]
     paired_faults::prepare(&f);
@@ -551,6 +556,141 @@ fn paired_case(mode: &'static str) {
     println!("acceptance={acceptance}");
     #[cfg(feature = "age360-fault-fixtures")]
     paired_faults::after_acceptance(&f);
+    let mut manual_child = None;
+    if mode == "manual_overlap" {
+        let child_pid: i64 = wait(|| {
+            fs::read_to_string(
+                f.root
+                    .path()
+                    .join("wake-child-before-claim-admission.reached"),
+            )
+            .ok()?
+            .parse()
+            .ok()
+        });
+        let child_identity = read_live_process_identity(child_pid).unwrap().unwrap();
+        let (claim, attempt) = wait(|| {
+            let mailbox = f.mailbox_for_poll()?;
+            let claim = mailbox.wake_session_reader().wake_claim(SESSION).ok()??;
+            let attempt = mailbox
+                .continuation_activation(SESSION, &claim.claim_token)
+                .ok()??;
+            Some((claim, attempt))
+        });
+        let (source_id, phase): (Option<String>, String) = f.sidecar_connection()
+            .query_row(
+                "SELECT source_registration_id,phase FROM completion_continuation_attempt WHERE attempt_id=?1 AND claim_token=?2",
+                rusqlite::params![attempt.attempt_id, claim.claim_token],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+        assert_eq!(source_id.as_deref(), Some(source.registration_id.as_str()));
+        assert!(matches!(phase.as_str(), "starting" | "running"));
+        assert!(
+            f.mailbox()
+                .completion_event_listeners(&source.handle)
+                .unwrap()
+                .iter()
+                .all(|listener| listener.acknowledged_at.is_none())
+        );
+        assert!(!f.root.path().join("resume-prompts.jsonl").exists());
+        // The original native turn can leave a committed tail for explicit
+        // recovery. Settle it through the real CLI before testing manual
+        // coordination; otherwise State refuses the resume before the sidecar
+        // claim boundary and this case would only exercise that refusal.
+        let duties = oulipoly_state::StateDb::open_historical_read_only(&f.data.join("state.db"))
+            .unwrap()
+            .completed_turn_identities()
+            .unwrap();
+        for duty in &duties {
+            let settled = f
+                .command()
+                .args([
+                    "completed-turn",
+                    "--invocation",
+                    &duty.invocation_uuid,
+                    "--settle",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                settled.status.success(),
+                "completed turn settlement failed: {}",
+                String::from_utf8_lossy(&settled.stderr)
+            );
+        }
+        assert!(
+            oulipoly_state::StateDb::open_historical_read_only(&f.data.join("state.db"))
+                .unwrap()
+                .completed_turn_identities()
+                .unwrap()
+                .is_empty()
+        );
+        let manual = f
+            .command()
+            .args([
+                "resume",
+                "-m",
+                MODEL,
+                "--session-id",
+                SESSION,
+                "--models-dir",
+            ])
+            .arg(&f.models)
+            .stdout(fs::File::create(f.root.path().join("manual.stdout")).unwrap())
+            .stderr(fs::File::create(f.root.path().join("manual.stderr")).unwrap())
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        manual_child = Some(manual);
+        wait(|| {
+            f.root
+                .path()
+                .join("manual-after-claim-coordination-NativeBusy.reached")
+                .exists()
+                .then_some(())
+        });
+        assert_eq!(
+            read_live_process_identity(child_pid).unwrap(),
+            Some(child_identity)
+        );
+        let retained = f
+            .mailbox()
+            .wake_session_reader()
+            .wake_claim(SESSION)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.claim_token, claim.claim_token);
+        let retained_attempt = f
+            .mailbox()
+            .continuation_activation(SESSION, &claim.claim_token)
+            .unwrap();
+        assert_eq!(retained_attempt.unwrap().attempt_id, attempt.attempt_id);
+        let retained_source: Option<String> = f.sidecar_connection()
+            .query_row("SELECT source_registration_id FROM completion_continuation_attempt WHERE attempt_id=?1", [&attempt.attempt_id], |row| row.get(0)).unwrap();
+        assert_eq!(
+            retained_source.as_deref(),
+            Some(source.registration_id.as_str())
+        );
+        assert!(
+            f.mailbox()
+                .completion_event_listeners(&source.handle)
+                .unwrap()
+                .iter()
+                .all(|listener| listener.acknowledged_at.is_none())
+        );
+        assert!(!f.root.path().join("resume-prompts.jsonl").exists());
+        println!(
+            "manual coordination overlapped unadmitted child={child_pid} exact claim={} attempt={} source={}",
+            claim.claim_token, attempt.attempt_id, source.registration_id
+        );
+        fs::remove_file(f.root.path().join("wake-child-before-claim-admission.hold")).unwrap();
+        fs::remove_file(
+            f.root
+                .path()
+                .join("manual-after-claim-coordination-NativeBusy.hold"),
+        )
+        .unwrap();
+    }
     if mode == "acceptance_reply_loss" {
         f.wait_initial(&mut initial);
     }
@@ -841,7 +981,7 @@ fn paired_case(mode: &'static str) {
         assert_eq!(byte_receipt["artifact"], true);
     }
     println!("actual native adapter byte receipt={byte_receipt}");
-    if mode == "ack_before_drain" {
+    if matches!(mode, "ack_before_drain" | "manual_overlap") {
         let descendant: i64 = wait(|| {
             fs::read_to_string(f.root.path().join("descendant.pid"))
                 .ok()?
@@ -912,10 +1052,22 @@ fn paired_case(mode: &'static str) {
         "actual workload launches={launch_count} native recipient invocations={}",
         prompt.lines().count()
     );
+    if mode == "manual_overlap" {
+        assert_eq!(
+            prompt.lines().count(),
+            1,
+            "the overlapping manual and automatic entries must deliver to one recipient"
+        );
+    }
     let listeners = f
         .mailbox()
         .completion_event_listeners(&source.handle)
         .unwrap();
+    if mode == "manual_overlap" {
+        assert_eq!(listeners.len(), 1);
+        assert_eq!(listeners[0].mailbox_seq, byte_receipt["seq"].as_i64());
+        assert!(listeners[0].acknowledged_at.is_some());
+    }
     assert!(
         listeners
             .iter()
@@ -935,9 +1087,40 @@ fn paired_case(mode: &'static str) {
             .is_empty()
             .then_some(())
     });
+    if let Some(mut manual) = manual_child {
+        let status = wait(|| manual.try_wait().unwrap());
+        println!(
+            "overlapping manual resume status={status} stderr={}",
+            fs::read_to_string(f.root.path().join("manual.stderr")).unwrap()
+        );
+        assert_eq!(
+            fs::read_to_string(f.root.path().join("resume-prompts.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "manual completion must not create a second recipient"
+        );
+        wait(|| {
+            f.mailbox_for_poll()?
+                .wake_session_reader()
+                .wake_claim(SESSION)
+                .ok()?
+                .is_none()
+                .then_some(())
+        });
+        assert!(f.mailbox().list_pending(SESSION).unwrap().is_empty());
+    }
     let (attempts, integrated): (i64, i64) = f.sidecar_connection().query_row(
         "SELECT COUNT(*),COALESCE(SUM(integrated),0) FROM completion_continuation_attempt WHERE source_registration_id=?1",
         [&source.registration_id], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+    if mode == "manual_overlap" {
+        assert_eq!(
+            (attempts, integrated),
+            (2, 2),
+            "source and exact activation both owe integrated physical outcomes"
+        );
+    }
     let census = live_census::observe(f.root.path()).expect("live resource traversal");
     println!(
         "paired live resource observations source_recovery_attempts={attempts} integrated={integrated} observed_files={} observed_bytes={} disappeared_entries={:?}; non-atomic traversal, unknown sizes for disappeared entries, not a complete snapshot; fixture teardown is not product release authority",
@@ -957,6 +1140,14 @@ fn paired_v2_ack_precedes_physical_activation_drain() {
         return;
     }
     paired_case("ack_before_drain");
+}
+#[cfg(feature = "age360-fault-fixtures")]
+#[test]
+fn paired_manual_resume_overlaps_unadmitted_v2_receiver() {
+    if private_case(true) {
+        return;
+    }
+    paired_case("manual_overlap");
 }
 #[test]
 fn sync_response_without_notification_or_ack() {

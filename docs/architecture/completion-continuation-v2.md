@@ -143,14 +143,25 @@ Boundaries:
 | `attempt-before-attachment` | CD received AC PID, before State custodian/adopter attachment |
 | `adopter-before-ac-release` | Original CD grant received after attachment, before forwarding grant to AC |
 | `driver-reaped-echild` | Actual original CD reap loop observed ECHILD; fixture observation only, never attempt discharge |
+| `wake-child-before-claim-admission` | Automatic receiver has the inherited claim token but has not opened the sidecar to validate/admit it |
+| `manual-after-claim-coordination-NativeBusy` | Real manual resume completed State-first sidecar coordination and observed native custody while that receiver is held |
 
 `src-tauri/tests/age360_completion_continuation.rs` uses private user/network/PID/
 mount namespaces and an external-process local provider. `native_` cases do not
-claim Bash/source pairing. Four paired cases require explicit
+claim Bash/source pairing. Paired cases require explicit
 `AGE360_AGENT_BASH_BIN`, reject a missing executable, and never select an installed
-or simulated fallback. The two added paired cases discriminate early exit and
+or simulated fallback. The early-exit and artifact cases discriminate early exit and
 complete artifact output. The full root-owned paired fault matrix remains larger
-than these four cases; no fixture or feature flag proves that matrix ran.
+than these cases; no fixture or feature flag proves that matrix ran.
+
+The feature-gated paired manual-overlap case holds the automatic receiver before
+claim admission, settles an unrelated completed-turn tail through the real CLI,
+then holds a real manual resume after its State-first sidecar coordination returns
+`NativeBusy`. It checks the accepted source and exact activation claim before
+either hold is released, then checks one recipient, its byte receipt and ACK,
+retained claim during live descendant custody, and both source and activation
+physical integration. A manual retry may later refuse a newly pending completed
+turn; the test does not treat that refusal as its overlap witness.
 
 `fixtures/age360/custody_faults.rs` discriminates those native pre-attachment and
 combined attempt-owner loss orders. Tests named `observes_unresolved_*` are
