@@ -142,6 +142,12 @@ fn recv_request(stream: &mut UnixStream) -> io::Result<(u8, libc::ucred, PinnedP
     }
     let credentials =
         credentials.ok_or_else(|| io::Error::other("missing per-request credentials"))?;
+    // The kernel resolves an explicitly supplied SCM_CREDENTIALS PID in the
+    // sender's PID namespace before translating it to this host broker. A
+    // privileged child namespace sender cannot name an ancestor-namespace
+    // connector, even if that connector transferred this socket. Keep this
+    // equality check and the pinned connector verification together; neither
+    // SO_PEERCRED nor SCM_CREDENTIALS alone proves the current sender.
     if (credentials.pid, credentials.uid, credentials.gid)
         != (original.pid, original.uid, original.gid)
     {
@@ -397,6 +403,12 @@ fn launch(peer: &PeerIdentity, registry: &mut RootRegistry) -> io::Result<String
     result
 }
 
+fn root_launch_admitted(peer: &PeerIdentity, scope: &Scope, host_namespace: &File) -> bool {
+    matches!(scope, Scope::Outside)
+        && peer.uid >= 1000
+        && matches!(peer.process.in_namespace(host_namespace), Ok(true))
+}
+
 fn serve() -> io::Result<()> {
     if unsafe { libc::geteuid() } != 0 {
         return Err(io::Error::other("host root required"));
@@ -437,10 +449,9 @@ fn serve() -> io::Result<()> {
         stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
         let result = (|| {
             let (operation, peer) = peer_from_request(&mut stream)?;
-            match (
-                operation,
-                classify_scope(&peer, &host_namespace, &registry, &works),
-            ) {
+            let scope = classify_scope(&peer, &host_namespace, &registry, &works);
+            let launch_admitted = root_launch_admitted(&peer, &scope, &host_namespace);
+            match (operation, scope) {
                 (b'C', Scope::Root(root)) => Ok(format!("inside {root}\n")),
                 (
                     b'C',
@@ -452,7 +463,7 @@ fn serve() -> io::Result<()> {
                 ) => Ok(format!("inside-work {root_id} {work_incarnation}\n")),
                 (b'C', Scope::Outside) => Ok("outside\n".to_owned()),
                 (b'C', Scope::Uncertain) => Ok("uncertain\n".to_owned()),
-                (b'L', Scope::Outside) if peer.uid >= 1000 => {
+                (b'L', Scope::Outside) if launch_admitted => {
                     launch(&peer, &mut registry).map(|id| format!("released {id}\n"))
                 }
                 (b'L', _) => Err(io::Error::other("root launch denied")),
@@ -481,6 +492,38 @@ mod tests {
     use super::*;
     use std::process::Command;
     use std::thread;
+
+    #[test]
+    fn root_launch_requires_host_namespace_outside_scope_and_user_uid() {
+        let host_namespace = File::open("/proc/self/ns/pid").unwrap();
+        let process = PinnedProcess::open(std::process::id() as i32).unwrap();
+        let mut peer = PeerIdentity {
+            uid: 1000,
+            gid: 1000,
+            process,
+        };
+        assert!(root_launch_admitted(
+            &peer,
+            &Scope::Outside,
+            &host_namespace
+        ));
+        assert!(!root_launch_admitted(
+            &peer,
+            &Scope::Root(uuid::Uuid::new_v4().to_string()),
+            &host_namespace
+        ));
+        assert!(!root_launch_admitted(
+            &peer,
+            &Scope::Uncertain,
+            &host_namespace
+        ));
+        peer.uid = 0;
+        assert!(!root_launch_admitted(
+            &peer,
+            &Scope::Outside,
+            &host_namespace
+        ));
+    }
 
     #[test]
     fn challenged_per_request_credentials_accept_exact_sender() {
@@ -543,6 +586,77 @@ mod tests {
             .args(["-c", script, socket.to_str().unwrap()])
             .output()
             .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn privileged_child_pid_namespace_cannot_claim_outside_connector() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("socket");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let outside = UnixStream::connect(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let error = peer_from_request(&mut stream).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("transferred/inherited socket sender"),
+                "unexpected denial: {error}"
+            );
+        });
+        let child_script = r#"
+import errno, os, socket, struct, sys
+assert os.getpid() == 1
+caps = next(line.split()[1] for line in open('/proc/self/status') if line.startswith('CapEff:'))
+assert int(caps, 16) & (1 << 21), caps  # CAP_SYS_ADMIN in the child user namespace
+s = socket.socket(fileno=3)
+challenge = s.recv(16)
+assert len(challenge) == 16
+message = b'L' + challenge
+claimed = struct.pack('3i', int(sys.argv[1]), 0, 0)
+try:
+    s.sendmsg([message], [(socket.SOL_SOCKET, socket.SCM_CREDENTIALS, claimed)])
+except OSError as error:
+    assert error.errno == errno.ESRCH, error
+else:
+    sys.exit(42)
+# A real send from this PID namespace is translated to its host PID and must
+# still differ from the outside connector's pinned SO_PEERCRED identity.
+assert s.send(message) == len(message)
+"#;
+        let source_fd = outside.as_raw_fd();
+        let mut child = Command::new("unshare");
+        child.args([
+            "--user",
+            "--map-root-user",
+            "--pid",
+            "--fork",
+            "--mount",
+            "--mount-proc",
+            "python3",
+            "-c",
+            child_script,
+            &std::process::id().to_string(),
+        ]);
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            child.pre_exec(move || {
+                if libc::dup2(source_fd, 3) < 0 || libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let output = child.output().unwrap();
         assert!(
             output.status.success(),
             "{}",

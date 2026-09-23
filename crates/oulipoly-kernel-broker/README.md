@@ -35,13 +35,30 @@ The Unix stream socket accepts one request per connection:
 The request has no executable, UID, mount, namespace, root ID, or PID fields.
 For `L`, the broker takes the UID/GID from kernel credentials, refuses system
 UIDs, checks the fixed root-owned image path, and admits only a peer classified
-outside all managed roots. It creates a new mount and PID namespace without a
+outside all managed roots **whose pinned connector is in the broker's exact
+host PID namespace**. An unrelated child PID namespace can classify `outside`
+but cannot launch. It creates a new mount and PID namespace without a
 user namespace, mounts private procfs, durably records a new root UUID and
 host PID1 incarnation before releasing the fixed Runner child. The protected
 root PID1 reaps adopted children and has no idle exit timer. The Runner child
 drops to the authenticated UID/GID and kernel-reported supplementary groups; it receives a
 small fixed environment and no caller-supplied arguments or file descriptors.
 The broker does not set `no_new_privs` or install seccomp.
+
+The challenged request still relies on equality of connect-time
+`SO_PEERCRED` and per-message `SCM_CREDENTIALS`, with the connector pinned by
+pidfd/starttime/namespace. `SCM_CREDENTIALS` is configurable by a sender with
+`CAP_SYS_ADMIN`; equality alone is not a general sender proof. For a socket
+transferred from a host connector into a child PID namespace, Linux resolves an
+explicitly claimed PID in the sender's own PID namespace before reporting it to
+the host receiver. The child cannot name an ancestor-only connector. The
+private adversarial test supplies `CAP_SYS_ADMIN` in a child user namespace,
+tries the outside PID, observes `ESRCH`, and then verifies that a real send is
+rejected by the broker's production request reader. This is a checked exclusion
+for that specific transfer path, not a host-root sudo test or a general proof
+for arbitrary IPC provenance. A host namespace process with host-root authority
+remains outside this trust boundary and must be addressed by installation
+policy and an authenticated host guardian.
 
 The root registry uses one fsynced file per root and reattaches only to the
 same boot, PID starttime, namespace inode, and live namespace PID1. A missing

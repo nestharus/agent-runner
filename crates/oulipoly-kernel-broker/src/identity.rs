@@ -110,6 +110,17 @@ impl PinnedProcess {
         &self.pidns
     }
 
+    /// A root launch may originate only from the broker's host PID namespace.
+    /// `Outside` also includes unrelated child namespaces, which are not an
+    /// entry authority. Reverify the pinned process on both sides of the
+    /// namespace comparison so a dead/reused connector is never accepted.
+    pub fn in_namespace(&self, namespace: &File) -> io::Result<bool> {
+        self.verify()?;
+        let matches = namespace_identity(namespace)? == (self.pidns_dev, self.pidns_ino);
+        self.verify()?;
+        Ok(matches)
+    }
+
     pub fn is_namespace_init(&self) -> io::Result<bool> {
         self.verify()?;
         let status = fs::read_to_string(format!("/proc/{}/status", self.host_pid))?;

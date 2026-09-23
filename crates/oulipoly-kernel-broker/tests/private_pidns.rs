@@ -128,6 +128,15 @@ fn sibling_nested_classifier_and_durable_unknown_debt() {
         peers.insert(tag, (socket, process));
     }
     let host_ns = File::open("/proc/self/ns/pid").unwrap();
+    for (_, process) in peers.values() {
+        assert!(!process.in_namespace(&host_ns).unwrap());
+    }
+    assert!(
+        PinnedProcess::open(std::process::id() as i32)
+            .unwrap()
+            .in_namespace(&host_ns)
+            .unwrap()
+    );
     let registry_error = RootRegistry::open(temp.path()).unwrap_err();
     // A socket in the registry directory is intentionally rejected. Separate
     // the durable registry from the fixture transport.

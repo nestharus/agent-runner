@@ -26,6 +26,8 @@
 | Work PID1 with exact live root and direct parent namespace, registered before release. | Fsynced record binding root/work/parent and PID1 incarnation. |
 | Root or work PID1 missing/changed on restart. | Durable unknown debt, never a drain receipt. |
 | Unsolicited descriptor in a challenged socket request. | Descriptor closed and request refused. |
+| Root launch from an unrelated child PID namespace classified `outside`. | Denied because the connector is not in the broker's host PID namespace. |
+| Host-connected socket inherited by a privileged child PID namespace process. | Ancestor PID claim fails in the kernel; a real child send fails the broker's per-request credential equality check. |
 
 ## Edge cases
 
@@ -51,7 +53,7 @@
 
 - `crates/oulipoly-kernel-broker/tests/private_pidns.rs` exercises root sibling/nested classification and root debt.
 - `crates/oulipoly-kernel-broker/tests/private_work_pidns.rs` exercises root/work binding, sibling separation, adopted peer classification, persistence poisoning, and restart uncertainty.
-- `crates/oulipoly-kernel-broker/src/linux_main.rs` unit tests exercise challenged credentials and descriptor rejection.
+- `crates/oulipoly-kernel-broker/src/linux_main.rs` unit tests exercise challenged credentials, a `CAP_SYS_ADMIN` child namespace socket handoff, exact host namespace launch policy, and descriptor rejection.
 
 ## Cross-references
 
