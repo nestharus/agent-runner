@@ -1004,12 +1004,14 @@ impl StateDb {
         self.apply_completed_turn_effects(authority, record.effects.input(), &record.settlement_id)
     }
 
+    /// Returns false when this exact committed turn is already terminal. A
+    /// replay must not replace its final tails with a new pending marker.
     pub fn record_completed_turn_tails(
         &self,
         uuid: &str,
         settlement: &str,
         tails: &serde_json::Value,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let recovery_pending = i64::from(!completed_turn_tails_finished(tails));
         let transition_at = Self::current_rfc3339_timestamp();
         let changed = self
@@ -1029,7 +1031,8 @@ impl StateDb {
                    WHEN created_at IS NULL THEN 'legacy_unknown'
                    WHEN julianday(COALESCE(closed_at,?5))<julianday(created_at)
                    THEN 'clock_anomaly' ELSE 'eligible' END
-             WHERE invocation_uuid=?1 AND settlement_id=?2 AND committed_at IS NOT NULL",
+             WHERE invocation_uuid=?1 AND settlement_id=?2
+               AND committed_at IS NOT NULL AND recovery_pending=1",
                 params![
                     uuid,
                     settlement,
@@ -1040,9 +1043,29 @@ impl StateDb {
             )
             .map_err(custody_error)?;
         if changed == 1 {
-            Ok(())
-        } else {
-            Err("completed_turn_not_committed".into())
+            return Ok(true);
+        }
+        let current: Option<(i64, String)> = self
+            .conn
+            .query_row(
+                "SELECT recovery_pending,tails_json FROM completed_turns
+                 WHERE invocation_uuid=?1 AND settlement_id=?2 AND committed_at IS NOT NULL",
+                params![uuid, settlement],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(custody_error)?;
+        match current {
+            Some((0, stored))
+                if completed_turn_tails_finished(
+                    &serde_json::from_str::<serde_json::Value>(&stored)
+                        .map_err(|error| error.to_string())?,
+                ) =>
+            {
+                Ok(false)
+            }
+            Some((0, _)) => Err("completed_turn_terminal_tails_inconsistent".into()),
+            _ => Err("completed_turn_not_committed".into()),
         }
     }
 }
@@ -2008,6 +2031,89 @@ mod tests {
                 "confirmed-proof".into(),
                 123
             )
+        );
+    }
+    #[test]
+    fn completed_turn_tail_replay_preserves_terminal_state_after_restart() {
+        let (dir, state, uuid, effects) = fixture();
+        let settlement = admit(&state, &effects);
+        let record = state.completed_turn(&uuid).unwrap().unwrap();
+        state.settle_completed_turn(&record).unwrap();
+        let pending = serde_json::json!({"native":"pending","delivery":"pending"});
+        let finished = serde_json::json!({
+            "native":"complete_or_standalone",
+            "delivery":"complete",
+            "idle":"complete",
+            "wake":"no_pending_at_recheck"
+        });
+        assert!(
+            state
+                .record_completed_turn_tails(&uuid, &settlement, &pending)
+                .unwrap()
+        );
+        drop(state);
+
+        // A lost reply after the first tail write leaves a recoverable duty.
+        let state = StateDb::open(&dir.path().join("state.db")).unwrap();
+        assert_eq!(state.completed_turn_identities().unwrap().len(), 1);
+        assert!(
+            state
+                .record_completed_turn_tails(&uuid, &settlement, &pending)
+                .unwrap()
+        );
+        assert!(
+            state
+                .record_completed_turn_tails(&uuid, &settlement, &finished)
+                .unwrap()
+        );
+        let before: (String, String) = state
+            .conn
+            .query_row(
+                "SELECT closed_at,updated_at FROM completed_turns WHERE invocation_uuid=?1",
+                [&uuid],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            !state
+                .record_completed_turn_tails(&uuid, &settlement, &pending)
+                .unwrap()
+        );
+        assert!(
+            !state
+                .record_completed_turn_tails(&uuid, &settlement, &finished)
+                .unwrap()
+        );
+        assert_eq!(
+            state.completed_turn(&uuid).unwrap().unwrap().tails,
+            finished
+        );
+        assert!(state.completed_turn_identities().unwrap().is_empty());
+        let after: (String, String, i64) = state
+            .conn
+            .query_row(
+                "SELECT closed_at,updated_at,recovery_pending FROM completed_turns WHERE invocation_uuid=?1",
+                [&uuid],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(after, (before.0, before.1, 0));
+        assert!(
+            state
+                .conn
+                .execute(
+                    "UPDATE completed_turns SET recovery_pending=1 WHERE invocation_uuid=?1",
+                    [&uuid]
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("terminal state cannot reopen")
+        );
+        assert!(
+            state
+                .record_completed_turn_tails(&uuid, "wrong-settlement", &pending)
+                .unwrap_err()
+                .contains("completed_turn_not_committed")
         );
     }
     #[test]

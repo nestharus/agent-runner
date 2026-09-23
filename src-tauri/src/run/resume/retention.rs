@@ -373,7 +373,9 @@ fn recovery_tails(
 ) -> Result<(), String> {
     let path = MailboxDb::path_for_state_db(state.path());
     let mut tails = serde_json::json!({"native":"pending","delivery":"pending","idle":"pending","wake":"pending_recheck","wake_owner":"root/operator","wake_action":"separate authorized session advance; recovery never launches"});
-    state.record_completed_turn_tails(&record.invocation_uuid, &record.settlement_id, &tails)?;
+    if !state.record_completed_turn_tails(&record.invocation_uuid, &record.settlement_id, &tails)? {
+        return Ok(());
+    }
     state.complete_completed_turn_native(&record.invocation_uuid, &record.settlement_id)?;
     tails["native"] = serde_json::json!("complete_or_standalone");
     if path.exists() {
@@ -413,7 +415,9 @@ fn recovery_tails(
     } else {
         return Err("completed_turn_history_missing".into());
     }
-    state.record_completed_turn_tails(&record.invocation_uuid, &record.settlement_id, &tails)
+    state
+        .record_completed_turn_tails(&record.invocation_uuid, &record.settlement_id, &tails)
+        .map(|_| ())
 }
 
 #[cfg(test)]
