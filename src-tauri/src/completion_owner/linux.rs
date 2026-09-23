@@ -140,8 +140,9 @@ pub(super) fn verify_kernel_owner_socket(
 pub(super) fn owner_broker_socket() -> PathBuf {
     #[cfg(feature = "age319-private-broker-fixture")]
     if unsafe { libc::geteuid() } == 0
-        && std::fs::read_link("/proc/self/ns/user").ok()
-            != std::fs::read_link("/proc/1/ns/user").ok()
+        && std::fs::read_to_string("/proc/self/uid_map")
+            .ok()
+            .is_some_and(|map| map.split_ascii_whitespace().nth(2) == Some("1"))
         && let Some(path) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1")
     {
         return PathBuf::from(path);

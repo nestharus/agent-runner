@@ -1,8 +1,93 @@
 use crate::registry::RootRegistry;
+use std::ffi::CString;
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::MetadataExt;
+use std::sync::OnceLock;
+
+// The serving broker installs a fresh detached procfs before reading any
+// durable identity. Replacing the pathname /proc in a shared mount namespace
+// cannot redirect reads through this CLOEXEC fd. This does not protect the fd
+// from a host-root workload with access to broker memory or /proc/<broker>/fd.
+// Non-serving library tests retain a plain /proc view.
+static HOST_PROC: OnceLock<File> = OnceLock::new();
+
+pub fn install_detached_host_proc() -> io::Result<()> {
+    if HOST_PROC.get().is_some() {
+        return Err(io::Error::other("host proc observer already installed"));
+    }
+    let name = CString::new("proc").unwrap();
+    let context = unsafe { libc::syscall(libc::SYS_fsopen, name.as_ptr(), 1u32) as i32 };
+    if context < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let context = unsafe { File::from_raw_fd(context) };
+    // FSCONFIG_CMD_CREATE. A new procfs superblock is bound to this broker's
+    // current PID namespace; no mountpoint in the workload is consulted.
+    if unsafe { libc::syscall(libc::SYS_fsconfig, context.as_raw_fd(), 6u32, 0, 0, 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mount = unsafe { libc::syscall(libc::SYS_fsmount, context.as_raw_fd(), 1u32, 0u32) as i32 };
+    if mount < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mount = unsafe { File::from_raw_fd(mount) };
+    let stat = proc_read_from(&mount, "self/stat")?;
+    let pid = stat
+        .split_ascii_whitespace()
+        .next()
+        .and_then(|field| field.parse::<i32>().ok());
+    if pid != Some(unsafe { libc::getpid() }) {
+        return Err(io::Error::other(
+            "detached procfs is not the broker PID observer",
+        ));
+    }
+    HOST_PROC
+        .set(mount)
+        .map_err(|_| io::Error::other("host proc observer changed"))
+}
+
+fn proc_file_from(root: &File, relative: &str) -> io::Result<File> {
+    let name = CString::new(relative).map_err(|_| io::Error::other("invalid proc path"))?;
+    let fd = unsafe {
+        libc::openat(
+            root.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn proc_read_from(root: &File, relative: &str) -> io::Result<String> {
+    let mut content = String::new();
+    proc_file_from(root, relative)?.read_to_string(&mut content)?;
+    Ok(content)
+}
+
+pub fn host_proc_file(relative: &str) -> io::Result<File> {
+    if let Some(root) = HOST_PROC.get() {
+        proc_file_from(root, relative)
+    } else {
+        File::open(format!("/proc/{relative}"))
+    }
+}
+
+fn host_proc_read(relative: &str) -> io::Result<String> {
+    if let Some(root) = HOST_PROC.get() {
+        proc_read_from(root, relative)
+    } else {
+        fs::read_to_string(format!("/proc/{relative}"))
+    }
+}
+
+pub fn host_proc_uid(pid: i32) -> io::Result<u32> {
+    Ok(host_proc_file(&format!("{pid}"))?.metadata()?.uid())
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Classification {
@@ -23,7 +108,7 @@ pub struct PinnedProcess {
 }
 
 fn proc_starttime(pid: i32) -> io::Result<(u64, u8)> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let stat = host_proc_read(&format!("{pid}/stat"))?;
     // comm is parenthesized and may itself contain spaces and parentheses.
     let tail = stat
         .rsplit_once(") ")
@@ -42,7 +127,7 @@ fn proc_starttime(pid: i32) -> io::Result<(u64, u8)> {
 }
 
 pub fn boot_id() -> io::Result<String> {
-    Ok(fs::read_to_string("/proc/sys/kernel/random/boot_id")?
+    Ok(host_proc_read("sys/kernel/random/boot_id")?
         .trim()
         .to_owned())
 }
@@ -59,7 +144,7 @@ impl PinnedProcess {
     pub fn direct_child_of(&self, parent: &PinnedProcess) -> io::Result<bool> {
         self.verify()?;
         parent.verify()?;
-        let stat = fs::read_to_string(format!("/proc/{}/stat", self.host_pid))?;
+        let stat = host_proc_read(&format!("{}/stat", self.host_pid))?;
         let tail = stat
             .rsplit_once(") ")
             .ok_or_else(|| io::Error::other("malformed proc stat"))?
@@ -77,7 +162,7 @@ impl PinnedProcess {
 
     pub fn same_executable_as(&self, installed: &File) -> io::Result<bool> {
         self.verify()?;
-        let image = File::open(format!("/proc/{}/exe", self.host_pid))?;
+        let image = host_proc_file(&format!("{}/exe", self.host_pid))?;
         let actual = image.metadata()?;
         let expected = installed.metadata()?;
         self.verify()?;
@@ -98,7 +183,7 @@ impl PinnedProcess {
         if state == b'Z' || state == b'X' {
             return Err(io::Error::other("dead peer"));
         }
-        let pidns = File::open(format!("/proc/{host_pid}/ns/pid"))?;
+        let pidns = host_proc_file(&format!("{host_pid}/ns/pid"))?;
         let (pidns_dev, pidns_ino) = namespace_identity(&pidns)?;
         let process = Self {
             host_pid,
@@ -121,7 +206,7 @@ impl PinnedProcess {
         if starttime != self.starttime_ticks || state == b'Z' || state == b'X' {
             return Err(io::Error::other("process incarnation changed"));
         }
-        let current = File::open(format!("/proc/{}/ns/pid", self.host_pid))?;
+        let current = host_proc_file(&format!("{}/ns/pid", self.host_pid))?;
         if namespace_identity(&current)? != (self.pidns_dev, self.pidns_ino) {
             return Err(io::Error::other("PID namespace changed"));
         }
@@ -154,7 +239,7 @@ impl PinnedProcess {
 
     pub fn is_namespace_init(&self) -> io::Result<bool> {
         self.verify()?;
-        let status = fs::read_to_string(format!("/proc/{}/status", self.host_pid))?;
+        let status = host_proc_read(&format!("{}/status", self.host_pid))?;
         let line = status
             .lines()
             .find(|line| line.starts_with("NSpid:"))
@@ -169,7 +254,7 @@ impl PinnedProcess {
 
     pub fn supplementary_groups(&self) -> io::Result<Vec<libc::gid_t>> {
         self.verify()?;
-        let status = fs::read_to_string(format!("/proc/{}/status", self.host_pid))?;
+        let status = host_proc_read(&format!("{}/status", self.host_pid))?;
         let line = status
             .lines()
             .find(|line| line.starts_with("Groups:"))

@@ -290,7 +290,7 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
     }
     for mode in ["help", "diagnostics"] {
         let output = Command::new("unshare")
-            .arg("-Ur")
+            .args(["-Urpfm", "--mount-proc"])
             .arg(std::env::current_exe().unwrap())
             .args([
                 "--exact",

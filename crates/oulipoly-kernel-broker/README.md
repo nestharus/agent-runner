@@ -6,8 +6,8 @@ domain without mutation, reserves a broker root, pins its exact direct-child
 host guardian, and waits for native owner publication and broker readback before
 releasing the recovery driver. It then requests a single-use root child join
 only for CLI help or offline diagnostics. Provider/recovery CLI, GUI and TTY
-entry refuse before broker reservation because native service identity still
-uses host and namespace-local PIDs interchangeably beyond the owner handshake.
+entry refuse before broker reservation because the accepted-work execution and
+physical-drain boundary is incomplete.
 Ordinary Runner and Bash admission and allocated-attempt custody remain active.
 This source is not a deployable AGE-319 restoration.
 
@@ -20,6 +20,12 @@ a root-owned fixed Runner image at
 `/usr/local/libexec/oulipoly/oulipoly-agent-runner`, and root-owned state and
 runtime directories. It has no installer. `age319-private-broker-fixture`
 permits path overrides only for UID 0 inside a noninitial user namespace.
+Serving startup must create a fresh detached procfs mount tied to the broker's
+PID namespace. Failure stops the broker. Process identity reads use that
+descriptor, so replacing the visible `/proc` pathname does not redirect them.
+The descriptor is not independently protected from an unrestricted host-root
+workload that can inspect broker FDs or memory; this is a verified partial
+observer improvement, not service admission authority.
 
 Each Unix stream request carries a broker challenge and credentials checked
 against the pinned connector's pidfd, boot ID, starttime and PID namespace.
@@ -94,14 +100,13 @@ test, not a host-root sudo or deployed continuity proof.
 - The merged State/runtime/Runner PID readers translate namespace-local PIDs
   into the caller's procfs observer and fail closed on changed or ambiguous
   identity. The observer tag in the child environment is a drift check, not
-  broker authority. This root join creates a PID namespace without a separate
-  mount namespace, and broker and guardian identity reads still use `/proc`
-  paths. A workload with host-root `sudo` could replace that mount; the current
-  source does not authenticate the host-procfs invariant against that case.
-  Before service admission, bind broker identity reads to a pinned host procfs
-  observer that the workload cannot replace, and bind the guardian and nested
-  worker's host PID identities to broker-attested incarnations. A private
-  procfs fixture proves translation mechanics only. Keep service-requiring
+  broker authority. The broker now reads identity through a detached procfs
+  descriptor and a private fixture verifies that visible `/proc` replacement
+  does not change those reads. A private adversarial probe also showed that
+  root with `CAP_SYS_PTRACE` can reopen that descriptor through
+  `/proc/<broker>/fd` even after the broker sets nondumpable. Workload access
+  to broker FDs/memory and the host guardian/nested worker's independent host
+  identity bindings remain unresolved. Keep service-requiring
   CLI, TTY, and GUI refusing until their remaining bindings exist. Current
   supported entry is help/offline diagnostics.
 - Extend the positive `H` preparation into a one-use consumed grant and

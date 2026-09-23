@@ -3,7 +3,9 @@
 mod root_join;
 use oulipoly_kernel_broker::accepted_grant::GrantRegistry;
 use oulipoly_kernel_broker::entry_registry::{EntryRegistry, ProcessStamp};
-use oulipoly_kernel_broker::identity::{PeerIdentity, PinnedProcess};
+use oulipoly_kernel_broker::identity::{
+    PeerIdentity, PinnedProcess, host_proc_file, host_proc_uid, install_detached_host_proc,
+};
 use oulipoly_kernel_broker::protocol::{AcceptedWorkSpec, JoinSpec, OwnerWitness, ProcessWitness};
 use oulipoly_kernel_broker::registry::RootRegistry;
 use oulipoly_kernel_broker::work_registry::{Scope, WorkRegistry, classify_scope};
@@ -21,7 +23,9 @@ const RUNNER: &str = "/usr/local/libexec/oulipoly/oulipoly-agent-runner";
 #[cfg(feature = "age319-private-broker-fixture")]
 fn private_fixture() -> bool {
     (unsafe { libc::geteuid() }) == 0
-        && fs::read_link("/proc/self/ns/user").ok() != fs::read_link("/proc/1/ns/user").ok()
+        && fs::read_to_string("/proc/self/uid_map")
+            .ok()
+            .is_some_and(|map| map.split_ascii_whitespace().nth(2) == Some("1"))
         && std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1").is_some()
 }
 #[cfg(not(feature = "age319-private-broker-fixture"))]
@@ -422,7 +426,7 @@ fn dispatch_authenticated(
                 return Err(io::Error::other("missing guardian prepare"));
             };
             let guardian = PinnedProcess::open(guardian_pid)?;
-            if fs::metadata(format!("/proc/{guardian_pid}"))?.uid() != peer.uid
+            if host_proc_uid(guardian_pid)? != peer.uid
                 || !guardian.same_executable_as(runner_image)?
             {
                 return Err(io::Error::other("guardian UID mismatch"));
@@ -473,10 +477,19 @@ fn serve() -> io::Result<()> {
         return Err(io::Error::other("host root required"));
     }
     let fixture = private_fixture();
-    if !fixture && fs::read_link("/proc/self/ns/user")? != fs::read_link("/proc/1/ns/user")? {
+    // Installation is mandatory for serving, including restart. Failure to
+    // create an independent observer is an admission failure, not a reason to
+    // fall back to the mutable mounted /proc pathname.
+    install_detached_host_proc()?;
+    let same_namespace = |left: &str, right: &str| -> io::Result<bool> {
+        let left = host_proc_file(left)?.metadata()?;
+        let right = host_proc_file(right)?.metadata()?;
+        Ok((left.dev(), left.ino()) == (right.dev(), right.ino()))
+    };
+    if !fixture && !same_namespace("self/ns/user", "1/ns/user")? {
         return Err(io::Error::other("initial user namespace required"));
     }
-    if !fixture && fs::read_link("/proc/self/ns/pid")? != fs::read_link("/proc/1/ns/pid")? {
+    if !fixture && !same_namespace("self/ns/pid", "1/ns/pid")? {
         return Err(io::Error::other("host PID namespace required"));
     }
     if !fixture {
@@ -517,7 +530,7 @@ fn serve() -> io::Result<()> {
     if !fixture {
         checked_root_path(&works_path, true)?;
     }
-    let host_namespace = File::open("/proc/self/ns/pid")?;
+    let host_namespace = host_proc_file("self/ns/pid")?;
     let mut registry = RootRegistry::open(&state)?;
     let works = WorkRegistry::open(&works_path, &registry)?;
     let entries_path = Path::new(&state).join("entries");
