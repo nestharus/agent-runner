@@ -6,6 +6,7 @@
 pub mod accepted_grant;
 pub mod entry_registry;
 pub mod identity;
+pub mod native_receipt;
 pub mod protocol;
 pub mod registry;
 pub mod work_registry;
