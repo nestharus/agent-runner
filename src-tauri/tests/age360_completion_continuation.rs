@@ -942,6 +942,41 @@ fn paired_case(mode: &'static str) {
         );
         let readback: serde_json::Value = serde_json::from_slice(&readback.stdout).unwrap();
         assert_eq!(readback["selected_output"]["kind"], "raw_bytes");
+        assert_eq!(readback["physical_drain"]["attempt_search_complete"], false);
+        let attempt_cursor = readback["physical_drain"]["next_attempt_cursor"]
+            .as_str()
+            .unwrap();
+        let attempt_page = f
+            .command()
+            .args([
+                "notify",
+                "agent-bash-recovery-attempts",
+                "--event-id",
+                &source.handle,
+                "--cursor",
+                attempt_cursor,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            attempt_page.status.success(),
+            "{}",
+            String::from_utf8_lossy(&attempt_page.stderr)
+        );
+        let attempt_page: serde_json::Value = serde_json::from_slice(&attempt_page.stdout).unwrap();
+        assert_eq!(
+            attempt_page["physical_drain"]["attempt_search_complete"],
+            true
+        );
+        assert!(
+            attempt_page["physical_drain"]["attempts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|attempt| attempt["operation"] == "source_recovery"
+                    && attempt["phase"] == "drained"
+                    && attempt["drain_receipt"].is_string())
+        );
         assert_eq!(fs::read(&recovered).unwrap(), b"paired-source-output");
         assert_eq!(
             readback["presentation_and_ack"][0]["policy"],
@@ -1227,8 +1262,9 @@ fn paired_two_native_sources_share_one_activation_and_drain() {
         );
         assert!(
             mailbox
-                .completion_recovery_attempts(&source.registration_id)
+                .completion_recovery_attempts(&source.registration_id, None)
                 .unwrap()
+                .0
                 .iter()
                 .any(|row| row["attempt_id"] == attempt.attempt_id
                     && row["association_completeness"] == "known")
@@ -1294,8 +1330,9 @@ fn paired_two_native_sources_share_one_activation_and_drain() {
     for source in &registrations {
         assert!(
             f.mailbox()
-                .completion_recovery_attempts(&source.registration_id)
+                .completion_recovery_attempts(&source.registration_id, None)
                 .unwrap()
+                .0
                 .iter()
                 .any(|row| row["attempt_id"] == attempt.attempt_id
                     && row["phase"] == "drained"

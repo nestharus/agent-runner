@@ -1171,8 +1171,10 @@ mod contention_tests {
         let conn = db.connection();
         conn.execute(
             "INSERT INTO completion_continuation_source
-             (registration_id,domain_id,source_id,event_id,registration_digest,binding)
-             VALUES('old-source',?1,'old-source','old-source-event','digest',x'00')",
+             (registration_id,domain_id,source_id,event_id,registration_digest,binding,
+              phase,snapshot_sha256,outcome_sha256,payload_sha256,payload_byte_len)
+             VALUES('old-source',?1,'old-source','old-source-event','digest',x'00',
+                    'accepted','snapshot','outcome','payload',1)",
             [&domain],
         )
         .unwrap();
@@ -1262,24 +1264,87 @@ mod contention_tests {
                     '/private/old/result',1,'old-receipt');"
         ))
         .unwrap();
-        let recovery_steps = Arc::new(AtomicUsize::new(0));
-        let observed = Arc::clone(&recovery_steps);
-        conn.progress_handler(
-            1,
-            Some(move || {
-                observed.fetch_add(1, Ordering::Relaxed);
-                false
-            }),
-        )
+        // A late positive with a deleted claim remains discoverable; an empty
+        // bounded page cannot be mistaken for an exhaustive negative answer.
+        let claim_retained: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM session_wake_claim WHERE claim_token='deleted-claim')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!claim_retained);
+        conn.execute_batch(&format!(
+            "INSERT INTO completion_continuation_attempt
+             (attempt_id,domain_id,owner_generation,operation,request_sha256,
+              source_registration_id,session_id,claim_token,phase,result_path,
+              integrated,drain_receipt)
+             VALUES('old-linked','{domain}','old-owner','activation','digest',
+                    'old-source','old-receiver','also-deleted','drained',
+                    '/private/old/result',1,'linked-receipt');
+             INSERT INTO completion_continuation_attempt_source
+             (attempt_id,registration_id,listener_revision)
+             VALUES('old-linked','old-source',1);"
+        ))
         .unwrap();
-        let recovery = db.completion_recovery_attempts("old-source").unwrap();
-        conn.progress_handler(0, None::<fn() -> bool>).unwrap();
-        assert_eq!(recovery.len(), 1);
-        assert_eq!(recovery[0]["attempt_id"], "old-positive");
-        assert_eq!(recovery[0]["association_completeness"], "unknown");
+        let mut next = None;
+        let mut found = Vec::new();
+        let mut pages = 0;
+        let mut max_steps = 0;
+        let mut total_steps = 0;
+        loop {
+            let steps = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&steps);
+            conn.progress_handler(
+                1,
+                Some(move || observed.fetch_add(1, Ordering::Relaxed) >= VM_BUDGET),
+            )
+            .unwrap();
+            let (page, following) = db
+                .completion_recovery_attempts("old-source", next.as_ref())
+                .unwrap();
+            conn.progress_handler(0, None::<fn() -> bool>).unwrap();
+            let used = steps.load(Ordering::Relaxed);
+            max_steps = max_steps.max(used);
+            total_steps += used;
+            assert!(used < VM_BUDGET, "recovery page used {used} VM steps");
+            pages += 1;
+            if pages == 2 {
+                assert!(page.is_empty(), "early history page has no scalar match");
+                assert!(
+                    following.is_some(),
+                    "an empty page must expose incompleteness"
+                );
+            }
+            if pages == 1 {
+                let mut wrong_source_cursor = following.clone().unwrap();
+                wrong_source_cursor["registration_sha256"] = "another-source".into();
+                assert!(
+                    db.completion_recovery_attempts("old-source", Some(&wrong_source_cursor))
+                        .is_err()
+                );
+            }
+            found.extend(page);
+            next = following;
+            if next.is_none() {
+                break;
+            }
+            assert!(pages < 200);
+        }
+        assert!(pages > 100, "late positive must require bounded paging");
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0]["attempt_id"], "old-linked");
+        assert_eq!(found[0]["drain_receipt"], "linked-receipt");
+        assert_eq!(found[1]["attempt_id"], "old-positive");
+        assert_eq!(found[1]["association_completeness"], "unknown");
+        assert_eq!(found[1]["drain_receipt"], "old-receipt");
+        assert_eq!(
+            db.continuation_attempt_association_completeness("old-source")
+                .unwrap(),
+            "unknown"
+        );
         eprintln!(
-            "{ROWS} historical attempts: explicit legacy recovery read used {} VM steps",
-            recovery_steps.load(Ordering::Relaxed)
+            "{ROWS} historical attempts: {pages} bounded recovery pages, max {max_steps} VM steps/page, {total_steps} VM steps total; late receipt retained after claim deletion"
         );
     }
 

@@ -2303,7 +2303,7 @@ mod notification_activation_tests {
                     .unwrap(),
                 "known"
             );
-            let recovery = db.completion_recovery_attempts(source).unwrap();
+            let recovery = db.completion_recovery_attempts(source, None).unwrap().0;
             assert_eq!(recovery.len(), 1);
             assert_eq!(recovery[0]["phase"], "reserved");
             assert_eq!(recovery[0]["association_completeness"], "known");
@@ -2360,7 +2360,7 @@ mod notification_activation_tests {
                     .unwrap()
                     .is_empty()
             );
-            let recovery = db.completion_recovery_attempts(source).unwrap();
+            let recovery = db.completion_recovery_attempts(source, None).unwrap().0;
             assert_eq!(recovery.len(), 1);
             assert_eq!(recovery[0]["phase"], "drained");
             assert_eq!(recovery[0]["drain_receipt"], receipt);

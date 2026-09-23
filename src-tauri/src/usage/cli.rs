@@ -438,6 +438,16 @@ pub(crate) enum NotifySubcommands {
         output: Option<PathBuf>,
     },
 
+    /// Continue the bounded physical attempt search for an accepted completion.
+    #[command(name = "agent-bash-recovery-attempts")]
+    RecoveryAttempts {
+        #[arg(long)]
+        event_id: String,
+        /// Opaque next_attempt_cursor from a recovery read or attempt page.
+        #[arg(long)]
+        cursor: String,
+    },
+
     /// Admit this live actor's later listener to an already committed v2 source.
     #[command(name = "agent-bash-listen")]
     Listen {

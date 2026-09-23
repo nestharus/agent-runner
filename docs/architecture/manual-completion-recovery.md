@@ -11,6 +11,7 @@ oulipoly-agent-runner notify agent-bash-recovery-list --session-id SESSION_ID
 oulipoly-agent-runner notify agent-bash-recovery-list
 oulipoly-agent-runner notify agent-bash-recovery-list --session-id SESSION_ID --cursor NEXT_CURSOR
 oulipoly-agent-runner notify agent-bash-recovery-read --event-id EVENT_ID --output /private/recovered.bin
+oulipoly-agent-runner notify agent-bash-recovery-attempts --event-id EVENT_ID --cursor NEXT_ATTEMPT_CURSOR
 ```
 
 List pages contain up to 100 **accepted** event identities, newest triggered
@@ -47,6 +48,21 @@ evidence and ACK separately, including response-only listeners with no row.
 Runner attempt phases and exact receipts. No receipt or `drained` phase is
 inferred from acceptance, presentation, a missing Bash source,
 or the manual read itself.
+
+`physical_drain.attempts` is one page of exact attempt rows, not necessarily
+the whole history. The read and each `agent-bash-recovery-attempts` call scan at
+most 128 retained attempt keys; a linked association page may contain up to
+128 exact rows. If `attempt_search_complete` is false, pass
+`next_attempt_cursor` to the attempts command, even when `attempts` is empty.
+Only a null cursor ends this traversal. The source-level
+`association_completeness: "unknown"` remains unknown for pre-v25 sources even
+after every retained attempt has been scanned: a deleted old claim cannot prove
+which other sources shared an activation. A scalar source match is positive
+evidence for that source; it is not used to assign the activation to another
+source. Pages use an attempt-ID anchor and keyset walk rather than a frozen
+snapshot. If new attempts arrive during the walk, restart the read to see a
+current view. The attempts command reads only sidecar metadata, so following
+the cursor does not rehash or recopy the selected output artifact.
 
 Accepted v2 event payloads remain protected from terminal payload reclamation
 by the accepted-source reference. Runner-owned raw output copies have no

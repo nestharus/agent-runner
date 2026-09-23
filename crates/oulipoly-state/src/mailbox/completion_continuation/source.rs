@@ -12,6 +12,27 @@ struct RecoveryCursor {
     after_event_id: String,
 }
 
+const RECOVERY_ATTEMPT_PAGE_LIMIT: usize = 128;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryAttemptCursor {
+    version: u8,
+    domain_id: String,
+    registration_sha256: String,
+    anchor_attempt_id: String,
+    phase: String,
+    after_attempt_id: Option<String>,
+}
+
+fn recovery_registration_digest(registration_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(b"completion-recovery-attempt-source-v1\0");
+    digest.update(registration_id.as_bytes());
+    format!("{:x}", digest.finalize())
+}
+
 fn recovery_session_digest(session_id: Option<&str>) -> String {
     use sha2::{Digest, Sha256};
     let mut digest = Sha256::new();
@@ -270,40 +291,204 @@ impl MailboxDb {
         ).optional().map_err(|e| e.to_string())
     }
 
+    /// An indexed link page followed by fixed-size pages of the retained
+    /// attempt keyspace. Historical scalar associations have no index because
+    /// building one during sidecar open would scan the entire live table.
+    /// An empty page with a cursor is therefore not evidence of no attempts.
     pub fn completion_recovery_attempts(
         &self,
         registration_id: &str,
-    ) -> Result<Vec<serde_json::Value>, String> {
-        let mut statement = self
+        cursor: Option<&serde_json::Value>,
+    ) -> Result<(Vec<serde_json::Value>, Option<serde_json::Value>), String> {
+        let domain_id: String = self
             .conn
-            .prepare(
-                "SELECT attempt_id,operation,phase,integrated,drain_receipt,
-                    association_completeness
-             FROM completion_continuation_attempt AS attempt
-             WHERE EXISTS(SELECT 1 FROM completion_continuation_attempt_source AS link
-                          WHERE link.attempt_id=attempt.attempt_id AND link.registration_id=?1)
-                OR (operation!='activation' AND source_registration_id=?1)
-                OR (association_completeness='unknown' AND source_registration_id=?1)
-             ORDER BY attempt_id LIMIT 1001",
+            .query_row(
+                "SELECT domain_id FROM completion_continuation_source
+             WHERE registration_id=?1 AND phase='accepted'",
+                [registration_id],
+                |r| r.get(0),
             )
             .map_err(|e| e.to_string())?;
-        let rows = statement
-            .query_map([registration_id], |r| {
-                Ok(serde_json::json!({
-                    "attempt_id":r.get::<_,String>(0)?, "operation":r.get::<_,String>(1)?,
-                    "phase":r.get::<_,String>(2)?, "integrated":r.get::<_,bool>(3)?,
-                    "drain_receipt":r.get::<_,Option<String>>(4)?,
-                    "association_completeness":r.get::<_,String>(5)?,
-                }))
-            })
-            .map_err(|e| e.to_string())?;
-        let attempts: Vec<_> = rows
-            .map(|r| r.map_err(|e| e.to_string()))
-            .collect::<Result<_, _>>()?;
-        if attempts.len() > 1000 {
-            return Err("completion recovery attempt projection exceeds bound".into());
+        let cursor: RecoveryAttemptCursor = match cursor {
+            Some(value) => serde_json::from_value(value.clone())
+                .map_err(|_| "invalid recovery attempt cursor".to_string())?,
+            None => {
+                let anchor_attempt_id: Option<String> = self
+                    .conn
+                    .query_row(
+                        "SELECT MAX(attempt_id) FROM completion_continuation_attempt",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| e.to_string())?;
+                RecoveryAttemptCursor {
+                    version: 1,
+                    domain_id: domain_id.clone(),
+                    registration_sha256: recovery_registration_digest(registration_id),
+                    anchor_attempt_id: anchor_attempt_id.unwrap_or_default(),
+                    phase: "linked".into(),
+                    after_attempt_id: None,
+                }
+            }
+        };
+        if cursor.version != 1
+            || cursor.domain_id != domain_id
+            || cursor.registration_sha256 != recovery_registration_digest(registration_id)
+            || !matches!(cursor.phase.as_str(), "linked" | "history")
+            || cursor
+                .after_attempt_id
+                .as_deref()
+                .is_some_and(|after| after.is_empty() || after > cursor.anchor_attempt_id.as_str())
+        {
+            return Err("invalid or stale recovery attempt cursor".into());
         }
-        Ok(attempts)
+        if !cursor.anchor_attempt_id.is_empty() {
+            let anchor_exists: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM completion_continuation_attempt WHERE attempt_id=?1)",
+                [&cursor.anchor_attempt_id], |r| r.get(0),
+            ).map_err(|e| e.to_string())?;
+            if !anchor_exists {
+                return Err("stale recovery attempt cursor".into());
+            }
+        }
+        if let Some(after) = &cursor.after_attempt_id {
+            let boundary_exists: bool = if cursor.phase == "linked" {
+                self.conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM completion_continuation_attempt_source
+                     WHERE registration_id=?1 AND attempt_id=?2)",
+                        params![registration_id, after],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| e.to_string())?
+            } else {
+                self.conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM completion_continuation_attempt WHERE attempt_id=?1)",
+                    [after], |r| r.get(0),
+                ).map_err(|e| e.to_string())?
+            };
+            if !boundary_exists {
+                return Err("stale recovery attempt cursor".into());
+            }
+        }
+        let mut attempts = Vec::new();
+        let next = if cursor.phase == "linked" {
+            let mut statement = self
+                .conn
+                .prepare(
+                    "SELECT a.attempt_id,a.operation,a.phase,a.integrated,a.drain_receipt,
+                        a.association_completeness
+                 FROM completion_continuation_attempt_source AS link
+                      INDEXED BY completion_continuation_attempt_source_registration
+                 JOIN completion_continuation_attempt AS a ON a.attempt_id=link.attempt_id
+                 WHERE link.registration_id=?1 AND link.attempt_id<=?2
+                   AND link.attempt_id>?3
+                 ORDER BY link.attempt_id LIMIT ?4",
+                )
+                .map_err(|e| e.to_string())?;
+            let mut rows = statement
+                .query(params![
+                    registration_id,
+                    cursor.anchor_attempt_id,
+                    cursor.after_attempt_id.as_deref().unwrap_or(""),
+                    (RECOVERY_ATTEMPT_PAGE_LIMIT + 1) as i64
+                ])
+                .map_err(|e| e.to_string())?;
+            while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+                attempts.push(serde_json::json!({
+                    "attempt_id":row.get::<_,String>(0).map_err(|e|e.to_string())?,
+                    "operation":row.get::<_,String>(1).map_err(|e|e.to_string())?,
+                    "phase":row.get::<_,String>(2).map_err(|e|e.to_string())?,
+                    "integrated":row.get::<_,bool>(3).map_err(|e|e.to_string())?,
+                    "drain_receipt":row.get::<_,Option<String>>(4).map_err(|e|e.to_string())?,
+                    "association_completeness":row.get::<_,String>(5).map_err(|e|e.to_string())?,
+                }));
+            }
+            let more_links = attempts.len() > RECOVERY_ATTEMPT_PAGE_LIMIT;
+            attempts.truncate(RECOVERY_ATTEMPT_PAGE_LIMIT);
+            let mut next = cursor.clone();
+            if more_links {
+                next.after_attempt_id = attempts
+                    .last()
+                    .and_then(|a| a["attempt_id"].as_str())
+                    .map(str::to_owned);
+            } else {
+                next.phase = "history".into();
+                next.after_attempt_id = None;
+            }
+            Some(next)
+        } else {
+            // This walks at most 129 primary-key entries, including entries
+            // with no scalar match. Filtering before LIMIT would reintroduce
+            // an unbounded one-call search for a late historical receipt.
+            let mut statement = self
+                .conn
+                .prepare(
+                    "SELECT attempt_id,operation,phase,integrated,drain_receipt,
+                        association_completeness,source_registration_id
+                 FROM completion_continuation_attempt
+                 WHERE attempt_id<=?1 AND attempt_id>?2
+                 ORDER BY attempt_id LIMIT ?3",
+                )
+                .map_err(|e| e.to_string())?;
+            let mut rows = statement
+                .query(params![
+                    cursor.anchor_attempt_id,
+                    cursor.after_attempt_id.as_deref().unwrap_or(""),
+                    (RECOVERY_ATTEMPT_PAGE_LIMIT + 1) as i64
+                ])
+                .map_err(|e| e.to_string())?;
+            let mut scanned = 0;
+            let mut last_scanned = None;
+            let mut more_history = false;
+            while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+                if scanned == RECOVERY_ATTEMPT_PAGE_LIMIT {
+                    more_history = true;
+                    break;
+                }
+                scanned += 1;
+                let attempt_id: String = row.get(0).map_err(|e| e.to_string())?;
+                last_scanned = Some(attempt_id.clone());
+                let operation: String = row.get(1).map_err(|e| e.to_string())?;
+                let completeness: String = row.get(5).map_err(|e| e.to_string())?;
+                let scalar_source: Option<String> = row.get(6).map_err(|e| e.to_string())?;
+                if scalar_source.as_deref() != Some(registration_id)
+                    || (operation == "activation" && completeness != "unknown")
+                {
+                    continue;
+                }
+                let linked: bool = self
+                    .conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM completion_continuation_attempt_source
+                     WHERE attempt_id=?1 AND registration_id=?2)",
+                        params![attempt_id, registration_id],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| e.to_string())?;
+                if linked {
+                    continue;
+                }
+                attempts.push(serde_json::json!({
+                    "attempt_id":attempt_id, "operation":operation,
+                    "phase":row.get::<_,String>(2).map_err(|e|e.to_string())?,
+                    "integrated":row.get::<_,bool>(3).map_err(|e|e.to_string())?,
+                    "drain_receipt":row.get::<_,Option<String>>(4).map_err(|e|e.to_string())?,
+                    "association_completeness":completeness,
+                }));
+            }
+            if more_history {
+                let mut next = cursor.clone();
+                next.after_attempt_id = last_scanned;
+                Some(next)
+            } else {
+                None
+            }
+        };
+        Ok((
+            attempts,
+            next.map(|next| serde_json::to_value(next).expect("cursor serializes")),
+        ))
     }
 
     pub(crate) fn has_original_completion_source(
