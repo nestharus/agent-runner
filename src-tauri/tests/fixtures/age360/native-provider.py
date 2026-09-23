@@ -78,6 +78,7 @@ def launch(request):
             rows = json.loads(listed.stdout)["rows"]
             assert len(rows) == 1
             received_output = None
+            received_artifact = False
             if os.environ.get("AGE365_LEGACY_WAKE") == "1":
                 assert rows[0]["handle"] == "age365-legacy-mailbox"
                 assert rows[0]["handle"] in prompt
@@ -105,7 +106,24 @@ def launch(request):
                     received_output = {"missing_original_output": True, "proof": missing}
                 elif case not in ("large_output", "hash_cancel"):
                     payload = json.loads(rows[0]["payload_json"])
-                    raw = payload["snapshot"]["output"].encode("utf-8")
+                    selected = payload["snapshot"]["output"]
+                    if isinstance(selected, str):
+                        # Older inline snapshots carry a lossy UTF-8 string.
+                        assert payload.get("output_artifact") is None
+                        raw = selected.encode("utf-8")
+                    else:
+                        # The v2 source freezes raw bytes; both descriptor
+                        # encodings name the retained file's original bytes.
+                        artifact = payload["output_artifact"]
+                        assert selected["representation"] == "retained-output-v1"
+                        assert selected["relative"] == "completion-output-v2.bin"
+                        assert selected["encoding"] in ("raw", "utf8-lossy")
+                        assert artifact["encoding"] == selected["encoding"]
+                        raw = pathlib.Path(artifact["path"]).read_bytes()
+                        assert len(raw) == selected["byte_len"] == artifact["byte_len"]
+                        digest = hashlib.sha256(raw).hexdigest()
+                        assert digest == selected["sha256"] == artifact["sha256"]
+                        received_artifact = True
                     if case in ("publication_error", "publication_io_error"):
                         live = pathlib.Path(rows[0]["log_path"]).read_bytes()
                         assert len(live) >= len(raw) + 1024 * 1024
@@ -130,10 +148,11 @@ def launch(request):
                         assert pathlib.Path(artifact["path"]).read_bytes() == b"\0" * (16 * 1024 * 1024) + b"READY\n"
                     assert digest.hexdigest() == artifact["sha256"]
                     received_output = {"byte_len": size, "sha256": digest.hexdigest()}
+                    received_artifact = True
                 if rows[0].get("payload_file_path"):
                     payload = pathlib.Path(rows[0]["payload_file_path"]).read_bytes()
                     assert hashlib.sha256(payload).hexdigest() == rows[0]["payload_sha256"]
-            pathlib.Path(os.environ["AGE360_ROOT"]).joinpath("recipient-byte-receipt.json").write_text(json.dumps({"seq": rows[0]["seq"], "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(), "output_checked": case != "owner_only", "artifact": case in ("large_output", "hash_cancel"), "output": received_output}))
+            pathlib.Path(os.environ["AGE360_ROOT"]).joinpath("recipient-byte-receipt.json").write_text(json.dumps({"seq": rows[0]["seq"], "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(), "output_checked": case != "owner_only", "artifact": received_artifact, "output": received_output}))
             sequence = str(rows[0]["seq"])
             ack = subprocess.run([runner,"mailbox","ack","--session-id",known,"--from-seq",sequence,"--to-seq",sequence,"--json"],capture_output=True,check=True,timeout=10)
             pathlib.Path(os.environ["AGE360_ROOT"]).joinpath("recipient-exact-ack.json").write_bytes(ack.stdout)

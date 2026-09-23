@@ -94,6 +94,9 @@ fn private_case(paired: bool) -> bool {
         .env("AGE360_PRIVATE_CASE", &name)
         .env("AGE360_PARENT_NET", &net)
         .env("AGE360_RUNNER_BIN", runner);
+    if let Some(tmpdir) = std::env::var_os("TMPDIR") {
+        command.env("TMPDIR", tmpdir);
+    }
     if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
         command.env("LLVM_PROFILE_FILE", profile);
     }
@@ -202,6 +205,9 @@ impl Fixture {
             )
             .env("AGENT_BASH_AGENT_RUNNER_BIN", runner())
             .current_dir(self.root.path());
+        if let Some(tmpdir) = std::env::var_os("TMPDIR") {
+            cmd.env("TMPDIR", tmpdir);
+        }
         if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
             cmd.env("LLVM_PROFILE_FILE", profile);
         }
@@ -260,6 +266,19 @@ impl Fixture {
     }
     fn mailbox(&self) -> MailboxDb {
         MailboxDb::open_historical_read_only(&self.data.join("pid-identity.db")).unwrap()
+    }
+    fn mailbox_for_poll(&self) -> Option<MailboxDb> {
+        match MailboxDb::open_historical_read_only(&self.data.join("pid-identity.db")) {
+            Ok(mailbox) => Some(mailbox),
+            Err(error)
+                if error.contains(
+                    "SQLite source continued changing while retrying a read-only snapshot",
+                ) =>
+            {
+                None
+            }
+            Err(error) => panic!("mailbox snapshot failed outside source churn: {error}"),
+        }
     }
     fn gate(&self, name: &str) {
         fs::write(self.root.path().join(name), b"release\n").unwrap();
@@ -465,6 +484,9 @@ fn native_unmarked_nested_entry_cannot_elect_descendant_owner() {
 
 fn paired_case(mode: &'static str) {
     let f = Fixture::new(mode);
+    if mode == "ack_before_drain" {
+        f.gate("test-descendant-enabled");
+    }
     #[cfg(feature = "age360-fault-fixtures")]
     paired_faults::prepare(&f);
     f.gate("release-resume");
@@ -521,7 +543,7 @@ fn paired_case(mode: &'static str) {
     }
     let acceptance = wait(|| {
         let value = f
-            .mailbox()
+            .mailbox_for_poll()?
             .completion_continuation_acceptance(&source.registration_id)
             .ok()??;
         (value["phase"] == "accepted").then_some(value)
@@ -800,7 +822,7 @@ fn paired_case(mode: &'static str) {
     }
     wait(|| {
         let listeners = f
-            .mailbox()
+            .mailbox_for_poll()?
             .completion_event_listeners(&source.handle)
             .ok()?;
         listeners
@@ -815,7 +837,57 @@ fn paired_case(mode: &'static str) {
             .ok()
     });
     assert_eq!(byte_receipt["output_checked"], true);
+    if matches!(mode, "async" | "pause" | "ack_before_drain") {
+        assert_eq!(byte_receipt["artifact"], true);
+    }
     println!("actual native adapter byte receipt={byte_receipt}");
+    if mode == "ack_before_drain" {
+        let descendant: i64 = wait(|| {
+            fs::read_to_string(f.root.path().join("descendant.pid"))
+                .ok()?
+                .parse()
+                .ok()
+        });
+        let descendant_identity = read_live_process_identity(descendant)
+            .unwrap()
+            .expect("recipient's published descendant must still be live");
+        let (claim, attempt) = wait(|| {
+            let mailbox = f.mailbox_for_poll()?;
+            let claim = mailbox.wake_session_reader().wake_claim(SESSION).ok()??;
+            let attempt = mailbox
+                .continuation_activation(SESSION, &claim.claim_token)
+                .ok()??;
+            Some((claim, attempt))
+        });
+        let phase: String = f
+            .sidecar_connection()
+            .query_row(
+                "SELECT phase FROM completion_continuation_attempt WHERE attempt_id=?1",
+                [&attempt.attempt_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(matches!(phase.as_str(), "starting" | "running"));
+        assert_eq!(
+            read_live_process_identity(descendant).unwrap(),
+            Some(descendant_identity),
+            "listener ACK must precede physical descendant drain"
+        );
+        let mut writer = MailboxDb::open(&f.data.join("pid-identity.db")).unwrap();
+        assert_eq!(
+            writer
+                .wake_sessions()
+                .release_wake_claim_for_manual_resume(SESSION, &claim.claim_token),
+            Ok(false),
+            "manual release must retain the live v2 activation claim"
+        );
+        drop(writer);
+        println!(
+            "paired v2 ACK before drain attempt={} phase={phase} descendant={descendant}",
+            attempt.attempt_id
+        );
+        f.gate("release-descendant");
+    }
     // Both modes have completed their mode-specific initial observation above.
     assert!(initial.wait().unwrap().success());
     let prompt = fs::read_to_string(f.root.path().join("resume-prompts.jsonl")).unwrap();
@@ -857,7 +929,7 @@ fn paired_case(mode: &'static str) {
             .unwrap()
     );
     wait(|| {
-        f.mailbox()
+        f.mailbox_for_poll()?
             .pending_continuation_attempt_ids(&source.registration_id)
             .ok()?
             .is_empty()
@@ -878,6 +950,13 @@ fn normal_sleeping_recipient() {
         return;
     }
     paired_case("async");
+}
+#[test]
+fn paired_v2_ack_precedes_physical_activation_drain() {
+    if private_case(true) {
+        return;
+    }
+    paired_case("ack_before_drain");
 }
 #[test]
 fn sync_response_without_notification_or_ack() {

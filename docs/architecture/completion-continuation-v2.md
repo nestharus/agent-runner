@@ -93,15 +93,17 @@ Ready registration accepts a genuine pre-sentinel `exit_root` / `exit_tree` with
 matching scope, raw terminal wait/rc and output closure (plus Tree drain for Tree).
 It requires null `ready_sentinel`; a successful rc alone is not sentinel success.
 
-Small snapshot output remains an inline JSON string. Full supported output can
-instead be an explicit `retained-output-v1` object with exactly:
+New snapshots describe output at every size, including empty output, as a
+`retained-output-v1` object with exactly:
 
 - `relative: "completion-output-v2.bin"`
 - `sha256`: SHA-256 of the complete frozen **raw** log bytes
 - `byte_len`: exact length, at most 1 GiB (the supported raw log ceiling)
-- `encoding: "utf8-lossy"`: complete raw bytes are interpreted with the existing
-  UTF-8 replacement semantics, not modified or truncated during retention
+- `encoding: "raw"`: complete raw bytes are retained without UTF-8 replacement
 - `representation: "retained-output-v1"`
+
+Runner also accepts older `encoding: "utf8-lossy"` artifact descriptors as raw
+files. Older inline JSON strings retain their lossy UTF-8 semantics.
 
 Bash freezes and syncs the immutable file before publishing its descriptor.
 Runner streams no-follow regular-file verification and copies it to its domain's
