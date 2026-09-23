@@ -1,0 +1,24 @@
+# Source artifact only. Requires administrator installation of a root-owned
+# broker and exact Runner image plus an oulipoly group. Do not enable before
+# Runner/Bash grant and placement integration is complete.
+[Unit]
+Description=Oulipoly host PID namespace broker
+After=local-fs.target
+
+[Service]
+Type=simple
+User=root
+Group=oulipoly
+ExecStart=/usr/local/libexec/oulipoly/oulipoly-kernel-broker
+RuntimeDirectory=oulipoly-kernel-broker
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=restart
+StateDirectory=oulipoly-kernel-broker
+StateDirectoryMode=0700
+Restart=on-failure
+KillMode=process
+Delegate=yes
+NoNewPrivileges=no
+
+[Install]
+WantedBy=multi-user.target

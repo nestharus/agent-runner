@@ -3126,6 +3126,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "oulipoly-kernel-broker"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
 name = "oulipoly-provider"
 version = "0.1.0"
 dependencies = [
