@@ -417,25 +417,27 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
         }
         #[cfg(feature = "age319-private-broker-fixture")]
         if private_handoff {
-            // A later process in this same root namespace cannot reuse the
-            // root's U or D authority. It needs its own broker admission.
-            let child = std::env::current_exe().map_err(|e| e.to_string())?;
-            let release_json = serde_json::to_string(&spec).map_err(|e| e.to_string())?;
-            for (key, value) in [
-                ("AGE319_PRIVATE_HANDOFF_PROBE_SPEC", release_json.as_str()),
-                ("AGE319_PRIVATE_HANDOFF_PROBE_D_KEY", receipt.d_key.as_str()),
-            ] {
-                let outcome = std::process::Command::new(&child)
-                    .arg("__age319-private-handoff-probe-v1")
-                    .env_remove(REQUIRED_ENV)
-                    .env_remove(CHILD_FD_ENV)
-                    .env_remove("AGE319_PRIVATE_HANDOFF_PROBE_SPEC")
-                    .env_remove("AGE319_PRIVATE_HANDOFF_PROBE_D_KEY")
-                    .env(key, value)
-                    .status()
-                    .map_err(|e| e.to_string())?;
-                if outcome.success() {
-                    return Err("unregistered later root descendant reused root U/D".into());
+            if std::env::var_os("AGE319_PRIVATE_FRESH_PROVIDER_V1").is_none() {
+                // The older handoff fixture runs sibling probes. The provider
+                // proof keeps this released root free of local forks before K.
+                let child = std::env::current_exe().map_err(|e| e.to_string())?;
+                let release_json = serde_json::to_string(&spec).map_err(|e| e.to_string())?;
+                for (key, value) in [
+                    ("AGE319_PRIVATE_HANDOFF_PROBE_SPEC", release_json.as_str()),
+                    ("AGE319_PRIVATE_HANDOFF_PROBE_D_KEY", receipt.d_key.as_str()),
+                ] {
+                    let outcome = std::process::Command::new(&child)
+                        .arg("__age319-private-handoff-probe-v1")
+                        .env_remove(REQUIRED_ENV)
+                        .env_remove(CHILD_FD_ENV)
+                        .env_remove("AGE319_PRIVATE_HANDOFF_PROBE_SPEC")
+                        .env_remove("AGE319_PRIVATE_HANDOFF_PROBE_D_KEY")
+                        .env(key, value)
+                        .status()
+                        .map_err(|e| e.to_string())?;
+                    if outcome.success() {
+                        return Err("unregistered later root descendant reused root U/D".into());
+                    }
                 }
             }
             let status = std::fs::read_to_string("/proc/self/status").map_err(|e| e.to_string())?;
@@ -558,6 +560,10 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
                 oulipoly_state::mailbox::FreshRootWorkIntent::NormalCli(_)
             ) {
                 prepare_normal_work(receipt, session)?;
+                #[cfg(feature = "age319-private-broker-fixture")]
+                if std::env::var_os("AGE319_PRIVATE_FRESH_PROVIDER_V1").is_some() {
+                    return private_fresh_provider(receipt);
+                }
                 return Err("normal provider route held: native K/Q, result and physical custody are absent".into());
             }
             if !private_help {
@@ -630,6 +636,141 @@ fn prepare_normal_work(
         }
     }
     Ok(())
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_fresh_provider(
+    receipt: &oulipoly_state::mailbox::FreshReleasedHandoff,
+) -> Result<ExitCode, String> {
+    let args = match &receipt.root_work_intent {
+        oulipoly_state::mailbox::FreshRootWorkIntent::NormalCli(args)
+            if matches!(args.as_slice(), [flag, model, _prompt]
+                if flag == "--model" && model == "fixture-model") =>
+        {
+            args
+        }
+        _ => return Err("private provider requires exact fixture model/prompt syntax".into()),
+    };
+    let image = std::env::var("AGE319_PRIVATE_PROVIDER_IMAGE_V1")
+        .map_err(|_| "private provider image absent")?;
+    let marker = std::env::var("AGE319_PRIVATE_PROVIDER_MARKER_V1")
+        .map_err(|_| "private provider marker absent")?;
+    let image = File::open(&image).map_err(|e| e.to_string())?;
+    let cwd = File::open(std::env::current_dir().map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    let input = private_sealed_bytes(b"fresh-provider-input", args[2].as_bytes())?;
+    let recipe_bytes = serde_json::to_vec(&serde_json::json!({
+        "argv": [marker], "env": [["PATH", "/usr/bin:/bin"]],
+    }))
+    .map_err(|e| e.to_string())?;
+    let recipe = private_sealed_bytes(b"fresh-provider-recipe", &recipe_bytes)?;
+    let socket = broker_socket().with_file_name("v30.sock");
+    let submitted = protocol::private_fresh_provider_at(
+        &socket,
+        &receipt.d_key,
+        b'5',
+        Some([
+            image.as_raw_fd(),
+            cwd.as_raw_fd(),
+            input.as_raw_fd(),
+            recipe.as_raw_fd(),
+        ]),
+    );
+    let grant = match submitted {
+        Ok(response) => response
+            .strip_prefix("fresh-provider-k ")
+            .and_then(|s| s.strip_suffix('\n'))
+            .ok_or("private provider K response invalid")?
+            .to_owned(),
+        Err(_) => {
+            // K may already be consumed. Resolve the same D/held grant and
+            // never submit a second provider execution request.
+            let state = protocol::private_fresh_provider_at(&socket, &receipt.d_key, b'6', None)
+                .map_err(|e| format!("private provider K unknown; readback failed: {e}"))?;
+            if state.starts_with("fresh-provider-unknown ") {
+                return Err("private provider K consumed with unknown physical state".into());
+            }
+            state
+                .split_whitespace()
+                .nth(1)
+                .ok_or("private provider K readback missing grant")?
+                .to_owned()
+        }
+    };
+    uuid::Uuid::parse_str(&grant).map_err(|_| "private provider K grant invalid")?;
+    if protocol::private_fresh_provider_at(
+        &socket,
+        &receipt.d_key,
+        b'5',
+        Some([
+            image.as_raw_fd(),
+            cwd.as_raw_fd(),
+            input.as_raw_fd(),
+            recipe.as_raw_fd(),
+        ]),
+    )
+    .is_ok()
+    {
+        return Err("private provider duplicate K was accepted".into());
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let state = protocol::private_fresh_provider_at(&socket, &receipt.d_key, b'6', None)
+            .map_err(|e| format!("private provider result readback failed: {e}"))?;
+        if state.starts_with(&format!("fresh-provider-exited {grant} ")) {
+            break;
+        }
+        if state.starts_with("fresh-provider-unknown ") || std::time::Instant::now() >= deadline {
+            return Err("private provider result unknown".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let gate = std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+        .map_err(|_| "private provider gate directory absent")?;
+    while !std::path::Path::new(&gate).join("provider-cancel").exists() {
+        if std::time::Instant::now() >= deadline {
+            return Err("private provider cancellation fixture expired".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    protocol::private_fresh_provider_at(&socket, &receipt.d_key, b'7', None)
+        .map_err(|e| format!("private provider cancel failed: {e}"))?;
+    loop {
+        let state = protocol::private_fresh_provider_at(&socket, &receipt.d_key, b'6', None)
+            .map_err(|e| format!("private provider Q readback failed: {e}"))?;
+        if state.starts_with(&format!("fresh-provider-drained {grant} ")) {
+            // The broker verified the complete output and physical Q. The
+            // ordinary runtime has no remote result backend yet; this private
+            // fixture must not turn the readback into CLI terminal success.
+            return Err(format!(
+                "private provider Q verified; runtime result backend closed: {}",
+                state.trim()
+            ));
+        }
+        if state.starts_with("fresh-provider-unknown ") || std::time::Instant::now() >= deadline {
+            return Err("private provider Q unknown".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_sealed_bytes(name: &'static [u8], bytes: &[u8]) -> Result<File, String> {
+    use std::io::Seek;
+    let name = std::ffi::CString::new(name).map_err(|e| e.to_string())?;
+    let fd =
+        unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_ALLOW_SEALING | libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    file.write_all(bytes).map_err(|e| e.to_string())?;
+    let seals = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+    if unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, seals) } < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    file.rewind().map_err(|e| e.to_string())?;
+    Ok(file)
 }
 
 fn begin_root_effect(

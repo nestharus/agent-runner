@@ -47,6 +47,8 @@ impl Drop for SnapshotRestore {
 
 fn inner() {
     let mode = std::env::var("AGE319_PRIVATE_JOIN_MODE").unwrap_or_else(|_| "help".into());
+    let provider_mode = mode.starts_with("normal_model_provider");
+    let model_mode = mode == "normal_model_held" || provider_mode;
     let native_mode = mode.starts_with("native_");
     let native_live = matches!(
         mode.as_str(),
@@ -61,6 +63,9 @@ fn inner() {
             | "normal_handoff_effect_reply_loss"
             | "normal_help"
             | "normal_model_held"
+            | "normal_model_provider"
+            | "normal_model_provider_reply_loss"
+            | "normal_model_provider_restart"
     );
     let recipient_mode = mode.starts_with("normal_recipient");
     let real_source = mode.starts_with("normal_bash_source");
@@ -68,6 +73,7 @@ fn inner() {
     let io_failure_source = mode == "normal_bash_source_capture_io_failure";
     let runner =
         std::env::var("OULIPOLY_AGE319_RUNNER_IMAGE").expect("built Runner image required");
+    let provider_image = std::env::var("OULIPOLY_AGE319_PROVIDER_IMAGE").unwrap_or_default();
     let temp = tempfile::tempdir().unwrap();
     let data = temp.path().join("data");
     let broker_state = temp.path().join("broker-state");
@@ -257,6 +263,10 @@ fn inner() {
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+        .envs((mode == "normal_model_provider_reply_loss").then_some((
+            "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_PROVIDER_K_REPLY_V1",
+            "1",
+        )))
         .envs(native_mode.then_some(("OULIPOLY_KERNEL_BROKER_FIXTURE_NATIVE_GATE_V1", &gate)))
         .envs(
             (mode == "held_release_gate_fail")
@@ -284,7 +294,7 @@ fn inner() {
         let mut entry = Command::new(&runner)
             .arg(if mode == "normal_help" {
                 "--help"
-            } else if mode == "normal_model_held" {
+            } else if model_mode {
                 "--model"
             } else if handoff_mode {
                 "__age319-private-root-handoff-v1"
@@ -292,7 +302,7 @@ fn inner() {
                 "__age319-private-normal-v30"
             })
             .args(
-                (mode == "normal_model_held")
+                model_mode
                     .then_some(["fixture-model", "hello fixture"])
                     .into_iter()
                     .flatten(),
@@ -304,7 +314,16 @@ fn inner() {
             .env("AGE319_PRIVATE_REPAIR_CHALLENGE_V1", "1")
             .env("AGE319_PRIVATE_SOURCE_SELECTION_CHALLENGE_V1", "1")
             .envs((mode == "normal_help").then_some(("AGE319_PRIVATE_OFFLINE_ROOT_V1", "1")))
-            .envs((mode == "normal_model_held").then_some(("AGE319_PRIVATE_NORMAL_ROOT_V1", "1")))
+            .envs(model_mode.then_some(("AGE319_PRIVATE_NORMAL_ROOT_V1", "1")))
+            .envs(provider_mode.then_some(("AGE319_PRIVATE_FRESH_PROVIDER_V1", "1")))
+            .envs(
+                provider_mode
+                    .then_some(("AGE319_PRIVATE_PROVIDER_IMAGE_V1", provider_image.as_str())),
+            )
+            .envs(provider_mode.then_some((
+                "AGE319_PRIVATE_PROVIDER_MARKER_V1",
+                gate.join("provider-effect").to_str().unwrap(),
+            )))
             .envs(
                 (mode == "normal_handoff").then_some(("AGE319_PRIVATE_HANDOFF_REPLY_LOSS_V1", "1")),
             )
@@ -538,6 +557,9 @@ fn inner() {
                     | "normal_handoff_effect_reply_loss"
                     | "normal_help"
                     | "normal_model_held"
+                    | "normal_model_provider"
+                    | "normal_model_provider_reply_loss"
+                    | "normal_model_provider_restart"
             ) {
                 let marker: serde_json::Value =
                     serde_json::from_slice(&fs::read(gate.join("child-handoff")).unwrap()).unwrap();
@@ -571,7 +593,7 @@ fn inner() {
                     receipt.root_work_intent,
                     if mode == "normal_help" {
                         oulipoly_state::mailbox::FreshRootWorkIntent::CliHelp(vec!["--help".into()])
-                    } else if mode == "normal_model_held" {
+                    } else if model_mode {
                         oulipoly_state::mailbox::FreshRootWorkIntent::NormalCli(vec![
                             "--model".into(),
                             "fixture-model".into(),
@@ -637,7 +659,7 @@ fn inner() {
                     intent_kind,
                     if mode == "normal_help" {
                         "cli_help"
-                    } else if mode == "normal_model_held" {
+                    } else if model_mode {
                         "normal_cli"
                     } else {
                         "private_probe"
@@ -663,7 +685,7 @@ fn inner() {
                         .unwrap()
                         .is_none()
                 );
-                if mode == "normal_model_held" {
+                if model_mode {
                     assert!(
                         lane.read_normal_work(&receipt, &actor, &session)
                             .unwrap()
@@ -708,7 +730,7 @@ fn inner() {
                     lane.require_released_handoff(&receipt.d_key, &receipt, &reused_pid)
                         .is_err()
                 );
-                if mode == "normal_model_held" {
+                if model_mode {
                     assert!(
                         lane.prepare_normal_work(&receipt, &reused_pid, &session)
                             .is_err()
@@ -850,6 +872,156 @@ fn inner() {
                     .unwrap();
                 assert_eq!(pending, 1, "old pending ACK debt must coexist with fresh D");
                 fs::write(gate.join("child-effect"), b"yes").unwrap();
+                if provider_mode {
+                    let provider_dir = broker_state.join("v30/fresh-provider");
+                    eventually(|| {
+                        gate.join("provider-effect").exists() || entry.try_wait().unwrap().is_some()
+                    });
+                    assert!(
+                        gate.join("provider-effect").exists(),
+                        "{}",
+                        fs::read_to_string(&err).unwrap()
+                    );
+                    let grant_file =
+                        provider_dir.join(format!("{}.fresh-grant.json", receipt.handoff_id));
+                    eventually(|| grant_file.exists());
+                    let grant: serde_json::Value =
+                        serde_json::from_slice(&fs::read(&grant_file).unwrap()).unwrap();
+                    let grant_id = grant["id"].as_str().unwrap();
+                    eventually(|| provider_dir.join(format!("{grant_id}.exit.json")).exists());
+                    assert!(
+                        !provider_dir.join(format!("{grant_id}.drain.json")).exists(),
+                        "provider exit with adopted child falsely settled Q"
+                    );
+                    assert!(
+                        protocol::private_fresh_provider_at(
+                            &socket.with_file_name("v30.sock"),
+                            &receipt.d_key,
+                            b'6',
+                            None
+                        )
+                        .is_err(),
+                        "sibling observed provider K"
+                    );
+                    assert!(
+                        protocol::private_fresh_provider_at(
+                            &socket.with_file_name("v30.sock"),
+                            &uuid::Uuid::new_v4().to_string(),
+                            b'6',
+                            None
+                        )
+                        .is_err(),
+                        "wrong D key observed provider K"
+                    );
+                    assert_eq!(
+                        fs::read(gate.join("provider-effect")).unwrap(),
+                        b"one-provider-effect\n"
+                    );
+                    if mode == "normal_model_provider_restart" {
+                        let fresh_socket = socket.with_file_name("v30.sock");
+                        stop(&mut broker);
+                        assert!(
+                            !provider_dir.join(format!("{grant_id}.drain.json")).exists(),
+                            "broker death falsely settled adopted work"
+                        );
+                        broker = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
+                            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
+                            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
+                            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::from(
+                                File::create(temp.path().join("broker-restart.log")).unwrap(),
+                            ))
+                            .spawn()
+                            .unwrap();
+                        let until = Instant::now() + Duration::from_secs(15);
+                        while protocol::request_at(
+                            &fresh_socket,
+                            protocol::Operation::ObserveEntryGate,
+                        )
+                        .ok()
+                        .as_deref()
+                            != Some("entry-gate-v1 fresh-v30-closed\n")
+                            && broker.try_wait().unwrap().is_none()
+                            && Instant::now() < until
+                        {
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        assert!(
+                            protocol::request_at(
+                                &fresh_socket,
+                                protocol::Operation::ObserveEntryGate
+                            )
+                            .ok()
+                            .as_deref()
+                                == Some("entry-gate-v1 fresh-v30-closed\n"),
+                            "fresh socket did not rebind; broker status {:?}; log {}",
+                            broker.try_wait().unwrap(),
+                            fs::read_to_string(temp.path().join("broker-restart.log")).unwrap()
+                        );
+                        assert!(
+                            broker.try_wait().unwrap().is_none(),
+                            "restarted broker exited: {}",
+                            fs::read_to_string(temp.path().join("broker-restart.log")).unwrap()
+                        );
+                    }
+                    fs::write(gate.join("provider-cancel"), b"yes").unwrap();
+                    eventually(|| entry.try_wait().unwrap().is_some());
+                    assert!(
+                        !entry.wait().unwrap().success(),
+                        "private provider fixture became ordinary CLI success"
+                    );
+                    assert!(
+                        fs::read_to_string(&err)
+                            .unwrap()
+                            .contains("private provider Q verified; runtime result backend closed"),
+                        "{}",
+                        fs::read_to_string(&err).unwrap()
+                    );
+                    assert_eq!(
+                        fs::read(provider_dir.join(format!("{grant_id}.stdout"))).unwrap(),
+                        b"provider-stdout:hello fixture"
+                    );
+                    assert_eq!(
+                        fs::read(provider_dir.join(format!("{grant_id}.stderr"))).unwrap(),
+                        b"provider-stderr\n"
+                    );
+                    for suffix in [
+                        "consumed.json",
+                        "attach.json",
+                        "exit.json",
+                        "drain.json",
+                        "pid1-wait.json",
+                    ] {
+                        assert!(
+                            provider_dir.join(format!("{grant_id}.{suffix}")).exists(),
+                            "missing {suffix}"
+                        );
+                    }
+                    assert_eq!(
+                        fresh_state
+                            .query_row::<i64, _, _>(
+                                "SELECT count(*) FROM fresh_root_effect",
+                                [],
+                                |r| r.get(0)
+                            )
+                            .unwrap(),
+                        0
+                    );
+                    assert_eq!(
+                        fresh_state
+                            .query_row::<i64, _, _>(
+                                "SELECT count(*) FROM fresh_normal_work_preparation",
+                                [],
+                                |r| r.get(0)
+                            )
+                            .unwrap(),
+                        1
+                    );
+                    stop(&mut broker);
+                    return;
+                }
                 eventually(|| entry.try_wait().unwrap().is_some());
                 let completed = entry.wait().unwrap().success();
                 if mode == "normal_model_held" {
@@ -2858,6 +3030,9 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_handoff_effect_reply_loss",
         "normal_help",
         "normal_model_held",
+        "normal_model_provider",
+        "normal_model_provider_reply_loss",
+        "normal_model_provider_restart",
         "normal_guardian_death",
         "normal_driver_death",
         "normal_broker_death",

@@ -15,6 +15,11 @@ path = "src/main.rs"
 name = "oulipoly-installed-launcher"
 path = "src/installed_launcher.rs"
 
+[[bin]]
+name = "age319-fresh-provider-fixture"
+path = "src/fresh_provider_fixture.rs"
+required-features = ["age319-private-broker-fixture"]
+
 [dependencies]
 base64 = "0.22"
 libc.workspace = true
