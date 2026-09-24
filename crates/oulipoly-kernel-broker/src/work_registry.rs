@@ -4,13 +4,14 @@
 //! The launch module uses this registry before worker pre-exec release; a
 //! work record alone does not certify execution or completion.
 use crate::identity::{PeerIdentity, PinnedProcess, boot_id};
+use crate::json_artifact;
 use crate::registry::{LiveRoot, RootRegistry};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::fs::{self, File};
+use std::io;
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -130,10 +131,16 @@ impl WorkRegistry {
             let entry = entry?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
+            if name.starts_with(".json-pending-") {
+                return Err(json_artifact::pending_error(
+                    &entry.path(),
+                    "work_registry_open",
+                ));
+            }
             if !name.ends_with(".json") || !entry.file_type()?.is_file() {
                 return Err(io::Error::other("unrecognized work registry entry"));
             }
-            let record: WorkRecord = serde_json::from_slice(&fs::read(entry.path())?)?;
+            let record: WorkRecord = json_artifact::read(&entry.path(), "work_registry_open")?;
             if format!("{}.json", record.work_incarnation) != name
                 || uuid::Uuid::parse_str(&record.work_incarnation).is_err()
             {
@@ -335,20 +342,11 @@ impl WorkRegistry {
         };
         root.init.verify()?;
         init.verify()?;
-        let path = self
-            .directory
-            .join(format!("{}.json", record.work_incarnation));
-        let persisted = (|| {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(path)?;
-            serde_json::to_writer(&mut file, &record)?;
-            file.write_all(b"\n")?;
-            file.sync_all()?;
-            File::open(&self.directory)?.sync_all()
-        })();
+        let persisted = json_artifact::create_new(
+            &self.directory,
+            &format!("{}.json", record.work_incarnation),
+            &record,
+        );
         if let Err(error) = persisted {
             self.poisoned = true;
             return Err(error);

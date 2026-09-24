@@ -1729,11 +1729,23 @@ fn cached_or_retry_process_recorder(
             *guard = Some(recorder.clone());
             recorder
         }
-        Err(_) => {
+        Err(error) => {
+            // Keep the failed initializer's reason separate from broker request
+            // errors. Recorder telemetry remains optional and retryable.
+            eprintln!("{}", recorder_init_failure_line(&error));
             emit_gap_once("process_recorder_init");
             FlightRecorder::disabled()
         }
     }
+}
+
+fn recorder_init_failure_line(error: &str) -> String {
+    let reason: String = error
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(240)
+        .collect();
+    format!("oulipoly recorder init failure: stage=process_recorder_init reason={reason}")
 }
 
 #[cfg(test)]
@@ -4837,6 +4849,10 @@ mod tests {
         });
         assert!(disabled.inner.writer.is_none());
         assert_eq!(reports.try_recv().unwrap(), "process_recorder_init");
+        assert_eq!(
+            recorder_init_failure_line("fixture OS error 11\npath"),
+            "oulipoly recorder init failure: stage=process_recorder_init reason=fixture OS error 11path"
+        );
 
         let initialized = cached_or_retry_process_recorder(&slot, || {
             FlightRecorder::open(directory.path(), RecorderConfig::default())
