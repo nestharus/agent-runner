@@ -165,9 +165,17 @@ enum RequestPayload {
     FreshRootEffectRequest {
         request: FreshRootEffectRequest,
     },
+    #[allow(
+        dead_code,
+        reason = "fresh Bash lane is closed without the private fixture"
+    )]
     FreshBashChildRequest {
         request_id: String,
     },
+    #[allow(
+        dead_code,
+        reason = "fresh Bash lane is closed without the private fixture"
+    )]
     FreshBashPrivateResult {
         result: oulipoly_state::mailbox::FreshBashPrivateResult,
     },
@@ -3732,13 +3740,17 @@ fn serve_fresh_v30() -> io::Result<()> {
     )
 }
 
+#[cfg(feature = "age319-private-broker-fixture")]
 fn fresh_bash_parent(
     state_root: &Path,
     lane: &FreshV30Lane,
     peer: &PeerIdentity,
     bash_image: Option<&File>,
-    new_registration: bool,
-) -> io::Result<(FreshReleasedHandoff, FreshRecipientIdentity)> {
+) -> io::Result<(
+    FreshReleasedHandoff,
+    FreshRecipientIdentity,
+    fresh_provider::ParentWork,
+)> {
     let image = bash_image.ok_or_else(|| io::Error::other("installed Bash image absent"))?;
     if !peer.process.same_executable_as(image)? {
         return Err(io::Error::other("Bash child image changed"));
@@ -3746,12 +3758,7 @@ fn fresh_bash_parent(
     let roots = RootRegistry::open(state_root)?;
     let works = WorkRegistry::open(state_root.join("works"), &roots)?;
     let root_id = match classify_scope(peer, &host_proc_file("self/ns/pid")?, &roots, &works) {
-        Scope::Root(id) => id,
-        Scope::Work { .. } => {
-            return Err(io::Error::other(
-                "nested Bash child requires consumed causal work grant",
-            ));
-        }
+        Scope::Root(id) | Scope::Work { root_id: id, .. } => id,
         Scope::Outside => return Err(io::Error::other("Bash child is outside a released root")),
         Scope::Uncertain => return Err(io::Error::other("Bash child scope uncertain")),
     };
@@ -3771,25 +3778,20 @@ fn fresh_bash_parent(
     {
         return Err(io::Error::other("released root PID1 changed"));
     }
-    // Root namespace membership proves scope, but does not identify the
-    // process that caused a *new* Bash invocation. At admission require the
-    // released Runner actor itself to have spawned this Bash process. Once
-    // registered, the same pinned Bash incarnation may survive adoption;
-    // c/E/O still use its durable child row and must not rely on PPID.
-    if new_registration {
-        let parent = PinnedProcess::open(actor.host_pid)?;
-        if parent.boot_id != actor.boot_id
-            || parent.starttime_ticks != actor.starttime_ticks
-            || (parent.pidns_dev, parent.pidns_ino) != (actor.pidns_dev, actor.pidns_ino)
-            || !peer.process.direct_child_of(&parent)?
-        {
-            return Err(io::Error::other(
-                "Bash child has no exact released Runner parent",
-            ));
-        }
-    }
+    let root_init = PinnedProcess::open(expected.host_pid)?;
+    let root_session = lane
+        .read_session(&root.d_key)
+        .map_err(io::Error::other)?
+        .ok_or_else(|| io::Error::other("released root D absent"))?;
+    let parent = fresh_provider::parent_for_bash(
+        &state_root.join("v30/fresh-provider"),
+        &root,
+        &root_session.session_id,
+        &peer.process,
+        &root_init,
+    )?;
     peer.process.verify()?;
-    Ok((root, actor))
+    Ok((root, actor, parent))
 }
 
 fn serve_fresh_v30_at(
@@ -3803,6 +3805,7 @@ fn serve_fresh_v30_at(
     let instance = EntryGate::open(&state_root.join("v30"))?;
     // An installed Bash child must match the package's pinned digest. Private
     // fixtures supply their built source binary only at broker startup.
+    #[cfg(feature = "age319-private-broker-fixture")]
     let bash_image = if private_fixture() {
         std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_BASH_V1")
             .map(File::open)
@@ -3948,6 +3951,11 @@ fn serve_fresh_v30_at(
                         request.request_id, request.invocation_uuid
                     ))
                 }
+                #[cfg(not(feature = "age319-private-broker-fixture"))]
+                b'C' | b'c' | b'E' | b'O' | b'8' | b'9' | b'!' => Err(io::Error::other(
+                    "fresh Bash child/work/result closed until normal root grant and physical result custody",
+                )),
+                #[cfg(feature = "age319-private-broker-fixture")]
                 b'C' | b'c' | b'E' | b'O' | b'8' | b'9' | b'!' => {
                     if !private_fixture() {
                         return Err(io::Error::other(
@@ -3964,21 +3972,18 @@ fn serve_fresh_v30_at(
                         }
                         _ => return Err(io::Error::other("Bash child request absent")),
                     };
-                    let new_registration = operation == b'C'
-                        && lane
-                            .read_bash_child(&request_id)
-                            .map_err(io::Error::other)?
-                            .is_none();
-                    let (root, root_actor) = fresh_bash_parent(
-                        state_root,
-                        &lane,
-                        &peer,
-                        bash_image.as_ref(),
-                        new_registration,
-                    )?;
+                    let (root, root_actor, parent_work) =
+                        fresh_bash_parent(state_root, &lane, &peer, bash_image.as_ref())?;
                     let child = if operation == b'C' && !instance.is_closed() {
-                        lane.admit_bash_child(&request_id, &root, &root_actor, &recipient)
-                            .map_err(io::Error::other)?
+                        lane.admit_bash_child(
+                            &request_id,
+                            &root,
+                            &root_actor,
+                            &recipient,
+                            parent_work.grant_id(),
+                            parent_work.work_id(),
+                        )
+                        .map_err(io::Error::other)?
                     } else {
                         let mut child = lane
                             .read_bash_child(&request_id)
@@ -3990,6 +3995,11 @@ fn serve_fresh_v30_at(
                             .ok_or_else(|| io::Error::other("Bash child D incomplete"))?;
                         lane.require_bash_child(&child, &root, &root_actor, &recipient)
                             .map_err(io::Error::other)?;
+                        if child.parent_work_grant_id != parent_work.grant_id()
+                            || child.parent_work_id != parent_work.work_id()
+                        {
+                            return Err(io::Error::other("Bash causal parent work changed"));
+                        }
                         child
                     };
                     peer.process.verify()?;
@@ -4020,16 +4030,11 @@ fn serve_fresh_v30_at(
                             let root_pid = root.old_release.prepared.root_init.host_pid;
                             let root_init = PinnedProcess::open(root_pid)?;
                             let actor = PinnedProcess::open(peer.process.host_pid)?;
-                            let parent = if operation == b'8' {
-                                Some(PinnedProcess::open(root_actor.host_pid)?)
-                            } else {
-                                None
-                            };
                             let binding = fresh_provider::binding_from_bash_child(
                                 &root,
                                 &child,
                                 &actor,
-                                parent.as_ref(),
+                                &parent_work,
                                 &root_init,
                             )?;
                             let directory = state_root.join("v30/fresh-provider");

@@ -44,17 +44,59 @@ pub(super) struct Binding {
     root_starttime: u64,
     root_pidns_dev: u64,
     root_pidns_ino: u64,
-    causal_parent: Option<ParentActor>,
+    causal_parent: Option<ParentWorkStamp>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct ParentActor {
-    pid: i32,
-    starttime: u64,
-    boot_id: String,
+struct ParentWorkStamp {
+    grant_id: String,
+    work_id: String,
+    init_pid: i32,
+    init_starttime: u64,
     pidns_dev: u64,
     pidns_ino: u64,
+}
+
+pub(super) struct ParentWork {
+    stamp: ParentWorkStamp,
+    init: PinnedProcess,
+}
+
+impl ParentWork {
+    pub(super) fn grant_id(&self) -> &str {
+        &self.stamp.grant_id
+    }
+    pub(super) fn work_id(&self) -> &str {
+        &self.stamp.work_id
+    }
+}
+
+/// Walk kernel PID-namespace parents rather than process parents. A nested
+/// namespace, setsid, and later adoption leave this work relationship intact.
+fn in_namespace_lineage(actor: &PinnedProcess, ancestor: &File) -> io::Result<bool> {
+    actor.verify()?;
+    let target = ancestor.metadata()?;
+    let mut current = actor.namespace().try_clone()?;
+    loop {
+        let observed = current.metadata()?;
+        if (observed.dev(), observed.ino()) == (target.dev(), target.ino()) {
+            actor.verify()?;
+            return Ok(true);
+        }
+        let fd = unsafe { libc::ioctl(current.as_raw_fd(), libc::NS_GET_PARENT) };
+        if fd < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EPERM)
+                || error.raw_os_error() == Some(libc::ENOENT)
+            {
+                actor.verify()?;
+                return Ok(false);
+            }
+            return Err(error);
+        }
+        current = unsafe { File::from_raw_fd(fd) };
+    }
 }
 
 /// Caller must have just reattested the old release and fresh U/D through
@@ -109,17 +151,17 @@ pub(super) fn binding_from_held(
     })
 }
 
-/// A later Bash child has its own invocation, D and work key. This private
-/// binding checks the immediate parent at K and retains it for readback. It
-/// does not establish a consumed causal parent work grant or production W.
+/// A later Bash child has its own invocation, D and work key. Its parent is
+/// the consumed root provider K and live work namespace, independent of PPID.
 pub(super) fn binding_from_bash_child(
     release: &FreshReleasedHandoff,
     child: &FreshBashChild,
     bash: &PinnedProcess,
-    parent: Option<&PinnedProcess>,
+    parent: &ParentWork,
     root: &PinnedProcess,
 ) -> io::Result<Binding> {
     bash.verify()?;
+    parent.init.verify()?;
     root.verify()?;
     let prepared = &release.old_release.prepared;
     if child.root_handoff_id != release.handoff_id
@@ -136,26 +178,13 @@ pub(super) fn binding_from_bash_child(
         || (prepared.root_init.pidns_dev, prepared.root_init.pidns_ino)
             != (root.pidns_dev, root.pidns_ino)
         || !root.is_namespace_init()?
-        || !bash.in_namespace(root.namespace())?
+        || !in_namespace_lineage(bash, parent.init.namespace())?
+        || child.parent_work_grant_id != parent.stamp.grant_id
+        || child.parent_work_id != parent.stamp.work_id
     {
         return Err(io::Error::other(
             "fresh Bash work child/parent/root mismatch",
         ));
-    }
-    if let Some(parent) = parent {
-        parent.verify()?;
-        if prepared.joined_child.host_pid != parent.host_pid
-            || prepared.joined_child.starttime_ticks != parent.starttime_ticks
-            || prepared.joined_child.boot_id != parent.boot_id
-            || (
-                prepared.joined_child.pidns_dev,
-                prepared.joined_child.pidns_ino,
-            ) != (parent.pidns_dev, parent.pidns_ino)
-            || !parent.direct_child_of(root)?
-            || !bash.direct_child_of(parent)?
-        {
-            return Err(io::Error::other("fresh Bash K causal parent changed"));
-        }
     }
     Ok(Binding {
         root_id: prepared.root_id.clone(),
@@ -173,13 +202,7 @@ pub(super) fn binding_from_bash_child(
         root_starttime: root.starttime_ticks,
         root_pidns_dev: root.pidns_dev,
         root_pidns_ino: root.pidns_ino,
-        causal_parent: Some(ParentActor {
-            pid: prepared.joined_child.host_pid,
-            starttime: prepared.joined_child.starttime_ticks,
-            boot_id: prepared.joined_child.boot_id.clone(),
-            pidns_dev: prepared.joined_child.pidns_dev,
-            pidns_ino: prepared.joined_child.pidns_ino,
-        }),
+        causal_parent: Some(parent.stamp.clone()),
     })
 }
 
@@ -584,6 +607,94 @@ pub(super) fn grant_for_binding(directory: &Path, binding: &Binding) -> io::Resu
     Ok(Some(grant.id))
 }
 
+/// The root's challenged, one-use K and its broker-attached PID1 are the
+/// causal parent. A copied handoff/key or a process merely inside the root
+/// namespace cannot supply this proof. The namespace remains the work's
+/// identity after the provider exits and its descendants are adopted.
+pub(super) fn parent_for_bash(
+    directory: &Path,
+    release: &FreshReleasedHandoff,
+    root_session_id: &str,
+    bash: &PinnedProcess,
+    root: &PinnedProcess,
+) -> io::Result<ParentWork> {
+    let Some(grant): Option<Grant> = exact_file(
+        directory,
+        &format!("{}.fresh-grant.json", release.handoff_id),
+    )?
+    else {
+        return Err(io::Error::other("consumed causal parent work grant absent"));
+    };
+    let b = &grant.binding;
+    let prepared = &release.old_release.prepared;
+    if grant.version != 1
+        || b.causal_parent.is_some()
+        || b.root_id != prepared.root_id
+        || b.handoff_id != release.handoff_id
+        || b.grant_key != release.handoff_id
+        || b.invocation_uuid != release.invocation_uuid
+        || b.session_id != root_session_id
+        || b.owner_generation != prepared.owner_generation
+        || b.actor_pid != prepared.joined_child.host_pid
+        || b.actor_starttime != prepared.joined_child.starttime_ticks
+        || b.actor_boot_id != prepared.joined_child.boot_id
+        || (b.actor_pidns_dev, b.actor_pidns_ino)
+            != (
+                prepared.joined_child.pidns_dev,
+                prepared.joined_child.pidns_ino,
+            )
+        || b.root_pid != root.host_pid
+        || b.root_starttime != root.starttime_ticks
+        || (b.root_pidns_dev, b.root_pidns_ino) != (root.pidns_dev, root.pidns_ino)
+        || !root.is_namespace_init()?
+    {
+        return Err(io::Error::other("causal parent root K binding changed"));
+    }
+    let consumed: Option<Grant> = exact_file(directory, &format!("{}.consumed.json", grant.id))?;
+    if consumed.as_ref() != Some(&grant) {
+        return Err(io::Error::other("causal parent K not consumed"));
+    }
+    let Some(attach): Option<Attach> = exact_file(directory, &format!("{}.attach.json", grant.id))?
+    else {
+        return Err(io::Error::other("causal parent work attach absent"));
+    };
+    if attach.version != 1 || attach.grant_id != grant.id || attach.work_id.is_empty() {
+        return Err(io::Error::other("causal parent work attach changed"));
+    }
+    let init = PinnedProcess::open(attach.pid1)?;
+    let fd = unsafe { libc::ioctl(init.namespace().as_raw_fd(), libc::NS_GET_PARENT) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let parent_namespace = unsafe { File::from_raw_fd(fd) };
+    let parent_meta = parent_namespace.metadata()?;
+    if init.boot_id != b.actor_boot_id
+        || init.starttime_ticks != attach.pid1_starttime
+        || (init.pidns_dev, init.pidns_ino) != (attach.pidns_dev, attach.pidns_ino)
+        || !init.is_namespace_init()?
+        || (parent_meta.dev(), parent_meta.ino()) != (root.pidns_dev, root.pidns_ino)
+        || !in_namespace_lineage(bash, init.namespace())?
+    {
+        return Err(io::Error::other(
+            "Bash is outside exact consumed parent work",
+        ));
+    }
+    bash.verify()?;
+    root.verify()?;
+    init.verify()?;
+    Ok(ParentWork {
+        stamp: ParentWorkStamp {
+            grant_id: grant.id,
+            work_id: attach.work_id,
+            init_pid: init.host_pid,
+            init_starttime: init.starttime_ticks,
+            pidns_dev: init.pidns_dev,
+            pidns_ino: init.pidns_ino,
+        },
+        init,
+    })
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Attach {
@@ -813,6 +924,7 @@ fn run_init(mut init: Init) -> io::Result<()> {
 fn create_init(parent_ns: &File, init: Init) -> io::Result<(i32, UnixStream, UnixStream)> {
     let (broker_control, init_control) = UnixStream::pair()?;
     let (broker_gate, init_gate) = UnixStream::pair()?;
+    let (mut ready_rx, mut ready_tx) = UnixStream::pair()?;
     let one: libc::c_int = 1;
     if unsafe {
         libc::setsockopt(
@@ -838,6 +950,7 @@ fn create_init(parent_ns: &File, init: Init) -> io::Result<(i32, UnixStream, Uni
     if pid == 0 {
         drop(broker_control);
         drop(broker_gate);
+        drop(ready_rx);
         if unsafe { libc::setns(parent_ns.as_raw_fd(), libc::CLONE_NEWPID) } != 0 {
             unsafe { libc::_exit(70) };
         }
@@ -846,8 +959,33 @@ fn create_init(parent_ns: &File, init: Init) -> io::Result<(i32, UnixStream, Uni
             unsafe { libc::_exit(70) };
         }
         if entered > 0 {
-            unsafe { libc::_exit(0) };
+            // Keep the actual parent of `entered` alive and wait for it. A
+            // double-fork orphan can be adopted by the outside broker's
+            // subreaper; its zombie then pins the parent work PID namespace
+            // while PID1 is trying to discharge Q.
+            drop(init);
+            if work_launch::close_other_descriptors(&[ready_tx.as_raw_fd()]).is_err() {
+                unsafe { libc::_exit(70) };
+            }
+            if ready_tx.write_all(b"R").is_err() {
+                unsafe { libc::_exit(70) };
+            }
+            let mut status = 0;
+            let waited = unsafe { libc::waitpid(entered, &mut status, 0) };
+            unsafe {
+                libc::_exit(
+                    if waited == entered
+                        && libc::WIFEXITED(status)
+                        && libc::WEXITSTATUS(status) == 0
+                    {
+                        0
+                    } else {
+                        70
+                    },
+                )
+            };
         }
+        drop(ready_tx);
         let ptr = Box::into_raw(Box::new(init));
         let mut stack = vec![0u8; 1024 * 1024];
         let top = unsafe { stack.as_mut_ptr().add(stack.len()) };
@@ -886,13 +1024,22 @@ fn create_init(parent_ns: &File, init: Init) -> io::Result<(i32, UnixStream, Uni
         unsafe { libc::_exit(if okay { 0 } else { 70 }) };
     }
     drop(init);
-    let mut status = 0;
-    if unsafe { libc::waitpid(pid, &mut status, 0) } != pid
-        || !libc::WIFEXITED(status)
-        || libc::WEXITSTATUS(status) != 0
-    {
+    drop(ready_tx);
+    let mut ready = [0u8; 1];
+    if ready_rx.read_exact(&mut ready).is_err() || ready != [b'R'] {
+        let mut status = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
         return Err(io::Error::other("fresh provider namespace helper failed"));
     }
+    std::thread::Builder::new()
+        .name("fresh-provider-helper-reaper".into())
+        .spawn(move || {
+            let mut status = 0;
+            let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+            if waited != pid || !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+                eprintln!("fresh provider namespace helper did not exit cleanly: {pid}");
+            }
+        })?;
     let cred = work_launch::child_credential(&broker_control, b'I')?;
     if cred.uid != 0 || cred.pid <= 0 {
         return Err(io::Error::other("fresh provider PID1 identity refused"));
@@ -920,27 +1067,47 @@ pub(super) fn launch(
         || actor.boot_id != b.actor_boot_id
         || (actor.pidns_dev, actor.pidns_ino) != (b.actor_pidns_dev, b.actor_pidns_ino)
         || !root.is_namespace_init()?
-        || !actor.in_namespace(root.namespace())?
     {
         return Err(io::Error::other("fresh provider K root or actor changed"));
     }
-    match &b.causal_parent {
+    let parent_namespace = match &b.causal_parent {
         Some(parent) => {
-            let pinned = PinnedProcess::open(parent.pid)?;
-            if pinned.starttime_ticks != parent.starttime
-                || pinned.boot_id != parent.boot_id
+            let consumed: Grant = exact_file(
+                &prepared.directory,
+                &format!("{}.consumed.json", parent.grant_id),
+            )?
+            .ok_or_else(|| io::Error::other("causal parent consumed K absent"))?;
+            let attach: Attach = exact_file(
+                &prepared.directory,
+                &format!("{}.attach.json", parent.grant_id),
+            )?
+            .ok_or_else(|| io::Error::other("causal parent attach absent"))?;
+            let pinned = PinnedProcess::open(parent.init_pid)?;
+            if consumed.id != parent.grant_id
+                || consumed.binding.causal_parent.is_some()
+                || consumed.binding.root_id != b.root_id
+                || consumed.binding.handoff_id != b.handoff_id
+                || attach.grant_id != parent.grant_id
+                || attach.work_id != parent.work_id
+                || attach.pid1 != parent.init_pid
+                || attach.pid1_starttime != parent.init_starttime
+                || (attach.pidns_dev, attach.pidns_ino) != (parent.pidns_dev, parent.pidns_ino)
+                || pinned.starttime_ticks != parent.init_starttime
                 || (pinned.pidns_dev, pinned.pidns_ino) != (parent.pidns_dev, parent.pidns_ino)
-                || !pinned.direct_child_of(root)?
-                || !actor.direct_child_of(&pinned)?
+                || !pinned.is_namespace_init()?
+                || !in_namespace_lineage(actor, pinned.namespace())?
             {
                 return Err(io::Error::other("fresh Bash K causal parent changed"));
             }
+            pinned.namespace().try_clone()?
         }
-        None if !actor.direct_child_of(root)? => {
-            return Err(io::Error::other("fresh provider K root child changed"));
+        None => {
+            if !actor.direct_child_of(root)? || !actor.in_namespace(root.namespace())? {
+                return Err(io::Error::other("fresh provider K root child changed"));
+            }
+            root.namespace().try_clone()?
         }
-        None => {}
-    }
+    };
     if unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) } != 0
         || unsafe { libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0) } != 0
     {
@@ -990,7 +1157,7 @@ pub(super) fn launch(
         gid,
         groups: actor.supplementary_groups()?,
     };
-    let (pid, mut control, mut gate) = create_init(root.namespace(), init)?;
+    let (pid, mut control, mut gate) = create_init(&parent_namespace, init)?;
     let init_pin = PinnedProcess::open(pid)?;
     if !init_pin.is_namespace_init()? {
         return Err(io::Error::other("fresh provider PID1 not namespace init"));

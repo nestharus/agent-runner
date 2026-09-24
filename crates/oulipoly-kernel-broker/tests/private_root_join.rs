@@ -18,12 +18,14 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[track_caller]
 fn eventually(mut condition: impl FnMut() -> bool) {
     let until = Instant::now() + Duration::from_secs(20);
     while !condition() {
         assert!(
             Instant::now() < until,
-            "private root join fixture timed out"
+            "private root join fixture timed out at {}",
+            std::panic::Location::caller()
         );
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -65,6 +67,7 @@ fn inner() {
             | "normal_help"
             | "normal_model_held"
             | "normal_model_provider"
+            | "normal_model_provider_bash_causal"
             | "normal_model_provider_reply_loss"
             | "normal_model_provider_restart"
     );
@@ -74,7 +77,7 @@ fn inner() {
     let io_failure_source = mode == "normal_bash_source_capture_io_failure";
     let runner =
         std::env::var("OULIPOLY_AGE319_RUNNER_IMAGE").expect("built Runner image required");
-    let bash = (mode == "normal_handoff_bash_child")
+    let bash = (mode == "normal_handoff_bash_child" || mode == "normal_model_provider_bash_causal")
         .then(|| std::env::var("OULIPOLY_AGE319_BASH_IMAGE").expect("built Bash image required"));
     let bash_request = uuid::Uuid::new_v4().to_string();
     let provider_image = std::env::var("OULIPOLY_AGE319_PROVIDER_IMAGE").unwrap_or_default();
@@ -323,7 +326,10 @@ fn inner() {
                 bash.as_ref()
                     .map(|path| ("AGE319_PRIVATE_BASH_IMAGE", path)),
             )
-            .envs(bash.as_ref().map(|_| ("AGE319_PRIVATE_BASH_CHILD_V1", "1")))
+            .envs(
+                (mode == "normal_handoff_bash_child")
+                    .then_some(("AGE319_PRIVATE_BASH_CHILD_V1", "1")),
+            )
             .envs(bash.as_ref().map(|_| {
                 (
                     "AGE319_PRIVATE_BASH_EFFECT_MARKER",
@@ -339,6 +345,10 @@ fn inner() {
             .envs((mode == "normal_help").then_some(("AGE319_PRIVATE_OFFLINE_ROOT_V1", "1")))
             .envs(model_mode.then_some(("AGE319_PRIVATE_NORMAL_ROOT_V1", "1")))
             .envs(provider_mode.then_some(("AGE319_PRIVATE_FRESH_PROVIDER_V1", "1")))
+            .envs(
+                (mode == "normal_model_provider_bash_causal")
+                    .then_some(("AGE319_PRIVATE_PROVIDER_CAUSAL_BASH_V1", "1")),
+            )
             .envs(
                 provider_mode
                     .then_some(("AGE319_PRIVATE_PROVIDER_IMAGE_V1", provider_image.as_str())),
@@ -575,8 +585,68 @@ fn inner() {
                 fs::read_to_string(&err).unwrap()
             );
             if mode == "normal_handoff_bash_child" {
-                let report: serde_json::Value =
-                    serde_json::from_slice(&fs::read(gate.join("bash-child")).unwrap()).unwrap();
+                let refusals: serde_json::Value =
+                    serde_json::from_slice(&fs::read(gate.join("bash-child-refused")).unwrap())
+                        .unwrap();
+                assert!(
+                    refusals["direct"]
+                        .as_str()
+                        .unwrap()
+                        .contains("consumed causal parent work grant absent")
+                );
+                assert!(
+                    refusals["grandchild"]
+                        .as_str()
+                        .unwrap()
+                        .contains("consumed causal parent work grant absent")
+                );
+                assert!(!gate.join("bash-effect").exists());
+                let fresh = rusqlite::Connection::open(broker_state.join("v30/state.db")).unwrap();
+                let count: i64 = fresh
+                    .query_row("SELECT count(*) FROM fresh_bash_child", [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(count, 0);
+                fs::write(gate.join("child-effect"), b"yes").unwrap();
+                eventually(|| entry.try_wait().unwrap().is_some());
+                assert!(
+                    entry.wait().unwrap().success(),
+                    "{}",
+                    fs::read_to_string(&err).unwrap()
+                );
+                stop(&mut broker);
+                return;
+            }
+            if mode == "normal_model_provider_bash_causal" {
+                fs::write(gate.join("child-effect"), b"yes").unwrap();
+                let until = Instant::now() + Duration::from_secs(20);
+                while fs::read(gate.join("bash-causal-output"))
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                    .is_none()
+                    && entry.try_wait().unwrap().is_none()
+                    && Instant::now() < until
+                {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                assert!(
+                    gate.join("bash-causal-output").exists(),
+                    "causal Bash did not launch; entry={} broker={} bash={}",
+                    fs::read_to_string(&err).unwrap_or_default(),
+                    fs::read_to_string(&broker_log).unwrap_or_default(),
+                    fs::read_to_string(gate.join("bash-causal-error")).unwrap_or_default()
+                );
+                let report: serde_json::Value = serde_json::from_slice(
+                    &fs::read(gate.join("bash-causal-output")).unwrap(),
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "causal Bash: {error}; stderr: {}; entry: {}; broker: {}; helper: {}",
+                        fs::read_to_string(gate.join("bash-causal-error")).unwrap_or_default(),
+                        fs::read_to_string(&err).unwrap_or_default(),
+                        fs::read_to_string(&broker_log).unwrap_or_default(),
+                        fs::read_to_string(gate.join("causal-helper-error")).unwrap_or_default()
+                    )
+                });
                 let child: oulipoly_state::mailbox::FreshBashChild =
                     serde_json::from_value(report["child"].clone()).unwrap();
                 let result: oulipoly_state::mailbox::FreshBashPrivateResult =
@@ -612,6 +682,43 @@ fn inner() {
                 .unwrap();
                 assert_eq!(child.request_id, bash_request);
                 assert_eq!(child.parent_invocation_uuid, root.invocation_uuid);
+                let parent_grant: serde_json::Value = serde_json::from_slice(
+                    &fs::read(physical_dir.join(format!("{}.fresh-grant.json", root.handoff_id)))
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(child.parent_work_grant_id, parent_grant["id"]);
+                assert_ne!(child.actor.pidns_ino, prepared.root_init.pidns_ino);
+                let parent_attach: serde_json::Value = serde_json::from_slice(
+                    &fs::read(
+                        physical_dir.join(format!("{}.attach.json", child.parent_work_grant_id)),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(child.parent_work_id, parent_attach["work_id"]);
+                assert_eq!(fs::read(gate.join("causal-env-count")).unwrap(), b"0");
+                assert_eq!(fs::read(gate.join("causal-fd-clear")).unwrap(), b"closed");
+                let keyring_result =
+                    fs::read_to_string(gate.join("causal-keyring-result")).unwrap();
+                assert_eq!(keyring_result, "joined-empty-session-keyring");
+                let intermediary_pid =
+                    fs::read_to_string(gate.join("causal-intermediary-proc-pid")).unwrap();
+                assert_ne!(
+                    report["parent_pid_before_c"],
+                    intermediary_pid.parse::<u32>().unwrap(),
+                    "Bash retained the intermediary as direct parent at C"
+                );
+                assert_ne!(
+                    child.actor.pidns_ino,
+                    parent_attach["pidns_ino"].as_u64().unwrap(),
+                    "Bash must run inside a nested PID namespace below its parent work"
+                );
+                assert!(
+                    physical_dir
+                        .join(format!("{}.consumed.json", child.parent_work_grant_id))
+                        .exists()
+                );
                 assert_eq!(child.root_id, prepared.root_id);
                 assert_ne!(child.invocation_uuid, root.invocation_uuid);
                 assert_ne!(child.d_key, root.d_key);
@@ -803,6 +910,55 @@ fn inner() {
                     "copied root data admitted sibling Bash"
                 );
                 assert!(!outside_marker.exists());
+                fs::write(gate.join("sibling-request"), b"yes").unwrap();
+                eventually(|| {
+                    fs::read(gate.join("sibling-result.json"))
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                        .is_some()
+                        || entry.try_wait().unwrap().is_some()
+                });
+                let sibling_result: serde_json::Value =
+                    serde_json::from_slice(&fs::read(gate.join("sibling-result.json")).unwrap())
+                        .unwrap();
+                assert_eq!(sibling_result["success"], false);
+                assert!(
+                    sibling_result["stderr"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Bash is outside exact consumed parent work"),
+                    "same-root sibling namespace refusal: {sibling_result}"
+                );
+                assert!(!gate.join("sibling-effect").exists());
+                fs::write(gate.join("provider-cancel"), b"yes").unwrap();
+                let until = Instant::now() + Duration::from_secs(20);
+                while entry.try_wait().unwrap().is_none() && Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                assert!(
+                    entry.try_wait().unwrap().is_some(),
+                    "causal parent Q wait: entry={} broker={}",
+                    fs::read_to_string(&err).unwrap_or_default(),
+                    fs::read_to_string(&broker_log).unwrap_or_default()
+                );
+                assert!(
+                    fs::read_to_string(&err)
+                        .unwrap()
+                        .contains("private provider Q verified"),
+                    "{}",
+                    fs::read_to_string(&err).unwrap()
+                );
+                let parent_grant_id = child.parent_work_grant_id;
+                for suffix in ["consumed", "exit", "drain", "pid1-wait"] {
+                    assert!(
+                        physical_dir
+                            .join(format!("{parent_grant_id}.{suffix}.json"))
+                            .exists(),
+                        "causal parent physical {suffix} absent"
+                    );
+                }
+                // Preserve the original child's durable-result readback
+                // check after a broker restart, now on the causal route.
                 stop(&mut broker);
                 broker = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
                     .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
@@ -823,25 +979,6 @@ fn inner() {
                     reopened.read_private_bash_result(&bash_request).unwrap(),
                     lane.read_private_bash_result(&bash_request).unwrap()
                 );
-                fs::write(gate.join("child-effect"), b"yes").unwrap();
-                eventually(|| entry.try_wait().unwrap().is_some());
-                assert!(
-                    entry.wait().unwrap().success(),
-                    "{}",
-                    fs::read_to_string(&err).unwrap()
-                );
-                assert_eq!(
-                    fs::read_to_string(&out).unwrap(),
-                    format!("OULIPOLY_KERNEL_V30_CHILD_EFFECT={}\n", released.release_id)
-                );
-                let root_effect: String = fresh
-                    .query_row(
-                        "SELECT state FROM fresh_root_effect WHERE handoff_id=?1",
-                        [&root.handoff_id],
-                        |row| row.get(0),
-                    )
-                    .unwrap();
-                assert_eq!(root_effect, "returned_success");
                 stop(&mut broker);
                 return;
             }
@@ -3343,6 +3480,7 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_help",
         "normal_model_held",
         "normal_model_provider",
+        "normal_model_provider_bash_causal",
         "normal_model_provider_reply_loss",
         "normal_model_provider_restart",
         "normal_guardian_death",

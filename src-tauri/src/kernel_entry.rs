@@ -468,19 +468,18 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
                     .arg("__age319-private-admit-child-v1")
                     .output()
                     .map_err(|e| e.to_string())?;
-                if !output.status.success() {
+                if output.status.success()
+                    || !String::from_utf8_lossy(&output.stderr)
+                        .contains("consumed causal parent work grant absent")
+                {
                     return Err(format!(
-                        "real private Bash child failed: {}",
+                        "root-only Bash was not refused: {}",
                         String::from_utf8_lossy(&output.stderr)
                     ));
                 }
-                let report: serde_json::Value =
-                    serde_json::from_slice(&output.stdout).map_err(|e| e.to_string())?;
-                private_v30_marker("bash-child", &report)?;
-                // A Bash image in the same released root namespace is not
-                // enough to create another child. The shell remains alive as
-                // Bash's direct parent, so this exercises a real in-root
-                // grandchild rather than an outside process.
+                // A direct child and a grandchild both lack a consumed parent
+                // K. Their root membership, image and copied environment do
+                // not authorize C.
                 let unrelated_marker = PathBuf::from(
                     std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
                         .ok_or("private gate directory absent")?,
@@ -499,13 +498,20 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
                     return Err("in-root Bash grandchild acquired fresh child admission".into());
                 }
                 if !String::from_utf8_lossy(&unrelated.stderr)
-                    .contains("Bash child has no exact released Runner parent")
+                    .contains("consumed causal parent work grant absent")
                 {
                     return Err(format!(
                         "in-root Bash grandchild refused for unexpected reason: {}",
                         String::from_utf8_lossy(&unrelated.stderr)
                     ));
                 }
+                private_v30_marker(
+                    "bash-child-refused",
+                    &serde_json::json!({
+                        "direct": String::from_utf8_lossy(&output.stderr),
+                        "grandchild": String::from_utf8_lossy(&unrelated.stderr),
+                    }),
+                )?;
             }
         }
         effect_binding = Some((receipt, session));
@@ -697,16 +703,32 @@ fn private_fresh_provider(
         }
         _ => return Err("private provider requires exact fixture model/prompt syntax".into()),
     };
-    let image = std::env::var("AGE319_PRIVATE_PROVIDER_IMAGE_V1")
-        .map_err(|_| "private provider image absent")?;
+    let causal = std::env::var_os("AGE319_PRIVATE_PROVIDER_CAUSAL_BASH_V1").is_some();
+    let image_path = PathBuf::from(
+        std::env::var("AGE319_PRIVATE_PROVIDER_IMAGE_V1")
+            .map_err(|_| "private provider image absent")?,
+    );
     let marker = std::env::var("AGE319_PRIVATE_PROVIDER_MARKER_V1")
         .map_err(|_| "private provider marker absent")?;
-    let image = File::open(&image).map_err(|e| e.to_string())?;
+    let image = File::open(&image_path).map_err(|e| e.to_string())?;
     let cwd = File::open(std::env::current_dir().map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
     let input = private_sealed_bytes(b"fresh-provider-input", args[2].as_bytes())?;
+    let argv = if causal {
+        vec![
+            marker,
+            std::env::var("AGE319_PRIVATE_BASH_IMAGE").map_err(|_| "private Bash image absent")?,
+            socket_for_private_causal_bash().display().to_string(),
+            std::env::var("AGE319_PRIVATE_BASH_REQUEST_KEY")
+                .map_err(|_| "private Bash request absent")?,
+            std::env::var("AGE319_PRIVATE_BASH_EFFECT_MARKER")
+                .map_err(|_| "private Bash marker absent")?,
+        ]
+    } else {
+        vec![marker]
+    };
     let recipe_bytes = serde_json::to_vec(&serde_json::json!({
-        "argv": [marker], "env": [["PATH", "/usr/bin:/bin"]],
+        "argv": argv, "env": [["PATH", "/usr/bin:/bin"]],
     }))
     .map_err(|e| e.to_string())?;
     let recipe = private_sealed_bytes(b"fresh-provider-recipe", &recipe_bytes)?;
@@ -759,7 +781,8 @@ fn private_fresh_provider(
     {
         return Err("private provider duplicate K was accepted".into());
     }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(if causal { 90 } else { 20 });
     loop {
         let state = protocol::private_fresh_provider_at(&socket, &receipt.d_key, b'6', None)
             .map_err(|e| format!("private provider result readback failed: {e}"))?;
@@ -773,7 +796,38 @@ fn private_fresh_provider(
     }
     let gate = std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
         .map_err(|_| "private provider gate directory absent")?;
+    let mut sibling_checked = !causal;
     while !std::path::Path::new(&gate).join("provider-cancel").exists() {
+        if !sibling_checked && std::path::Path::new(&gate).join("sibling-request").exists() {
+            let sibling_effect = std::path::Path::new(&gate).join("sibling-effect");
+            let output = std::process::Command::new("unshare")
+                .args(["--pid", "--fork", "--"])
+                .arg(
+                    std::env::var("AGE319_PRIVATE_BASH_IMAGE")
+                        .map_err(|_| "private sibling Bash image absent")?,
+                )
+                .arg("__age319-private-admit-child-v1")
+                .arg(&socket)
+                .arg(
+                    std::env::var("AGE319_PRIVATE_BASH_REQUEST_KEY")
+                        .map_err(|_| "private sibling Bash request absent")?,
+                )
+                .arg(&sibling_effect)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .output()
+                .map_err(|error| format!("private sibling namespace launch failed: {error}"))?;
+            std::fs::write(
+                std::path::Path::new(&gate).join("sibling-result.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "success": output.status.success(),
+                    "stderr": String::from_utf8_lossy(&output.stderr),
+                }))
+                .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+            sibling_checked = true;
+        }
         if std::time::Instant::now() >= deadline {
             return Err("private provider cancellation fixture expired".into());
         }
@@ -798,6 +852,11 @@ fn private_fresh_provider(
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn socket_for_private_causal_bash() -> PathBuf {
+    broker_socket().with_file_name("v30.sock")
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]

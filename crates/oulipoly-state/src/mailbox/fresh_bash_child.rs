@@ -10,6 +10,10 @@ pub struct FreshBashChild {
     pub root_handoff_id: String,
     pub root_id: String,
     pub parent_invocation_uuid: String,
+    /// Broker-observed, consumed K for the work namespace containing Bash.
+    /// These are immutable readback identities, never caller authority.
+    pub parent_work_grant_id: String,
+    pub parent_work_id: String,
     pub actor: FreshRecipientIdentity,
     pub registration_authority: String,
     pub session: FreshV30Session,
@@ -138,8 +142,12 @@ impl FreshV30Lane {
         root: &FreshReleasedHandoff,
         root_actor: &FreshRecipientIdentity,
         actor: &FreshRecipientIdentity,
+        parent_work_grant_id: &str,
+        parent_work_id: &str,
     ) -> Result<FreshBashChild, String> {
         validate_request_id(request_id)?;
+        validate_request_id(parent_work_grant_id)?;
+        validate_request_id(parent_work_id)?;
         if actor.host_pid <= 0 || actor.starttime_ticks == 0 || actor.boot_id.is_empty()
             || actor == root_actor
         {
@@ -156,6 +164,8 @@ impl FreshV30Lane {
             root_handoff_id: root.handoff_id.clone(),
             root_id: root.old_release.prepared.root_id.clone(),
             parent_invocation_uuid: root.invocation_uuid.clone(),
+            parent_work_grant_id: parent_work_grant_id.into(),
+            parent_work_id: parent_work_id.into(),
             actor: actor.clone(),
             registration_authority: crate::CompletionRegistrationAuthority::generate()?
                 .process_environment_value().into(),
@@ -188,6 +198,8 @@ impl FreshV30Lane {
             || stored.invocation_uuid == root.invocation_uuid
             || stored.d_key == root.d_key
             || stored.actor != *actor
+            || stored.parent_work_grant_id != parent_work_grant_id
+            || stored.parent_work_id != parent_work_id
         {
             return Err("Bash child actor or parent conflict".into());
         }
@@ -287,6 +299,8 @@ impl FreshV30Lane {
         if child.actor != *actor || child.root_handoff_id != root.handoff_id
             || child.root_id != root.old_release.prepared.root_id
             || child.parent_invocation_uuid != root.invocation_uuid
+            || validate_request_id(&child.parent_work_grant_id).is_err()
+            || validate_request_id(&child.parent_work_id).is_err()
             || child.invocation_uuid == root.invocation_uuid
             || child.d_key == root.d_key
             || child.session.session_id == root_session.session_id
