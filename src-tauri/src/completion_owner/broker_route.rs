@@ -5,8 +5,9 @@ use oulipoly_kernel_broker::protocol::{
     self, StateReadSpec, StateRoute, StateWriteAction, StateWriteSpec,
 };
 use oulipoly_state::mailbox::{
-    BrokerContinuationReadback, BrokerReleaseEvidence, BrokerRepairReadback, BrokerSourceSelection,
-    CompletionDomainOwner, ContinuationAttempt, PreparedBrokerOwner,
+    BrokerContinuationReadback, BrokerReleaseEvidence, BrokerRepairReadback,
+    BrokerSourceEffectGrant, BrokerSourceSelection, CompletionDomainOwner, ContinuationAttempt,
+    PreparedBrokerOwner,
 };
 use std::path::{Path, PathBuf};
 
@@ -20,6 +21,106 @@ pub(crate) struct V30OwnerRoute {
 }
 
 impl V30OwnerRoute {
+    pub(crate) fn reserve_source_grant(
+        &self,
+        owner: &CompletionDomainOwner,
+        selected: &BrokerSourceSelection,
+    ) -> Result<BrokerSourceEffectGrant, String> {
+        self.read_running(owner, None)?;
+        if selected.source_generation != self.source_generation
+            || selected.root_id != self.root_id
+            || selected.owner_generation != self.owner_generation
+            || selected.candidate.is_none()
+        {
+            return Err("source grant selection changed".into());
+        }
+        let spec = self.write_spec(
+            "broker-source-grant-reserve-v30",
+            StateWriteAction::ReserveSourceGrant,
+        );
+        #[cfg(feature = "age319-private-broker-fixture")]
+        let written = if std::env::var_os("AGE319_PRIVATE_SOURCE_GRANT_REPLY_LOSS_V1").is_some() {
+            protocol::reserve_source_effect_grant_drop_reply_at(&self.socket, &spec)
+                .map(|()| Err(std::io::Error::other("private source grant reply lost")))
+                .unwrap_or_else(Err)
+        } else {
+            protocol::reserve_source_effect_grant_at(&self.socket, &spec)
+        };
+        #[cfg(not(feature = "age319-private-broker-fixture"))]
+        let written = protocol::reserve_source_effect_grant_at(&self.socket, &spec);
+        let exact = self
+            .read_source_grant(owner)
+            .map_err(|error| {
+                format!(
+                    "{}; source grant readback: {error}",
+                    written
+                        .as_ref()
+                        .err()
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "source grant reply received".into())
+                )
+            })?
+            .ok_or("broker source grant missing after reservation")?;
+        if exact.source_generation != self.source_generation
+            || exact.root_id != self.root_id
+            || exact.owner_generation != self.owner_generation
+            || exact.candidate != *selected.candidate.as_ref().unwrap()
+            || exact.authority_ordinal != selected.authority_ordinal
+            || !matches!(exact.phase.as_str(), "reserved" | "unknown")
+            || written.as_ref().is_ok_and(|value| value != &exact)
+        {
+            return Err("broker source grant reservation/readback conflict".into());
+        }
+        #[cfg(feature = "age319-private-broker-fixture")]
+        if std::env::var_os("AGE319_PRIVATE_SOURCE_SELECTION_CHALLENGE_V1").is_some() {
+            if protocol::reserve_source_effect_grant_at(&self.socket, &spec).is_ok() {
+                return Err("private source grant replay reserved a second effect".into());
+            }
+            for (field, value) in [
+                ("root", uuid::Uuid::new_v4().to_string()),
+                ("source", uuid::Uuid::new_v4().to_string()),
+                ("owner", uuid::Uuid::new_v4().to_string()),
+            ] {
+                let mut wrong = self.write_spec(
+                    "broker-source-grant-reserve-v30",
+                    StateWriteAction::ReserveSourceGrant,
+                );
+                match field {
+                    "root" => wrong.root_id = value,
+                    "source" => wrong.source_generation = value,
+                    _ => wrong.owner_generation = value,
+                }
+                if protocol::reserve_source_effect_grant_at(&self.socket, &wrong).is_ok() {
+                    return Err(
+                        "private wrong-root/stale-source/sibling-owner grant accepted".into(),
+                    );
+                }
+            }
+        }
+        Ok(exact)
+    }
+
+    pub(crate) fn read_source_grant(
+        &self,
+        owner: &CompletionDomainOwner,
+    ) -> Result<Option<BrokerSourceEffectGrant>, String> {
+        self.read_running(owner, None)?;
+        let grant = protocol::read_source_effect_grant_at(
+            &self.socket,
+            &self.read_spec("broker-source-grant-read-v30", None),
+        )
+        .map_err(|e| e.to_string())?;
+        if grant.as_ref().is_some_and(|grant| {
+            grant.source_generation != self.source_generation
+                || grant.root_id != self.root_id
+                || grant.owner_generation != self.owner_generation
+                || grant.driver_identity != owner.driver_identity
+        }) {
+            return Err("broker source grant owner/readback conflict".into());
+        }
+        Ok(grant)
+    }
+
     pub(crate) fn source_selection(
         &self,
         owner: &CompletionDomainOwner,

@@ -143,6 +143,23 @@ pub struct BrokerSourceCandidate {
     pub listener: crate::completion_continuation::ListenerIdentity,
 }
 
+/// Durable one-use source debt. `reserved` has no effect authority until a
+/// physically held recovery child consumes it; `unknown` cannot mint another
+/// grant. No production transition to `consumed` exists before that custody
+/// path is wired.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct BrokerSourceEffectGrant {
+    pub grant_id: String,
+    pub source_generation: String,
+    pub root_id: String,
+    pub owner_generation: String,
+    pub driver_identity: crate::completion_continuation::SourceProcessIdentity,
+    pub authority_ordinal: i64,
+    pub candidate: BrokerSourceCandidate,
+    pub phase: String,
+    pub revision: i64,
+}
+
 /// Installer-owned proof that the old service images and every sidecar writer
 /// were stopped, joined and fenced. No production constructor exists yet:
 /// the installed service/launcher census and new-entry fence must be added
@@ -370,6 +387,210 @@ impl BrokerSidecar {
             authority_ordinal: head.map_or(0, |head| head.authority_ordinal),
             candidate,
         })
+    }
+
+    /// Reserve only the broker's first still-pending State-projected source.
+    /// The caller supplies no registration, listener, path or grant ID.
+    pub fn reserve_source_effect_grant(
+        &mut self,
+        source_generation: &str,
+        root_id: &str,
+        owner: &CompletionDomainOwner,
+    ) -> Result<BrokerSourceEffectGrant, String> {
+        let running = self.read_exact_continuation(
+            source_generation,
+            root_id,
+            &owner.domain_id,
+            &owner.supervisor_authority_id,
+            &owner.owner_generation,
+            None,
+        )?;
+        if !running.broker_owned || running.owner != *owner {
+            return Err("broker source grant requires exact running owner".into());
+        }
+        let selection = self.read_bounded_source_selection(source_generation, root_id, owner)?;
+        let candidate = selection
+            .candidate
+            .ok_or("broker source grant has no pending source")?;
+        let binding = self
+            .mailbox
+            .unaccepted_completion_continuations(&owner.supervisor_authority_id, 1)?
+            .into_iter()
+            .next()
+            .ok_or("broker source binding vanished")?;
+        let registration = binding.registration()?;
+        if registration.registration_id != candidate.registration_id
+            || binding.registration_digest() != candidate.registration_digest
+            || registration.listener_revision != candidate.listener_revision
+            || binding.admission_listener()? != candidate.listener
+        {
+            return Err("broker source binding changed before grant".into());
+        }
+        if self
+            .read_source_effect_grant(source_generation, root_id, owner)?
+            .is_some()
+        {
+            return Err("broker source grant already exists".into());
+        }
+        let grant_id = uuid::Uuid::new_v4().to_string();
+        self.mailbox
+            .conn
+            .execute(
+                "INSERT INTO broker_source_effect_grant (
+             grant_id,source_generation,root_id,owner_generation,driver_identity,
+             authority_ordinal,registration_id,registration_digest,registration_bytes,
+             listener_revision,listener_json,phase,revision)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'reserved',1)",
+                params![
+                    grant_id,
+                    source_generation,
+                    root_id,
+                    owner.owner_generation,
+                    serde_json::to_string(&owner.driver_identity).map_err(|e| e.to_string())?,
+                    selection.authority_ordinal,
+                    candidate.registration_id,
+                    candidate.registration_digest,
+                    binding.registration_bytes(),
+                    i64::try_from(candidate.listener_revision)
+                        .map_err(|_| "broker source listener revision exceeds SQLite range")?,
+                    serde_json::to_string(&candidate.listener).map_err(|e| e.to_string())?
+                ],
+            )
+            .map_err(|e| format!("broker source grant reservation failed: {e}"))?;
+        let exact = self
+            .read_source_effect_grant(source_generation, root_id, owner)?
+            .ok_or("broker source grant disappeared after reservation")?;
+        if exact.grant_id != grant_id
+            || exact.phase != "reserved"
+            || exact.revision != 1
+            || exact.candidate != candidate
+            || exact.authority_ordinal != selection.authority_ordinal
+        {
+            return Err("broker source grant reservation/readback conflict".into());
+        }
+        Ok(exact)
+    }
+
+    /// Exact readback after a lost reservation reply. Selection is repeated
+    /// from retained State/sidecar; a caller-selected source cannot find a
+    /// grant for another registration.
+    pub fn read_source_effect_grant(
+        &self,
+        source_generation: &str,
+        root_id: &str,
+        owner: &CompletionDomainOwner,
+    ) -> Result<Option<BrokerSourceEffectGrant>, String> {
+        let running = self.read_exact_continuation(
+            source_generation,
+            root_id,
+            &owner.domain_id,
+            &owner.supervisor_authority_id,
+            &owner.owner_generation,
+            None,
+        )?;
+        if !running.broker_owned || running.owner != *owner {
+            return Err("broker source grant read requires exact running owner".into());
+        }
+        let selection = self.read_bounded_source_selection(source_generation, root_id, owner)?;
+        let Some(candidate) = selection.candidate else {
+            return Ok(None);
+        };
+        let row = self
+            .mailbox
+            .conn
+            .query_row(
+                "SELECT grant_id,source_generation,root_id,owner_generation,driver_identity,
+             authority_ordinal,registration_digest,registration_bytes,
+             listener_revision,listener_json,phase,revision
+             FROM broker_source_effect_grant WHERE registration_id=?1",
+                [&candidate.registration_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, Vec<u8>>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, i64>(11)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some((
+            grant_id,
+            generation,
+            root,
+            owner_id,
+            driver_json,
+            ordinal,
+            digest,
+            registration_bytes,
+            listener_revision,
+            listener_json,
+            phase,
+            revision,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        let listener_revision = u64::try_from(listener_revision)
+            .map_err(|_| "broker source grant listener revision is negative")?;
+        let driver_identity = serde_json::from_str(&driver_json).map_err(|e| e.to_string())?;
+        let listener: crate::completion_continuation::ListenerIdentity =
+            serde_json::from_str(&listener_json).map_err(|e| e.to_string())?;
+        if generation != source_generation
+            || root != root_id
+            || owner_id != owner.owner_generation
+            || driver_identity != owner.driver_identity
+            || uuid::Uuid::parse_str(&grant_id)
+                .map(|id| id.to_string() != grant_id)
+                .unwrap_or(true)
+            || digest != candidate.registration_digest
+            || registration_bytes.len() > crate::completion_continuation::MAX_REGISTRATION_BYTES
+            || crate::completion_continuation::sha256(&registration_bytes) != digest
+            || listener_revision != candidate.listener_revision
+            || listener != candidate.listener
+            || ordinal > selection.authority_ordinal
+            || !matches!(
+                (phase.as_str(), revision),
+                ("reserved", 1) | ("consumed" | "unknown", 2..)
+            )
+        {
+            return Err("broker source grant exact readback conflict".into());
+        }
+        Ok(Some(BrokerSourceEffectGrant {
+            grant_id,
+            source_generation: generation,
+            root_id: root,
+            owner_generation: owner_id,
+            driver_identity,
+            authority_ordinal: ordinal,
+            candidate,
+            phase,
+            revision,
+        }))
+    }
+
+    /// On broker restart the old in-memory gate and child custody cannot be
+    /// reconstructed. Retain the one-use debt; never convert it to a fresh
+    /// reservation or a false never-started outcome.
+    pub fn orphan_reserved_source_grants(&mut self) -> Result<usize, String> {
+        self.check_mailbox_read(&self.source_generation)?;
+        self.mailbox
+            .conn
+            .execute(
+                "UPDATE broker_source_effect_grant SET phase='unknown',revision=revision+1
+             WHERE phase='reserved'",
+                [],
+            )
+            .map_err(|e| e.to_string())
     }
 
     /// StateDb supplies every admitted binding; the root-retained sidecar is
@@ -1686,6 +1907,7 @@ fn activate_with_owner(path: &Path, owner: u32, anchor: &Path) -> Result<String,
         schema::BROKER_PREPARED_OWNER_IMMUTABLE,
         schema::BROKER_PREPARED_OWNER_RETAIN,
         schema::BROKER_OWNER_RELEASE_SCHEMA,
+        schema::BROKER_SOURCE_EFFECT_GRANT_SCHEMA,
         schema::BROKER_OWNER_RELEASE_IMMUTABLE,
         schema::BROKER_OWNER_RELEASE_RETAIN,
         schema::BROKER_OWNER_RELEASE_EXACT,

@@ -740,6 +740,16 @@ pub(super) fn validate_broker_owned(conn: &Connection) -> Result<String, String>
     if release_definition != BROKER_OWNER_RELEASE_SCHEMA {
         return Err("broker release schema changed".into());
     }
+    let grant_definition: String = tx
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='broker_source_effect_grant'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("broker source grant schema missing: {error}"))?;
+    if grant_definition != BROKER_SOURCE_EFFECT_GRANT_SCHEMA {
+        return Err("broker source grant schema changed".into());
+    }
     for (name, expected) in [
         (
             "broker_prepared_owner_immutable",
@@ -851,6 +861,26 @@ pub(super) const BROKER_OWNER_RELEASE_SCHEMA: &str = "CREATE TABLE broker_owner_
     guardian_identity TEXT NOT NULL,
     driver_identity TEXT NOT NULL,
     committed_at TEXT NOT NULL
+)";
+
+// This is broker-owned debt, never a grant inferred from a copied State row or
+// an original source pathname. There is at most one grant per registration.
+// An unresolved launch is retained as unknown across broker incarnation loss.
+pub(super) const BROKER_SOURCE_EFFECT_GRANT_SCHEMA: &str =
+    "CREATE TABLE broker_source_effect_grant (
+    grant_id TEXT PRIMARY KEY,
+    source_generation TEXT NOT NULL,
+    root_id TEXT NOT NULL,
+    owner_generation TEXT NOT NULL,
+    driver_identity TEXT NOT NULL,
+    authority_ordinal INTEGER NOT NULL CHECK(authority_ordinal>=0),
+    registration_id TEXT NOT NULL UNIQUE,
+    registration_digest TEXT NOT NULL,
+    registration_bytes BLOB NOT NULL,
+    listener_revision INTEGER NOT NULL CHECK(listener_revision>=0),
+    listener_json TEXT NOT NULL,
+    phase TEXT NOT NULL CHECK(phase IN ('reserved','consumed','unknown')),
+    revision INTEGER NOT NULL CHECK(revision>=1)
 )";
 
 pub(super) const BROKER_OWNER_RELEASE_IMMUTABLE: &str =

@@ -128,27 +128,42 @@ fn run_v30_repair_boundary(
     route: &super::broker_route::V30OwnerRoute,
     owner: &CompletionDomainOwner,
 ) -> Result<(), String> {
-    // Each broker call projects at most 64 admitted State rows. Cap a driver
-    // turn too; a large pending suffix is durable work for succession.
-    for _ in 0..8 {
+    // Each broker call projects at most 64 admitted State rows. Continue to
+    // the actual bound head; a fixed turn limit could strand valid older work.
+    loop {
         let page = route.repair_page(owner)?;
         if page.has_more {
             continue;
         }
         let selected = route.source_selection(owner, &page)?;
         if selected.candidate.is_some() {
-            // This metadata came from the retained broker connection. The
-            // exact registration and listener have no source-file custody
-            // proof. Its immutable paths still name user-owned files, and a
-            // copied recovery image/environment can reopen those paths.
-            // Neither a reservation nor an effect is authorized here.
+            // Reserve a unique broker-owned debt for the exact State-selected
+            // registration/listener and running driver. A grant remains inert
+            // until an actual recovery child can be held and consumed by the
+            // root broker. The production effect/accept gates stay closed.
+            let grant = match route.read_source_grant(owner)? {
+                Some(existing) => existing,
+                None => route.reserve_source_grant(owner, &selected)?,
+            };
+            if grant.candidate != *selected.candidate.as_ref().unwrap()
+                || !matches!(grant.phase.as_str(), "reserved" | "unknown")
+            {
+                return Err("v30 selected source/grant changed".into());
+            }
+            #[cfg(feature = "age319-private-broker-fixture")]
+            if let Some(gate) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1") {
+                std::fs::write(
+                    Path::new(&gate).join("source-grant-ready"),
+                    grant.grant_id.as_bytes(),
+                )
+                .map_err(|e| e.to_string())?;
+            }
             return Err(
-                "v30 source recovery requires exact registration/listener file custody, preserved recovery image/environment path semantics, and a one-use effect grant".into(),
+                "v30 source effect grant retained; physical recovery child custody and root-only exact acceptance remain closed".into(),
             );
         }
         return Err("v30 wake selection requires broker recipient grant".into());
     }
-    Err("v30 bounded State repair page limit reached".into())
 }
 
 fn run_owned(path: &Path, owner: &CompletionDomainOwner) -> Result<(), String> {

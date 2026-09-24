@@ -157,6 +157,10 @@ fn inner() {
                 (mode == "normal_repair_lost_reply")
                     .then_some(("AGE319_PRIVATE_REPAIR_REPLY_LOSS_V1", "1")),
             )
+            .envs(
+                (mode == "normal_source_grant_lost_reply")
+                    .then_some(("AGE319_PRIVATE_SOURCE_GRANT_REPLY_LOSS_V1", "1")),
+            )
             .env_remove("LD_LIBRARY_PATH")
             .stdin(Stdio::null())
             .stdout(Stdio::from(File::create(&out).unwrap()))
@@ -300,6 +304,11 @@ fn inner() {
                 attempt_id: None,
             };
             assert!(protocol::read_bounded_source_selection_at(&socket, &source_read).is_err());
+            let grant_read = protocol::StateReadSpec {
+                protocol: "broker-source-grant-read-v30".into(),
+                ..source_read
+            };
+            assert!(protocol::read_source_effect_grant_at(&socket, &grant_read).is_err());
             let repair_write = protocol::StateWriteSpec {
                 protocol: "broker-repair-write-v30".into(),
                 source_generation: generation.clone(),
@@ -331,6 +340,16 @@ fn inner() {
                     .unwrap();
                 eventually(|| protocol::request_at(&socket, Operation::Classify).is_ok());
             }
+            if !post_death {
+                eventually(|| {
+                    gate.join("source-grant-ready").exists() || entry.try_wait().unwrap().is_some()
+                });
+                assert!(
+                    gate.join("source-grant-ready").exists(),
+                    "source grant boundary: {}",
+                    fs::read_to_string(&err).unwrap_or_default()
+                );
+            }
             fs::write(gate.join("child-effect"), b"yes").unwrap();
             eventually(|| entry.try_wait().unwrap().is_some());
             if post_death {
@@ -340,7 +359,7 @@ fn inner() {
                 assert!(
                     fs::read_to_string(&err)
                         .unwrap_or_default()
-                        .contains("v30 source recovery requires exact registration/listener file custody, preserved recovery image/environment path semantics, and a one-use effect grant"),
+                        .contains("v30 source effect grant retained; physical recovery child custody and root-only exact acceptance remain closed"),
                     "normal repair boundary: entry={} broker={}",
                     fs::read_to_string(&err).unwrap_or_default(),
                     fs::read_to_string(&broker_log).unwrap_or_default(),
@@ -384,6 +403,36 @@ fn inner() {
                     )
                     .unwrap();
                 assert_eq!(attempts, 0, "source preview cannot reserve or launch");
+                let grant: (String, String, String, Vec<u8>, String, i64) = projected
+                    .query_row(
+                        "SELECT phase,registration_id,registration_digest,registration_bytes,
+                         owner_generation,revision
+                         FROM broker_source_effect_grant",
+                        [],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                            ))
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(grant.0, "reserved");
+                assert_eq!(grant.1, *source_id);
+                assert_eq!(
+                    grant.2,
+                    pending_binding.as_ref().unwrap().registration_digest()
+                );
+                assert_eq!(
+                    grant.3,
+                    pending_binding.as_ref().unwrap().registration_bytes()
+                );
+                assert_eq!(grant.4, prepared.owner_generation);
+                assert_eq!(grant.5, 1);
             }
             assert_eq!(
                 fs::read(data.join("pid-identity.db")).unwrap(),
@@ -420,6 +469,7 @@ fn inner() {
                 | "normal_prepare_lost_reply"
                 | "normal_release_lost_reply"
                 | "normal_repair_lost_reply"
+                | "normal_source_grant_lost_reply"
         ) {
             let retained = rusqlite::Connection::open_with_flags(
                 broker_state.join("sidecar/pid-identity.db"),
@@ -434,6 +484,18 @@ fn inner() {
                 )
                 .unwrap();
             assert_eq!(ordinal, 1, "restart must retain exact repair cursor");
+            let grant: (String, i64, i64) = retained
+                .query_row(
+                    "SELECT phase,revision,count(*) FROM broker_source_effect_grant",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                grant,
+                ("unknown".into(), 2, 1),
+                "lost custody must retain one unknown grant"
+            );
         }
         stop(&mut restarted);
         unsafe { libc::kill(prepared.root_init.host_pid, libc::SIGKILL) };
@@ -1307,6 +1369,7 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_prepare_lost_reply",
         "normal_release_lost_reply",
         "normal_repair_lost_reply",
+        "normal_source_grant_lost_reply",
         "normal_guardian_post",
         "normal_driver_post",
         "normal_broker_post",

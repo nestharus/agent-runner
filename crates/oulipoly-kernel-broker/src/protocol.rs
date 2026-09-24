@@ -143,6 +143,7 @@ pub enum StateWriteAction {
     Repair {
         expected_ordinal: i64,
     },
+    ReserveSourceGrant,
     Release,
 }
 
@@ -297,6 +298,46 @@ pub fn read_bounded_source_selection_at(
         return Err(io::Error::other("invalid bounded source selection read"));
     }
     serde_json::from_slice(&send_state_frame_at(path, b'R', spec)?).map_err(io::Error::other)
+}
+
+/// Read the grant for the broker-selected pending source. No registration ID,
+/// listener, pathname or grant ID is accepted from the caller.
+pub fn read_source_effect_grant_at(
+    path: &Path,
+    spec: &StateReadSpec,
+) -> io::Result<Option<oulipoly_state::mailbox::BrokerSourceEffectGrant>> {
+    if spec.protocol != "broker-source-grant-read-v30" || spec.attempt_id.is_some() {
+        return Err(io::Error::other("invalid source grant read"));
+    }
+    serde_json::from_slice(&send_state_frame_at(path, b'R', spec)?).map_err(io::Error::other)
+}
+
+pub fn reserve_source_effect_grant_at(
+    path: &Path,
+    spec: &StateWriteSpec,
+) -> io::Result<oulipoly_state::mailbox::BrokerSourceEffectGrant> {
+    if spec.protocol != "broker-source-grant-reserve-v30"
+        || !matches!(spec.action, StateWriteAction::ReserveSourceGrant)
+    {
+        return Err(io::Error::other("invalid source grant reservation"));
+    }
+    let granted: Option<oulipoly_state::mailbox::BrokerSourceEffectGrant> =
+        serde_json::from_slice(&send_state_frame_at(path, b'W', spec)?)
+            .map_err(io::Error::other)?;
+    granted.ok_or_else(|| io::Error::other("broker source grant reservation absent"))
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+pub fn reserve_source_effect_grant_drop_reply_at(
+    path: &Path,
+    spec: &StateWriteSpec,
+) -> io::Result<()> {
+    if spec.protocol != "broker-source-grant-reserve-v30"
+        || !matches!(spec.action, StateWriteAction::ReserveSourceGrant)
+    {
+        return Err(io::Error::other("invalid lost-reply source grant"));
+    }
+    state_write_drop_reply_at(path, spec)
 }
 
 pub fn write_bounded_repair_at(

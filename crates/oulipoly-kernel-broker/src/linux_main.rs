@@ -638,6 +638,9 @@ fn write_broker_state(
     };
     match spec.action {
         StateWriteAction::Release => Err(io::Error::other("release requires held v30 protocol")),
+        StateWriteAction::ReserveSourceGrant => Err(io::Error::other(
+            "source grant reservation requires broker-selected v30 protocol",
+        )),
         StateWriteAction::Prepare { .. } => {
             Err(io::Error::other("prepared owner requires v30 protocol"))
         }
@@ -883,6 +886,106 @@ fn encode_source_selection(
         return Err(io::Error::other(
             "broker source selection readback too large",
         ));
+    }
+    Ok(response)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "broker actor and retained State authorities are independent"
+)]
+fn read_source_effect_grant(
+    spec: StateReadSpec,
+    peer: &PeerIdentity,
+    host_namespace: &File,
+    runner_image: &File,
+    roots: &RootRegistry,
+    works: &WorkRegistry,
+    entries: &EntryRegistry,
+    sidecar: &BrokerSidecar,
+) -> io::Result<Option<oulipoly_state::mailbox::BrokerSourceEffectGrant>> {
+    if spec.protocol != "broker-source-grant-read-v30" || spec.attempt_id.is_some() {
+        return Err(io::Error::other(
+            "broker source grant read version conflict",
+        ));
+    }
+    let exact = read_broker_state(
+        StateReadSpec {
+            protocol: "broker-state-read-v1".into(),
+            ..spec
+        },
+        peer,
+        host_namespace,
+        runner_image,
+        roots,
+        works,
+        entries,
+        sidecar,
+    )?;
+    if !exact.broker_owned || exact.owner.driver_identity.pid != i64::from(peer.process.host_pid) {
+        return Err(io::Error::other(
+            "broker source grant read requires exact driver",
+        ));
+    }
+    sidecar
+        .read_source_effect_grant(&exact.source_generation, &exact.root_id, &exact.owner)
+        .map_err(io::Error::other)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "broker actor and retained State authorities are independent"
+)]
+fn reserve_source_effect_grant(
+    spec: StateWriteSpec,
+    peer: &PeerIdentity,
+    host_namespace: &File,
+    runner_image: &File,
+    roots: &RootRegistry,
+    works: &WorkRegistry,
+    entries: &EntryRegistry,
+    sidecar: &mut BrokerSidecar,
+) -> io::Result<oulipoly_state::mailbox::BrokerSourceEffectGrant> {
+    if spec.protocol != "broker-source-grant-reserve-v30"
+        || !matches!(spec.action, StateWriteAction::ReserveSourceGrant)
+    {
+        return Err(io::Error::other(
+            "broker source grant reservation version conflict",
+        ));
+    }
+    let exact = read_broker_state(
+        StateReadSpec {
+            protocol: "broker-state-read-v1".into(),
+            source_generation: spec.source_generation,
+            root_id: spec.root_id,
+            owner_generation: spec.owner_generation,
+            attempt_id: None,
+        },
+        peer,
+        host_namespace,
+        runner_image,
+        roots,
+        works,
+        entries,
+        sidecar,
+    )?;
+    if !exact.broker_owned || exact.owner.driver_identity.pid != i64::from(peer.process.host_pid) {
+        return Err(io::Error::other(
+            "broker source grant reservation requires exact driver",
+        ));
+    }
+    sidecar
+        .reserve_source_effect_grant(&exact.source_generation, &exact.root_id, &exact.owner)
+        .map_err(io::Error::other)
+}
+
+fn encode_source_effect_grant(
+    grant: &Option<oulipoly_state::mailbox::BrokerSourceEffectGrant>,
+) -> io::Result<String> {
+    let mut response = serde_json::to_string(grant)?;
+    response.push('\n');
+    if response.len() > 4096 {
+        return Err(io::Error::other("broker source grant readback too large"));
     }
     Ok(response)
 }
@@ -2149,6 +2252,11 @@ fn serve() -> io::Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error),
     };
+    if let Some(sidecar) = broker_sidecar.as_mut() {
+        sidecar
+            .orphan_reserved_source_grants()
+            .map_err(io::Error::other)?;
+    }
     let runner_image = File::open(&runner)?;
     if let Some(pair) = &installed_pair {
         pair.verify_file(Path::new(&runner), &pair.runner_sha256, true, &runner_image)?;
@@ -2550,6 +2658,18 @@ fn serve() -> io::Result<()> {
                         sidecar,
                     )?;
                     encode_source_selection(&selection)
+                } else if spec.protocol == "broker-source-grant-read-v30" {
+                    let grant = read_source_effect_grant(
+                        spec,
+                        &peer,
+                        &host_namespace,
+                        &runner_image,
+                        &registry,
+                        &works,
+                        &entries,
+                        sidecar,
+                    )?;
+                    encode_source_effect_grant(&grant)
                 } else {
                     let readback = read_broker_state(
                         spec,
@@ -2606,6 +2726,18 @@ fn serve() -> io::Result<()> {
                         sidecar,
                     )?;
                     encode_repair_readback(&readback)
+                } else if spec.protocol == "broker-source-grant-reserve-v30" {
+                    let grant = reserve_source_effect_grant(
+                        spec,
+                        &peer,
+                        &host_namespace,
+                        &runner_image,
+                        &registry,
+                        &works,
+                        &entries,
+                        sidecar,
+                    )?;
+                    encode_source_effect_grant(&Some(grant))
                 } else {
                     let readback = write_broker_state(
                         spec,
