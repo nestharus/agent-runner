@@ -142,6 +142,15 @@ fn inner() {
         .read_exact_prepared_owner(&generation, &prepared.root_id, &prepared.owner_generation)
         .unwrap();
         assert_eq!(persisted, prepared);
+        assert!(
+            BrokerSidecar::open_existing(
+                &broker_state.join("sidecar/pid-identity.db"),
+                &broker_state,
+            )
+            .unwrap()
+            .read_exact_release(&generation, &prepared.root_id, &prepared.owner_generation)
+            .is_err()
+        );
         let db = rusqlite::Connection::open_with_flags(
             broker_state.join("sidecar/pid-identity.db"),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -163,6 +172,14 @@ fn inner() {
             attempt_id: None,
         };
         assert!(protocol::read_prepared_owner_at(&socket, &read).is_err()); // wrong actor
+        let child_attest = protocol::StateReadSpec {
+            protocol: "broker-release-attest-v30".into(),
+            source_generation: generation.clone(),
+            root_id: prepared.root_id.clone(),
+            owner_generation: prepared.owner_generation.clone(),
+            attempt_id: None,
+        };
+        assert!(protocol::attest_released_child_at(&socket, &child_attest).is_err());
         let forged = protocol::StateWriteSpec {
             protocol: "broker-prepared-write-v30".into(),
             source_generation: generation.clone(),
@@ -236,6 +253,15 @@ fn inner() {
         .read_exact_prepared_owner(&generation, &prepared.root_id, &prepared.owner_generation)
         .unwrap();
         assert_eq!(retained, prepared);
+        assert!(
+            BrokerSidecar::open_existing(
+                &broker_state.join("sidecar/pid-identity.db"),
+                &broker_state,
+            )
+            .unwrap()
+            .read_exact_release(&generation, &prepared.root_id, &prepared.owner_generation)
+            .is_err()
+        );
         let second = Command::new(&runner)
             .arg("__age319-private-held-prepared-v30")
             .env("OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1", "1")

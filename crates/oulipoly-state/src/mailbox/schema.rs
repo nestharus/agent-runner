@@ -730,6 +730,16 @@ pub(super) fn validate_broker_owned(conn: &Connection) -> Result<String, String>
     if prepared_definition != BROKER_PREPARED_OWNER_SCHEMA {
         return Err("broker prepared owner schema changed".into());
     }
+    let release_definition: String = tx
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='broker_owner_release'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("broker release schema missing: {error}"))?;
+    if release_definition != BROKER_OWNER_RELEASE_SCHEMA {
+        return Err("broker release schema changed".into());
+    }
     for (name, expected) in [
         (
             "broker_prepared_owner_immutable",
@@ -740,6 +750,12 @@ pub(super) fn validate_broker_owned(conn: &Connection) -> Result<String, String>
             "broker_prepared_owner_no_running",
             BROKER_PREPARED_OWNER_NO_RUNNING,
         ),
+        (
+            "broker_owner_release_immutable",
+            BROKER_OWNER_RELEASE_IMMUTABLE,
+        ),
+        ("broker_owner_release_retain", BROKER_OWNER_RELEASE_RETAIN),
+        ("broker_owner_release_exact", BROKER_OWNER_RELEASE_EXACT),
     ] {
         let definition: String = tx
             .query_row(
@@ -773,7 +789,7 @@ pub(super) const BROKER_AUTHORITY_SCHEMA: &str = "CREATE TABLE broker_sidecar_au
 )";
 
 pub(super) const BROKER_OWNER_SCHEMA: &str = "CREATE TABLE broker_completion_owner (
-    owner_generation TEXT PRIMARY KEY REFERENCES completion_continuation_owner(generation),
+    owner_generation TEXT PRIMARY KEY REFERENCES completion_continuation_owner(generation) DEFERRABLE INITIALLY DEFERRED,
     source_generation TEXT NOT NULL,
     root_id TEXT NOT NULL,
     guardian_identity TEXT NOT NULL,
@@ -807,14 +823,59 @@ pub(super) const BROKER_PREPARED_OWNER_RETAIN: &str = "CREATE TRIGGER broker_pre
 BEFORE DELETE ON broker_prepared_owner
 BEGIN SELECT RAISE(ABORT,'prepared owner must be retained'); END";
 
-// A later reviewed release transition must replace this inert boundary with
-// an atomic broker-proven running/release commit. No current caller may turn a
-// prepared record into the old running owner by direct publication.
+// A prepared generation may become running only inside the broker's exact
+// release transaction. The release row alone does not authorize child work;
+// live broker post-gate attestation is still required.
 pub(super) const BROKER_PREPARED_OWNER_NO_RUNNING: &str =
     "CREATE TRIGGER broker_prepared_owner_no_running
 BEFORE INSERT ON completion_continuation_owner
 WHEN EXISTS (SELECT 1 FROM broker_prepared_owner WHERE owner_generation=NEW.generation)
-BEGIN SELECT RAISE(ABORT,'prepared owner cannot be published as running'); END";
+AND NOT EXISTS (
+ SELECT 1 FROM broker_owner_release r JOIN broker_prepared_owner p
+ ON p.owner_generation=r.owner_generation
+ JOIN broker_completion_owner b ON b.owner_generation=r.owner_generation
+ WHERE r.owner_generation=NEW.generation AND r.source_generation=p.source_generation
+ AND r.root_id=p.root_id AND NEW.kernel_root_id=p.root_id
+ AND NEW.domain_id=p.domain_id AND NEW.supervisor_authority_id=p.supervisor_authority_id
+ AND NEW.endpoint=p.endpoint AND NEW.guardian_identity=r.guardian_identity
+ AND NEW.driver_identity=r.driver_identity AND b.source_generation=r.source_generation
+ AND b.root_id=r.root_id AND b.guardian_identity=r.guardian_identity
+ AND b.driver_identity=r.driver_identity)
+BEGIN SELECT RAISE(ABORT,'prepared owner requires exact release'); END";
+
+pub(super) const BROKER_OWNER_RELEASE_SCHEMA: &str = "CREATE TABLE broker_owner_release (
+    owner_generation TEXT PRIMARY KEY REFERENCES broker_prepared_owner(owner_generation),
+    source_generation TEXT NOT NULL,
+    root_id TEXT NOT NULL UNIQUE,
+    release_id TEXT NOT NULL UNIQUE,
+    guardian_identity TEXT NOT NULL,
+    driver_identity TEXT NOT NULL,
+    committed_at TEXT NOT NULL
+)";
+
+pub(super) const BROKER_OWNER_RELEASE_IMMUTABLE: &str =
+    "CREATE TRIGGER broker_owner_release_immutable
+BEFORE UPDATE ON broker_owner_release
+BEGIN SELECT RAISE(ABORT,'broker release is immutable'); END";
+
+pub(super) const BROKER_OWNER_RELEASE_RETAIN: &str = "CREATE TRIGGER broker_owner_release_retain
+BEFORE DELETE ON broker_owner_release
+BEGIN SELECT RAISE(ABORT,'broker release must be retained'); END";
+
+pub(super) const BROKER_OWNER_RELEASE_EXACT: &str = "CREATE TRIGGER broker_owner_release_exact
+BEFORE INSERT ON broker_owner_release
+WHEN NOT EXISTS (
+ SELECT 1 FROM broker_prepared_owner p WHERE p.owner_generation=NEW.owner_generation
+ AND p.source_generation=NEW.source_generation AND p.root_id=NEW.root_id
+ AND json_valid(NEW.guardian_identity) AND json_valid(NEW.driver_identity)
+ AND CAST(json_extract(NEW.guardian_identity,'$.pid') AS INTEGER)=json_extract(p.guardian_identity,'$.host_pid')
+ AND json_extract(NEW.guardian_identity,'$.boot_id')=json_extract(p.guardian_identity,'$.boot_id')
+ AND CAST(json_extract(NEW.guardian_identity,'$.starttime_ticks') AS INTEGER)=json_extract(p.guardian_identity,'$.starttime_ticks')
+ AND CAST(json_extract(NEW.driver_identity,'$.pid') AS INTEGER)=json_extract(p.driver_identity,'$.host_pid')
+ AND json_extract(NEW.driver_identity,'$.boot_id')=json_extract(p.driver_identity,'$.boot_id')
+ AND CAST(json_extract(NEW.driver_identity,'$.starttime_ticks') AS INTEGER)=json_extract(p.driver_identity,'$.starttime_ticks')
+ AND NOT EXISTS (SELECT 1 FROM completion_continuation_owner WHERE generation=NEW.owner_generation))
+BEGIN SELECT RAISE(ABORT,'broker release actor mismatch'); END";
 
 fn create_fresh_schema(conn: &Connection) -> Result<(), String> {
     apply_steps(conn, SCHEMA_STEPS)

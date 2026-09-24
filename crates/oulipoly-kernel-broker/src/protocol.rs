@@ -162,6 +162,18 @@ pub fn read_prepared_owner_at(
     serde_json::from_slice(&send_state_frame_at(path, b'R', spec)?).map_err(io::Error::other)
 }
 
+/// Child-only broker attestation of a committed release and all live pinned
+/// actors. A prepared row or physical gate byte cannot satisfy this read.
+pub fn attest_released_child_at(
+    path: &Path,
+    spec: &StateReadSpec,
+) -> io::Result<oulipoly_state::mailbox::BrokerReleaseEvidence> {
+    if spec.protocol != "broker-release-attest-v30" || spec.attempt_id.is_some() {
+        return Err(io::Error::other("invalid release attestation request"));
+    }
+    serde_json::from_slice(&send_state_frame_at(path, b'R', spec)?).map_err(io::Error::other)
+}
+
 /// A committed write reply can be lost. Reconcile by `read_state_at` using the
 /// same source/root/owner/attempt identity before any retry or launch decision.
 pub fn write_state_at(

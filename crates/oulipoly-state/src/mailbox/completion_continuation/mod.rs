@@ -376,17 +376,28 @@ WHERE supervisor_authority_id IN (SELECT authority_id FROM supervisor_scope) AND
         owner: &CompletionDomainOwner,
         kernel_root_id: Option<&str>,
     ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        Self::publish_completion_owner_on(&tx, owner, kernel_root_id)?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    /// Shared by the v29 publisher and the v30 broker's atomic release. The
+    /// caller owns commit so no running owner can escape without its evidence.
+    pub(in crate::mailbox) fn publish_completion_owner_on(
+        tx: &Transaction<'_>,
+        owner: &CompletionDomainOwner,
+        kernel_root_id: Option<&str>,
+    ) -> Result<(), String> {
         if let Some(root_id) = kernel_root_id {
             let parsed = uuid::Uuid::parse_str(root_id).map_err(|_| "invalid kernel root ID")?;
             if parsed.to_string() != root_id {
                 return Err("kernel root ID is not canonical".into());
             }
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| e.to_string())?;
-        if owner.protocol != PROTOCOL || domain_on(&tx)?.as_deref() != Some(&owner.domain_id) {
+        if owner.protocol != PROTOCOL || domain_on(tx)?.as_deref() != Some(&owner.domain_id) {
             return Err("completion owner domain/protocol conflict".into());
         }
         let authority = uuid::Uuid::parse_str(&owner.supervisor_authority_id)
@@ -563,7 +574,7 @@ UPDATE completion_continuation_attempt SET phase='unknown_custody',revision=revi
             ],
         )
         .map_err(|e| e.to_string())?;
-        tx.commit().map_err(|e| e.to_string())
+        Ok(())
     }
 }
 

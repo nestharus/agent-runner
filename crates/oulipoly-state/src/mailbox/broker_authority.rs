@@ -137,6 +137,15 @@ impl PreparedBrokerOwner {
     }
 }
 
+/// Durable transaction evidence only. A consumer still needs the broker to
+/// verify every live actor after the child crosses the physical gate.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct BrokerReleaseEvidence {
+    pub prepared: PreparedBrokerOwner,
+    pub release_id: String,
+    pub owner: super::CompletionDomainOwner,
+}
+
 impl BrokerSidecar {
     /// Persist only broker-observed preparation on the retained root-owned
     /// connection. A duplicate or copied v29 running generation is refused.
@@ -258,6 +267,142 @@ impl BrokerSidecar {
         }
         broker_main_file_must_be_named(&self.mailbox.conn)?;
         Ok(prepared)
+    }
+
+    /// Transaction primitive for the future held-gate release path. It is
+    /// crate-private while no child post-gate attestation exists, so the
+    /// serving broker cannot commit it through a wire request yet. Once the
+    /// broker has written the exact retained gate, it must call this at most
+    /// once; a lost response is reconciled with `read_exact_release`.
+    #[allow(dead_code)]
+    pub(crate) fn commit_exact_prepared_release(
+        &mut self,
+        expected: &PreparedBrokerOwner,
+    ) -> Result<BrokerReleaseEvidence, String> {
+        if !expected.valid() || expected.source_generation != self.source_generation {
+            return Err("invalid exact release binding".into());
+        }
+        let prepared = self.read_exact_prepared_owner(
+            &expected.source_generation,
+            &expected.root_id,
+            &expected.owner_generation,
+        )?;
+        if &prepared != expected {
+            return Err("prepared release actor or endpoint changed".into());
+        }
+        let identity = |stamp: &PreparedProcessStamp| -> Result<_, String> {
+            Ok(crate::completion_continuation::SourceProcessIdentity {
+                pid: i64::from(stamp.host_pid),
+                boot_id: stamp.boot_id.clone(),
+                starttime_ticks: i64::try_from(stamp.starttime_ticks)
+                    .map_err(|_| "release process starttime overflow")?,
+            })
+        };
+        let owner = super::CompletionDomainOwner {
+            protocol: crate::completion_continuation::PROTOCOL.into(),
+            domain_id: prepared.domain_id.clone(),
+            supervisor_authority_id: prepared.supervisor_authority_id.clone(),
+            owner_generation: prepared.owner_generation.clone(),
+            guardian_identity: identity(&prepared.guardian)?,
+            driver_identity: identity(&prepared.driver)?,
+            endpoint: prepared.endpoint.clone(),
+        };
+        #[cfg(unix)]
+        check_storage(&self.mailbox.path, self.storage_owner, &self.storage_anchor)?;
+        broker_main_file_must_be_named(&self.mailbox.conn)?;
+        let release_id = uuid::Uuid::new_v4().to_string();
+        let tx = self
+            .mailbox
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let guardian =
+            serde_json::to_string(&owner.guardian_identity).map_err(|e| e.to_string())?;
+        let driver = serde_json::to_string(&owner.driver_identity).map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO broker_owner_release(owner_generation,source_generation,root_id,
+             release_id,guardian_identity,driver_identity,committed_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                owner.owner_generation,
+                prepared.source_generation,
+                prepared.root_id,
+                release_id,
+                guardian,
+                driver,
+                Utc::now().to_rfc3339(),
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO broker_completion_owner(owner_generation,source_generation,root_id,
+             guardian_identity,driver_identity) VALUES(?1,?2,?3,?4,?5)",
+            params![
+                owner.owner_generation,
+                prepared.source_generation,
+                prepared.root_id,
+                guardian,
+                driver,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        MailboxDb::publish_completion_owner_on(&tx, &owner, Some(&prepared.root_id))?;
+        tx.commit().map_err(|e| e.to_string())?;
+        self.read_exact_release(
+            &prepared.source_generation,
+            &prepared.root_id,
+            &prepared.owner_generation,
+        )
+    }
+
+    /// Exact committed readback for a lost release reply. This checks durable
+    /// State only and deliberately makes no live-process authorization claim.
+    pub fn read_exact_release(
+        &self,
+        source_generation: &str,
+        root_id: &str,
+        owner_generation: &str,
+    ) -> Result<BrokerReleaseEvidence, String> {
+        let prepared =
+            self.read_exact_prepared_owner(source_generation, root_id, owner_generation)?;
+        let release_id: String = self
+            .mailbox
+            .conn
+            .query_row(
+                "SELECT release_id FROM broker_owner_release WHERE owner_generation=?1
+                 AND source_generation=?2 AND root_id=?3",
+                params![owner_generation, source_generation, root_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .ok_or("exact broker release absent")?;
+        let readback = self.read_exact_continuation(
+            source_generation,
+            root_id,
+            &prepared.domain_id,
+            &prepared.supervisor_authority_id,
+            owner_generation,
+            None,
+        )?;
+        if !readback.broker_owned
+            || readback.owner.endpoint != prepared.endpoint
+            || readback.owner.guardian_identity.pid != i64::from(prepared.guardian.host_pid)
+            || readback.owner.guardian_identity.boot_id != prepared.guardian.boot_id
+            || readback.owner.guardian_identity.starttime_ticks
+                != i64::try_from(prepared.guardian.starttime_ticks).map_err(|e| e.to_string())?
+            || readback.owner.driver_identity.pid != i64::from(prepared.driver.host_pid)
+            || readback.owner.driver_identity.boot_id != prepared.driver.boot_id
+            || readback.owner.driver_identity.starttime_ticks
+                != i64::try_from(prepared.driver.starttime_ticks).map_err(|e| e.to_string())?
+        {
+            return Err("broker release owner provenance mismatch".into());
+        }
+        Ok(BrokerReleaseEvidence {
+            prepared,
+            release_id,
+            owner: readback.owner,
+        })
     }
     #[cfg(unix)]
     pub fn open_existing(path: &Path, broker_state_root: &Path) -> Result<Self, String> {
@@ -604,7 +749,11 @@ impl BrokerSidecar {
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM broker_completion_owner WHERE owner_generation=?1
                 AND source_generation=?2 AND root_id=?3 AND guardian_identity=?4
-                AND driver_identity=?5)",
+                AND driver_identity=?5 AND (
+                  NOT EXISTS(SELECT 1 FROM broker_prepared_owner WHERE owner_generation=?1)
+                  OR EXISTS(SELECT 1 FROM broker_owner_release WHERE owner_generation=?1
+                    AND source_generation=?2 AND root_id=?3 AND guardian_identity=?4
+                    AND driver_identity=?5)))",
                 params![
                     owner_generation,
                     self.source_generation,
@@ -1089,6 +1238,10 @@ fn activate_with_owner(path: &Path, owner: u32, anchor: &Path) -> Result<String,
         schema::BROKER_PREPARED_OWNER_SCHEMA,
         schema::BROKER_PREPARED_OWNER_IMMUTABLE,
         schema::BROKER_PREPARED_OWNER_RETAIN,
+        schema::BROKER_OWNER_RELEASE_SCHEMA,
+        schema::BROKER_OWNER_RELEASE_IMMUTABLE,
+        schema::BROKER_OWNER_RELEASE_RETAIN,
+        schema::BROKER_OWNER_RELEASE_EXACT,
         schema::BROKER_PREPARED_OWNER_NO_RUNNING,
     ] {
         tx.execute_batch(definition)
@@ -1209,7 +1362,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn prepared_owner_is_exact_durable_and_never_running_authority() {
+    fn prepared_owner_requires_atomic_exact_release_before_running() {
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("sidecar");
         fs::create_dir(&directory).unwrap();
@@ -1295,6 +1448,52 @@ mod tests {
                 )
                 .is_err()
         );
+        // A direct v18 publisher cannot use a release row without the exact
+        // broker provenance marker in the same transaction.
+        let direct_owner = super::super::CompletionDomainOwner {
+            protocol: PROTOCOL.into(),
+            domain_id: prepared.domain_id.clone(),
+            supervisor_authority_id: prepared.supervisor_authority_id.clone(),
+            owner_generation: prepared.owner_generation.clone(),
+            guardian_identity: SourceProcessIdentity {
+                pid: i64::from(prepared.guardian.host_pid),
+                boot_id: prepared.guardian.boot_id.clone(),
+                starttime_ticks: prepared.guardian.starttime_ticks as i64,
+            },
+            driver_identity: SourceProcessIdentity {
+                pid: i64::from(prepared.driver.host_pid),
+                boot_id: prepared.driver.boot_id.clone(),
+                starttime_ticks: prepared.driver.starttime_ticks as i64,
+            },
+            endpoint: prepared.endpoint.clone(),
+        };
+        {
+            let tx = broker
+                .mailbox
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            tx.execute(
+                "INSERT INTO broker_owner_release(owner_generation,source_generation,root_id,
+                 release_id,guardian_identity,driver_identity,committed_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,'fixture')",
+                params![
+                    prepared.owner_generation,
+                    prepared.source_generation,
+                    prepared.root_id,
+                    uuid::Uuid::new_v4().to_string(),
+                    serde_json::to_string(&direct_owner.guardian_identity).unwrap(),
+                    serde_json::to_string(&direct_owner.driver_identity).unwrap(),
+                ],
+            )
+            .unwrap();
+            assert!(MailboxDb::publish_completion_owner_on(
+                &tx,
+                &direct_owner,
+                Some(&prepared.root_id),
+            )
+            .is_err());
+        }
         assert!(
             broker
                 .read_exact_prepared_owner("stale", &prepared.root_id, &prepared.owner_generation)
@@ -1333,6 +1532,75 @@ mod tests {
                 .unwrap(),
             0,
         );
+        broker
+            .mailbox
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER broker_release_fail BEFORE INSERT ON broker_completion_owner
+                BEGIN SELECT RAISE(ABORT,'injected marker failure'); END",
+            )
+            .unwrap();
+        assert!(broker.commit_exact_prepared_release(&prepared).is_err());
+        for (table, key) in [
+            ("completion_continuation_owner", "generation"),
+            ("broker_completion_owner", "owner_generation"),
+            ("broker_owner_release", "owner_generation"),
+        ] {
+            let count: i64 = broker
+                .mailbox
+                .conn
+                .query_row(
+                    &format!("SELECT count(*) FROM {table} WHERE {key}=?1"),
+                    [&prepared.owner_generation],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "partial release in {table}");
+        }
+        assert!(
+            broker
+                .read_exact_release(
+                    &source_generation,
+                    &prepared.root_id,
+                    &prepared.owner_generation
+                )
+                .is_err()
+        );
+        broker
+            .mailbox
+            .conn
+            .execute_batch("DROP TRIGGER broker_release_fail")
+            .unwrap();
+        broker
+            .mailbox
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER broker_running_fail BEFORE INSERT ON completion_continuation_owner
+                BEGIN SELECT RAISE(ABORT,'injected running failure'); END",
+            )
+            .unwrap();
+        assert!(broker.commit_exact_prepared_release(&prepared).is_err());
+        assert!(
+            broker
+                .read_exact_release(
+                    &source_generation,
+                    &prepared.root_id,
+                    &prepared.owner_generation,
+                )
+                .is_err()
+        );
+        broker
+            .mailbox
+            .conn
+            .execute_batch("DROP TRIGGER broker_running_fail")
+            .unwrap();
+        let mut altered = prepared.clone();
+        altered.driver.starttime_ticks += 1;
+        assert!(broker.commit_exact_prepared_release(&altered).is_err());
+        let released = broker.commit_exact_prepared_release(&prepared).unwrap();
+        assert_eq!(released.prepared, prepared);
+        assert_eq!(released.owner.owner_generation, prepared.owner_generation);
+        assert!(broker.commit_exact_prepared_release(&prepared).is_err());
         drop(broker);
         let broker = open_with_owner(&path, uid, root.path()).unwrap();
         assert_eq!(
@@ -1344,6 +1612,16 @@ mod tests {
                 )
                 .unwrap(),
             prepared,
+        );
+        assert_eq!(
+            broker
+                .read_exact_release(
+                    &source_generation,
+                    &prepared.root_id,
+                    &prepared.owner_generation
+                )
+                .unwrap(),
+            released,
         );
         broker
             .mailbox

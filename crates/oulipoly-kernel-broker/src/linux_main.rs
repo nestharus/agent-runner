@@ -18,7 +18,9 @@ use oulipoly_kernel_broker::protocol::{
 };
 use oulipoly_kernel_broker::registry::RootRegistry;
 use oulipoly_kernel_broker::work_registry::{Scope, WorkRegistry, classify_scope};
-use oulipoly_state::mailbox::{BrokerSidecar, PreparedBrokerOwner, PreparedProcessStamp};
+use oulipoly_state::mailbox::{
+    BrokerReleaseEvidence, BrokerSidecar, PreparedBrokerOwner, PreparedProcessStamp,
+};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -1629,6 +1631,108 @@ fn encode_prepared_owner(owner: &PreparedBrokerOwner) -> io::Result<String> {
     Ok(response)
 }
 
+/// A gate byte is never authority. Even after the durable release commit,
+/// only the exact original child can obtain this post-gate observation, and
+/// every actor is reopened and compared with its prepared incarnation. The
+/// current v30 held route never writes the gate or commits release.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "independent broker actor and State authorities"
+)]
+fn attest_released_child(
+    spec: StateReadSpec,
+    peer: &PeerIdentity,
+    host_namespace: &File,
+    runner_image: &File,
+    roots: &RootRegistry,
+    works: &WorkRegistry,
+    entries: &EntryRegistry,
+    sidecar: &BrokerSidecar,
+) -> io::Result<BrokerReleaseEvidence> {
+    if spec.protocol != "broker-release-attest-v30"
+        || spec.attempt_id.is_some()
+        || roots.has_debt()
+        || works.has_debt()
+        || entries.has_uncertain_write()
+        || !matches!(
+            classify_scope(peer, host_namespace, roots, works),
+            Scope::Root(ref root) if root == &spec.root_id
+        )
+    {
+        return Err(io::Error::other("released child attestation denied"));
+    }
+    let evidence = sidecar
+        .read_exact_release(
+            &spec.source_generation,
+            &spec.root_id,
+            &spec.owner_generation,
+        )
+        .map_err(io::Error::other)?;
+    let prepared = &evidence.prepared;
+    let entry = entries
+        .record(&spec.root_id)
+        .ok_or_else(|| io::Error::other("released entry absent"))?;
+    let root = roots
+        .live_roots()
+        .find(|root| root.record.root_id == spec.root_id)
+        .ok_or_else(|| io::Error::other("released PID1 absent"))?;
+    let entry_process = PinnedProcess::open(prepared.entry.host_pid)?;
+    let guardian = PinnedProcess::open(prepared.guardian.host_pid)?;
+    let driver = PinnedProcess::open(prepared.driver.host_pid)?;
+    let actor_matches = |process: &PinnedProcess, stamp: &PreparedProcessStamp| {
+        prepared_stamp(&ProcessStamp::from(process)) == *stamp
+    };
+    if entry.owner_uid != prepared.owner_uid
+        || root.record.owner_uid != prepared.owner_uid
+        || peer.uid != prepared.owner_uid
+        || !entry.join_consumed
+        || entry.entry != ProcessStamp::from(&entry_process)
+        || entry.guardian.as_ref() != Some(&ProcessStamp::from(&guardian))
+        || entry.prepared_driver.as_ref() != Some(&ProcessStamp::from(&driver))
+        || entry.joined_child.as_ref() != Some(&ProcessStamp::from(&peer.process))
+        || entry.domain_id.as_deref() != Some(prepared.domain_id.as_str())
+        || entry.supervisor_authority_id.as_deref()
+            != Some(prepared.supervisor_authority_id.as_str())
+        || !actor_matches(&entry_process, &prepared.entry)
+        || !actor_matches(&guardian, &prepared.guardian)
+        || !actor_matches(&driver, &prepared.driver)
+        || !actor_matches(&root.init, &prepared.root_init)
+        || !actor_matches(&peer.process, &prepared.joined_child)
+        || !guardian.direct_child_of(&entry_process)?
+        || !driver.direct_child_of(&guardian)?
+        || !peer.process.direct_child_of(&root.init)?
+        || !entry_process.in_namespace(host_namespace)?
+        || !guardian.in_namespace(host_namespace)?
+        || !driver.in_namespace(host_namespace)?
+        || !peer.process.in_namespace(root.init.namespace())?
+        || !entry_process.same_executable_as(runner_image)?
+        || !guardian.same_executable_as(runner_image)?
+        || !driver.same_executable_as(runner_image)?
+        || !peer.process.same_executable_as(runner_image)?
+        || host_proc_uid(entry_process.host_pid)? != prepared.owner_uid
+        || host_proc_uid(guardian.host_pid)? != prepared.owner_uid
+        || host_proc_uid(driver.host_pid)? != prepared.owner_uid
+        || host_proc_uid(peer.process.host_pid)? != prepared.owner_uid
+    {
+        return Err(io::Error::other("released actor incarnation changed"));
+    }
+    root.init.verify()?;
+    entry_process.verify()?;
+    guardian.verify()?;
+    driver.verify()?;
+    peer.process.verify()?;
+    Ok(evidence)
+}
+
+fn encode_release_evidence(evidence: &BrokerReleaseEvidence) -> io::Result<String> {
+    let mut response = serde_json::to_string(evidence)?;
+    response.push('\n');
+    if response.len() > 4096 {
+        return Err(io::Error::other("release attestation too large"));
+    }
+    Ok(response)
+}
+
 fn serve() -> io::Result<()> {
     if unsafe { libc::geteuid() } != 0 {
         return Err(io::Error::other("host root required"));
@@ -2059,6 +2163,18 @@ fn serve() -> io::Result<()> {
                         sidecar,
                     )?;
                     encode_prepared_owner(&readback)
+                } else if spec.protocol == "broker-release-attest-v30" {
+                    let evidence = attest_released_child(
+                        spec,
+                        &peer,
+                        &host_namespace,
+                        &runner_image,
+                        &registry,
+                        &works,
+                        &entries,
+                        sidecar,
+                    )?;
+                    encode_release_evidence(&evidence)
                 } else {
                     let readback = read_broker_state(
                         spec,
