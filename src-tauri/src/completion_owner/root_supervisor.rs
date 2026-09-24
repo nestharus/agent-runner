@@ -3,6 +3,13 @@
 //! integrates its exact terminal result. Per-operation workers isolate physical
 //! child-tree draining but hold no SQLite or replay authority.
 
+#[cfg(feature = "age319-private-broker-fixture")]
+const PRIVATE_NATIVE_GATE_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+#[cfg(feature = "age319-private-broker-fixture")]
+const PRIVATE_NATIVE_DRAIN_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+#[cfg(feature = "age319-private-broker-fixture")]
+const PRIVATE_NATIVE_GATE_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
 use super::custody::{CustodianRequest, LaunchRecipe};
 use oulipoly_kernel_broker::protocol::{self, NativeKSpec, NativePrepareSpec};
 use oulipoly_state::diagnostic_recorder::{
@@ -456,12 +463,12 @@ pub(crate) fn private_native_lineage(
     std::fs::write(gate_dir.join("native-prepared"), grant_id.as_bytes())
         .map_err(|error| error.to_string())?;
     let wait = |name: &str| -> Result<(), String> {
-        let until = Instant::now() + Duration::from_secs(20);
+        let until = Instant::now() + PRIVATE_NATIVE_GATE_WAIT;
         while !gate_dir.join(name).exists() {
             if Instant::now() >= until {
                 return Err(format!("private native {name} timed out"));
             }
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(PRIVATE_NATIVE_GATE_POLL);
         }
         Ok(())
     };
@@ -503,7 +510,7 @@ pub(crate) fn private_native_lineage(
             return Err(format!("private cancellation refused: {cancel}"));
         }
     }
-    let until = Instant::now() + Duration::from_secs(15);
+    let until = Instant::now() + PRIVATE_NATIVE_DRAIN_WAIT;
     loop {
         let q = protocol::observe_native_work_v30_at(&socket, &grant_id)
             .map_err(|error| error.to_string())?;
@@ -515,7 +522,7 @@ pub(crate) fn private_native_lineage(
         if Instant::now() >= until {
             return Err(format!("private native Q remained debt: {q}"));
         }
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(PRIVATE_NATIVE_GATE_POLL);
     }
 }
 

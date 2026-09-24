@@ -1,5 +1,9 @@
 //! Broker-owned post-owner source custody. A consumed source grant may be
 //! bound here only while its PID1 and worker are held behind the launch gate.
+
+const CANCELLATION_ESCALATION_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+const PID1_REAP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
 use crate::entry_registry::{EntryRecord, ProcessStamp};
 use crate::identity::{PinnedProcess, observed_incarnation_gone};
 use crate::registry::RootRecord;
@@ -14,7 +18,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 static SOURCE_CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
 
@@ -898,7 +902,7 @@ fn reap_source_pid1(
     loop {
         if SOURCE_CANCEL_REQUESTED.load(Ordering::Relaxed) {
             let started = *cancellation_started.get_or_insert_with(Instant::now);
-            signal_source_members(if started.elapsed() >= Duration::from_secs(2) {
+            signal_source_members(if started.elapsed() >= CANCELLATION_ESCALATION_DELAY {
                 libc::SIGKILL
             } else {
                 libc::SIGTERM
@@ -913,7 +917,7 @@ fn reap_source_pid1(
             continue;
         }
         if reaped == 0 {
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(PID1_REAP_POLL_INTERVAL);
             continue;
         }
         let error = io::Error::last_os_error();

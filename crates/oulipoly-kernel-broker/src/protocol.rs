@@ -1,6 +1,19 @@
 //! One connection, one challenged request. Entry operations cannot select an
 //! executable, UID, namespace, or mount. The accepted-work guardian operation
 //! carries the initiator's already pinned executable and accepted descriptors.
+
+const FRESH_RECIPIENT_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const ENTRY_OBSERVATION_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+const NORMAL_WORK_REPLY_READ_BYTES: u64 = 8193;
+const ROOT_EFFECT_REPLY_READ_BYTES: u64 = 8193;
+const RELEASED_HANDOFF_REPLY_READ_BYTES: u64 = 8193;
+const FRESH_SESSION_REPLY_READ_BYTES: u64 = 1025;
+const STATE_FRAME_REPLY_READ_BYTES: u64 = 4097;
+const BROKER_RESPONSE_READ_BYTES: u64 = 257;
+#[cfg(feature = "age319-private-broker-fixture")]
+const FRESH_ROUTE_REPLY_READ_BYTES: u64 = 4097;
+
 use crate::installed_launch::InstalledLaunchSpec;
 use std::io::{self, Read, Write};
 #[cfg(feature = "age319-private-broker-fixture")]
@@ -355,7 +368,9 @@ pub fn private_fresh_route_at(
         return Err(io::Error::other("fresh route selection uncertain"));
     }
     let mut answer_bytes = Vec::new();
-    stream.take(4097).read_to_end(&mut answer_bytes)?;
+    stream
+        .take(FRESH_ROUTE_REPLY_READ_BYTES)
+        .read_to_end(&mut answer_bytes)?;
     if answer_bytes.len() > 4096 || !answer_bytes.ends_with(b"\n") {
         return Err(io::Error::other("invalid fresh route response"));
     }
@@ -574,7 +589,9 @@ fn normal_work_request_at(
         return Err(io::Error::other("short normal work request"));
     }
     let mut reply = Vec::new();
-    stream.take(8193).read_to_end(&mut reply)?;
+    stream
+        .take(NORMAL_WORK_REPLY_READ_BYTES)
+        .read_to_end(&mut reply)?;
     if reply.len() > 8192 || !reply.ends_with(b"\n") {
         return Err(io::Error::other(
             "normal work response oversized or incomplete",
@@ -630,7 +647,9 @@ fn root_effect_request_at(
         return Err(io::Error::other("short root effect request"));
     }
     let mut reply = Vec::new();
-    stream.take(8193).read_to_end(&mut reply)?;
+    stream
+        .take(ROOT_EFFECT_REPLY_READ_BYTES)
+        .read_to_end(&mut reply)?;
     if reply.len() > 8192 || !reply.ends_with(b"\n") {
         return Err(io::Error::other(
             "root effect response oversized or incomplete",
@@ -684,7 +703,9 @@ pub fn request_released_fresh_handoff_at(
     frame.extend_from_slice(&body);
     stream.write_all(&frame)?;
     let mut reply = Vec::new();
-    stream.take(8193).read_to_end(&mut reply)?;
+    stream
+        .take(RELEASED_HANDOFF_REPLY_READ_BYTES)
+        .read_to_end(&mut reply)?;
     if reply.len() > 8192 || !reply.ends_with(b"\n") {
         return Err(io::Error::other(
             "fresh released handoff response oversized or incomplete",
@@ -787,8 +808,8 @@ pub fn fresh_recipient_request_at(
         return Err(io::Error::other("fresh recipient request too large"));
     }
     let mut stream = checked_connection(path)?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
-    stream.set_write_timeout(Some(std::time::Duration::from_secs(30)))?;
+    stream.set_read_timeout(Some(FRESH_RECIPIENT_IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(FRESH_RECIPIENT_IO_TIMEOUT))?;
     let mut challenge = [0u8; 16];
     stream.read_exact(&mut challenge)?;
     let mut frame = Vec::with_capacity(17 + body.len());
@@ -839,7 +860,9 @@ fn fresh_v30_session_request_at(
     frame[17..33].copy_from_slice(id.as_bytes());
     stream.write_all(&frame)?;
     let mut bytes = Vec::new();
-    stream.take(1025).read_to_end(&mut bytes)?;
+    stream
+        .take(FRESH_SESSION_REPLY_READ_BYTES)
+        .read_to_end(&mut bytes)?;
     if bytes.len() > 1024 || !bytes.ends_with(b"\n") {
         return Err(io::Error::other(
             "fresh session response oversized or incomplete",
@@ -1348,7 +1371,9 @@ fn send_state_frame_at<T: serde::Serialize>(
         return Err(io::Error::other("short State read request"));
     }
     let mut response = Vec::new();
-    stream.take(4097).read_to_end(&mut response)?;
+    stream
+        .take(STATE_FRAME_REPLY_READ_BYTES)
+        .read_to_end(&mut response)?;
     if response.len() > 4096 || !response.ends_with(b"\n") {
         return Err(io::Error::other("invalid State read response"));
     }
@@ -2370,7 +2395,9 @@ fn checked_connection(path: &Path) -> io::Result<UnixStream> {
 
 fn read_response(stream: UnixStream) -> io::Result<String> {
     let mut response = Vec::new();
-    stream.take(257).read_to_end(&mut response)?;
+    stream
+        .take(BROKER_RESPONSE_READ_BYTES)
+        .read_to_end(&mut response)?;
     if response.len() > 256 || !response.ends_with(b"\n") {
         return Err(io::Error::other("invalid broker response"));
     }
@@ -2576,7 +2603,7 @@ fn request_frame_at(path: &Path, operation: Operation, payload: Payload) -> io::
             | Operation::CloseEntryGate
             | Operation::AbortEntryGate
     ) {
-        let timeout = Some(std::time::Duration::from_secs(5));
+        let timeout = Some(ENTRY_OBSERVATION_IO_TIMEOUT);
         stream.set_read_timeout(timeout)?;
         stream.set_write_timeout(timeout)?;
     }

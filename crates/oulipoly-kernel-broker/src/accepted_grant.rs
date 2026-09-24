@@ -1,6 +1,9 @@
 //! Durable, one-use accepted-work preparation. The host guardian can submit
 //! its exact positive receipt. A consumed record is durable launch debt, never
 //! by itself proof of execution or physical drain.
+
+const IMAGE_DIGEST_BUFFER_BYTES: usize = 64 * 1024;
+
 use crate::entry_registry::{EntryRegistry, ProcessStamp};
 use crate::identity::{PeerIdentity, PinnedProcess, host_proc_file};
 use crate::native_receipt::{BoundNativeAuthority, verify as verify_native_receipt};
@@ -302,7 +305,7 @@ fn valid_digest(value: &str) -> bool {
 
 fn image_digest(file: &File) -> io::Result<String> {
     let mut hash = Sha256::new();
-    let mut bytes = [0u8; 64 * 1024];
+    let mut bytes = [0u8; IMAGE_DIGEST_BUFFER_BYTES];
     let mut offset = 0;
     loop {
         let count = file.read_at(&mut bytes, offset)?;

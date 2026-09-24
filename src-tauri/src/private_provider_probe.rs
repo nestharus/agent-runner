@@ -1,6 +1,9 @@
 //! Private native K fixture: run the real provider client inside the held work.
 //! The enclosing probe requires the existing private user namespace. This is
 //! executable custody evidence, never proof of host-root sudo credentials.
+
+const PRIVATE_CUSTODY_QUIESCENCE_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
 use oulipoly_core::launch_custody::{LaunchCustody, LaunchScope};
 use oulipoly_provider::client::{ProviderClient, ProviderClientOptions};
 use oulipoly_provider::custody::AttemptActorCustody;
@@ -52,7 +55,7 @@ pub(crate) fn run(marker: &Path) -> Result<(), String> {
     drop(scope);
     custody.seal();
     while !custody.quiescent() {
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::thread::sleep(PRIVATE_CUSTODY_QUIESCENCE_POLL);
     }
     Ok(())
 }

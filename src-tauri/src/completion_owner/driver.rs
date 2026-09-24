@@ -3,6 +3,16 @@
 //! it does not fork, reap, cancel, integrate terminal results, or succeed the
 //! root. The selected v30 route repairs through the retained broker source,
 //! then refuses before source recovery or wake without their grants.
+
+#[cfg(feature = "age319-private-broker-fixture")]
+const PRIVATE_CHILD_ATTESTATION_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+#[cfg(feature = "age319-private-broker-fixture")]
+const PRIVATE_CHILD_ATTESTATION_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+#[cfg(feature = "age319-private-broker-fixture")]
+const PRIVATE_SOURCE_PRELAUNCH_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+#[cfg(feature = "age319-private-broker-fixture")]
+const PRIVATE_SOURCE_PRELAUNCH_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
 use oulipoly_kernel_broker::protocol::{self, StateRoute};
 use oulipoly_state::StateDb;
 use oulipoly_state::mailbox::{CompletionDomainOwner, ContinuationAttempt, MailboxDb};
@@ -83,12 +93,12 @@ fn run_with_root(
                     let gate_dir = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
                         .ok_or("private exec driver gate directory missing")?;
                     let attested = Path::new(&gate_dir).join("child-attested");
-                    let deadline = Instant::now() + Duration::from_secs(20);
+                    let deadline = Instant::now() + PRIVATE_CHILD_ATTESTATION_WAIT;
                     while !attested.exists() {
                         if Instant::now() >= deadline {
                             return Err("private exec driver child attestation timed out".into());
                         }
-                        std::thread::sleep(Duration::from_millis(20));
+                        std::thread::sleep(PRIVATE_CHILD_ATTESTATION_POLL);
                     }
                     return Err(
                         "v30 driver bounded State repair and wake route is not available".into(),
@@ -156,12 +166,12 @@ fn run_v30_repair_boundary(
                 )
                 .map_err(|e| e.to_string())?;
                 if std::env::var_os("AGE319_PRIVATE_SOURCE_PRELAUNCH_BARRIER_V1").is_some() {
-                    let deadline = Instant::now() + Duration::from_secs(20);
+                    let deadline = Instant::now() + PRIVATE_SOURCE_PRELAUNCH_WAIT;
                     while !Path::new(&gate).join("source-allow-launch").exists() {
                         if Instant::now() >= deadline {
                             return Err("private source prelaunch barrier expired".into());
                         }
-                        std::thread::sleep(Duration::from_millis(20));
+                        std::thread::sleep(PRIVATE_SOURCE_PRELAUNCH_POLL);
                     }
                 }
             }

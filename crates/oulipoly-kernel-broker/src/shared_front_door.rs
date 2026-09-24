@@ -5,6 +5,10 @@
 static FIXTURE_ONLY_MARKER: [u8; 46] = *b"OULIPOLY_AGE319_FRONT_DOOR_FIXTURE_ONLY_UNSAFE";
 #[cfg(target_os = "linux")]
 mod linux {
+    const BROKER_OBSERVE_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    const OBSERVE_RESPONSE_READ_BYTES: u64 = 257;
+
     use serde::Deserialize;
     use sha2::{Digest, Sha256};
     use std::ffi::{CStr, CString, OsStr};
@@ -432,8 +436,8 @@ mod linux {
 
     fn observe_broker(path: &Path, image: &Path) -> io::Result<BrokerRoute> {
         let mut stream = UnixStream::connect(path)?;
-        stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
-        stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
+        stream.set_read_timeout(Some(BROKER_OBSERVE_IO_TIMEOUT))?;
+        stream.set_write_timeout(Some(BROKER_OBSERVE_IO_TIMEOUT))?;
         let mut peer = libc::ucred {
             pid: 0,
             uid: 0,
@@ -472,7 +476,9 @@ mod linux {
         request[1..].copy_from_slice(&challenge);
         stream.write_all(&request)?;
         let mut response = Vec::new();
-        (&mut stream).take(257).read_to_end(&mut response)?;
+        (&mut stream)
+            .take(OBSERVE_RESPONSE_READ_BYTES)
+            .read_to_end(&mut response)?;
         if response.len() > 256 || !response.ends_with(b"\n") {
             return Err(error("invalid broker route response"));
         }

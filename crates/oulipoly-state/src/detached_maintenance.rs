@@ -1,5 +1,11 @@
 //! Bounded opportunity runner used only by the detached maintenance process.
 
+const DEFAULT_DISCOVERY_NODES: usize = 128;
+const DEFAULT_PARTITIONS_PER_RUN: usize = 4;
+const DEFAULT_RETIREMENT_VALIDATION_ROWS: u64 = 256;
+const DEFAULT_RETIREMENT_VALIDATION_BYTES: u64 = 8 * 1024 * 1024;
+const DEFAULT_RETIREMENT_UNLINK_ENTRIES: usize = 4;
+
 use crate::event_store::maintenance_discovery::{
     DiscoveryClass, DiscoveryCursor, DiscoveryEntry, DiscoveryPhase, archive_invalid_absent_leaf,
     move_generation_class, read_batch, record_closed_generation, register_legacy_generation,
@@ -58,12 +64,12 @@ impl From<EventRetirementWorkLimitsDto> for EventRetirementWorkLimits {
 impl Default for OpportunityWorkLimits {
     fn default() -> Self {
         Self {
-            max_discovery_nodes: 128,
-            max_partitions_per_run: 4,
+            max_discovery_nodes: DEFAULT_DISCOVERY_NODES,
+            max_partitions_per_run: DEFAULT_PARTITIONS_PER_RUN,
             retirement: EventRetirementWorkLimitsDto {
-                max_validation_rows: 256,
-                max_validation_bytes: 8 * 1024 * 1024,
-                max_unlink_entries: 4,
+                max_validation_rows: DEFAULT_RETIREMENT_VALIDATION_ROWS,
+                max_validation_bytes: DEFAULT_RETIREMENT_VALIDATION_BYTES,
+                max_unlink_entries: DEFAULT_RETIREMENT_UNLINK_ENTRIES,
             },
         }
     }

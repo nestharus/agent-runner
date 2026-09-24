@@ -1,5 +1,17 @@
 //! Broker-owned, one-use native continuation K. Nothing below the worker's
 //! execution gate may run until the exact retained State attach is committed.
+
+const CANCELLATION_ESCALATION_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+const PID1_REAP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+#[cfg(feature = "age319-private-broker-fixture")]
+const PRIVATE_NATIVE_GATE_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+#[cfg(feature = "age319-private-broker-fixture")]
+const PRIVATE_NATIVE_GATE_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+const HASH_OUTPUT_BUFFER_BYTES: usize = 64 * 1024;
+const CAPTURE_OUTPUT_BUFFER_BYTES: usize = 8192;
+const LAUNCH_READ_BUFFER_BYTES: usize = 64 * 1024;
+
 use super::work_launch;
 use oulipoly_kernel_broker::accepted_grant::{GrantRegistry, NativeGrantRecord};
 use oulipoly_kernel_broker::entry_registry::ProcessStamp;
@@ -23,7 +35,7 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 static CANCEL: AtomicBool = AtomicBool::new(false);
 extern "C" fn request_cancel(_: libc::c_int) {
@@ -113,7 +125,7 @@ fn hash_output(path: &Path, name: &str) -> io::Result<Option<OutputEvidence>> {
     }
     let mut hash = Sha256::new();
     let mut count = 0u64;
-    let mut buffer = [0u8; 64 * 1024];
+    let mut buffer = [0u8; HASH_OUTPUT_BUFFER_BYTES];
     loop {
         let read = file.read(&mut buffer)?;
         if read == 0 {
@@ -143,7 +155,7 @@ fn hash_output(path: &Path, name: &str) -> io::Result<Option<OutputEvidence>> {
 
 fn capture_output(request: &File) -> io::Result<Vec<OutputEvidence>> {
     let mut bytes = Vec::new();
-    let mut buffer = [0u8; 8192];
+    let mut buffer = [0u8; CAPTURE_OUTPUT_BUFFER_BYTES];
     let mut offset = 0;
     loop {
         let read = request.read_at(&mut buffer, offset)?;
@@ -293,7 +305,7 @@ fn run_init(mut context: InitContext) -> io::Result<()> {
     loop {
         if CANCEL.load(Ordering::Relaxed) {
             let started = *cancellation_started.get_or_insert_with(Instant::now);
-            let signal = if started.elapsed() >= Duration::from_secs(2) {
+            let signal = if started.elapsed() >= CANCELLATION_ESCALATION_DELAY {
                 libc::SIGKILL
             } else {
                 libc::SIGTERM
@@ -310,7 +322,7 @@ fn run_init(mut context: InitContext) -> io::Result<()> {
             continue;
         }
         if reaped == 0 {
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(PID1_REAP_POLL_INTERVAL);
             continue;
         }
         let error = io::Error::last_os_error();
@@ -516,7 +528,7 @@ pub(super) fn launch(
     let image = runner_image.try_clone()?;
     let digest = {
         let mut hash = Sha256::new();
-        let mut buffer = [0u8; 64 * 1024];
+        let mut buffer = [0u8; LAUNCH_READ_BUFFER_BYTES];
         let mut offset = 0;
         loop {
             let count = image.read_at(&mut buffer, offset)?;
@@ -617,12 +629,12 @@ pub(super) fn launch(
     {
         let directory = Path::new(&directory);
         std::fs::write(directory.join("native-attached"), spent.grant_id.as_bytes())?;
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + PRIVATE_NATIVE_GATE_WAIT;
         while !directory.join("native-release").exists() {
             if Instant::now() >= deadline {
                 return Err(io::Error::other("private native execution gate expired"));
             }
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(PRIVATE_NATIVE_GATE_POLL);
         }
     }
     // R lets pre-exec finish; the worker's own gate remains held until E.
@@ -1042,6 +1054,7 @@ mod tests {
     use super::*;
     use std::fs;
     use std::process::Command;
+    use std::time::Duration;
 
     #[test]
     fn private_native_pid1_holds_worker_then_reaps_long_adopted_descendant() {

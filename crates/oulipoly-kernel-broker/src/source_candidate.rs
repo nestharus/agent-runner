@@ -1,5 +1,8 @@
 //! Original-location v2 Bash candidate evidence. Only a retained broker
 //! source grant selects these bytes; a pathname alone carries no authority.
+
+const STAMP_BUFFER_BYTES: usize = 64 * 1024;
+
 use oulipoly_state::completion_continuation::{
     MAX_REGISTRATION_BYTES, SourceRegistration, open_source_file, sha256,
 };
@@ -29,7 +32,7 @@ fn stamp(file: &mut File, limit: usize, owner_uid: u32) -> Result<FileStamp, Str
     file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
     let mut digest = Sha256::new();
     let mut count = 0u64;
-    let mut buffer = [0u8; 64 * 1024];
+    let mut buffer = [0u8; STAMP_BUFFER_BYTES];
     loop {
         let n = file.read(&mut buffer).map_err(|e| e.to_string())?;
         if n == 0 {

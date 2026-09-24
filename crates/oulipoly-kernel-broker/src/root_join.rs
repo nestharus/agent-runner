@@ -1,5 +1,9 @@
 //! One-use root child placement. The host guardian remains outside this PID
 //! namespace. PID1 is a reaper and retains the root after the broker exits.
+
+#[cfg(feature = "age319-private-broker-fixture")]
+const PRIVATE_ROOT_GATE_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
 use oulipoly_kernel_broker::entry_registry::EntryRegistry;
 use oulipoly_kernel_broker::entry_registry::ProcessStamp;
 use oulipoly_kernel_broker::identity::{PeerIdentity, PinnedProcess};
@@ -539,7 +543,7 @@ pub(super) fn hold(
             init.verify()?;
             child.verify()?;
             peer.process.verify()?;
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(PRIVATE_ROOT_GATE_POLL);
         }
     }
     let guardian = PinnedProcess::open(guardian_pid)?;

@@ -3,6 +3,11 @@
 use super::*;
 use serde_json::{Value, json};
 
+const J01_TRACE_RELEASE_WAIT: Duration = Duration::from_secs(45);
+const J01_TRACE_RELEASE_POLL: Duration = Duration::from_millis(10);
+const J01_AFTER_RELEASE_WAIT: Duration = Duration::from_secs(45);
+const J01_AFTER_RELEASE_POLL: Duration = Duration::from_millis(10);
+
 fn actor(id: &SourceProcessIdentity) -> Value {
     json!({"pid": id.pid, "boot": id.boot_id, "starttime": id.starttime_ticks})
 }
@@ -98,9 +103,9 @@ pub(super) fn at_fresh_join(
     // The fixture releases this exact peer after reading the trace. A timeout
     // records a failed bounded observation; it never changes admission.
     let release = root.join(format!("j01-release-{}", peer.pid));
-    let deadline = Instant::now() + Duration::from_secs(45);
+    let deadline = Instant::now() + J01_TRACE_RELEASE_WAIT;
     while !release.exists() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(J01_TRACE_RELEASE_POLL);
     }
 }
 
@@ -113,8 +118,8 @@ pub(super) fn after_context_release(path: &Path) {
         return;
     }
     let _ = std::fs::write(root.join("j01-after-release.reached"), b"released\n");
-    let deadline = Instant::now() + Duration::from_secs(45);
+    let deadline = Instant::now() + J01_AFTER_RELEASE_WAIT;
     while hold.exists() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(J01_AFTER_RELEASE_POLL);
     }
 }

@@ -1,6 +1,10 @@
 //! One-use accepted-work placement. The broker owns the irreversible grant
 //! transition, the nested PID1 and the worker's pre-exec gate. The PID1 writes
 //! a terminal receipt only after it has reaped every adopted descendant.
+
+const CANCELLATION_ESCALATION_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+const PID1_REAP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
 use oulipoly_kernel_broker::accepted_grant::{GrantRecord, GrantRegistry};
 use oulipoly_kernel_broker::entry_registry::{EntryRegistry, ProcessStamp};
 use oulipoly_kernel_broker::identity::{PeerIdentity, PinnedProcess, observed_incarnation_gone};
@@ -16,7 +20,7 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 const EXECUTOR_ARG: &str = "__root-original-work-v1";
 static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -226,7 +230,7 @@ fn run_init(context: InitContext) -> io::Result<()> {
     loop {
         if CANCEL_REQUESTED.load(Ordering::Relaxed) {
             let started = *cancellation_started.get_or_insert_with(Instant::now);
-            let signal = if started.elapsed() >= Duration::from_secs(2) {
+            let signal = if started.elapsed() >= CANCELLATION_ESCALATION_DELAY {
                 libc::SIGKILL
             } else {
                 libc::SIGTERM
@@ -242,7 +246,7 @@ fn run_init(context: InitContext) -> io::Result<()> {
             continue;
         }
         if reaped == 0 {
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(PID1_REAP_POLL_INTERVAL);
             continue;
         }
         let error = io::Error::last_os_error();
