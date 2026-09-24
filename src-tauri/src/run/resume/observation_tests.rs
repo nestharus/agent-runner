@@ -5,6 +5,279 @@ use oulipoly_runtime::session_provider::{SessionProviderPageTurn, SessionProvide
 use oulipoly_state::SessionLifecycleRepository;
 use oulipoly_state::mailbox::{AgentBashCompleteEnqueue, EnqueueResult};
 
+fn register_receipt_runtime(f: &mut Fixture) {
+    let config_root = f.root.path().join("config");
+    f.db.wake_sessions()
+        .upsert_session_metadata(oulipoly_state::mailbox::SessionMetadataUpsert {
+            session_id: SESSION,
+            mode: "headless",
+            invocation_uuid: Some("native-invocation"),
+            provider_name: Some("account"),
+            model_name: Some("offline"),
+            models_dir: config_root.to_str(),
+            effective_cwd: f.root.path().to_str(),
+        })
+        .unwrap();
+}
+
+#[test]
+fn detached_receipt_page_requires_exact_pending_anchor_and_checkpoint() {
+    use crate::native_receipt::broker_scan::{
+        ScanRequest, ScanResult, finish_completed_checkpoint, integrate_result, prepare_request,
+    };
+    let result_for = |request: &ScanRequest, matches: &[&str]| -> ScanResult {
+        serde_json::from_value(serde_json::json!({
+            "protocol": "receipt-scan-page-v1",
+            "request_sha256": request.digest().unwrap(),
+            "page": {
+                "provider_instance_id": "instance", "settings_id": "settings",
+                "session_id": SESSION, "reader_identity": "fixture-reader",
+                "snapshot_id": "snapshot-1", "page_index": 0,
+                "page_start_sequence": 0, "page_turn_count": matches.len(),
+                "snapshot_complete": true, "next_page_token": null,
+                "resume_token": "after-1", "matching_turn_ids": matches,
+            }
+        }))
+        .unwrap()
+    };
+    let mut f = Fixture::new();
+    assert!(prepare_request(&f.db, &f.attempt).unwrap().is_none());
+    f.anchored_submit();
+    register_receipt_runtime(&mut f);
+    let request = prepare_request(&f.db, &f.attempt).unwrap().unwrap();
+    let positive = result_for(&request, &["turn-1"]);
+    let mut wrong: serde_json::Value = serde_json::to_value(&positive).unwrap();
+    wrong["request_sha256"] = serde_json::json!("0".repeat(64));
+    assert!(integrate_result(&f.db, &request, &serde_json::from_value(wrong).unwrap()).is_err());
+    assert!(
+        f.db.delivery_observation_progress(&f.attempt)
+            .unwrap()
+            .is_none()
+    );
+    f.restart(); // Lost worker reply: retained request/result can be read back and CASed once.
+    assert!(integrate_result(&f.db, &request, &positive).unwrap());
+    assert!(
+        f.db.delivery_observation_confirmation(&f.attempt)
+            .unwrap()
+            .is_some()
+    );
+    assert!(integrate_result(&f.db, &request, &positive).is_err());
+
+    let mut changed = Fixture::new();
+    changed.anchored_submit();
+    register_receipt_runtime(&mut changed);
+    let request = prepare_request(&changed.db, &changed.attempt)
+        .unwrap()
+        .unwrap();
+    rusqlite::Connection::open(changed.db.path())
+        .unwrap()
+        .execute(
+            "UPDATE session_runtime SET effective_cwd='/changed' WHERE session_id=?1",
+            [SESSION],
+        )
+        .unwrap();
+    assert!(integrate_result(&changed.db, &request, &result_for(&request, &["turn-1"])).is_err());
+    assert!(
+        changed
+            .db
+            .delivery_observation_progress(&changed.attempt)
+            .unwrap()
+            .is_none()
+    );
+    changed.assert_pending_without_replay();
+
+    let mut absent = Fixture::new();
+    absent.anchored_submit();
+    register_receipt_runtime(&mut absent);
+    let request = prepare_request(&absent.db, &absent.attempt)
+        .unwrap()
+        .unwrap();
+    assert!(!integrate_result(&absent.db, &request, &result_for(&request, &[])).unwrap());
+    absent.restart();
+    absent.assert_pending_without_replay();
+
+    let mut ambiguous = Fixture::new();
+    ambiguous.anchored_submit();
+    register_receipt_runtime(&mut ambiguous);
+    let request = prepare_request(&ambiguous.db, &ambiguous.attempt)
+        .unwrap()
+        .unwrap();
+    assert!(
+        !integrate_result(
+            &ambiguous.db,
+            &request,
+            &result_for(&request, &["turn-1", "turn-2"])
+        )
+        .unwrap()
+    );
+    ambiguous.restart();
+    ambiguous.assert_pending_without_replay();
+
+    let mut interrupted = Fixture::new();
+    interrupted.anchored_submit();
+    register_receipt_runtime(&mut interrupted);
+    let request = prepare_request(&interrupted.db, &interrupted.attempt)
+        .unwrap()
+        .unwrap();
+    let conn = rusqlite::Connection::open(interrupted.db.path()).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER receipt_confirmation_fault
+        BEFORE UPDATE OF observation_confirmed_at ON mailbox_delivery_attempts
+        BEGIN SELECT RAISE(ABORT,'private receipt confirmation fault'); END;",
+    )
+    .unwrap();
+    assert!(
+        integrate_result(
+            &interrupted.db,
+            &request,
+            &result_for(&request, &["turn-1"])
+        )
+        .is_err()
+    );
+    assert!(
+        interrupted
+            .db
+            .delivery_observation_progress(&interrupted.attempt)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        interrupted
+            .db
+            .delivery_observation_confirmation(&interrupted.attempt)
+            .unwrap()
+            .is_none()
+    );
+    conn.execute_batch("DROP TRIGGER receipt_confirmation_fault")
+        .unwrap();
+    interrupted.restart();
+    let retained = prepare_request(&interrupted.db, &interrupted.attempt)
+        .unwrap()
+        .unwrap();
+    assert!(finish_completed_checkpoint(&interrupted.db, &retained).unwrap());
+    assert!(
+        interrupted
+            .db
+            .delivery_observation_confirmation(&interrupted.attempt)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn detached_receipt_page_reads_actual_provider_and_keeps_uncertain_work_pending() {
+    use crate::native_receipt::broker_scan::{
+        integrate_result, prepare_request, scan_with_registry,
+    };
+    use oulipoly_config::{ProviderEndpointConfig, ProviderEntry, ProvidersConfig};
+    use oulipoly_runtime::provider_registry::{ProviderRegistry, ProviderRegistryOptions};
+    use std::collections::HashMap;
+    use std::os::unix::fs::PermissionsExt;
+
+    for mode in ["positive", "nonzero", "cancel", "ambiguous"] {
+        let mut f = Fixture::new();
+        f.anchor.provider_instance_id = "receipt-scan-fixture-instance".into();
+        let script = f.root.path().join("receipt-scan-fixture.py");
+        let source = include_str!("../../native_receipt/scan_fixture.py").replace(
+            "__FIXTURE_ROOT__",
+            &serde_json::to_string(f.root.path()).unwrap(),
+        );
+        std::fs::write(&script, source).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let hashes = if mode == "ambiguous" {
+            vec![
+                f.anchor.expected_sha256.clone(),
+                f.anchor.expected_sha256.clone(),
+            ]
+        } else {
+            vec![f.anchor.expected_sha256.clone()]
+        };
+        std::fs::write(
+            f.root.path().join("turn-hashes.json"),
+            serde_json::to_vec(&hashes).unwrap(),
+        )
+        .unwrap();
+        if mode == "nonzero" {
+            std::fs::write(f.root.path().join("nonzero"), b"").unwrap();
+        }
+        if mode == "cancel" {
+            std::fs::write(f.root.path().join("hold"), b"").unwrap();
+        }
+        f.anchored_submit();
+        register_receipt_runtime(&mut f);
+        let providers = ProvidersConfig {
+            entries: HashMap::from([(
+                "account".into(),
+                ProviderEntry {
+                    implementation: Some(ProviderEndpointConfig {
+                        family: "receipt-scan-fixture".into(),
+                        executable: script.display().to_string(),
+                    }),
+                    settings_id: Some("settings".into()),
+                    ..ProviderEntry::default()
+                },
+            )]),
+        };
+        let registry = ProviderRegistry::from_configs(
+            &[],
+            &providers,
+            ProviderRegistryOptions::default()
+                .with_config_root(f.root.path().join("config"))
+                .with_data_root(f.root.path().join("data")),
+        )
+        .unwrap();
+        let request = prepare_request(&f.db, &f.attempt).unwrap().unwrap();
+        let cancellation = CancellationToken::new();
+        if mode == "cancel" {
+            cancellation.cancel_after(Duration::from_millis(100));
+        }
+        let result = scan_with_registry(&request, &registry, &cancellation, Duration::from_secs(5));
+        if mode == "nonzero" || mode == "cancel" {
+            assert!(result.is_err());
+            assert!(
+                f.db.delivery_observation_progress(&f.attempt)
+                    .unwrap()
+                    .is_none()
+            );
+            f.restart();
+            f.assert_pending_without_replay();
+            continue;
+        }
+        let result = result.unwrap_or_else(|error| {
+            panic!(
+                "{error}; provider={}; calls={}",
+                std::fs::read_to_string(f.root.path().join("provider-error")).unwrap_or_default(),
+                std::fs::read_to_string(f.root.path().join("provider-calls")).unwrap_or_default()
+            )
+        });
+        // The reply may be lost after the provider ran. Integration uses the
+        // retained request and result once; it never invokes that provider again.
+        f.restart();
+        assert_eq!(
+            integrate_result(&f.db, &request, &result).unwrap(),
+            mode == "positive"
+        );
+        let calls = std::fs::read_to_string(f.root.path().join("provider-calls")).unwrap();
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|line| *line == "session.read_turns")
+                .count(),
+            1
+        );
+        if mode == "ambiguous" {
+            f.assert_pending_without_replay();
+        } else {
+            assert!(
+                f.db.delivery_observation_confirmation(&f.attempt)
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(integrate_result(&f.db, &request, &result).is_err());
+        }
+    }
+}
+
 const SESSION: &str = "11111111-1111-4111-8111-111111111111";
 struct Fixture {
     root: tempfile::TempDir,

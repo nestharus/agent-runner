@@ -20,6 +20,12 @@ pub(crate) const OBSERVATION_MAX_TURNS: u64 = 64;
 pub(crate) const OBSERVATION_MAX_RESPONSE_BYTES: u64 = 128 * 1024;
 pub(crate) const OBSERVATION_MAX_SOURCE_BYTES: u64 = 512 * 1024;
 
+// The detached page protocol is a closed production seam until the broker
+// binds it to a one-use accepted work grant and authentic worker/Q readback.
+#[path = "native_receipt/broker_scan.rs"]
+#[allow(dead_code)] // Closed production seam until broker work/result binding exists.
+pub(crate) mod broker_scan;
+
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ObservationProgress {
     #[serde(default)]

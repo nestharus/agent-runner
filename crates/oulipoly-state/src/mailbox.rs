@@ -1104,7 +1104,8 @@ struct DeliveryAttemptTarget<'a> {
     mode: DeliveryAttemptMode,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MailboxDeliveryObservationAnchor {
     pub provider_name: String,
     pub provider_instance_id: String,
@@ -5309,6 +5310,101 @@ impl MailboxDb {
             )
             .optional()
             .map_err(|e| e.to_string())
+    }
+
+    /// Admission for a detached receipt page. The request must name an exact
+    /// pending, anchored submission; an old unanchored or resolved attempt is
+    /// never promoted into receipt authority by the scanner's return value.
+    pub fn pending_receipt_scan_owner(
+        &self,
+        attempt_id: &str,
+        anchor: &MailboxDeliveryObservationAnchor,
+    ) -> Result<Option<String>, String> {
+        self.conn
+            .query_row(
+                "SELECT a.delivery_invocation_uuid FROM mailbox_delivery_attempts a
+             JOIN session_runtime r ON r.session_id=a.session_id
+             WHERE a.attempt_id=?1 AND a.session_id=?2 AND a.observation_session_id=?2
+               AND a.observation_provider_name=?3 AND a.observation_provider_instance_id=?4
+               AND a.observation_settings_id=?5 AND a.observation_anchor_token=?6
+               AND a.observation_expected_sha256=?7 AND a.resolved_at IS NULL
+               AND a.observation_confirmed_at IS NULL AND a.headless_submission_state='possible'
+               AND a.submission_started_at IS NOT NULL AND r.mode='headless'
+               AND r.provider_name=?3
+               AND NOT EXISTS(SELECT 1 FROM mailbox_observation_stops s
+                   WHERE s.session_id=a.session_id AND s.rearmed_at IS NULL)
+               AND NOT EXISTS(SELECT 1 FROM mailbox_notification_control n
+                   WHERE n.session_id=a.session_id AND n.paused=1)",
+                params![
+                    attempt_id,
+                    anchor.provider_session_id,
+                    anchor.provider_name,
+                    anchor.provider_instance_id,
+                    anchor.settings_id,
+                    anchor.resume_token,
+                    anchor.expected_sha256
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| format!("receipt scan admission: {error}"))
+    }
+
+    /// Integrate one returned page only while the same submitted attempt,
+    /// anchor, owner and previous checkpoint are still pending. A missing or
+    /// ambiguous page never marks non-delivery. This is intentionally separate
+    /// from a broker physical Q and from the consumer acknowledgement.
+    pub fn advance_delivery_observation_progress_exact(
+        &self,
+        attempt_id: &str,
+        invocation_uuid: &str,
+        anchor: &MailboxDeliveryObservationAnchor,
+        previous: Option<&str>,
+        next: &str,
+        model_name: &str,
+        effective_cwd: &str,
+        config_root: &str,
+    ) -> Result<bool, String> {
+        if next.len() > 128 * 1024 {
+            return Err("mailbox observation progress exceeds bound".into());
+        }
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE mailbox_delivery_attempts AS a
+             SET observation_progress=?10, observation_error=NULL
+             WHERE a.attempt_id=?1 AND a.delivery_invocation_uuid=?2
+               AND a.session_id=?3 AND a.observation_session_id=?3
+               AND a.observation_provider_name=?4 AND a.observation_provider_instance_id=?5
+               AND a.observation_settings_id=?6 AND a.observation_anchor_token=?7
+               AND a.observation_expected_sha256=?8 AND a.observation_progress IS ?9
+               AND a.resolved_at IS NULL AND a.observation_confirmed_at IS NULL
+               AND a.headless_submission_state='possible' AND a.submission_started_at IS NOT NULL
+               AND EXISTS(SELECT 1 FROM session_runtime r WHERE r.session_id=a.session_id
+                   AND r.mode='headless' AND r.provider_name=?4
+                   AND r.model_name=?11 AND r.effective_cwd=?12 AND r.models_dir=?13)
+               AND NOT EXISTS(SELECT 1 FROM mailbox_observation_stops s
+                   WHERE s.session_id=a.session_id AND s.rearmed_at IS NULL)
+               AND NOT EXISTS(SELECT 1 FROM mailbox_notification_control n
+                   WHERE n.session_id=a.session_id AND n.paused=1)",
+                params![
+                    attempt_id,
+                    invocation_uuid,
+                    anchor.provider_session_id,
+                    anchor.provider_name,
+                    anchor.provider_instance_id,
+                    anchor.settings_id,
+                    anchor.resume_token,
+                    anchor.expected_sha256,
+                    previous,
+                    next,
+                    model_name,
+                    effective_cwd,
+                    config_root
+                ],
+            )
+            .map_err(|error| format!("receipt scan checkpoint CAS: {error}"))?;
+        Ok(changed == 1)
     }
 
     /// Publish native receipt and settle only this attempt's remaining items.
