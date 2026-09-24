@@ -947,6 +947,8 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
     }
     let config_dir = oulipoly_state::paths::config_dir()?;
     let pool = load_fresh_headless_pool(&config_dir, model_name)?;
+    let config_source = File::open(&config_dir)
+        .map_err(|e| format!("fresh config source unavailable before K: {e}"))?;
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let socket = broker_socket().with_file_name("v30.sock");
     let total = pool.model.providers.len();
@@ -968,8 +970,14 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
             auth_refresh_command: pool.account_effects[index].1.clone(),
         };
         let pinned = private_pin_plan(&candidate.plan)?;
-        protocol::private_fresh_route_at(&socket, &request, b'h', Some(pinned.descriptors()))
-            .map_err(|e| format!("fresh route candidate refused before K: {e}"))?;
+        let [image, cwd, input, recipe] = pinned.descriptors();
+        protocol::private_fresh_route_at(
+            &socket,
+            &request,
+            b'h',
+            &[image, cwd, input, recipe, config_source.as_raw_fd()],
+        )
+        .map_err(|e| format!("fresh route candidate refused before K: {e}"))?;
     }
     let mut quota_receipts = Vec::new();
     for (index, (quota_script, auth_command)) in pool.account_effects.iter().enumerate() {
@@ -1023,12 +1031,13 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
         quota_script: None,
         auth_refresh_command: None,
     };
-    let selected = protocol::private_fresh_route_at(&socket, &request, b'f', None)
-        .map_err(|e| format!("fresh route selection refused before K: {e}"))?
-        .ok_or("fresh route selection absent before K")?;
+    let selected =
+        protocol::private_fresh_route_at(&socket, &request, b'f', &[config_source.as_raw_fd()])
+            .map_err(|e| format!("fresh route selection refused before K: {e}"))?
+            .ok_or("fresh route selection absent before K")?;
     if selected.model != pool.model.name
         || selected.config_sha256 != pool.config_sha256
-        || selected.policy_version != "fresh-account-effects-v1"
+        || selected.policy_version != "fresh-account-effects-v2"
         || !selected.eligible_accounts.contains(&selected.account)
         || selected.eligible_accounts.iter().any(|account| {
             !pool

@@ -1465,7 +1465,7 @@ fn inner() {
                                 auth_refresh_command: None,
                             },
                             b'f',
-                            None,
+                            &[std::fs::File::open("/").unwrap().as_raw_fd()],
                         )
                         .is_err(),
                         "sibling read back fresh route"
@@ -2837,7 +2837,13 @@ fn inner() {
                 assert!(gate.join("native-t-sent").exists());
                 let mut provider_descendant = None;
                 if native_live {
-                    eventually(|| gate.join("native-effect").exists());
+                    // The provider creates the marker before writing its
+                    // physical-custody line; observe content, not just the
+                    // directory entry.
+                    eventually(|| {
+                        fs::metadata(gate.join("native-effect"))
+                            .is_ok_and(|metadata| metadata.len() > 0)
+                    });
                     if mode.starts_with("native_receipt_") {
                         assert_eq!(
                             fs::read(gate.join("native-effect").with_extension("helper-entry"))

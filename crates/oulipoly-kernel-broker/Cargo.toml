@@ -33,6 +33,7 @@ sha2.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 oulipoly-state = { path = "../oulipoly-state" }
+oulipoly-runtime = { path = "../oulipoly-runtime" }
 
 [dev-dependencies]
 tempfile.workspace = true

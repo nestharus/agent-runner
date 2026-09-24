@@ -397,7 +397,9 @@ fn recv_request(
             #[cfg(feature = "age319-private-broker-fixture")]
             b'5' | b'9' => descriptors.len() != 4,
             #[cfg(feature = "age319-private-broker-fixture")]
-            b'h' => descriptors.len() != 4,
+            b'h' => descriptors.len() != 5,
+            #[cfg(feature = "age319-private-broker-fixture")]
+            b'f' => descriptors.len() != 1,
             b'L' => !(1..=4).contains(&descriptors.len()),
             b'V' | b'S' | b's' | b'T' => descriptors.len() != 1,
             _ => !descriptors.is_empty(),
@@ -4339,9 +4341,17 @@ fn serve_fresh_v30_at(
                             if instance.is_closed() {
                                 return Err(io::Error::other("fresh route entry gate closed"));
                             }
-                            let [image_fd, cwd, input, recipe]: [File; 4] = descriptors
+                            let [image_fd, cwd, input, recipe, config_dir]: [File; 5] = descriptors
                                 .try_into()
                                 .map_err(|_| io::Error::other("fresh route descriptors absent"))?;
+                            fresh_provider::validate_route_source(&config_dir, &route_request)?;
+                            fresh_provider::bind_route_source(
+                                &directory,
+                                &binding,
+                                &route_request,
+                                &config_dir,
+                                true,
+                            )?;
                             let image =
                                 fs::read_link(format!("/proc/self/fd/{}", image_fd.as_raw_fd()))?;
                             let plan = fresh_provider::plan_from_descriptors(
@@ -4355,6 +4365,17 @@ fn serve_fresh_v30_at(
                             )?;
                             return Ok("fresh-route-registered\n".into());
                         }
+                        let [config_dir]: [File; 1] = descriptors
+                            .try_into()
+                            .map_err(|_| io::Error::other("fresh route source absent"))?;
+                        fresh_provider::validate_route_source(&config_dir, &route_request)?;
+                        fresh_provider::bind_route_source(
+                            &directory,
+                            &binding,
+                            &route_request,
+                            &config_dir,
+                            false,
+                        )?;
                         let selection =
                             fresh_provider::select_route(&directory, &binding, &route_request)?;
                         return Ok(format!(
@@ -4903,6 +4924,33 @@ mod tests {
     }
 
     #[test]
+    fn legacy_and_fresh_e_frames_keep_their_exact_lengths() {
+        for (body_len, accepted) in [(0, true), (1, false), (15, false), (16, true), (17, false)] {
+            let (mut server, mut client) = UnixStream::pair().unwrap();
+            let receiver = thread::spawn(move || recv_request(&mut server));
+            let mut challenge = [0u8; 16];
+            client.read_exact(&mut challenge).unwrap();
+            let mut frame = vec![b'E'];
+            frame.extend_from_slice(&challenge);
+            frame.extend_from_slice(&vec![0x5a; body_len]);
+            client.write_all(&frame).unwrap();
+            let result = receiver.join().unwrap();
+            assert_eq!(result.is_ok(), accepted, "E frame length {}", frame.len());
+            if let Ok((operation, payload, _, _)) = result {
+                assert_eq!(operation, b'E');
+                if body_len == 0 {
+                    assert!(matches!(payload, RequestPayload::None));
+                } else {
+                    assert!(matches!(
+                        payload,
+                        RequestPayload::FreshBashChildRequest { .. }
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn state_write_frame_is_challenged_and_carries_no_path_or_row_authority() {
         let (mut server, mut client) = UnixStream::pair().unwrap();
         let receiver = thread::spawn(move || recv_request(&mut server));
@@ -5194,7 +5242,7 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let (op, payload, peer) = peer_from_request(&mut stream).unwrap();
-            assert_eq!(op, b'C');
+            assert_eq!(op, b'E');
             assert!(matches!(payload, RequestPayload::None));
             assert_eq!(peer.process.host_pid, std::process::id() as i32);
         });
@@ -5202,7 +5250,7 @@ mod tests {
         let mut challenge = [0u8; 16];
         client.read_exact(&mut challenge).unwrap();
         let mut message = [0u8; 17];
-        message[0] = b'C';
+        message[0] = b'E';
         message[1..].copy_from_slice(&challenge);
         assert_eq!(
             unsafe { libc::send(client.as_raw_fd(), message.as_ptr().cast(), 17, 0) },
@@ -5223,7 +5271,7 @@ mod tests {
         let mut client = UnixStream::connect(&socket).unwrap();
         let mut challenge = [0u8; 16];
         client.read_exact(&mut challenge).unwrap();
-        let message = [b'C'; 17];
+        let message = [b'E'; 17];
         assert_eq!(
             unsafe { libc::send(client.as_raw_fd(), message.as_ptr().cast(), 17, 0) },
             17
@@ -5243,7 +5291,7 @@ mod tests {
                 .unwrap();
             assert!(peer_from_request(&mut stream).is_err());
         });
-        let script = "import os,socket,sys\ns=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.connect(sys.argv[1]);c=s.recv(16);p=os.fork()\nif p==0:\n s.sendall(b'C'+c);os._exit(0)\nos.waitpid(p,0)";
+        let script = "import os,socket,sys\ns=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.connect(sys.argv[1]);c=s.recv(16);p=os.fork()\nif p==0:\n s.sendall(b'E'+c);os._exit(0)\nos.waitpid(p,0)";
         let output = Command::new("python3")
             .args(["-c", script, socket.to_str().unwrap()])
             .output()
@@ -5283,7 +5331,7 @@ assert int(caps, 16) & (1 << 21), caps  # CAP_SYS_ADMIN in the child user namesp
 s = socket.socket(fileno=3)
 challenge = s.recv(16)
 assert len(challenge) == 16
-message = b'C' + challenge
+message = b'E' + challenge
 claimed = struct.pack('3i', int(sys.argv[1]), 0, 0)
 try:
     s.sendmsg([message], [(socket.SOL_SOCKET, socket.SCM_CREDENTIALS, claimed)])

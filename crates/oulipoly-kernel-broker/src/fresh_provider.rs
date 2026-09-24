@@ -462,6 +462,16 @@ struct RouteDecision {
     selection: FreshRouteSelection,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct RouteSource {
+    version: u32,
+    binding: Binding,
+    config_sha256: String,
+    directory_device: u64,
+    directory_inode: u64,
+}
+
 fn route_request_valid(request: &FreshRouteRequest, binding: &Binding) -> io::Result<()> {
     if request.d_key.is_empty()
         || request.model.is_empty()
@@ -476,6 +486,85 @@ fn route_request_valid(request: &FreshRouteRequest, binding: &Binding) -> io::Re
         return Err(io::Error::other("fresh route request invalid"));
     }
     Ok(())
+}
+
+/// Read the configured pool in the broker through the caller's pinned directory
+/// descriptor. The request digest and roster are assertions checked against
+/// source bytes, not authority supplied by the Runner. Registration and the
+/// final choice both recheck the source, so a configuration edit between them
+/// refuses the choice before any provider K.
+pub(super) fn validate_route_source(
+    config_dir: &File,
+    request: &FreshRouteRequest,
+) -> io::Result<()> {
+    if !config_dir.metadata()?.is_dir() {
+        return Err(io::Error::other("fresh config source is not a directory"));
+    }
+    let path = PathBuf::from(format!("/proc/self/fd/{}", config_dir.as_raw_fd()));
+    let pool = oulipoly_runtime::executor::cli::fresh_remote::load_fresh_headless_pool(
+        &path,
+        &request.model,
+    )
+    .map_err(|error| io::Error::other(format!("fresh config source invalid: {error}")))?;
+    if pool.config_sha256 != request.config_sha256 || pool.model.providers.len() != request.total {
+        return Err(io::Error::other(
+            "fresh config source digest or roster changed",
+        ));
+    }
+    if let Some(index) = request.index {
+        let member = pool
+            .model
+            .providers
+            .get(index)
+            .ok_or_else(|| io::Error::other("fresh config source account index invalid"))?;
+        let effect = pool
+            .account_effects
+            .get(index)
+            .ok_or_else(|| io::Error::other("fresh config source account effect absent"))?;
+        if request.account.as_deref() != Some(member.name.as_str())
+            || request.quota_script != effect.0
+            || request.auth_refresh_command != effect.1
+        {
+            return Err(io::Error::other(
+                "fresh config source account or effect forged",
+            ));
+        }
+    } else if request.account.is_some()
+        || request.quota_script.is_some()
+        || request.auth_refresh_command.is_some()
+    {
+        return Err(io::Error::other(
+            "fresh config source selection carries candidate",
+        ));
+    }
+    Ok(())
+}
+
+/// Bind every candidate and the final choice to the same directory inode.
+/// A source with identical bytes at another path is a different snapshot
+/// origin and cannot replace this held root's already registered source.
+pub(super) fn bind_route_source(
+    directory: &Path,
+    binding: &Binding,
+    request: &FreshRouteRequest,
+    config_dir: &File,
+    registration: bool,
+) -> io::Result<()> {
+    let meta = config_dir.metadata()?;
+    let source = RouteSource {
+        version: 1,
+        binding: binding.clone(),
+        config_sha256: request.config_sha256.clone(),
+        directory_device: meta.dev(),
+        directory_inode: meta.ino(),
+    };
+    let name = format!("{}.route-source.json", binding.handoff_id);
+    match exact_file::<RouteSource>(directory, &name)? {
+        Some(existing) if existing == source => Ok(()),
+        Some(_) => Err(io::Error::other("fresh route source directory changed")),
+        None if registration => durable_new(directory, &name, &source),
+        None => Err(io::Error::other("fresh route source registration absent")),
+    }
 }
 
 fn candidate_name(handoff: &str, index: usize) -> String {
@@ -495,6 +584,13 @@ struct AccountEffectIntent {
     request: FreshAccountEffectRequest,
     environment_sha256: String,
     plan_sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QuotaReuse {
+    source_directory: String,
+    source_effect_id: String,
 }
 
 fn redacted_effect_request(request: &FreshAccountEffectRequest) -> FreshAccountEffectRequest {
@@ -567,6 +663,81 @@ fn effect_intent(dir: &Path) -> io::Result<Option<AccountEffectIntent>> {
     exact_file(dir, "intent.json")
 }
 
+fn reusable_quota_source(
+    directory: &Path,
+    binding: &Binding,
+    request: &FreshAccountEffectRequest,
+) -> io::Result<Option<(String, AccountEffectIntent)>> {
+    let parent = directory.join("account-effects");
+    let mut names = std::fs::read_dir(&parent)?
+        .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+        .collect::<io::Result<Vec<_>>>()?;
+    names.sort();
+    let mut fresh = None;
+    let mut unresolved = None;
+    for name in names {
+        if !name.ends_with("-quota-first") && !name.ends_with("-quota-retry") {
+            continue;
+        }
+        let source_dir = parent.join(&name);
+        let Some(intent) = effect_intent(&source_dir)? else {
+            continue;
+        };
+        if intent.version != 1
+            || intent.binding == *binding
+            || intent.request.model != request.model
+            || intent.request.config_sha256 != request.config_sha256
+            || intent.request.account != request.account
+            || intent.request.index != request.index
+            || intent.environment_sha256 != environment_digest(request)?
+            || source_dir.join("reuse.json").exists()
+        {
+            continue;
+        }
+        let readback = effect_readback_from_dir(&source_dir, &intent)?;
+        if readback.state == "drained" && readback.outcome.as_deref() == Some("valid_windows") {
+            if matches!(
+                quota_remaining(&readback, Utc::now().timestamp()),
+                Ok(Some(_))
+            ) {
+                if fresh
+                    .as_ref()
+                    .is_none_or(|(_, _, prior_time)| readback.completed_unix_seconds > *prior_time)
+                {
+                    fresh = Some((name, intent, readback.completed_unix_seconds));
+                }
+            }
+        } else if readback.state != "drained" && unresolved.is_none() {
+            unresolved = Some((name, intent));
+        }
+    }
+    Ok(fresh.map(|(name, intent, _)| (name, intent)).or(unresolved))
+}
+
+/// Serialize the scan and durable auth intent across broker threads and
+/// incarnations. The lock protects the decision only; an already started K is
+/// represented by the fsynced intent and must be observed, never launched again.
+fn auth_admission_lock(directory: &Path, account: &str) -> io::Result<File> {
+    let parent = directory.join("account-effects");
+    std::fs::create_dir_all(&parent)?;
+    let name = format!("auth-{:x}.lock", Sha256::digest(account.as_bytes()));
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .open(parent.join(name))?;
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(file);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
 fn refuse_concurrent_auth(directory: &Path, binding: &Binding, account: &str) -> io::Result<()> {
     let parent = directory.join("account-effects");
     let entries = match std::fs::read_dir(parent) {
@@ -595,9 +766,10 @@ fn refuse_concurrent_auth(directory: &Path, binding: &Binding, account: &str) ->
                 .completed_unix_seconds
                 .is_some_and(|completed| Utc::now().timestamp() - completed < 30)
         {
-            return Err(io::Error::other(
-                "fresh auth refresh already active or recently completed for account",
-            ));
+            return Err(io::Error::other(format!(
+                "fresh auth refresh already active or recently completed: effect={}, state={}, artifact={}",
+                prior.effect_id, prior.state, prior.artifact
+            )));
         }
     }
     Ok(())
@@ -608,6 +780,38 @@ fn effect_readback_from_dir(
     intent: &AccountEffectIntent,
 ) -> io::Result<FreshAccountEffectReadback> {
     let artifact = dir.display().to_string();
+    if let Some(reuse) = exact_file::<QuotaReuse>(dir, "reuse.json")? {
+        if reuse.source_directory.contains('/')
+            || reuse.source_directory.contains("..")
+            || (!reuse.source_directory.ends_with("-quota-first")
+                && !reuse.source_directory.ends_with("-quota-retry"))
+        {
+            return Err(io::Error::other("fresh quota reuse source invalid"));
+        }
+        let source_dir = dir
+            .parent()
+            .ok_or_else(|| io::Error::other("fresh quota reuse parent absent"))?
+            .join(&reuse.source_directory);
+        if source_dir.join("reuse.json").exists() {
+            return Err(io::Error::other("fresh quota reuse chain refused"));
+        }
+        let source = effect_intent(&source_dir)?
+            .ok_or_else(|| io::Error::other("fresh quota reuse intent absent"))?;
+        if source.id != reuse.source_effect_id
+            || source.version != 1
+            || source.request.model != intent.request.model
+            || source.request.config_sha256 != intent.request.config_sha256
+            || source.request.account != intent.request.account
+            || source.request.index != intent.request.index
+            || source.environment_sha256 != intent.environment_sha256
+        {
+            return Err(io::Error::other("fresh quota reuse provenance changed"));
+        }
+        let mut readback = effect_readback_from_dir(&source_dir, &source)?;
+        readback.effect_id = intent.id.clone();
+        readback.artifact = format!("{artifact} -> {}", readback.artifact);
+        return Ok(readback);
+    }
     let unknown = |state: &str| FreshAccountEffectReadback {
         effect_id: intent.id.clone(),
         state: state.into(),
@@ -745,6 +949,19 @@ pub(super) fn begin_account_effect(
             "fresh account effect already begun; observe exact effect",
         ));
     }
+    let _auth_lock = if matches!(
+        request.kind,
+        FreshAccountEffectKind::AuthRefresh | FreshAccountEffectKind::QuotaFirst
+    ) {
+        Some(auth_admission_lock(directory, &request.account)?)
+    } else {
+        None
+    };
+    if dir.exists() {
+        return Err(io::Error::other(
+            "fresh account effect already begun; observe exact effect",
+        ));
+    }
     if request.kind == FreshAccountEffectKind::AuthRefresh {
         refuse_concurrent_auth(directory, binding, &request.account)?;
     }
@@ -778,6 +995,33 @@ pub(super) fn begin_account_effect(
                     "quota retry has no drained auth prerequisite",
                 ));
             }
+        }
+    }
+    if request.kind == FreshAccountEffectKind::QuotaFirst {
+        let parent = directory.join("account-effects");
+        if let Some((source_directory, source)) =
+            reusable_quota_source(directory, binding, request)?
+        {
+            std::fs::create_dir(&dir)?;
+            File::open(&parent)?.sync_all()?;
+            let intent = AccountEffectIntent {
+                version: 1,
+                id: uuid::Uuid::new_v4().to_string(),
+                binding: binding.clone(),
+                request: redacted_effect_request(request),
+                environment_sha256: environment_digest(request)?,
+                plan_sha256: format!("reused:{}", source.id),
+            };
+            durable_new(&dir, "intent.json", &intent)?;
+            durable_new(
+                &dir,
+                "reuse.json",
+                &QuotaReuse {
+                    source_directory,
+                    source_effect_id: source.id,
+                },
+            )?;
+            return effect_readback_from_dir(&dir, &intent);
         }
     }
     let cwd = std::fs::read_link(format!("/proc/{}/cwd", actor.host_pid))?;
@@ -919,14 +1163,28 @@ fn route_evidence(directory: &Path, candidate: &RouteCandidate) -> io::Result<(u
         invocations += 1;
         match observe(directory, &grant.id)? {
             Observation::Drained { status, .. } => {
-                if status != 0 {
+                let drain_path = directory.join(format!("{}.drain.json", grant.id));
+                if status != 0 && file_age_less_than(&drain_path, Duration::from_secs(30 * 60))? {
                     failures += 1;
                 }
             }
+            // A consumed K remains live until a physical Q or a known
+            // outcome. Its age alone cannot authorize another selection.
             _ => live += 1,
         }
     }
     Ok((live, failures, invocations))
+}
+
+fn file_age_less_than(path: &Path, window: Duration) -> io::Result<bool> {
+    Ok(std::fs::metadata(path)?
+        .modified()?
+        .elapsed()
+        .is_ok_and(|age| age < window))
+}
+
+fn recent_failure_admitted(failures: u64, has_unsuppressed: bool, pinned: bool) -> bool {
+    pinned || !has_unsuppressed || failures < 3
 }
 
 fn candidate_quota(
@@ -1041,7 +1299,7 @@ pub(super) fn select_route(
             || existing.pin != request.pin
             || existing.selection.model != request.model
             || existing.selection.config_sha256 != request.config_sha256
-            || existing.selection.policy_version != "fresh-account-effects-v1"
+            || existing.selection.policy_version != "fresh-account-effects-v2"
             || !existing
                 .selection
                 .eligible_accounts
@@ -1079,25 +1337,42 @@ pub(super) fn select_route(
         .iter()
         .map(|(candidate, _)| candidate.account.clone())
         .collect();
-    let mut best: Option<((u64, u64, u32, u64, usize), FreshRouteSelection)> = None;
-    for (candidate, quota_remaining) in eligible {
+    let observations: Vec<_> = eligible
+        .into_iter()
+        .map(|(candidate, quota_remaining)| {
+            let evidence = route_evidence(directory, &candidate)?;
+            Ok((candidate, quota_remaining, evidence))
+        })
+        .collect::<io::Result<_>>()?;
+    let has_unsuppressed = observations.iter().any(|(candidate, _, (_, failures, _))| {
+        request
+            .pin
+            .as_deref()
+            .is_none_or(|pin| pin == candidate.account)
+            && *failures < 3
+    });
+    let mut best: Option<((u64, u32, u64, usize), FreshRouteSelection)> = None;
+    for (candidate, quota_remaining, (live, failures, invocations)) in observations {
         if request
             .pin
             .as_deref()
             .is_some_and(|pin| pin != candidate.account)
+            || !recent_failure_admitted(failures, has_unsuppressed, request.pin.is_some())
         {
             continue;
         }
-        let (live, failures, invocations) = route_evidence(directory, &candidate)?;
         let score = (
             live,
-            failures,
-            if all_metered {
+            if all_metered && has_unsuppressed {
                 u32::MAX - quota_remaining
             } else {
                 0
             },
-            invocations,
+            invocations.saturating_add(if !all_metered && has_unsuppressed {
+                failures.saturating_mul(10)
+            } else {
+                0
+            }),
             candidate.index,
         );
         let selection = FreshRouteSelection {
@@ -1109,7 +1384,7 @@ pub(super) fn select_route(
             observed_live: live,
             observed_failures: failures,
             observed_invocations: invocations,
-            policy_version: "fresh-account-effects-v1".into(),
+            policy_version: "fresh-account-effects-v2".into(),
             eligible_accounts: eligible_accounts.clone(),
             quota_remaining_basis_points: candidate.quota_script.as_ref().map(|_| quota_remaining),
         };
@@ -1910,6 +2185,117 @@ mod tests {
     use super::*;
     use std::process::Command;
 
+    #[test]
+    fn recent_failure_window_threshold_fallback_and_pin() {
+        let temp = tempfile::tempdir().unwrap();
+        let receipt = temp.path().join("drain.json");
+        let file = File::create(&receipt).unwrap();
+        assert!(file_age_less_than(&receipt, Duration::from_secs(30 * 60)).unwrap());
+        file.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::now() - Duration::from_secs(31 * 60)),
+        )
+        .unwrap();
+        assert!(!file_age_less_than(&receipt, Duration::from_secs(30 * 60)).unwrap());
+        assert!(recent_failure_admitted(2, true, false));
+        assert!(!recent_failure_admitted(3, true, false));
+        assert!(recent_failure_admitted(3, false, false));
+        assert!(recent_failure_admitted(3, true, true));
+    }
+
+    #[test]
+    fn auth_admission_serializes_same_account_across_threads() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = auth_admission_lock(temp.path(), "same-account").unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                ready_tx.send(()).unwrap();
+                let _second = auth_admission_lock(temp.path(), "same-account").unwrap();
+                acquired_tx.send(()).unwrap();
+            });
+            ready_rx.recv().unwrap();
+            assert!(acquired_rx.try_recv().is_err());
+            drop(first);
+            acquired_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+    }
+
+    #[test]
+    fn broker_source_rejects_roster_effect_and_digest_forgery_or_edit() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("models")).unwrap();
+        std::fs::write(
+            temp.path().join("providers.toml"),
+            "[first]\ncommand = \"/bin/true\"\nquota_script = \"printf ok\"\n[second]\ncommand = \"/bin/true\"\n",
+        )
+        .unwrap();
+        let model_path = temp.path().join("models/pool.toml");
+        std::fs::write(
+            &model_path,
+            "[[providers]]\nname = \"first\"\n[[providers]]\nname = \"second\"\n",
+        )
+        .unwrap();
+        let source = File::open(temp.path()).unwrap();
+        let pool = oulipoly_runtime::executor::cli::fresh_remote::load_fresh_headless_pool(
+            temp.path(),
+            "pool",
+        )
+        .unwrap();
+        let mut request = FreshRouteRequest {
+            d_key: uuid::Uuid::new_v4().to_string(),
+            model: "pool".into(),
+            config_sha256: pool.config_sha256.clone(),
+            account: Some("first".into()),
+            index: Some(0),
+            total: 2,
+            pin: None,
+            quota_script: Some("printf ok".into()),
+            auth_refresh_command: None,
+        };
+        validate_route_source(&source, &request).unwrap();
+        request.account = Some("second".into());
+        assert!(validate_route_source(&source, &request).is_err());
+        request.account = Some("first".into());
+        request.index = Some(2);
+        assert!(validate_route_source(&source, &request).is_err());
+        request.index = Some(0);
+        request.quota_script = Some("printf forged".into());
+        assert!(validate_route_source(&source, &request).is_err());
+        request.quota_script = Some("printf ok".into());
+        request.config_sha256 = "0".repeat(64);
+        assert!(validate_route_source(&source, &request).is_err());
+        request.config_sha256 = pool.config_sha256;
+        request.account = None;
+        request.index = None;
+        request.quota_script = None;
+        validate_route_source(&source, &request).unwrap();
+        let observer = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+        let binding = fixture_binding(&observer, &observer);
+        let broker_dir = temp.path().join("broker");
+        std::fs::create_dir(&broker_dir).unwrap();
+        bind_route_source(&broker_dir, &binding, &request, &source, true).unwrap();
+        bind_route_source(&broker_dir, &binding, &request, &source, false).unwrap();
+        let duplicate_dir = temp.path().join("duplicate");
+        std::fs::create_dir_all(duplicate_dir.join("models")).unwrap();
+        std::fs::copy(
+            temp.path().join("providers.toml"),
+            duplicate_dir.join("providers.toml"),
+        )
+        .unwrap();
+        std::fs::copy(&model_path, duplicate_dir.join("models/pool.toml")).unwrap();
+        let duplicate = File::open(&duplicate_dir).unwrap();
+        validate_route_source(&duplicate, &request).unwrap();
+        assert!(bind_route_source(&broker_dir, &binding, &request, &duplicate, false).is_err());
+        std::fs::write(
+            &model_path,
+            "[[providers]]\nname = \"second\"\n[[providers]]\nname = \"first\"\n",
+        )
+        .unwrap();
+        assert!(validate_route_source(&source, &request).is_err());
+    }
+
     fn fixture_binding(root: &PinnedProcess, actor: &PinnedProcess) -> Binding {
         Binding {
             root_id: uuid::Uuid::new_v4().to_string(),
@@ -2148,6 +2534,25 @@ mod tests {
                 Observation::ProviderExited(_)
             ),
             "provider exit with adopted child was treated as Q"
+        );
+        let consumed = File::options()
+            .write(true)
+            .open(temporary.path().join(format!("{id}.consumed.json")))
+            .unwrap();
+        consumed
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() - Duration::from_secs(61 * 60)),
+            )
+            .unwrap();
+        let first_candidate: RouteCandidate =
+            exact_file(temporary.path(), &candidate_name(&binding.handoff_id, 0))
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            route_evidence(temporary.path(), &first_candidate).unwrap(),
+            (1, 0, 1),
+            "aged consumed K with a live descendant was dropped before Q"
         );
         let mut second_binding = binding.clone();
         second_binding.handoff_id = uuid::Uuid::new_v4().to_string();
@@ -2388,9 +2793,64 @@ mod tests {
         let retry = effect(0, "recovering", FreshAccountEffectKind::QuotaRetry);
         begin_account_effect(temporary.path(), &binding, &retry, &root, &actor, 0, 0).unwrap();
         assert_eq!(wait(&retry).outcome.as_deref(), Some("valid_windows"));
+        let mut sibling_binding = binding.clone();
+        sibling_binding.root_id = uuid::Uuid::new_v4().to_string();
+        sibling_binding.handoff_id = uuid::Uuid::new_v4().to_string();
+        let sibling_first = FreshAccountEffectRequest {
+            d_key: uuid::Uuid::new_v4().to_string(),
+            ..first.clone()
+        };
+        register_route_candidate(
+            temporary.path(),
+            &sibling_binding,
+            &request(0, "recovering", &shell_script, Some(&auth_script)),
+            plan(
+                &image,
+                temporary.path(),
+                &File::open(&input).unwrap(),
+                vec!["--recovering".into()],
+                vec![],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let reused = begin_account_effect(
+            temporary.path(),
+            &sibling_binding,
+            &sibling_first,
+            &root,
+            &actor,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(reused.outcome.as_deref(), Some("valid_windows"));
+        assert!(
+            grant_for_binding(
+                &effect_directory(temporary.path(), &sibling_binding, &sibling_first),
+                &sibling_binding,
+            )
+            .unwrap()
+            .is_none(),
+            "a matching fresh quota Q was rerun for a second root"
+        );
+        assert_eq!(
+            observe_account_effect(temporary.path(), &sibling_binding, &sibling_first)
+                .unwrap()
+                .effect_id,
+            reused.effect_id,
+        );
         let negative = effect(1, "exhausted", FreshAccountEffectKind::QuotaFirst);
         begin_account_effect(temporary.path(), &binding, &negative, &root, &actor, 0, 0).unwrap();
         assert_eq!(wait(&negative).outcome.as_deref(), Some("valid_windows"));
+        let mut exhausted_sibling = binding.clone();
+        exhausted_sibling.handoff_id = uuid::Uuid::new_v4().to_string();
+        assert!(
+            reusable_quota_source(temporary.path(), &exhausted_sibling, &negative)
+                .unwrap()
+                .is_none(),
+            "an exhausted physical Q was reused instead of allowing a new quota probe"
+        );
         assert!(
             select_route(
                 temporary.path(),
@@ -2487,6 +2947,52 @@ mod tests {
         let slow_grant = grant_for_binding(&slow_dir, &uncertain_binding)
             .unwrap()
             .unwrap();
+        let mut concurrent_binding = uncertain_binding.clone();
+        concurrent_binding.root_id = uuid::Uuid::new_v4().to_string();
+        concurrent_binding.handoff_id = uuid::Uuid::new_v4().to_string();
+        let concurrent_slow = FreshAccountEffectRequest {
+            d_key: uuid::Uuid::new_v4().to_string(),
+            ..slow.clone()
+        };
+        register_route_candidate(
+            temporary.path(),
+            &concurrent_binding,
+            &unknown_route,
+            plan(
+                &image,
+                temporary.path(),
+                &File::open(&input).unwrap(),
+                vec!["--slow".into()],
+                vec![],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let concurrent = begin_account_effect(
+            temporary.path(),
+            &concurrent_binding,
+            &concurrent_slow,
+            &root,
+            &actor,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_ne!(concurrent.state, "drained");
+        assert!(
+            concurrent
+                .artifact
+                .contains(&slow_dir.display().to_string())
+        );
+        assert!(
+            grant_for_binding(
+                &effect_directory(temporary.path(), &concurrent_binding, &concurrent_slow),
+                &concurrent_binding,
+            )
+            .unwrap()
+            .is_none(),
+            "concurrent fresh root started a duplicate quota K"
+        );
         assert!(
             begin_account_effect(
                 temporary.path(),
@@ -2530,6 +3036,13 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+        assert_eq!(
+            observe_account_effect(temporary.path(), &concurrent_binding, &concurrent_slow)
+                .unwrap()
+                .outcome
+                .as_deref(),
+            Some("failed")
+        );
         actor_child.kill().unwrap();
         actor_child.wait().unwrap();
     }
