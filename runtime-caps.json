@@ -4315,25 +4315,6 @@
       }
     },
     {
-      "id": "state.completion-continuation.evidence.max-output-bytes",
-      "owner": "state/completion_continuation/evidence",
-      "class": "resource_guard",
-      "protected_resource": "retained completion output artifact length",
-      "exhaustion_behavior": "Artifacts over one GiB are rejected before open/copy as unsupported completion output evidence.",
-      "observability": "copy_verified and MissingOriginalOutput validation return the fixed artifact validation error without reading the body.",
-      "configurability": "Fixed source declaration MAX_OUTPUT_BYTES; no runtime override exists at the bound validate use.",
-      "rationale": "The ceiling preserves binary-output support while bounding verification work and downstream transfer.",
-      "default_value": "1024 * 1024 * 1024",
-      "source": "crates/oulipoly-state/src/completion_continuation/evidence.rs",
-      "symbol": "MAX_OUTPUT_BYTES",
-      "declaration_scope": "module",
-      "controlling_use": {
-        "source": "crates/oulipoly-state/src/completion_continuation/evidence.rs",
-        "scope": "module::impl:MissingOriginalOutput::fn:validate",
-        "kind": "direct_control"
-      }
-    },
-    {
       "id": "state.completion-continuation.fault-barrier-poll",
       "owner": "state/completion_continuation",
       "class": "test_only_patience",
@@ -4379,14 +4360,14 @@
       "exhaustion_behavior": "Full chunks are hashed, written, and followed by another read until exact EOF.",
       "observability": "Read, write, length, and digest conflicts are returned before the artifact is accepted as verified.",
       "configurability": "Fixed source chunk size with no runtime override.",
-      "rationale": "Streaming 64 KiB chunks avoids allocating a body up to MAX_OUTPUT_BYTES.",
+      "rationale": "Streaming 64 KiB chunks bounds memory without imposing a positive raw-output size ceiling.",
       "default_value": "64 * 1024",
       "source": "crates/oulipoly-state/src/completion_continuation/evidence.rs",
       "symbol": "OUTPUT_COPY_BUFFER_BYTES",
       "declaration_scope": "module",
       "controlling_use": {
         "source": "crates/oulipoly-state/src/completion_continuation/evidence.rs",
-        "scope": "module::impl:OutputArtifact::fn:copy_verified",
+        "scope": "module::fn:copy_verified_raw",
         "kind": "direct_control"
       }
     },
