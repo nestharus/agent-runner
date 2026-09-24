@@ -6,7 +6,7 @@
 #[cfg(target_os = "linux")]
 #[allow(
     dead_code,
-    reason = "production v30 entry stays closed until every sidecar client is routed"
+    reason = "v30 bootstrap uses only the prepared, released and running subset"
 )]
 pub(crate) mod broker_route;
 #[cfg(target_os = "linux")]
@@ -43,6 +43,14 @@ pub(crate) fn run_pinned_guardian(
     announce: std::os::unix::net::UnixStream,
 ) -> Result<(), String> {
     linux::run_pinned_guardian(pin, announce)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn run_pinned_guardian_v30(
+    pin: &PinnedGuardian,
+    announce: std::os::unix::net::UnixStream,
+) -> Result<(), String> {
+    linux::run_pinned_guardian_v30(pin, announce)
 }
 
 #[cfg(target_os = "linux")]

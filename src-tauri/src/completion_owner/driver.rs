@@ -7,6 +7,7 @@ use oulipoly_kernel_broker::protocol::{self, StateRoute};
 use oulipoly_state::StateDb;
 use oulipoly_state::mailbox::{CompletionDomainOwner, ContinuationAttempt, MailboxDb};
 use std::collections::{BTreeSet, HashMap};
+use std::io::Read;
 use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -59,7 +60,12 @@ fn run_with_root(
     launch_channel: UnixStream,
     root_id: Option<&str>,
 ) -> Result<(), String> {
-    super::root_supervisor::install_driver_channel(launch_channel);
+    let mut v30_channel = if root_id.is_some() {
+        Some(launch_channel)
+    } else {
+        super::root_supervisor::install_driver_channel(launch_channel);
+        None
+    };
     let result = (|| match root_id {
         Some(root_id) => match protocol::state_route_at(&super::linux::owner_broker_socket())
             .map_err(|error| format!("completion driver broker route unavailable: {error}"))?
@@ -84,6 +90,21 @@ fn run_with_root(
                         }
                         std::thread::sleep(Duration::from_millis(20));
                     }
+                    return Err(
+                        "v30 driver bounded State repair and wake route is not available".into(),
+                    );
+                }
+                // The broker's child attestation reopens this exact driver.
+                // Stay pinned until the original guardian reports the joined
+                // child's terminal receipt; EOF is a refusal, not succession.
+                let mut completed = [0];
+                v30_channel
+                    .as_mut()
+                    .ok_or("v30 driver gate absent")?
+                    .read_exact(&mut completed)
+                    .map_err(|e| e.to_string())?;
+                if completed != [b'D'] {
+                    return Err("v30 driver completion gate changed".into());
                 }
                 Err("v30 driver bounded State repair and wake route is not available".into())
             }

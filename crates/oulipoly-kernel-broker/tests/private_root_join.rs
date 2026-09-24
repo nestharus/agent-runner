@@ -32,6 +32,7 @@ fn stop(child: &mut Child) {
 fn inner() {
     let mode = std::env::var("AGE319_PRIVATE_JOIN_MODE").unwrap_or_else(|_| "help".into());
     let release_mode = mode.starts_with("held_release");
+    let normal_mode = mode.starts_with("normal_");
     let runner =
         std::env::var("OULIPOLY_AGE319_RUNNER_IMAGE").expect("built Runner image required");
     let temp = tempfile::tempdir().unwrap();
@@ -50,6 +51,7 @@ fn inner() {
         || mode == "held_prepared"
         || mode == "held_guardian_death"
         || release_mode
+        || normal_mode
     {
         let sidecar_dir = broker_state.join("sidecar");
         fs::create_dir(&sidecar_dir).unwrap();
@@ -86,6 +88,222 @@ fn inner() {
         "broker startup: {}",
         fs::read_to_string(&broker_log).unwrap()
     );
+    if normal_mode {
+        let generation = broker_generation.unwrap();
+        fs::write(data.join("pid-identity.db"), b"retired copied owner").unwrap();
+        let out = temp.path().join("normal.out");
+        let err = temp.path().join("normal.err");
+        let mut entry = Command::new(&runner)
+            .arg("__age319-private-normal-v30")
+            .env("OULIPOLY_DATA_DIR", &data)
+            .env("OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1", "1")
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+            .envs(
+                (mode == "normal_prepare_lost_reply")
+                    .then_some(("AGE319_PRIVATE_NORMAL_PREPARE_REPLY_LOSS_V1", "1")),
+            )
+            .envs(
+                (mode == "normal_release_lost_reply")
+                    .then_some(("AGE319_PRIVATE_NORMAL_RELEASE_REPLY_LOSS_V1", "1")),
+            )
+            .env_remove("LD_LIBRARY_PATH")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(File::create(&out).unwrap()))
+            .stderr(Stdio::from(File::create(&err).unwrap()))
+            .spawn()
+            .unwrap();
+        eventually(|| gate.join("held").exists() || entry.try_wait().unwrap().is_some());
+        assert!(
+            gate.join("held").exists(),
+            "normal held J: {} broker: {}",
+            fs::read_to_string(&err).unwrap(),
+            fs::read_to_string(&broker_log).unwrap()
+        );
+        assert_eq!(fs::metadata(&out).unwrap().len(), 0);
+        assert!(!gate.join("prepared").exists());
+        let held_db = rusqlite::Connection::open_with_flags(
+            broker_state.join("sidecar/pid-identity.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let held_running: i64 = held_db
+            .query_row(
+                "SELECT count(*) FROM completion_continuation_owner",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(held_running, 0);
+        let held_prepared: i64 = held_db
+            .query_row("SELECT count(*) FROM broker_prepared_owner", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(held_prepared, 0, "held J must precede prepared W");
+        assert_eq!(
+            fs::read_dir(broker_state.join("entries")).unwrap().count(),
+            1
+        );
+        fs::write(gate.join("prepare"), b"yes").unwrap();
+        eventually(|| gate.join("prepared").exists() || entry.try_wait().unwrap().is_some());
+        assert!(
+            gate.join("prepared").exists(),
+            "normal entry: {} broker: {}",
+            fs::read_to_string(&err).unwrap(),
+            fs::read_to_string(&broker_log).unwrap()
+        );
+        let prepared: oulipoly_state::mailbox::PreparedBrokerOwner =
+            serde_json::from_slice(&fs::read(gate.join("prepared")).unwrap()).unwrap();
+        assert_eq!(prepared.source_generation, generation);
+        assert_eq!(prepared.entry.host_pid, entry.id() as i32);
+        assert_eq!(fs::metadata(&out).unwrap().len(), 0);
+        let db = rusqlite::Connection::open_with_flags(
+            broker_state.join("sidecar/pid-identity.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let running: i64 = db
+            .query_row(
+                "SELECT count(*) FROM completion_continuation_owner",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(running, 0, "prepared W must not mint running owner");
+        let record: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                broker_state
+                    .join("entries")
+                    .join(format!("{}.json", prepared.root_id)),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["join_consumed"], true);
+        assert_eq!(
+            record["joined_child"]["host_pid"],
+            prepared.joined_child.host_pid
+        );
+        assert_eq!(
+            fs::read(data.join("pid-identity.db")).unwrap(),
+            b"retired copied owner"
+        );
+        let prepared_read = protocol::StateReadSpec {
+            protocol: "broker-prepared-read-v30".into(),
+            source_generation: generation.clone(),
+            root_id: prepared.root_id.clone(),
+            owner_generation: prepared.owner_generation.clone(),
+            attempt_id: None,
+        };
+        assert!(protocol::read_prepared_owner_at(&socket, &prepared_read).is_err());
+        if mode == "normal_guardian_death" {
+            unsafe { libc::kill(prepared.guardian.host_pid, libc::SIGKILL) };
+            fs::write(gate.join("release"), b"yes").unwrap();
+            eventually(|| entry.try_wait().unwrap().is_some());
+            assert!(!entry.wait().unwrap().success());
+            assert_eq!(fs::metadata(&out).unwrap().len(), 0);
+        } else if mode == "normal_driver_death" {
+            unsafe { libc::kill(prepared.driver.host_pid, libc::SIGKILL) };
+            fs::write(gate.join("release"), b"yes").unwrap();
+            eventually(|| entry.try_wait().unwrap().is_some());
+            assert!(!entry.wait().unwrap().success());
+            assert_eq!(fs::metadata(&out).unwrap().len(), 0);
+        } else if mode == "normal_broker_death" {
+            stop(&mut broker);
+            fs::write(gate.join("release"), b"yes").unwrap();
+            eventually(|| entry.try_wait().unwrap().is_some());
+            assert!(!entry.wait().unwrap().success());
+            assert_eq!(fs::metadata(&out).unwrap().len(), 0);
+        } else {
+            fs::write(gate.join("release"), b"yes").unwrap();
+            eventually(|| gate.join("released").exists() || entry.try_wait().unwrap().is_some());
+            assert!(
+                gate.join("released").exists(),
+                "{}",
+                fs::read_to_string(&err).unwrap()
+            );
+            let released: oulipoly_state::mailbox::BrokerReleaseEvidence =
+                serde_json::from_slice(&fs::read(gate.join("released")).unwrap()).unwrap();
+            assert_eq!(released.prepared, prepared);
+            eventually(|| {
+                gate.join("child-attested").exists() || entry.try_wait().unwrap().is_some()
+            });
+            assert!(
+                gate.join("child-attested").exists(),
+                "{}",
+                fs::read_to_string(&err).unwrap()
+            );
+            assert_eq!(fs::metadata(&out).unwrap().len(), 0);
+            let post_death = matches!(
+                mode.as_str(),
+                "normal_guardian_post" | "normal_driver_post" | "normal_broker_post"
+            );
+            if mode == "normal_guardian_post" {
+                unsafe { libc::kill(prepared.guardian.host_pid, libc::SIGKILL) };
+            } else if mode == "normal_driver_post" {
+                unsafe { libc::kill(prepared.driver.host_pid, libc::SIGKILL) };
+            } else if mode == "normal_broker_post" {
+                stop(&mut broker);
+                let restart_log = temp.path().join("normal-post-restart.log");
+                broker = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
+                    .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                    .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
+                    .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
+                    .stderr(Stdio::from(File::create(&restart_log).unwrap()))
+                    .spawn()
+                    .unwrap();
+                eventually(|| protocol::request_at(&socket, Operation::Classify).is_ok());
+            }
+            fs::write(gate.join("child-effect"), b"yes").unwrap();
+            eventually(|| entry.try_wait().unwrap().is_some());
+            if post_death {
+                assert!(!entry.wait().unwrap().success());
+                assert_eq!(fs::metadata(&out).unwrap().len(), 0);
+            } else {
+                eventually(|| {
+                    fs::read_to_string(&err)
+                        .unwrap_or_default()
+                        .contains("v30 driver bounded State repair and wake route is not available")
+                });
+                assert_eq!(
+                    fs::read_to_string(&out).unwrap(),
+                    format!("OULIPOLY_KERNEL_V30_CHILD_EFFECT={}\n", released.release_id)
+                );
+            }
+            assert_eq!(
+                fs::read(data.join("pid-identity.db")).unwrap(),
+                b"retired copied owner"
+            );
+        }
+        if mode != "normal_broker_death" {
+            stop(&mut broker);
+        }
+        let restart_log = temp.path().join("normal-restart.log");
+        let mut restarted = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
+            .stderr(Stdio::from(File::create(&restart_log).unwrap()))
+            .spawn()
+            .unwrap();
+        eventually(|| protocol::request_at(&socket, Operation::Classify).is_ok());
+        let second = Command::new(&runner)
+            .arg("__age319-private-normal-v30")
+            .env("OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1", "1")
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+            .output()
+            .unwrap();
+        assert!(!second.status.success());
+        assert_eq!(
+            fs::read_dir(broker_state.join("entries")).unwrap().count(),
+            1
+        );
+        stop(&mut restarted);
+        unsafe { libc::kill(prepared.root_init.host_pid, libc::SIGKILL) };
+        return;
+    }
     if mode == "held_prepared" || mode == "held_guardian_death" || release_mode {
         let generation = broker_generation.unwrap();
         // A copied v29 path is unusable before E and throughout W/R.
@@ -947,6 +1165,15 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "held_release_commit_fail",
         "held_release_child_predeath",
         "held_release_gate_fail",
+        "normal_release",
+        "normal_guardian_death",
+        "normal_driver_death",
+        "normal_broker_death",
+        "normal_prepare_lost_reply",
+        "normal_release_lost_reply",
+        "normal_guardian_post",
+        "normal_driver_post",
+        "normal_broker_post",
     ] {
         let output = Command::new("unshare")
             .args(["-Urpfm", "--mount-proc"])

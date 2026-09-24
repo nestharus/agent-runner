@@ -1,6 +1,6 @@
 //! Exact v30 owner and attempt route over the challenged broker connection.
-//! The ordinary guardian cannot select this route until its other sidecar
-//! readers and writers have been moved to the same retained source.
+//! The v30 bootstrap selects this route after held J. Scheduling remains
+//! closed until its other State and mailbox clients use the retained source.
 use oulipoly_kernel_broker::protocol::{
     self, StateReadSpec, StateRoute, StateWriteAction, StateWriteSpec,
 };
@@ -122,6 +122,15 @@ impl V30OwnerRoute {
                 endpoint: endpoint.to_str().ok_or("invalid owner endpoint")?.into(),
             },
         );
+        #[cfg(feature = "age319-private-broker-fixture")]
+        let written = if std::env::var_os("AGE319_PRIVATE_NORMAL_PREPARE_REPLY_LOSS_V1").is_some() {
+            protocol::prepare_owner_drop_reply_at(&self.socket, &spec)
+                .map(|()| Err(std::io::Error::other("private prepared reply lost")))
+                .unwrap_or_else(Err)
+        } else {
+            protocol::prepare_owner_at(&self.socket, &spec)
+        };
+        #[cfg(not(feature = "age319-private-broker-fixture"))]
         let written = protocol::prepare_owner_at(&self.socket, &spec);
         // Read once by exact root/owner after any reply, including a lost one.
         // A missing readback is uncertainty, not permission to retry W.
@@ -178,10 +187,17 @@ impl V30OwnerRoute {
         {
             return Err("release preparation changed".into());
         }
-        let written = protocol::release_prepared_owner_at(
-            &self.socket,
-            &self.write_spec("broker-held-release-v30", StateWriteAction::Release),
-        );
+        let spec = self.write_spec("broker-held-release-v30", StateWriteAction::Release);
+        #[cfg(feature = "age319-private-broker-fixture")]
+        let written = if std::env::var_os("AGE319_PRIVATE_NORMAL_RELEASE_REPLY_LOSS_V1").is_some() {
+            protocol::release_prepared_owner_drop_reply_at(&self.socket, &spec)
+                .map(|()| Err(std::io::Error::other("private release reply lost")))
+                .unwrap_or_else(Err)
+        } else {
+            protocol::release_prepared_owner_at(&self.socket, &spec)
+        };
+        #[cfg(not(feature = "age319-private-broker-fixture"))]
+        let written = protocol::release_prepared_owner_at(&self.socket, &spec);
         let exact = protocol::read_released_owner_at(
             &self.socket,
             &self.read_spec("broker-release-readback-v30", None),

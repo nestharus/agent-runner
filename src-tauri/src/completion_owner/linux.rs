@@ -481,6 +481,137 @@ pub(crate) fn run_pinned_guardian(
     )
 }
 
+/// The v30 bootstrap owns no retired sidecar handle.  The child and driver may
+/// exist before publication, but both remain behind independent broker/owner
+/// gates until the exact held J has been consumed.
+pub(crate) fn run_pinned_guardian_v30(
+    pin: &super::PinnedGuardian,
+    mut entry: UnixStream,
+) -> Result<(), String> {
+    let broker = owner_broker_socket();
+    let StateRoute::BrokerOwned { domain_id, .. } =
+        protocol::state_route_at(&broker).map_err(|e| e.to_string())?
+    else {
+        return Err("v30 guardian lost broker-owned source".into());
+    };
+    if domain_id != pin.domain_id {
+        return Err("v30 guardian domain changed".into());
+    }
+    let directory = PathBuf::from("/tmp").join(format!(
+        "oulipoly-completion-v30-{}-{}",
+        unsafe { libc::geteuid() },
+        pin.root_id
+    ));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&directory)
+        .map_err(|e| e.to_string())?;
+    let endpoint = directory.join("owner.sock");
+    let listener = UnixListener::bind(&endpoint).map_err(|e| e.to_string())?;
+    let (owner, mut driver_gate) = start_v30_driver(&endpoint, pin, listener.as_raw_fd())?;
+    let context = identity(peer_pid(&entry)?)?;
+    let grant = super::original_work::RootAuthorities::default().fresh_with_root_id(
+        &owner,
+        context,
+        pin.root_id.clone(),
+    )?;
+    let proposal = serde_json::json!({
+        "driver_pid": owner.driver_identity.pid,
+        "owner_generation": owner.owner_generation,
+        "endpoint": owner.endpoint,
+        "root_authority": serde_json::to_string(&grant).map_err(|e| e.to_string())?,
+    });
+    serde_json::to_writer(&mut entry, &proposal).map_err(|e| e.to_string())?;
+    entry.write_all(b"\n").map_err(|e| e.to_string())?;
+    let mut receipt = [0];
+    entry.read_exact(&mut receipt).map_err(|e| e.to_string())?;
+    if receipt != [b'J'] {
+        return Err("v30 guardian did not receive exact held J receipt".into());
+    }
+    let route = super::broker_route::V30OwnerRoute::guardian(
+        &broker,
+        &pin.root_id,
+        &pin.domain_id,
+        &pin.supervisor_authority_id,
+        &owner.owner_generation,
+    )?;
+    let prepared = route.prepare(owner.driver_identity.pid as i32, &endpoint)?;
+    serde_json::to_writer(&mut entry, &prepared).map_err(|e| e.to_string())?;
+    entry.write_all(b"\n").map_err(|e| e.to_string())?;
+    entry.read_exact(&mut receipt).map_err(|e| e.to_string())?;
+    if receipt != [b'A'] {
+        return Err("v30 entry did not attest prepared owner".into());
+    }
+    let released = route.release(&prepared)?;
+    route.read_running(&released.owner, None)?;
+    serde_json::to_writer(&mut entry, &released).map_err(|e| e.to_string())?;
+    entry.write_all(b"\n").map_err(|e| e.to_string())?;
+    publish_driver_owner(&mut driver_gate, &released.owner)?;
+    // Keep the original guardian alive while the released child performs its
+    // post-gate broker attestation. EOF or death is refusal, never succession.
+    entry.read_exact(&mut receipt).map_err(|e| e.to_string())?;
+    if receipt != [b'D'] {
+        return Err("v30 child completion was not reported".into());
+    }
+    driver_gate.write_all(b"D").map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn start_v30_driver(
+    endpoint: &Path,
+    pin: &super::PinnedGuardian,
+    listener: RawFd,
+) -> Result<(CompletionDomainOwner, UnixStream), String> {
+    let (release, gate) = UnixStream::pair().map_err(|e| e.to_string())?;
+    let image = std::ffi::CString::new("/proc/self/exe").unwrap();
+    let arg0 = std::ffi::CString::new("oulipoly-agent-runner").unwrap();
+    let mode = std::ffi::CString::new(super::driver::DRIVER_ARG).unwrap();
+    // The selected v30 branch never opens this legacy positional argument.
+    // Its root selector and owner frame are checked against broker R.
+    let retired = std::ffi::CString::new(MailboxDb::default_path()?.as_os_str().as_bytes())
+        .map_err(|_| "legacy driver path contains NUL")?;
+    let fd_arg = std::ffi::CString::new(gate.as_raw_fd().to_string()).unwrap();
+    let root =
+        std::ffi::CString::new(pin.root_id.as_str()).map_err(|_| "broker root contains NUL")?;
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    if pid == 0 {
+        drop(release);
+        unsafe { libc::close(listener) };
+        let fd = gate.as_raw_fd();
+        close_except(&[fd]);
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
+            unsafe { libc::_exit(70) }
+        }
+        let argv = [
+            arg0.as_ptr(),
+            mode.as_ptr(),
+            retired.as_ptr(),
+            fd_arg.as_ptr(),
+            root.as_ptr(),
+            std::ptr::null(),
+        ];
+        unsafe {
+            libc::execv(image.as_ptr(), argv.as_ptr());
+            libc::_exit(70)
+        }
+    }
+    drop(gate);
+    let owner = CompletionDomainOwner {
+        protocol: PROTOCOL.into(),
+        domain_id: pin.domain_id.clone(),
+        supervisor_authority_id: pin.supervisor_authority_id.clone(),
+        owner_generation: uuid::Uuid::new_v4().to_string(),
+        guardian_identity: current_identity()?,
+        driver_identity: direct_child_identity(pid as u32)?,
+        endpoint: endpoint.to_string_lossy().into_owned(),
+    };
+    Ok((owner, release))
+}
+
 pub(crate) fn verify_pinned_owner_ready(
     announce: &mut UnixStream,
     pin: &super::PinnedGuardian,

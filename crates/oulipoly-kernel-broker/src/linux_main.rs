@@ -454,8 +454,10 @@ fn read_broker_state(
     entries: &EntryRegistry,
     sidecar: &BrokerSidecar,
 ) -> io::Result<oulipoly_state::mailbox::BrokerContinuationReadback> {
-    if spec.protocol != "broker-state-read-v1"
-        || roots.has_debt()
+    if !matches!(
+        spec.protocol.as_str(),
+        "broker-state-read-v1" | "broker-entry-running-readback-v30"
+    ) || roots.has_debt()
         || entries.has_uncertain_write()
         || works.has_debt()
         || !matches!(
@@ -500,15 +502,35 @@ fn read_broker_state(
             spec.attempt_id.as_deref(),
         )
         .map_err(io::Error::other)?;
-    if !state_actor_matches(
-        peer,
-        &guardian,
-        guardian_stamp,
-        &readback.owner,
-        runner_image,
-    )? {
+    let exact_entry_read = if spec.protocol == "broker-entry-running-readback-v30"
+        && spec.attempt_id.is_none()
+        && entry.entry == ProcessStamp::from(&peer.process)
+        && peer.process.same_executable_as(runner_image)?
+        && let Some(stamp) = &entry.prepared_driver
+    {
+        let driver = PinnedProcess::open(stamp.host_pid)?;
+        let matches = ProcessStamp::from(&driver) == *stamp
+            && driver.direct_child_of(&guardian)?
+            && driver.same_executable_as(runner_image)?
+            && driver.in_namespace(host_namespace)?
+            && i64::from(stamp.host_pid) == readback.owner.driver_identity.pid
+            && stamp.starttime_ticks as i64 == readback.owner.driver_identity.starttime_ticks;
+        driver.verify()?;
+        matches
+    } else {
+        false
+    };
+    if !exact_entry_read
+        && !state_actor_matches(
+            peer,
+            &guardian,
+            guardian_stamp,
+            &readback.owner,
+            runner_image,
+        )?
+    {
         return Err(io::Error::other(
-            "broker State caller is not exact guardian or driver",
+            "broker State caller is not exact entry, guardian or driver",
         ));
     }
     guardian.verify()?;

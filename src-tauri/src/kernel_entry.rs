@@ -11,10 +11,22 @@ use std::process::ExitCode;
 
 #[cfg(feature = "age319-private-broker-fixture")]
 const PRIVATE_PREPARED_ENTRY: &str = "__age319-private-held-prepared-v30";
+#[cfg(feature = "age319-private-broker-fixture")]
+const PRIVATE_NORMAL_ENTRY: &str = "__age319-private-normal-v30";
 
 #[cfg(feature = "age319-private-broker-fixture")]
 fn private_prepared_mode() -> bool {
     std::env::args().nth(1).as_deref() == Some(PRIVATE_PREPARED_ENTRY)
+        && unsafe { libc::geteuid() } == 0
+        && std::fs::read_to_string("/proc/self/uid_map")
+            .ok()
+            .is_some_and(|map| map.split_ascii_whitespace().nth(2) == Some("1"))
+        && std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1").is_some()
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_normal_mode() -> bool {
+    std::env::args().nth(1).as_deref() == Some(PRIVATE_NORMAL_ENTRY)
         && unsafe { libc::geteuid() } == 0
         && std::fs::read_to_string("/proc/self/uid_map")
             .ok()
@@ -63,7 +75,8 @@ pub(crate) fn verify_installed_entry_route() -> Result<(), String> {
     let route = protocol::observe_entry_gate_at(&broker_socket())
         .map_err(|error| format!("installed broker entry gate unavailable: {error}"))?;
     #[cfg(feature = "age319-private-broker-fixture")]
-    if route == EntryRoute::BrokerV30Closed && (private_prepared_mode() || private_v30_child_mode())
+    if route == EntryRoute::BrokerV30Closed
+        && (private_prepared_mode() || private_normal_mode() || private_v30_child_mode())
     {
         return Ok(());
     }
@@ -472,56 +485,57 @@ pub(crate) fn host_entry() -> Option<ExitCode> {
         eprintln!("OULIPOLY_KERNEL_ENTRY_GAP={error}");
         return Some(ExitCode::FAILURE);
     }
-    let result = stage_host_entry(
-        || {
-            // A selected v30 route must never read the retired user-owned
-            // sidecar, even if an intact v29 copy is still present there.
-            // Owner publication currently precedes J, while Y/W require its
-            // consumed child. Keep admission closed until that ordering and
-            // the remaining writer/read topology are routed together.
-            match protocol::state_route_at(&broker_socket())
-                .map_err(|e| format!("broker State route unavailable: {e}"))?
-            {
-                StateRoute::Legacy => {}
-                StateRoute::BrokerOwned {
-                    source_generation, ..
-                } => {
-                    return Err(format!(
-                        "broker-owned State generation {source_generation} requires production client routing"
-                    ));
+    let result = match protocol::state_route_at(&broker_socket()) {
+        Ok(StateRoute::BrokerOwned { .. }) => v30_host_entry(),
+        Err(error) => Err(format!("broker State route unavailable: {error}")),
+        Ok(StateRoute::Legacy) => stage_host_entry(
+            || {
+                match protocol::state_route_at(&broker_socket())
+                    .map_err(|e| format!("broker State route unavailable: {e}"))?
+                {
+                    StateRoute::Legacy => {}
+                    StateRoute::BrokerOwned {
+                        source_generation, ..
+                    } => {
+                        return Err(format!(
+                            "broker-owned State generation {source_generation} requires v30 entry admission"
+                        ));
+                    }
                 }
-            }
-            // Probe before E: a detached snapshot cannot create or migrate the
-            // live databases. Missing State/domain initialization is a separate
-            // administrative transition, never part of a failed custody grant.
-            let path = MailboxDb::default_path()?;
-            let state = oulipoly_state::schema_probe::run_schema_probe()
-                .map_err(|e| format!("State preflight refused: {e:?}"))?
-                .state_db;
-            if !state.exists
-                || state.user_version != state.current_schema_version
-                || !state.compatible
-            {
-                return Err("current State domain must be initialized separately".into());
-            }
-            let domain = MailboxDb::open_read_only(&path)?
-                .completion_continuation_domain()?
-                .ok_or("native completion domain is absent")?;
-            uuid::Uuid::parse_str(&domain).map_err(|_| "invalid native domain ID")?;
-            Ok(domain)
-        },
-        || {
-            let response = protocol::request_at(&broker_socket(), Operation::ReserveEntry)
-                .map_err(|e| e.to_string())?;
-            let id = response
-                .strip_prefix("reserved ")
-                .and_then(|s| s.strip_suffix('\n'))
-                .ok_or_else(|| format!("kernel entry reservation refused: {}", response.trim()))?;
-            uuid::Uuid::parse_str(id).map_err(|_| "invalid broker root ID".to_owned())?;
-            Ok(id.to_owned())
-        },
-        bind_host_guardian,
-    );
+                // Probe before E: a detached snapshot cannot create or migrate the
+                // live databases. Missing State/domain initialization is a separate
+                // administrative transition, never part of a failed custody grant.
+                let path = MailboxDb::default_path()?;
+                let state = oulipoly_state::schema_probe::run_schema_probe()
+                    .map_err(|e| format!("State preflight refused: {e:?}"))?
+                    .state_db;
+                if !state.exists
+                    || state.user_version != state.current_schema_version
+                    || !state.compatible
+                {
+                    return Err("current State domain must be initialized separately".into());
+                }
+                let domain = MailboxDb::open_read_only(&path)?
+                    .completion_continuation_domain()?
+                    .ok_or("native completion domain is absent")?;
+                uuid::Uuid::parse_str(&domain).map_err(|_| "invalid native domain ID")?;
+                Ok(domain)
+            },
+            || {
+                let response = protocol::request_at(&broker_socket(), Operation::ReserveEntry)
+                    .map_err(|e| e.to_string())?;
+                let id = response
+                    .strip_prefix("reserved ")
+                    .and_then(|s| s.strip_suffix('\n'))
+                    .ok_or_else(|| {
+                        format!("kernel entry reservation refused: {}", response.trim())
+                    })?;
+                uuid::Uuid::parse_str(id).map_err(|_| "invalid broker root ID".to_owned())?;
+                Ok(id.to_owned())
+            },
+            bind_host_guardian,
+        ),
+    };
     match result {
         Ok(code) => Some(code),
         Err(error) => {
@@ -540,15 +554,16 @@ fn supported_host_mode() -> Result<(), String> {
         })
         .collect::<Result<Vec<_>, _>>()?;
     #[cfg(feature = "age319-private-broker-fixture")]
-    let private_bash_fixture = args == ["__age319-private-bash-work-v1"]
+    let private_entry_fixture = (args == ["__age319-private-bash-work-v1"]
+        || args == [PRIVATE_NORMAL_ENTRY])
         && unsafe { libc::geteuid() } == 0
         && std::fs::read_to_string("/proc/self/uid_map")
             .ok()
             .is_some_and(|map| map.split_ascii_whitespace().nth(2) == Some("1"))
         && std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1").is_some();
     #[cfg(not(feature = "age319-private-broker-fixture"))]
-    let private_bash_fixture = false;
-    if !private_bash_fixture && !protocol::supported_entry_args(&args) {
+    let private_entry_fixture = false;
+    if !private_entry_fixture && !protocol::supported_entry_args(&args) {
         return Err(
             "unsupported kernel CLI mode: only help and offline diagnostics are admitted".into(),
         );
@@ -1126,6 +1141,290 @@ fn private_held_prepared_entry() -> Result<(), String> {
     } else {
         Err("prepared-only child gate remains closed".into())
     }
+}
+
+fn v30_host_entry() -> Result<ExitCode, String> {
+    let broker = broker_socket();
+    let StateRoute::BrokerOwned {
+        source_generation,
+        domain_id,
+    } = protocol::state_route_at(&broker).map_err(|e| e.to_string())?
+    else {
+        return Err("v30 entry has no broker-owned source".into());
+    };
+    let response =
+        protocol::request_at(&broker, Operation::ReserveV30Entry).map_err(|e| e.to_string())?;
+    let root = response
+        .strip_prefix("reserved ")
+        .and_then(|s| s.strip_suffix('\n'))
+        .ok_or("v30 E did not reserve a root")?
+        .to_owned();
+    let supervisor = uuid::Uuid::new_v4().to_string();
+    let (mut entry, mut guardian) = UnixStream::pair().map_err(|e| e.to_string())?;
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    if pid == 0 {
+        drop(entry);
+        let result = (|| {
+            let mut gate = [0];
+            guardian.read_exact(&mut gate).map_err(|e| e.to_string())?;
+            if gate != [b'P'] {
+                return Err("v30 guardian P gate refused".into());
+            }
+            let bound = protocol::bind_v30_guardian_at(&broker, &root, &domain_id, &supervisor)
+                .map_err(|e| e.to_string())?;
+            guardian
+                .write_all(bound.as_bytes())
+                .map_err(|e| e.to_string())?;
+            guardian.read_exact(&mut gate).map_err(|e| e.to_string())?;
+            if gate != [b'X'] {
+                return Err("v30 guardian A gate refused".into());
+            }
+            unsafe { std::env::remove_var(REQUIRED_ENV) };
+            crate::completion_owner::run_pinned_guardian_v30(
+                &crate::completion_owner::PinnedGuardian {
+                    root_id: root,
+                    domain_id,
+                    supervisor_authority_id: supervisor,
+                },
+                guardian,
+            )
+        })();
+        if let Err(error) = &result {
+            eprintln!("OULIPOLY_KERNEL_V30_GUARDIAN_GAP={error}");
+        }
+        unsafe { libc::_exit(if result.is_ok() { 0 } else { 70 }) }
+    }
+    drop(guardian);
+    let result = (|| {
+        let prepared =
+            protocol::prepare_v30_guardian_at(&broker, &root, pid).map_err(|e| e.to_string())?;
+        if prepared != format!("prepared {root}\n") {
+            return Err("v30 guardian P readback changed".into());
+        }
+        entry.write_all(b"P").map_err(|e| e.to_string())?;
+        if read_v30_frame(&mut entry)? != format!("bound {root} {domain_id} {supervisor}") {
+            return Err("v30 guardian G changed".into());
+        }
+        if protocol::read_v30_entry_at(&broker, &root).map_err(|e| e.to_string())?
+            != format!("bound-entry {root} {domain_id} {supervisor} {pid}\n")
+        {
+            return Err("v30 entry A changed".into());
+        }
+        entry.write_all(b"X").map_err(|e| e.to_string())?;
+        let proposal: serde_json::Value =
+            serde_json::from_str(&read_v30_frame(&mut entry)?).map_err(|e| e.to_string())?;
+        let driver_pid = proposal["driver_pid"]
+            .as_i64()
+            .ok_or("v30 driver PID absent")?;
+        let owner_generation = proposal["owner_generation"]
+            .as_str()
+            .ok_or("v30 owner generation absent")?;
+        let endpoint = proposal["endpoint"].as_str().ok_or("v30 endpoint absent")?;
+        let authority = proposal["root_authority"]
+            .as_str()
+            .ok_or("v30 root authority absent")?;
+        // Broker J validates the capability, original entry socket and pinned
+        // actors. The proposal is only data until its held child is returned.
+        let args = std::env::args_os()
+            .skip(1)
+            .map(|arg| {
+                arg.into_string()
+                    .map_err(|_| "non-UTF8 CLI argument".to_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let environment = std::env::vars_os()
+            .map(|(key, value)| {
+                Ok((
+                    key.into_string()
+                        .map_err(|_| "non-UTF8 environment name".to_owned())?,
+                    value
+                        .into_string()
+                        .map_err(|_| "non-UTF8 environment value".to_owned())?,
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()?
+            .into_iter()
+            .filter(|(name, _)| !name.starts_with("OULIPOLY_KERNEL_"))
+            .collect();
+        let cwd = File::open(".").map_err(|e| e.to_string())?;
+        let (mut receipt, completion) = UnixStream::pair().map_err(|e| e.to_string())?;
+        let join = JoinSpec {
+            root_id: root.clone(),
+            domain_id: domain_id.clone(),
+            supervisor_id: supervisor.clone(),
+            guardian_pid: pid,
+            root_authority: authority.into(),
+            args,
+            environment,
+        };
+        let held = protocol::join_held_v30_at(
+            &broker,
+            &join,
+            [0, 1, 2, cwd.as_raw_fd(), completion.as_raw_fd()],
+        )
+        .map_err(|e| format!("v30 held J uncertain: {e}"))?;
+        let child_pid: i32 = held
+            .strip_prefix(&format!("held-joined {root} "))
+            .and_then(|s| s.strip_suffix('\n'))
+            .ok_or("v30 held J refused")?
+            .parse()
+            .map_err(|_| "v30 held child PID invalid")?;
+        #[cfg(feature = "age319-private-broker-fixture")]
+        if private_normal_mode() {
+            let (_replay_receipt, replay_completion) =
+                UnixStream::pair().map_err(|e| e.to_string())?;
+            if protocol::join_held_v30_at(
+                &broker,
+                &join,
+                [0, 1, 2, cwd.as_raw_fd(), replay_completion.as_raw_fd()],
+            )
+            .is_ok_and(|reply| reply.starts_with("held-joined "))
+            {
+                return Err("v30 held J replay created a second child".into());
+            }
+            private_v30_marker("held", &child_pid)?;
+            private_v30_barrier("prepare")?;
+        }
+        drop(completion);
+        entry.write_all(b"J").map_err(|e| e.to_string())?;
+        let guardian_prepared: oulipoly_state::mailbox::PreparedBrokerOwner =
+            serde_json::from_str(&read_v30_frame(&mut entry)?).map_err(|e| e.to_string())?;
+        let spec = protocol::StateReadSpec {
+            protocol: "broker-prepared-read-v30".into(),
+            source_generation: source_generation.clone(),
+            root_id: root.clone(),
+            owner_generation: owner_generation.into(),
+            attempt_id: None,
+        };
+        let exact = protocol::read_prepared_owner_at(&broker, &spec).map_err(|e| e.to_string())?;
+        if exact != guardian_prepared
+            || exact.entry.host_pid != unsafe { libc::getpid() }
+            || exact.guardian.host_pid != pid
+            || i64::from(exact.driver.host_pid) != driver_pid
+            || exact.joined_child.host_pid != child_pid
+            || exact.endpoint != endpoint
+        {
+            return Err("v30 entry and guardian prepared readback conflict".into());
+        }
+        #[cfg(feature = "age319-private-broker-fixture")]
+        if private_normal_mode() {
+            for (source, candidate_root, candidate_owner) in [
+                (
+                    uuid::Uuid::new_v4().to_string(),
+                    root.clone(),
+                    owner_generation.to_owned(),
+                ),
+                (
+                    source_generation.clone(),
+                    uuid::Uuid::new_v4().to_string(),
+                    owner_generation.to_owned(),
+                ),
+                (
+                    source_generation.clone(),
+                    root.clone(),
+                    uuid::Uuid::new_v4().to_string(),
+                ),
+            ] {
+                if protocol::read_prepared_owner_at(
+                    &broker,
+                    &protocol::StateReadSpec {
+                        protocol: "broker-prepared-read-v30".into(),
+                        source_generation: source,
+                        root_id: candidate_root,
+                        owner_generation: candidate_owner,
+                        attempt_id: None,
+                    },
+                )
+                .is_ok()
+                {
+                    return Err("v30 stale, wrong-root or sibling prepared read accepted".into());
+                }
+            }
+            private_v30_marker("prepared", &exact)?;
+            private_v30_barrier("release")?;
+        }
+        entry.write_all(b"A").map_err(|e| e.to_string())?;
+        let evidence: oulipoly_state::mailbox::BrokerReleaseEvidence =
+            serde_json::from_str(&read_v30_frame(&mut entry)?).map_err(|e| e.to_string())?;
+        let running = protocol::read_state_at(
+            &broker,
+            &protocol::StateReadSpec {
+                protocol: "broker-entry-running-readback-v30".into(),
+                ..spec
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        if evidence.prepared != exact
+            || running.owner != evidence.owner
+            || running.root_id != root
+            || running.source_generation != source_generation
+        {
+            return Err("v30 running readback changed".into());
+        }
+        #[cfg(feature = "age319-private-broker-fixture")]
+        if private_normal_mode() {
+            private_v30_marker("released", &evidence)?;
+        }
+        let status = read_v30_frame(&mut receipt)?;
+        entry.write_all(b"D").map_err(|e| e.to_string())?;
+        let code: u8 = status
+            .strip_prefix("exit ")
+            .ok_or("v30 child completion absent")?
+            .parse()
+            .map_err(|_| "v30 child completion invalid")?;
+        Ok(ExitCode::from(code))
+    })();
+    if result.is_err() {
+        let _ = entry.shutdown(std::net::Shutdown::Both);
+    }
+    result
+}
+
+fn read_v30_frame(socket: &mut UnixStream) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    loop {
+        if bytes.len() >= 16 * 1024 {
+            return Err("v30 frame too large".into());
+        }
+        let mut byte = [0];
+        socket.read_exact(&mut byte).map_err(|e| e.to_string())?;
+        if byte == [b'\n'] {
+            return String::from_utf8(bytes).map_err(|e| e.to_string());
+        }
+        bytes.push(byte[0]);
+    }
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_v30_marker(name: &str, value: &impl serde::Serialize) -> Result<(), String> {
+    let directory = PathBuf::from(
+        std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+            .ok_or("private v30 gate directory absent")?,
+    );
+    std::fs::write(
+        directory.join(name),
+        serde_json::to_vec(value).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_v30_barrier(name: &str) -> Result<(), String> {
+    let directory = PathBuf::from(
+        std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+            .ok_or("private v30 gate directory absent")?,
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !directory.join(name).exists() {
+        if std::time::Instant::now() >= deadline {
+            return Err(format!("private v30 {name} wait expired"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    Ok(())
 }
 
 fn stage_host_entry(

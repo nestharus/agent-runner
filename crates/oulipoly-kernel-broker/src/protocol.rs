@@ -846,7 +846,7 @@ pub fn prepare_accepted_work_at(
 /// observer against a privileged workload that can replace `/proc`.
 pub fn supported_entry_args(args: &[String]) -> bool {
     #[cfg(feature = "age319-private-broker-fixture")]
-    if matches!(args, [only] if only == "__age319-private-join-only-v1" || only == "__age319-private-bash-work-v1")
+    if matches!(args, [only] if only == "__age319-private-join-only-v1" || only == "__age319-private-bash-work-v1" || only == "__age319-private-normal-v30")
         && unsafe { libc::geteuid() } == 0
         && std::fs::read_to_string("/proc/self/uid_map")
             .ok()
