@@ -4,6 +4,7 @@
 use oulipoly_kernel_broker::protocol::{
     self, AcceptedWorkSpec, JoinSpec, Operation, ProcessWitness, SourceScope, SourceSocketWitness,
 };
+use oulipoly_kernel_broker::source_physical::{SourceObservation, SourcePhysicalRegistry};
 use oulipoly_state::completion_continuation::AdmittedSourceBinding;
 use oulipoly_state::mailbox::{AgentBashCompleteEnqueue, BrokerSidecar, EnqueueResult, MailboxDb};
 use sha2::{Digest, Sha256};
@@ -31,12 +32,26 @@ fn stop(child: &mut Child) {
     let _ = child.wait();
 }
 
+struct SnapshotRestore {
+    path: std::path::PathBuf,
+    bytes: Vec<u8>,
+}
+
+impl Drop for SnapshotRestore {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.path, &self.bytes);
+    }
+}
+
 fn inner() {
     let mode = std::env::var("AGE319_PRIVATE_JOIN_MODE").unwrap_or_else(|_| "help".into());
     let native_mode = mode.starts_with("native_");
     let release_mode = mode.starts_with("held_release") || native_mode;
     let normal_mode = mode.starts_with("normal_");
     let recipient_mode = mode.starts_with("normal_recipient");
+    let real_source = mode.starts_with("normal_bash_source");
+    let nonzero_source = mode == "normal_bash_source_nonzero";
+    let io_failure_source = mode == "normal_bash_source_capture_io_failure";
     let runner =
         std::env::var("OULIPOLY_AGE319_RUNNER_IMAGE").expect("built Runner image required");
     let temp = tempfile::tempdir().unwrap();
@@ -73,18 +88,47 @@ fn inner() {
         }
     });
     let pending_binding = (normal_mode && !recipient_mode && mode != "normal_empty").then(|| {
-        let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../oulipoly-state/tests/fixtures/age360-paired-wire.json"
-        ))
-        .unwrap();
-        AdmittedSourceBinding::new(
-            "fixture-admission",
-            fixture["registration_bytes_utf8"]
-                .as_str()
-                .unwrap()
-                .as_bytes(),
-        )
-        .unwrap()
+        if real_source {
+            let registration =
+                fs::read(std::env::var("AGE319_PRIVATE_BASH_REGISTRATION").unwrap()).unwrap();
+            let source: oulipoly_state::completion_continuation::SourceRegistration =
+                serde_json::from_slice(&registration).unwrap();
+            let state_path = std::env::var("AGE319_PRIVATE_BASH_STATE_DB").unwrap();
+            let committed = rusqlite::Connection::open_with_flags(
+                &state_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let bytes: Vec<u8> = committed
+                .query_row(
+                    "SELECT completion_v2_binding FROM invocation_completion_obligations
+                     WHERE event_id=?1 AND completion_v2_binding IS NOT NULL",
+                    [&source.handle],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let binding: AdmittedSourceBinding = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(binding.registration_bytes(), registration);
+            assert_eq!(binding.registration().unwrap(), source);
+            assert!(
+                !binding.caller_admission_id().is_empty(),
+                "Bash source must have a genuine committed State admission"
+            );
+            binding
+        } else {
+            let fixture: serde_json::Value = serde_json::from_str(include_str!(
+                "../../oulipoly-state/tests/fixtures/age360-paired-wire.json"
+            ))
+            .unwrap();
+            AdmittedSourceBinding::new(
+                "fixture-admission",
+                fixture["registration_bytes_utf8"]
+                    .as_str()
+                    .unwrap()
+                    .as_bytes(),
+            )
+            .unwrap()
+        }
     });
     let domain = pending_binding
         .as_ref()
@@ -227,6 +271,12 @@ fn inner() {
                 (mode == "normal_source_grant_lost_reply")
                     .then_some(("AGE319_PRIVATE_SOURCE_GRANT_REPLY_LOSS_V1", "1")),
             )
+            .envs(real_source.then_some(("AGE319_PRIVATE_SOURCE_LAUNCH_REPLAY_V1", "1")))
+            .envs(
+                (mode == "normal_bash_source_lost_reply")
+                    .then_some(("AGE319_PRIVATE_SOURCE_LAUNCH_REPLY_LOSS_V1", "1")),
+            )
+            .envs(nonzero_source.then_some(("AGE319_PRIVATE_SOURCE_PRELAUNCH_BARRIER_V1", "1")))
             .env_remove("LD_LIBRARY_PATH")
             .stdin(Stdio::null())
             .stdout(Stdio::from(File::create(&out).unwrap()))
@@ -404,6 +454,7 @@ fn inner() {
                     | "normal_recipient_broker_post"
                     | "normal_recipient_driver_post"
             );
+            let mut damaged_snapshot = None;
             if mode == "normal_guardian_post" {
                 unsafe { libc::kill(prepared.guardian.host_pid, libc::SIGKILL) };
             } else if mode == "normal_driver_post" || mode == "normal_recipient_driver_post" {
@@ -429,36 +480,106 @@ fn inner() {
                     "source grant boundary: {}",
                     fs::read_to_string(&err).unwrap_or_default()
                 );
+                // A sibling caller cannot turn the driver's reserved grant
+                // into a physical source effect by naming its root/owner.
+                let launch = protocol::StateWriteSpec {
+                    protocol: "broker-source-effect-launch-v30".into(),
+                    source_generation: generation.clone(),
+                    root_id: prepared.root_id.clone(),
+                    owner_generation: prepared.owner_generation.clone(),
+                    action: protocol::StateWriteAction::LaunchSourceGrant,
+                };
+                assert!(protocol::launch_source_effect_grant_at(&socket, &launch).is_err());
+                let mut stale = launch;
+                stale.owner_generation = uuid::Uuid::new_v4().to_string();
+                assert!(protocol::launch_source_effect_grant_at(&socket, &stale).is_err());
+                if nonzero_source {
+                    let source = pending_binding.as_ref().unwrap().registration().unwrap();
+                    let path = Path::new(&source.handle_dir).join(&source.snapshot_relative);
+                    let original = fs::read(&path).unwrap();
+                    fs::write(&path, b"invalid v2 snapshot").unwrap();
+                    damaged_snapshot = Some(SnapshotRestore {
+                        path,
+                        bytes: original,
+                    });
+                    fs::write(gate.join("source-allow-launch"), b"yes").unwrap();
+                    // The original guardian must stay pinned until W has
+                    // consumed the grant and acknowledged the held worker.
+                    eventually(|| gate.join("source-launched").exists());
+                } else if real_source {
+                    eventually(|| gate.join("source-grant-consumed-readback").exists());
+                }
+            }
+            if (recipient_mode || mode == "normal_empty") && !post_death {
+                // Keep the exact joined owner live until the driver's
+                // broker read has completed. Releasing the child first can
+                // legitimately turn that read into dead-peer refusal.
+                eventually(|| {
+                    fs::read_to_string(&err).is_ok_and(|message| message.contains("v30 "))
+                });
             }
             fs::write(gate.join("child-effect"), b"yes").unwrap();
             eventually(|| entry.try_wait().unwrap().is_some());
+            if (real_source || recipient_mode || mode == "normal_empty") && !post_death {
+                // The joined child can exit before the outside driver finishes
+                // W, especially when the private prelaunch gate is held.
+                let deadline = Instant::now() + Duration::from_secs(20);
+                while !fs::read_to_string(&err).is_ok_and(|message| message.contains("v30 ")) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "driver did not report boundary: mode={mode} entry={} broker={} driver={:?}",
+                        fs::read_to_string(&err).unwrap_or_default(),
+                        fs::read_to_string(&broker_log).unwrap_or_default(),
+                        prepared.driver,
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
             if post_death {
                 assert!(!entry.wait().unwrap().success());
                 assert_eq!(fs::metadata(&out).unwrap().len(), 0);
             } else {
+                let entry_error = fs::read_to_string(&err).unwrap_or_default();
                 let expected_stop = if recipient_mode {
-                    "v30 recipient effect closed: no broker-authenticated live recipient or exact wake successor, durable one-use work grant, or pinned provider K/physical child tree"
+                    Some(
+                        "v30 recipient effect closed: no broker-authenticated live recipient or exact wake successor, durable one-use work grant, or pinned provider K/physical child tree",
+                    )
                 } else if mode == "normal_empty" {
-                    "v30 no pending broker recipient; wake effect refused"
+                    Some("v30 no pending broker recipient; wake effect refused")
+                } else if real_source && mode != "normal_bash_source_lost_reply" {
+                    Some("v30 source physically launched; v2 acceptance remains closed")
+                } else if real_source {
+                    Some("v30 source launch uncertain or refused")
                 } else {
-                    "v30 source recovery requires exact registration/listener file custody, preserved recovery image/environment path semantics, and a one-use effect grant"
+                    None
                 };
-                assert!(
-                    fs::read_to_string(&err)
-                        .unwrap_or_default()
-                        .contains(if recipient_mode || mode == "normal_empty" {
-                            expected_stop
-                        } else {
-                            "v30 source effect grant retained; physical recovery child custody and root-only exact acceptance remain closed"
-                        }),
-                    "normal repair boundary: entry={} broker={}",
-                    fs::read_to_string(&err).unwrap_or_default(),
-                    fs::read_to_string(&broker_log).unwrap_or_default(),
-                );
-                assert_eq!(
-                    fs::read_to_string(&out).unwrap(),
-                    format!("OULIPOLY_KERNEL_V30_CHILD_EFFECT={}\n", released.release_id)
-                );
+                if let Some(expected_stop) = expected_stop {
+                    assert!(
+                        entry_error.contains(expected_stop),
+                        "normal repair boundary: entry={entry_error} broker={} status={:?} launched={} physical={:?}",
+                        fs::read_to_string(&broker_log).unwrap_or_default(),
+                        entry.try_wait().unwrap(),
+                        gate.join("source-launched").exists(),
+                        fs::read_dir(broker_state.join("source-physical"))
+                            .unwrap()
+                            .filter_map(Result::ok)
+                            .map(|entry| entry.file_name())
+                            .collect::<Vec<_>>(),
+                    );
+                } else {
+                    assert!(!gate.join("source-launched").exists());
+                }
+                if recipient_mode || mode == "normal_empty" {
+                    assert!(
+                        fs::read(&out).unwrap().is_empty(),
+                        "a refused recipient/wake path cannot create child effect"
+                    );
+                } else {
+                    assert_eq!(
+                        fs::read_to_string(&out).unwrap(),
+                        format!("OULIPOLY_KERNEL_V30_CHILD_EFFECT={}\n", released.release_id)
+                    );
+                }
                 let projected = rusqlite::Connection::open_with_flags(
                     broker_state.join("sidecar/pid-identity.db"),
                     rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -518,12 +639,202 @@ fn inner() {
                             },
                         )
                         .unwrap();
-                    assert_eq!(grant.0, "reserved");
+                    assert_eq!(grant.0, if real_source { "consumed" } else { "reserved" });
                     assert_eq!(grant.1, *source_id);
                     assert_eq!(grant.2, binding.registration_digest());
                     assert_eq!(grant.3, binding.registration_bytes());
                     assert_eq!(grant.4, prepared.owner_generation);
-                    assert_eq!(grant.5, 1);
+                    assert_eq!(grant.5, if real_source { 2 } else { 1 });
+                    if real_source {
+                        assert_eq!(
+                            gate.join("source-launched").exists(),
+                            mode != "normal_bash_source_lost_reply"
+                        );
+                        let physical = broker_state.join("source-physical");
+                        let grant_id = fs::read_to_string(gate.join("source-grant-ready")).unwrap();
+                        eventually(|| {
+                            fs::read_dir(&physical)
+                                .unwrap()
+                                .filter_map(Result::ok)
+                                .any(|entry| {
+                                    entry
+                                        .file_name()
+                                        .to_string_lossy()
+                                        .ends_with(".terminal.json")
+                                })
+                        });
+                        eventually(|| {
+                            matches!(
+                                SourcePhysicalRegistry::open(&physical)
+                                    .unwrap()
+                                    .observe(&grant_id)
+                                    .unwrap(),
+                                SourceObservation::Drained { .. }
+                            )
+                        });
+                        let observation = SourcePhysicalRegistry::open(&physical)
+                            .unwrap()
+                            .observe(&grant_id)
+                            .unwrap();
+                        assert!(matches!(observation, SourceObservation::Drained {
+                        worker_wait_status, cancel_requested: false, ..
+                    } if (worker_wait_status == 0) != nonzero_source));
+                        let mut retained = BrokerSidecar::open_existing(
+                            &broker_state.join("sidecar/pid-identity.db"),
+                            &broker_state,
+                        )
+                        .unwrap();
+                        let custody = SourcePhysicalRegistry::open(&physical).unwrap();
+                        if nonzero_source {
+                            assert!(
+                                oulipoly_kernel_broker::source_acceptance::assess_v2_candidate(
+                                    &retained, &custody, &grant_id
+                                )
+                                .is_err()
+                            );
+                            assert!(oulipoly_kernel_broker::source_acceptance::capture_and_stage_v2_evidence(
+                            &mut retained, &custody, &grant_id
+                        ).is_err());
+                            assert_eq!(
+                                retained
+                                    .read_source_evidence(&custody.records()[0].grant)
+                                    .unwrap()
+                                    .unwrap()
+                                    .phase,
+                                "unknown"
+                            );
+                            drop(damaged_snapshot.take().unwrap());
+                        } else if io_failure_source {
+                            use std::os::unix::fs::OpenOptionsExt;
+                            let evidence_path = physical.join(format!("{grant_id}.evidence.json"));
+                            std::fs::OpenOptions::new()
+                                .write(true)
+                                .create_new(true)
+                                .mode(0o600)
+                                .open(&evidence_path)
+                                .unwrap();
+                            assert!(oulipoly_kernel_broker::source_acceptance::capture_and_stage_v2_evidence(
+                            &mut retained, &custody, &grant_id
+                        ).is_err(), "create-new evidence write must fail closed");
+                            assert_eq!(
+                                retained
+                                    .read_source_evidence(&custody.records()[0].grant)
+                                    .unwrap()
+                                    .unwrap()
+                                    .phase,
+                                "unknown"
+                            );
+                        } else {
+                            let assessed =
+                                oulipoly_kernel_broker::source_acceptance::assess_v2_candidate(
+                                    &retained, &custody, &grant_id,
+                                )
+                                .unwrap();
+                            assert_eq!(
+                                assessed.registration_id,
+                                pending_binding
+                                    .as_ref()
+                                    .unwrap()
+                                    .registration()
+                                    .unwrap()
+                                    .registration_id
+                            );
+                            let captured =
+                            oulipoly_kernel_broker::source_acceptance::capture_and_stage_v2_evidence(
+                                &mut retained, &custody, &grant_id
+                            ).unwrap();
+                            assert_eq!(captured.candidate, assessed);
+                            assert_eq!(
+                                retained
+                                    .read_source_evidence(&custody.records()[0].grant)
+                                    .unwrap()
+                                    .unwrap()
+                                    .phase,
+                                "captured"
+                            );
+                            assert!(oulipoly_kernel_broker::source_acceptance::capture_and_stage_v2_evidence(
+                            &mut retained, &custody, &grant_id
+                        ).is_err(), "duplicate capture cannot replace broker-owned bytes");
+                            assert!(
+                                oulipoly_kernel_broker::source_acceptance::commit_v2_evidence(
+                                    &mut retained,
+                                    &custody,
+                                    &grant_id
+                                )
+                                .is_err(),
+                                "re-admitted old v29 source has no fresh v30 authority"
+                            );
+                            let reply: serde_json::Value = serde_json::from_slice(
+                                &fs::read(physical.join(format!("{grant_id}.stdout"))).unwrap(),
+                            )
+                            .unwrap();
+                            let verified = oulipoly_state::completion_continuation::VerifiedCompletion::from_source_files(
+                        pending_binding.as_ref().unwrap()).unwrap();
+                            verified.validate_source_reply(&reply).unwrap();
+                            let source = pending_binding.as_ref().unwrap().registration().unwrap();
+                            let snapshot =
+                                Path::new(&source.handle_dir).join(&source.snapshot_relative);
+                            let original = fs::read(&snapshot).unwrap();
+                            let mut changed = original.clone();
+                            changed.push(b' ');
+                            fs::write(&snapshot, &changed).unwrap();
+                            let changed_evidence = oulipoly_state::completion_continuation::VerifiedCompletion::from_source_files(
+                        pending_binding.as_ref().unwrap()).unwrap();
+                            assert!(
+                                changed_evidence.validate_source_reply(&reply).is_err(),
+                                "changed original snapshot must not match physical Bash reply"
+                            );
+                            assert!(
+                                oulipoly_kernel_broker::source_acceptance::assess_v2_candidate(
+                                    &retained, &custody, &grant_id
+                                )
+                                .is_err(),
+                                "changed original snapshot must not pass broker candidate assessment"
+                            );
+                            assert!(
+                            oulipoly_kernel_broker::source_acceptance::read_captured_v2_evidence(
+                                &retained, &custody, &grant_id
+                            )
+                            .is_err(),
+                            "changed original snapshot must fail captured readback"
+                        );
+                            fs::write(&snapshot, original).unwrap();
+                            assert_eq!(
+                                oulipoly_kernel_broker::source_acceptance::assess_v2_candidate(
+                                    &retained, &custody, &grant_id
+                                )
+                                .unwrap(),
+                                assessed
+                            );
+                            assert_eq!(
+                            oulipoly_kernel_broker::source_acceptance::read_captured_v2_evidence(
+                                &retained, &custody, &grant_id
+                            )
+                            .unwrap(),
+                            captured
+                        );
+                            let evidence_path = physical.join(format!("{grant_id}.evidence.json"));
+                            let owned_bytes = fs::read(&evidence_path).unwrap();
+                            let mut damaged = owned_bytes.clone();
+                            damaged.push(b' ');
+                            fs::write(&evidence_path, &damaged).unwrap();
+                            assert!(
+                            oulipoly_kernel_broker::source_acceptance::read_captured_v2_evidence(
+                                &retained, &custody, &grant_id
+                            )
+                            .is_err(),
+                            "same-inode mutation of broker evidence must fail"
+                        );
+                            fs::write(&evidence_path, owned_bytes).unwrap();
+                            assert_eq!(
+                            oulipoly_kernel_broker::source_acceptance::read_captured_v2_evidence(
+                                &retained, &custody, &grant_id
+                            )
+                            .unwrap(),
+                            captured
+                        );
+                        }
+                    }
                 } else {
                     let grants: i64 = projected
                         .query_row(
@@ -671,6 +982,73 @@ fn inner() {
                 ("unknown".into(), 2, 1),
                 "lost custody must retain one unknown grant"
             );
+        }
+        if real_source {
+            let retained = rusqlite::Connection::open_with_flags(
+                broker_state.join("sidecar/pid-identity.db"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let grant: (String, i64, i64) = retained
+                .query_row(
+                    "SELECT phase,revision,count(*) FROM broker_source_effect_grant",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(grant, ("consumed".into(), 2, 1));
+            let grant_id = fs::read_to_string(gate.join("source-grant-ready")).unwrap();
+            let registration_id = pending_binding
+                .as_ref()
+                .unwrap()
+                .registration()
+                .unwrap()
+                .registration_id;
+            let source_phase: String = retained
+                .query_row(
+                    "SELECT phase FROM completion_continuation_source WHERE registration_id=?1",
+                    [&registration_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                source_phase, "registered",
+                "evidence debt must not release the source"
+            );
+            assert!(matches!(
+                SourcePhysicalRegistry::open(broker_state.join("source-physical"))
+                    .unwrap()
+                    .observe(&grant_id)
+                    .unwrap(),
+                SourceObservation::Drained { .. }
+            ));
+            let reopened = BrokerSidecar::open_existing(
+                &broker_state.join("sidecar/pid-identity.db"),
+                &broker_state,
+            )
+            .unwrap();
+            let physical =
+                SourcePhysicalRegistry::open(broker_state.join("source-physical")).unwrap();
+            let debt = reopened
+                .read_source_evidence(&physical.records()[0].grant)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                debt.phase,
+                if nonzero_source || io_failure_source {
+                    "unknown"
+                } else {
+                    "captured"
+                }
+            );
+            if !nonzero_source && !io_failure_source {
+                assert!(
+                    oulipoly_kernel_broker::source_acceptance::read_captured_v2_evidence(
+                        &reopened, &physical, &grant_id
+                    )
+                    .is_ok()
+                );
+            }
         }
         stop(&mut restarted);
         unsafe { libc::kill(prepared.root_init.host_pid, libc::SIGKILL) };
@@ -1843,4 +2221,43 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         );
         assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
     }
+}
+
+#[test]
+fn genuine_bash_source_v30_is_one_use_and_not_accepted_without_commit_custody() {
+    if std::env::var_os("AGE319_PRIVATE_JOIN_INNER").is_some() {
+        inner();
+        return;
+    }
+    let Some(mode) = std::env::var("AGE319_PRIVATE_BASH_MODE").ok() else {
+        return;
+    };
+    assert!(matches!(
+        mode.as_str(),
+        "normal_bash_source"
+            | "normal_bash_source_lost_reply"
+            | "normal_bash_source_nonzero"
+            | "normal_bash_source_capture_io_failure"
+    ));
+    assert!(std::env::var_os("OULIPOLY_AGE319_RUNNER_IMAGE").is_some());
+    assert!(std::env::var_os("AGE319_PRIVATE_BASH_REGISTRATION").is_some());
+    assert!(std::env::var_os("AGE319_PRIVATE_BASH_STATE_DB").is_some());
+    let output = Command::new("unshare")
+        .args(["-Urpfm", "--mount-proc"])
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "genuine_bash_source_v30_is_one_use_and_not_accepted_without_commit_custody",
+            "--nocapture",
+        ])
+        .env("AGE319_PRIVATE_JOIN_INNER", "1")
+        .env("AGE319_PRIVATE_JOIN_MODE", &mode)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{mode}: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

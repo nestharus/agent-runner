@@ -3130,6 +3130,7 @@ dependencies = [
 name = "oulipoly-kernel-broker"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "libc",
  "oulipoly-state",
  "rusqlite",

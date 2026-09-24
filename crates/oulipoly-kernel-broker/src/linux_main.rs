@@ -6,6 +6,8 @@ mod native_work;
 mod private_installed_exec;
 #[path = "root_join.rs"]
 mod root_join;
+#[path = "source_launch.rs"]
+mod source_launch;
 #[path = "work_launch.rs"]
 mod work_launch;
 use oulipoly_kernel_broker::accepted_grant::GrantRegistry;
@@ -26,6 +28,8 @@ use oulipoly_kernel_broker::protocol::{
     StateWriteSpec,
 };
 use oulipoly_kernel_broker::registry::RootRegistry;
+use oulipoly_kernel_broker::source_acceptance::capture_and_stage_v2_evidence;
+use oulipoly_kernel_broker::source_physical::{SourceObservation, SourcePhysicalRegistry};
 use oulipoly_kernel_broker::work_registry::{Scope, WorkRegistry, classify_scope};
 use oulipoly_state::mailbox::{
     BrokerReleaseEvidence, BrokerSidecar, FreshV30Lane, PreparedBrokerOwner, PreparedProcessStamp,
@@ -858,7 +862,7 @@ fn write_broker_state(
                 .map_err(io::Error::other)?;
             Ok(readback)
         }
-        StateWriteAction::Repair { .. } => {
+        StateWriteAction::Repair { .. } | StateWriteAction::LaunchSourceGrant => {
             Err(io::Error::other("bounded repair requires v30 protocol"))
         }
     }
@@ -2428,6 +2432,85 @@ fn serve() -> io::Result<()> {
     if !fixture {
         checked_root_path(&works_path, true)?;
     }
+    let source_physical_path = Path::new(&state).join("source-physical");
+    if !source_physical_path.exists() {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&source_physical_path)?;
+    }
+    if !fixture {
+        checked_root_path(&source_physical_path, true)?;
+    }
+    // Startup reads physical records independently of the original driver.
+    // No source effect is enabled here: only a later exact held-child binding
+    // may insert a consumed grant and open its gate.
+    let mut source_physical = SourcePhysicalRegistry::open(&source_physical_path)?;
+    for grant_id in source_physical.orphaned_grants() {
+        eprintln!("source physical debt {grant_id}: no durable held record");
+    }
+    for (grant_id, result) in source_physical.reconcile_cancellations() {
+        if let Err(error) = result {
+            eprintln!("source cancellation debt {grant_id}: {error}");
+        }
+    }
+    for record in source_physical.records() {
+        match source_physical.observe(&record.grant.grant_id) {
+            Ok(SourceObservation::Unknown {
+                reason, diagnostic, ..
+            }) => {
+                eprintln!(
+                    "source physical debt {}: {reason}; diagnostic={diagnostic:?}",
+                    record.grant.grant_id
+                );
+            }
+            Err(error) => {
+                eprintln!("source physical debt {}: {error}", record.grant.grant_id);
+            }
+            _ => {}
+        }
+    }
+    // After a broker restart, a drained one-use source can be captured from
+    // retained State and the prior physical record. Never mint another W or
+    // infer source acceptance from zero exit. Failed capture becomes debt.
+    if let Some(sidecar) = broker_sidecar.as_mut() {
+        let grants: Vec<_> = source_physical
+            .records()
+            .iter()
+            .map(|r| r.grant.clone())
+            .collect();
+        for grant in grants {
+            match sidecar.read_source_evidence(&grant) {
+                Ok(Some(_)) => {}
+                Ok(None) => match source_physical.observe(&grant.grant_id) {
+                    Ok(SourceObservation::Drained { .. }) => {
+                        if let Err(error) = capture_and_stage_v2_evidence(
+                            sidecar,
+                            &source_physical,
+                            &grant.grant_id,
+                        ) {
+                            eprintln!("source evidence debt {}: {error}", grant.grant_id);
+                        }
+                    }
+                    Ok(SourceObservation::Unknown { .. }) | Err(_) => {
+                        if let Err(error) = sidecar.retain_unknown_source_evidence(&grant) {
+                            eprintln!(
+                                "source evidence unknown-debt readback failed {}: {error}",
+                                grant.grant_id
+                            );
+                        }
+                    }
+                    _ => {}
+                },
+                Err(error) => {
+                    eprintln!(
+                        "source evidence readback failed {}: {error}",
+                        grant.grant_id
+                    );
+                }
+            }
+        }
+    }
     let host_namespace = host_proc_file("self/ns/pid")?;
     let mut registry = RootRegistry::open(&state)?;
     let mut works = WorkRegistry::open(&works_path, &registry)?;
@@ -3186,6 +3269,40 @@ fn serve() -> io::Result<()> {
                         sidecar,
                     )?;
                     encode_source_effect_grant(&Some(grant))
+                } else if spec.protocol == "broker-source-effect-launch-v30"
+                    && matches!(spec.action, StateWriteAction::LaunchSourceGrant)
+                {
+                    let exact = read_broker_state(
+                        StateReadSpec {
+                            protocol: "broker-state-read-v1".into(),
+                            source_generation: spec.source_generation,
+                            root_id: spec.root_id,
+                            owner_generation: spec.owner_generation,
+                            attempt_id: None,
+                        },
+                        &peer,
+                        &host_namespace,
+                        &runner_image,
+                        &registry,
+                        &works,
+                        &entries,
+                        sidecar,
+                    )?;
+                    if !exact.broker_owned
+                        || exact.owner.driver_identity.pid != i64::from(peer.process.host_pid)
+                    {
+                        return Err(io::Error::other("source launch requires exact live driver"));
+                    }
+                    source_launch::launch(
+                        &exact.root_id,
+                        &exact.owner,
+                        &peer,
+                        &registry,
+                        &entries,
+                        sidecar,
+                        &mut source_physical,
+                        &source_physical_path,
+                    )
                 } else {
                     let readback = write_broker_state(
                         spec,

@@ -81,6 +81,11 @@ impl RootRegistry {
             if name == "private-launches" && entry.file_type()?.is_dir() {
                 continue;
             }
+            // SourcePhysicalRegistry opens and validates this fixed broker
+            // directory before any post-owner readback.
+            if name == "source-physical" && entry.file_type()?.is_dir() {
+                continue;
+            }
             // serve() has already opened and validated this fixed root-only
             // storage before it opens the root registry.
             if name == "sidecar" && entry.file_type()?.is_dir() {

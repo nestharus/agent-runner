@@ -230,6 +230,7 @@ pub enum StateWriteAction {
         expected_ordinal: i64,
     },
     ReserveSourceGrant,
+    LaunchSourceGrant,
     Release,
 }
 
@@ -423,6 +424,31 @@ pub fn reserve_source_effect_grant_at(
         serde_json::from_slice(&send_state_frame_at(path, b'W', spec)?)
             .map_err(io::Error::other)?;
     granted.ok_or_else(|| io::Error::other("broker source grant reservation absent"))
+}
+
+/// Ask the broker to launch its own reserved source. The driver supplies only
+/// its generation/root/owner witness; no candidate path or grant ID crosses
+/// this boundary. A lost reply must be reconciled as one-use source debt.
+pub fn launch_source_effect_grant_at(path: &Path, spec: &StateWriteSpec) -> io::Result<String> {
+    if spec.protocol != "broker-source-effect-launch-v30"
+        || !matches!(spec.action, StateWriteAction::LaunchSourceGrant)
+    {
+        return Err(io::Error::other("invalid source effect launch"));
+    }
+    String::from_utf8(send_state_frame_at(path, b'W', spec)?).map_err(io::Error::other)
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+pub fn launch_source_effect_grant_drop_reply_at(
+    path: &Path,
+    spec: &StateWriteSpec,
+) -> io::Result<()> {
+    if spec.protocol != "broker-source-effect-launch-v30"
+        || !matches!(spec.action, StateWriteAction::LaunchSourceGrant)
+    {
+        return Err(io::Error::other("invalid lost-reply source launch"));
+    }
+    state_write_drop_reply_at(path, spec)
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]

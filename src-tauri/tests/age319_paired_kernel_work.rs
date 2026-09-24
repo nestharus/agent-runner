@@ -63,10 +63,12 @@ impl PrivateDir {
 
 impl Drop for PrivateDir {
     fn drop(&mut self) {
-        if std::thread::panicking() && std::env::var_os("AGE319_KEEP_PRIVATE_FAILURE").is_some() {
+        if (std::thread::panicking() && std::env::var_os("AGE319_KEEP_PRIVATE_FAILURE").is_some())
+            || std::env::var_os("AGE319_KEEP_PRIVATE_SUCCESS").is_some()
+        {
             let path = self.path().to_path_buf();
             let _ = self.0.take().unwrap().keep();
-            eprintln!("AGE319_PRIVATE_FAILURE_DIR={}", path.display());
+            eprintln!("AGE319_PRIVATE_RETAINED_DIR={}", path.display());
         }
     }
 }
@@ -1128,6 +1130,9 @@ fn real_bash_source_reaches_guardian_h_k_q() {
         )
         .output()
         .unwrap();
+    if std::env::var_os("AGE319_KEEP_PRIVATE_SUCCESS").is_some() {
+        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+    }
     assert!(
         output.status.success(),
         "stdout={} stderr={}",

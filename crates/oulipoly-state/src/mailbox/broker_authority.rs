@@ -182,6 +182,158 @@ pub struct BrokerRecipientCandidate {
     pub payload_byte_len: i64,
 }
 
+/// Exact reserved row and its State-admitted original registration bytes.
+/// Only the retained broker sidecar can construct this material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrokerSourceMaterial {
+    pub grant: BrokerSourceEffectGrant,
+    pub registration_bytes: Vec<u8>,
+}
+
+/// Exact root-only evidence file seal. The broker verifies the physical and
+/// original bytes before constructing this; State pins it to the consumed
+/// grant and source at the SQLite fence.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BrokerSourceEvidenceSeal {
+    pub manifest_sha256: String,
+    pub manifest_device: u64,
+    pub manifest_inode: u64,
+    pub manifest_byte_len: u64,
+    pub snapshot_sha256: String,
+    pub outcome_sha256: String,
+    pub recovery_stdout_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrokerSourceEvidenceReadback {
+    pub grant_id: String,
+    pub source_generation: String,
+    pub registration_id: String,
+    pub seal: Option<BrokerSourceEvidenceSeal>,
+    pub phase: String,
+    pub revision: i64,
+}
+
+fn consume_source_grant_row(
+    conn: &Connection,
+    material: &BrokerSourceMaterial,
+) -> Result<(), String> {
+    let changed = conn
+        .execute(
+            "UPDATE broker_source_effect_grant SET phase='consumed',revision=2
+         WHERE grant_id=?1 AND source_generation=?2 AND root_id=?3
+           AND owner_generation=?4 AND driver_identity=?5 AND authority_ordinal=?6
+           AND registration_id=?7 AND registration_digest=?8 AND registration_bytes=?9
+           AND listener_revision=?10 AND listener_json=?11
+           AND phase='reserved' AND revision=1",
+            params![
+                material.grant.grant_id,
+                material.grant.source_generation,
+                material.grant.root_id,
+                material.grant.owner_generation,
+                serde_json::to_string(&material.grant.driver_identity).map_err(|e| e.to_string())?,
+                material.grant.authority_ordinal,
+                material.grant.candidate.registration_id,
+                material.grant.candidate.registration_digest,
+                material.registration_bytes,
+                i64::try_from(material.grant.candidate.listener_revision)
+                    .map_err(|_| "listener revision overflow")?,
+                serde_json::to_string(&material.grant.candidate.listener)
+                    .map_err(|e| e.to_string())?,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    if changed != 1 {
+        return Err("source grant already consumed or changed".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod source_grant_cas_tests {
+    use super::*;
+
+    #[test]
+    fn exact_source_row_consumes_once_and_refuses_wrong_sibling_or_stale_material() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE broker_source_effect_grant (
+            grant_id TEXT PRIMARY KEY, source_generation TEXT, root_id TEXT,
+            owner_generation TEXT, driver_identity TEXT, authority_ordinal INTEGER,
+            registration_id TEXT, registration_digest TEXT, registration_bytes BLOB,
+            listener_revision INTEGER, listener_json TEXT, phase TEXT, revision INTEGER);",
+        )
+        .unwrap();
+        let bytes = b"exact registration".to_vec();
+        let material = BrokerSourceMaterial {
+            grant: BrokerSourceEffectGrant {
+                grant_id: uuid::Uuid::new_v4().to_string(),
+                source_generation: uuid::Uuid::new_v4().to_string(),
+                root_id: uuid::Uuid::new_v4().to_string(),
+                owner_generation: uuid::Uuid::new_v4().to_string(),
+                driver_identity: crate::completion_continuation::SourceProcessIdentity {
+                    pid: 10,
+                    boot_id: uuid::Uuid::new_v4().to_string(),
+                    starttime_ticks: 20,
+                },
+                authority_ordinal: 7,
+                candidate: BrokerSourceCandidate {
+                    registration_id: uuid::Uuid::new_v4().to_string(),
+                    registration_digest: crate::completion_continuation::sha256(&bytes),
+                    listener_revision: 2,
+                    listener: crate::completion_continuation::ListenerIdentity {
+                        listener_id: uuid::Uuid::new_v4().to_string(),
+                        session_id: "exact".into(),
+                        owner_invocation_uuid: uuid::Uuid::new_v4().to_string(),
+                    },
+                },
+                phase: "reserved".into(),
+                revision: 1,
+            },
+            registration_bytes: bytes,
+        };
+        conn.execute("INSERT INTO broker_source_effect_grant VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'reserved',1)", params![
+            material.grant.grant_id,
+            material.grant.source_generation,
+            material.grant.root_id,
+            material.grant.owner_generation,
+            serde_json::to_string(&material.grant.driver_identity).unwrap(),
+            material.grant.authority_ordinal,
+            material.grant.candidate.registration_id,
+            material.grant.candidate.registration_digest,
+            material.registration_bytes,
+            material.grant.candidate.listener_revision as i64,
+            serde_json::to_string(&material.grant.candidate.listener).unwrap(),
+        ]).unwrap();
+        let mut wrong = material.clone();
+        wrong.grant.grant_id = uuid::Uuid::new_v4().to_string();
+        assert!(consume_source_grant_row(&conn, &wrong).is_err());
+        wrong = material.clone();
+        wrong.grant.root_id = uuid::Uuid::new_v4().to_string();
+        assert!(consume_source_grant_row(&conn, &wrong).is_err());
+        wrong = material.clone();
+        wrong.grant.candidate.registration_id = uuid::Uuid::new_v4().to_string();
+        assert!(consume_source_grant_row(&conn, &wrong).is_err());
+        wrong = material.clone();
+        wrong.grant.candidate.listener.session_id = "sibling".into();
+        assert!(consume_source_grant_row(&conn, &wrong).is_err());
+        wrong = material.clone();
+        wrong.grant.authority_ordinal -= 1;
+        assert!(consume_source_grant_row(&conn, &wrong).is_err());
+        consume_source_grant_row(&conn, &material).unwrap();
+        assert!(consume_source_grant_row(&conn, &material).is_err());
+        let row: (String, i64) = conn
+            .query_row(
+                "SELECT phase,revision FROM broker_source_effect_grant",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("consumed".into(), 2));
+    }
+}
+
 /// Installer-owned proof that the old service images and every sidecar writer
 /// were stopped, joined and fenced. No production constructor exists yet:
 /// the installed service/launcher census and new-entry fence must be added
@@ -672,6 +824,400 @@ impl BrokerSidecar {
             phase,
             revision,
         }))
+    }
+
+    /// Read the exact original registration stored with the reserved grant.
+    /// The caller must check the original pathname and recovery image before
+    /// consuming this one-use authority.
+    pub fn read_reserved_source_material(
+        &self,
+        source_generation: &str,
+        root_id: &str,
+        owner: &CompletionDomainOwner,
+    ) -> Result<BrokerSourceMaterial, String> {
+        let grant = self
+            .read_source_effect_grant(source_generation, root_id, owner)?
+            .ok_or("reserved source grant absent")?;
+        if grant.phase != "reserved" || grant.revision != 1 {
+            return Err("source grant is not reserved".into());
+        }
+        let bytes: Vec<u8> = self
+            .mailbox
+            .conn
+            .query_row(
+                "SELECT registration_bytes FROM broker_source_effect_grant
+             WHERE grant_id=?1 AND registration_id=?2 AND phase='reserved' AND revision=1",
+                params![grant.grant_id, grant.candidate.registration_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        let registration: crate::completion_continuation::SourceRegistration =
+            serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        registration.validate()?;
+        if bytes.len() > crate::completion_continuation::MAX_REGISTRATION_BYTES
+            || crate::completion_continuation::sha256(&bytes) != grant.candidate.registration_digest
+            || registration.registration_id != grant.candidate.registration_id
+            || registration.listener_revision != grant.candidate.listener_revision
+        {
+            return Err("reserved source registration changed".into());
+        }
+        Ok(BrokerSourceMaterial {
+            grant,
+            registration_bytes: bytes,
+        })
+    }
+
+    /// Post-owner readback for a physical grant. This is candidate evidence,
+    /// not an acceptance transition: the original v2 files are mutable and a
+    /// separate broker-owned snapshot/commit fence is still required.
+    pub fn read_consumed_source_candidate(
+        &self,
+        physical_grant: &BrokerSourceEffectGrant,
+    ) -> Result<crate::completion_continuation::AdmittedSourceBinding, String> {
+        self.check_mailbox_read(&physical_grant.source_generation)?;
+        if physical_grant.phase != "consumed" || physical_grant.revision != 2 {
+            return Err("physical source is not a consumed grant".into());
+        }
+        let row: (
+            String,
+            String,
+            String,
+            String,
+            i64,
+            String,
+            Vec<u8>,
+            i64,
+            String,
+            String,
+            i64,
+        ) = self
+            .mailbox
+            .conn
+            .query_row(
+                "SELECT source_generation,root_id,owner_generation,driver_identity,
+                    authority_ordinal,registration_digest,registration_bytes,
+                    listener_revision,listener_json,phase,revision
+             FROM broker_source_effect_grant WHERE grant_id=?1 AND registration_id=?2",
+                params![
+                    physical_grant.grant_id,
+                    physical_grant.candidate.registration_id
+                ],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                    ))
+                },
+            )
+            .map_err(|e| e.to_string())?;
+        if row.0 != physical_grant.source_generation
+            || row.1 != physical_grant.root_id
+            || row.2 != physical_grant.owner_generation
+            || row.3
+                != serde_json::to_string(&physical_grant.driver_identity)
+                    .map_err(|e| e.to_string())?
+            || row.4 != physical_grant.authority_ordinal
+            || row.5 != physical_grant.candidate.registration_digest
+            || row.7
+                != i64::try_from(physical_grant.candidate.listener_revision)
+                    .map_err(|e| e.to_string())?
+            || serde_json::from_str::<crate::completion_continuation::ListenerIdentity>(&row.8)
+                .map_err(|e| e.to_string())?
+                != physical_grant.candidate.listener
+            || row.9 != "consumed"
+            || row.10 != 2
+            || crate::completion_continuation::sha256(&row.6) != row.5
+        {
+            return Err("consumed source grant changed after physical launch".into());
+        }
+        let scope: (String, String, String) = self.mailbox.conn.query_row(
+            "SELECT domain_id,supervisor_authority_id,driver_identity
+             FROM broker_prepared_owner WHERE owner_generation=?1 AND source_generation=?2 AND root_id=?3",
+            params![physical_grant.owner_generation, physical_grant.source_generation, physical_grant.root_id],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).map_err(|e| e.to_string())?;
+        let retained: (Vec<u8>, String, String) = self.mailbox.conn.query_row(
+            "SELECT binding,phase,supervisor_authority_id FROM completion_continuation_source
+             WHERE registration_id=?1 AND domain_id=(SELECT domain_id FROM completion_continuation_domain)",
+            [&physical_grant.candidate.registration_id],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).map_err(|e| e.to_string())?;
+        let binding = crate::completion_continuation::AdmittedSourceBinding::decode(&retained.0)?;
+        let prepared_driver: PreparedProcessStamp =
+            serde_json::from_str(&scope.2).map_err(|e| e.to_string())?;
+        if retained.1 != "registered"
+            || retained.2 != scope.1
+            || binding.registration()?.domain_id != scope.0
+            || i64::from(prepared_driver.host_pid) != physical_grant.driver_identity.pid
+            || prepared_driver.boot_id != physical_grant.driver_identity.boot_id
+            || i64::try_from(prepared_driver.starttime_ticks).map_err(|e| e.to_string())?
+                != physical_grant.driver_identity.starttime_ticks
+            || binding.registration_bytes() != row.6
+            || binding.registration_digest() != row.5
+            || binding.admission_listener()? != physical_grant.candidate.listener
+            || binding.registration()?.listener_revision
+                != physical_grant.candidate.listener_revision
+        {
+            return Err("consumed source projection changed".into());
+        }
+        let state = self.bound_state()?;
+        if state.admitted_completion_continuation(&binding)?.as_ref() != Some(&binding) {
+            return Err("consumed source lost exact State admission".into());
+        }
+        self.check_mailbox_read(&physical_grant.source_generation)?;
+        Ok(binding)
+    }
+
+    pub fn read_source_evidence(
+        &self,
+        grant: &BrokerSourceEffectGrant,
+    ) -> Result<Option<BrokerSourceEvidenceReadback>, String> {
+        self.check_mailbox_read(&grant.source_generation)?;
+        let row: Option<(String, String, String, Option<String>, String, i64)> = self
+            .mailbox
+            .conn
+            .query_row(
+                "SELECT grant_id,source_generation,registration_id,seal_json,phase,revision
+                 FROM broker_source_evidence WHERE grant_id=?1",
+                [&grant.grant_id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        row.map(
+            |(grant_id, generation, registration_id, json, phase, revision)| {
+                if grant_id != grant.grant_id
+                    || generation != grant.source_generation
+                    || registration_id != grant.candidate.registration_id
+                    || !matches!(
+                        (phase.as_str(), revision),
+                        ("unknown", 1) | ("captured", 1) | ("accepted", 2)
+                    )
+                    || (phase == "unknown") != json.is_none()
+                {
+                    return Err("broker source evidence row changed".into());
+                }
+                let seal = json
+                    .map(|value| serde_json::from_str(&value).map_err(|e| e.to_string()))
+                    .transpose()?;
+                Ok(BrokerSourceEvidenceReadback {
+                    grant_id,
+                    source_generation: generation,
+                    registration_id,
+                    seal,
+                    phase,
+                    revision,
+                })
+            },
+        )
+        .transpose()
+    }
+
+    /// A failed capture or lost reply must leave one durable unknown row. The
+    /// consumed one-use grant remains debt even if this second write fails.
+    pub fn retain_unknown_source_evidence(
+        &mut self,
+        grant: &BrokerSourceEffectGrant,
+    ) -> Result<BrokerSourceEvidenceReadback, String> {
+        self.check_mailbox_read(&grant.source_generation)?;
+        if grant.phase != "consumed" || grant.revision != 2 {
+            return Err("unknown evidence requires consumed source grant".into());
+        }
+        self.mailbox
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO broker_source_evidence
+             (grant_id,source_generation,registration_id,seal_json,phase,revision)
+             SELECT grant_id,source_generation,registration_id,NULL,'unknown',1
+             FROM broker_source_effect_grant
+             WHERE grant_id=?1 AND source_generation=?2 AND registration_id=?3
+               AND phase='consumed' AND revision=2",
+                params![
+                    grant.grant_id,
+                    grant.source_generation,
+                    grant.candidate.registration_id
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        self.read_source_evidence(grant)?
+            .ok_or("unknown source evidence readback absent".into())
+    }
+
+    /// Pin an already fsynced root-only snapshot. A duplicate capture cannot
+    /// replace its seal, and unknown debt cannot be upgraded by retry.
+    pub fn record_source_evidence_snapshot(
+        &mut self,
+        grant: &BrokerSourceEffectGrant,
+        seal: &BrokerSourceEvidenceSeal,
+    ) -> Result<BrokerSourceEvidenceReadback, String> {
+        let binding = self.read_consumed_source_candidate(grant)?;
+        if seal.manifest_inode == 0
+            || seal.manifest_byte_len == 0
+            || seal.manifest_byte_len > 32 * 1024 * 1024
+            || [
+                &seal.manifest_sha256,
+                &seal.snapshot_sha256,
+                &seal.outcome_sha256,
+                &seal.recovery_stdout_sha256,
+            ]
+            .into_iter()
+            .any(|value| !crate::completion_continuation::is_sha256(value))
+            || binding.registration()?.registration_id != grant.candidate.registration_id
+        {
+            return Err("invalid broker source evidence seal".into());
+        }
+        let json = serde_json::to_string(seal).map_err(|e| e.to_string())?;
+        let changed = self
+            .mailbox
+            .conn
+            .execute(
+                "INSERT INTO broker_source_evidence
+             (grant_id,source_generation,registration_id,seal_json,phase,revision)
+             SELECT grant_id,source_generation,registration_id,?4,'captured',1
+             FROM broker_source_effect_grant
+             WHERE grant_id=?1 AND source_generation=?2 AND registration_id=?3
+               AND phase='consumed' AND revision=2",
+                params![
+                    grant.grant_id,
+                    grant.source_generation,
+                    grant.candidate.registration_id,
+                    json
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        if changed != 1 {
+            return Err("consumed source evidence capture CAS failed".into());
+        }
+        let readback = self
+            .read_source_evidence(grant)?
+            .ok_or("captured source evidence readback absent")?;
+        if readback.phase != "captured"
+            || readback.revision != 1
+            || readback.seal.as_ref() != Some(seal)
+        {
+            return Err("captured source evidence readback conflict".into());
+        }
+        Ok(readback)
+    }
+
+    /// Exact positive fence, intentionally closed until the fresh v30 lane
+    /// writes an independently broker-authenticated admission provenance row.
+    /// Old v29 re-admission, physical zero exit, and a matching hash cannot
+    /// populate that row. This transition does not release or notify.
+    pub fn commit_source_evidence_acceptance(
+        &mut self,
+        grant: &BrokerSourceEffectGrant,
+        seal: &BrokerSourceEvidenceSeal,
+    ) -> Result<BrokerSourceEvidenceReadback, String> {
+        let binding = self.read_consumed_source_candidate(grant)?;
+        let before = self
+            .read_source_evidence(grant)?
+            .ok_or("captured source evidence absent")?;
+        if before.phase != "captured" || before.revision != 1 || before.seal.as_ref() != Some(seal)
+        {
+            return Err("source evidence commit seal changed".into());
+        }
+        let changed = self
+            .mailbox
+            .conn
+            .execute(
+                "UPDATE broker_source_evidence SET phase='accepted',revision=2
+             WHERE grant_id=?1 AND source_generation=?2 AND registration_id=?3
+               AND seal_json=?4 AND phase='captured' AND revision=1
+               AND EXISTS (
+                 SELECT 1 FROM broker_source_effect_grant g
+                 WHERE g.grant_id=?1 AND g.source_generation=?2
+                   AND g.registration_id=?3 AND g.phase='consumed' AND g.revision=2)
+               AND EXISTS (
+                 SELECT 1 FROM broker_fresh_source_admission a
+                 WHERE a.registration_id=?3 AND a.source_generation=?2
+                   AND a.registration_digest=?5 AND a.state_admission_id=?6)",
+                params![
+                    grant.grant_id,
+                    grant.source_generation,
+                    grant.candidate.registration_id,
+                    serde_json::to_string(seal).map_err(|e| e.to_string())?,
+                    binding.registration_digest(),
+                    binding.caller_admission_id(),
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        if changed != 1 {
+            return Err(
+                "fresh v30 source admission authority absent or source commit changed".into(),
+            );
+        }
+        let after = self
+            .read_source_evidence(grant)?
+            .ok_or("accepted source evidence readback absent")?;
+        if after.phase != "accepted" || after.revision != 2 || after.seal.as_ref() != Some(seal) {
+            return Err("accepted source evidence readback conflict".into());
+        }
+        Ok(after)
+    }
+
+    /// One conditional irreversible transition. A lost reply cannot consume
+    /// again; the caller must retain the consumed row as unknown debt until
+    /// an exact held-child physical record is fsynced.
+    pub fn consume_reserved_source_effect_grant(
+        &mut self,
+        material: &BrokerSourceMaterial,
+        owner: &CompletionDomainOwner,
+    ) -> Result<BrokerSourceEffectGrant, String> {
+        let exact = self.read_reserved_source_material(
+            &material.grant.source_generation,
+            &material.grant.root_id,
+            owner,
+        )?;
+        if exact != *material {
+            return Err("source material changed before consume".into());
+        }
+        let synchronous: i64 = self
+            .mailbox
+            .conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .map_err(|e| e.to_string())?;
+        let journal: String = self
+            .mailbox
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .map_err(|e| e.to_string())?;
+        if synchronous != 2 || !journal.eq_ignore_ascii_case("wal") {
+            return Err("source consume requires durable FULL WAL sidecar".into());
+        }
+        consume_source_grant_row(&self.mailbox.conn, material)?;
+        let consumed = self
+            .read_source_effect_grant(
+                &material.grant.source_generation,
+                &material.grant.root_id,
+                owner,
+            )?
+            .ok_or("consumed source grant disappeared")?;
+        if consumed.phase != "consumed"
+            || consumed.revision != 2
+            || consumed.grant_id != material.grant.grant_id
+        {
+            return Err("consumed source grant readback conflict".into());
+        }
+        Ok(consumed)
     }
 
     /// On broker restart the old in-memory gate and child custody cannot be
@@ -2263,6 +2809,12 @@ pub(super) fn activate_with_owner(
         schema::BROKER_PREPARED_OWNER_RETAIN,
         schema::BROKER_OWNER_RELEASE_SCHEMA,
         schema::BROKER_SOURCE_EFFECT_GRANT_SCHEMA,
+        schema::BROKER_SOURCE_EVIDENCE_SCHEMA,
+        schema::BROKER_FRESH_SOURCE_ADMISSION_SCHEMA,
+        schema::BROKER_SOURCE_EVIDENCE_UPDATE_GUARD,
+        schema::BROKER_SOURCE_EVIDENCE_RETAIN,
+        schema::BROKER_FRESH_SOURCE_ADMISSION_IMMUTABLE,
+        schema::BROKER_FRESH_SOURCE_ADMISSION_RETAIN,
         schema::BROKER_OWNER_RELEASE_IMMUTABLE,
         schema::BROKER_OWNER_RELEASE_RETAIN,
         schema::BROKER_OWNER_RELEASE_EXACT,

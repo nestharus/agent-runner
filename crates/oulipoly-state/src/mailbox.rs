@@ -54,6 +54,7 @@ pub use broker_authority::{
     BrokerContinuationReadback, BrokerMailboxReadback, BrokerNativeGrantReadback,
     BrokerRecipientCandidate, BrokerRecipientSelection, BrokerReleaseEvidence,
     BrokerRepairReadback, BrokerSidecar, BrokerSourceCandidate, BrokerSourceEffectGrant,
+    BrokerSourceEvidenceReadback, BrokerSourceEvidenceSeal, BrokerSourceMaterial,
     BrokerSourceSelection, PreparedBrokerOwner, PreparedProcessStamp, QuiescedCutoverProof,
 };
 #[cfg(target_os = "linux")]

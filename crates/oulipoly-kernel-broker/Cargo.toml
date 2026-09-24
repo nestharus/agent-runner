@@ -16,6 +16,7 @@ name = "oulipoly-installed-launcher"
 path = "src/installed_launcher.rs"
 
 [dependencies]
+base64 = "0.22"
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
