@@ -162,6 +162,12 @@ enum RequestPayload {
     FreshRootEffectRequest {
         request: FreshRootEffectRequest,
     },
+    FreshBashChildRequest {
+        request_id: String,
+    },
+    FreshBashPrivateResult {
+        result: oulipoly_state::mailbox::FreshBashPrivateResult,
+    },
     FreshRecipientRequest {
         request: FreshRecipientRequest,
     },
@@ -339,15 +345,16 @@ fn recv_request(
     let valid_length = match request[0] {
         b'G' | b'g' => read == 65,
         b'P' | b'p' => read == 37,
-        b'Q' | b'Z' | b'q' | b'z' | b'D' | b'd' => read == 33,
+        b'Q' | b'Z' | b'q' | b'z' | b'D' | b'd' | b'C' | b'c' | b'E' => read == 33,
         #[cfg(feature = "age319-private-broker-fixture")]
         b'l' | b'M' => read == 49,
         b'A' | b'a' => read == 33,
         b'J' | b'j' => (18..=48 * 1024 + 17).contains(&read),
         b'L' => (18..=48 * 1024 + 17).contains(&read),
         b'V' | b'S' | b's' | b'T' | b'H' | b'K' | b'B' | b'N' | b'k' | b't' | b'R' | b'W'
-        | b'Y' | b'0' | b'1' | b'2' => (18..=2048 + 17).contains(&read),
+        | b'Y' | b'0' | b'1' | b'2' | b'3' | b'4' => (18..=2048 + 17).contains(&read),
         b'F' => (18..=8192 + 17).contains(&read),
+        b'O' => (18..=1024 + 17).contains(&read),
         b'U' => (18..=512 + 17).contains(&read),
         _ => read == 17,
     };
@@ -391,11 +398,20 @@ fn recv_request(
         b'F' => RequestPayload::FreshRecipientRequest {
             request: serde_json::from_slice(&request[17..read as usize])?,
         },
-        b'0' | b'1' | b'2' => RequestPayload::FreshRootEffectRequest {
+        b'0' | b'1' | b'2' | b'3' | b'4' => RequestPayload::FreshRootEffectRequest {
             request: serde_json::from_slice(&request[17..read as usize])?,
         },
         b'D' | b'd' => RequestPayload::FreshSessionRequest {
             request_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
+        },
+        b'C' | b'c' => RequestPayload::FreshBashChildRequest {
+            request_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
+        },
+        b'E' => RequestPayload::FreshBashChildRequest {
+            request_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
+        },
+        b'O' => RequestPayload::FreshBashPrivateResult {
+            result: serde_json::from_slice(&request[17..read as usize])?,
         },
         b'P' | b'p' => RequestPayload::Prepare {
             root_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
@@ -3693,6 +3709,48 @@ fn serve_fresh_v30() -> io::Result<()> {
     )
 }
 
+fn fresh_bash_parent(
+    state_root: &Path,
+    lane: &FreshV30Lane,
+    peer: &PeerIdentity,
+    bash_image: Option<&File>,
+) -> io::Result<(FreshReleasedHandoff, FreshRecipientIdentity)> {
+    let image = bash_image.ok_or_else(|| io::Error::other("installed Bash image absent"))?;
+    if !peer.process.same_executable_as(image)? {
+        return Err(io::Error::other("Bash child image changed"));
+    }
+    let roots = RootRegistry::open(state_root)?;
+    let works = WorkRegistry::open(state_root.join("works"), &roots)?;
+    let root_id = match classify_scope(peer, &host_proc_file("self/ns/pid")?, &roots, &works) {
+        Scope::Root(id) => id,
+        Scope::Work { .. } => {
+            return Err(io::Error::other(
+                "nested Bash child requires consumed causal work grant",
+            ));
+        }
+        Scope::Outside => return Err(io::Error::other("Bash child is outside a released root")),
+        Scope::Uncertain => return Err(io::Error::other("Bash child scope uncertain")),
+    };
+    let (root, actor) = lane
+        .released_handoff_for_root(&root_id)
+        .map_err(io::Error::other)?;
+    let init = roots
+        .live_roots()
+        .find(|live| live.record.root_id == root_id)
+        .ok_or_else(|| io::Error::other("released root PID1 absent"))?;
+    let expected = &root.old_release.prepared.root_init;
+    if init.record.init_host_pid != expected.host_pid
+        || init.record.init_starttime_ticks != expected.starttime_ticks
+        || init.record.boot_id != expected.boot_id
+        || init.record.pidns_dev != expected.pidns_dev
+        || init.record.pidns_ino != expected.pidns_ino
+    {
+        return Err(io::Error::other("released root PID1 changed"));
+    }
+    peer.process.verify()?;
+    Ok((root, actor))
+}
+
 fn serve_fresh_v30_at(
     state_root: &Path,
     socket: &Path,
@@ -3702,6 +3760,24 @@ fn serve_fresh_v30_at(
     // A missing or incomplete publication cannot bind the new endpoint.
     let mut lane = FreshV30Lane::open_at(state_root).map_err(io::Error::other)?;
     let instance = EntryGate::open(&state_root.join("v30"))?;
+    // An installed Bash child must match the package's pinned digest. Private
+    // fixtures supply their built source binary only at broker startup.
+    let bash_image = if private_fixture() {
+        std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_BASH_V1")
+            .map(File::open)
+            .transpose()?
+    } else {
+        let pair = InstalledPair::load(Path::new(installed_pair::MANIFEST), true)?;
+        pair.bash_sha256
+            .as_deref()
+            .map(|digest| -> io::Result<File> {
+                let path = Path::new(installed_pair::BASH);
+                let image = File::open(path)?;
+                pair.verify_file(path, digest, true, &image)?;
+                Ok(image)
+            })
+            .transpose()?
+    };
     match fs::symlink_metadata(socket) {
         Ok(meta) if meta.file_type().is_socket() && meta.uid() == 0 && meta.nlink() == 1 => {
             fs::remove_file(socket)?;
@@ -3736,7 +3812,7 @@ fn serve_fresh_v30_at(
                 RequestPayload::FreshRecipientRequest {
                     request: FreshRecipientRequest::Lookup { .. }
                 }
-            );
+            ) || matches!(operation, b'C' | b'c' | b'E' | b'O');
             // The shared front door has its own pinned image. It may observe
             // the live lane identity, but it cannot acquire Runner authority.
             // Every effect-bearing operation still requires the fresh Runner
@@ -3826,6 +3902,66 @@ fn serve_fresh_v30_at(
                         "fresh-child-request {} {}\n",
                         request.request_id, request.invocation_uuid
                     ))
+                }
+                b'C' | b'c' | b'E' | b'O' => {
+                    if !private_fixture() {
+                        return Err(io::Error::other(
+                            "fresh Bash child/work/result closed until normal root grant and physical result custody",
+                        ));
+                    }
+                    if operation == b'E' && instance.is_closed() {
+                        return Err(io::Error::other("fresh Bash private work gate closed"));
+                    }
+                    let request_id = match &payload {
+                        RequestPayload::FreshBashChildRequest { request_id } => request_id.clone(),
+                        RequestPayload::FreshBashPrivateResult { result } => {
+                            result.request_id.clone()
+                        }
+                        _ => return Err(io::Error::other("Bash child request absent")),
+                    };
+                    let (root, root_actor) =
+                        fresh_bash_parent(state_root, &lane, &peer, bash_image.as_ref())?;
+                    let child = if operation == b'C' && !instance.is_closed() {
+                        lane.admit_bash_child(&request_id, &root, &root_actor, &recipient)
+                            .map_err(io::Error::other)?
+                    } else {
+                        let mut child = lane
+                            .read_bash_child(&request_id)
+                            .map_err(io::Error::other)?
+                            .ok_or_else(|| io::Error::other("Bash child absent"))?;
+                        child.session = lane
+                            .read_session(&child.d_key)
+                            .map_err(io::Error::other)?
+                            .ok_or_else(|| io::Error::other("Bash child D incomplete"))?;
+                        lane.require_bash_child(&child, &root, &root_actor, &recipient)
+                            .map_err(io::Error::other)?;
+                        child
+                    };
+                    peer.process.verify()?;
+                    match operation {
+                        b'C' | b'c' => Ok(format!(
+                            "fresh-bash-child {}\n",
+                            serde_json::to_string(&child)?
+                        )),
+                        b'E' => {
+                            let grant = lane
+                                .admit_private_bash_work(&child)
+                                .map_err(io::Error::other)?;
+                            Ok(format!("fresh-bash-work {grant}\n"))
+                        }
+                        b'O' => {
+                            let RequestPayload::FreshBashPrivateResult { result } = payload else {
+                                unreachable!()
+                            };
+                            lane.record_private_bash_result(&result)
+                                .map_err(io::Error::other)?;
+                            Ok(format!(
+                                "fresh-bash-result {}\n",
+                                serde_json::to_string(&result)?
+                            ))
+                        }
+                        _ => unreachable!(),
+                    }
                 }
                 b'D' | b'd' => {
                     let RequestPayload::FreshSessionRequest { request_id } = payload else {
@@ -3986,6 +4122,65 @@ fn serve_fresh_v30_at(
                             serde_json::to_string(&effect)?
                         )),
                         None => Ok("fresh-root-effect absent\n".into()),
+                    }
+                }
+                b'3' | b'4' => {
+                    let RequestPayload::FreshRootEffectRequest { request } = payload else {
+                        return Err(io::Error::other("normal work request absent"));
+                    };
+                    if request.success.is_some() {
+                        return Err(io::Error::other(
+                            "normal work request cannot return a result",
+                        ));
+                    }
+                    let receipt = lane
+                        .released_handoff_for_child(&request.d_key, &recipient)
+                        .map_err(io::Error::other)?;
+                    let spec = StateReadSpec {
+                        protocol: "broker-release-attest-v30".into(),
+                        source_generation: receipt.old_release.prepared.source_generation.clone(),
+                        root_id: receipt.old_release.prepared.root_id.clone(),
+                        owner_generation: receipt.old_release.prepared.owner_generation.clone(),
+                        attempt_id: None,
+                    };
+                    let bridge = handoff_tx.as_ref().ok_or_else(|| {
+                        io::Error::other("in-process release authority unavailable")
+                    })?;
+                    if bridge_released_handoff(
+                        bridge,
+                        spec,
+                        peer,
+                        lane.identity(),
+                        true,
+                        &runner_image,
+                    )? != receipt
+                    {
+                        return Err(io::Error::other("normal work release readback changed"));
+                    }
+                    let session = lane
+                        .read_session(&request.d_key)
+                        .map_err(io::Error::other)?
+                        .ok_or_else(|| io::Error::other("normal work D absent"))?;
+                    lane.require_released_invocation(&receipt, &recipient, &session)
+                        .map_err(io::Error::other)?;
+                    let preparation = if operation == b'3' {
+                        if instance.is_closed() {
+                            return Err(io::Error::other("normal work preparation gate closed"));
+                        }
+                        Some(
+                            lane.prepare_normal_work(&receipt, &recipient, &session)
+                                .map_err(io::Error::other)?,
+                        )
+                    } else {
+                        lane.read_normal_work(&receipt, &recipient, &session)
+                            .map_err(io::Error::other)?
+                    };
+                    match preparation {
+                        Some(preparation) => Ok(format!(
+                            "fresh-normal-work {}\n",
+                            serde_json::to_string(&preparation)?
+                        )),
+                        None => Ok("fresh-normal-work absent\n".into()),
                     }
                 }
                 b'F' => {

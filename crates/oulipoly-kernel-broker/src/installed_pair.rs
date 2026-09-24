@@ -11,6 +11,7 @@ pub const MANIFEST: &str = "/usr/local/libexec/oulipoly/install-v1.json";
 pub const RUNNER: &str = "/usr/local/libexec/oulipoly/oulipoly-agent-runner";
 pub const BROKER: &str = "/usr/local/libexec/oulipoly/oulipoly-kernel-broker";
 pub const LAUNCHER: &str = "/usr/local/libexec/oulipoly/oulipoly-installed-launcher";
+pub const BASH: &str = "/usr/local/libexec/oulipoly/agent-bash";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -22,6 +23,8 @@ pub struct InstalledPair {
     pub broker_sha256: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launcher_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bash_sha256: Option<String>,
 }
 
 impl InstalledPair {
@@ -37,7 +40,9 @@ impl InstalledPair {
             return Err(io::Error::other("oversized installed pair manifest"));
         }
         let pair: Self = serde_json::from_slice(&bytes)?;
-        if pair.schema != 1
+        if !matches!(pair.schema, 1 | 2)
+            || (pair.schema == 1 && pair.bash_sha256.is_some())
+            || (pair.schema == 2 && pair.bash_sha256.is_none())
             || pair.version != env!("CARGO_PKG_VERSION")
             || uuid::Uuid::parse_str(&pair.generation)
                 .ok()
@@ -46,6 +51,10 @@ impl InstalledPair {
             || !valid_digest(&pair.broker_sha256)
             || pair
                 .launcher_sha256
+                .as_deref()
+                .is_some_and(|hash| !valid_digest(hash))
+            || pair
+                .bash_sha256
                 .as_deref()
                 .is_some_and(|hash| !valid_digest(hash))
         {
@@ -161,12 +170,16 @@ mod tests {
         let mut hash = Sha256::new();
         io::copy(&mut File::open(&executable).unwrap(), &mut hash).unwrap();
         let pair = InstalledPair {
-            schema: 1,
+            schema: 2,
             version: env!("CARGO_PKG_VERSION").into(),
             generation: uuid::Uuid::new_v4().to_string(),
             runner_sha256: format!("{:x}", hash.finalize()),
             broker_sha256: "a".repeat(64),
             launcher_sha256: Some(format!(
+                "{:x}",
+                Sha256::digest(fs::read(&executable).unwrap())
+            )),
+            bash_sha256: Some(format!(
                 "{:x}",
                 Sha256::digest(fs::read(&executable).unwrap())
             )),
@@ -186,6 +199,8 @@ mod tests {
             .unwrap();
         pair.verify_image(&executable, pair.launcher_sha256.as_deref().unwrap(), false)
             .unwrap();
+        pair.verify_image(&executable, pair.bash_sha256.as_deref().unwrap(), false)
+            .unwrap();
         assert!(
             pair.verify_image(&executable, &pair.broker_sha256, false)
                 .is_err()
@@ -202,6 +217,26 @@ mod tests {
         );
         let mut old = pair;
         old.version = "0.0.0".into();
+        fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+        assert!(InstalledPair::load(&path, false).is_err());
+        old.version = env!("CARGO_PKG_VERSION").into();
+        old.bash_sha256 = Some("wrong".into());
+        fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+        assert!(InstalledPair::load(&path, false).is_err());
+    }
+
+    #[test]
+    fn retained_v1_manifest_still_loads_without_bash() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("install-v1.json");
+        let mut old = fixture(&path);
+        old.schema = 1;
+        old.bash_sha256 = None;
+        fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+        let loaded = InstalledPair::load(&path, false).unwrap();
+        assert_eq!(loaded.schema, 1);
+        assert!(loaded.bash_sha256.is_none());
+        old.schema = 2;
         fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
         assert!(InstalledPair::load(&path, false).is_err());
     }

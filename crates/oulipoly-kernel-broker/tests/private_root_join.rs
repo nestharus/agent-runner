@@ -57,9 +57,11 @@ fn inner() {
     let handoff_mode = matches!(
         mode.as_str(),
         "normal_handoff"
+            | "normal_handoff_bash_child"
             | "normal_handoff_fsync"
             | "normal_handoff_effect_reply_loss"
             | "normal_help"
+            | "normal_model_held"
     );
     let recipient_mode = mode.starts_with("normal_recipient");
     let real_source = mode.starts_with("normal_bash_source");
@@ -67,6 +69,9 @@ fn inner() {
     let io_failure_source = mode == "normal_bash_source_capture_io_failure";
     let runner =
         std::env::var("OULIPOLY_AGE319_RUNNER_IMAGE").expect("built Runner image required");
+    let bash = (mode == "normal_handoff_bash_child")
+        .then(|| std::env::var("OULIPOLY_AGE319_BASH_IMAGE").expect("built Bash image required"));
+    let bash_request = uuid::Uuid::new_v4().to_string();
     let temp = tempfile::tempdir().unwrap();
     let data = temp.path().join("data");
     let broker_state = temp.path().join("broker-state");
@@ -255,6 +260,10 @@ fn inner() {
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
+        .envs(
+            bash.as_ref()
+                .map(|path| ("OULIPOLY_KERNEL_BROKER_FIXTURE_BASH_V1", path)),
+        )
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
         .envs(native_mode.then_some(("OULIPOLY_KERNEL_BROKER_FIXTURE_NATIVE_GATE_V1", &gate)))
         .envs(
@@ -283,18 +292,42 @@ fn inner() {
         let mut entry = Command::new(&runner)
             .arg(if mode == "normal_help" {
                 "--help"
+            } else if mode == "normal_model_held" {
+                "--model"
             } else if handoff_mode {
                 "__age319-private-root-handoff-v1"
             } else {
                 "__age319-private-normal-v30"
             })
+            .args(
+                (mode == "normal_model_held")
+                    .then_some(["fixture-model", "hello fixture"])
+                    .into_iter()
+                    .flatten(),
+            )
             .env("OULIPOLY_DATA_DIR", &data)
             .env("OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1", "1")
             .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
             .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+            .envs(
+                bash.as_ref()
+                    .map(|path| ("AGE319_PRIVATE_BASH_IMAGE", path)),
+            )
+            .envs(bash.as_ref().map(|_| ("AGE319_PRIVATE_BASH_CHILD_V1", "1")))
+            .envs(bash.as_ref().map(|_| {
+                (
+                    "AGE319_PRIVATE_BASH_EFFECT_MARKER",
+                    gate.join("bash-effect"),
+                )
+            }))
+            .envs(
+                bash.as_ref()
+                    .map(|_| ("AGE319_PRIVATE_BASH_REQUEST_KEY", &bash_request)),
+            )
             .env("AGE319_PRIVATE_REPAIR_CHALLENGE_V1", "1")
             .env("AGE319_PRIVATE_SOURCE_SELECTION_CHALLENGE_V1", "1")
             .envs((mode == "normal_help").then_some(("AGE319_PRIVATE_OFFLINE_ROOT_V1", "1")))
+            .envs((mode == "normal_model_held").then_some(("AGE319_PRIVATE_NORMAL_ROOT_V1", "1")))
             .envs(
                 (mode == "normal_handoff").then_some(("AGE319_PRIVATE_HANDOFF_REPLY_LOSS_V1", "1")),
             )
@@ -522,9 +555,245 @@ fn inner() {
                 "{}",
                 fs::read_to_string(&err).unwrap()
             );
+            if mode == "normal_handoff_bash_child" {
+                let report: serde_json::Value =
+                    serde_json::from_slice(&fs::read(gate.join("bash-child")).unwrap()).unwrap();
+                let child: oulipoly_state::mailbox::FreshBashChild =
+                    serde_json::from_value(report["child"].clone()).unwrap();
+                let result: oulipoly_state::mailbox::FreshBashPrivateResult =
+                    serde_json::from_value(report["result"].clone()).unwrap();
+                let root: oulipoly_state::mailbox::FreshReleasedHandoff = serde_json::from_slice(
+                    &fs::read(
+                        broker_state
+                            .join("released-handoffs")
+                            .join(format!("{}.json", prepared.root_id)),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(child.request_id, bash_request);
+                assert_eq!(child.parent_invocation_uuid, root.invocation_uuid);
+                assert_eq!(child.root_id, prepared.root_id);
+                assert_ne!(child.invocation_uuid, root.invocation_uuid);
+                assert_ne!(child.d_key, root.d_key);
+                assert!(child.handle.starts_with("ab30_"));
+                assert_eq!(report["stdout"], "v30-child-output\n");
+                assert_eq!(result.exit_code, 0);
+                assert_eq!(
+                    result.stdout_sha256,
+                    format!("{:x}", Sha256::digest(b"v30-child-output\n"))
+                );
+                assert_eq!(report["no_new_privs"], 0);
+                assert_eq!(report["seccomp"], 0);
+                assert_eq!(fs::read(gate.join("bash-effect")).unwrap(), b"ran\n");
+                let fresh = rusqlite::Connection::open_with_flags(
+                    broker_state.join("v30/state.db"),
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .unwrap();
+                let (parent, session, model): (i64,String,String) = fresh.query_row(
+                    "SELECT parent_invocation_id,provider_session_id,model_name FROM invocations WHERE invocation_uuid=?1",
+                    [&child.invocation_uuid], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+                let root_id: i64 = fresh
+                    .query_row(
+                        "SELECT id FROM invocations WHERE invocation_uuid=?1",
+                        [&root.invocation_uuid],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(parent, root_id);
+                assert_eq!(session, child.session.session_id);
+                assert_eq!(model, "agent-bash-child");
+                assert_eq!(
+                    fresh
+                        .query_row("SELECT count(*) FROM invocations", [], |r| r
+                            .get::<_, i64>(0))
+                        .unwrap(),
+                    2
+                );
+                assert_eq!(
+                    fresh
+                        .query_row("SELECT count(*) FROM fresh_bash_private_work", [], |r| r
+                            .get::<_, i64>(0))
+                        .unwrap(),
+                    1
+                );
+                assert_eq!(
+                    fresh
+                        .query_row("SELECT count(*) FROM fresh_bash_private_result", [], |r| {
+                            r.get::<_, i64>(0)
+                        })
+                        .unwrap(),
+                    1
+                );
+                assert_eq!(
+                    oulipoly_kernel_broker::registry::RootRegistry::open(&broker_state)
+                        .unwrap()
+                        .live_roots()
+                        .count(),
+                    1,
+                    "Bash child must not mint a supervisor/root"
+                );
+                let lane = FreshV30Lane::open_at(&broker_state).unwrap();
+                assert_eq!(
+                    lane.read_private_bash_result(&bash_request).unwrap(),
+                    Some(result)
+                );
+                let root_actor = oulipoly_state::mailbox::FreshRecipientIdentity {
+                    host_pid: prepared.joined_child.host_pid,
+                    boot_id: prepared.joined_child.boot_id.clone(),
+                    starttime_ticks: prepared.joined_child.starttime_ticks,
+                    pidns_dev: prepared.joined_child.pidns_dev,
+                    pidns_ino: prepared.joined_child.pidns_ino,
+                };
+                let mut wrong_actor = child.actor.clone();
+                wrong_actor.starttime_ticks += 1;
+                assert!(
+                    lane.require_bash_child(&child, &root, &root_actor, &wrong_actor)
+                        .is_err()
+                );
+                wrong_actor = child.actor.clone();
+                wrong_actor.pidns_ino += 1;
+                assert!(
+                    lane.require_bash_child(&child, &root, &root_actor, &wrong_actor)
+                        .is_err()
+                );
+                let mut wrong_parent = child.clone();
+                wrong_parent.parent_invocation_uuid = uuid::Uuid::new_v4().to_string();
+                assert!(
+                    lane.require_bash_child(&wrong_parent, &root, &root_actor, &child.actor)
+                        .is_err()
+                );
+                let mut wrong_d = child.clone();
+                wrong_d.session.request_id = root.d_key.clone();
+                assert!(
+                    lane.require_bash_child(&wrong_d, &root, &root_actor, &child.actor)
+                        .is_err()
+                );
+                let mut partial = child.clone();
+                partial.request_id = uuid::Uuid::new_v4().to_string();
+                partial.d_key = uuid::Uuid::new_v4().to_string();
+                partial.invocation_uuid = uuid::Uuid::new_v4().to_string();
+                partial.handle = format!("ab30_{}", uuid::Uuid::new_v4().simple());
+                partial.actor.starttime_ticks += 1;
+                let fresh_write =
+                    rusqlite::Connection::open(broker_state.join("v30/state.db")).unwrap();
+                fresh_write
+                    .execute(
+                        "INSERT INTO fresh_bash_child
+                     (request_id,d_key,invocation_uuid,handle,root_handoff_id,root_id,
+                      parent_invocation_uuid,actor_identity,receipt_json,admitted_at)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'2026-09-24T00:00:00Z')",
+                        rusqlite::params![
+                            partial.request_id,
+                            partial.d_key,
+                            partial.invocation_uuid,
+                            partial.handle,
+                            partial.root_handoff_id,
+                            partial.root_id,
+                            partial.parent_invocation_uuid,
+                            serde_json::to_string(&partial.actor).unwrap(),
+                            serde_json::to_string(&partial).unwrap()
+                        ],
+                    )
+                    .unwrap();
+                assert!(
+                    lane.admit_private_bash_work(&partial).is_err(),
+                    "partial child row acquired a work grant"
+                );
+                assert!(
+                    fresh
+                        .query_row(
+                            "SELECT count(*) FROM fresh_bash_private_work WHERE request_id=?1",
+                            [&partial.request_id],
+                            |r| r.get::<_, i64>(0),
+                        )
+                        .unwrap()
+                        == 0
+                );
+                let image_probe = raw_fresh_id_request(
+                    &socket.with_file_name("v30.sock"),
+                    b'C',
+                    uuid::Uuid::new_v4(),
+                );
+                assert!(
+                    image_probe.contains("Bash child image changed"),
+                    "{image_probe}"
+                );
+                assert!(
+                    !raw_fresh_id_request(&socket, b'C', uuid::Uuid::new_v4())
+                        .starts_with("fresh-bash-child "),
+                    "old socket admitted a fresh child"
+                );
+                // The same pinned Bash image with a copied root key remains
+                // outside the root namespace when called by this sibling.
+                let outside_marker = gate.join("outside-bash-effect");
+                let sibling = Command::new(bash.as_ref().unwrap())
+                    .arg("__age319-private-admit-child-v1")
+                    .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                    .env("AGE319_PRIVATE_BASH_EFFECT_MARKER", &outside_marker)
+                    .env("AGE319_PRIVATE_BASH_REQUEST_KEY", &bash_request)
+                    .env("AGENT_BASH_OWNER_INVOCATION_UUID", &root.invocation_uuid)
+                    .env("AGENT_BASH_OWNER_SESSION_ID", &child.session.session_id)
+                    .env(
+                        "OULIPOLY_PARENT_INVOCATION",
+                        format!("{{\"id\":\"{}\"}}", root.invocation_uuid),
+                    )
+                    .output()
+                    .unwrap();
+                assert!(
+                    !sibling.status.success(),
+                    "copied root data admitted sibling Bash"
+                );
+                assert!(!outside_marker.exists());
+                stop(&mut broker);
+                broker = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
+                    .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                    .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
+                    .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
+                    .env(
+                        "OULIPOLY_KERNEL_BROKER_FIXTURE_BASH_V1",
+                        bash.as_ref().unwrap(),
+                    )
+                    .stderr(Stdio::from(
+                        File::create(temp.path().join("bash-child-restart.log")).unwrap(),
+                    ))
+                    .spawn()
+                    .unwrap();
+                eventually(|| protocol::request_at(&socket, Operation::Classify).is_ok());
+                let reopened = FreshV30Lane::open_at(&broker_state).unwrap();
+                assert_eq!(
+                    reopened.read_private_bash_result(&bash_request).unwrap(),
+                    lane.read_private_bash_result(&bash_request).unwrap()
+                );
+                fs::write(gate.join("child-effect"), b"yes").unwrap();
+                eventually(|| entry.try_wait().unwrap().is_some());
+                assert!(
+                    entry.wait().unwrap().success(),
+                    "{}",
+                    fs::read_to_string(&err).unwrap()
+                );
+                assert_eq!(
+                    fs::read_to_string(&out).unwrap(),
+                    format!("OULIPOLY_KERNEL_V30_CHILD_EFFECT={}\n", released.release_id)
+                );
+                let root_effect: String = fresh
+                    .query_row(
+                        "SELECT state FROM fresh_root_effect WHERE handoff_id=?1",
+                        [&root.handoff_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(root_effect, "returned_success");
+                stop(&mut broker);
+                return;
+            }
             if matches!(
                 mode.as_str(),
-                "normal_handoff" | "normal_handoff_effect_reply_loss" | "normal_help"
+                "normal_handoff"
+                    | "normal_handoff_effect_reply_loss"
+                    | "normal_help"
+                    | "normal_model_held"
             ) {
                 let marker: serde_json::Value =
                     serde_json::from_slice(&fs::read(gate.join("child-handoff")).unwrap()).unwrap();
@@ -558,6 +827,12 @@ fn inner() {
                     receipt.root_work_intent,
                     if mode == "normal_help" {
                         oulipoly_state::mailbox::FreshRootWorkIntent::CliHelp(vec!["--help".into()])
+                    } else if mode == "normal_model_held" {
+                        oulipoly_state::mailbox::FreshRootWorkIntent::NormalCli(vec![
+                            "--model".into(),
+                            "fixture-model".into(),
+                            "hello fixture".into(),
+                        ])
                     } else {
                         oulipoly_state::mailbox::FreshRootWorkIntent::PrivateProbe(vec![
                             "__age319-private-root-handoff-v1".into(),
@@ -618,6 +893,8 @@ fn inner() {
                     intent_kind,
                     if mode == "normal_help" {
                         "cli_help"
+                    } else if mode == "normal_model_held" {
+                        "normal_cli"
                     } else {
                         "private_probe"
                     }
@@ -642,6 +919,29 @@ fn inner() {
                         .unwrap()
                         .is_none()
                 );
+                if mode == "normal_model_held" {
+                    assert!(
+                        lane.read_normal_work(&receipt, &actor, &session)
+                            .unwrap()
+                            .is_none()
+                    );
+                    assert!(
+                        protocol::prepare_fresh_normal_work_at(
+                            &socket.with_file_name("v30.sock"),
+                            &receipt.d_key
+                        )
+                        .is_err(),
+                        "live same-image sibling prepared held normal work"
+                    );
+                    assert!(
+                        protocol::prepare_fresh_normal_work_at(
+                            &socket.with_file_name("v30.sock"),
+                            &uuid::Uuid::new_v4().to_string()
+                        )
+                        .is_err(),
+                        "wrong key prepared held normal work"
+                    );
+                }
                 assert!(
                     protocol::begin_fresh_root_effect_at(
                         &socket.with_file_name("v30.sock"),
@@ -664,6 +964,12 @@ fn inner() {
                     lane.require_released_handoff(&receipt.d_key, &receipt, &reused_pid)
                         .is_err()
                 );
+                if mode == "normal_model_held" {
+                    assert!(
+                        lane.prepare_normal_work(&receipt, &reused_pid, &session)
+                            .is_err()
+                    );
+                }
                 let mut wrong_lane = receipt.clone();
                 wrong_lane.fresh_lane.lane_id = uuid::Uuid::new_v4().to_string();
                 assert!(
@@ -802,50 +1108,120 @@ fn inner() {
                 fs::write(gate.join("child-effect"), b"yes").unwrap();
                 eventually(|| entry.try_wait().unwrap().is_some());
                 let completed = entry.wait().unwrap().success();
-                let effect: String = fresh_state
-                    .query_row(
-                        "SELECT state FROM fresh_root_effect WHERE handoff_id=?1",
-                        [&receipt.handoff_id],
-                        |row| row.get(0),
-                    )
-                    .unwrap();
-                if mode == "normal_handoff_effect_reply_loss" {
-                    assert!(!completed, "lost start reply executed root work");
-                    assert_eq!(effect, "started", "lost start is durable unknown");
-                    assert_eq!(fs::metadata(&out).unwrap().len(), 0);
+                if mode == "normal_model_held" {
+                    assert!(!completed, "normal provider route must refuse before spawn");
                     assert!(
                         fs::read_to_string(&err)
                             .unwrap()
-                            .contains("root effect start reply lost; execution refused")
+                            .contains("normal provider route held")
                     );
-                } else {
-                    assert!(
-                        completed,
-                        "handoff child: {}",
-                        fs::read_to_string(&err).unwrap()
-                    );
-                    assert_eq!(effect, "returned_success");
-                    if mode == "normal_help" {
-                        let help = fs::read_to_string(&out).unwrap();
-                        assert!(help.contains("Usage:"), "real CLI help absent: {help}");
-                        assert!(!help.contains("OULIPOLY_KERNEL_V30_CHILD_EFFECT"));
-                    } else {
-                        assert_eq!(
-                            fs::read_to_string(&out).unwrap(),
-                            format!("OULIPOLY_KERNEL_V30_CHILD_EFFECT={}\n", released.release_id)
-                        );
-                    }
-                }
-                assert_eq!(
-                    fresh_state
-                        .query_row::<i64, _, _>(
-                            "SELECT count(*) FROM fresh_root_effect",
-                            [],
-                            |row| row.get(0),
+                    let held: (String, String) = fresh_state.query_row(
+                        "SELECT state,intent_json FROM fresh_normal_work_preparation WHERE handoff_id=?1",
+                        [&receipt.handoff_id],
+                        |row| Ok((row.get(0)?,row.get(1)?)),
+                    ).unwrap();
+                    assert_eq!(held.0, "held");
+                    assert_eq!(
+                        serde_json::from_str::<oulipoly_state::mailbox::FreshRootWorkIntent>(
+                            &held.1
                         )
                         .unwrap(),
-                    1
-                );
+                        receipt.root_work_intent
+                    );
+                    assert_eq!(fs::metadata(&out).unwrap().len(), 0);
+                    assert_eq!(
+                        fresh_state
+                            .query_row::<i64, _, _>(
+                                "SELECT count(*) FROM fresh_root_effect",
+                                [],
+                                |row| row.get(0)
+                            )
+                            .unwrap(),
+                        0
+                    );
+                    assert_eq!(
+                        fresh_state
+                            .query_row::<i64, _, _>(
+                                "SELECT count(*) FROM fresh_normal_work_preparation",
+                                [],
+                                |row| row.get(0)
+                            )
+                            .unwrap(),
+                        1
+                    );
+                    assert!(
+                        protocol::prepare_fresh_normal_work_at(
+                            &socket.with_file_name("v30.sock"),
+                            &receipt.d_key
+                        )
+                        .is_err(),
+                        "same-image sibling prepared normal work"
+                    );
+                    assert!(
+                        protocol::observe_fresh_normal_work_at(
+                            &socket.with_file_name("v30.sock"),
+                            &receipt.d_key
+                        )
+                        .is_err(),
+                        "same-image sibling observed normal work"
+                    );
+                    assert!(
+                        protocol::prepare_fresh_normal_work_at(
+                            &socket.with_file_name("v30.sock"),
+                            &uuid::Uuid::new_v4().to_string()
+                        )
+                        .is_err(),
+                        "wrong D key prepared normal work"
+                    );
+                } else {
+                    let effect: String = fresh_state
+                        .query_row(
+                            "SELECT state FROM fresh_root_effect WHERE handoff_id=?1",
+                            [&receipt.handoff_id],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    if mode == "normal_handoff_effect_reply_loss" {
+                        assert!(!completed, "lost start reply executed root work");
+                        assert_eq!(effect, "started", "lost start is durable unknown");
+                        assert_eq!(fs::metadata(&out).unwrap().len(), 0);
+                        assert!(
+                            fs::read_to_string(&err)
+                                .unwrap()
+                                .contains("root effect start reply lost; execution refused")
+                        );
+                    } else {
+                        assert!(
+                            completed,
+                            "handoff child: {}",
+                            fs::read_to_string(&err).unwrap()
+                        );
+                        assert_eq!(effect, "returned_success");
+                        if mode == "normal_help" {
+                            let help = fs::read_to_string(&out).unwrap();
+                            assert!(help.contains("Usage:"), "real CLI help absent: {help}");
+                            assert!(!help.contains("OULIPOLY_KERNEL_V30_CHILD_EFFECT"));
+                        } else {
+                            assert_eq!(
+                                fs::read_to_string(&out).unwrap(),
+                                format!(
+                                    "OULIPOLY_KERNEL_V30_CHILD_EFFECT={}\n",
+                                    released.release_id
+                                )
+                            );
+                        }
+                    }
+                    assert_eq!(
+                        fresh_state
+                            .query_row::<i64, _, _>(
+                                "SELECT count(*) FROM fresh_root_effect",
+                                [],
+                                |row| row.get(0),
+                            )
+                            .unwrap(),
+                        1
+                    );
+                }
                 stop(&mut broker);
                 return;
             }
@@ -2698,6 +3074,23 @@ fn inner() {
     }
 }
 
+fn raw_fresh_id_request(socket: &Path, opcode: u8, id: uuid::Uuid) -> String {
+    use std::io::{Read, Write};
+    let mut stream = UnixStream::connect(socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge).unwrap();
+    let mut frame = vec![opcode];
+    frame.extend_from_slice(&challenge);
+    frame.extend_from_slice(id.as_bytes());
+    stream.write_all(&frame).unwrap();
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply).unwrap();
+    reply
+}
+
 #[test]
 fn original_runner_joins_once_behind_persistent_root_pid1() {
     if std::env::var_os("AGE319_PRIVATE_JOIN_INNER").is_some() {
@@ -2734,9 +3127,11 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "native_receipt_pid1_loss",
         "normal_release",
         "normal_handoff",
+        "normal_handoff_bash_child",
         "normal_handoff_fsync",
         "normal_handoff_effect_reply_loss",
         "normal_help",
+        "normal_model_held",
         "normal_guardian_death",
         "normal_driver_death",
         "normal_broker_death",

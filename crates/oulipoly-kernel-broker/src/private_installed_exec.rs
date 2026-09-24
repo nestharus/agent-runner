@@ -3,7 +3,7 @@
 use oulipoly_kernel_broker::entry_registry::ProcessStamp;
 use oulipoly_kernel_broker::identity::{PeerIdentity, PinnedProcess};
 use oulipoly_kernel_broker::installed_launch::{self, EntryKind, InstalledLaunchSpec};
-use oulipoly_kernel_broker::protocol::supported_entry_args;
+use oulipoly_kernel_broker::protocol::supported_offline_entry_args;
 use serde::{Deserialize, Serialize};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
@@ -579,7 +579,7 @@ pub(super) fn launch(
             .map(|arg| String::from_utf8(arg.clone()))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| io::Error::other("private CLI mode requires UTF-8 args"))?;
-        if !supported_entry_args(&args) {
+        if !supported_offline_entry_args(&args) {
             return Err(io::Error::other("private CLI mode refused"));
         }
     }

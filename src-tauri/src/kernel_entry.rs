@@ -30,6 +30,7 @@ fn private_normal_mode() -> bool {
         arg == PRIVATE_NORMAL_ENTRY
             || arg == "__age319-private-bash-work-v1"
             || arg == "__age319-private-root-handoff-v1"
+            || (arg == "--model" && std::env::var_os("AGE319_PRIVATE_NORMAL_ROOT_V1").is_some())
             || (arg == "--help" && std::env::var_os("AGE319_PRIVATE_OFFLINE_ROOT_V1").is_some())
     }) && unsafe { libc::geteuid() } == 0
         && std::fs::read_to_string("/proc/self/uid_map")
@@ -381,7 +382,9 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
     #[cfg(feature = "age319-private-broker-fixture")]
     let private_handoff = private_v30_child_mode()
         && (std::env::args().nth(1).as_deref() == Some("__age319-private-root-handoff-v1")
-            || private_help);
+            || private_help
+            || (std::env::var_os("AGE319_PRIVATE_NORMAL_ROOT_V1").is_some()
+                && std::env::args().nth(1).as_deref() == Some("--model")));
     #[cfg(feature = "age319-private-broker-fixture")]
     let request_handoff = private_handoff || !private_v30_child_mode();
     #[cfg(not(feature = "age319-private-broker-fixture"))]
@@ -456,6 +459,23 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
                 }),
             )?;
             private_receipt = Some(receipt.clone());
+            if std::env::var_os("AGE319_PRIVATE_BASH_CHILD_V1").is_some() {
+                let bash = std::env::var("AGE319_PRIVATE_BASH_IMAGE")
+                    .map_err(|_| "private Bash source image absent")?;
+                let output = std::process::Command::new(bash)
+                    .arg("__age319-private-admit-child-v1")
+                    .output()
+                    .map_err(|e| e.to_string())?;
+                if !output.status.success() {
+                    return Err(format!(
+                        "real private Bash child failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    ));
+                }
+                let report: serde_json::Value =
+                    serde_json::from_slice(&output.stdout).map_err(|e| e.to_string())?;
+                private_v30_marker("bash-child", &report)?;
+            }
         }
         effect_binding = Some((receipt, session));
     }
@@ -550,6 +570,13 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
                 }
                 return Err("private root effect start reply lost; execution refused".into());
             }
+            if matches!(
+                receipt.root_work_intent,
+                oulipoly_state::mailbox::FreshRootWorkIntent::NormalCli(_)
+            ) {
+                prepare_normal_work(receipt, session)?;
+                return Err("normal provider route held: native K/Q, result and physical custody are absent".into());
+            }
             if !private_help {
                 begin_root_effect(receipt, session)?;
             }
@@ -573,12 +600,53 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
         return Err("root entry argv changed after broker release".into());
     }
     if !receipt.root_work_intent.returnable_entry() {
+        if matches!(
+            receipt.root_work_intent,
+            oulipoly_state::mailbox::FreshRootWorkIntent::NormalCli(_)
+        ) {
+            prepare_normal_work(&receipt, &session)?;
+            return Err(
+                "normal provider route held: native K/Q, result and physical custody are absent"
+                    .into(),
+            );
+        }
         return Err("root entry intent has no returnable effect/result path".into());
     }
     begin_root_effect(&receipt, &session)?;
     let result = crate::process_entrypoint();
     return_root_effect(&receipt, &session, result == ExitCode::SUCCESS)?;
     Ok(result)
+}
+
+fn prepare_normal_work(
+    receipt: &oulipoly_state::mailbox::FreshReleasedHandoff,
+    session: &oulipoly_state::mailbox::FreshV30Session,
+) -> Result<(), String> {
+    let socket = broker_socket().with_file_name("v30.sock");
+    let preparation = protocol::prepare_fresh_normal_work_at(&socket, &receipt.d_key)
+        .or_else(|_| {
+            protocol::observe_fresh_normal_work_at(&socket, &receipt.d_key).and_then(|value| {
+                value.ok_or_else(|| std::io::Error::other("normal work preparation unknown"))
+            })
+        })
+        .map_err(|e| format!("normal work preparation absent or unknown: {e}"))?;
+    if preparation.handoff_id != receipt.handoff_id
+        || preparation.invocation_uuid != receipt.invocation_uuid
+        || preparation.session_id != session.session_id
+        || preparation.intent != receipt.root_work_intent
+        || preparation.state != "held"
+    {
+        return Err("normal work preparation readback conflict".into());
+    }
+    #[cfg(feature = "age319-private-broker-fixture")]
+    if std::env::var_os("AGE319_PRIVATE_NORMAL_ROOT_V1").is_some() {
+        let repeated = protocol::prepare_fresh_normal_work_at(&socket, &receipt.d_key)
+            .map_err(|e| format!("private normal preparation retry failed: {e}"))?;
+        if repeated != preparation {
+            return Err("normal work retry minted a second preparation".into());
+        }
+    }
+    Ok(())
 }
 
 fn begin_root_effect(
@@ -2066,6 +2134,7 @@ mod tests {
             runner_sha256: "a".repeat(64),
             broker_sha256: "b".repeat(64),
             launcher_sha256: None,
+            bash_sha256: None,
         };
         let observation = protocol::InstalledPairObservation {
             version: pair.version.clone(),

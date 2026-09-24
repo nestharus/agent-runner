@@ -4,7 +4,7 @@ CREATE TABLE fresh_released_handoff (
  handoff_id TEXT PRIMARY KEY,
  d_key TEXT NOT NULL UNIQUE,
  invocation_uuid TEXT NOT NULL UNIQUE,
- root_intent_kind TEXT NOT NULL CHECK(root_intent_kind IN ('cli_help','cli_diagnostics','private_probe')),
+ root_intent_kind TEXT NOT NULL CHECK(root_intent_kind IN ('cli_help','cli_diagnostics','normal_cli','private_probe')),
  root_id TEXT NOT NULL UNIQUE,
  actor_identity TEXT NOT NULL UNIQUE,
  receipt_json TEXT NOT NULL,

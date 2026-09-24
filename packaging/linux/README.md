@@ -30,9 +30,10 @@ On this joined source, the default Runner binary retains the broker-gated
 offline root entry; `age319-closed-fresh` is a separate build feature. Pass an
 explicit closed-feature image as `fresh_runner` when preparing v2 staging.
 `stage_versioned_island.py` records exact bytes but does not attest Cargo
-features. `build_paired_bundle.py` and the current Linux release job still emit
-only the fixed schema-v1 bundle from their supplied default Runner/broker/
-launcher images; they do not publish or install this v2 root. Do not reuse a
+features. `build_paired_bundle.py` retains the fixed schema-v1 bundle when
+no Bash image is supplied; the current Linux release job uses that path.
+An explicit `--bash` selects a separate schema-2 image bundle. Neither path
+publishes or installs this v2 root. Do not reuse a
 closed-feature Runner image as that bundle's old Runner image, or overwrite a
 historical pinned v1 image during v2 preparation.
 
@@ -106,14 +107,15 @@ stage. A later positive route needs a new compatible installation and separate
 root/child/source/result proof, including host `sudo`/setuid/native access.
 
 `build_paired_bundle.py` stages one versioned archive with the fixed Runner,
-broker and thin launcher images, `install-v1.json`, broker service unit, `agents` and
+broker and thin launcher images, optional Bash image, `install-v1.json`, broker service unit, `agents` and
 `oulipoly-agent-runner` CLI links, and an `oulipoly-plane` GUI link and desktop
 entry. The archive is inert: building or extracting it does not enable the
 service or activate v30 State. The existing Tauri `.deb` and raw Runner release
 assets continue to use their legacy paths and are **not** a paired deployment.
 
-The manifest contains the workspace package version, a generation derived from
-all three exact image digests, and those SHA-256 digests. The production broker
+The manifest contains the workspace package version and exact image digests.
+Schema 1 derives its generation from Runner, broker and launcher; schema 2
+also includes Bash. The production broker
 checks root ownership, path safety, all named image digests, its running image,
 and the manifest before
 binding `/run/oulipoly-kernel-broker/control.sock`. A Runner started from the
@@ -164,3 +166,13 @@ must remain unrestricted.
 The manifest check is an image compatibility prerequisite only. It does not
 prove a global writer census, persistent ingress, process custody, State v30
 routing, or delivery readiness.
+
+When supplied, the fixed Bash image and digest are staged for future child admission. The
+ordinary Bash `run` command still refuses a v30 owner before local handle or
+workload creation. The private Bash child fixture is compiled under a separate
+feature and is not part of this package.
+
+Bundles with Bash use manifest schema 2 and a distinct `oulipoly-pair-v2`
+generation derived from all four image digests. The reader still accepts
+retained schema 1 manifests with no Bash field. A schema 1 bundle cannot admit
+a Bash child; adding Bash to an old schema 1 manifest is invalid.
