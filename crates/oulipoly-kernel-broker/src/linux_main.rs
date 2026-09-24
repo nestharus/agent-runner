@@ -346,7 +346,7 @@ fn recv_request(
         b'J' | b'j' => (18..=48 * 1024 + 17).contains(&read),
         b'L' => (18..=48 * 1024 + 17).contains(&read),
         b'V' | b'S' | b's' | b'T' | b'H' | b'K' | b'B' | b'N' | b'k' | b't' | b'R' | b'W'
-        | b'Y' | b'0' | b'1' | b'2' => (18..=2048 + 17).contains(&read),
+        | b'Y' | b'0' | b'1' | b'2' | b'3' | b'4' => (18..=2048 + 17).contains(&read),
         b'F' => (18..=8192 + 17).contains(&read),
         b'U' => (18..=512 + 17).contains(&read),
         _ => read == 17,
@@ -391,7 +391,7 @@ fn recv_request(
         b'F' => RequestPayload::FreshRecipientRequest {
             request: serde_json::from_slice(&request[17..read as usize])?,
         },
-        b'0' | b'1' | b'2' => RequestPayload::FreshRootEffectRequest {
+        b'0' | b'1' | b'2' | b'3' | b'4' => RequestPayload::FreshRootEffectRequest {
             request: serde_json::from_slice(&request[17..read as usize])?,
         },
         b'D' | b'd' => RequestPayload::FreshSessionRequest {
@@ -3978,6 +3978,65 @@ fn serve_fresh_v30_at(
                             serde_json::to_string(&effect)?
                         )),
                         None => Ok("fresh-root-effect absent\n".into()),
+                    }
+                }
+                b'3' | b'4' => {
+                    let RequestPayload::FreshRootEffectRequest { request } = payload else {
+                        return Err(io::Error::other("normal work request absent"));
+                    };
+                    if request.success.is_some() {
+                        return Err(io::Error::other(
+                            "normal work request cannot return a result",
+                        ));
+                    }
+                    let receipt = lane
+                        .released_handoff_for_child(&request.d_key, &recipient)
+                        .map_err(io::Error::other)?;
+                    let spec = StateReadSpec {
+                        protocol: "broker-release-attest-v30".into(),
+                        source_generation: receipt.old_release.prepared.source_generation.clone(),
+                        root_id: receipt.old_release.prepared.root_id.clone(),
+                        owner_generation: receipt.old_release.prepared.owner_generation.clone(),
+                        attempt_id: None,
+                    };
+                    let bridge = handoff_tx.as_ref().ok_or_else(|| {
+                        io::Error::other("in-process release authority unavailable")
+                    })?;
+                    if bridge_released_handoff(
+                        bridge,
+                        spec,
+                        peer,
+                        lane.identity(),
+                        true,
+                        &runner_image,
+                    )? != receipt
+                    {
+                        return Err(io::Error::other("normal work release readback changed"));
+                    }
+                    let session = lane
+                        .read_session(&request.d_key)
+                        .map_err(io::Error::other)?
+                        .ok_or_else(|| io::Error::other("normal work D absent"))?;
+                    lane.require_released_invocation(&receipt, &recipient, &session)
+                        .map_err(io::Error::other)?;
+                    let preparation = if operation == b'3' {
+                        if instance.is_closed() {
+                            return Err(io::Error::other("normal work preparation gate closed"));
+                        }
+                        Some(
+                            lane.prepare_normal_work(&receipt, &recipient, &session)
+                                .map_err(io::Error::other)?,
+                        )
+                    } else {
+                        lane.read_normal_work(&receipt, &recipient, &session)
+                            .map_err(io::Error::other)?
+                    };
+                    match preparation {
+                        Some(preparation) => Ok(format!(
+                            "fresh-normal-work {}\n",
+                            serde_json::to_string(&preparation)?
+                        )),
+                        None => Ok("fresh-normal-work absent\n".into()),
                     }
                 }
                 b'F' => {

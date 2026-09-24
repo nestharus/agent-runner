@@ -49,6 +49,9 @@ impl HeldRootJoin {
             [only] if super::private_fixture() && only == "__age319-private-root-handoff-v1" => {
                 Ok(FreshRootWorkIntent::PrivateProbe(self.launch_args.clone()))
             }
+            _ if oulipoly_state::mailbox::normal_root_arguments(&self.launch_args) => {
+                Ok(FreshRootWorkIntent::NormalCli(self.launch_args.clone()))
+            }
             _ => Err(io::Error::other(
                 "released root has no supported root work intent",
             )),

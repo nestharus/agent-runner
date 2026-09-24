@@ -354,6 +354,35 @@ fn private_fresh_dual_lane_live_old_wal_collision_and_restart() {
     reopened.require_mailbox_row(&session, 2).unwrap();
     assert_eq!(reopened.read_session(&request_id).unwrap(), Some(session));
 
+    // The no-fork normal-work table is an additive fresh-State object.
+    state
+        .execute_batch("DROP TABLE fresh_normal_work_preparation")
+        .unwrap();
+    assert_eq!(FreshV30Lane::initialize_at(&broker_root).unwrap(), first);
+    assert_eq!(
+        mailbox
+            .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        32
+    );
+    state
+        .execute_batch(
+            "DROP TRIGGER fresh_normal_work_preparation_no_delete;
+         CREATE TRIGGER fresh_normal_work_preparation_no_delete
+         BEFORE DELETE ON fresh_normal_work_preparation BEGIN SELECT 1; END;",
+        )
+        .unwrap();
+    assert!(
+        FreshV30Lane::open_at(&broker_root)
+            .err()
+            .unwrap()
+            .contains("fresh fresh_normal_work_preparation schema differs")
+    );
+    state
+        .execute_batch("DROP TABLE fresh_normal_work_preparation")
+        .unwrap();
+    assert_eq!(FreshV30Lane::initialize_at(&broker_root).unwrap(), first);
+
     // A published lane from before the root effect Act gains only the
     // additive State objects. The sidecar stays at broker version 32.
     state.execute_batch("DROP TABLE fresh_root_effect").unwrap();

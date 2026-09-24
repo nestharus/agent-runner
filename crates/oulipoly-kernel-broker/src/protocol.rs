@@ -121,6 +121,78 @@ pub fn return_fresh_root_effect_at(
         .ok_or_else(|| io::Error::other("fresh root effect return absent"))
 }
 
+/// An exact no-fork preparation. It cannot start provider work; after this
+/// readback the Runner must still refuse until a separate native K/Q exists.
+pub fn prepare_fresh_normal_work_at(
+    path: &Path,
+    d_key: &str,
+) -> io::Result<oulipoly_state::mailbox::FreshNormalWorkPreparation> {
+    normal_work_request_at(path, b'3', d_key)?
+        .ok_or_else(|| io::Error::other("normal work preparation absent"))
+}
+
+pub fn observe_fresh_normal_work_at(
+    path: &Path,
+    d_key: &str,
+) -> io::Result<Option<oulipoly_state::mailbox::FreshNormalWorkPreparation>> {
+    normal_work_request_at(path, b'4', d_key)
+}
+
+fn normal_work_request_at(
+    path: &Path,
+    operation: u8,
+    d_key: &str,
+) -> io::Result<Option<oulipoly_state::mailbox::FreshNormalWorkPreparation>> {
+    let id =
+        uuid::Uuid::parse_str(d_key).map_err(|_| io::Error::other("invalid normal work D key"))?;
+    if id.is_nil() || id.to_string() != d_key {
+        return Err(io::Error::other("noncanonical normal work D key"));
+    }
+    let body = serde_json::to_vec(&FreshRootEffectRequest {
+        d_key: d_key.into(),
+        success: None,
+    })?;
+    let mut stream = checked_connection(path)?;
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let mut frame = Vec::with_capacity(17 + body.len());
+    frame.push(operation);
+    frame.extend_from_slice(&challenge);
+    frame.extend_from_slice(&body);
+    if unsafe {
+        libc::send(
+            stream.as_raw_fd(),
+            frame.as_ptr().cast(),
+            frame.len(),
+            libc::MSG_NOSIGNAL,
+        )
+    } != frame.len() as isize
+    {
+        return Err(io::Error::other("short normal work request"));
+    }
+    let mut reply = Vec::new();
+    stream.take(8193).read_to_end(&mut reply)?;
+    if reply.len() > 8192 || !reply.ends_with(b"\n") {
+        return Err(io::Error::other(
+            "normal work response oversized or incomplete",
+        ));
+    }
+    let reply = String::from_utf8(reply).map_err(io::Error::other)?;
+    if let Some(error) = reply.strip_prefix("error ") {
+        return Err(io::Error::other(error.trim_end().to_owned()));
+    }
+    if reply == "fresh-normal-work absent\n" {
+        return Ok(None);
+    }
+    let body = reply
+        .strip_prefix("fresh-normal-work ")
+        .and_then(|value| value.strip_suffix('\n'))
+        .ok_or_else(|| io::Error::other("normal work response invalid"))?;
+    serde_json::from_str(body)
+        .map(Some)
+        .map_err(io::Error::other)
+}
+
 fn root_effect_request_at(
     path: &Path,
     operation: u8,
@@ -1490,10 +1562,10 @@ pub fn prepare_accepted_work_at(
     read_response(stream)
 }
 
-/// Only CLI surfaces that dispatch without native service bootstrap may enter
-/// the root child. Observer-aware PID reads do not supply broker-owned nested
-/// work launch, control, and physical drain, or authenticate the host procfs
-/// observer against a privileged workload that can replace `/proc`.
+/// Normal syntax can reach the held J/U/D preparation boundary. The Runner
+/// refuses those intents before CLI bootstrap until a separate native K/Q
+/// result and physical-drain route is installed. This predicate is never a
+/// provider launch authorization.
 pub fn supported_entry_args(args: &[String]) -> bool {
     #[cfg(feature = "age319-private-broker-fixture")]
     if matches!(args, [first, second] if first == "__age319-private-installed-probe-v1" && (second == "tty" || second == "setuid" || second == "sleep"))
@@ -1513,6 +1585,12 @@ pub fn supported_entry_args(args: &[String]) -> bool {
     {
         return true;
     }
+    supported_offline_entry_args(args) || oulipoly_state::mailbox::normal_root_arguments(args)
+}
+
+/// The independent private installed-launch fixture has no released U/D or
+/// normal-work hold, so widening J syntax must never widen that route.
+pub fn supported_offline_entry_args(args: &[String]) -> bool {
     matches!(args, [only] if only == "--help" || only == "-h")
         || args.first().is_some_and(|first| first == "diagnostics")
 }

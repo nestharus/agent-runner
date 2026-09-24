@@ -19,6 +19,7 @@ const FRESH_STATE_SCHEMA: &str = include_str!("migrations/0030_fresh_state_ident
 const FRESH_CHILD_REQUEST_SCHEMA: &str = include_str!("migrations/0030_fresh_child_request.sql");
 const FRESH_HANDOFF_SCHEMA: &str = include_str!("migrations/0031_fresh_released_handoff.sql");
 const FRESH_ROOT_EFFECT_SCHEMA: &str = include_str!("migrations/0032_fresh_root_effect.sql");
+const FRESH_NORMAL_WORK_SCHEMA: &str = include_str!("migrations/0033_fresh_normal_work.sql");
 const FRESH_RECIPIENT_SCHEMA: &str = include_str!("migrations/0030_fresh_recipient.sql");
 const FRESH_RECIPIENT_STATE_SCHEMA: &str =
     include_str!("migrations/0030_fresh_recipient_state.sql");
@@ -43,6 +44,7 @@ pub struct FreshV30LaneIdentity {
 pub enum FreshRootWorkIntent {
     CliHelp(Vec<String>),
     CliDiagnostics(Vec<String>),
+    NormalCli(Vec<String>),
     PrivateProbe(Vec<String>),
 }
 
@@ -51,6 +53,7 @@ impl FreshRootWorkIntent {
         match self {
             Self::CliHelp(_) => "cli_help",
             Self::CliDiagnostics(_) => "cli_diagnostics",
+            Self::NormalCli(_) => "normal_cli",
             Self::PrivateProbe(_) => "private_probe",
         }
     }
@@ -61,6 +64,7 @@ impl FreshRootWorkIntent {
                 matches!(args.as_slice(), [only] if only == "--help" || only == "-h")
             }
             Self::CliDiagnostics(args) => args.first().is_some_and(|first| first == "diagnostics"),
+            Self::NormalCli(args) => normal_root_arguments(args),
             Self::PrivateProbe(args) => {
                 cfg!(feature = "age319-private-broker-fixture")
                     && matches!(args.as_slice(), [only] if only == "__age319-private-root-handoff-v1")
@@ -70,7 +74,10 @@ impl FreshRootWorkIntent {
 
     pub fn arguments(&self) -> &[String] {
         match self {
-            Self::CliHelp(args) | Self::CliDiagnostics(args) | Self::PrivateProbe(args) => args,
+            Self::CliHelp(args)
+            | Self::CliDiagnostics(args)
+            | Self::NormalCli(args)
+            | Self::PrivateProbe(args) => args,
         }
     }
 
@@ -80,9 +87,55 @@ impl FreshRootWorkIntent {
         self.valid()
             && match self {
                 Self::CliHelp(_) | Self::CliDiagnostics(_) => true,
+                Self::NormalCli(_) => false,
                 Self::PrivateProbe(_) => cfg!(feature = "age319-private-broker-fixture"),
             }
     }
+}
+
+/// Conservative syntax for a held normal root. This classification does not
+/// authorize CLI dispatch or provider spawn. The Runner's Clap parser remains
+/// authoritative once a separate provider K/Q route exists.
+pub fn normal_root_arguments(args: &[String]) -> bool {
+    match args {
+        [flag, model, ..]
+            if (flag == "--model" || flag == "-m")
+                && !model.is_empty()
+                && !model.starts_with('-') =>
+        {
+            true
+        }
+        [flag, session, ..]
+            if flag == "--resume" && !session.is_empty() && !session.starts_with('-') =>
+        {
+            true
+        }
+        [first, ..] if first.starts_with("--model=") && first.len() > "--model=".len() => true,
+        [first, ..] if first.starts_with("--resume=") && first.len() > "--resume=".len() => true,
+        [first, ..]
+            if matches!(
+                first.as_str(),
+                "--new" | "-n" | "--file" | "-f" | "--agent-file" | "-a"
+            ) =>
+        {
+            true
+        }
+        [first, ..] if !first.starts_with('-') => true,
+        _ => false,
+    }
+}
+
+/// A durable, exact normal-root boundary. `held` carries no provider launch
+/// authority: there is deliberately no started/success transition here.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreshNormalWorkPreparation {
+    pub handoff_id: String,
+    pub invocation_uuid: String,
+    pub session_id: String,
+    pub actor: FreshRecipientIdentity,
+    pub intent: FreshRootWorkIntent,
+    pub state: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -516,6 +569,18 @@ impl FreshV30Lane {
         if root_intent_columns != 1 || old_bash_columns != 0 {
             return Err("fresh root handoff schema conflicts with Bash placeholder schema".into());
         }
+        verify_fresh_sql_objects(
+            &state_conn,
+            FRESH_HANDOFF_SCHEMA,
+            "fresh_released_handoff",
+            &[
+                "fresh_released_handoff_no_update",
+                "fresh_released_handoff_no_delete",
+                "fresh_released_owner",
+                "fresh_released_owner_no_update",
+                "fresh_released_owner_no_delete",
+            ],
+        )?;
         match fresh_root_effect_schema_count(&state_conn)? {
             0 => state_conn
                 .execute_batch(FRESH_ROOT_EFFECT_SCHEMA)
@@ -527,6 +592,25 @@ impl FreshV30Lane {
             return Err("fresh root effect schema is incomplete".into());
         }
         verify_fresh_root_effect_schema(&state_conn)?;
+        match fresh_normal_work_schema_count(&state_conn)? {
+            0 => state_conn
+                .execute_batch(FRESH_NORMAL_WORK_SCHEMA)
+                .map_err(|e| e.to_string())?,
+            3 => {}
+            _ => return Err("fresh normal work schema is incomplete".into()),
+        }
+        if fresh_normal_work_schema_count(&state_conn)? != 3 {
+            return Err("fresh normal work schema is incomplete".into());
+        }
+        verify_fresh_sql_objects(
+            &state_conn,
+            FRESH_NORMAL_WORK_SCHEMA,
+            "fresh_normal_work_preparation",
+            &[
+                "fresh_normal_work_preparation_no_update",
+                "fresh_normal_work_preparation_no_delete",
+            ],
+        )?;
         state_conn
             .execute_batch("COMMIT")
             .map_err(|e| e.to_string())?;
@@ -968,6 +1052,108 @@ impl FreshV30Lane {
         Ok(readback)
     }
 
+    /// Persist a no-fork normal-work boundary under the exact released root.
+    /// The broker still has no native K, so this cannot authorize execution.
+    pub fn prepare_normal_work(
+        &self,
+        receipt: &FreshReleasedHandoff,
+        actor: &FreshRecipientIdentity,
+        session: &FreshV30Session,
+    ) -> Result<FreshNormalWorkPreparation, String> {
+        self.require_released_invocation(receipt, actor, session)?;
+        if !matches!(&receipt.root_work_intent, FreshRootWorkIntent::NormalCli(_))
+            || !receipt.root_work_intent.valid()
+        {
+            return Err("normal work requires exact normal root intent".into());
+        }
+        let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        state
+            .execute_batch("PRAGMA synchronous=FULL; BEGIN IMMEDIATE")
+            .map_err(|e| e.to_string())?;
+        let started: i64 = state
+            .query_row(
+                "SELECT count(*) FROM fresh_root_effect WHERE handoff_id=?1",
+                [&receipt.handoff_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if started != 0 {
+            return Err("normal work preparation followed root effect start".into());
+        }
+        state
+            .execute(
+                "INSERT INTO fresh_normal_work_preparation
+             (handoff_id,invocation_uuid,session_id,actor_identity,intent_json,state,prepared_at)
+             VALUES(?1,?2,?3,?4,?5,'held',?6)
+             ON CONFLICT(handoff_id) DO NOTHING",
+                params![
+                    receipt.handoff_id,
+                    receipt.invocation_uuid,
+                    session.session_id,
+                    serde_json::to_string(actor).map_err(|e| e.to_string())?,
+                    serde_json::to_string(&receipt.root_work_intent).map_err(|e| e.to_string())?,
+                    Utc::now().to_rfc3339()
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        state.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+        self.read_normal_work(receipt, actor, session)?
+            .ok_or_else(|| "normal work preparation disappeared".into())
+    }
+
+    pub fn read_normal_work(
+        &self,
+        receipt: &FreshReleasedHandoff,
+        actor: &FreshRecipientIdentity,
+        session: &FreshV30Session,
+    ) -> Result<Option<FreshNormalWorkPreparation>, String> {
+        self.require_released_invocation(receipt, actor, session)?;
+        let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let row: Option<(String, String, String, String, String, String)> = state
+            .query_row(
+                "SELECT handoff_id,invocation_uuid,session_id,actor_identity,intent_json,state
+             FROM fresh_normal_work_preparation WHERE handoff_id=?1",
+                [&receipt.handoff_id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some((handoff_id, invocation_uuid, session_id, actor_json, intent_json, state)) = row
+        else {
+            return Ok(None);
+        };
+        if handoff_id != receipt.handoff_id
+            || invocation_uuid != receipt.invocation_uuid
+            || session_id != session.session_id
+            || state != "held"
+            || serde_json::from_str::<FreshRecipientIdentity>(&actor_json)
+                .map_err(|e| e.to_string())?
+                != *actor
+            || serde_json::from_str::<FreshRootWorkIntent>(&intent_json)
+                .map_err(|e| e.to_string())?
+                != receipt.root_work_intent
+        {
+            return Err("normal work preparation identity readback conflict".into());
+        }
+        Ok(Some(FreshNormalWorkPreparation {
+            handoff_id,
+            invocation_uuid,
+            session_id,
+            actor: actor.clone(),
+            intent: receipt.root_work_intent.clone(),
+            state,
+        }))
+    }
+
     /// The intended caller is a released Runner root retaining both UUIDs
     /// across U and D. The broker supplies the pinned peer identity; caller
     /// JSON cannot select an actor. Release and invocation linkage are still
@@ -1398,6 +1584,54 @@ fn verify_fresh_root_effect_schema(state: &Connection) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     if objects(state)? != objects(&canonical)? {
         return Err("fresh root effect schema differs from embedded SQL".into());
+    }
+    Ok(())
+}
+
+fn fresh_normal_work_schema_count(state: &Connection) -> Result<i64, String> {
+    state
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE
+         (type='table' AND name='fresh_normal_work_preparation') OR
+         (type='trigger' AND name IN
+          ('fresh_normal_work_preparation_no_update','fresh_normal_work_preparation_no_delete'))",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())
+}
+
+fn verify_fresh_sql_objects(
+    state: &Connection,
+    sql: &str,
+    first: &str,
+    others: &[&str],
+) -> Result<(), String> {
+    fn objects(
+        state: &Connection,
+        names: &[&str],
+    ) -> Result<Vec<(String, String, String)>, String> {
+        let mut statement = state.prepare(
+            "SELECT type,name,sql FROM sqlite_master WHERE name=?1 OR name=?2 OR name=?3 OR name=?4 OR name=?5 OR name=?6 ORDER BY type,name"
+        ).map_err(|e| e.to_string())?;
+        let mut bind = [""; 6];
+        for (slot, name) in bind.iter_mut().zip(names) {
+            *slot = name;
+        }
+        statement
+            .query_map(rusqlite::params_from_iter(bind), |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+    let canonical = Connection::open_in_memory().map_err(|e| e.to_string())?;
+    canonical.execute_batch(sql).map_err(|e| e.to_string())?;
+    let mut names = vec![first];
+    names.extend_from_slice(others);
+    if objects(state, &names)? != objects(&canonical, &names)? {
+        return Err(format!("fresh {first} schema differs from embedded SQL"));
     }
     Ok(())
 }
