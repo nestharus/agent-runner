@@ -624,23 +624,36 @@ pub(super) use attempts::{
 };
 
 pub(super) fn validate_schema_on(conn: &Connection) -> Result<(), String> {
-    validate_schema_version_on(conn, super::schema::CURRENT_VERSION)
+    validate_schema_version_on(conn, super::schema::CURRENT_VERSION, true)
 }
 
 pub(super) fn validate_broker_schema_on(conn: &Connection) -> Result<(), String> {
-    validate_schema_version_on(conn, super::schema::BROKER_OWNED_VERSION)
+    validate_schema_version_on(conn, super::schema::BROKER_OWNED_VERSION, true)
 }
 
-fn validate_schema_version_on(conn: &Connection, required_version: i64) -> Result<(), String> {
+// Historical v29 sources are still read for staged cutover. Their fingerprint
+// must not move when the ordinary current schema advances.
+pub(super) fn validate_v29_schema_on(conn: &Connection) -> Result<(), String> {
+    validate_schema_version_on(conn, 29, false)
+}
+
+fn validate_schema_version_on(
+    conn: &Connection,
+    required_version: i64,
+    include_uncertain: bool,
+) -> Result<(), String> {
     type Definition = (String, String, String);
-    static EXPECTED: std::sync::OnceLock<Result<Vec<Definition>, String>> =
+    static EXPECTED_V29: std::sync::OnceLock<Result<Vec<Definition>, String>> =
         std::sync::OnceLock::new();
-    fn definitions(conn: &Connection) -> Result<Vec<Definition>, String> {
+    static EXPECTED_CURRENT: std::sync::OnceLock<Result<Vec<Definition>, String>> =
+        std::sync::OnceLock::new();
+    fn definitions(conn: &Connection, include_uncertain: bool) -> Result<Vec<Definition>, String> {
         let mut statement = conn
             .prepare(
                 "SELECT type,name,sql FROM sqlite_master
                  WHERE sql IS NOT NULL AND (
                     name LIKE 'completion_continuation_%'
+                    OR name LIKE 'completion_uncertain_input%'
                     OR name LIKE 'completion_native_grant_%'
                     OR name LIKE 'completion_native_worker_%'
                     OR name LIKE 'completion_native_kernel_%'
@@ -651,12 +664,16 @@ fn validate_schema_version_on(conn: &Connection, required_version: i64) -> Resul
                     OR name='mailbox'
                     OR name='mailbox_completion_provenance_immutable'
                     OR name='mailbox_completion_provenance_insert_valid'
-                    OR name='mailbox_completion_provenance_update_valid')
+                    OR name='mailbox_completion_provenance_update_valid'
+                    OR (?1=1 AND name IN ('idx_mailbox_deliverable_session_live',
+                        'idx_mailbox_deliverable_target_live',
+                        'idx_mailbox_deliverable_global',
+                        'completion_uncertain_input_preserve')))
                  ORDER BY type,name",
             )
             .map_err(|e| e.to_string())?;
         statement
-            .query_map([], |r| {
+            .query_map([include_uncertain], |r| {
                 let kind: String = r.get(0)?;
                 let name: String = r.get(1)?;
                 let mut sql: String = r.get(2)?;
@@ -710,57 +727,92 @@ fn validate_schema_version_on(conn: &Connection, required_version: i64) -> Resul
             .map(|r| r.map_err(|e| e.to_string()))
             .collect()
     }
-    let expected = EXPECTED
-        .get_or_init(|| {
-            let expected = Connection::open_in_memory().map_err(|e| e.to_string())?;
-            expected
+    fn expected_definitions(include_uncertain: bool) -> Result<Vec<Definition>, String> {
+        let expected = Connection::open_in_memory().map_err(|e| e.to_string())?;
+        expected
                 .execute_batch("CREATE TABLE session_wake_claim(session_id TEXT,claim_token TEXT); CREATE TABLE completion_event_listener(event_id TEXT,listener_id TEXT,acknowledged_at TEXT,acknowledgement_reason TEXT,mailbox_seq INTEGER,PRIMARY KEY(event_id,listener_id));")
                 .map_err(|e| e.to_string())?;
-            expected
-                .execute_batch(include_str!(
-                    "../migrations/0018_completion_continuation.sql"
-                ))
-                .map_err(|e| e.to_string())?;
-            expected.execute_batch(include_str!("../migrations/0019_notification_settlement.sql"))
-                .map_err(|e| e.to_string())?;
-            expected
-                .execute_batch(include_str!(
-                    "../migrations/0021_completion_recovery_working_set.sql"
-                ))
-                .map_err(|e| e.to_string())?;
-            expected
-                .execute_batch(include_str!(
-                    "../migrations/0022_completion_native_runtime.sql"
-                ))
-                .map_err(|e| e.to_string())?;
-            expected.execute_batch(
-                "CREATE TABLE mailbox(completion_provenance TEXT NOT NULL DEFAULT 'unclassified');",
-            ).map_err(|e| e.to_string())?;
-            expected.execute_batch(super::schema::COMPLETION_PROVENANCE_TRIGGER_SQL)
-                .map_err(|e| e.to_string())?;
-            expected.execute_batch("ALTER TABLE completion_continuation_attempt
+        expected
+            .execute_batch(include_str!(
+                "../migrations/0018_completion_continuation.sql"
+            ))
+            .map_err(|e| e.to_string())?;
+        expected
+            .execute_batch(include_str!(
+                "../migrations/0019_notification_settlement.sql"
+            ))
+            .map_err(|e| e.to_string())?;
+        expected
+            .execute_batch(include_str!(
+                "../migrations/0021_completion_recovery_working_set.sql"
+            ))
+            .map_err(|e| e.to_string())?;
+        expected
+            .execute_batch(include_str!(
+                "../migrations/0022_completion_native_runtime.sql"
+            ))
+            .map_err(|e| e.to_string())?;
+        expected
+            .execute_batch(
+                "CREATE TABLE mailbox(seq INTEGER PRIMARY KEY,session_id TEXT,target_kind TEXT,
+                 target_id TEXT,delivered_at TEXT,delivery_error TEXT,
+                 completion_provenance TEXT NOT NULL DEFAULT 'unclassified');
+                 CREATE INDEX idx_mailbox_deliverable_session_live ON mailbox(seq);
+                 CREATE INDEX idx_mailbox_deliverable_target_live ON mailbox(seq);
+                 CREATE INDEX idx_mailbox_deliverable_global ON mailbox(seq);",
+            )
+            .map_err(|e| e.to_string())?;
+        expected
+            .execute_batch(super::schema::COMPLETION_PROVENANCE_TRIGGER_SQL)
+            .map_err(|e| e.to_string())?;
+        expected
+            .execute_batch(
+                "ALTER TABLE completion_continuation_attempt
             ADD COLUMN association_completeness TEXT NOT NULL DEFAULT 'unknown';
             ALTER TABLE completion_continuation_source
-            ADD COLUMN attempt_association_history TEXT NOT NULL DEFAULT 'unknown';")
+            ADD COLUMN attempt_association_history TEXT NOT NULL DEFAULT 'unknown';",
+            )
+            .map_err(|e| e.to_string())?;
+        expected
+            .execute_batch(include_str!(
+                "../migrations/0025_completion_attempt_sources.sql"
+            ))
+            .map_err(|e| e.to_string())?;
+        expected
+            .execute_batch(include_str!(
+                "../migrations/0026_completion_attempt_search_generation.sql"
+            ))
+            .map_err(|e| e.to_string())?;
+        expected
+            .execute_batch(include_str!("../migrations/0027_kernel_root_owner.sql"))
+            .map_err(|e| e.to_string())?;
+        expected
+            .execute_batch(include_str!("../migrations/0028_native_grant_binding.sql"))
+            .map_err(|e| e.to_string())?;
+        expected
+            .execute_batch(include_str!(
+                "../migrations/0029_native_worker_kernel_q.sql"
+            ))
+            .map_err(|e| e.to_string())?;
+        if include_uncertain {
+            expected
+                .execute_batch(include_str!("../migrations/0031_uncertain_activation.sql"))
                 .map_err(|e| e.to_string())?;
-            expected.execute_batch(include_str!("../migrations/0025_completion_attempt_sources.sql"))
-                .map_err(|e| e.to_string())?;
-            expected.execute_batch(include_str!("../migrations/0026_completion_attempt_search_generation.sql"))
-                .map_err(|e| e.to_string())?;
-            expected.execute_batch(include_str!("../migrations/0027_kernel_root_owner.sql"))
-                .map_err(|e| e.to_string())?;
-            expected.execute_batch(include_str!("../migrations/0028_native_grant_binding.sql"))
-                .map_err(|e| e.to_string())?;
-            expected.execute_batch(include_str!("../migrations/0029_native_worker_kernel_q.sql"))
-                .map_err(|e| e.to_string())?;
-            definitions(&expected)
-        })
-        .as_ref()
-        .map_err(Clone::clone)?;
+        }
+        definitions(&expected, include_uncertain)
+    }
+    let expected = if include_uncertain {
+        EXPECTED_CURRENT.get_or_init(|| expected_definitions(true))
+    } else {
+        EXPECTED_V29.get_or_init(|| expected_definitions(false))
+    }
+    .as_ref()
+    .map_err(Clone::clone)?;
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .map_err(|e| e.to_string())?;
-    if version != required_version || definitions(conn)? != *expected {
+    let actual = definitions(conn, include_uncertain)?;
+    if version != required_version || actual != *expected {
         return Err(
             "unsupported_transition_required: completion domain schema lineage differs".into(),
         );
@@ -2465,6 +2517,132 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn never_forked_activation_keeps_submitted_input_retryable() {
+        let (_dir, mut db, owner) = fixture();
+        let result = db
+            .enqueue_submitted_input(&crate::mailbox::SubmittedInputEnqueue {
+                submission_token: "pre-effect",
+                target: crate::mailbox::InboxTarget {
+                    kind: crate::mailbox::InboxTargetKind::Session,
+                    id: "session",
+                },
+                input: b"safe-retry",
+            })
+            .unwrap();
+        let crate::mailbox::EnqueueResult::Inserted(row) = result else {
+            panic!("fixture input was not inserted");
+        };
+        let attempt = reservation(&mut db, &owner);
+        db.conn
+            .execute(
+                "UPDATE session_wake_claim
+                 SET min_pending_seq_at_claim=?1,max_pending_seq_at_claim=?1
+                 WHERE session_id='session'",
+                [row.seq],
+            )
+            .unwrap();
+        db.accept_continuation_attempt(&attempt).unwrap();
+        db.record_continuation_never_forked(&attempt, "worker_not_forked")
+            .unwrap();
+        assert_eq!(db.uncertain_activation_input_count("session").unwrap(), 0);
+        assert_eq!(db.pending_delivery_count("session", None).unwrap(), 1);
+        assert!(
+            db.wake_session_reader()
+                .wake_claim("session")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn drained_activation_fences_only_exact_claim_rows_across_restart_and_manual_ack() {
+        let (dir, mut db, owner) = fixture();
+        let enqueue = |db: &mut MailboxDb, token: &str| {
+            let crate::mailbox::EnqueueResult::Inserted(row) = db
+                .enqueue_submitted_input(&crate::mailbox::SubmittedInputEnqueue {
+                    submission_token: token,
+                    target: crate::mailbox::InboxTarget {
+                        kind: crate::mailbox::InboxTargetKind::Session,
+                        id: "session",
+                    },
+                    input: token.as_bytes(),
+                })
+                .unwrap()
+            else {
+                panic!("fixture input was not inserted");
+            };
+            row.seq
+        };
+        let first = enqueue(&mut db, "selected-first");
+        let second = enqueue(&mut db, "selected-second");
+        let attempt = reservation(&mut db, &owner);
+        db.conn
+            .execute(
+                "UPDATE session_wake_claim SET min_pending_seq_at_claim=?1,
+             max_pending_seq_at_claim=?2 WHERE session_id='session' AND claim_token='token'",
+                rusqlite::params![first, second],
+            )
+            .unwrap();
+        let later = enqueue(&mut db, "unrelated-later");
+        db.accept_continuation_attempt(&attempt).unwrap();
+        db.attach_continuation_custodian(&attempt, &owner.driver_identity)
+            .unwrap();
+        db.advance_continuation_attempt(
+            &attempt,
+            3,
+            "accepted",
+            "starting",
+            &owner.driver_identity,
+        )
+        .unwrap();
+        db.discharge_continuation_attempt(&attempt, &owner.driver_identity, "ECHILD")
+            .unwrap();
+        let fenced = db
+            .conn
+            .prepare("SELECT mailbox_seq FROM completion_uncertain_input ORDER BY mailbox_seq")
+            .unwrap()
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(fenced, vec![first, second]);
+        assert_eq!(db.uncertain_activation_input_count("session").unwrap(), 2);
+        assert_eq!(db.pending_delivery_count("session", None).unwrap(), 1);
+        let later_error: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT delivery_error FROM mailbox WHERE seq=?1",
+                [later],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(later_error, None);
+        assert!(
+            db.mark_delivery_failed("session", None, &[first], "transient")
+                .is_err()
+        );
+        drop(db);
+        let mut reopened = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        assert_eq!(
+            reopened
+                .uncertain_activation_input_count("session")
+                .unwrap(),
+            2
+        );
+        assert_eq!(reopened.pending_delivery_count("session", None).unwrap(), 1);
+        reopened
+            .acknowledge_range("session", first, first, "manual")
+            .unwrap();
+        assert_eq!(
+            reopened
+                .uncertain_activation_input_count("session")
+                .unwrap(),
+            1
+        );
+        assert_eq!(reopened.pending_delivery_count("session", None).unwrap(), 1);
     }
 
     #[test]

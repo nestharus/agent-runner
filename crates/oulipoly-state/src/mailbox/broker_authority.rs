@@ -2783,16 +2783,23 @@ pub(super) fn activate_with_owner(
 ) -> Result<String, String> {
     check_storage(path, owner, anchor)?;
     let authority = MailboxAuthorityFence::acquire_exclusive(path).map_err(|e| e.to_string())?;
-    harden_artifacts(path, owner)?;
-    let version: i64 = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
-        .map_err(|error| error.to_string())?
-        .query_row("PRAGMA user_version", [], |row| row.get(0))
+    let original = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|error| error.to_string())?;
-    if version != schema::CURRENT_VERSION {
-        return Err("broker cutover requires an already migrated v29 copy".into());
+    let version = schema::sidecar_version(&original)?;
+    match version {
+        // Only an independently staged copy may reach this call from the old
+        // cutover path. Validate its historical shape before migrating it;
+        // the default v29 island is never opened writable here.
+        29 => schema::validate_exact_v29(&original)?,
+        31 => schema::validate_exact_current(&original)?,
+        30 => return Err("persisted broker-owned v30 sidecar requires separate disposition; in-place migration is unsupported".into()),
+        _ => return Err(format!("broker activation requires ordinary v29 copy or v31 fresh sidecar, found version {version}")),
     }
+    super::broker_payload_custody::verify_activation(&original, path, owner)?;
+    drop(original);
+    harden_artifacts(path, owner)?;
     let mut mailbox = MailboxDb::open_with_authority(&authority)?;
-    schema::validate_exact_v29(&mailbox.conn)?;
+    schema::validate_exact_current(&mailbox.conn)?;
     super::broker_payload_custody::verify_activation(&mailbox.conn, path, owner)?;
     let generation = uuid::Uuid::new_v4().to_string();
     let tx = mailbox
@@ -2936,6 +2943,25 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    // Construct an exact historical source from the current fixture builder.
+    // The production cutover only reads this file and migrates its staged copy.
+    #[cfg(unix)]
+    fn pin_v29_fixture(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "DROP TRIGGER completion_uncertain_input_preserve;
+             DROP TABLE completion_uncertain_input;
+             DROP INDEX idx_mailbox_deliverable_session_live;
+             DROP INDEX idx_mailbox_deliverable_target_live;
+             DROP INDEX idx_mailbox_deliverable_global;
+             PRAGMA user_version=29;",
+        )
+        .unwrap();
+        conn.execute_batch(include_str!("migrations/0022_live_history_barrier.sql"))
+            .unwrap();
+        schema::validate_exact_v29(&conn).unwrap();
+    }
+
     #[cfg(target_os = "linux")]
     fn payload_cutover_fixture() -> (
         tempfile::TempDir,
@@ -3013,6 +3039,7 @@ mod tests {
             )
             .unwrap();
         drop(db);
+        pin_v29_fixture(&source);
         (root, source, broker_root, mail, input)
     }
 
@@ -3386,6 +3413,7 @@ mod tests {
         let sibling = enqueue(&mut old, "sibling", "foreign");
         let second = enqueue(&mut old, "recipient", "second");
         drop(old);
+        pin_v29_fixture(&source);
 
         let broker_root = root.path().join("broker");
         fs::create_dir(&broker_root).unwrap();
@@ -3841,6 +3869,7 @@ mod tests {
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
         let path = directory.join("pid-identity.db");
         drop(MailboxDb::open(&path).unwrap());
+        pin_v29_fixture(&path);
         for artifact in [path.clone(), mailbox_authority_path(&path)] {
             fs::set_permissions(artifact, fs::Permissions::from_mode(0o600)).unwrap();
         }
@@ -3860,6 +3889,52 @@ mod tests {
         assert!(activate_with_owner(&path, uid, root.path()).is_err());
         fs::remove_file(directory.join("payload-custody.json")).unwrap();
         assert!(open_with_owner(&path, uid, root.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_v30_broker_sidecar_refuses_without_rewriting_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("sidecar");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join("pid-identity.db");
+        drop(MailboxDb::open(&path).unwrap());
+        for artifact in [path.clone(), mailbox_authority_path(&path)] {
+            fs::set_permissions(artifact, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let uid = unsafe { libc::geteuid() };
+        let generation = activate_with_owner(&path, uid, root.path()).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP TRIGGER completion_uncertain_input_preserve;
+             DROP TABLE completion_uncertain_input;
+             DROP INDEX idx_mailbox_deliverable_session_live;
+             DROP INDEX idx_mailbox_deliverable_target_live;
+             DROP INDEX idx_mailbox_deliverable_global;
+             PRAGMA user_version=30;",
+        )
+        .unwrap();
+        conn.execute_batch(include_str!("migrations/0022_live_history_barrier.sql"))
+            .unwrap();
+        drop(conn);
+        for refused in [
+            open_with_owner(&path, uid, root.path()).err().unwrap(),
+            activate_with_owner(&path, uid, root.path()).err().unwrap(),
+        ] {
+            assert!(refused.contains("persisted broker-owned v30"), "{refused}");
+        }
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(schema::sidecar_version(&conn).unwrap(), 30);
+        let retained: String = conn
+            .query_row(
+                "SELECT source_generation FROM broker_sidecar_authority WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained, generation);
+        assert!(MailboxDb::open(&path).is_err());
     }
 
     #[cfg(unix)]
@@ -3896,6 +3971,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source.pid-identity.db");
         drop(MailboxDb::open(&source).unwrap());
+        pin_v29_fixture(&source);
         let source_connection = Connection::open(&source).unwrap();
         source_connection
             .execute_batch(
@@ -3943,6 +4019,7 @@ mod tests {
         fs::set_permissions(&broker_root, fs::Permissions::from_mode(0o700)).unwrap();
         let source = source_dir.join("pid-identity.db");
         drop(MailboxDb::open(&source).unwrap());
+        pin_v29_fixture(&source);
         let writer = Connection::open(&source).unwrap();
         writer.execute_batch("PRAGMA wal_autocheckpoint=0; CREATE TABLE cutover_probe(value TEXT); INSERT INTO cutover_probe VALUES('committed WAL row');").unwrap();
         let uid = unsafe { libc::geteuid() };
@@ -4006,6 +4083,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("pid-identity.db");
         drop(MailboxDb::open(&source).unwrap());
+        pin_v29_fixture(&source);
         let broker_root = root.path().join("broker");
         fs::create_dir(&broker_root).unwrap();
         let uid = unsafe { libc::geteuid() };
@@ -4030,6 +4108,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("pid-identity.db");
         drop(MailboxDb::open(&source).unwrap());
+        pin_v29_fixture(&source);
         let broker_root = root.path().join("broker");
         fs::create_dir(&broker_root).unwrap();
         fs::set_permissions(&broker_root, fs::Permissions::from_mode(0o700)).unwrap();
@@ -4052,6 +4131,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("pid-identity.db");
         drop(MailboxDb::open(&source).unwrap());
+        pin_v29_fixture(&source);
         let broker_root = root.path().join("broker");
         fs::create_dir(&broker_root).unwrap();
         fs::set_permissions(&broker_root, fs::Permissions::from_mode(0o700)).unwrap();
@@ -4070,7 +4150,9 @@ mod tests {
         let uid = unsafe { libc::geteuid() };
         assert!(stage_with_owner(&source, uid, &broker_root, uid).is_err());
         assert!(!broker_root.join("sidecar").exists());
-        assert!(MailboxDb::open(&source).is_ok());
+        let historical =
+            Connection::open_with_flags(&source, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        schema::validate_exact_v29(&historical).unwrap();
     }
 
     #[cfg(target_os = "linux")]
@@ -4079,6 +4161,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("pid-identity.db");
         drop(MailboxDb::open(&source).unwrap());
+        pin_v29_fixture(&source);
         let writer = Connection::open(&source).unwrap();
         writer.execute_batch("CREATE TABLE cutover_probe(value TEXT); INSERT INTO cutover_probe VALUES('first');").unwrap();
         let broker_root = root.path().join("broker");
@@ -4116,6 +4199,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("pid-identity.db");
         drop(MailboxDb::open(&source).unwrap());
+        pin_v29_fixture(&source);
         let broker_root = root.path().join("broker");
         fs::create_dir(&broker_root).unwrap();
         fs::set_permissions(&broker_root, fs::Permissions::from_mode(0o700)).unwrap();

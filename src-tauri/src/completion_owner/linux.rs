@@ -18,7 +18,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const GUARDIAN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const OWNER_HELLO_MAX_BYTES: u64 = 8_192;
@@ -244,8 +244,9 @@ fn connect_context(
             RefusalReason::Persistence => "persistence failure",
             RefusalReason::Identity => "process or protocol identity mismatch",
         };
+        let diagnostic = refusal.diagnostic.as_deref().unwrap_or("unavailable");
         return Err(format!(
-            "completion join refused: {category}; admission outcome uncertain; no replay authorized"
+            "completion join refused: {category}; diagnostic={diagnostic}; admission outcome uncertain; no replay authorized"
         ));
     }
     let response: super::original_work::RootJoinResponse =
@@ -1095,6 +1096,7 @@ fn retain_pending_context(
     root_supervisor: &super::root_supervisor::RootSupervisor,
     mut request: JoinRequest,
 ) {
+    let started = Instant::now();
     if matches!(
         &request.request.mode,
         super::original_work::RootJoinMode::Fresh
@@ -1102,57 +1104,135 @@ fn retain_pending_context(
         let existing_context_roots = root_authorities.roots_for_peer(&request.context);
         let active_root = root_supervisor.original_root_for_peer(&request.context);
         if !existing_context_roots.is_empty() || active_root.is_some() {
-            record_original_rejection(
+            refuse_join_identity(
                 owner,
-                &request.context,
-                active_root.or_else(|| existing_context_roots.iter().next().map(String::as_str)),
-                None,
-                "fresh_root_rejected_inside_existing_root",
+                &mut request,
+                started,
+                "J01_FRESH_INSIDE_ROOT",
+                &format!(
+                    "scopes={} active={}",
+                    existing_context_roots.len(),
+                    active_root.is_some()
+                ),
             );
-            JoinRefusal::new(owner, RefusalReason::Identity).send(&mut request.socket);
             return;
         }
-        if !same_process_image(request.context.pid, i64::from(std::process::id())) {
-            JoinRefusal::new(owner, RefusalReason::Identity).send(&mut request.socket);
+        let peer_image = process_image_identity(request.context.pid);
+        let owner_image = process_image_identity(i64::from(std::process::id()));
+        if peer_image.as_ref().ok() != owner_image.as_ref().ok()
+            || peer_image.is_err()
+            || owner_image.is_err()
+        {
+            refuse_join_identity(
+                owner,
+                &mut request,
+                started,
+                "J02_FRESH_IMAGE",
+                &format!(
+                    "peer_image={} owner_image={}",
+                    image_observation(&peer_image),
+                    image_observation(&owner_image)
+                ),
+            );
             return;
         }
     }
     if request.request.protocol != super::original_work::ROOT_PROTOCOL {
-        JoinRefusal::new(owner, RefusalReason::Identity).send(&mut request.socket);
+        refuse_join_identity(
+            owner,
+            &mut request,
+            started,
+            "J03_PROTOCOL",
+            "root_protocol_mismatch",
+        );
+        return;
+    }
+    #[cfg(feature = "age360-fault-fixtures")]
+    if path
+        .parent()
+        .and_then(Path::parent)
+        .is_some_and(|root| root.join("force-join-identity-refusal").exists())
+        && std::fs::read(format!("/proc/{}/cmdline", request.context.pid))
+            .is_ok_and(|cmdline| cmdline.split(|byte| *byte == 0).any(|arg| arg == b"resume"))
+    {
+        refuse_join_identity(
+            owner,
+            &mut request,
+            started,
+            "J90_FIXTURE_REFUSAL",
+            "forced_before_scope_admission",
+        );
         return;
     }
     let inherit_from_active = match &request.request.mode {
         super::original_work::RootJoinMode::Fresh => false,
         super::original_work::RootJoinMode::Inherit { grant } => {
-            if root_authorities
-                .validate_inherit(owner, &request.context, grant)
-                .is_ok()
-            {
+            let direct_started = Instant::now();
+            let direct = root_authorities.validate_inherit(owner, &request.context, grant);
+            let direct_us = direct_started.elapsed().as_micros();
+            if direct.is_ok() {
                 false
-            } else if root_authorities.authorize_capability(owner, grant).is_ok()
-                && root_supervisor.original_peer_in_root(&grant.root_id, &request.context)
-            {
-                true
-            } else if root_authorities.authorize_capability(owner, grant).is_ok()
-                && i32::try_from(request.context.pid).is_ok_and(|pid| pid > 0)
-                && u64::try_from(request.context.starttime_ticks).is_ok()
-                && protocol::verify_joined_child_at(
-                    &owner_broker_socket(),
-                    &JoinedChildWitness {
-                        root_id: grant.root_id.clone(),
-                        child: ProcessWitness {
-                            host_pid: request.context.pid as i32,
-                            boot_id: request.context.boot_id.clone(),
-                            starttime_ticks: request.context.starttime_ticks as u64,
-                        },
-                    },
-                )
-                .is_ok()
-            {
-                true
             } else {
-                JoinRefusal::new(owner, RefusalReason::Identity).send(&mut request.socket);
-                return;
+                let capability_started = Instant::now();
+                let capability = root_authorities.authorize_capability(owner, grant);
+                let capability_us = capability_started.elapsed().as_micros();
+                let active = capability.is_ok()
+                    && root_supervisor.original_peer_in_root(&grant.root_id, &request.context);
+                if active {
+                    true
+                } else {
+                    let broker_started = Instant::now();
+                    let broker = if capability.is_ok()
+                        && i32::try_from(request.context.pid).is_ok_and(|pid| pid > 0)
+                        && u64::try_from(request.context.starttime_ticks).is_ok()
+                    {
+                        protocol::verify_joined_child_at(
+                            &owner_broker_socket(),
+                            &JoinedChildWitness {
+                                root_id: grant.root_id.clone(),
+                                child: ProcessWitness {
+                                    host_pid: request.context.pid as i32,
+                                    boot_id: request.context.boot_id.clone(),
+                                    starttime_ticks: request.context.starttime_ticks as u64,
+                                },
+                            },
+                        )
+                    } else {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "precondition",
+                        ))
+                    };
+                    if broker.is_ok() {
+                        true
+                    } else {
+                        let code = if capability.is_err() {
+                            "J04_INHERIT_CAPABILITY"
+                        } else {
+                            "J05_INHERIT_LINEAGE"
+                        };
+                        let detail = format!(
+                            "direct={} direct_us={} capability={} capability_us={} active={} broker_kind={:?} broker_errno={:?} broker_us={} root={}:{} root_live={} peer_live={} peer_parent={} peer_image={} root_image={}",
+                            inherit_error_code(direct.as_ref().err()),
+                            direct_us,
+                            inherit_error_code(capability.as_ref().err()),
+                            capability_us,
+                            active,
+                            broker.as_ref().err().map(std::io::Error::kind),
+                            broker.as_ref().err().and_then(std::io::Error::raw_os_error),
+                            broker_started.elapsed().as_micros(),
+                            grant.root_identity.pid,
+                            grant.root_identity.starttime_ticks,
+                            live_identity_observation(&grant.root_identity),
+                            live_identity_observation(&request.context),
+                            parent_observation(request.context.pid),
+                            image_observation(&process_image_identity(request.context.pid)),
+                            image_observation(&process_image_identity(grant.root_identity.pid)),
+                        );
+                        refuse_join_identity(owner, &mut request, started, code, &detail);
+                        return;
+                    }
+                }
             }
         }
     };
@@ -1164,8 +1244,14 @@ fn retain_pending_context(
         super::original_work::RootJoinMode::Fresh => {
             match root_authorities.fresh(owner, request.context.clone()) {
                 Ok(grant) => grant,
-                Err(_) => {
-                    JoinRefusal::new(owner, RefusalReason::Identity).send(&mut request.socket);
+                Err(error) => {
+                    refuse_join_identity(
+                        owner,
+                        &mut request,
+                        started,
+                        "J06_FRESH_SCOPE",
+                        inherit_error_code(Some(&error)),
+                    );
                     return;
                 }
             }
@@ -1173,8 +1259,14 @@ fn retain_pending_context(
         super::original_work::RootJoinMode::Inherit { grant } if inherit_from_active => {
             match root_authorities.inherit_from_active_tree(owner, request.context.clone(), grant) {
                 Ok(grant) => grant,
-                Err(_) => {
-                    JoinRefusal::new(owner, RefusalReason::Identity).send(&mut request.socket);
+                Err(error) => {
+                    refuse_join_identity(
+                        owner,
+                        &mut request,
+                        started,
+                        "J07_ACTIVE_SCOPE",
+                        inherit_error_code(Some(&error)),
+                    );
                     return;
                 }
             }
@@ -1182,8 +1274,14 @@ fn retain_pending_context(
         super::original_work::RootJoinMode::Inherit { grant } => {
             match root_authorities.inherit(owner, request.context.clone(), grant) {
                 Ok(grant) => grant,
-                Err(_) => {
-                    JoinRefusal::new(owner, RefusalReason::Identity).send(&mut request.socket);
+                Err(error) => {
+                    refuse_join_identity(
+                        owner,
+                        &mut request,
+                        started,
+                        "J08_INHERIT_SCOPE",
+                        inherit_error_code(Some(&error)),
+                    );
                     return;
                 }
             }
@@ -1202,14 +1300,94 @@ fn retain_pending_context(
     contexts.retain_local(request.context, request.socket);
 }
 
-fn same_process_image(left: i64, right: i64) -> bool {
-    let Ok(left) = std::fs::metadata(format!("/proc/{left}/exe")) else {
-        return false;
+fn process_image_identity(pid: i64) -> std::io::Result<(u64, u64)> {
+    std::fs::metadata(format!("/proc/{pid}/exe")).map(|image| (image.dev(), image.ino()))
+}
+
+fn image_observation(image: &std::io::Result<(u64, u64)>) -> String {
+    match image {
+        Ok((dev, ino)) => format!("{dev}:{ino}"),
+        Err(error) => format!("errno={:?} kind={:?}", error.raw_os_error(), error.kind()),
+    }
+}
+
+fn live_identity_observation(expected: &SourceProcessIdentity) -> &'static str {
+    match identity(expected.pid) {
+        Ok(actual) if actual == *expected => "exact",
+        Ok(_) => "different",
+        Err(_) => "unreadable",
+    }
+}
+
+fn parent_observation(pid: i64) -> String {
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) => return format!("errno={:?}", error.raw_os_error()),
     };
-    let Ok(right) = std::fs::metadata(format!("/proc/{right}/exe")) else {
-        return false;
+    let parent = stat
+        .rsplit_once(')')
+        .and_then(|(_, tail)| tail.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<i64>().ok());
+    match parent {
+        Some(parent) => match identity(parent) {
+            Ok(parent_identity) => format!(
+                "{}:{}",
+                parent_identity.pid, parent_identity.starttime_ticks
+            ),
+            Err(_) => format!("{parent}:unreadable"),
+        },
+        None => "unparseable".into(),
+    }
+}
+
+fn inherit_error_code(error: Option<&String>) -> &'static str {
+    match error.map(String::as_str) {
+        None => "ok",
+        Some("root authority inheritance is outside the exact process tree") => {
+            "outside_exact_tree"
+        }
+        Some("root capability protocol or authority mismatch") => "protocol_or_authority",
+        Some("unknown root capability") => "unknown_scope",
+        Some("root capability mismatch") => "capability_mismatch",
+        Some("live context is already inside a root authority") => "existing_scope",
+        Some("duplicate root authority ID") => "duplicate_scope",
+        Some("invalid broker root ID") => "invalid_root_id",
+        Some(_) => "other",
+    }
+}
+
+fn refuse_join_identity(
+    owner: &CompletionDomainOwner,
+    request: &mut JoinRequest,
+    started: Instant,
+    code: &'static str,
+    detail: &str,
+) {
+    record_original_rejection(owner, &request.context, None, None, code);
+    let (mode, root_identity) = match &request.request.mode {
+        super::original_work::RootJoinMode::Fresh => ("fresh", "none".to_owned()),
+        super::original_work::RootJoinMode::Inherit { grant } => (
+            "inherit",
+            format!(
+                "{}:{}",
+                grant.root_identity.pid, grant.root_identity.starttime_ticks
+            ),
+        ),
     };
-    left.dev() == right.dev() && left.ino() == right.ino()
+    let diagnostic = format!(
+        "{code} mode={mode} peer={}:{}:{} guardian={}:{}:{} root={} elapsed_us={} {detail}",
+        request.context.pid,
+        request.context.boot_id,
+        request.context.starttime_ticks,
+        owner.guardian_identity.pid,
+        owner.guardian_identity.boot_id,
+        owner.guardian_identity.starttime_ticks,
+        root_identity,
+        started.elapsed().as_micros(),
+    );
+    JoinRefusal::new(owner, RefusalReason::Identity)
+        .with_diagnostic(diagnostic)
+        .send(&mut request.socket);
 }
 
 fn reject_work(

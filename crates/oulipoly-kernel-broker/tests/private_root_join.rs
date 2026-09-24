@@ -144,6 +144,21 @@ fn inner() {
         .unwrap_or_else(|| mailbox.completion_continuation_domain().unwrap().unwrap());
     let sidecar_generation = mailbox.sidecar_generation().unwrap();
     drop(mailbox);
+    let old = rusqlite::Connection::open(data.join("pid-identity.db")).unwrap();
+    old.execute_batch(
+        "DROP TRIGGER completion_uncertain_input_preserve;
+         DROP TABLE completion_uncertain_input;
+         DROP INDEX idx_mailbox_deliverable_session_live;
+         DROP INDEX idx_mailbox_deliverable_target_live;
+         DROP INDEX idx_mailbox_deliverable_global;
+         PRAGMA user_version=29;",
+    )
+    .unwrap();
+    old.execute_batch(include_str!(
+        "../../oulipoly-state/src/mailbox/migrations/0022_live_history_barrier.sql"
+    ))
+    .unwrap();
+    drop(old);
     if native_mode {
         rusqlite::Connection::open(data.join("pid-identity.db"))
             .unwrap()
@@ -2363,7 +2378,7 @@ fn inner() {
             .unwrap();
     let init_pid = root_record["init_host_pid"].as_i64().unwrap() as i32;
     let guardian_pid = record["guardian"]["host_pid"].as_i64().unwrap() as i32;
-    let mailbox = MailboxDb::open(&data.join("pid-identity.db")).unwrap();
+    let mailbox = MailboxDb::open_historical_read_only(&data.join("pid-identity.db")).unwrap();
     let owner = mailbox.completion_continuation_owner().unwrap().unwrap();
     assert_eq!(owner.guardian_identity.pid, i64::from(guardian_pid));
     assert_eq!(owner.domain_id, domain);

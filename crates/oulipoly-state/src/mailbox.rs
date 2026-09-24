@@ -80,6 +80,7 @@ pub const AGENT_BASH_COMPLETE_KIND: &str = "agent_bash_complete";
 pub const MAILBOX_DELIVERY_UNCONFIRMED_ERROR: &str = "mailbox_delivery_unconfirmed";
 pub const MAILBOX_INGRESS_EXPIRED_ERROR: &str = "mailbox_ingress_expired";
 pub const MAILBOX_PAYLOAD_VERIFICATION_FAILED_ERROR: &str = "mailbox_payload_verification_failed";
+pub const COMPLETION_EFFECT_UNCERTAIN_ERROR: &str = "completion_effect_uncertain";
 pub const SUBMITTED_INPUT_KIND: &str = "input";
 pub const WAKE_SWEEP_ABANDONED_ERROR: &str = "wake_sweep_abandoned";
 pub const MAILBOX_PAYLOAD_RETENTION_POLICY: &str = "until_terminal_disposition";
@@ -107,7 +108,8 @@ pub(super) const DELIVERABLE_MAILBOX_ERROR_PREDICATE: &str = "(
     delivery_error IS NULL OR delivery_error NOT IN (
         'wake_sweep_abandoned',
         'mailbox_payload_verification_failed',
-        'mailbox_ingress_expired'
+        'mailbox_ingress_expired',
+        'completion_effect_uncertain'
     )
 )";
 
@@ -4245,7 +4247,7 @@ impl MailboxDb {
             "SELECT {MAILBOX_ROW_COLUMNS}
              FROM mailbox
              WHERE seq=?3 AND delivered_at IS NULL
-               AND (delivery_error IS NULL OR delivery_error NOT IN (?4,?5,?6))
+               AND (delivery_error IS NULL OR delivery_error NOT IN (?4,?5,?6,?7))
                AND {PENDING_MAILBOX_TARGET_PREDICATE}"
         );
         self.conn
@@ -4258,6 +4260,7 @@ impl MailboxDb {
                     WAKE_SWEEP_ABANDONED_ERROR,
                     MAILBOX_PAYLOAD_VERIFICATION_FAILED_ERROR,
                     MAILBOX_INGRESS_EXPIRED_ERROR,
+                    COMPLETION_EFFECT_UNCERTAIN_ERROR,
                 ],
                 map_mailbox_row,
             )
@@ -7784,6 +7787,7 @@ pub fn mailbox_row_is_deliverable_pending(row: &MailboxRow) -> bool {
                 WAKE_SWEEP_ABANDONED_ERROR,
                 MAILBOX_PAYLOAD_VERIFICATION_FAILED_ERROR,
                 MAILBOX_INGRESS_EXPIRED_ERROR,
+                COMPLETION_EFFECT_UNCERTAIN_ERROR,
             ]
             .contains(&error)
         })
@@ -8178,7 +8182,8 @@ fn pending_wake_sessions_in_seq_range_query() -> &'static str {
        AND (delivery_error IS NULL OR delivery_error NOT IN (
            'wake_sweep_abandoned',
            'mailbox_payload_verification_failed',
-           'mailbox_ingress_expired'
+           'mailbox_ingress_expired',
+           'completion_effect_uncertain'
        ))
      GROUP BY session_id
      HAVING (?2 IS NULL OR oldest_seq > ?2)
@@ -9965,6 +9970,9 @@ fn validate_delivery_claim_seqs(seqs: &[i64]) -> Result<(), GenerationStorageErr
 }
 
 fn reject_unauthorized_terminal_wake_abandonment(delivery_error: &str) -> Result<(), String> {
+    if delivery_error == COMPLETION_EFFECT_UNCERTAIN_ERROR {
+        return Err("Uncertain activation disposition requires exact custodian drain".into());
+    }
     if delivery_error == WAKE_SWEEP_ABANDONED_ERROR {
         return Err(
             "Terminal wake abandonment requires a dedicated authority-bearing disposition"

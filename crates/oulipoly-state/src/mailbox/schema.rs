@@ -315,8 +315,10 @@ fn classify_completion_summary(summary: CompletionProtocolSummary) -> Option<&'s
     }
 }
 
-pub(super) const CURRENT_VERSION: i64 = 29;
-pub(super) const BROKER_OWNED_VERSION: i64 = 30;
+// v30 was assigned to the broker-owned sidecar. Keep that ordinal reserved so
+// an ordinary opener can never mistake an old broker cutover for an upgrade.
+pub(super) const CURRENT_VERSION: i64 = 31;
+pub(super) const BROKER_OWNED_VERSION: i64 = 32;
 const MAX_SUPPORTED_VERSION: i64 = CURRENT_VERSION;
 const SCHEMA_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -503,7 +505,26 @@ const SCHEMA_STEPS: &[MigrationStep] = &[
         owner: SidecarEntity::CompletionAuthority,
         apply: migrate_native_worker_kernel_q,
     },
+    MigrationStep {
+        target_version: 30,
+        owner: SidecarEntity::CompletionAuthority,
+        apply: reserved_broker_version,
+    },
+    MigrationStep {
+        target_version: 31,
+        owner: SidecarEntity::CompletionAuthority,
+        apply: migrate_uncertain_activation,
+    },
 ];
+
+fn reserved_broker_version(_conn: &Connection) -> Result<(), String> {
+    Ok(())
+}
+
+fn migrate_uncertain_activation(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(include_str!("migrations/0031_uncertain_activation.sql"))
+        .map_err(|error| error.to_string())
+}
 
 fn migrate_native_worker_kernel_q(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(include_str!("migrations/0029_native_worker_kernel_q.sql"))
@@ -582,6 +603,7 @@ fn observe_valid_current(conn: &Connection) -> Result<bool, String> {
     validate_supported_version(version)?;
     if version == MAX_SUPPORTED_VERSION {
         super::completion_continuation::validate_schema_on(&tx)?;
+        validate_no_broker_shape(&tx)?;
     }
     tx.commit()
         .map_err(|e| format!("Failed to finish sidecar schema observation: {e}"))?;
@@ -650,6 +672,7 @@ fn ensure_with_deadline(conn: &mut Connection, deadline: Option<Instant>) -> Res
         // A migration must not commit a current version whose completed
         // provenance, attempt, or kernel-owner schema fails ordinary readback.
         super::completion_continuation::validate_schema_on(&tx)?;
+        validate_no_broker_shape(&tx)?;
         return tx.commit().map_err(|err| {
             format!("Failed to commit PID mailbox sidecar schema migration: {err}")
         });
@@ -670,6 +693,12 @@ fn after_stale_observation() {
 }
 
 fn validate_supported_version(version: i64) -> Result<(), String> {
+    if version == 30 {
+        return Err(
+            "Unsupported PID mailbox sidecar schema version 30; reserved broker-owned ordinal"
+                .into(),
+        );
+    }
     if (0..=MAX_SUPPORTED_VERSION).contains(&version) {
         return Ok(());
     }
@@ -685,19 +714,50 @@ pub(super) fn validate_existing_writer_version(conn: &Connection) -> Result<(), 
 }
 
 pub(super) fn validate_exact_v29(conn: &Connection) -> Result<(), String> {
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|error| format!("Failed to observe historical v29 sidecar: {error}"))?;
+    super::completion_continuation::validate_v29_schema_on(&tx)?;
+    validate_no_broker_shape(&tx)?;
+    tx.commit()
+        .map_err(|error| format!("Failed to finish historical v29 observation: {error}"))
+}
+
+pub(super) fn validate_exact_current(conn: &Connection) -> Result<(), String> {
     if observe_valid_current(conn)? {
         Ok(())
     } else {
-        Err("broker cutover requires a complete v29 sidecar".into())
+        Err("broker activation requires a complete ordinary v31 sidecar".into())
     }
+}
+
+fn validate_no_broker_shape(conn: &Connection) -> Result<(), String> {
+    let broker_shape: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name GLOB 'broker_*' \
+             AND type IN ('table','index','trigger'))",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if broker_shape {
+        return Err("ordinary sidecar contains broker-owned schema".into());
+    }
+    Ok(())
 }
 
 pub(super) fn validate_broker_owned(conn: &Connection) -> Result<String, String> {
     let tx = conn
         .unchecked_transaction()
         .map_err(|error| format!("Failed to observe broker sidecar: {error}"))?;
-    if sidecar_version(&tx)? != BROKER_OWNED_VERSION {
-        return Err("broker sidecar requires schema version 30".into());
+    let version = sidecar_version(&tx)?;
+    if version == 30 {
+        return Err("persisted broker-owned v30 sidecar requires separate disposition; in-place migration is unsupported".into());
+    }
+    if version != BROKER_OWNED_VERSION {
+        return Err(format!(
+            "broker sidecar requires schema version {BROKER_OWNED_VERSION}"
+        ));
     }
     super::completion_continuation::validate_broker_schema_on(&tx)?;
     let definition: String = tx
@@ -1467,6 +1527,8 @@ pub(crate) fn remove_completion_recovery_working_set_for_legacy_fixture(conn: &C
          DROP INDEX IF EXISTS idx_mailbox_deliverable_target_live;
          DROP INDEX IF EXISTS idx_mailbox_deliverable_global;
          DROP INDEX IF EXISTS idx_mailbox_delivery_attempt_unresolved;
+         DROP TRIGGER IF EXISTS completion_uncertain_input_preserve;
+         DROP TABLE IF EXISTS completion_uncertain_input;
          DROP INDEX IF EXISTS idx_completion_event_listener_session_live;
          DROP INDEX IF EXISTS idx_completion_event_listener_unacknowledged;
          DROP INDEX IF EXISTS idx_completion_event_listener_retirement_pending;
@@ -1574,6 +1636,92 @@ mod contention_tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
+
+    #[test]
+    fn v29_upgrade_retains_submitted_input_and_reserves_old_broker_ordinal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        let mut db = super::super::MailboxDb::open(&path).unwrap();
+        let result = db
+            .enqueue_submitted_input(&super::super::SubmittedInputEnqueue {
+                submission_token: "upgrade-pending",
+                target: super::super::InboxTarget {
+                    kind: super::super::InboxTargetKind::Session,
+                    id: "session",
+                },
+                input: b"exact-pending-input",
+            })
+            .unwrap();
+        let super::super::EnqueueResult::Inserted(row) = result else {
+            panic!("fixture input was not inserted");
+        };
+        drop(db);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP TRIGGER completion_uncertain_input_preserve;
+             DROP TABLE completion_uncertain_input;
+             DROP INDEX idx_mailbox_deliverable_session_live;
+             DROP INDEX idx_mailbox_deliverable_target_live;
+             DROP INDEX idx_mailbox_deliverable_global;
+             PRAGMA user_version=29;",
+        )
+        .unwrap();
+        conn.execute_batch(include_str!("migrations/0022_live_history_barrier.sql"))
+            .unwrap();
+        assert_eq!(sidecar_version(&conn).unwrap(), 29);
+        validate_exact_v29(&conn).unwrap();
+        assert_eq!(sidecar_version(&conn).unwrap(), 29);
+        drop(conn);
+        db = super::super::MailboxDb::open(&path).unwrap();
+        assert_eq!(sidecar_version(db.connection()).unwrap(), CURRENT_VERSION);
+        assert_eq!(db.pending_delivery_count("session", None).unwrap(), 1);
+        assert_eq!(db.uncertain_activation_input_count("session").unwrap(), 0);
+        assert_eq!(
+            super::super::MailboxDb::open_historical_read_only(&path)
+                .unwrap()
+                .list_mailbox("session", true)
+                .unwrap()[0]
+                .seq,
+            row.seq
+        );
+        drop(db);
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "user_version", 30).unwrap();
+        drop(conn);
+        assert!(
+            super::super::MailboxDb::open(&path)
+                .err()
+                .unwrap()
+                .contains("Unsupported PID mailbox sidecar schema version 30")
+        );
+    }
+
+    #[test]
+    fn current_sidecar_rejects_partial_uncertain_indexes_and_cross_role_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        drop(super::super::MailboxDb::open(&path).unwrap());
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("DROP INDEX idx_mailbox_deliverable_global")
+            .unwrap();
+        drop(conn);
+        assert!(super::super::MailboxDb::open(&path).is_err());
+
+        let other_dir = dir.path().join("wrong-role");
+        std::fs::create_dir(&other_dir).unwrap();
+        let other = other_dir.join("pid-identity.db");
+        drop(super::super::MailboxDb::open(&other).unwrap());
+        let conn = Connection::open(&other).unwrap();
+        conn.execute_batch("CREATE TABLE broker_sidecar_authority(singleton INTEGER PRIMARY KEY)")
+            .unwrap();
+        drop(conn);
+        assert!(
+            super::super::MailboxDb::open(&other)
+                .err()
+                .unwrap()
+                .contains("broker-owned schema")
+        );
+    }
 
     #[test]
     fn published_v24_to_v28_upgrade_to_native_worker_ledger_preserves_attempts() {
@@ -1691,7 +1839,7 @@ mod contention_tests {
     }
 
     #[test]
-    fn v28_binding_upgrades_to_v29_without_rewriting_accepted_work() {
+    fn v28_binding_upgrades_to_current_without_rewriting_accepted_work() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pid-identity.db");
         let conn = Connection::open(&path).unwrap();
@@ -1719,7 +1867,7 @@ mod contention_tests {
         conn.pragma_update(None, "user_version", 28).unwrap();
         drop(conn);
         let db = super::super::MailboxDb::open(&path).unwrap();
-        assert_eq!(sidecar_version(db.connection()).unwrap(), 29);
+        assert_eq!(sidecar_version(db.connection()).unwrap(), CURRENT_VERSION);
         let retained: (String, i64, i64) = db.connection().query_row("SELECT a.phase,a.revision,a.integrated FROM completion_continuation_attempt a JOIN completion_native_grant_binding b ON b.attempt_id=a.attempt_id WHERE b.grant_id='v28-grant'", [], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
         assert_eq!(retained, ("accepted".into(), 2, 0));
         assert!(db.native_worker_attach("v28-attempt").unwrap().is_none());

@@ -41,6 +41,7 @@ struct MailboxStatusResponse {
     observation_stop: Option<oulipoly_state::mailbox::MailboxObservationStop>,
     pending_count: usize,
     deliverable_count: usize,
+    uncertain_count: usize,
     min_pending_seq: Option<i64>,
     max_pending_seq: Option<i64>,
 }
@@ -205,6 +206,7 @@ fn mailbox_status(session_id: &str) -> Result<MailboxStatusResponse, String> {
             observation_stop: None,
             pending_count: 0,
             deliverable_count: 0,
+            uncertain_count: 0,
             min_pending_seq: None,
             max_pending_seq: None,
         });
@@ -221,6 +223,7 @@ fn mailbox_status(session_id: &str) -> Result<MailboxStatusResponse, String> {
         observation_stop: db.mailbox_observation_stop(session_id)?,
         pending_count: pending.len(),
         deliverable_count,
+        uncertain_count: db.uncertain_activation_input_count(session_id)?,
         min_pending_seq,
         max_pending_seq,
     })
@@ -238,11 +241,12 @@ fn render_status(response: &MailboxStatusResponse, json: bool) -> Result<(), Str
             );
         }
         println!(
-            "session={} paused={} pending={} deliverable={} min_seq={} max_seq={}",
+            "session={} paused={} pending={} deliverable={} uncertain={} min_seq={} max_seq={}",
             response.session_id,
             response.paused,
             response.pending_count,
             response.deliverable_count,
+            response.uncertain_count,
             optional_seq(response.min_pending_seq),
             optional_seq(response.max_pending_seq)
         );

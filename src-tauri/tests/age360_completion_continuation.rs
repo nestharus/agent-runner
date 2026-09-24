@@ -2653,11 +2653,37 @@ fn native_root_state_token_cancellation(replace_driver: bool) {
     f.gate("release-initial-provider");
     f.wait_initial(&mut initial);
     let descendant: i64 = wait(|| {
-        fs::read_to_string(f.root.path().join("descendant.pid"))
+        if let Ok(pid) = fs::read_to_string(f.root.path().join("descendant.pid")) {
+            return pid.trim().parse().ok();
+        }
+        // The retained result is the earliest durable evidence that this
+        // launcher has exited. A pre-provider refusal cannot publish a PID;
+        // report its causal stderr now instead of waiting 45 seconds.
+        if let Some(claim) = f
+            .mailbox_for_poll()?
+            .wake_session_reader()
+            .wake_claim(SESSION)
             .ok()?
-            .trim()
-            .parse()
-            .ok()
+            && let Some(attempt) = f
+                .mailbox_for_poll()?
+                .continuation_activation(SESSION, &claim.claim_token)
+                .ok()?
+            && let Ok(bytes) = fs::read(&attempt.result_path)
+        {
+            let result: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("retained root result JSON");
+            let stderr = fs::read_to_string(
+                std::path::Path::new(&attempt.result_path)
+                    .parent()
+                    .unwrap()
+                    .join("launcher.stderr"),
+            )
+            .unwrap_or_else(|error| format!("launcher stderr unavailable: {error}"));
+            panic!(
+                "resumed launcher exited before descendant publication: root_result={result} launcher.stderr={stderr}"
+            );
+        }
+        None
     });
     let descendant_identity = read_live_process_identity(descendant)
         .unwrap()
@@ -2824,6 +2850,300 @@ fn native_state_linked_token_cancellation_drains_resistant_activation() {
     if !private_case(false) {
         native_root_state_token_cancellation(false);
     }
+}
+
+#[cfg(feature = "age360-fault-fixtures")]
+#[test]
+fn native_join_identity_refusal_retains_failure_and_releases_claim() {
+    if private_case(false) {
+        return;
+    }
+    let f = Fixture::new("owner_only");
+    f.gate("test-descendant-enabled");
+    f.gate("release-resume");
+    f.gate("root-result-retained.hold");
+    let mut initial = f.start_with_hold(true);
+    wait(|| {
+        f.root
+            .path()
+            .join("provider-initial-ready")
+            .exists()
+            .then_some(())
+    });
+    // The feature-only owner hook applies only to an inherited join. The
+    // initial provider has already established the session at this point.
+    f.gate("force-join-identity-refusal");
+    MailboxDb::open(&f.data.join("pid-identity.db"))
+        .unwrap()
+        .enqueue_submitted_input(&oulipoly_state::mailbox::SubmittedInputEnqueue {
+            submission_token: "native-join-refusal",
+            target: oulipoly_state::mailbox::InboxTarget {
+                kind: oulipoly_state::mailbox::InboxTargetKind::Session,
+                id: SESSION,
+            },
+            input: b"native-custody-input",
+        })
+        .unwrap();
+    f.gate("release-initial-provider");
+    f.wait_initial(&mut initial);
+    wait(|| {
+        f.root
+            .path()
+            .join("root-result-retained.reached")
+            .exists()
+            .then_some(())
+    });
+    let claim = f
+        .mailbox()
+        .wake_session_reader()
+        .wake_claim(SESSION)
+        .unwrap()
+        .unwrap();
+    let attempt = f
+        .mailbox()
+        .continuation_activation(SESSION, &claim.claim_token)
+        .unwrap()
+        .unwrap();
+    let original = fs::read(&attempt.result_path).unwrap();
+    let retained: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    let stderr = fs::read_to_string(
+        std::path::Path::new(&attempt.result_path)
+            .parent()
+            .unwrap()
+            .join("launcher.stderr"),
+    )
+    .unwrap();
+    println!("controlled join refusal: {}", stderr.trim());
+    assert!(stderr.contains("J90_FIXTURE_REFUSAL"), "{stderr}");
+    assert!(
+        stderr.contains("mode=fresh"),
+        "current-root launcher join mode: {stderr}"
+    );
+    assert_eq!(retained["root_exit_code"], 1);
+    assert_eq!(retained["root_wait_status"], 256);
+    assert_eq!(retained["spawn_failed"], false);
+    assert_eq!(retained["result_retained"], true);
+    assert_eq!(retained["owned_children"], "ECHILD");
+    assert!(retained["accepted_cancellation"].is_null());
+    assert!(
+        !f.root.path().join("resume-prompts.jsonl").exists(),
+        "resumed provider must have no effect"
+    );
+    assert!(
+        !f.root.path().join("descendant.pid").exists(),
+        "provider must not create a descendant"
+    );
+    assert!(
+        !f.root.path().join("state-cancel-token").exists(),
+        "no State token was requested"
+    );
+    fs::remove_file(f.root.path().join("root-result-retained.hold")).unwrap();
+    wait(|| {
+        f.mailbox_for_poll()?
+            .continuation_activation(SESSION, &claim.claim_token)
+            .ok()?
+            .is_none()
+            .then_some(())
+    });
+    wait(|| {
+        f.mailbox_for_poll()?
+            .wake_session_reader()
+            .wake_claim(SESSION)
+            .ok()?
+            .is_none()
+            .then_some(())
+    });
+    let integrated: (String, i64, String) = f.sidecar_connection()
+        .query_row(
+            "SELECT phase,integrated,drain_receipt FROM completion_continuation_attempt WHERE attempt_id=?1",
+            [&attempt.attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+    assert_eq!(integrated.0, "drained");
+    assert_eq!(integrated.1, 1);
+    assert_eq!(integrated.2.as_bytes(), original);
+    assert!(
+        !f.root.path().join("resume-prompts.jsonl").exists(),
+        "settlement must not replay provider"
+    );
+    let rows = f.mailbox().list_mailbox(SESSION, true).unwrap();
+    let submitted = rows
+        .iter()
+        .find(|row| row.submission_token.as_deref() == Some("native-join-refusal"))
+        .expect("original submitted input remains visible");
+    assert!(submitted.delivered_at.is_none());
+    assert_eq!(submitted.payload_byte_len, Some(20));
+    assert_eq!(
+        submitted.delivery_error.as_deref(),
+        Some(oulipoly_state::mailbox::COMPLETION_EFFECT_UNCERTAIN_ERROR)
+    );
+    let fenced: (String, String) = f
+        .sidecar_connection()
+        .query_row(
+            "SELECT attempt_id,disposition FROM completion_uncertain_input WHERE mailbox_seq=?1",
+            [submitted.seq],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        fenced,
+        (attempt.attempt_id.clone(), "effect_uncertain".into())
+    );
+    assert_eq!(
+        f.mailbox().pending_delivery_count(SESSION, None).unwrap(),
+        0
+    );
+    let state = oulipoly_state::StateDb::open(&f.data.join("state.db")).unwrap();
+    let resumed_attempts: i64 = state
+        .connection()
+        .query_row("SELECT COUNT(*) FROM provider_launch_attempts", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let false_successes: i64 = state
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM provider_logical_launches WHERE start_mode='resume' AND status='succeeded'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        resumed_attempts, 0,
+        "refused launcher must not reach provider launch"
+    );
+    assert_eq!(
+        false_successes, 0,
+        "refused launcher must not settle as success"
+    );
+    let activation_count: i64 = f
+        .sidecar_connection()
+        .query_row(
+            "SELECT COUNT(*) FROM completion_continuation_attempt WHERE session_id=?1",
+            [SESSION],
+            |row| row.get(0),
+        )
+        .unwrap();
+    println!(
+        "refusal settlement: activation_attempts={activation_count} provider_attempts={resumed_attempts} false_successes={false_successes}"
+    );
+    assert_eq!(
+        activation_count, 1,
+        "failure settlement must not re-activate"
+    );
+    // A new process takes the ordinary wake path after the original claim is
+    // gone. The fenced row remains visible but cannot select another effect.
+    let wake = f
+        .command()
+        .args(["mailbox", "resume", "--session-id", SESSION, "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        wake.status.success(),
+        "{}",
+        String::from_utf8_lossy(&wake.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&wake.stdout).unwrap();
+    assert_eq!(status["uncertain_count"], 1);
+    assert_eq!(status["deliverable_count"], 0);
+    assert_eq!(
+        f.mailbox().pending_delivery_count(SESSION, None).unwrap(),
+        0
+    );
+    let after_restart: i64 = f
+        .sidecar_connection()
+        .query_row(
+            "SELECT COUNT(*) FROM completion_continuation_attempt WHERE session_id=?1",
+            [SESSION],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(after_restart, 1, "restart/wake reactivated uncertain input");
+    assert!(
+        MailboxDb::open(&f.data.join("pid-identity.db"))
+            .unwrap()
+            .mark_delivery_failed(SESSION, None, &[submitted.seq], "transient_failure")
+            .is_err(),
+        "generic failure recording must not clear the uncertain disposition"
+    );
+
+    fs::remove_file(f.root.path().join("force-join-identity-refusal")).unwrap();
+    MailboxDb::open(&f.data.join("pid-identity.db"))
+        .unwrap()
+        .enqueue_submitted_input(&oulipoly_state::mailbox::SubmittedInputEnqueue {
+            submission_token: "native-unrelated-followup",
+            target: oulipoly_state::mailbox::InboxTarget {
+                kind: oulipoly_state::mailbox::InboxTargetKind::Session,
+                id: SESSION,
+            },
+            input: b"unrelated-followup",
+        })
+        .unwrap();
+    let wake = f
+        .command()
+        .args(["mailbox", "resume", "--session-id", SESSION, "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        wake.status.success(),
+        "{}",
+        String::from_utf8_lossy(&wake.stderr)
+    );
+    let prompts = wait(|| fs::read_to_string(f.root.path().join("resume-prompts.jsonl")).ok());
+    assert!(prompts.contains("unrelated-followup"), "{prompts}");
+    assert!(!prompts.contains("native-custody-input"), "{prompts}");
+    let provider_effects = wait(|| {
+        let state =
+            oulipoly_state::StateDb::open_historical_read_only(&f.data.join("state.db")).ok()?;
+        let count: i64 = state
+            .connection()
+            .query_row("SELECT COUNT(*) FROM provider_launch_attempts", [], |row| {
+                row.get(0)
+            })
+            .ok()?;
+        (count == 1).then_some(count)
+    });
+    assert_eq!(provider_effects, 1);
+    let retained = f.mailbox().list_mailbox(SESSION, true).unwrap();
+    assert!(retained.iter().any(|row| row.seq == submitted.seq
+        && row.delivery_error.as_deref()
+            == Some(oulipoly_state::mailbox::COMPLETION_EFFECT_UNCERTAIN_ERROR)));
+    let seq = submitted.seq.to_string();
+    let disposition = f
+        .command()
+        .args([
+            "mailbox",
+            "ack",
+            "--session-id",
+            SESSION,
+            "--from-seq",
+            &seq,
+            "--to-seq",
+            &seq,
+            "--delivered-by",
+            "manual-uncertain-resolution",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        disposition.status.success(),
+        "{}",
+        String::from_utf8_lossy(&disposition.stderr)
+    );
+    let resolved = f.mailbox().list_mailbox(SESSION, true).unwrap();
+    let original = resolved
+        .iter()
+        .find(|row| row.seq == submitted.seq)
+        .unwrap();
+    assert!(original.delivered_at.is_some());
+    assert!(original.delivery_error.is_none());
+    assert_eq!(
+        f.mailbox()
+            .uncertain_activation_input_count(SESSION)
+            .unwrap(),
+        0
+    );
 }
 #[test]
 fn native_root_state_token_cancellation_retains_result_across_driver_replacement() {

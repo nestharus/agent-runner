@@ -56,6 +56,19 @@ fn private_broker_has_distinct_fresh_route_while_old_wal_writer_survives() {
     drop(StateDb::open(&old_state).unwrap());
     drop(MailboxDb::open(&old_mailbox).unwrap());
     let old = Connection::open(&old_mailbox).unwrap();
+    old.execute_batch(
+        "DROP TRIGGER completion_uncertain_input_preserve;
+         DROP TABLE completion_uncertain_input;
+         DROP INDEX idx_mailbox_deliverable_session_live;
+         DROP INDEX idx_mailbox_deliverable_target_live;
+         DROP INDEX idx_mailbox_deliverable_global;
+         PRAGMA user_version=29;",
+    )
+    .unwrap();
+    old.execute_batch(include_str!(
+        "../../oulipoly-state/src/mailbox/migrations/0022_live_history_barrier.sql"
+    ))
+    .unwrap();
     insert_pending(&old, "old-session", "old-debt");
 
     let (ready_tx, ready_rx) = mpsc::channel();

@@ -43,6 +43,21 @@ fn private_fresh_dual_lane_live_old_wal_collision_and_restart() {
     drop(StateDb::open(&old_state).unwrap());
     drop(MailboxDb::open(&old_mailbox).unwrap());
     let old = Connection::open(&old_mailbox).unwrap();
+    // Historical direct writers keep their v29 island while the fresh lane
+    // starts from absent files under a different root.
+    old.execute_batch(
+        "DROP TRIGGER completion_uncertain_input_preserve;
+         DROP TABLE completion_uncertain_input;
+         DROP INDEX idx_mailbox_deliverable_session_live;
+         DROP INDEX idx_mailbox_deliverable_target_live;
+         DROP INDEX idx_mailbox_deliverable_global;
+         PRAGMA user_version=29;",
+    )
+    .unwrap();
+    old.execute_batch(include_str!(
+        "../src/mailbox/migrations/0022_live_history_barrier.sql"
+    ))
+    .unwrap();
     assert_eq!(insert_pending(&old, "legacy-existing", "old-debt"), 1);
 
     let (writer_ready, ready) = mpsc::channel();
@@ -116,7 +131,7 @@ fn private_fresh_dual_lane_live_old_wal_collision_and_restart() {
         mailbox
             .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        30
+        32
     );
 
     // Simulate a lost initialization reply and broker restart. Identity is

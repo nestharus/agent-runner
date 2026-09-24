@@ -41,6 +41,8 @@ pub(super) enum RefusalReason {
 #[serde(deny_unknown_fields)]
 pub(super) struct JoinRefusal {
     pub completion_join_refusal: RefusalReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
     pub protocol: String,
     pub domain_id: String,
     pub owner_generation: String,
@@ -51,11 +53,19 @@ impl JoinRefusal {
     pub fn new(owner: &CompletionDomainOwner, reason: RefusalReason) -> Self {
         Self {
             completion_join_refusal: reason,
+            diagnostic: None,
             protocol: owner.protocol.clone(),
             domain_id: owner.domain_id.clone(),
             owner_generation: owner.owner_generation.clone(),
             guardian_identity: owner.guardian_identity.clone(),
         }
+    }
+
+    pub fn with_diagnostic(mut self, diagnostic: String) -> Self {
+        // Keep even future callers' negative frames bounded. The stable code
+        // is first, so truncation cannot erase the causal category.
+        self.diagnostic = Some(diagnostic.chars().take(1024).collect());
+        self
     }
 
     pub fn send(&self, socket: &mut UnixStream) {
