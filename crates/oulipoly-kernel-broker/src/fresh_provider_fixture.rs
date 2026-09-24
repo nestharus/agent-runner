@@ -112,6 +112,7 @@ fn main() -> std::io::Result<()> {
         .first()
         .ok_or_else(|| std::io::Error::other("marker absent"))?;
     let fail = std::env::args().nth(2).as_deref() == Some("--fail");
+    let quota = std::env::args().nth(2).as_deref() == Some("--quota");
     let mut input = Vec::new();
     std::io::stdin().read_to_end(&mut input)?;
     let mut file = OpenOptions::new()
@@ -124,8 +125,16 @@ fn main() -> std::io::Result<()> {
     if args.len() == 5 {
         return causal_bash(&args);
     }
-    if args.len() != 1 && !(args.len() == 2 && args[1] == "--fail") {
+    if args.len() != 1
+        && !(args.len() == 2 && matches!(args[1].as_str(), "--fail" | "--quota"))
+    {
         return Err(std::io::Error::other("provider fixture arguments changed"));
+    }
+    if quota {
+        std::io::stderr().write_all(
+            br#"{"type":"error","error":{"data":{"message":"quota exhausted for account"}}}"#,
+        )?;
+        std::process::exit(1);
     }
     let pid = unsafe { libc::fork() };
     if pid < 0 {

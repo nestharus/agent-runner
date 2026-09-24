@@ -18,6 +18,8 @@ use oulipoly_kernel_broker::protocol::{
     FreshAccountEffectKind, FreshAccountEffectReadback, FreshAccountEffectRequest,
     FreshQuotaWindow, FreshRouteRequest, FreshRouteSelection,
 };
+use oulipoly_runtime::executor::cli::fresh_remote::FreshTerminalRecognizer;
+use oulipoly_runtime::executor::terminal_signal::TerminalSignalKind;
 use oulipoly_state::mailbox::{
     FreshBashChild, FreshNormalWorkPreparation, FreshReleasedHandoff, FreshRootWorkIntent,
 };
@@ -751,6 +753,36 @@ struct RouteCandidate {
     plan_sha256: String,
     quota_script: Option<String>,
     auth_refresh_command: Option<String>,
+    terminal_recognizer: FreshTerminalRecognizer,
+}
+
+pub(super) fn terminal_recognizer_from_source(
+    config_dir: &File,
+    request: &FreshRouteRequest,
+) -> io::Result<FreshTerminalRecognizer> {
+    let path = PathBuf::from(format!("/proc/self/fd/{}", config_dir.as_raw_fd()));
+    let pool = oulipoly_runtime::executor::cli::fresh_remote::load_fresh_headless_pool(
+        &path,
+        &request.model,
+    )
+    .map_err(io::Error::other)?;
+    let index = request
+        .index
+        .ok_or_else(|| io::Error::other("route index absent"))?;
+    if pool.config_sha256 != request.config_sha256
+        || pool.model.providers.len() != request.total
+        || pool
+            .model
+            .providers
+            .get(index)
+            .map(|provider| provider.name.as_str())
+            != request.account.as_deref()
+    {
+        return Err(io::Error::other("terminal recognizer source changed"));
+    }
+    Ok(FreshTerminalRecognizer::for_provider(
+        &pool.model.providers[index],
+    ))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -964,11 +996,43 @@ fn effect_intent(dir: &Path) -> io::Result<Option<AccountEffectIntent>> {
     exact_file(dir, "intent.json")
 }
 
+fn latest_terminal_marker_time(
+    directory: &Path,
+    request: &FreshAccountEffectRequest,
+) -> io::Result<Option<u128>> {
+    let mut latest = None;
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".terminal.json")
+        {
+            continue;
+        }
+        let record: TerminalRecord = serde_json::from_reader(File::open(entry.path())?)?;
+        if record.version != 1 {
+            return Err(io::Error::other("fresh terminal ledger version changed"));
+        }
+        if record.selection.model == request.model
+            && record.selection.config_sha256 == request.config_sha256
+            && record.selection.account == request.account
+            && record.outcome.is_marker()
+        {
+            latest = Some(latest.map_or(record.physical_q_unix_nanos, |prior: u128| {
+                prior.max(record.physical_q_unix_nanos)
+            }));
+        }
+    }
+    Ok(latest)
+}
+
 fn reusable_quota_source(
     directory: &Path,
     binding: &Binding,
     request: &FreshAccountEffectRequest,
 ) -> io::Result<Option<(String, AccountEffectIntent)>> {
+    let marker_q = latest_terminal_marker_time(directory, request)?;
     let parent = directory.join("account-effects");
     let mut names = std::fs::read_dir(&parent)?
         .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
@@ -997,10 +1061,11 @@ fn reusable_quota_source(
         }
         let readback = effect_readback_from_dir(&source_dir, &intent)?;
         if readback.state == "drained" && readback.outcome.as_deref() == Some("valid_windows") {
-            if matches!(
-                quota_remaining(&readback, Utc::now().timestamp()),
-                Ok(Some(_))
-            ) {
+            let after_marker = match marker_q {
+                Some(marker_q) => effect_physical_q_nanos(&source_dir, &intent)? > marker_q,
+                None => true,
+            };
+            if quota_remaining(&readback, Utc::now().timestamp())?.is_some() && after_marker {
                 if fresh
                     .as_ref()
                     .is_none_or(|(_, _, prior_time)| readback.completed_unix_seconds > *prior_time)
@@ -1299,6 +1364,9 @@ pub(super) fn begin_account_effect(
         }
     }
     if request.kind == FreshAccountEffectKind::QuotaFirst {
+        // Materialize typed Q history before considering a cross-root reuse.
+        // A pre-rejection healthy Q must never masquerade as verification.
+        route_evidence(directory, &candidate)?;
         let parent = directory.join("account-effects");
         if let Some((source_directory, source)) =
             reusable_quota_source(directory, binding, request)?
@@ -1366,6 +1434,7 @@ pub(super) fn register_route_candidate(
     binding: &Binding,
     request: &FreshRouteRequest,
     plan: Plan,
+    terminal_recognizer: FreshTerminalRecognizer,
 ) -> io::Result<()> {
     route_request_valid(request, binding)?;
     let index = request
@@ -1387,6 +1456,7 @@ pub(super) fn register_route_candidate(
         plan_sha256: plan.digest.clone(),
         quota_script: request.quota_script.clone(),
         auth_refresh_command: request.auth_refresh_command.clone(),
+        terminal_recognizer,
     };
     let name = candidate_name(&binding.handoff_id, index);
     if let Some(existing) = exact_file::<RouteCandidate>(directory, &name)? {
@@ -1428,10 +1498,196 @@ fn route_candidates(
     Ok(candidates)
 }
 
-fn route_evidence(directory: &Path, candidate: &RouteCandidate) -> io::Result<(u64, u64, u64)> {
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum TerminalOutcome {
+    Clean,
+    GenericFailure,
+    Cancelled,
+    Unknown,
+    QuotaRejected,
+    MaybeQuota,
+    AuthRejected,
+    ProviderUnavailable,
+    RateLimited,
+    StorageContention,
+}
+
+impl TerminalOutcome {
+    fn is_marker(self) -> bool {
+        !matches!(
+            self,
+            Self::Clean | Self::GenericFailure | Self::Cancelled | Self::Unknown
+        )
+    }
+
+    fn release_after(self) -> Option<Duration> {
+        match self {
+            Self::ProviderUnavailable => Some(Duration::from_secs(5 * 60)),
+            Self::StorageContention => Some(Duration::from_secs(2 * 60)),
+            Self::RateLimited => Some(Duration::from_secs(60)),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct TerminalRecord {
+    version: u32,
+    binding: Binding,
+    selection: FreshRouteSelection,
+    grant_id: String,
+    physical_q_sha256: String,
+    physical_q_unix_nanos: u128,
+    signal_kind: String,
+    outcome: TerminalOutcome,
+}
+
+fn file_unix_nanos(path: &Path) -> io::Result<u128> {
+    Ok(std::fs::metadata(path)?
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_nanos())
+}
+
+fn classify_terminal_outcome(
+    kind: TerminalSignalKind,
+    stderr: &[u8],
+    status: i32,
+    cancelled: bool,
+) -> TerminalOutcome {
+    // A cleanup cancellation may drain adopted descendants after the provider
+    // itself has already emitted a typed rejection. Keep that provider result.
+    match kind {
+        TerminalSignalKind::QuotaExhaustedInband => return TerminalOutcome::QuotaRejected,
+        TerminalSignalKind::MaybeQuotaExhausted => return TerminalOutcome::MaybeQuota,
+        TerminalSignalKind::RateLimited => return TerminalOutcome::RateLimited,
+        TerminalSignalKind::ProviderStorageContention => return TerminalOutcome::StorageContention,
+        TerminalSignalKind::ProviderUnavailable
+        | TerminalSignalKind::ProlongedSilence
+        | TerminalSignalKind::SpawnError => return TerminalOutcome::ProviderUnavailable,
+        _ => {}
+    }
+    if matches!(
+        kind,
+        TerminalSignalKind::CleanExit
+            | TerminalSignalKind::NonzeroExit
+            | TerminalSignalKind::Unknown
+    ) && oulipoly_runtime::diagnostics::non_quota_failure_diagnosis(
+        &String::from_utf8_lossy(stderr),
+        if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            -1
+        },
+    )
+    .is_some_and(|diagnosis| {
+        diagnosis.category == oulipoly_runtime::diagnostics::ErrorCategory::AuthExpired
+    }) {
+        return TerminalOutcome::AuthRejected;
+    }
+    if cancelled {
+        return TerminalOutcome::Cancelled;
+    }
+    match kind {
+        TerminalSignalKind::CleanExit => TerminalOutcome::Clean,
+        TerminalSignalKind::NonzeroExit
+        | TerminalSignalKind::SignalExit
+        | TerminalSignalKind::Unknown => {
+            if kind == TerminalSignalKind::Unknown {
+                TerminalOutcome::Unknown
+            } else {
+                TerminalOutcome::GenericFailure
+            }
+        }
+        _ => unreachable!("typed rejection handled above"),
+    }
+}
+
+fn terminal_record(
+    directory: &Path,
+    decision: &RouteDecision,
+    candidate: &RouteCandidate,
+    grant: &Grant,
+    status: i32,
+    mut stdout: File,
+    mut stderr: File,
+    cancelled: bool,
+) -> io::Result<TerminalRecord> {
+    if candidate.version != 1
+        || candidate.binding != decision.binding
+        || candidate.account != decision.selection.account
+        || candidate.model != decision.selection.model
+        || candidate.config_sha256 != decision.selection.config_sha256
+        || candidate.index != decision.selection.index
+        || candidate.plan_sha256 != grant.plan_sha256
+        || grant.plan_sha256 != decision.selection.plan_sha256
+    {
+        return Err(io::Error::other(
+            "fresh terminal candidate/Q binding changed",
+        ));
+    }
+    let q_path = directory.join(format!("{}.drain.json", grant.id));
+    let q_sha = sha_file(&File::open(&q_path)?)?.0;
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    stdout.read_to_end(&mut stdout_bytes)?;
+    stderr.read_to_end(&mut stderr_bytes)?;
+    let signal = candidate.terminal_recognizer.classify(
+        &candidate.account,
+        &stdout_bytes,
+        &stderr_bytes,
+        status,
+    );
+    let outcome = classify_terminal_outcome(signal.kind, &stderr_bytes, status, cancelled);
+    let name = format!("{}.terminal.json", grant.id);
+    if let Some(existing) = exact_file::<TerminalRecord>(directory, &name)? {
+        if existing.version != 1
+            || existing.binding != decision.binding
+            || existing.selection != decision.selection
+            || existing.grant_id != grant.id
+            || existing.physical_q_sha256 != q_sha
+            || existing.signal_kind != format!("{:?}", signal.kind)
+            || existing.outcome != outcome
+        {
+            return Err(io::Error::other("fresh terminal ledger changed"));
+        }
+        return Ok(existing);
+    }
+    let record = TerminalRecord {
+        version: 1,
+        binding: decision.binding.clone(),
+        selection: decision.selection.clone(),
+        grant_id: grant.id.clone(),
+        physical_q_sha256: q_sha,
+        physical_q_unix_nanos: file_unix_nanos(&q_path)?,
+        signal_kind: format!("{:?}", signal.kind),
+        outcome,
+    };
+    match durable_new(directory, &name, &record) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let raced: TerminalRecord = exact_file(directory, &name)?
+                .ok_or_else(|| io::Error::other("fresh terminal ledger race unreadable"))?;
+            if raced != record {
+                return Err(io::Error::other("fresh terminal ledger race changed"));
+            }
+        }
+        Err(error) => return Err(error),
+    }
+    Ok(record)
+}
+
+fn route_evidence(
+    directory: &Path,
+    candidate: &RouteCandidate,
+) -> io::Result<(u64, u64, u64, Vec<TerminalRecord>)> {
     let mut live = 0;
     let mut failures = 0;
     let mut invocations = 0;
+    let mut markers = Vec::new();
     for entry in std::fs::read_dir(directory)? {
         let entry = entry?;
         let name = entry.file_name();
@@ -1469,10 +1725,34 @@ fn route_evidence(directory: &Path, candidate: &RouteCandidate) -> io::Result<(u
         }
         invocations += 1;
         match observe(directory, &grant.id)? {
-            Observation::Drained { status, .. } => {
+            Observation::Drained {
+                status,
+                stdout,
+                stderr,
+                cancelled,
+                ..
+            } => {
                 let drain_path = directory.join(format!("{}.drain.json", grant.id));
                 if status != 0 && file_age_less_than(&drain_path, RECENT_FAILURE_SCORING_WINDOW)? {
                     failures += 1;
+                }
+                let previous_candidate: RouteCandidate = exact_file(
+                    directory,
+                    &candidate_name(&previous.binding.handoff_id, previous.selection.index),
+                )?
+                .ok_or_else(|| io::Error::other("fresh terminal candidate absent"))?;
+                let record = terminal_record(
+                    directory,
+                    &previous,
+                    &previous_candidate,
+                    &grant,
+                    status,
+                    stdout,
+                    stderr,
+                    cancelled,
+                )?;
+                if record.outcome.is_marker() {
+                    markers.push(record);
                 }
             }
             // A consumed K remains live until physical Q. Provider exit and
@@ -1488,7 +1768,7 @@ fn route_evidence(directory: &Path, candidate: &RouteCandidate) -> io::Result<(u
             }
         }
     }
-    Ok((live, failures, invocations))
+    Ok((live, failures, invocations, markers))
 }
 
 fn file_age_less_than(path: &Path, window: Duration) -> io::Result<bool> {
@@ -1506,9 +1786,9 @@ fn candidate_quota(
     directory: &Path,
     binding: &Binding,
     candidate: &RouteCandidate,
-) -> io::Result<(Option<u32>, Option<String>)> {
+) -> io::Result<(Option<(u32, Option<u128>)>, Option<String>)> {
     if candidate.quota_script.is_none() {
-        return Ok((Some(0), None)); // no configured quota source, invocation fallback
+        return Ok((Some((0, None)), None)); // no configured quota source, invocation fallback
     }
     let request = FreshAccountEffectRequest {
         d_key: String::new(),
@@ -1534,6 +1814,8 @@ fn candidate_quota(
         return Err(io::Error::other("fresh quota effect provenance changed"));
     }
     let mut result = effect_readback_from_dir(&first_dir, &first_intent)?;
+    let mut verified_dir = first_dir;
+    let mut verified_intent = first_intent;
     if result.state != "drained" {
         return Ok((None, Some(result.artifact)));
     }
@@ -1553,13 +1835,17 @@ fn candidate_quota(
         };
         if retry_intent.version != 1
             || retry_intent.binding != *binding
+            || retry_intent.request.model != candidate.model
             || retry_intent.request.account != candidate.account
             || retry_intent.request.config_sha256 != candidate.config_sha256
+            || retry_intent.request.index != candidate.index
             || retry_intent.request.kind != FreshAccountEffectKind::QuotaRetry
         {
             return Err(io::Error::other("fresh quota retry provenance changed"));
         }
         result = effect_readback_from_dir(&retry_dir, &retry_intent)?;
+        verified_dir = retry_dir;
+        verified_intent = retry_intent;
     }
     if result.state != "drained" {
         return Ok((None, Some(result.artifact)));
@@ -1567,7 +1853,154 @@ fn candidate_quota(
     if result.outcome.as_deref() != Some("valid_windows") || result.windows.is_empty() {
         return Ok((None, None));
     }
-    Ok((quota_remaining(&result, Utc::now().timestamp())?, None))
+    let Some(remaining) = quota_remaining(&result, Utc::now().timestamp())? else {
+        return Ok((None, None));
+    };
+    Ok((
+        Some((
+            remaining,
+            Some(effect_physical_q_nanos(&verified_dir, &verified_intent)?),
+        )),
+        None,
+    ))
+}
+
+/// Return the physical source Q time, never the time of a reused readback.
+fn effect_physical_q_nanos(dir: &Path, intent: &AccountEffectIntent) -> io::Result<u128> {
+    let (physical_dir, physical_intent) =
+        if let Some(reuse) = exact_file::<QuotaReuse>(dir, "reuse.json")? {
+            let name = &reuse.source_directory;
+            if name.contains('/')
+                || name.contains("..")
+                || (!name.ends_with("-quota-first") && !name.ends_with("-quota-retry"))
+            {
+                return Err(io::Error::other("fresh marker quota reuse source invalid"));
+            }
+            let source_dir = dir
+                .parent()
+                .ok_or_else(|| io::Error::other("effect parent absent"))?
+                .join(name);
+            let source = effect_intent(&source_dir)?
+                .ok_or_else(|| io::Error::other("quota source intent absent"))?;
+            if source.id != reuse.source_effect_id
+                || source.request.model != intent.request.model
+                || source.request.config_sha256 != intent.request.config_sha256
+                || source.request.account != intent.request.account
+                || source.request.index != intent.request.index
+                || source.environment_sha256 != intent.environment_sha256
+                || source_dir.join("reuse.json").exists()
+            {
+                return Err(io::Error::other(
+                    "fresh marker quota reuse provenance changed",
+                ));
+            }
+            (source_dir, source)
+        } else {
+            (dir.to_owned(), intent.clone())
+        };
+    let grant = grant_for_binding(&physical_dir, &physical_intent.binding)?
+        .ok_or_else(|| io::Error::other("fresh marker physical Q grant absent"))?;
+    if !matches!(observe(&physical_dir, &grant)?, Observation::Drained { .. }) {
+        return Err(io::Error::other("fresh marker physical Q not drained"));
+    }
+    file_unix_nanos(&physical_dir.join(format!("{grant}.drain.json")))
+}
+
+fn auth_verified_after_marker(
+    directory: &Path,
+    binding: &Binding,
+    candidate: &RouteCandidate,
+    marker: &TerminalRecord,
+) -> io::Result<bool> {
+    if candidate.auth_refresh_command.is_none() {
+        return Ok(false);
+    }
+    let request = FreshAccountEffectRequest {
+        d_key: String::new(),
+        model: candidate.model.clone(),
+        config_sha256: candidate.config_sha256.clone(),
+        account: candidate.account.clone(),
+        index: candidate.index,
+        kind: FreshAccountEffectKind::AuthRefresh,
+        environment: Vec::new(),
+    };
+    let dir = effect_directory(directory, binding, &request);
+    let Some(intent) = effect_intent(&dir)? else {
+        return Ok(false);
+    };
+    if intent.version != 1
+        || intent.binding != *binding
+        || intent.request.model != candidate.model
+        || intent.request.config_sha256 != candidate.config_sha256
+        || intent.request.account != candidate.account
+        || intent.request.index != candidate.index
+        || intent.request.kind != FreshAccountEffectKind::AuthRefresh
+    {
+        return Err(io::Error::other("fresh marker auth provenance changed"));
+    }
+    let result = effect_readback_from_dir(&dir, &intent)?;
+    Ok(result.state == "drained"
+        && result.outcome.as_deref() == Some("refreshed")
+        && effect_physical_q_nanos(&dir, &intent)? > marker.physical_q_unix_nanos)
+}
+
+fn marker_allows_candidate(
+    directory: &Path,
+    binding: &Binding,
+    candidate: &RouteCandidate,
+    markers: &[TerminalRecord],
+    quota_q_nanos: Option<u128>,
+) -> io::Result<bool> {
+    for marker in markers {
+        if !single_marker_allows_candidate(directory, binding, candidate, marker, quota_q_nanos)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn single_marker_allows_candidate(
+    directory: &Path,
+    binding: &Binding,
+    candidate: &RouteCandidate,
+    marker: &TerminalRecord,
+    quota_q_nanos: Option<u128>,
+) -> io::Result<bool> {
+    if marker.version != 1
+        || marker.selection.model != candidate.model
+        || marker.selection.config_sha256 != candidate.config_sha256
+        || marker.selection.account != candidate.account
+        || marker.selection.index != candidate.index
+    {
+        return Err(io::Error::other("fresh terminal marker candidate mismatch"));
+    }
+    let newer_healthy_quota = quota_q_nanos.is_some_and(|q| q > marker.physical_q_unix_nanos);
+    match marker.outcome {
+        TerminalOutcome::QuotaRejected | TerminalOutcome::MaybeQuota => Ok(newer_healthy_quota),
+        TerminalOutcome::AuthRejected => {
+            auth_verified_after_marker(directory, binding, candidate, marker)
+        }
+        TerminalOutcome::ProviderUnavailable
+        | TerminalOutcome::RateLimited
+        | TerminalOutcome::StorageContention => {
+            let release = marker
+                .outcome
+                .release_after()
+                .expect("availability interval");
+            let release_nanos = marker
+                .physical_q_unix_nanos
+                .saturating_add(release.as_nanos());
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(io::Error::other)?
+                .as_nanos();
+            Ok(newer_healthy_quota || now >= release_nanos)
+        }
+        TerminalOutcome::Clean
+        | TerminalOutcome::GenericFailure
+        | TerminalOutcome::Cancelled
+        | TerminalOutcome::Unknown => Ok(true),
+    }
 }
 
 fn quota_remaining(result: &FreshAccountEffectReadback, now: i64) -> io::Result<Option<u32>> {
@@ -1631,7 +2064,8 @@ pub(super) fn select_route(
     let mut eligible = Vec::new();
     let mut unknown_artifact = None;
     for candidate in candidates {
-        let (quota_remaining, unknown) = candidate_quota(directory, binding, &candidate)?;
+        let (live, failures, invocations, markers) = route_evidence(directory, &candidate)?;
+        let (quota, unknown) = candidate_quota(directory, binding, &candidate)?;
         if unknown.is_some()
             && request
                 .pin
@@ -1640,25 +2074,23 @@ pub(super) fn select_route(
         {
             unknown_artifact = unknown;
         }
-        let Some(quota_remaining) = quota_remaining else {
+        let Some((quota_remaining, quota_q_nanos)) = quota
+        else {
             continue;
         };
-        eligible.push((candidate, quota_remaining));
+        if !marker_allows_candidate(directory, binding, &candidate, &markers, quota_q_nanos)? {
+            continue;
+        }
+        eligible.push((candidate, quota_remaining, (live, failures, invocations)));
     }
     let all_metered = eligible
         .iter()
-        .all(|(candidate, _)| candidate.quota_script.is_some());
+        .all(|(candidate, _, _)| candidate.quota_script.is_some());
     let eligible_accounts: Vec<String> = eligible
         .iter()
-        .map(|(candidate, _)| candidate.account.clone())
+        .map(|(candidate, _, _)| candidate.account.clone())
         .collect();
-    let observations: Vec<_> = eligible
-        .into_iter()
-        .map(|(candidate, quota_remaining)| {
-            let evidence = route_evidence(directory, &candidate)?;
-            Ok((candidate, quota_remaining, evidence))
-        })
-        .collect::<io::Result<_>>()?;
+    let observations = eligible;
     let has_unsuppressed = observations.iter().any(|(candidate, _, (_, failures, _))| {
         request
             .pin
@@ -1750,21 +2182,34 @@ pub(super) fn require_selected_plan(
         directory,
         &candidate_name(&binding.handoff_id, decision.selection.index),
     )?
-    .ok_or_else(|| io::Error::other("fresh provider K candidate absent"))?;
-    if candidate.binding != *binding
+    .ok_or_else(|| io::Error::other("fresh provider selected candidate absent"))?;
+    if candidate.version != 1
+        || candidate.binding != *binding
+        || candidate.model != decision.selection.model
+        || candidate.config_sha256 != decision.selection.config_sha256
         || candidate.account != decision.selection.account
         || candidate.plan_sha256 != plan.digest
     {
-        return Err(io::Error::other("fresh provider K candidate changed"));
+        return Err(io::Error::other(
+            "fresh provider selected candidate changed",
+        ));
     }
-    let (remaining, unknown) = candidate_quota(directory, binding, &candidate)?;
+    let (_, _, _, markers) = route_evidence(directory, &candidate)?;
+    let (quota, unknown) = candidate_quota(directory, binding, &candidate)?;
     if unknown.is_some()
-        || remaining.is_none()
-        || candidate.quota_script.as_ref().map(|_| remaining.unwrap())
+        || quota.is_none()
+        || candidate.quota_script.as_ref().map(|_| quota.unwrap().0)
             != decision.selection.quota_remaining_basis_points
+        || !marker_allows_candidate(
+            directory,
+            binding,
+            &candidate,
+            &markers,
+            quota.and_then(|(_, q)| q),
+        )?
     {
         return Err(io::Error::other(
-            "fresh provider K quota evidence no longer eligible",
+            "fresh provider selected account no longer eligible before K",
         ));
     }
     Ok(())
@@ -2445,6 +2890,13 @@ pub(super) fn launch(
     {
         return Err(io::Error::other("fresh provider plan changed before K"));
     }
+    if prepared
+        .directory
+        .join(decision_name(&b.handoff_id))
+        .exists()
+    {
+        require_selected_plan(&prepared.directory, b, &prepared.plan)?;
+    }
     durable_new(
         &prepared.directory,
         &format!("{}.consumed.json", prepared.grant.id),
@@ -2997,6 +3449,242 @@ mod tests {
     }
 
     #[test]
+    fn typed_terminal_ledger_requires_new_matching_verification() {
+        let temp = tempfile::tempdir().unwrap();
+        let broker = temp.path().join("fresh-provider");
+        std::fs::create_dir(&broker).unwrap();
+        let old_wal = temp.path().join("state.db-wal");
+        std::fs::write(&old_wal, b"legacy WAL sentinel").unwrap();
+        let process = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+        let binding = fixture_binding(&process, &process);
+        let grant = Grant {
+            version: 1,
+            id: uuid::Uuid::new_v4().to_string(),
+            binding: binding.clone(),
+            plan_sha256: "p".repeat(64),
+        };
+        let selection = FreshRouteSelection {
+            model: "work".into(),
+            config_sha256: "c".repeat(64),
+            account: "opencode-one".into(),
+            index: 0,
+            plan_sha256: grant.plan_sha256.clone(),
+            observed_live: 0,
+            observed_failures: 0,
+            observed_invocations: 0,
+            policy_version: "fresh-account-effects-v2".into(),
+            eligible_accounts: vec!["opencode-one".into(), "second".into()],
+            quota_remaining_basis_points: Some(8000),
+        };
+        let candidate = RouteCandidate {
+            version: 1,
+            binding: binding.clone(),
+            model: selection.model.clone(),
+            config_sha256: selection.config_sha256.clone(),
+            account: selection.account.clone(),
+            index: 0,
+            total: 2,
+            pin: None,
+            plan_sha256: grant.plan_sha256.clone(),
+            quota_script: Some("quota source".into()),
+            auth_refresh_command: None,
+            terminal_recognizer: FreshTerminalRecognizer::OpenCode,
+        };
+        let decision = RouteDecision {
+            version: 1,
+            binding,
+            total: 2,
+            pin: None,
+            selection,
+        };
+        let q_path = broker.join(format!("{}.drain.json", grant.id));
+        std::fs::write(&q_path, b"exact physical Q").unwrap();
+        let stdout_path = broker.join("stdout");
+        let stderr_path = broker.join("stderr");
+        std::fs::write(&stdout_path, b"").unwrap();
+        std::fs::write(
+            &stderr_path,
+            br#"{"type":"error","error":{"data":{"message":"quota exhausted for account"}}}"#,
+        )
+        .unwrap();
+        let record = terminal_record(
+            &broker,
+            &decision,
+            &candidate,
+            &grant,
+            0,
+            File::open(&stdout_path).unwrap(),
+            File::open(&stderr_path).unwrap(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(record.signal_kind, "QuotaExhaustedInband");
+        assert_eq!(record.outcome, TerminalOutcome::QuotaRejected);
+        assert!(
+            !marker_allows_candidate(
+                &broker,
+                &decision.binding,
+                &candidate,
+                std::slice::from_ref(&record),
+                Some(record.physical_q_unix_nanos - 1),
+            )
+            .unwrap(),
+            "older healthy quota Q cannot clear a typed rejection"
+        );
+        assert!(
+            marker_allows_candidate(
+                &broker,
+                &decision.binding,
+                &candidate,
+                std::slice::from_ref(&record),
+                Some(record.physical_q_unix_nanos + 1),
+            )
+            .unwrap()
+        );
+        let mut auth_marker = record.clone();
+        auth_marker.outcome = TerminalOutcome::AuthRejected;
+        let mut auth_candidate = candidate.clone();
+        auth_candidate.auth_refresh_command = Some("refresh".into());
+        assert!(
+            !marker_allows_candidate(
+                &broker,
+                &decision.binding,
+                &auth_candidate,
+                std::slice::from_ref(&auth_marker),
+                Some(record.physical_q_unix_nanos + 1),
+            )
+            .unwrap(),
+            "healthy quota Q incorrectly cleared an auth rejection"
+        );
+        let mut other = candidate.clone();
+        other.account = "second".into();
+        other.index = 1;
+        assert!(marker_allows_candidate(&broker, &decision.binding, &other, &[], None).unwrap());
+        assert!(
+            marker_allows_candidate(
+                &broker,
+                &decision.binding,
+                &other,
+                std::slice::from_ref(&record),
+                None
+            )
+            .is_err()
+        );
+        let mut older_quota = record.clone();
+        older_quota.physical_q_unix_nanos -= Duration::from_secs(7 * 60).as_nanos();
+        let mut later_availability = record.clone();
+        later_availability.grant_id = uuid::Uuid::new_v4().to_string();
+        later_availability.outcome = TerminalOutcome::ProviderUnavailable;
+        later_availability.physical_q_unix_nanos -= Duration::from_secs(6 * 60).as_nanos();
+        assert!(
+            marker_allows_candidate(
+                &broker,
+                &decision.binding,
+                &candidate,
+                std::slice::from_ref(&later_availability),
+                None,
+            )
+            .unwrap(),
+            "typed availability recovery was not applied"
+        );
+        assert!(
+            !marker_allows_candidate(
+                &broker,
+                &decision.binding,
+                &candidate,
+                &[older_quota, later_availability],
+                None,
+            )
+            .unwrap(),
+            "later availability recovery hid unresolved quota"
+        );
+        let reread: TerminalRecord = exact_file(&broker, &format!("{}.terminal.json", grant.id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(record, reread, "restart changed durable terminal evidence");
+        assert_eq!(
+            terminal_record(
+                &broker,
+                &decision,
+                &candidate,
+                &grant,
+                0,
+                File::open(&stdout_path).unwrap(),
+                File::open(&stderr_path).unwrap(),
+                false,
+            )
+            .unwrap(),
+            record,
+        );
+        std::fs::write(&q_path, b"changed Q").unwrap();
+        assert!(
+            terminal_record(
+                &broker,
+                &decision,
+                &candidate,
+                &grant,
+                0,
+                File::open(&stdout_path).unwrap(),
+                File::open(&stderr_path).unwrap(),
+                false,
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(old_wal).unwrap(), b"legacy WAL sentinel");
+    }
+
+    #[test]
+    fn terminal_classes_do_not_infer_quota_from_exit_or_cancellation() {
+        let provider = FreshTerminalRecognizer::OpenAiCompat;
+        let generic = provider.classify("first", b"", b"plain failure", 1 << 8);
+        assert_eq!(generic.kind, TerminalSignalKind::NonzeroExit);
+        assert_eq!(
+            classify_terminal_outcome(generic.kind, b"plain failure", 1 << 8, false),
+            TerminalOutcome::GenericFailure,
+        );
+        assert_eq!(
+            classify_terminal_outcome(
+                generic.kind,
+                b"authentication failed: token expired",
+                1 << 8,
+                false
+            ),
+            TerminalOutcome::AuthRejected,
+        );
+        assert_eq!(
+            classify_terminal_outcome(
+                TerminalSignalKind::QuotaExhaustedInband,
+                b"quota exhausted",
+                0,
+                true
+            ),
+            TerminalOutcome::QuotaRejected,
+        );
+        assert_eq!(
+            classify_terminal_outcome(generic.kind, b"plain failure", 1 << 8, true),
+            TerminalOutcome::Cancelled,
+        );
+        assert_eq!(
+            classify_terminal_outcome(TerminalSignalKind::Unknown, b"", -1, false),
+            TerminalOutcome::Unknown,
+        );
+        let contention = FreshTerminalRecognizer::OpenCode.classify(
+            "opencode-first",
+            br#"{"type":"error","error":{"data":{"message":"Failed to execute statement"}}}"#,
+            b"",
+            0,
+        );
+        assert_eq!(
+            contention.kind,
+            TerminalSignalKind::ProviderStorageContention
+        );
+        assert_eq!(
+            classify_terminal_outcome(contention.kind, b"", 0, false),
+            TerminalOutcome::StorageContention,
+        );
+    }
+
+    #[test]
     fn recent_failure_window_threshold_fallback_and_pin() {
         let temp = tempfile::tempdir().unwrap();
         let receipt = temp.path().join("drain.json");
@@ -3200,6 +3888,7 @@ mod tests {
             plan_sha256: "c".repeat(64),
             quota_script: None,
             auth_refresh_command: None,
+            terminal_recognizer: FreshTerminalRecognizer::OpenAiCompat,
         };
         durable_new(
             temp.path(),
@@ -3275,6 +3964,13 @@ mod tests {
                 .join(decision_name(&current.handoff_id))
                 .exists()
         );
+        assert!(
+            !temp
+                .path()
+                .join(format!("{}.terminal.json", grant.id))
+                .exists(),
+            "lost Q invented a typed terminal marker"
+        );
     }
 
     #[test]
@@ -3298,6 +3994,182 @@ mod tests {
         result.windows[0].used_percent = 0.0;
         result.windows[0].resets_at = "2020-01-01T00:00:00Z".into();
         assert_eq!(quota_remaining(&result, now).unwrap(), None);
+    }
+
+    #[test]
+    fn typed_quota_q_excludes_account_even_with_pin_and_falls_back() {
+        if std::env::var_os("AGE319_FRESH_TERMINAL_INNER").is_none() {
+            let Some(image) = std::env::var_os("OULIPOLY_AGE319_PROVIDER_IMAGE") else {
+                return;
+            };
+            let output = Command::new("unshare")
+                .args(["-Urpfm", "--mount-proc"])
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", "linux_main::fresh_provider::tests::typed_quota_q_excludes_account_even_with_pin_and_falls_back", "--nocapture"])
+                .env("AGE319_FRESH_TERMINAL_INNER", "1")
+                .env("OULIPOLY_AGE319_PROVIDER_IMAGE", image)
+                .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", "/tmp/fresh-terminal-fixture-socket")
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        assert_eq!(unsafe { libc::getpid() }, 1);
+        let temporary = tempfile::tempdir().unwrap();
+        let old_wal = temporary.path().join("state.db-wal");
+        std::fs::write(&old_wal, b"old WAL unchanged").unwrap();
+        let image = PathBuf::from(std::env::var("OULIPOLY_AGE319_PROVIDER_IMAGE").unwrap());
+        let input = temporary.path().join("input");
+        std::fs::write(&input, b"prompt").unwrap();
+        let mut actor_child = Command::new("sleep").arg("60").spawn().unwrap();
+        let root = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+        let actor = PinnedProcess::open(actor_child.id() as i32).unwrap();
+        let mut binding = fixture_binding(&root, &actor);
+        let request =
+            |_binding: &Binding, index: Option<usize>, pin: Option<&str>| FreshRouteRequest {
+                d_key: uuid::Uuid::new_v4().to_string(),
+                model: "work".into(),
+                config_sha256: "c".repeat(64),
+                account: index
+                    .map(|i| if i == 0 { "opencode-first" } else { "second" }.to_string()),
+                index,
+                total: 2,
+                pin: pin.map(str::to_owned),
+                quota_script: None,
+                auth_refresh_command: None,
+            };
+        let make_plan = |index: usize| {
+            plan(
+                &image,
+                temporary.path(),
+                &File::open(&input).unwrap(),
+                vec![
+                    temporary
+                        .path()
+                        .join(format!("effect-{index}"))
+                        .display()
+                        .to_string(),
+                    if index == 0 { "--quota" } else { "--success" }.into(),
+                ],
+                vec![("PATH".into(), "/usr/bin:/bin".into())],
+            )
+            .unwrap()
+        };
+        let register = |binding: &Binding, pin: Option<&str>| {
+            for index in 0..2 {
+                register_route_candidate(
+                    temporary.path(),
+                    binding,
+                    &request(binding, Some(index), pin),
+                    make_plan(index),
+                    if index == 0 {
+                        FreshTerminalRecognizer::OpenCode
+                    } else {
+                        FreshTerminalRecognizer::OpenAiCompat
+                    },
+                )
+                .unwrap();
+            }
+        };
+        register(&binding, None);
+        let first =
+            select_route(temporary.path(), &binding, &request(&binding, None, None)).unwrap();
+        assert_eq!(first.account, "opencode-first");
+        let provider_grant = launch(
+            prepare(temporary.path(), binding.clone(), make_plan(0)).unwrap(),
+            &root,
+            &actor,
+            0,
+            0,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match observe(temporary.path(), &provider_grant).unwrap() {
+                Observation::Drained {
+                    status, cancelled, ..
+                } => {
+                    assert_eq!(status, 1 << 8);
+                    assert!(!cancelled);
+                    break;
+                }
+                Observation::Unknown => panic!("provider Q became unknown"),
+                _ if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+                _ => panic!("provider Q did not drain"),
+            }
+        }
+        binding.handoff_id = uuid::Uuid::new_v4().to_string();
+        register(&binding, None);
+        let second =
+            select_route(temporary.path(), &binding, &request(&binding, None, None)).unwrap();
+        assert_eq!(second.account, "second");
+        assert_eq!(second.eligible_accounts, ["second"]);
+        let record: TerminalRecord =
+            exact_file(temporary.path(), &format!("{provider_grant}.terminal.json"))
+                .unwrap()
+                .unwrap();
+        assert_eq!(record.outcome, TerminalOutcome::QuotaRejected);
+        let mut pinned = binding.clone();
+        pinned.handoff_id = uuid::Uuid::new_v4().to_string();
+        register(&pinned, Some("opencode-first"));
+        assert!(
+            select_route(
+                temporary.path(),
+                &pinned,
+                &request(&pinned, None, Some("opencode-first"))
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("no eligible account or pin")
+        );
+        let mut held_choice = pinned.clone();
+        held_choice.handoff_id = uuid::Uuid::new_v4().to_string();
+        register(&held_choice, Some("opencode-first"));
+        durable_new(
+            temporary.path(),
+            &decision_name(&held_choice.handoff_id),
+            &RouteDecision {
+                version: 1,
+                binding: held_choice.clone(),
+                total: 2,
+                pin: Some("opencode-first".into()),
+                selection: first,
+            },
+        )
+        .unwrap();
+        assert!(
+            require_selected_plan(temporary.path(), &held_choice, &make_plan(0))
+                .unwrap_err()
+                .to_string()
+                .contains("no longer eligible before K")
+        );
+        assert!(
+            launch(
+                prepare(temporary.path(), held_choice.clone(), make_plan(0)).unwrap(),
+                &root,
+                &actor,
+                0,
+                0,
+            )
+            .is_err(),
+            "stale held choice consumed provider K"
+        );
+        let held_grant = grant_for_binding(temporary.path(), &held_choice)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !temporary
+                .path()
+                .join(format!("{held_grant}.consumed.json"))
+                .exists()
+        );
+        assert_eq!(std::fs::read(old_wal).unwrap(), b"old WAL unchanged");
+        actor_child.kill().unwrap();
+        actor_child.wait().unwrap();
     }
 
     #[test]
@@ -3367,6 +4239,7 @@ mod tests {
                 binding,
                 &request(Some(0), Some("first")),
                 prepare_plan(vec![marker.display().to_string()]),
+                FreshTerminalRecognizer::OpenAiCompat,
             )
             .unwrap();
             register_route_candidate(
@@ -3376,6 +4249,7 @@ mod tests {
                 prepare_plan(vec![
                     temporary.path().join("other-effect").display().to_string(),
                 ]),
+                FreshTerminalRecognizer::OpenAiCompat,
             )
             .unwrap();
             select_route(temporary.path(), binding, &request(None, None)).unwrap()
@@ -3514,8 +4388,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             route_evidence(temporary.path(), &first_candidate).unwrap(),
-            (1, 0, 1),
-            "aged consumed K with a live descendant was dropped before Q"
+            (1, 0, 1, Vec::new())
         );
         let mut second_binding = binding.clone();
         second_binding.handoff_id = uuid::Uuid::new_v4().to_string();
@@ -3600,9 +4473,25 @@ mod tests {
                 .unwrap();
         assert_eq!(
             route_evidence(temporary.path(), &first_candidate).unwrap(),
-            (0, 1, 1),
+            (0, 1, 1, Vec::new()),
             "only physical Q may turn the nonzero exit into failure evidence"
         );
+        File::open(temporary.path().join(format!("{id}.drain.json")))
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() - Duration::from_secs(31 * 60)),
+            )
+            .unwrap();
+        assert_eq!(
+            route_evidence(temporary.path(), &first_candidate).unwrap(),
+            (0, 0, 1, Vec::new()),
+            "old completed Q is neither live nor a recent failure"
+        );
+        assert!(matches!(
+            observe(temporary.path(), &id).unwrap(),
+            Observation::Drained { .. }
+        ));
         let mut third_binding = binding.clone();
         third_binding.handoff_id = uuid::Uuid::new_v4().to_string();
         assert_eq!(route(&third_binding, None).account, "second");
@@ -3688,6 +4577,7 @@ mod tests {
                     vec![],
                 )
                 .unwrap(),
+                FreshTerminalRecognizer::OpenAiCompat,
             )
             .unwrap();
         }
@@ -3775,6 +4665,7 @@ mod tests {
                 vec![],
             )
             .unwrap(),
+            FreshTerminalRecognizer::OpenAiCompat,
         )
         .unwrap();
         let reused = begin_account_effect(
@@ -3802,6 +4693,69 @@ mod tests {
                 .unwrap()
                 .effect_id,
             reused.effect_id,
+        );
+        let mut pending_binding = binding.clone();
+        pending_binding.handoff_id = uuid::Uuid::new_v4().to_string();
+        let pending_dir = effect_directory(temporary.path(), &pending_binding, &first);
+        std::fs::create_dir(&pending_dir).unwrap();
+        let pending_intent = AccountEffectIntent {
+            version: 1,
+            id: uuid::Uuid::new_v4().to_string(),
+            binding: pending_binding.clone(),
+            request: redacted_effect_request(&first),
+            environment_sha256: environment_digest(&first).unwrap(),
+            plan_sha256: "pending-plan".into(),
+        };
+        durable_new(&pending_dir, "intent.json", &pending_intent).unwrap();
+        assert_eq!(
+            reusable_quota_source(temporary.path(), &sibling_binding, &first)
+                .unwrap()
+                .unwrap()
+                .1
+                .id,
+            pending_intent.id,
+            "a cached Q hid a matching unresolved quota effect"
+        );
+        let mut another_binding = binding.clone();
+        another_binding.handoff_id = uuid::Uuid::new_v4().to_string();
+        register_route_candidate(
+            temporary.path(),
+            &another_binding,
+            &request(0, "recovering", &shell_script, Some(&auth_script)),
+            plan(
+                &image,
+                temporary.path(),
+                &File::open(&input).unwrap(),
+                vec!["--recovering".into()],
+                vec![],
+            )
+            .unwrap(),
+            FreshTerminalRecognizer::OpenAiCompat,
+        )
+        .unwrap();
+        let blocked = begin_account_effect(
+            temporary.path(),
+            &another_binding,
+            &first,
+            &root,
+            &actor,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(blocked.state, "unknown");
+        assert!(
+            blocked
+                .artifact
+                .contains(&pending_dir.display().to_string())
+        );
+        assert!(
+            grant_for_binding(
+                &effect_directory(temporary.path(), &another_binding, &first),
+                &another_binding
+            )
+            .unwrap()
+            .is_none()
         );
         let negative = effect(1, "exhausted", FreshAccountEffectKind::QuotaFirst);
         begin_account_effect(temporary.path(), &binding, &negative, &root, &actor, 0, 0).unwrap();
@@ -3885,6 +4839,7 @@ mod tests {
                 vec![],
             )
             .unwrap(),
+            FreshTerminalRecognizer::OpenAiCompat,
         )
         .unwrap();
         let slow = FreshAccountEffectRequest {
@@ -3929,6 +4884,7 @@ mod tests {
                 vec![],
             )
             .unwrap(),
+            FreshTerminalRecognizer::OpenAiCompat,
         )
         .unwrap();
         let concurrent = begin_account_effect(
@@ -4005,6 +4961,113 @@ mod tests {
                 .outcome
                 .as_deref(),
             Some("failed")
+        );
+        // The synthetic pending intent above deliberately has no K. Remove
+        // that fixture-only artifact and its dependent reuse before testing
+        // a settled post-rejection quota verification.
+        std::fs::remove_dir_all(&pending_dir).unwrap();
+        std::fs::remove_dir_all(effect_directory(temporary.path(), &another_binding, &first))
+            .unwrap();
+        let retry_dir = effect_directory(temporary.path(), &binding, &retry);
+        let retry_intent = effect_intent(&retry_dir).unwrap().unwrap();
+        let old_healthy_q = effect_physical_q_nanos(&retry_dir, &retry_intent).unwrap();
+        let selected_candidate: RouteCandidate =
+            exact_file(temporary.path(), &candidate_name(&binding.handoff_id, 0))
+                .unwrap()
+                .unwrap();
+        let marker_grant = uuid::Uuid::new_v4().to_string();
+        let terminal_marker = TerminalRecord {
+            version: 1,
+            binding: binding.clone(),
+            selection: FreshRouteSelection {
+                model: "model".into(),
+                config_sha256: "a".repeat(64),
+                account: "recovering".into(),
+                index: 0,
+                plan_sha256: selected_candidate.plan_sha256.clone(),
+                observed_live: 0,
+                observed_failures: 0,
+                observed_invocations: 1,
+                policy_version: "fresh-account-effects-v2".into(),
+                eligible_accounts: vec!["recovering".into()],
+                quota_remaining_basis_points: Some(8000),
+            },
+            grant_id: marker_grant.clone(),
+            physical_q_sha256: "q".repeat(64),
+            physical_q_unix_nanos: old_healthy_q,
+            signal_kind: "QuotaExhaustedInband".into(),
+            outcome: TerminalOutcome::QuotaRejected,
+        };
+        durable_new(
+            temporary.path(),
+            &format!("{marker_grant}.terminal.json"),
+            &terminal_marker,
+        )
+        .unwrap();
+        let mut verification_binding = binding.clone();
+        verification_binding.handoff_id = uuid::Uuid::new_v4().to_string();
+        register_route_candidate(
+            temporary.path(),
+            &verification_binding,
+            &request(0, "recovering", &shell_script, Some(&auth_script)),
+            plan(
+                &image,
+                temporary.path(),
+                &File::open(&input).unwrap(),
+                vec!["--recovering".into()],
+                vec![],
+            )
+            .unwrap(),
+            FreshTerminalRecognizer::OpenAiCompat,
+        )
+        .unwrap();
+        let verify = effect(0, "recovering", FreshAccountEffectKind::QuotaFirst);
+        assert!(
+            reusable_quota_source(temporary.path(), &verification_binding, &verify)
+                .unwrap()
+                .is_none(),
+            "pre-rejection healthy Q was offered as marker verification"
+        );
+        begin_account_effect(
+            temporary.path(),
+            &verification_binding,
+            &verify,
+            &root,
+            &actor,
+            0,
+            0,
+        )
+        .unwrap();
+        let verify_dir = effect_directory(temporary.path(), &verification_binding, &verify);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let result =
+                observe_account_effect(temporary.path(), &verification_binding, &verify).unwrap();
+            if result.state == "drained" {
+                assert_eq!(result.outcome.as_deref(), Some("valid_windows"));
+                break;
+            }
+            assert!(Instant::now() < deadline, "new quota Q did not drain");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let verify_intent = effect_intent(&verify_dir).unwrap().unwrap();
+        let new_q = effect_physical_q_nanos(&verify_dir, &verify_intent).unwrap();
+        assert!(new_q > old_healthy_q);
+        let verify_candidate: RouteCandidate = exact_file(
+            temporary.path(),
+            &candidate_name(&verification_binding.handoff_id, 0),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            marker_allows_candidate(
+                temporary.path(),
+                &verification_binding,
+                &verify_candidate,
+                std::slice::from_ref(&terminal_marker),
+                Some(new_q),
+            )
+            .unwrap()
         );
         actor_child.kill().unwrap();
         actor_child.wait().unwrap();

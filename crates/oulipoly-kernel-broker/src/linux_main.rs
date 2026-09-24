@@ -4502,6 +4502,10 @@ fn serve_fresh_v30_at(
                                 &binding,
                                 &route_request,
                                 plan,
+                                fresh_provider::terminal_recognizer_from_source(
+                                    &config_dir,
+                                    &route_request,
+                                )?,
                             )?;
                             return Ok("fresh-route-registered\n".into());
                         }
