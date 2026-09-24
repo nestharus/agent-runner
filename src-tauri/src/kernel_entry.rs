@@ -821,34 +821,35 @@ fn private_verified_output(
 
 #[cfg(feature = "age319-private-broker-fixture")]
 fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode, String> {
-    use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig};
-    use oulipoly_runtime::executor::cli::fresh_remote::execute_fresh_headless;
-    let args = match &authority.receipt.root_work_intent {
-        oulipoly_state::mailbox::FreshRootWorkIntent::NormalCli(args)
-            if matches!(args.as_slice(), [flag, model, _prompt]
-                if flag == "--model" && model == "fixture-model") =>
-        {
-            args
-        }
-        _ => return Err("private provider requires exact fixture model/prompt syntax".into()),
+    use oulipoly_runtime::executor::cli::fresh_remote::{
+        execute_fresh_headless, load_configured_fresh_headless,
+    };
+    let (model_name, provider_pin, prompt) = match &authority.receipt.root_work_intent {
+        oulipoly_state::mailbox::FreshRootWorkIntent::NormalCli(args) => match args.as_slice() {
+            [flag, model, prompt] if flag == "--model" => (model.as_str(), None, prompt.as_str()),
+            [flag, model, pin_flag, pin, prompt]
+                if flag == "--model" && pin_flag == "--pin-provider" =>
+            {
+                (model.as_str(), Some(pin.as_str()), prompt.as_str())
+            }
+            _ => return Err("fresh provider CLI shape unsupported before K".into()),
+        },
+        _ => return Err("fresh provider root intent unsupported before K".into()),
     };
     if authority.session.session_id.is_empty() || authority.receipt.d_key.is_empty() {
         return Err("private fresh entry authority incomplete".into());
     }
-    let image = std::env::var("AGE319_PRIVATE_PROVIDER_IMAGE_V1")
-        .map_err(|_| "private provider image absent")?;
-    let marker = std::env::var("AGE319_PRIVATE_PROVIDER_MARKER_V1")
-        .map_err(|_| "private provider marker absent")?;
-    let model = ModelConfig {
-        name: "fixture-model".into(),
-        prompt_mode: PromptMode::Stdin,
-        providers: vec![ProviderConfig::new(image, vec![marker])],
-        inputs: Vec::new(),
-        provider: None,
-    };
+    let config_dir = oulipoly_state::paths::config_dir()?;
+    let selected = load_configured_fresh_headless(&config_dir, model_name, provider_pin)?;
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let mut backend = PrivateFreshBroker { authority };
-    let result = execute_fresh_headless(&model, 0, &args[2], &cwd, &mut backend)?;
+    let result = execute_fresh_headless(
+        &selected.model,
+        selected.provider_index,
+        prompt,
+        &cwd,
+        &mut backend,
+    )?;
     let gate = std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
         .map_err(|_| "private provider gate directory absent")?;
     let witness = serde_json::json!({
@@ -857,6 +858,8 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
         "stdout": String::from_utf8_lossy(&result.stdout),
         "stderr": result.stderr,
         "provider_index": result.provider_index,
+        "model": selected.model.name,
+        "provider": selected.provider_name,
         "terminal_reason": result.terminal_reason,
     });
     std::fs::write(
