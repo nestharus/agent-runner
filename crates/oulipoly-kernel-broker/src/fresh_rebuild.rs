@@ -297,6 +297,7 @@ pub(crate) fn offline_snapshot(root: &Path, source: &Path) -> io::Result<Offline
                     ProviderGrant {
                         decision_handoff: handoff.to_owned(),
                         grant: artifact(root, &grant_name)?,
+                        candidate: Some(artifact(root, candidate_name(handoff, candidate.index))?),
                         consumed_k,
                         certified_q: None,
                     },
@@ -570,6 +571,12 @@ pub(crate) fn reconcile_offline_account(
             terminal: Some(artifact(root, format!("{}.terminal.json", id))?),
             completed_unix_nanos,
         };
+        if let Some(previous) = &indexed.certified_q {
+            if previous != &q {
+                return Err(invalid("reconcile provider Q changed"));
+            }
+            continue;
+        }
         let marker = match outcome {
             TerminalOutcome::QuotaRejected => Some(TerminalMarkerKind::Quota),
             TerminalOutcome::AuthRejected => Some(TerminalMarkerKind::Auth),
@@ -1110,7 +1117,10 @@ mod tests {
         let after = index
             .reconcile_offline_account("physical-first", &fixture.source)
             .unwrap();
-        assert!(!after.grants.contains_key(&fixture.grant.id));
+        assert_eq!(
+            after.grants[&fixture.grant.id].certified_q,
+            before.grants[&fixture.grant.id].certified_q
+        );
         assert_eq!(after.observed_invocations, 1);
         assert_eq!(
             after.markers.model_capacity_nanos,
@@ -1121,8 +1131,9 @@ mod tests {
                 .unwrap()
                 .account("physical-first")
                 .unwrap()
-                .grants
-                .is_empty()
+                .grants[&fixture.grant.id]
+                .certified_q
+                .is_some()
         );
     }
 

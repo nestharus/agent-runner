@@ -1,9 +1,10 @@
 //! Broker-owned evidence index and detached frozen rebuild. The private broker
-//! holds the admission lease, but live route/effect writers and readers remain
-//! on retained files. Index Q pointers are published only after source-level
-//! certification; their hashes alone do not certify physical completion.
+//! holds the admission lease. The fixture route and original root provider
+//! writers mirror exact evidence here; routing and effect/manual readers still
+//! use retained files. Index Q pointers follow physical certification and a
+//! typed terminal marker; their hashes alone do not certify completion.
 //!
-//! Lock order for a future same-broker cutover: route lock, then account locks
+//! Lock order for a same-broker cutover: route lock, then account locks
 //! in sorted physical-key order. Grant/effect admission takes only its account
 //! lock. PID1 Q takes no index lock. Never acquire route lock from an account
 //! lock. Each operation here takes its own required lock; a caller holding an
@@ -550,6 +551,8 @@ impl Index {
             Self::open(root)?
         };
         index.validate_live_routes()?;
+        super::fresh_provider::reconcile_live_provider_accounts(&index)
+            .map_err(|error| corrupt(format!("live provider account admission: {error}")))?;
         Ok(index)
     }
 
@@ -1268,6 +1271,8 @@ impl Artifact {
 pub(super) struct ProviderGrant {
     pub decision_handoff: String,
     pub grant: Artifact,
+    #[serde(default)]
+    pub candidate: Option<Artifact>,
     pub consumed_k: Option<Artifact>,
     #[serde(default)]
     pub certified_q: Option<PhysicalQ>,
@@ -1375,6 +1380,9 @@ impl Index {
         // from a filename; Q/terminal pointers here are externally certified.
         for grant in account.grants.values() {
             grant.grant.validate()?;
+            if let Some(candidate) = &grant.candidate {
+                candidate.require_present(&self.root)?;
+            }
             if let Some(k) = &grant.consumed_k {
                 grant.grant.require_present(&self.root)?;
                 k.require_present(&self.root)?;
@@ -1415,6 +1423,47 @@ impl Index {
             }
         }
         Ok(account)
+    }
+    pub(super) fn live_account_keys(&self) -> Result<Vec<String>> {
+        self.check_generation()?;
+        let mut keys = Vec::new();
+        for entry in fs::read_dir(self.base().join("accounts"))? {
+            let path = entry?.path();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| corrupt("account entry name"))?;
+            if !name.ends_with(".known.json") {
+                continue;
+            }
+            let marker: KnownKey<String> =
+                read(&path)?.ok_or_else(|| corrupt("account marker absent"))?;
+            if marker.generation != self.generation
+                || path != self.known_path("accounts", &marker.key)?
+            {
+                return Err(corrupt("account marker key changed"));
+            }
+            self.account(&marker.key)?;
+            keys.push(marker.key);
+        }
+        let records = keys
+            .iter()
+            .map(|key| self.key_path("accounts", key))
+            .collect::<Result<std::collections::HashSet<_>>>()?;
+        for entry in fs::read_dir(self.base().join("accounts"))? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|ext| ext == "json")
+                && !path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with(".known.json"))
+                && path.metadata()?.len() != 0
+                && !records.contains(&path)
+            {
+                return Err(corrupt("unmarked account record"));
+            }
+        }
+        Ok(keys)
     }
     /// One exact CAS. No silent field overwrite; only the defined state
     /// transitions below may be submitted. The caller retains the previous
@@ -1472,8 +1521,11 @@ impl Index {
             } => {
                 let grant = a
                     .grants
-                    .get(&id)
+                    .get_mut(&id)
                     .ok_or(IndexError::Conflict("grant absent"))?;
+                if grant.certified_q.is_some() {
+                    return Err(IndexError::Conflict("provider Q already certified"));
+                }
                 let k = grant
                     .consumed_k
                     .as_ref()
@@ -1482,7 +1534,11 @@ impl Index {
                     return Err(IndexError::Conflict("provider Q/K or terminal mismatch"));
                 }
                 q.verify(&self.root)?;
-                a.grants.remove(&id);
+                // Keep the exact settled identity for admission readback. A
+                // physical K with no indexed ID must never resemble a grant
+                // whose Q was already projected. The record bound fails closed
+                // before a later K if retained history grows too large.
+                grant.certified_q = Some(q.clone());
                 if let Some(kind) = marker {
                     let target = match kind {
                         TerminalMarkerKind::Quota => &mut a.markers.quota_rejection_nanos,
@@ -2005,6 +2061,7 @@ mod tests {
                     grant: ProviderGrant {
                         decision_handoff: "d".into(),
                         grant: grant.clone(),
+                        candidate: None,
                         consumed_k: None,
                         certified_q: None,
                     },
@@ -2144,7 +2201,16 @@ mod tests {
         assert_eq!(a.observed_invocations, 1);
         assert_eq!(a.recent_failure_nanos, vec![10]);
         assert_eq!(a.markers.quota_rejection_nanos, Some(10));
-        assert!(a.grants.is_empty());
+        assert!(a.grants["g"].certified_q.is_some());
+        assert_eq!(
+            a.source_q[&keyed(&source).unwrap()]
+                .latest_quota_q
+                .as_ref()
+                .unwrap()
+                .completed_unix_nanos,
+            20,
+            "an older provider terminal cannot replace newer source Q",
+        );
         assert_eq!(
             Index::open(temp.path())
                 .unwrap()
@@ -2171,6 +2237,7 @@ mod tests {
                     grant: ProviderGrant {
                         decision_handoff: "d".into(),
                         grant: future_artifact("grant", b"x"),
+                        candidate: None,
                         consumed_k: None,
                         certified_q: None,
                     },
@@ -2280,6 +2347,7 @@ mod tests {
                     grant: ProviderGrant {
                         decision_handoff: "model-capacity-decision".into(),
                         grant: future_artifact("model-capacity-grant", b"G"),
+                        candidate: None,
                         consumed_k: None,
                         certified_q: None,
                     },

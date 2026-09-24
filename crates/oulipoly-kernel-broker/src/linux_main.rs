@@ -2,8 +2,8 @@
 #[cfg(feature = "age319-private-broker-fixture")]
 #[path = "fresh_provider.rs"]
 mod fresh_provider;
-// Offline AGE-319 substrate; only the broker-lifetime admission freeze lease
-// touches the live lane. Selectors and effect writers do not consume the index.
+// Opt-in AGE-319 route and original-provider writer index. Account/effect/manual
+// eligibility readers still use retained evidence; this is not activation.
 #[cfg(feature = "age319-private-broker-fixture")]
 #[path = "fresh_index.rs"]
 #[allow(dead_code)]
@@ -4583,12 +4583,18 @@ fn serve_fresh_v30_at(
                                 .require_live_route(&binding.handoff_id)
                                 .map_err(io::Error::other)?;
                         }
-                        let prepared = fresh_provider::prepare(&directory, binding, plan)?;
+                        let mut prepared = fresh_provider::prepare(&directory, binding, plan)?;
                         if let Some(index) = route_index.as_ref() {
-                            prepared.require_indexed_route(index)?;
+                            prepared.announce_indexed_grant(index)?;
                         }
-                        let grant =
-                            fresh_provider::launch(prepared, &root, &actor, actor_uid, actor_gid)?;
+                        let grant = fresh_provider::launch(
+                            prepared,
+                            &root,
+                            &actor,
+                            actor_uid,
+                            actor_gid,
+                            route_index.as_ref(),
+                        )?;
                         if std::env::var_os(
                             "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_PROVIDER_K_REPLY_V1",
                         )
@@ -4616,6 +4622,11 @@ fn serve_fresh_v30_at(
                     if operation == b'7' {
                         fresh_provider::cancel(&directory, &grant)?;
                         return Ok(format!("fresh-provider-cancel {grant}\n"));
+                    }
+                    if let Some(index) = route_index.as_ref() {
+                        fresh_provider::reconcile_indexed_provider_binding(
+                            index, &directory, &binding,
+                        )?;
                     }
                     let result = match fresh_provider::observe(&directory, &grant)? {
                         fresh_provider::Observation::Unknown => {

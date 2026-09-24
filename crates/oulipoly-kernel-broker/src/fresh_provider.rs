@@ -3,7 +3,10 @@
 //! ordinary CLI route remains closed; a private typed runtime backend consumes
 //! its Q-gated readbacks without publishing terminal success.
 use super::work_launch;
-use crate::linux_main::fresh_index::{CursorKey, Decision, Index};
+use crate::linux_main::fresh_index::{
+    AccountUpdate, Artifact, CursorKey, Decision, Index, PhysicalQ, ProviderGrant,
+    TerminalMarkerKind,
+};
 use chrono::{DateTime, Utc};
 use oulipoly_kernel_broker::identity::{PinnedProcess, host_proc_file, observed_incarnation_gone};
 use oulipoly_kernel_broker::protocol::{
@@ -422,6 +425,7 @@ pub(super) struct Prepared {
     grant: Grant,
     plan: Plan,
     directory: PathBuf,
+    indexed_account: Option<String>,
 }
 
 impl Prepared {
@@ -430,6 +434,262 @@ impl Prepared {
             .require_live_route(&self.grant.binding.handoff_id)
             .map_err(io::Error::other)
     }
+
+    pub(super) fn announce_indexed_grant(&mut self, index: &Index) -> io::Result<()> {
+        self.require_indexed_route(index)?;
+        let account = reconcile_indexed_provider_grant(index, &self.grant)?;
+        let indexed = index.account(&account).map_err(io::Error::other)?;
+        let grant = indexed
+            .grants
+            .get(&self.grant.id)
+            .ok_or_else(|| io::Error::other("indexed provider grant announcement absent"))?;
+        if grant.consumed_k.is_some() || grant.certified_q.is_some() {
+            return Err(io::Error::other("indexed provider grant already consumed"));
+        }
+        self.indexed_account = Some(account);
+        Ok(())
+    }
+}
+
+fn provider_artifact(root: &Path, name: &str) -> io::Result<Artifact> {
+    Artifact::from_existing(root, Path::new(name)).map_err(io::Error::other)
+}
+
+/// Reconcile only an original root grant. The exact route receipt fixes the
+/// physical account across models; effect and manual grants live elsewhere.
+fn reconcile_indexed_provider_grant(index: &Index, grant: &Grant) -> io::Result<String> {
+    let root = index.evidence_root();
+    index
+        .require_live_route(&grant.binding.handoff_id)
+        .map_err(io::Error::other)?;
+    let decision: RouteDecision = exact_file(root, &decision_name(&grant.binding.handoff_id))?
+        .ok_or_else(|| io::Error::other("indexed provider decision absent"))?;
+    let candidate: RouteCandidate = exact_file(
+        root,
+        &candidate_name(&grant.binding.handoff_id, decision.selection.index),
+    )?
+    .ok_or_else(|| io::Error::other("indexed provider candidate absent"))?;
+    if grant.version != 1
+        || grant.binding != decision.binding
+        || grant.plan_sha256 != decision.selection.plan_sha256
+        || candidate.version != 3
+        || candidate.binding != decision.binding
+        || candidate.account_identity != decision.selection.account_identity
+        || candidate.account != decision.selection.account
+        || candidate.model != decision.selection.model
+        || candidate.config_sha256 != decision.selection.config_sha256
+        || candidate.plan_sha256 != grant.plan_sha256
+    {
+        return Err(io::Error::other(
+            "indexed provider grant/intent/account changed",
+        ));
+    }
+    let key = candidate.account_identity.clone();
+    let grant_name = format!("{}.fresh-grant.json", grant.binding.handoff_id);
+    let retained: Grant = exact_file(root, &grant_name)?
+        .ok_or_else(|| io::Error::other("physical provider grant absent"))?;
+    if retained != *grant {
+        return Err(io::Error::other("physical provider grant changed"));
+    }
+    let grant_artifact = provider_artifact(root, &grant_name)?;
+    let candidate_artifact = provider_artifact(
+        root,
+        &candidate_name(&grant.binding.handoff_id, decision.selection.index),
+    )?;
+    let k_name = format!("{}.consumed.json", grant.id);
+    let k = exact_file::<Grant>(root, &k_name)?;
+    if k.as_ref().is_some_and(|k| k != grant) {
+        return Err(io::Error::other("physical provider K differs from grant"));
+    }
+    let mut account = index.account(&key).map_err(io::Error::other)?;
+    if let Some(existing) = account.grants.get(&grant.id) {
+        if existing.decision_handoff != grant.binding.handoff_id
+            || existing.grant != grant_artifact
+            || existing.candidate.as_ref() != Some(&candidate_artifact)
+        {
+            return Err(io::Error::other("indexed provider grant identity changed"));
+        }
+    } else {
+        if k.is_some() {
+            return Err(io::Error::other(
+                "physical provider K lacks indexed announcement",
+            ));
+        }
+        let announced = ProviderGrant {
+            decision_handoff: grant.binding.handoff_id.clone(),
+            grant: grant_artifact.clone(),
+            candidate: Some(candidate_artifact),
+            consumed_k: None,
+            certified_q: None,
+        };
+        let update = AccountUpdate::AnnounceGrant {
+            id: grant.id.clone(),
+            grant: announced.clone(),
+        };
+        let result = index.update_account(&key, account.revision, update);
+        account = index.account(&key).map_err(io::Error::other)?;
+        if account.grants.get(&grant.id) != Some(&announced) {
+            return Err(io::Error::other(format!(
+                "indexed provider grant publication failed: {result:?}"
+            )));
+        }
+    }
+    if k.is_some() {
+        let k_artifact = provider_artifact(root, &k_name)?;
+        let indexed = account.grants.get(&grant.id).unwrap();
+        match &indexed.consumed_k {
+            Some(old) if old != &k_artifact => {
+                return Err(io::Error::other("indexed provider K changed"));
+            }
+            None => {
+                let result = index.update_account(
+                    &key,
+                    account.revision,
+                    AccountUpdate::ConsumeGrant {
+                        id: grant.id.clone(),
+                        k: k_artifact.clone(),
+                    },
+                );
+                account = index.account(&key).map_err(io::Error::other)?;
+                if account
+                    .grants
+                    .get(&grant.id)
+                    .and_then(|g| g.consumed_k.as_ref())
+                    != Some(&k_artifact)
+                {
+                    return Err(io::Error::other(format!(
+                        "indexed provider K publication failed: {result:?}"
+                    )));
+                }
+            }
+            Some(_) => {}
+        }
+        let q_name = format!("{}.drain.json", grant.id);
+        if root.join(&q_name).exists() {
+            let Observation::Drained {
+                status,
+                stdout,
+                stderr,
+                cancelled,
+                ..
+            } = observe(root, &grant.id)?
+            else {
+                return Err(io::Error::other(
+                    "indexed provider Q lacks physical certification",
+                ));
+            };
+            let terminal = terminal_record(
+                root, &decision, &candidate, grant, status, stdout, stderr, cancelled,
+            )?;
+            let q = PhysicalQ {
+                physical_k: k_artifact,
+                q: provider_artifact(root, &q_name)?,
+                terminal: Some(provider_artifact(
+                    root,
+                    &format!("{}.terminal.json", grant.id),
+                )?),
+                completed_unix_nanos: i64::try_from(terminal.physical_q_unix_nanos)
+                    .map_err(io::Error::other)?,
+            };
+            let indexed = account.grants.get(&grant.id).unwrap();
+            if let Some(old) = &indexed.certified_q {
+                if old != &q {
+                    return Err(io::Error::other("indexed provider Q/terminal changed"));
+                }
+            } else {
+                let marker = match terminal.outcome {
+                    TerminalOutcome::QuotaRejected => Some(TerminalMarkerKind::Quota),
+                    TerminalOutcome::AuthRejected => Some(TerminalMarkerKind::Auth),
+                    TerminalOutcome::ModelAtCapacity => Some(TerminalMarkerKind::ModelCapacity),
+                    _ => None,
+                };
+                let result = index.update_account(
+                    &key,
+                    account.revision,
+                    AccountUpdate::SettleGrant {
+                        id: grant.id.clone(),
+                        q: q.clone(),
+                        failed: status != 0
+                            && file_age_less_than(
+                                &root.join(&q_name),
+                                Duration::from_secs(30 * 60),
+                            )?,
+                        marker,
+                    },
+                );
+                account = index.account(&key).map_err(io::Error::other)?;
+                if account
+                    .grants
+                    .get(&grant.id)
+                    .and_then(|g| g.certified_q.as_ref())
+                    != Some(&q)
+                {
+                    return Err(io::Error::other(format!(
+                        "indexed provider Q publication failed: {result:?}"
+                    )));
+                }
+            }
+        } else if account
+            .grants
+            .get(&grant.id)
+            .and_then(|g| g.certified_q.as_ref())
+            .is_some()
+            || root.join(format!("{}.terminal.json", grant.id)).exists()
+        {
+            return Err(io::Error::other("indexed provider terminal without Q"));
+        }
+    } else if root.join(format!("{}.drain.json", grant.id)).exists() {
+        return Err(io::Error::other("physical provider Q precedes K"));
+    }
+    Ok(key)
+}
+
+pub(super) fn reconcile_live_provider_accounts(index: &Index) -> io::Result<()> {
+    let root = index.evidence_root();
+    for key in index.live_account_keys().map_err(io::Error::other)? {
+        let account = index.account(&key).map_err(io::Error::other)?;
+        for grant in account.grants.values() {
+            if !root
+                .join(format!("{}.fresh-grant.json", grant.decision_handoff))
+                .exists()
+            {
+                return Err(io::Error::other("indexed provider grant artifact absent"));
+            }
+        }
+    }
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(handoff) = name
+            .to_str()
+            .and_then(|n| n.strip_suffix(".fresh-grant.json"))
+        else {
+            continue;
+        };
+        let grant: Grant = exact_file(root, &format!("{handoff}.fresh-grant.json"))?
+            .ok_or_else(|| io::Error::other("physical provider grant disappeared"))?;
+        if grant.binding.handoff_id != handoff {
+            return Err(io::Error::other("physical provider grant filename changed"));
+        }
+        reconcile_indexed_provider_grant(index, &grant)?;
+    }
+    Ok(())
+}
+
+pub(super) fn reconcile_indexed_provider_binding(
+    index: &Index,
+    root: &Path,
+    binding: &Binding,
+) -> io::Result<()> {
+    let grant: Grant = exact_file(root, &format!("{}.fresh-grant.json", binding.handoff_id))?
+        .ok_or_else(|| io::Error::other("physical provider grant absent"))?;
+    if grant.binding != *binding {
+        return Err(io::Error::other(
+            "physical provider readback binding changed",
+        ));
+    }
+    reconcile_indexed_provider_grant(index, &grant)?;
+    Ok(())
 }
 
 fn durable_new<T: Serialize>(directory: &Path, name: &str, value: &T) -> io::Result<()> {
@@ -1504,7 +1764,7 @@ pub(super) fn begin_account_effect(
     };
     durable_new(&dir, "intent.json", &intent)?;
     let prepared = prepare(&dir, binding.clone(), plan)?;
-    launch(prepared, root, actor, uid, gid)?;
+    launch(prepared, root, actor, uid, gid, None)?;
     effect_readback_from_dir(&dir, &intent)
 }
 
@@ -2722,6 +2982,7 @@ pub(super) fn prepare(directory: &Path, binding: Binding, plan: Plan) -> io::Res
         grant,
         plan,
         directory: directory.to_owned(),
+        indexed_account: None,
     })
 }
 
@@ -3078,6 +3339,7 @@ pub(super) fn launch(
     actor: &PinnedProcess,
     uid: u32,
     gid: u32,
+    index: Option<&Index>,
 ) -> io::Result<String> {
     root.verify()?;
     actor.verify()?;
@@ -3103,6 +3365,16 @@ pub(super) fn launch(
     if prepared.plan.digest != prepared.grant.plan_sha256 {
         return Err(io::Error::other("fresh provider plan changed before K"));
     }
+    if let Some(index) = index {
+        prepared.require_indexed_route(index)?;
+        if prepared.indexed_account.as_deref()
+            != Some(reconcile_indexed_provider_grant(index, &prepared.grant)?.as_str())
+        {
+            return Err(io::Error::other(
+                "indexed provider account changed before K",
+            ));
+        }
+    }
     if prepared
         .directory
         .join(decision_name(&b.handoff_id))
@@ -3115,6 +3387,11 @@ pub(super) fn launch(
         &format!("{}.consumed.json", prepared.grant.id),
         &prepared.grant,
     )?;
+    if let Some(index) = index {
+        // The provider child has not been created. A failed publication leaves
+        // one-use K debt, but cannot release the executable.
+        reconcile_indexed_provider_grant(index, &prepared.grant)?;
+    }
     let stdout = OpenOptions::new()
         .read(true)
         .write(true)
@@ -4228,6 +4505,364 @@ mod tests {
     }
 
     #[test]
+    fn indexed_provider_grant_announced_before_k_and_recovered_after_lost_reply() {
+        use crate::linux_main::fresh_index::{Index, broker_admission_lease};
+        let temp = tempfile::tempdir().unwrap();
+        let broker = temp.path().join("broker");
+        std::fs::create_dir(&broker).unwrap();
+        let wal = temp.path().join("state.db-wal");
+        std::fs::write(&wal, b"old WAL").unwrap();
+        let lease = broker_admission_lease(&broker).unwrap();
+        let index = Index::admit_live_routes(&broker, &lease).unwrap();
+        let process = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+        let binding = fixture_binding(&process, &process);
+        let request = register_unmetered_route(&broker, &binding, None);
+        let selected = select_route_with_index(&broker, &binding, &request, Some(&index)).unwrap();
+        let grant = Grant {
+            version: 1,
+            id: uuid::Uuid::new_v4().to_string(),
+            binding: binding.clone(),
+            plan_sha256: selected.plan_sha256,
+        };
+        durable_new(
+            &broker,
+            &format!("{}.fresh-grant.json", binding.handoff_id),
+            &grant,
+        )
+        .unwrap();
+        assert_eq!(
+            reconcile_indexed_provider_grant(&index, &grant).unwrap(),
+            "first"
+        );
+        let before = index.account("first").unwrap();
+        assert!(before.grants[&grant.id].consumed_k.is_none());
+        assert!(!broker.join(format!("{}.consumed.json", grant.id)).exists());
+        durable_new(&broker, &format!("{}.consumed.json", grant.id), &grant).unwrap();
+        // Simulate a lost publication reply: the next readback accepts only
+        // this exact K and cannot count the invocation twice.
+        reconcile_indexed_provider_grant(&index, &grant).unwrap();
+        reconcile_indexed_provider_grant(&index, &grant).unwrap();
+        assert_eq!(index.account("first").unwrap().observed_invocations, 1);
+        let restarted = Index::admit_live_routes(&broker, &lease).unwrap();
+        assert_eq!(restarted.account("first").unwrap().observed_invocations, 1);
+        assert!(
+            restarted.account("first").unwrap().grants[&grant.id]
+                .certified_q
+                .is_none()
+        );
+        assert_eq!(std::fs::read(wal).unwrap(), b"old WAL");
+        let candidate = broker.join(candidate_name(&binding.handoff_id, 0));
+        std::fs::write(&candidate, b"changed source candidate").unwrap();
+        assert!(reconcile_indexed_provider_grant(&restarted, &grant).is_err());
+        assert!(Index::admit_live_routes(&broker, &lease).is_err());
+    }
+
+    #[test]
+    fn indexed_provider_failed_announcement_blocks_k_and_accounts_stay_isolated() {
+        use crate::linux_main::fresh_index::{Index, broker_admission_lease};
+        let temp = tempfile::tempdir().unwrap();
+        let broker = temp.path().join("broker");
+        std::fs::create_dir(&broker).unwrap();
+        let lease = broker_admission_lease(&broker).unwrap();
+        let index = Index::admit_live_routes(&broker, &lease).unwrap();
+        let process = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+        let first_binding = fixture_binding(&process, &process);
+        let first_request = register_unmetered_route(&broker, &first_binding, None);
+        let first =
+            select_route_with_index(&broker, &first_binding, &first_request, Some(&index)).unwrap();
+        let second_binding = fixture_binding(&process, &process);
+        let second_request = register_unmetered_route(&broker, &second_binding, Some("second"));
+        let second =
+            select_route_with_index(&broker, &second_binding, &second_request, Some(&index))
+                .unwrap();
+        assert_eq!(second.account_identity, "second");
+        let first_grant = Grant {
+            version: 1,
+            id: uuid::Uuid::new_v4().to_string(),
+            binding: first_binding.clone(),
+            plan_sha256: first.plan_sha256,
+        };
+        durable_new(
+            &broker,
+            &format!("{}.fresh-grant.json", first_binding.handoff_id),
+            &first_grant,
+        )
+        .unwrap();
+        reconcile_indexed_provider_grant(&index, &first_grant).unwrap();
+        durable_new(
+            &broker,
+            &format!("{}.consumed.json", first_grant.id),
+            &first_grant,
+        )
+        .unwrap();
+        reconcile_indexed_provider_grant(&index, &first_grant).unwrap();
+
+        let second_grant = Grant {
+            version: 1,
+            id: uuid::Uuid::new_v4().to_string(),
+            binding: second_binding.clone(),
+            plan_sha256: second.plan_sha256,
+        };
+        durable_new(
+            &broker,
+            &format!("{}.fresh-grant.json", second_binding.handoff_id),
+            &second_grant,
+        )
+        .unwrap();
+        // A damaged generation manifest makes publication fail. The caller never
+        // reaches K, and the other physical account remains independently 1.
+        let manifest = broker.join("index-v1/manifest.json");
+        let original = std::fs::read(&manifest).unwrap();
+        std::fs::write(&manifest, b"broken").unwrap();
+        assert!(reconcile_indexed_provider_grant(&index, &second_grant).is_err());
+        assert!(
+            !broker
+                .join(format!("{}.consumed.json", second_grant.id))
+                .exists()
+        );
+        std::fs::write(&manifest, original).unwrap();
+        assert_eq!(index.account("first").unwrap().observed_invocations, 1);
+        assert_eq!(index.account("second").unwrap().observed_invocations, 0);
+    }
+
+    #[test]
+    fn indexed_provider_account_key_is_shared_across_models() {
+        use crate::linux_main::fresh_index::{Index, broker_admission_lease};
+        let temp = tempfile::tempdir().unwrap();
+        let broker = temp.path().join("broker");
+        std::fs::create_dir(&broker).unwrap();
+        let lease = broker_admission_lease(&broker).unwrap();
+        let index = Index::admit_live_routes(&broker, &lease).unwrap();
+        let process = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+        let first_binding = fixture_binding(&process, &process);
+        let first_request = register_unmetered_route(&broker, &first_binding, None);
+        let first =
+            select_route_with_index(&broker, &first_binding, &first_request, Some(&index)).unwrap();
+        let second_binding = fixture_binding(&process, &process);
+        let second_candidate = RouteCandidate {
+            version: 3,
+            binding: second_binding.clone(),
+            model: "other-model".into(),
+            config_sha256: "d".repeat(64),
+            account: "alias".into(),
+            account_identity: "first".into(),
+            index: 0,
+            total: 1,
+            pin: None,
+            plan_sha256: "e".repeat(64),
+            quota_script: None,
+            auth_refresh_command: None,
+            terminal_recognizer: FreshTerminalRecognizer::OpenCode,
+        };
+        durable_new(
+            &broker,
+            &candidate_name(&second_binding.handoff_id, 0),
+            &second_candidate,
+        )
+        .unwrap();
+        let second_request = FreshRouteRequest {
+            protocol_version: 4,
+            d_key: uuid::Uuid::new_v4().to_string(),
+            model: "other-model".into(),
+            config_sha256: "d".repeat(64),
+            account: None,
+            account_identity: None,
+            index: None,
+            total: 1,
+            pin: None,
+            quota_script: None,
+            auth_refresh_command: None,
+        };
+        let second =
+            select_route_with_index(&broker, &second_binding, &second_request, Some(&index))
+                .unwrap();
+        assert_eq!(second.account_identity, first.account_identity);
+        for (binding, selected) in [(&first_binding, first), (&second_binding, second)] {
+            let grant = Grant {
+                version: 1,
+                id: uuid::Uuid::new_v4().to_string(),
+                binding: binding.clone(),
+                plan_sha256: selected.plan_sha256,
+            };
+            durable_new(
+                &broker,
+                &format!("{}.fresh-grant.json", binding.handoff_id),
+                &grant,
+            )
+            .unwrap();
+            assert_eq!(
+                reconcile_indexed_provider_grant(&index, &grant).unwrap(),
+                "first"
+            );
+            durable_new(&broker, &format!("{}.consumed.json", grant.id), &grant).unwrap();
+            reconcile_indexed_provider_grant(&index, &grant).unwrap();
+        }
+        let account = index.account("first").unwrap();
+        assert_eq!(account.observed_invocations, 2);
+        assert_eq!(account.grants.len(), 2);
+    }
+
+    #[test]
+    fn indexed_provider_uncertified_q_retains_exact_k_without_terminal() {
+        use crate::linux_main::fresh_index::{Index, broker_admission_lease};
+        let temp = tempfile::tempdir().unwrap();
+        let broker = temp.path().join("broker");
+        std::fs::create_dir(&broker).unwrap();
+        let lease = broker_admission_lease(&broker).unwrap();
+        let index = Index::admit_live_routes(&broker, &lease).unwrap();
+        let process = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+        let binding = fixture_binding(&process, &process);
+        let request = register_unmetered_route(&broker, &binding, None);
+        let selected = select_route_with_index(&broker, &binding, &request, Some(&index)).unwrap();
+        let grant = Grant {
+            version: 1,
+            id: uuid::Uuid::new_v4().to_string(),
+            binding: binding.clone(),
+            plan_sha256: selected.plan_sha256,
+        };
+        durable_new(
+            &broker,
+            &format!("{}.fresh-grant.json", binding.handoff_id),
+            &grant,
+        )
+        .unwrap();
+        reconcile_indexed_provider_grant(&index, &grant).unwrap();
+        durable_new(&broker, &format!("{}.consumed.json", grant.id), &grant).unwrap();
+        reconcile_indexed_provider_grant(&index, &grant).unwrap();
+        std::fs::write(
+            broker.join(format!("{}.drain.json", grant.id)),
+            b"unverified Q",
+        )
+        .unwrap();
+        assert!(reconcile_indexed_provider_grant(&index, &grant).is_err());
+        let retained = index.account("first").unwrap();
+        assert!(retained.grants[&grant.id].consumed_k.is_some());
+        assert!(retained.grants[&grant.id].certified_q.is_none());
+        assert!(!broker.join(format!("{}.terminal.json", grant.id)).exists());
+        assert!(Index::admit_live_routes(&broker, &lease).is_err());
+    }
+
+    #[test]
+    fn indexed_provider_q_waits_for_drain_witness_then_records_typed_terminal_once() {
+        use crate::linux_main::fresh_index::{Index, broker_admission_lease};
+        let temp = tempfile::tempdir().unwrap();
+        let broker = temp.path().join("broker");
+        std::fs::create_dir(&broker).unwrap();
+        let lease = broker_admission_lease(&broker).unwrap();
+        let index = Index::admit_live_routes(&broker, &lease).unwrap();
+        let process = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+        let binding = fixture_binding(&process, &process);
+        let request = register_unmetered_route(&broker, &binding, None);
+        let selected = select_route_with_index(&broker, &binding, &request, Some(&index)).unwrap();
+        let grant = Grant {
+            version: 1,
+            id: uuid::Uuid::new_v4().to_string(),
+            binding: binding.clone(),
+            plan_sha256: selected.plan_sha256,
+        };
+        durable_new(
+            &broker,
+            &format!("{}.fresh-grant.json", binding.handoff_id),
+            &grant,
+        )
+        .unwrap();
+        reconcile_indexed_provider_grant(&index, &grant).unwrap();
+        durable_new(&broker, &format!("{}.consumed.json", grant.id), &grant).unwrap();
+        reconcile_indexed_provider_grant(&index, &grant).unwrap();
+
+        // Synthetic immutable PID1 receipts exercise the same independent
+        // observe() validator used for actual drains; no terminal is authored
+        // by the test before that validator succeeds.
+        let work_id = uuid::Uuid::new_v4().to_string();
+        let missing_pid = 999_999_999;
+        durable_new(
+            &broker,
+            &format!("{}.attach.json", grant.id),
+            &Attach {
+                version: 1,
+                grant_id: grant.id.clone(),
+                work_id: work_id.clone(),
+                pid1: missing_pid,
+                pid1_starttime: 1,
+                pidns_dev: 0,
+                pidns_ino: 0,
+                pid1_parent_namespace_pid: missing_pid,
+                provider_pid: missing_pid,
+                provider_starttime: 1,
+                provider_local_pid: 2,
+            },
+        )
+        .unwrap();
+        std::fs::write(broker.join(format!("{}.stdout", grant.id)), b"").unwrap();
+        std::fs::write(
+            broker.join(format!("{}.stderr", grant.id)),
+            br#"{"type":"error","error":{"data":{"message":"quota exhausted for account"}}}"#,
+        )
+        .unwrap();
+        let stdout =
+            output(&File::open(broker.join(format!("{}.stdout", grant.id))).unwrap()).unwrap();
+        let stderr =
+            output(&File::open(broker.join(format!("{}.stderr", grant.id))).unwrap()).unwrap();
+        durable_new(
+            &broker,
+            &format!("{}.drain.json", grant.id),
+            &Drain {
+                version: 1,
+                grant_id: grant.id.clone(),
+                work_id: work_id.clone(),
+                stdout,
+                stderr,
+                cancelled: false,
+                zero_remaining: true,
+            },
+        )
+        .unwrap();
+        assert!(reconcile_indexed_provider_grant(&index, &grant).is_err());
+        assert!(
+            index.account("first").unwrap().grants[&grant.id]
+                .certified_q
+                .is_none()
+        );
+        assert!(!broker.join(format!("{}.terminal.json", grant.id)).exists());
+        durable_new(
+            &broker,
+            &format!("{}.exit.json", grant.id),
+            &ProviderExit {
+                version: 1,
+                grant_id: grant.id.clone(),
+                work_id: work_id.clone(),
+                provider_local_pid: 2,
+                wait_status: 0,
+            },
+        )
+        .unwrap();
+        durable_new(
+            &broker,
+            &format!("{}.pid1-wait.json", grant.id),
+            &Pid1Wait {
+                version: 1,
+                grant_id: grant.id.clone(),
+                work_id,
+                pid1_parent_namespace_pid: missing_pid,
+                wait_status: 0,
+                reaped: true,
+            },
+        )
+        .unwrap();
+        reconcile_indexed_provider_grant(&index, &grant).unwrap();
+        let settled = index.account("first").unwrap();
+        assert!(settled.grants[&grant.id].certified_q.is_some());
+        assert!(settled.markers.quota_rejection_nanos.is_some());
+        assert!(settled.recent_failure_nanos.is_empty()); // typed quota on exit 0 is not a failed process
+        let terminal: TerminalRecord = exact_file(&broker, &format!("{}.terminal.json", grant.id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal.outcome, TerminalOutcome::QuotaRejected);
+        let restarted = Index::admit_live_routes(&broker, &lease).unwrap();
+        assert_eq!(restarted.account("first").unwrap(), settled);
+    }
+
+    #[test]
     fn indexed_route_writer_admission_readback_and_receipt_damage() {
         use crate::linux_main::fresh_index::{Index, broker_admission_lease};
         let temp = tempfile::tempdir().unwrap();
@@ -4892,6 +5527,7 @@ mod tests {
             &actor,
             0,
             0,
+            None,
         )
         .unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -4962,6 +5598,7 @@ mod tests {
                 &actor,
                 0,
                 0,
+                None,
             )
             .is_err(),
             "stale held choice consumed provider K"
@@ -5130,7 +5767,7 @@ mod tests {
         let mut wrong_child = Command::new("sleep").arg("60").spawn().unwrap();
         let wrong_actor = PinnedProcess::open(wrong_child.id() as i32).unwrap();
         assert!(
-            launch(wrong_prepared, &root, &wrong_actor, 0, 0).is_err(),
+            launch(wrong_prepared, &root, &wrong_actor, 0, 0, None).is_err(),
             "wrong actor consumed fresh provider K"
         );
         wrong_child.kill().unwrap();
@@ -5143,7 +5780,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(same.grant.id, prepared.grant.id);
-        let id = launch(prepared, &root, &actor, 0, 0).unwrap();
+        let id = launch(prepared, &root, &actor, 0, 0, None).unwrap();
         assert_eq!(id, same.grant.id);
         assert_eq!(
             grant_for_matching_plan(
@@ -5164,7 +5801,7 @@ mod tests {
             "changed plan recovered a consumed K"
         );
         assert!(
-            launch(same, &root, &actor, 0, 0).is_err(),
+            launch(same, &root, &actor, 0, 0, None).is_err(),
             "second K succeeded"
         );
         let deadline = Instant::now() + Duration::from_secs(15);
