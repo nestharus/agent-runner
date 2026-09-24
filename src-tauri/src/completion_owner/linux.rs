@@ -804,7 +804,7 @@ fn guardian(
         publish_driver_owner(&mut driver_channel, &owner)?;
     }
     let mut root_supervisor = super::root_supervisor::RootSupervisor::new(path, driver_channel)?;
-    root_supervisor.set_kernel_pinned(pinned.is_some());
+    root_supervisor.set_kernel_pinned(pinned.map(|pin| pin.root_id.as_str()));
     // Open a distinct description after close_except: never reuse the
     // bootstrap parent's inherited flock description.
     let admission = admission_gate(endpoint)?;

@@ -4,11 +4,14 @@
 //! child-tree draining but hold no SQLite or replay authority.
 
 use super::custody::{CustodianRequest, LaunchRecipe};
-use oulipoly_kernel_broker::protocol::{self, NativePrepareSpec};
+use oulipoly_kernel_broker::protocol::{self, NativeKSpec, NativePrepareSpec};
 use oulipoly_state::diagnostic_recorder::{
     DiagnosticId, DiagnosticPhase, PhaseObservation, SpanStart, process_recorder,
 };
-use oulipoly_state::mailbox::{CompletionDomainOwner, ContinuationAttempt, MailboxDb};
+use oulipoly_state::mailbox::{
+    AcceptedNativeGrantSnapshot, BrokerContinuationReadback, CompletionDomainOwner,
+    ContinuationAttempt, MailboxDb,
+};
 use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
@@ -188,6 +191,116 @@ fn prepare_and_bind_native(
     Ok(grant_id.into())
 }
 
+/// Build the receipt only from the broker's exact retained-State readback.
+/// A caller-selected sidecar or a local accepted row cannot supply these fields.
+fn v30_accepted_snapshot(
+    readback: &BrokerContinuationReadback,
+    owner: &CompletionDomainOwner,
+    attempt: &ContinuationAttempt,
+    root_id: &str,
+) -> Result<AcceptedNativeGrantSnapshot, String> {
+    if !readback.broker_owned
+        || readback.root_id != root_id
+        || readback.owner != *owner
+        || readback.attempt.as_ref() != Some(attempt)
+        || readback.phase.as_deref() != Some("accepted")
+        || readback.revision != Some(2)
+        || !readback.claim_present
+        || attempt.operation != "activation"
+    {
+        return Err("v30 native acceptance lacks exact retained activation".into());
+    }
+    Ok(AcceptedNativeGrantSnapshot {
+        attempt: attempt.clone(),
+        domain_id: owner.domain_id.clone(),
+        kernel_root_id: root_id.into(),
+        supervisor_authority_id: owner.supervisor_authority_id.clone(),
+        owner_generation: owner.owner_generation.clone(),
+        guardian_identity: owner.guardian_identity.clone(),
+        phase: "accepted".into(),
+        revision: 2,
+        integrated: false,
+        custodian_identity: None,
+        adopter_identity: None,
+    })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "independent request and broker authority"
+)]
+fn prepare_native_v30(
+    owner: &CompletionDomainOwner,
+    attempt: &ContinuationAttempt,
+    root_id: &str,
+    request_path: &Path,
+    request_file: &std::fs::File,
+    request_bytes: &[u8],
+) -> Result<(String, String), String> {
+    let socket = super::linux::owner_broker_socket();
+    let route = super::broker_route::V30OwnerRoute::guardian(
+        &socket,
+        root_id,
+        &owner.domain_id,
+        &owner.supervisor_authority_id,
+        &owner.owner_generation,
+    )?;
+    let readback = route.accept(owner, attempt)?;
+    let accepted = v30_accepted_snapshot(&readback, owner, attempt, root_id)?;
+    let receipt_sha256 =
+        publish_native_receipt(request_path, request_file, request_bytes, &accepted)?;
+    let directory = std::fs::File::open(request_path.parent().ok_or("native directory absent")?)
+        .map_err(|e| e.to_string())?;
+    let receipt = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(request_path.with_file_name(NATIVE_ACCEPTED_FILE))
+        .map_err(|e| e.to_string())?;
+    let spec = NativePrepareSpec {
+        protocol: "native-continuation-v30".into(),
+        root_id: root_id.into(),
+        attempt_id: attempt.attempt_id.clone(),
+        owner_generation: owner.owner_generation.clone(),
+        receipt_sha256: receipt_sha256.clone(),
+    };
+    let descriptors = || {
+        [
+            directory.as_raw_fd(),
+            request_file.as_raw_fd(),
+            receipt.as_raw_fd(),
+        ]
+    };
+    // N is idempotent only for the exact broker-owned accepted snapshot. A
+    // lost reply is resolved by replaying that same evidence, never by N on
+    // another State file or by creating a second provider worker.
+    let send = || protocol::prepare_native_at(&socket, &spec, descriptors());
+    let response = send().or_else(|_| send()).map_err(|e| e.to_string())?;
+    let grant_id = response
+        .strip_prefix("prepared-native-v30 ")
+        .and_then(|value| value.strip_suffix('\n'))
+        .ok_or("broker did not return exact v30 native grant")?;
+    uuid::Uuid::parse_str(grant_id).map_err(|_| "invalid v30 native grant ID")?;
+    // The challenged t path rechecks the retained State binding and the
+    // named descriptor bytes. Its current reply is always a closed gate.
+    let preflight = protocol::native_k_v30_at(
+        &socket,
+        &NativeKSpec {
+            protocol: "native-continuation-v30".into(),
+            grant_id: grant_id.into(),
+            root_id: root_id.into(),
+            attempt_id: attempt.attempt_id.clone(),
+            owner_generation: owner.owner_generation.clone(),
+            receipt_sha256: receipt_sha256.clone(),
+        },
+        descriptors(),
+    );
+    let expected = "native K v30 closed: error v30 native K physical attach/release remains closed";
+    if preflight.err().as_ref().map(ToString::to_string).as_deref() != Some(expected) {
+        return Err("v30 native K preflight did not return exact closed gate".into());
+    }
+    Ok((grant_id.into(), receipt_sha256))
+}
+
 #[cfg(test)]
 mod native_acceptance_tests {
     use super::*;
@@ -226,6 +339,66 @@ mod native_acceptance_tests {
             custodian_identity: None,
             adopter_identity: None,
         }
+    }
+
+    #[test]
+    fn v30_receipt_snapshot_requires_exact_broker_owned_activation() {
+        let mut expected = snapshot(Path::new("/private/result.json"));
+        expected.attempt.operation = "activation".into();
+        expected.attempt.claim_token = Some(uuid::Uuid::new_v4().to_string());
+        let owner = CompletionDomainOwner {
+            protocol: oulipoly_state::completion_continuation::PROTOCOL.into(),
+            domain_id: expected.domain_id.clone(),
+            supervisor_authority_id: expected.supervisor_authority_id.clone(),
+            owner_generation: expected.owner_generation.clone(),
+            guardian_identity: expected.guardian_identity.clone(),
+            driver_identity: expected.guardian_identity.clone(),
+            endpoint: "/private/owner.sock".into(),
+        };
+        let exact = BrokerContinuationReadback {
+            source_generation: uuid::Uuid::new_v4().to_string(),
+            root_id: expected.kernel_root_id.clone(),
+            owner: owner.clone(),
+            attempt: Some(expected.attempt.clone()),
+            phase: Some("accepted".into()),
+            revision: Some(2),
+            claim_present: true,
+            broker_owned: true,
+        };
+        assert_eq!(
+            v30_accepted_snapshot(&exact, &owner, &expected.attempt, &expected.kernel_root_id)
+                .unwrap(),
+            expected
+        );
+        let mut copy = exact.clone();
+        copy.broker_owned = false;
+        assert!(
+            v30_accepted_snapshot(&copy, &owner, &expected.attempt, &expected.kernel_root_id)
+                .is_err()
+        );
+        copy = exact.clone();
+        copy.claim_present = false;
+        assert!(
+            v30_accepted_snapshot(&copy, &owner, &expected.attempt, &expected.kernel_root_id)
+                .is_err()
+        );
+        copy = exact.clone();
+        copy.root_id = uuid::Uuid::new_v4().to_string();
+        assert!(
+            v30_accepted_snapshot(&copy, &owner, &expected.attempt, &expected.kernel_root_id)
+                .is_err()
+        );
+        copy = exact.clone();
+        copy.attempt.as_mut().unwrap().attempt_id = uuid::Uuid::new_v4().to_string();
+        assert!(
+            v30_accepted_snapshot(&copy, &owner, &expected.attempt, &expected.kernel_root_id)
+                .is_err()
+        );
+        let mut transport = expected.attempt.clone();
+        transport.operation = "transport".into();
+        assert!(
+            v30_accepted_snapshot(&exact, &owner, &transport, &expected.kernel_root_id).is_err()
+        );
     }
 
     #[test]
@@ -554,6 +727,7 @@ pub(super) struct RootSupervisor {
     driver_error: Option<String>,
     original: super::original_work::OriginalWorkSupervisor,
     kernel_pinned: bool,
+    kernel_root_id: Option<String>,
 }
 
 impl RootSupervisor {
@@ -573,12 +747,14 @@ impl RootSupervisor {
             driver_error: None,
             original: super::original_work::OriginalWorkSupervisor::default(),
             kernel_pinned: false,
+            kernel_root_id: None,
         })
     }
 
-    pub(super) fn set_kernel_pinned(&mut self, pinned: bool) {
-        self.kernel_pinned = pinned;
-        self.original.set_kernel_pinned(pinned);
+    pub(super) fn set_kernel_pinned(&mut self, root_id: Option<&str>) {
+        self.kernel_pinned = root_id.is_some();
+        self.kernel_root_id = root_id.map(str::to_owned);
+        self.original.set_kernel_pinned(root_id.is_some());
     }
 
     pub(super) fn replace_driver(&mut self, driver: UnixStream) -> Result<(), String> {
@@ -991,22 +1167,15 @@ impl RootSupervisor {
         if attempt.owner_generation != owner.owner_generation {
             return Err("root supervisor rejected a foreign owner generation".into());
         }
-        if self.kernel_pinned {
-            match protocol::state_route_at(&super::linux::owner_broker_socket()).map_err(
-                |error| format!("native State route unavailable before acceptance: {error}"),
-            )? {
-                protocol::StateRoute::Legacy => {}
-                protocol::StateRoute::BrokerOwned { .. } => {
-                    // The v29 path below opens self.path and owns its local
-                    // worker. A v30 attempt must first cross the broker's
-                    // retained acceptance and physical attach route.
-                    return Err(
-                        "v30 native worker requires broker-routed acceptance and physical attach"
-                            .into(),
-                    );
-                }
-            }
-        }
+        let state_route = if self.kernel_pinned {
+            Some(
+                protocol::state_route_at(&super::linux::owner_broker_socket()).map_err(
+                    |error| format!("native State route unavailable before acceptance: {error}"),
+                )?,
+            )
+        } else {
+            None
+        };
         let request_path = super::custody::request_path(attempt)?;
         let request_file = std::fs::OpenOptions::new()
             .read(true)
@@ -1018,6 +1187,48 @@ impl RootSupervisor {
             serde_json::from_slice(&request_bytes).map_err(|error| error.to_string())?;
         if request.path != self.path || request.attempt != *attempt {
             return Err("root supervisor immutable launch request conflict".into());
+        }
+        if matches!(state_route, Some(protocol::StateRoute::BrokerOwned { .. })) {
+            let root_id = self
+                .kernel_root_id
+                .clone()
+                .ok_or("v30 guardian root absent")?;
+            let (cancellation, _worker_cancellation) =
+                UnixStream::pair().map_err(|error| error.to_string())?;
+            cancellation
+                .set_nonblocking(true)
+                .map_err(|error| error.to_string())?;
+            // The v30 request's path is historical identity, not a database
+            // selector. This branch never opens the user sidecar.
+            if attempt.operation != "activation" {
+                return Err("v30 native guardian accepts activation only".into());
+            }
+            let outcome = prepare_native_v30(
+                owner,
+                attempt,
+                &root_id,
+                &request_path,
+                &request_file,
+                &request_bytes,
+            );
+            let (reason, receipt_sha256) = match outcome {
+                Ok((grant_id, digest)) => (
+                    format!("v30 native grant {grant_id} bound; physical K/Q remains closed"),
+                    Some(digest),
+                ),
+                Err(error) => (
+                    format!("v30 native acceptance/K preflight uncertain: {error}"),
+                    None,
+                ),
+            };
+            self.retain_native_broker_pending(
+                attempt,
+                diagnostic_id,
+                cancellation,
+                reason.clone(),
+                receipt_sha256,
+            );
+            return Err(reason);
         }
         let (mut grant, worker_gate) = UnixStream::pair().map_err(|error| error.to_string())?;
         let (cancellation, worker_cancellation) =
