@@ -53,6 +53,12 @@ impl ProvidersConfig {
         let Some(text) = read_optional_providers_file(path)? else {
             return Ok(Self::default());
         };
+        Self::from_toml(&text)
+    }
+
+    /// Parse an exact provider snapshot using the same validation as file
+    /// loading. Fresh roots bind this byte snapshot to their broker choice.
+    pub fn from_toml(text: &str) -> Result<Self, LoadError> {
         let raw = parse_providers_toml(&text)?;
         let raw = apply_defaults_to_raw_providers(raw);
         validate_providers_config(&raw)?;

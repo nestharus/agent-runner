@@ -8,14 +8,16 @@ use super::result::{execution_result_from_raw, raw_result_from_supervised_output
 use super::supervision::supervised_output_from_terminal;
 use super::terminal_signal::terminal_status_from_exit_status;
 use crate::executor::ExecutionResult;
-use oulipoly_config::{InvocationMode, ModelConfig, PromptMode};
-use std::collections::{BTreeMap, HashMap};
+use oulipoly_config::{InvocationMode, ModelConfig, PromptMode, ProvidersConfig};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 
 /// A canonical runtime plan. The implementation must pin the named image,
 /// cwd, recipe and input before K; paths and strings alone are not authority.
+#[derive(Clone)]
 pub struct FreshProviderPlan {
     pub executable: PathBuf,
     pub cwd: PathBuf,
@@ -39,6 +41,93 @@ pub trait FreshProviderBackend {
     ) -> Result<FreshProviderCompletion, String>;
 }
 
+pub struct PreparedFreshHeadless {
+    pub plan: FreshProviderPlan,
+    launch: super::launch::ProviderLaunch,
+    provider_name: String,
+    provider_index: usize,
+}
+
+#[derive(Debug)]
+pub struct FreshConfiguredPool {
+    pub model: ModelConfig,
+    pub config_sha256: String,
+}
+
+/// The two source files are identified as bytes before any provider plan is
+/// offered to the broker. The broker binds its durable choice to this identity
+/// and to the sealed candidate plans; a later edit cannot change an uncertain K.
+pub fn load_fresh_headless_pool(
+    config_dir: &Path,
+    model_name: &str,
+) -> Result<FreshConfiguredPool, String> {
+    if !config_dir.is_absolute() {
+        return Err("fresh config root is not absolute before K".into());
+    }
+    if model_name.is_empty()
+        || model_name == "."
+        || model_name == ".."
+        || model_name.contains('/')
+        || model_name.contains('\\')
+        || model_name.starts_with('-')
+    {
+        return Err("fresh model name invalid before K".into());
+    }
+    let provider_path = config_dir.join("providers.toml");
+    let model_path = config_dir.join("models").join(format!("{model_name}.toml"));
+    let provider_bytes = std::fs::read(&provider_path)
+        .map_err(|e| format!("fresh providers source unavailable before K: {e}"))?;
+    let model_bytes = std::fs::read(&model_path)
+        .map_err(|e| format!("fresh model source unavailable before K: {e}"))?;
+    let mut hash = Sha256::new();
+    for bytes in [&provider_bytes, &model_bytes] {
+        hash.update((bytes.len() as u64).to_le_bytes());
+        hash.update(bytes);
+    }
+    let provider_text = std::str::from_utf8(&provider_bytes)
+        .map_err(|e| format!("fresh providers source is not UTF-8 before K: {e}"))?;
+    let model_text = std::str::from_utf8(&model_bytes)
+        .map_err(|e| format!("fresh model source is not UTF-8 before K: {e}"))?;
+    let providers = ProvidersConfig::from_toml(provider_text)
+        .map_err(|e| format!("fresh providers config invalid before K: {e}"))?;
+    let mut model = ModelConfig::from_toml_with_name(model_name, model_text, Some(&providers))
+        .map_err(|e| format!("fresh model config invalid before K: {e}"))?;
+    let mut members = HashSet::new();
+    let mut prompt_mode = None;
+    for member in &mut model.providers {
+        if !members.insert(member.name.clone()) {
+            return Err("fresh model has duplicate provider accounts before K".into());
+        }
+        let account = providers
+            .get(&member.name)
+            .ok_or_else(|| format!("fresh provider {:?} absent before K", member.name))?;
+        if account.quota_script.is_some() || account.auth_refresh_command.is_some() {
+            return Err("fresh provider quota authority unavailable before K".into());
+        }
+        let (effective, mode) = providers
+            .effective_provider(member)
+            .map_err(|e| format!("fresh provider config invalid before K: {e}"))?;
+        if prompt_mode.is_some_and(|previous| previous != mode) {
+            return Err("fresh pool has incompatible prompt modes before K".into());
+        }
+        prompt_mode = Some(mode);
+        *member = effective;
+    }
+    if model.providers.is_empty() {
+        return Err("fresh model has no accounts before K".into());
+    }
+    model.prompt_mode = prompt_mode.ok_or("fresh model has no prompt mode before K")?;
+    let after_provider = std::fs::read(&provider_path).map_err(|e| e.to_string())?;
+    let after_model = std::fs::read(&model_path).map_err(|e| e.to_string())?;
+    if after_provider != provider_bytes || after_model != model_bytes {
+        return Err("fresh config changed during load before K".into());
+    }
+    Ok(FreshConfiguredPool {
+        model,
+        config_sha256: format!("{:x}", hash.finalize()),
+    })
+}
+
 /// Explicit narrow route. Unsupported shapes refuse before the backend sees
 /// a plan, so no local supervisor or balancer can retry an uncertain K.
 pub fn execute_fresh_headless(
@@ -48,6 +137,16 @@ pub fn execute_fresh_headless(
     working_dir: &Path,
     backend: &mut impl FreshProviderBackend,
 ) -> Result<ExecutionResult, String> {
+    let prepared = prepare_fresh_headless(model, provider_index, prompt, working_dir)?;
+    run_prepared_fresh_headless(prepared, backend)
+}
+
+pub fn prepare_fresh_headless(
+    model: &ModelConfig,
+    provider_index: usize,
+    prompt: &str,
+    working_dir: &Path,
+) -> Result<PreparedFreshHeadless, String> {
     let provider = provider_for_index(model, provider_index)?;
     if model.prompt_mode != PromptMode::Stdin
         || !model.inputs.is_empty()
@@ -152,16 +251,34 @@ pub fn execute_fresh_headless(
         .prompt_payload
         .clone()
         .unwrap_or_default();
-    let completion = backend.run_to_physical_q(FreshProviderPlan {
-        executable: parts[0].clone().into(),
-        cwd: working_dir.to_path_buf(),
-        argv,
-        environment: environment.into_iter().collect(),
-        stdin,
-    })?;
+    Ok(PreparedFreshHeadless {
+        plan: FreshProviderPlan {
+            executable: parts[0].clone().into(),
+            cwd: working_dir.to_path_buf(),
+            argv,
+            environment: environment.into_iter().collect(),
+            stdin,
+        },
+        launch,
+        provider_name: provider.name.clone(),
+        provider_index,
+    })
+}
+
+pub fn run_prepared_fresh_headless(
+    prepared: PreparedFreshHeadless,
+    backend: &mut impl FreshProviderBackend,
+) -> Result<ExecutionResult, String> {
+    let PreparedFreshHeadless {
+        plan,
+        launch,
+        provider_name,
+        provider_index,
+    } = prepared;
+    let completion = backend.run_to_physical_q(plan)?;
     let status = ExitStatus::from_raw(completion.wait_status);
     let terminal = supervised_output_from_terminal(
-        &provider.name,
+        &provider_name,
         launch.supervisor_config.recognizer,
         completion.stdout,
         completion.stderr,
@@ -188,6 +305,7 @@ fn forbidden_fresh_environment(key: &str) -> bool {
 mod tests {
     use super::*;
     use oulipoly_config::ProviderConfig;
+    use std::fs;
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -220,6 +338,53 @@ mod tests {
             inputs: Vec::new(),
             provider: None,
         }
+    }
+
+    #[test]
+    fn real_config_prepares_two_accounts_and_refuses_unowned_quota() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("models")).unwrap();
+        fs::write(
+            root.path().join("models/work.toml"),
+            "[[providers]]\nname = 'other'\n[[providers]]\nname = 'chosen'\nargs = ['--model-option']\n",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("providers.toml"),
+            "[other]\ncommand = '/bin/false'\n[chosen]\ncommand = '/bin/true'\nargs = ['--account-option']\n",
+        )
+        .unwrap();
+        let pool = load_fresh_headless_pool(root.path(), "work").unwrap();
+        assert_eq!(pool.model.providers.len(), 2);
+        assert_eq!(pool.model.providers[1].name, "chosen");
+        assert_eq!(pool.model.providers[1].command, "/bin/true");
+        assert_eq!(pool.config_sha256.len(), 64);
+        assert_eq!(
+            pool.model.providers[1].args,
+            ["--account-option", "--model-option"]
+        );
+        fs::write(
+            root.path().join("providers.toml"),
+            "[other]\ncommand = '/bin/true'\n[chosen]\ncommand = '/bin/true'\nargs = ['--account-option']\n",
+        )
+        .unwrap();
+        assert_ne!(
+            load_fresh_headless_pool(root.path(), "work")
+                .unwrap()
+                .config_sha256,
+            pool.config_sha256
+        );
+        assert!(load_fresh_headless_pool(root.path(), "../work").is_err());
+        fs::write(
+            root.path().join("providers.toml"),
+            "[other]\ncommand = '/bin/false'\n[chosen]\ncommand = '/bin/true'\nquota_script = 'must-not-run'\n",
+        )
+        .unwrap();
+        assert!(
+            load_fresh_headless_pool(root.path(), "work")
+                .unwrap_err()
+                .contains("quota authority unavailable")
+        );
     }
 
     #[test]

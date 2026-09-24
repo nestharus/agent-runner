@@ -48,6 +48,13 @@ impl Drop for SnapshotRestore {
 fn inner() {
     let mode = std::env::var("AGE319_PRIVATE_JOIN_MODE").unwrap_or_else(|_| "help".into());
     let provider_mode = mode.starts_with("normal_model_provider");
+    let provider_negative = matches!(
+        mode.as_str(),
+        "normal_model_provider_bad_config"
+            | "normal_model_provider_unsupported"
+            | "normal_model_provider_quota"
+            | "normal_model_provider_auth"
+    );
     let model_mode = mode == "normal_model_held" || provider_mode;
     let native_mode = mode.starts_with("native_");
     let native_live = matches!(
@@ -66,7 +73,13 @@ fn inner() {
             | "normal_model_held"
             | "normal_model_provider"
             | "normal_model_provider_reply_loss"
+            | "normal_model_provider_q_reply_loss"
             | "normal_model_provider_restart"
+            | "normal_model_provider_bad_config"
+            | "normal_model_provider_unsupported"
+            | "normal_model_provider_quota"
+            | "normal_model_provider_auth"
+            | "normal_model_provider_no_pin"
     );
     let recipient_mode = mode.starts_with("normal_recipient");
     let real_source = mode.starts_with("normal_bash_source");
@@ -91,6 +104,44 @@ fn inner() {
     fs::create_dir(&broker_state).unwrap();
     fs::set_permissions(&broker_state, fs::Permissions::from_mode(0o700)).unwrap();
     fs::create_dir(&gate).unwrap();
+    let config_home = temp.path().join("config-home");
+    if provider_mode {
+        let config_dir = config_home.join("oulipoly-agent-runner");
+        fs::create_dir_all(config_dir.join("models")).unwrap();
+        let provider_command = serde_json::to_string(&provider_image).unwrap();
+        let marker = serde_json::to_string(gate.join("provider-effect").to_str().unwrap()).unwrap();
+        let unused_marker =
+            serde_json::to_string(gate.join("provider-effect-unused").to_str().unwrap()).unwrap();
+        let provider_name = if mode == "normal_model_provider_bad_config" {
+            "wrong-account"
+        } else {
+            "local"
+        };
+        let prompt_mode = if mode == "normal_model_provider_unsupported" {
+            "prompt_mode = \"arg\"\n"
+        } else {
+            ""
+        };
+        let quota = if mode == "normal_model_provider_quota" {
+            "quota_script = \"quota-must-not-run\"\n"
+        } else if mode == "normal_model_provider_auth" {
+            "auth_refresh_command = \"auth-must-not-run\"\n"
+        } else {
+            ""
+        };
+        fs::write(
+            config_dir.join("providers.toml"),
+            format!(
+                "[unused]\ncommand = {provider_command}\nargs = [{unused_marker}]\n[{provider_name}]\ncommand = {provider_command}\nargs = [{marker}]\n{prompt_mode}{quota}"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            config_dir.join("models/configured-model.toml"),
+            "[[providers]]\nname = \"unused\"\n[[providers]]\nname = \"local\"\n",
+        )
+        .unwrap();
+    }
     let mailbox =
         MailboxDb::open_completion_continuation_domain(&data.join("pid-identity.db")).unwrap();
     let pending_binding =
@@ -322,13 +373,24 @@ fn inner() {
             } else {
                 "__age319-private-normal-v30"
             })
-            .args(
-                model_mode
-                    .then_some(["fixture-model", "hello fixture"])
-                    .into_iter()
-                    .flatten(),
-            )
+            .args(if provider_mode {
+                if mode == "normal_model_provider_no_pin" {
+                    vec!["configured-model", "hello fixture"]
+                } else {
+                    vec![
+                        "configured-model",
+                        "--pin-provider",
+                        "local",
+                        "hello fixture",
+                    ]
+                }
+            } else if model_mode {
+                vec!["fixture-model", "hello fixture"]
+            } else {
+                Vec::new()
+            })
             .env("OULIPOLY_DATA_DIR", &data)
+            .envs(provider_mode.then_some(("OULIPOLY_CONFIG_HOME", &config_home)))
             .env("OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1", "1")
             .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
             .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
@@ -828,7 +890,13 @@ fn inner() {
                     | "normal_model_held"
                     | "normal_model_provider"
                     | "normal_model_provider_reply_loss"
+                    | "normal_model_provider_q_reply_loss"
                     | "normal_model_provider_restart"
+                    | "normal_model_provider_bad_config"
+                    | "normal_model_provider_unsupported"
+                    | "normal_model_provider_quota"
+                    | "normal_model_provider_auth"
+                    | "normal_model_provider_no_pin"
             ) {
                 let marker: serde_json::Value =
                     serde_json::from_slice(&fs::read(gate.join("child-handoff")).unwrap()).unwrap();
@@ -862,6 +930,13 @@ fn inner() {
                     receipt.root_work_intent,
                     if mode == "normal_help" {
                         oulipoly_state::mailbox::FreshRootWorkIntent::CliHelp(vec!["--help".into()])
+                    } else if provider_mode {
+                        let mut args = vec!["--model".into(), "configured-model".into()];
+                        if mode != "normal_model_provider_no_pin" {
+                            args.extend(["--pin-provider".into(), "local".into()]);
+                        }
+                        args.push("hello fixture".into());
+                        oulipoly_state::mailbox::FreshRootWorkIntent::NormalCli(args)
                     } else if model_mode {
                         oulipoly_state::mailbox::FreshRootWorkIntent::NormalCli(vec![
                             "--model".into(),
@@ -1102,6 +1177,11 @@ fn inner() {
                     .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
                     .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
                     .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
+                    .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+                    .envs((mode == "normal_model_provider_reply_loss").then_some((
+                        "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_PROVIDER_K_REPLY_V1",
+                        "1",
+                    )))
                     .stderr(Stdio::from(
                         File::create(temp.path().join("handoff-restart.log")).unwrap(),
                     ))
@@ -1140,14 +1220,60 @@ fn inner() {
                     )
                     .unwrap();
                 assert_eq!(pending, 1, "old pending ACK debt must coexist with fresh D");
+                let old_state_path = data.join("state.db");
+                let old_state_before = fs::read(&old_state_path).unwrap();
+                let old_wal_path = data.join("state.db-wal");
+                let old_wal_before = fs::read(&old_wal_path).ok();
+                let v29_main_before = fs::read(&historical_sidecar).unwrap();
+                let v29_wal = historical_data.join("pid-identity.db-wal");
+                let v29_wal_before = fs::read(&v29_wal).ok();
                 fs::write(gate.join("child-effect"), b"yes").unwrap();
+                if provider_negative {
+                    eventually(|| entry.try_wait().unwrap().is_some());
+                    assert!(!entry.wait().unwrap().success());
+                    let stderr = fs::read_to_string(&err).unwrap();
+                    let reason = match mode.as_str() {
+                        "normal_model_provider_bad_config" => {
+                            "fresh provider \"local\" absent before K"
+                        }
+                        "normal_model_provider_unsupported" => {
+                            "fresh pool has incompatible prompt modes before K"
+                        }
+                        "normal_model_provider_quota" => {
+                            "fresh provider quota authority unavailable before K"
+                        }
+                        "normal_model_provider_auth" => {
+                            "fresh provider quota authority unavailable before K"
+                        }
+                        _ => unreachable!(),
+                    };
+                    assert!(stderr.contains(reason), "{stderr}");
+                    assert!(!gate.join("provider-effect").exists());
+                    assert!(!gate.join("provider-runtime-result").exists());
+                    assert_eq!(
+                        fs::read_dir(broker_state.join("v30/fresh-provider"))
+                            .unwrap()
+                            .count(),
+                        0,
+                        "pre-K refusal created provider grant/effect"
+                    );
+                    assert_eq!(fs::read(&old_state_path).unwrap(), old_state_before);
+                    assert_eq!(fs::read(&old_wal_path).ok(), old_wal_before);
+                    assert_eq!(fs::read(&historical_sidecar).unwrap(), v29_main_before);
+                    assert_eq!(fs::read(&v29_wal).ok(), v29_wal_before);
+                    stop(&mut broker);
+                    return;
+                }
                 if provider_mode {
                     let provider_dir = broker_state.join("v30/fresh-provider");
-                    eventually(|| {
-                        gate.join("provider-effect").exists() || entry.try_wait().unwrap().is_some()
-                    });
+                    let selected_marker = if mode == "normal_model_provider_no_pin" {
+                        gate.join("provider-effect-unused")
+                    } else {
+                        gate.join("provider-effect")
+                    };
+                    eventually(|| selected_marker.exists() || entry.try_wait().unwrap().is_some());
                     assert!(
-                        gate.join("provider-effect").exists(),
+                        selected_marker.exists(),
                         "{}",
                         fs::read_to_string(&err).unwrap()
                     );
@@ -1156,6 +1282,26 @@ fn inner() {
                     eventually(|| grant_file.exists());
                     let grant: serde_json::Value =
                         serde_json::from_slice(&fs::read(&grant_file).unwrap()).unwrap();
+                    let route_file =
+                        provider_dir.join(format!("{}.route-selection.json", receipt.handoff_id));
+                    let route: serde_json::Value =
+                        serde_json::from_slice(&fs::read(route_file).unwrap()).unwrap();
+                    let selected_account = if mode == "normal_model_provider_no_pin" {
+                        "unused"
+                    } else {
+                        "local"
+                    };
+                    assert_eq!(route["selection"]["account"], selected_account);
+                    assert_eq!(
+                        route["selection"]["index"],
+                        if mode == "normal_model_provider_no_pin" {
+                            0
+                        } else {
+                            1
+                        }
+                    );
+                    assert_eq!(route["selection"]["plan_sha256"], grant["plan_sha256"]);
+                    assert_eq!(route["binding"]["handoff_id"], receipt.handoff_id);
                     let grant_id = grant["id"].as_str().unwrap();
                     eventually(|| provider_dir.join(format!("{grant_id}.exit.json")).exists());
                     assert!(
@@ -1173,6 +1319,28 @@ fn inner() {
                         "sibling observed provider K"
                     );
                     assert!(
+                        protocol::private_fresh_route_at(
+                            &socket.with_file_name("v30.sock"),
+                            &protocol::FreshRouteRequest {
+                                d_key: receipt.d_key.clone(),
+                                model: "configured-model".into(),
+                                config_sha256: route["selection"]["config_sha256"]
+                                    .as_str()
+                                    .unwrap()
+                                    .into(),
+                                account: None,
+                                index: None,
+                                total: 2,
+                                pin: (mode != "normal_model_provider_no_pin")
+                                    .then(|| "local".into()),
+                            },
+                            b'f',
+                            None,
+                        )
+                        .is_err(),
+                        "sibling read back fresh route"
+                    );
+                    assert!(
                         protocol::private_fresh_provider_at(
                             &socket.with_file_name("v30.sock"),
                             &uuid::Uuid::new_v4().to_string(),
@@ -1183,7 +1351,7 @@ fn inner() {
                         "wrong D key observed provider K"
                     );
                     assert_eq!(
-                        fs::read(gate.join("provider-effect")).unwrap(),
+                        fs::read(&selected_marker).unwrap(),
                         b"one-provider-effect\n"
                     );
                     assert!(
@@ -1239,12 +1407,42 @@ fn inner() {
                             fs::read_to_string(temp.path().join("broker-restart.log")).unwrap()
                         );
                     }
+                    if mode == "normal_model_provider_q_reply_loss" {
+                        fs::write(gate.join("provider-drop-q-reply"), b"yes").unwrap();
+                    }
                     fs::write(gate.join("provider-cancel"), b"yes").unwrap();
                     eventually(|| entry.try_wait().unwrap().is_some());
                     assert!(
                         !entry.wait().unwrap().success(),
                         "private provider fixture became ordinary CLI success"
                     );
+                    if mode == "normal_model_provider_q_reply_loss" {
+                        let stderr = fs::read_to_string(&err).unwrap();
+                        assert!(stderr.contains("fresh provider unknown:"), "{stderr}");
+                        assert!(gate.join("provider-q-reply-dropped").exists());
+                        assert!(stderr.contains("\"automatic_replay\":false"), "{stderr}");
+                        assert!(stderr.contains(grant_id), "{stderr}");
+                        assert!(!gate.join("provider-runtime-result").exists());
+                        assert!(provider_dir.join(format!("{grant_id}.drain.json")).exists());
+                        assert_eq!(
+                            fs::read_dir(&provider_dir)
+                                .unwrap()
+                                .filter_map(Result::ok)
+                                .filter(|entry| entry
+                                    .file_name()
+                                    .to_string_lossy()
+                                    .ends_with(".consumed.json"))
+                                .count(),
+                            1,
+                            "lost Q reply caused a second K"
+                        );
+                        assert_eq!(fs::read(&old_state_path).unwrap(), old_state_before);
+                        assert_eq!(fs::read(&old_wal_path).ok(), old_wal_before);
+                        assert_eq!(fs::read(&historical_sidecar).unwrap(), v29_main_before);
+                        assert_eq!(fs::read(&v29_wal).ok(), v29_wal_before);
+                        stop(&mut broker);
+                        return;
+                    }
                     assert!(
                         fs::read_to_string(&err)
                             .unwrap()
@@ -1258,7 +1456,40 @@ fn inner() {
                     .unwrap();
                     assert_eq!(mapped["mapped_after_q"], true);
                     assert_eq!(mapped["exit_code"], 0);
-                    assert_eq!(mapped["provider_index"], 0);
+                    assert_eq!(
+                        mapped["provider_index"],
+                        if mode == "normal_model_provider_no_pin" {
+                            0
+                        } else {
+                            1
+                        }
+                    );
+                    assert_eq!(mapped["model"], "configured-model");
+                    assert_eq!(
+                        mapped["provider"],
+                        if mode == "normal_model_provider_no_pin" {
+                            "unused"
+                        } else {
+                            "local"
+                        }
+                    );
+                    assert_eq!(mapped["route_observed_live"], 0);
+                    assert_eq!(mapped["route_observed_invocations"], 0);
+                    if mode == "normal_model_provider_reply_loss" {
+                        assert!(gate.join("provider-k-reply-dropped").exists());
+                        assert_eq!(
+                            fs::read_dir(&provider_dir)
+                                .unwrap()
+                                .filter_map(Result::ok)
+                                .filter(|entry| entry
+                                    .file_name()
+                                    .to_string_lossy()
+                                    .ends_with(".consumed.json"))
+                                .count(),
+                            1,
+                            "lost K reply caused duplicate provider launch"
+                        );
+                    }
                     assert_eq!(mapped["stdout"], "provider-stdout:hello fixture");
                     assert_eq!(mapped["stderr"], "provider-stderr\n");
                     assert_eq!(
@@ -1301,6 +1532,10 @@ fn inner() {
                             .unwrap(),
                         1
                     );
+                    assert_eq!(fs::read(&old_state_path).unwrap(), old_state_before);
+                    assert_eq!(fs::read(&old_wal_path).ok(), old_wal_before);
+                    assert_eq!(fs::read(&historical_sidecar).unwrap(), v29_main_before);
+                    assert_eq!(fs::read(&v29_wal).ok(), v29_wal_before);
                     stop(&mut broker);
                     return;
                 }
@@ -3433,7 +3668,13 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_model_held",
         "normal_model_provider",
         "normal_model_provider_reply_loss",
+        "normal_model_provider_q_reply_loss",
         "normal_model_provider_restart",
+        "normal_model_provider_bad_config",
+        "normal_model_provider_unsupported",
+        "normal_model_provider_quota",
+        "normal_model_provider_auth",
+        "normal_model_provider_no_pin",
         "normal_guardian_death",
         "normal_driver_death",
         "normal_broker_death",

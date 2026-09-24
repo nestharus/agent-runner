@@ -711,6 +711,55 @@ fn private_provider_unknown(
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]
+struct PrivatePinnedPlan {
+    image: File,
+    cwd: File,
+    input: File,
+    recipe: File,
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+impl PrivatePinnedPlan {
+    fn descriptors(&self) -> [std::os::fd::RawFd; 4] {
+        [
+            self.image.as_raw_fd(),
+            self.cwd.as_raw_fd(),
+            self.input.as_raw_fd(),
+            self.recipe.as_raw_fd(),
+        ]
+    }
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_pin_plan(
+    plan: &oulipoly_runtime::executor::cli::fresh_remote::FreshProviderPlan,
+) -> Result<PrivatePinnedPlan, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let image = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&plan.executable)
+        .map_err(|e| format!("fresh provider image: {e}"))?;
+    let cwd = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(&plan.cwd)
+        .map_err(|e| format!("fresh provider cwd: {e}"))?;
+    let input = private_sealed_bytes(b"fresh-provider-input", &plan.stdin)?;
+    let recipe_bytes = serde_json::to_vec(&serde_json::json!({
+        "argv": plan.argv, "env": plan.environment,
+    }))
+    .map_err(|e| e.to_string())?;
+    let recipe = private_sealed_bytes(b"fresh-provider-recipe", &recipe_bytes)?;
+    Ok(PrivatePinnedPlan {
+        image,
+        cwd,
+        input,
+        recipe,
+    })
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
 impl oulipoly_runtime::executor::cli::fresh_remote::FreshProviderBackend
     for PrivateFreshBroker<'_>
 {
@@ -720,37 +769,16 @@ impl oulipoly_runtime::executor::cli::fresh_remote::FreshProviderBackend
     ) -> Result<oulipoly_runtime::executor::cli::fresh_remote::FreshProviderCompletion, String>
     {
         use oulipoly_kernel_broker::protocol;
-        use std::os::unix::fs::OpenOptionsExt;
         let socket = broker_socket().with_file_name("v30.sock");
         // Descriptor identity and byte content are rechecked and sealed by
         // the host broker before one-use K; neither configured path nor text
         // recipe is trusted after this point.
-        let image = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&plan.executable)
-            .map_err(|e| format!("fresh provider image: {e}"))?;
-        let cwd = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-            .open(&plan.cwd)
-            .map_err(|e| format!("fresh provider cwd: {e}"))?;
-        let input = private_sealed_bytes(b"fresh-provider-input", &plan.stdin)?;
-        let recipe_bytes = serde_json::to_vec(&serde_json::json!({
-            "argv": plan.argv, "env": plan.environment,
-        }))
-        .map_err(|e| e.to_string())?;
-        let recipe = private_sealed_bytes(b"fresh-provider-recipe", &recipe_bytes)?;
+        let pinned = private_pin_plan(&plan)?;
         let submitted = protocol::private_fresh_provider_at(
             &socket,
             &self.authority.receipt.d_key,
             b'5',
-            Some([
-                image.as_raw_fd(),
-                cwd.as_raw_fd(),
-                input.as_raw_fd(),
-                recipe.as_raw_fd(),
-            ]),
+            Some(pinned.descriptors()),
         );
         let grant = match submitted {
             Ok(response) => response
@@ -765,12 +793,7 @@ impl oulipoly_runtime::executor::cli::fresh_remote::FreshProviderBackend
                     &socket,
                     &self.authority.receipt.d_key,
                     b'9',
-                    Some([
-                        image.as_raw_fd(),
-                        cwd.as_raw_fd(),
-                        input.as_raw_fd(),
-                        recipe.as_raw_fd(),
-                    ]),
+                    Some(pinned.descriptors()),
                 )
                 .map_err(|e| self.unknown(None, "K readback", &format!("{error}; {e}")))?;
                 if state.starts_with("fresh-provider-unknown ") {
@@ -900,37 +923,77 @@ fn private_verified_output(
 
 #[cfg(feature = "age319-private-broker-fixture")]
 fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode, String> {
-    use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig};
-    use oulipoly_runtime::executor::cli::fresh_remote::execute_fresh_headless;
-    let args = match &authority.receipt.root_work_intent {
-        oulipoly_state::mailbox::FreshRootWorkIntent::NormalCli(args)
-            if matches!(args.as_slice(), [flag, model, _prompt]
-                if flag == "--model" && model == "fixture-model") =>
-        {
-            args
-        }
-        _ => return Err("private provider requires exact fixture model/prompt syntax".into()),
+    use oulipoly_kernel_broker::protocol::{self, FreshRouteRequest};
+    use oulipoly_runtime::executor::cli::fresh_remote::{
+        load_fresh_headless_pool, prepare_fresh_headless, run_prepared_fresh_headless,
+    };
+    let (model_name, provider_pin, prompt) = match &authority.receipt.root_work_intent {
+        oulipoly_state::mailbox::FreshRootWorkIntent::NormalCli(args) => match args.as_slice() {
+            [flag, model, prompt] if flag == "--model" => (model.as_str(), None, prompt.as_str()),
+            [flag, model, pin_flag, pin, prompt]
+                if flag == "--model" && pin_flag == "--pin-provider" =>
+            {
+                (model.as_str(), Some(pin.as_str()), prompt.as_str())
+            }
+            _ => return Err("fresh provider CLI shape unsupported before K".into()),
+        },
+        _ => return Err("fresh provider root intent unsupported before K".into()),
     };
     if authority.session.session_id.is_empty() || authority.receipt.d_key.is_empty() {
         return Err("private fresh entry authority incomplete".into());
     }
-    let image = std::env::var("AGE319_PRIVATE_PROVIDER_IMAGE_V1")
-        .map_err(|_| "private provider image absent")?;
-    let marker = std::env::var("AGE319_PRIVATE_PROVIDER_MARKER_V1")
-        .map_err(|_| "private provider marker absent")?;
-    let model = ModelConfig {
-        name: "fixture-model".into(),
-        prompt_mode: PromptMode::Stdin,
-        providers: vec![ProviderConfig::new(image, vec![marker])],
-        inputs: Vec::new(),
-        provider: None,
-    };
+    let config_dir = oulipoly_state::paths::config_dir()?;
+    let pool = load_fresh_headless_pool(&config_dir, model_name)?;
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let socket = broker_socket().with_file_name("v30.sock");
+    let total = pool.model.providers.len();
+    let mut prepared = Vec::with_capacity(total);
+    for index in 0..total {
+        let plan = prepare_fresh_headless(&pool.model, index, prompt, &cwd)?;
+        prepared.push(plan);
+    }
+    for (index, candidate) in prepared.iter().enumerate() {
+        let request = FreshRouteRequest {
+            d_key: authority.receipt.d_key.clone(),
+            model: pool.model.name.clone(),
+            config_sha256: pool.config_sha256.clone(),
+            account: Some(pool.model.providers[index].name.clone()),
+            index: Some(index),
+            total,
+            pin: provider_pin.map(str::to_owned),
+        };
+        let pinned = private_pin_plan(&candidate.plan)?;
+        protocol::private_fresh_route_at(&socket, &request, b'h', Some(pinned.descriptors()))
+            .map_err(|e| format!("fresh route candidate refused before K: {e}"))?;
+    }
+    let request = FreshRouteRequest {
+        d_key: authority.receipt.d_key.clone(),
+        model: pool.model.name.clone(),
+        config_sha256: pool.config_sha256.clone(),
+        account: None,
+        index: None,
+        total,
+        pin: provider_pin.map(str::to_owned),
+    };
+    let selected = protocol::private_fresh_route_at(&socket, &request, b'f', None)
+        .map_err(|e| format!("fresh route selection refused before K: {e}"))?
+        .ok_or("fresh route selection absent before K")?;
+    if selected.model != pool.model.name
+        || selected.config_sha256 != pool.config_sha256
+        || pool
+            .model
+            .providers
+            .get(selected.index)
+            .is_none_or(|member| member.name != selected.account)
+    {
+        return Err("fresh route readback differs from configured pool before K".into());
+    }
+    let selected_plan = prepared.swap_remove(selected.index);
     let mut backend = PrivateFreshBroker {
         authority,
         grant_id: None,
     };
-    let result = execute_fresh_headless(&model, 0, &args[2], &cwd, &mut backend)?;
+    let result = run_prepared_fresh_headless(selected_plan, &mut backend)?;
     let gate = std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1").map_err(|e| {
         backend.unknown(
             backend.grant_id.as_deref(),
@@ -944,6 +1007,13 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
         "stdout": String::from_utf8_lossy(&result.stdout),
         "stderr": result.stderr,
         "provider_index": result.provider_index,
+        "model": selected.model,
+        "provider": selected.account,
+        "route_config_sha256": selected.config_sha256,
+        "route_plan_sha256": selected.plan_sha256,
+        "route_observed_live": selected.observed_live,
+        "route_observed_failures": selected.observed_failures,
+        "route_observed_invocations": selected.observed_invocations,
         "terminal_reason": result.terminal_reason,
     });
     std::fs::write(
