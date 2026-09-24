@@ -135,6 +135,27 @@ fn source_intent(
         .iter()
         .position(|member| member.name == request.account)
         .ok_or_else(|| io::Error::other("manual quota account absent from source model"))?;
+    let provider = &pool.model.providers[index];
+    for (key, value) in &provider.environment {
+        if !request
+            .environment
+            .iter()
+            .any(|pair| pair == &(key.clone(), value.clone()))
+        {
+            return Err(io::Error::other(
+                "manual quota pinned provider environment mismatch",
+            ));
+        }
+    }
+    for key in &provider.unset_environment {
+        if !provider.environment.contains_key(key)
+            && request.environment.iter().any(|pair| &pair.0 == key)
+        {
+            return Err(io::Error::other(
+                "manual quota pinned provider environment removal missing",
+            ));
+        }
+    }
     let physical_account_id = pool.account_identities[index]
         .clone()
         .filter(|id| !id.trim().is_empty())
@@ -772,6 +793,22 @@ mod tests {
         assert!(unmetered.windows.is_empty());
         assert!(
             !operation_dir(&f.ledger, &request.operation_id)
+                .join("k.json")
+                .exists()
+        );
+        let source = fs::read_to_string(f.source.join("providers.toml")).unwrap();
+        fs::write(
+            f.source.join("providers.toml"),
+            source.replace(
+                "[first]\n",
+                "[first]\nenvironment = { QUOTA_PROBE_TOKEN = 'configured' }\n",
+            ),
+        )
+        .unwrap();
+        let wrong_environment = f.request("first");
+        assert!(f.begin(&wrong_environment).is_err());
+        assert!(
+            !operation_dir(&f.ledger, &wrong_environment.operation_id)
                 .join("k.json")
                 .exists()
         );

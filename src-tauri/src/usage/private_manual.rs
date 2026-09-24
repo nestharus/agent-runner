@@ -51,30 +51,6 @@ fn socket() -> PathBuf {
     PathBuf::from(protocol::INSTALLED_FRESH_V30_SOCKET)
 }
 
-fn environment() -> Result<Vec<(String, String)>, String> {
-    let mut values = Vec::new();
-    for (key, value) in std::env::vars_os() {
-        let key = key
-            .into_string()
-            .map_err(|_| "quota environment key is not UTF-8")?;
-        if key.starts_with("LD_")
-            || key.starts_with("DYLD_")
-            || key.starts_with("OULIPOLY_KERNEL_")
-            || matches!(key.as_str(), "GLIBC_TUNABLES" | "GCONV_PATH")
-        {
-            continue;
-        }
-        values.push((
-            key,
-            value
-                .into_string()
-                .map_err(|_| "quota environment value is not UTF-8")?,
-        ));
-    }
-    values.sort();
-    Ok(values)
-}
-
 fn journal_path(physical_id: &str) -> Result<PathBuf, String> {
     let root = oulipoly_state::paths::data_dir()?.join("manual-quota-operations");
     fs::create_dir_all(&root).map_err(|e| e.to_string())?;
@@ -277,7 +253,22 @@ pub(crate) fn run(
             &model.name,
         )?;
         let path = journal_path(physical_id)?;
-        let environment = environment()?;
+        let index = pool
+            .model
+            .providers
+            .iter()
+            .position(|provider| provider.name == account.account_id)
+            .ok_or("manual quota provider absent from pinned model")?;
+        // Use the same assembled effect environment as the fresh route. It
+        // includes config overrides, removals, and the pinned data directory.
+        let environment = oulipoly_runtime::executor::cli::fresh_remote::prepare_fresh_headless(
+            &pool.model,
+            index,
+            "",
+            &std::env::current_dir().map_err(|e| e.to_string())?,
+        )?
+        .plan
+        .environment;
         let journal = match read_request(&path)? {
             Some(prior) => prior,
             None => {

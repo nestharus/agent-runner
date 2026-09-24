@@ -837,14 +837,15 @@ fn usage_private_manual_requires_broker_and_never_runs_legacy_script() {
     );
     fixture.write_model("fixture", &["shared", "unmetered"]);
     fixture.write_providers(&[
-        ProviderFixture::with_script("shared", "claude", &script),
-        ProviderFixture::no_usage("unmetered", "codex"),
+        ProviderFixture::with_script("shared", "/bin/true", &script),
+        ProviderFixture::no_usage("unmetered", "/bin/true"),
     ]);
     let path = fixture.app_config_dir.join("providers.toml");
     let providers = fs::read_to_string(&path).unwrap();
     fs::write(
         &path,
         providers
+            .replace("prompt_mode = \"arg\"", "prompt_mode = \"stdin\"")
             .replace(
                 "[shared]\n",
                 "[shared]\nquota_account_id = 'physical-shared'\n",
@@ -910,21 +911,26 @@ fn usage_private_manual_reaches_broker_and_forces_new_physical_q() {
         &quota_script_json(
             &log,
             r#"{"windows":[{"used_percent":24,"resets_at":"2099-01-01T00:00:00Z"}]}"#,
+        )
+        .replace(
+            "set -euo pipefail\n",
+            "set -euo pipefail\ntest \"$QUOTA_PROBE_TOKEN\" = configured-token\n",
         ),
     );
     fixture.write_model("fixture", &["shared", "unmetered"]);
     fixture.write_providers(&[
-        ProviderFixture::with_script("shared", "claude", &script),
-        ProviderFixture::no_usage("unmetered", "codex"),
+        ProviderFixture::with_script("shared", "/bin/true", &script),
+        ProviderFixture::no_usage("unmetered", "/bin/true"),
     ]);
     let providers_path = fixture.app_config_dir.join("providers.toml");
     let providers = fs::read_to_string(&providers_path).unwrap();
     fs::write(
         &providers_path,
         providers
+            .replace("prompt_mode = \"arg\"", "prompt_mode = \"stdin\"")
             .replace(
                 "[shared]\n",
-                "[shared]\nquota_account_id = 'physical-shared'\n",
+                "[shared]\nquota_account_id = 'physical-shared'\nenvironment = { QUOTA_PROBE_TOKEN = 'configured-token' }\n",
             )
             .replace(
                 "[unmetered]\n",
