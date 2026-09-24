@@ -11,6 +11,7 @@ pub mod installed_pair;
 pub mod native_receipt;
 pub mod protocol;
 pub mod registry;
+pub mod source_acceptance;
 pub mod source_candidate;
 pub mod source_physical;
 pub mod work_registry;

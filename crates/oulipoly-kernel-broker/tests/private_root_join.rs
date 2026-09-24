@@ -4,6 +4,7 @@
 use oulipoly_kernel_broker::protocol::{
     self, AcceptedWorkSpec, JoinSpec, Operation, ProcessWitness, SourceScope, SourceSocketWitness,
 };
+use oulipoly_kernel_broker::source_physical::{SourceObservation, SourcePhysicalRegistry};
 use oulipoly_state::completion_continuation::AdmittedSourceBinding;
 use oulipoly_state::mailbox::{BrokerSidecar, MailboxDb};
 use std::fs::{self, File};
@@ -30,10 +31,23 @@ fn stop(child: &mut Child) {
     let _ = child.wait();
 }
 
+struct SnapshotRestore {
+    path: std::path::PathBuf,
+    bytes: Vec<u8>,
+}
+
+impl Drop for SnapshotRestore {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.path, &self.bytes);
+    }
+}
+
 fn inner() {
     let mode = std::env::var("AGE319_PRIVATE_JOIN_MODE").unwrap_or_else(|_| "help".into());
     let release_mode = mode.starts_with("held_release");
     let normal_mode = mode.starts_with("normal_");
+    let real_source = mode.starts_with("normal_bash_source");
+    let nonzero_source = mode == "normal_bash_source_nonzero";
     let runner =
         std::env::var("OULIPOLY_AGE319_RUNNER_IMAGE").expect("built Runner image required");
     let temp = tempfile::tempdir().unwrap();
@@ -46,18 +60,47 @@ fn inner() {
     let mailbox =
         MailboxDb::open_completion_continuation_domain(&data.join("pid-identity.db")).unwrap();
     let pending_binding = normal_mode.then(|| {
-        let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../oulipoly-state/tests/fixtures/age360-paired-wire.json"
-        ))
-        .unwrap();
-        AdmittedSourceBinding::new(
-            "fixture-admission",
-            fixture["registration_bytes_utf8"]
-                .as_str()
-                .unwrap()
-                .as_bytes(),
-        )
-        .unwrap()
+        if real_source {
+            let registration =
+                fs::read(std::env::var("AGE319_PRIVATE_BASH_REGISTRATION").unwrap()).unwrap();
+            let source: oulipoly_state::completion_continuation::SourceRegistration =
+                serde_json::from_slice(&registration).unwrap();
+            let state_path = std::env::var("AGE319_PRIVATE_BASH_STATE_DB").unwrap();
+            let committed = rusqlite::Connection::open_with_flags(
+                &state_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let bytes: Vec<u8> = committed
+                .query_row(
+                    "SELECT completion_v2_binding FROM invocation_completion_obligations
+                     WHERE event_id=?1 AND completion_v2_binding IS NOT NULL",
+                    [&source.handle],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let binding: AdmittedSourceBinding = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(binding.registration_bytes(), registration);
+            assert_eq!(binding.registration().unwrap(), source);
+            assert!(
+                !binding.caller_admission_id().is_empty(),
+                "Bash source must have a genuine committed State admission"
+            );
+            binding
+        } else {
+            let fixture: serde_json::Value = serde_json::from_str(include_str!(
+                "../../oulipoly-state/tests/fixtures/age360-paired-wire.json"
+            ))
+            .unwrap();
+            AdmittedSourceBinding::new(
+                "fixture-admission",
+                fixture["registration_bytes_utf8"]
+                    .as_str()
+                    .unwrap()
+                    .as_bytes(),
+            )
+            .unwrap()
+        }
     });
     let domain = pending_binding
         .as_ref()
@@ -161,6 +204,12 @@ fn inner() {
                 (mode == "normal_source_grant_lost_reply")
                     .then_some(("AGE319_PRIVATE_SOURCE_GRANT_REPLY_LOSS_V1", "1")),
             )
+            .envs(real_source.then_some(("AGE319_PRIVATE_SOURCE_LAUNCH_REPLAY_V1", "1")))
+            .envs(
+                (mode == "normal_bash_source_lost_reply")
+                    .then_some(("AGE319_PRIVATE_SOURCE_LAUNCH_REPLY_LOSS_V1", "1")),
+            )
+            .envs(nonzero_source.then_some(("AGE319_PRIVATE_SOURCE_PRELAUNCH_BARRIER_V1", "1")))
             .env_remove("LD_LIBRARY_PATH")
             .stdin(Stdio::null())
             .stdout(Stdio::from(File::create(&out).unwrap()))
@@ -324,6 +373,7 @@ fn inner() {
                 mode.as_str(),
                 "normal_guardian_post" | "normal_driver_post" | "normal_broker_post"
             );
+            let mut damaged_snapshot = None;
             if mode == "normal_guardian_post" {
                 unsafe { libc::kill(prepared.guardian.host_pid, libc::SIGKILL) };
             } else if mode == "normal_driver_post" {
@@ -362,20 +412,54 @@ fn inner() {
                 let mut stale = launch;
                 stale.owner_generation = uuid::Uuid::new_v4().to_string();
                 assert!(protocol::launch_source_effect_grant_at(&socket, &stale).is_err());
+                if nonzero_source {
+                    let source = pending_binding.as_ref().unwrap().registration().unwrap();
+                    let path = Path::new(&source.handle_dir).join(&source.snapshot_relative);
+                    let original = fs::read(&path).unwrap();
+                    fs::write(&path, b"invalid v2 snapshot").unwrap();
+                    damaged_snapshot = Some(SnapshotRestore {
+                        path,
+                        bytes: original,
+                    });
+                    fs::write(gate.join("source-allow-launch"), b"yes").unwrap();
+                    // The original guardian must stay pinned until W has
+                    // consumed the grant and acknowledged the held worker.
+                    eventually(|| gate.join("source-launched").exists());
+                } else if real_source {
+                    eventually(|| gate.join("source-grant-consumed-readback").exists());
+                }
             }
             fs::write(gate.join("child-effect"), b"yes").unwrap();
             eventually(|| entry.try_wait().unwrap().is_some());
+            if real_source && !post_death {
+                // The joined child can exit before the outside driver finishes
+                // W, especially when the private prelaunch gate is held.
+                eventually(|| {
+                    fs::read_to_string(&err).is_ok_and(|message| message.contains("v30 source"))
+                });
+            }
             if post_death {
                 assert!(!entry.wait().unwrap().success());
                 assert_eq!(fs::metadata(&out).unwrap().len(), 0);
             } else {
+                let entry_error = fs::read_to_string(&err).unwrap_or_default();
                 assert!(
-                    fs::read_to_string(&err)
-                        .unwrap_or_default()
-                        .contains("v30 source effect grant retained; physical recovery child custody and root-only exact acceptance remain closed"),
-                    "normal repair boundary: entry={} broker={}",
-                    fs::read_to_string(&err).unwrap_or_default(),
+                    entry_error.contains(
+                        if real_source && mode != "normal_bash_source_lost_reply" {
+                            "v30 source physically launched; v2 acceptance remains closed"
+                        } else {
+                            "v30 source launch uncertain or refused"
+                        }
+                    ),
+                    "normal repair boundary: entry={entry_error} broker={} status={:?} launched={} physical={:?}",
                     fs::read_to_string(&broker_log).unwrap_or_default(),
+                    entry.try_wait().unwrap(),
+                    gate.join("source-launched").exists(),
+                    fs::read_dir(broker_state.join("source-physical"))
+                        .unwrap()
+                        .filter_map(Result::ok)
+                        .map(|entry| entry.file_name())
+                        .collect::<Vec<_>>(),
                 );
                 assert_eq!(
                     fs::read_to_string(&out).unwrap(),
@@ -434,7 +518,7 @@ fn inner() {
                         },
                     )
                     .unwrap();
-                assert_eq!(grant.0, "reserved");
+                assert_eq!(grant.0, if real_source { "consumed" } else { "reserved" });
                 assert_eq!(grant.1, *source_id);
                 assert_eq!(
                     grant.2,
@@ -445,7 +529,133 @@ fn inner() {
                     pending_binding.as_ref().unwrap().registration_bytes()
                 );
                 assert_eq!(grant.4, prepared.owner_generation);
-                assert_eq!(grant.5, 1);
+                assert_eq!(grant.5, if real_source { 2 } else { 1 });
+                if real_source {
+                    assert_eq!(
+                        gate.join("source-launched").exists(),
+                        mode != "normal_bash_source_lost_reply"
+                    );
+                    let physical = broker_state.join("source-physical");
+                    let grant_id = fs::read_to_string(gate.join("source-grant-ready")).unwrap();
+                    eventually(|| {
+                        fs::read_dir(&physical)
+                            .unwrap()
+                            .filter_map(Result::ok)
+                            .any(|entry| {
+                                entry
+                                    .file_name()
+                                    .to_string_lossy()
+                                    .ends_with(".terminal.json")
+                            })
+                    });
+                    eventually(|| {
+                        matches!(
+                            SourcePhysicalRegistry::open(&physical)
+                                .unwrap()
+                                .observe(&grant_id)
+                                .unwrap(),
+                            SourceObservation::Drained { .. }
+                        )
+                    });
+                    let observation = SourcePhysicalRegistry::open(&physical)
+                        .unwrap()
+                        .observe(&grant_id)
+                        .unwrap();
+                    assert!(matches!(observation, SourceObservation::Drained {
+                        worker_wait_status, cancel_requested: false, ..
+                    } if (worker_wait_status == 0) != nonzero_source));
+                    let retained = BrokerSidecar::open_existing(
+                        &broker_state.join("sidecar/pid-identity.db"),
+                        &broker_state,
+                    )
+                    .unwrap();
+                    let custody = SourcePhysicalRegistry::open(&physical).unwrap();
+                    if nonzero_source {
+                        assert!(
+                            oulipoly_kernel_broker::source_acceptance::assess_v2_candidate(
+                                &retained, &custody, &grant_id
+                            )
+                            .is_err()
+                        );
+                        drop(damaged_snapshot.take().unwrap());
+                    } else {
+                        let assessed =
+                            oulipoly_kernel_broker::source_acceptance::assess_v2_candidate(
+                                &retained, &custody, &grant_id,
+                            )
+                            .unwrap();
+                        assert_eq!(
+                            assessed.registration_id,
+                            pending_binding
+                                .as_ref()
+                                .unwrap()
+                                .registration()
+                                .unwrap()
+                                .registration_id
+                        );
+                        let reply: serde_json::Value = serde_json::from_slice(
+                            &fs::read(physical.join(format!("{grant_id}.stdout"))).unwrap(),
+                        )
+                        .unwrap();
+                        let verified = oulipoly_state::completion_continuation::VerifiedCompletion::from_source_files(
+                        pending_binding.as_ref().unwrap()).unwrap();
+                        verified.validate_source_reply(&reply).unwrap();
+                        let source = pending_binding.as_ref().unwrap().registration().unwrap();
+                        let snapshot =
+                            Path::new(&source.handle_dir).join(&source.snapshot_relative);
+                        let original = fs::read(&snapshot).unwrap();
+                        let mut changed = original.clone();
+                        changed.push(b' ');
+                        fs::write(&snapshot, &changed).unwrap();
+                        let changed_evidence = oulipoly_state::completion_continuation::VerifiedCompletion::from_source_files(
+                        pending_binding.as_ref().unwrap()).unwrap();
+                        assert!(
+                            changed_evidence.validate_source_reply(&reply).is_err(),
+                            "changed original snapshot must not match physical Bash reply"
+                        );
+                        assert!(
+                            oulipoly_kernel_broker::source_acceptance::assess_v2_candidate(
+                                &retained, &custody, &grant_id
+                            )
+                            .is_err(),
+                            "changed original snapshot must not pass broker candidate assessment"
+                        );
+                        fs::write(&snapshot, original).unwrap();
+                        assert_eq!(
+                            oulipoly_kernel_broker::source_acceptance::assess_v2_candidate(
+                                &retained, &custody, &grant_id
+                            )
+                            .unwrap(),
+                            assessed
+                        );
+                    }
+                    assert_eq!(
+                        fs::read_dir(&physical)
+                            .unwrap()
+                            .filter_map(Result::ok)
+                            .filter(|entry| entry
+                                .file_name()
+                                .to_string_lossy()
+                                .ends_with(".terminal.json"))
+                            .count(),
+                        1,
+                        "genuine Bash source must have one terminal receipt before restart"
+                    );
+                    assert_eq!(
+                        fs::read_dir(&physical)
+                            .unwrap()
+                            .filter_map(Result::ok)
+                            .filter(
+                                |entry| entry.file_name().to_string_lossy().ends_with(".json")
+                                    && !entry
+                                        .file_name()
+                                        .to_string_lossy()
+                                        .ends_with(".terminal.json")
+                            )
+                            .count(),
+                        1
+                    );
+                }
             }
             assert_eq!(
                 fs::read(data.join("pid-identity.db")).unwrap(),
@@ -509,6 +719,29 @@ fn inner() {
                 ("unknown".into(), 2, 1),
                 "lost custody must retain one unknown grant"
             );
+        }
+        if real_source {
+            let retained = rusqlite::Connection::open_with_flags(
+                broker_state.join("sidecar/pid-identity.db"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let grant: (String, i64, i64) = retained
+                .query_row(
+                    "SELECT phase,revision,count(*) FROM broker_source_effect_grant",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(grant, ("consumed".into(), 2, 1));
+            let grant_id = fs::read_to_string(gate.join("source-grant-ready")).unwrap();
+            assert!(matches!(
+                SourcePhysicalRegistry::open(broker_state.join("source-physical"))
+                    .unwrap()
+                    .observe(&grant_id)
+                    .unwrap(),
+                SourceObservation::Drained { .. }
+            ));
         }
         stop(&mut restarted);
         unsafe { libc::kill(prepared.root_init.host_pid, libc::SIGKILL) };
@@ -1412,4 +1645,40 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         );
         assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
     }
+}
+
+#[test]
+fn genuine_bash_source_v30_is_one_use_and_not_accepted_without_commit_custody() {
+    if std::env::var_os("AGE319_PRIVATE_JOIN_INNER").is_some() {
+        inner();
+        return;
+    }
+    let Some(mode) = std::env::var("AGE319_PRIVATE_BASH_MODE").ok() else {
+        return;
+    };
+    assert!(matches!(
+        mode.as_str(),
+        "normal_bash_source" | "normal_bash_source_lost_reply" | "normal_bash_source_nonzero"
+    ));
+    assert!(std::env::var_os("OULIPOLY_AGE319_RUNNER_IMAGE").is_some());
+    assert!(std::env::var_os("AGE319_PRIVATE_BASH_REGISTRATION").is_some());
+    assert!(std::env::var_os("AGE319_PRIVATE_BASH_STATE_DB").is_some());
+    let output = Command::new("unshare")
+        .args(["-Urpfm", "--mount-proc"])
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "genuine_bash_source_v30_is_one_use_and_not_accepted_without_commit_custody",
+            "--nocapture",
+        ])
+        .env("AGE319_PRIVATE_JOIN_INNER", "1")
+        .env("AGE319_PRIVATE_JOIN_MODE", &mode)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{mode}: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

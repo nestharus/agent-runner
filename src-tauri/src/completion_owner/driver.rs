@@ -138,20 +138,14 @@ fn run_v30_repair_boundary(
         let selected = route.source_selection(owner, &page)?;
         if selected.candidate.is_some() {
             // Reserve a unique broker-owned debt for the exact State-selected
-            // registration/listener and running driver. A grant remains inert
-            // until an actual recovery child can be held and consumed by the
-            // root broker. The guardian currently exits after the joined
-            // original child reports D; a recovery PID1 can outlive that
-            // guardian and driver. Post-effect observation therefore needs a
-            // broker-owned durable witness that remains usable after this
-            // live-driver read route closes. The effect/accept gates stay closed.
+            // registration/listener and running driver. W takes no source path
+            // or grant ID from us; the broker rereads this reservation before
+            // holding and releasing one recovery child.
             let grant = match route.read_source_grant(owner)? {
                 Some(existing) => existing,
                 None => route.reserve_source_grant(owner, &selected)?,
             };
-            if grant.candidate != *selected.candidate.as_ref().unwrap()
-                || !matches!(grant.phase.as_str(), "reserved" | "unknown")
-            {
+            if grant.candidate != *selected.candidate.as_ref().unwrap() {
                 return Err("v30 selected source/grant changed".into());
             }
             #[cfg(feature = "age319-private-broker-fixture")]
@@ -161,10 +155,30 @@ fn run_v30_repair_boundary(
                     grant.grant_id.as_bytes(),
                 )
                 .map_err(|e| e.to_string())?;
+                if std::env::var_os("AGE319_PRIVATE_SOURCE_PRELAUNCH_BARRIER_V1").is_some() {
+                    let deadline = Instant::now() + Duration::from_secs(20);
+                    while !Path::new(&gate).join("source-allow-launch").exists() {
+                        if Instant::now() >= deadline {
+                            return Err("private source prelaunch barrier expired".into());
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                }
             }
-            return Err(
-                "v30 source effect grant retained; physical recovery child custody and root-only exact acceptance remain closed".into(),
-            );
+            if grant.phase != "reserved" || grant.revision != 1 {
+                return Err("v30 source grant already has effect or unknown debt".into());
+            }
+            let launched = route.launch_reserved_source(owner, &grant)?;
+            #[cfg(feature = "age319-private-broker-fixture")]
+            if let Some(gate) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1") {
+                std::fs::write(
+                    Path::new(&gate).join("source-launched"),
+                    launched.as_bytes(),
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            let _ = launched;
+            return Err("v30 source physically launched; v2 acceptance remains closed".into());
         }
         return Err("v30 wake selection requires broker recipient grant".into());
     }

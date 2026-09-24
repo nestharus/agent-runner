@@ -341,6 +341,19 @@ pub fn launch_source_effect_grant_at(path: &Path, spec: &StateWriteSpec) -> io::
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]
+pub fn launch_source_effect_grant_drop_reply_at(
+    path: &Path,
+    spec: &StateWriteSpec,
+) -> io::Result<()> {
+    if spec.protocol != "broker-source-effect-launch-v30"
+        || !matches!(spec.action, StateWriteAction::LaunchSourceGrant)
+    {
+        return Err(io::Error::other("invalid lost-reply source launch"));
+    }
+    state_write_drop_reply_at(path, spec)
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
 pub fn reserve_source_effect_grant_drop_reply_at(
     path: &Path,
     spec: &StateWriteSpec,

@@ -746,6 +746,116 @@ impl BrokerSidecar {
         })
     }
 
+    /// Post-owner readback for a physical grant. This is candidate evidence,
+    /// not an acceptance transition: the original v2 files are mutable and a
+    /// separate broker-owned snapshot/commit fence is still required.
+    pub fn read_consumed_source_candidate(
+        &self,
+        physical_grant: &BrokerSourceEffectGrant,
+    ) -> Result<crate::completion_continuation::AdmittedSourceBinding, String> {
+        self.check_mailbox_read(&physical_grant.source_generation)?;
+        if physical_grant.phase != "consumed" || physical_grant.revision != 2 {
+            return Err("physical source is not a consumed grant".into());
+        }
+        let row: (
+            String,
+            String,
+            String,
+            String,
+            i64,
+            String,
+            Vec<u8>,
+            i64,
+            String,
+            String,
+            i64,
+        ) = self
+            .mailbox
+            .conn
+            .query_row(
+                "SELECT source_generation,root_id,owner_generation,driver_identity,
+                    authority_ordinal,registration_digest,registration_bytes,
+                    listener_revision,listener_json,phase,revision
+             FROM broker_source_effect_grant WHERE grant_id=?1 AND registration_id=?2",
+                params![
+                    physical_grant.grant_id,
+                    physical_grant.candidate.registration_id
+                ],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                    ))
+                },
+            )
+            .map_err(|e| e.to_string())?;
+        if row.0 != physical_grant.source_generation
+            || row.1 != physical_grant.root_id
+            || row.2 != physical_grant.owner_generation
+            || row.3
+                != serde_json::to_string(&physical_grant.driver_identity)
+                    .map_err(|e| e.to_string())?
+            || row.4 != physical_grant.authority_ordinal
+            || row.5 != physical_grant.candidate.registration_digest
+            || row.7
+                != i64::try_from(physical_grant.candidate.listener_revision)
+                    .map_err(|e| e.to_string())?
+            || serde_json::from_str::<crate::completion_continuation::ListenerIdentity>(&row.8)
+                .map_err(|e| e.to_string())?
+                != physical_grant.candidate.listener
+            || row.9 != "consumed"
+            || row.10 != 2
+            || crate::completion_continuation::sha256(&row.6) != row.5
+        {
+            return Err("consumed source grant changed after physical launch".into());
+        }
+        let scope: (String, String, String) = self.mailbox.conn.query_row(
+            "SELECT domain_id,supervisor_authority_id,driver_identity
+             FROM broker_prepared_owner WHERE owner_generation=?1 AND source_generation=?2 AND root_id=?3",
+            params![physical_grant.owner_generation, physical_grant.source_generation, physical_grant.root_id],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).map_err(|e| e.to_string())?;
+        let retained: (Vec<u8>, String, String) = self.mailbox.conn.query_row(
+            "SELECT binding,phase,supervisor_authority_id FROM completion_continuation_source
+             WHERE registration_id=?1 AND domain_id=(SELECT domain_id FROM completion_continuation_domain)",
+            [&physical_grant.candidate.registration_id],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).map_err(|e| e.to_string())?;
+        let binding = crate::completion_continuation::AdmittedSourceBinding::decode(&retained.0)?;
+        let prepared_driver: PreparedProcessStamp =
+            serde_json::from_str(&scope.2).map_err(|e| e.to_string())?;
+        if retained.1 != "registered"
+            || retained.2 != scope.1
+            || binding.registration()?.domain_id != scope.0
+            || i64::from(prepared_driver.host_pid) != physical_grant.driver_identity.pid
+            || prepared_driver.boot_id != physical_grant.driver_identity.boot_id
+            || i64::try_from(prepared_driver.starttime_ticks).map_err(|e| e.to_string())?
+                != physical_grant.driver_identity.starttime_ticks
+            || binding.registration_bytes() != row.6
+            || binding.registration_digest() != row.5
+            || binding.admission_listener()? != physical_grant.candidate.listener
+            || binding.registration()?.listener_revision
+                != physical_grant.candidate.listener_revision
+        {
+            return Err("consumed source projection changed".into());
+        }
+        let state = self.bound_state()?;
+        if state.admitted_completion_continuation(&binding)?.as_ref() != Some(&binding) {
+            return Err("consumed source lost exact State admission".into());
+        }
+        self.check_mailbox_read(&physical_grant.source_generation)?;
+        Ok(binding)
+    }
+
     /// One conditional irreversible transition. A lost reply cannot consume
     /// again; the caller must retain the consumed row as unknown debt until
     /// an exact held-child physical record is fsynced.

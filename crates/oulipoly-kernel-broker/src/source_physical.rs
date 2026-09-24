@@ -395,6 +395,27 @@ impl SourcePhysicalRegistry {
         &self.records
     }
 
+    /// Open the broker-owned captured reply only after complete physical
+    /// readback. The caller still has to parse and bind it to State and v2
+    /// original evidence; this file alone is never acceptance.
+    pub fn open_drained_stdout(&self, grant_id: &str) -> io::Result<File> {
+        if !matches!(self.observe(grant_id)?, SourceObservation::Drained { .. }) {
+            return Err(io::Error::other(
+                "source stdout has no drained physical witness",
+            ));
+        }
+        let record = self
+            .records
+            .iter()
+            .find(|r| r.grant.grant_id == grant_id)
+            .ok_or_else(|| io::Error::other("source physical grant absent"))?;
+        let file = open_exact(&self.directory, grant_id, "stdout")?;
+        if OutputStamp::of(&file)? != record.stdout {
+            return Err(io::Error::other("source stdout inode changed"));
+        }
+        Ok(file)
+    }
+
     pub fn orphaned_grants(&self) -> &[String] {
         &self.orphaned
     }

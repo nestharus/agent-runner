@@ -21,6 +21,80 @@ pub(crate) struct V30OwnerRoute {
 }
 
 impl V30OwnerRoute {
+    /// W selects the already reserved grant inside the broker. A missing reply
+    /// is one-use uncertainty: read the grant for diagnosis, never send W again.
+    pub(crate) fn launch_reserved_source(
+        &self,
+        owner: &CompletionDomainOwner,
+        reserved: &BrokerSourceEffectGrant,
+    ) -> Result<String, String> {
+        self.read_running(owner, None)?;
+        if reserved.source_generation != self.source_generation
+            || reserved.root_id != self.root_id
+            || reserved.owner_generation != self.owner_generation
+            || reserved.driver_identity != owner.driver_identity
+            || reserved.phase != "reserved"
+            || reserved.revision != 1
+            || self.read_source_grant(owner)?.as_ref() != Some(reserved)
+        {
+            return Err("v30 source launch lost exact reserved grant".into());
+        }
+        let spec = self.write_spec(
+            "broker-source-effect-launch-v30",
+            StateWriteAction::LaunchSourceGrant,
+        );
+        #[cfg(feature = "age319-private-broker-fixture")]
+        let reply = if std::env::var_os("AGE319_PRIVATE_SOURCE_LAUNCH_REPLY_LOSS_V1").is_some() {
+            protocol::launch_source_effect_grant_drop_reply_at(&self.socket, &spec)
+                .map(|()| Err(std::io::Error::other("private source launch reply lost")))
+                .unwrap_or_else(Err)
+        } else {
+            protocol::launch_source_effect_grant_at(&self.socket, &spec)
+        };
+        #[cfg(not(feature = "age319-private-broker-fixture"))]
+        let reply = protocol::launch_source_effect_grant_at(&self.socket, &spec);
+        let after = self.read_source_grant(owner)?;
+        if after.as_ref().is_none_or(|grant| {
+            grant.grant_id != reserved.grant_id
+                || grant.candidate != reserved.candidate
+                || !matches!(grant.phase.as_str(), "reserved" | "consumed" | "unknown")
+        }) {
+            return Err("v30 source launch readback changed; effect unknown".into());
+        }
+        #[cfg(feature = "age319-private-broker-fixture")]
+        if after
+            .as_ref()
+            .is_some_and(|grant| grant.phase == "consumed")
+            && let Some(gate) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+        {
+            std::fs::write(
+                Path::new(&gate).join("source-grant-consumed-readback"),
+                reserved.grant_id.as_bytes(),
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        match reply {
+            Ok(reply)
+                if after
+                    .as_ref()
+                    .is_some_and(|grant| grant.phase == "consumed") =>
+            {
+                #[cfg(feature = "age319-private-broker-fixture")]
+                if std::env::var_os("AGE319_PRIVATE_SOURCE_LAUNCH_REPLAY_V1").is_some()
+                    && protocol::launch_source_effect_grant_at(&self.socket, &spec).is_ok()
+                {
+                    return Err("private source W replay launched a second worker".into());
+                }
+                Ok(reply)
+            }
+            Ok(_) => Err("v30 source launch reply lacked consumed grant".into()),
+            Err(error) => Err(format!(
+                "v30 source launch uncertain or refused: {error}; grant phase {}",
+                after.unwrap().phase
+            )),
+        }
+    }
+
     pub(crate) fn reserve_source_grant(
         &self,
         owner: &CompletionDomainOwner,
