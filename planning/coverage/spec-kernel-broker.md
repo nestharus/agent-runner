@@ -10,6 +10,7 @@
 - `crates/oulipoly-kernel-broker/src/cutover_gate.rs`
 - `crates/oulipoly-kernel-broker/src/entry_registry.rs`
 - `crates/oulipoly-kernel-broker/src/fresh_provider.rs`
+- `crates/oulipoly-kernel-broker/src/fresh_index.rs`
 - `crates/oulipoly-kernel-broker/src/fresh_provider_fixture.rs`
 - `crates/oulipoly-kernel-broker/src/lib.rs`
 - `crates/oulipoly-kernel-broker/src/linux_main.rs`
@@ -120,6 +121,8 @@
 - Ordinary Runner/Bash entry and allocated-attempt NNP/seccomp remain. The opt-in entry keeps the host guardian outside the root PID namespace and releases only the fixed Runner for help/offline diagnostics.
 
 ## Declared test patterns
+
+- `fresh_index.rs` unit tests cover explicit empty genesis and pre-index refusal, keyed record collision/corruption, missing committed records, generation mismatch, serialized decision CAS and pending/decision/cursor crash windows, pin sequence, durable account reopen, prepared grant/effect and manual K without Q, exact artifact readback, marker times and bounded failures. This substrate is not wired into live selection or effect writers.
 
 - `crates/oulipoly-kernel-broker/tests/private_pidns.rs` exercises root sibling/nested classification and root debt.
 - `crates/oulipoly-kernel-broker/tests/private_work_pidns.rs` exercises root/work binding, sibling separation, adopted peer classification, persistence poisoning, and restart uncertainty.

@@ -2,6 +2,11 @@
 #[cfg(feature = "age319-private-broker-fixture")]
 #[path = "fresh_provider.rs"]
 mod fresh_provider;
+// Inert AGE-319 substrate. No live selector, admission, or effect path calls it.
+#[cfg(feature = "age319-private-broker-fixture")]
+#[path = "fresh_index.rs"]
+#[allow(dead_code)]
+mod fresh_index;
 #[cfg(feature = "age319-private-broker-fixture")]
 #[path = "manual_quota.rs"]
 mod manual_quota;
