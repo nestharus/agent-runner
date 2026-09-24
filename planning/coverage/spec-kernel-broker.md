@@ -12,9 +12,11 @@
 - `crates/oulipoly-kernel-broker/src/protocol.rs`
 - `crates/oulipoly-kernel-broker/src/registry.rs`
 - `crates/oulipoly-kernel-broker/src/root_join.rs`
+- `crates/oulipoly-kernel-broker/src/source_physical.rs`
 - `crates/oulipoly-kernel-broker/src/work_registry.rs`
 - `crates/oulipoly-kernel-broker/src/writer_census.rs`
 - `crates/oulipoly-kernel-broker/tests/private_root_join.rs`
+- `crates/oulipoly-kernel-broker/tests/private_source_physical.rs`
 - `crates/oulipoly-kernel-broker/tests/private_accepted_h_frame.rs`
 - `src-tauri/src/kernel_entry.rs`
 - `src-tauri/src/completion_owner/linux.rs`
@@ -45,6 +47,9 @@
 | H succeeds, fails, or loses its response at the pinned guardian. | The accepted request remains no-replay and never forks through the legacy `Command::spawn` path; no execution grant or physical drain is inferred from H. |
 | Prepared grant consumed before a future namespace fork, then broker restart. | Fsynced consumed record remains and replay is refused. |
 | Root or work PID1 missing/changed on restart. | Durable unknown debt, never a drain receipt. |
+| Broker-owned consumed source grant, pinned root/entry/driver/guardian/held worker, and empty root-only capture files. | One fsynced source physical record binds exact process incarnations, nested PID1 lineage, worker local PID and output inodes before the worker gate opens. A duplicate grant or orphan output blocks another physical binding. Production consumption and launch are still closed. |
+| Source worker exits while an adopted descendant remains live. | Source PID1 retains the worker wait, reaps to ECHILD without a lifetime cap, syncs bounded stdout/stderr, and writes one terminal receipt; post-owner readback remains live/pending until the exact PID1 incarnation ends. Missing, changed or incomplete evidence remains unknown debt. |
+| Broker restarts after a durable source cancellation intent but before a signal reply. | The fixed root-only registry reopens, reissues the request through the exact PID1 pidfd, and observes the same terminal/drain receipt. A changed PID never receives the signal. |
 | Unsolicited descriptor in a challenged socket request. | Descriptor closed and request refused. |
 | Entry reservation from an unrelated child PID namespace classified `outside`. | Denied because the connector is not in the broker's host PID namespace. |
 | Host entry reserves before guardian fork, then prepares a gated exact child and binds its domain. | Fsynced root/entry/prepared-guardian/domain binding; repeated bind refused. |
@@ -77,6 +82,7 @@
 - Registry read order does not matter for nested parent reattachment.
 - A write or fsync failure poisons the running registry until restart/reconciliation.
 - A grant ID may bind only one work namespace record; old classifier records have no grant authority.
+- Source capture is complete only up to 64 MiB per stream. Larger output yields unknown debt rather than truncated success.
 
 ## Error conditions
 
@@ -97,6 +103,7 @@
 - `crates/oulipoly-kernel-broker/tests/private_pidns.rs` exercises root sibling/nested classification and root debt.
 - `crates/oulipoly-kernel-broker/tests/private_work_pidns.rs` exercises root/work binding, sibling separation, adopted peer classification, persistence poisoning, and restart uncertainty.
 - `crates/oulipoly-kernel-broker/tests/private_root_join.rs` runs the actual opt-in Runner and broker binaries in a private user namespace, holds the child at the pre-exec gate, and checks exact root/guardian placement, persisted child stamp, V acceptance and changed-incarnation/socket refusal, replay denial and broker restart debt. Its normal v30 modes use an independently admitted StateDb suffix, a corrupted retired sidecar, and the retained broker connection. The execed driver projects the bounded suffix, rejects wrong root/source/owner and stale/duplicate repair requests, reconciles a lost reply by exact cursor readback, and stops at the missing source grant. Restart retains the repaired cursor without admitting another root.
+- `crates/oulipoly-kernel-broker/tests/private_source_physical.rs` runs a Rust nested PID1 reaper with a held Python worker and an adopted descendant longer than five seconds. It exercises post-owner readback, complete bounded output, duplicate and orphan debt, in-place output change, missing receipt, and cancellation intent replay after registry reopen. Its consumed grant is a private fixture surrogate, not a Bash-created source or production consume.
 - `crates/oulipoly-kernel-broker/src/linux_main.rs` unit tests exercise challenged credentials, a `CAP_SYS_ADMIN` child namespace socket handoff, exact host namespace policy, descriptor rejection, and production dispatch E/P/G ordering.
 - `crates/oulipoly-kernel-broker/src/entry_registry.rs` exercises persisted exact prepare/bind and sibling/replay denial.
 - `crates/oulipoly-kernel-broker/src/accepted_grant.rs` exercises receipt/intent binding, consumed replay refusal across reopen, and malformed recovery refusal.

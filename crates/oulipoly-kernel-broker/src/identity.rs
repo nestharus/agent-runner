@@ -305,18 +305,24 @@ impl PinnedProcess {
     }
 
     pub fn is_namespace_init(&self) -> io::Result<bool> {
+        Ok(self.namespace_pid()? == 1)
+    }
+
+    pub fn namespace_pid(&self) -> io::Result<i32> {
         self.verify()?;
         let status = host_proc_read(&format!("{}/status", self.host_pid))?;
         let line = status
             .lines()
             .find(|line| line.starts_with("NSpid:"))
             .ok_or_else(|| io::Error::other("missing NSpid"))?;
-        let local = line
+        let local: i32 = line
             .split_ascii_whitespace()
             .last()
-            .ok_or_else(|| io::Error::other("empty NSpid"))?;
+            .ok_or_else(|| io::Error::other("empty NSpid"))?
+            .parse()
+            .map_err(|_| io::Error::other("invalid NSpid"))?;
         self.verify()?;
-        Ok(local == "1")
+        Ok(local)
     }
 
     pub fn supplementary_groups(&self) -> io::Result<Vec<libc::gid_t>> {

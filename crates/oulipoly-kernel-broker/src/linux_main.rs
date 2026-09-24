@@ -17,6 +17,7 @@ use oulipoly_kernel_broker::protocol::{
     StateWriteSpec,
 };
 use oulipoly_kernel_broker::registry::RootRegistry;
+use oulipoly_kernel_broker::source_physical::{SourceObservation, SourcePhysicalRegistry};
 use oulipoly_kernel_broker::work_registry::{Scope, WorkRegistry, classify_scope};
 use oulipoly_state::mailbox::{
     BrokerReleaseEvidence, BrokerSidecar, PreparedBrokerOwner, PreparedProcessStamp,
@@ -2268,6 +2269,39 @@ fn serve() -> io::Result<()> {
     }
     if !fixture {
         checked_root_path(&works_path, true)?;
+    }
+    let source_physical_path = Path::new(&state).join("source-physical");
+    if !source_physical_path.exists() {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&source_physical_path)?;
+    }
+    if !fixture {
+        checked_root_path(&source_physical_path, true)?;
+    }
+    // Startup reads physical records independently of the original driver.
+    // No source effect is enabled here: only a later exact held-child binding
+    // may insert a consumed grant and open its gate.
+    let mut source_physical = SourcePhysicalRegistry::open(&source_physical_path)?;
+    for grant_id in source_physical.orphaned_grants() {
+        eprintln!("source physical debt {grant_id}: no durable held record");
+    }
+    for (grant_id, result) in source_physical.reconcile_cancellations() {
+        if let Err(error) = result {
+            eprintln!("source cancellation debt {grant_id}: {error}");
+        }
+    }
+    for record in source_physical.records() {
+        match source_physical.observe(&record.grant.grant_id) {
+            Ok(SourceObservation::Unknown { reason, .. }) => {
+                eprintln!("source physical debt {}: {reason}", record.grant.grant_id);
+            }
+            Err(error) => {
+                eprintln!("source physical debt {}: {error}", record.grant.grant_id);
+            }
+            _ => {}
+        }
     }
     let host_namespace = host_proc_file("self/ns/pid")?;
     let mut registry = RootRegistry::open(&state)?;
