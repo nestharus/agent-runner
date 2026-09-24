@@ -388,6 +388,7 @@ mod tests {
             guardian: Some(stamp.clone()),
             join_consumed: true,
             joined_child: Some(stamp.clone()),
+            prepared_driver: None,
         };
         fs::write(
             registry_dir.join("entries").join(format!("{root}.json")),

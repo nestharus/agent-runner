@@ -45,7 +45,10 @@ fn inner() {
     let domain = mailbox.completion_continuation_domain().unwrap().unwrap();
     drop(mailbox);
     drop(oulipoly_state::StateDb::open(&data.join("state.db")).unwrap());
-    let broker_generation = if mode == "broker_state" {
+    let broker_generation = if mode == "broker_state"
+        || mode == "held_prepared"
+        || mode == "held_guardian_death"
+    {
         let sidecar_dir = broker_state.join("sidecar");
         fs::create_dir(&sidecar_dir).unwrap();
         fs::set_permissions(&sidecar_dir, fs::Permissions::from_mode(0o700)).unwrap();
@@ -77,6 +80,181 @@ fn inner() {
         "broker startup: {}",
         fs::read_to_string(&broker_log).unwrap()
     );
+    if mode == "held_prepared" || mode == "held_guardian_death" {
+        let generation = broker_generation.unwrap();
+        // A copied v29 path is unusable before E and throughout W/R.
+        fs::write(data.join("pid-identity.db"), b"retired copied owner").unwrap();
+        let out = temp.path().join("held.out");
+        let err = temp.path().join("held.err");
+        let mut entry = Command::new(&runner)
+            .arg("__age319-private-held-prepared-v30")
+            .env("OULIPOLY_DATA_DIR", &data)
+            .env("OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1", "1")
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+            .envs(
+                (mode == "held_guardian_death")
+                    .then_some(("AGE319_PRIVATE_EXPECT_GUARDIAN_DEATH_V1", "1")),
+            )
+            .env_remove("LD_LIBRARY_PATH")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(File::create(&out).unwrap()))
+            .stderr(Stdio::from(File::create(&err).unwrap()))
+            .spawn()
+            .unwrap();
+        eventually(|| gate.join("prepared").exists() || entry.try_wait().unwrap().is_some());
+        assert!(
+            gate.join("prepared").exists(),
+            "entry: {} broker: {}",
+            fs::read_to_string(&err).unwrap(),
+            fs::read_to_string(&broker_log).unwrap()
+        );
+        let prepared: oulipoly_state::mailbox::PreparedBrokerOwner =
+            serde_json::from_slice(&fs::read(gate.join("prepared")).unwrap()).unwrap();
+        assert_eq!(prepared.source_generation, generation);
+        assert_eq!(prepared.entry.host_pid, entry.id() as i32);
+        assert_eq!(prepared.domain_id, domain);
+        assert_ne!(prepared.entry.pidns_ino, prepared.joined_child.pidns_ino);
+        let entry_record: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                broker_state
+                    .join("entries")
+                    .join(format!("{}.json", prepared.root_id)),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            entry_record["prepared_driver"]["host_pid"],
+            prepared.driver.host_pid
+        );
+        assert_eq!(
+            entry_record["prepared_driver"]["starttime_ticks"],
+            prepared.driver.starttime_ticks
+        );
+        assert_eq!(fs::metadata(&out).unwrap().len(), 0);
+        assert!(entry.try_wait().unwrap().is_none());
+        let persisted = BrokerSidecar::open_existing(
+            &broker_state.join("sidecar/pid-identity.db"),
+            &broker_state,
+        )
+        .unwrap()
+        .read_exact_prepared_owner(&generation, &prepared.root_id, &prepared.owner_generation)
+        .unwrap();
+        assert_eq!(persisted, prepared);
+        let db = rusqlite::Connection::open_with_flags(
+            broker_state.join("sidecar/pid-identity.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let running: i64 = db
+            .query_row(
+                "SELECT count(*) FROM completion_continuation_owner",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(running, 0);
+        let read = protocol::StateReadSpec {
+            protocol: "broker-prepared-read-v30".into(),
+            source_generation: generation.clone(),
+            root_id: prepared.root_id.clone(),
+            owner_generation: prepared.owner_generation.clone(),
+            attempt_id: None,
+        };
+        assert!(protocol::read_prepared_owner_at(&socket, &read).is_err()); // wrong actor
+        let forged = protocol::StateWriteSpec {
+            protocol: "broker-prepared-write-v30".into(),
+            source_generation: generation.clone(),
+            root_id: prepared.root_id.clone(),
+            owner_generation: uuid::Uuid::new_v4().to_string(),
+            action: protocol::StateWriteAction::Prepare {
+                driver_pid: prepared.driver.host_pid,
+                endpoint: prepared.endpoint.clone(),
+            },
+        };
+        assert!(protocol::prepare_owner_at(&socket, &forged).is_err());
+        let mut wrong = read;
+        wrong.source_generation = uuid::Uuid::new_v4().to_string();
+        assert!(protocol::read_prepared_owner_at(&socket, &wrong).is_err());
+        assert_eq!(fs::metadata(&out).unwrap().len(), 0);
+        if mode == "held_guardian_death" {
+            unsafe {
+                libc::kill(prepared.guardian.host_pid, libc::SIGKILL);
+            }
+            fs::write(gate.join("guardian-dead"), b"yes").unwrap();
+            eventually(|| {
+                gate.join("death-refused").exists() || entry.try_wait().unwrap().is_some()
+            });
+            assert!(
+                gate.join("death-refused").exists(),
+                "{}",
+                fs::read_to_string(&err).unwrap()
+            );
+            assert_eq!(fs::metadata(&out).unwrap().len(), 0);
+        }
+        stop(&mut broker);
+        fs::write(gate.join("finish"), b"done").unwrap();
+        eventually(|| entry.try_wait().unwrap().is_some());
+        assert!(!entry.wait().unwrap().success());
+        assert_eq!(fs::metadata(&out).unwrap().len(), 0);
+        let records: Vec<_> = fs::read_dir(broker_state.join("entries"))
+            .unwrap()
+            .collect();
+        assert_eq!(records.len(), 1);
+        let record: serde_json::Value =
+            serde_json::from_slice(&fs::read(records[0].as_ref().unwrap().path()).unwrap())
+                .unwrap();
+        assert_eq!(record["join_consumed"], true);
+        assert_eq!(
+            record["joined_child"]["host_pid"],
+            prepared.joined_child.host_pid
+        );
+        let restart_log = temp.path().join("prepared-restart.log");
+        let mut restarted = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(File::create(&restart_log).unwrap()))
+            .spawn()
+            .unwrap();
+        eventually(|| {
+            protocol::request_at(&socket, Operation::Classify).is_ok()
+                || restarted.try_wait().unwrap().is_some()
+        });
+        assert!(
+            restarted.try_wait().unwrap().is_none(),
+            "restart: {}",
+            fs::read_to_string(&restart_log).unwrap()
+        );
+        let retained = BrokerSidecar::open_existing(
+            &broker_state.join("sidecar/pid-identity.db"),
+            &broker_state,
+        )
+        .unwrap()
+        .read_exact_prepared_owner(&generation, &prepared.root_id, &prepared.owner_generation)
+        .unwrap();
+        assert_eq!(retained, prepared);
+        let second = Command::new(&runner)
+            .arg("__age319-private-held-prepared-v30")
+            .env("OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1", "1")
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+            .output()
+            .unwrap();
+        assert!(!second.status.success());
+        assert_eq!(
+            fs::read_dir(broker_state.join("entries")).unwrap().count(),
+            1
+        );
+        assert_eq!(fs::metadata(&out).unwrap().len(), 0);
+        stop(&mut restarted);
+        unsafe {
+            libc::kill(prepared.root_init.host_pid, libc::SIGKILL);
+        }
+        return;
+    }
     if let Some(_generation) = broker_generation {
         // The test executable shares UID and broker access but is not the
         // fixed Runner image. It cannot inspect the route or select a path.
@@ -454,6 +632,8 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "join_only",
         "held_death",
         "broker_state",
+        "held_prepared",
+        "held_guardian_death",
     ] {
         let output = Command::new("unshare")
             .args(["-Urpfm", "--mount-proc"])

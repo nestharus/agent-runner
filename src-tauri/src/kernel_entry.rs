@@ -8,6 +8,19 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+#[cfg(feature = "age319-private-broker-fixture")]
+const PRIVATE_PREPARED_ENTRY: &str = "__age319-private-held-prepared-v30";
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_prepared_mode() -> bool {
+    std::env::args().nth(1).as_deref() == Some(PRIVATE_PREPARED_ENTRY)
+        && unsafe { libc::geteuid() } == 0
+        && std::fs::read_to_string("/proc/self/uid_map")
+            .ok()
+            .is_some_and(|map| map.split_ascii_whitespace().nth(2) == Some("1"))
+        && std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1").is_some()
+}
+
 const REQUIRED_ENV: &str = "OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1";
 const CHILD_FD_ENV: &str = "OULIPOLY_KERNEL_CHILD_JOIN_FD_V1";
 const INSTALLED_RUNNER: &str = "/usr/local/libexec/oulipoly/oulipoly-agent-runner";
@@ -23,6 +36,10 @@ pub(crate) fn verify_installed_entry_route() -> Result<(), String> {
     }
     let route = protocol::observe_entry_gate_at(&broker_socket())
         .map_err(|error| format!("installed broker entry gate unavailable: {error}"))?;
+    #[cfg(feature = "age319-private-broker-fixture")]
+    if route == EntryRoute::BrokerV30Closed && private_prepared_mode() {
+        return Ok(());
+    }
     require_legacy_entry_route(route)
 }
 
@@ -324,6 +341,16 @@ fn private_bash_work() -> Result<ExitCode, String> {
 }
 
 pub(crate) fn host_entry() -> Option<ExitCode> {
+    #[cfg(feature = "age319-private-broker-fixture")]
+    if private_prepared_mode() {
+        return Some(match private_held_prepared_entry() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("OULIPOLY_KERNEL_PREPARED_GAP={error}");
+                ExitCode::FAILURE
+            }
+        });
+    }
     if std::env::var_os(REQUIRED_ENV).is_none() {
         return None;
     }
@@ -342,7 +369,9 @@ pub(crate) fn host_entry() -> Option<ExitCode> {
                 .map_err(|e| format!("broker State route unavailable: {e}"))?
             {
                 StateRoute::Legacy => {}
-                StateRoute::BrokerOwned { source_generation } => {
+                StateRoute::BrokerOwned {
+                    source_generation, ..
+                } => {
                     return Err(format!(
                         "broker-owned State generation {source_generation} requires production client routing"
                     ));
@@ -430,6 +459,289 @@ fn broker_socket() -> PathBuf {
         return PathBuf::from(path);
     }
     PathBuf::from(protocol::INSTALLED_SOCKET)
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_line(socket: &mut UnixStream) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    loop {
+        if bytes.len() >= 4096 {
+            return Err("oversized private prepared frame".into());
+        }
+        let mut byte = [0u8];
+        socket.read_exact(&mut byte).map_err(|e| e.to_string())?;
+        if byte == [b'\n'] {
+            break;
+        }
+        bytes.push(byte[0]);
+    }
+    String::from_utf8(bytes).map_err(|e| e.to_string())
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_guardian_prepared(
+    mut channel: UnixStream,
+    broker: &std::path::Path,
+    gate_dir: &std::path::Path,
+    root: &str,
+    domain: &str,
+    supervisor: &str,
+    source_generation: &str,
+) -> Result<(), String> {
+    let mut byte = [0u8];
+    channel.read_exact(&mut byte).map_err(|e| e.to_string())?;
+    if byte != [b'P'] {
+        return Err("private guardian prepare gate refused".into());
+    }
+    let bound = protocol::bind_v30_guardian_at(broker, root, domain, supervisor)
+        .map_err(|e| e.to_string())?;
+    channel
+        .write_all(bound.as_bytes())
+        .map_err(|e| e.to_string())?;
+    channel.read_exact(&mut byte).map_err(|e| e.to_string())?;
+    if byte != [b'X'] {
+        return Err("private guardian bind readback refused".into());
+    }
+    let endpoint = gate_dir.join("pending-owner.sock");
+    let _pending_endpoint =
+        std::os::unix::net::UnixListener::bind(&endpoint).map_err(|e| e.to_string())?;
+    let (mut driver_parent, mut driver_child) = UnixStream::pair().map_err(|e| e.to_string())?;
+    let driver_pid = unsafe { libc::fork() };
+    if driver_pid < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    if driver_pid == 0 {
+        drop(driver_parent);
+        let mut release = [0u8];
+        let _ = driver_child.read_exact(&mut release);
+        unsafe { libc::_exit(0) }
+    }
+    drop(driver_child);
+    let owner_generation = uuid::Uuid::new_v4().to_string();
+    let proposal = serde_json::json!({
+        "driver_pid": driver_pid,
+        "owner_generation": owner_generation,
+        "endpoint": endpoint.to_string_lossy(),
+    });
+    channel
+        .write_all(proposal.to_string().as_bytes())
+        .map_err(|e| e.to_string())?;
+    channel.write_all(b"\n").map_err(|e| e.to_string())?;
+    channel.read_exact(&mut byte).map_err(|e| e.to_string())?;
+    if byte != [b'J'] {
+        return Err("private held join refused".into());
+    }
+    let generation = protocol::prepared_generation_at(broker, root).map_err(|e| e.to_string())?;
+    if generation != source_generation {
+        return Err("broker I/Y source generation changed".into());
+    }
+    let write = protocol::StateWriteSpec {
+        protocol: "broker-prepared-write-v30".into(),
+        source_generation: generation.clone(),
+        root_id: root.into(),
+        owner_generation: owner_generation.clone(),
+        action: protocol::StateWriteAction::Prepare {
+            driver_pid,
+            endpoint: endpoint.to_string_lossy().into_owned(),
+        },
+    };
+    let published = protocol::prepare_owner_at(broker, &write).map_err(|e| e.to_string())?;
+    if protocol::prepare_owner_at(broker, &write).is_ok() {
+        return Err("prepared W replay published twice".into());
+    }
+    let read = protocol::StateReadSpec {
+        protocol: "broker-prepared-read-v30".into(),
+        source_generation: generation,
+        root_id: root.into(),
+        owner_generation,
+        attempt_id: None,
+    };
+    let exact = protocol::read_prepared_owner_at(broker, &read).map_err(|e| e.to_string())?;
+    if published != exact
+        || exact.domain_id != domain
+        || exact.supervisor_authority_id != supervisor
+        || exact.guardian.host_pid != unsafe { libc::getpid() }
+        || exact.driver.host_pid != driver_pid
+    {
+        return Err("guardian prepared readback changed".into());
+    }
+    let mut stale = read;
+    stale.source_generation = uuid::Uuid::new_v4().to_string();
+    if protocol::read_prepared_owner_at(broker, &stale).is_ok() {
+        return Err("stale source generation gained prepared readback".into());
+    }
+    channel
+        .write_all(
+            serde_json::to_string(&exact)
+                .map_err(|e| e.to_string())?
+                .as_bytes(),
+        )
+        .map_err(|e| e.to_string())?;
+    channel.write_all(b"\n").map_err(|e| e.to_string())?;
+    let _ = channel.read_exact(&mut byte);
+    let _ = driver_parent.write_all(b"X");
+    unsafe { libc::waitpid(driver_pid, std::ptr::null_mut(), 0) };
+    Ok(())
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_held_prepared_entry() -> Result<(), String> {
+    use oulipoly_state::mailbox::PreparedBrokerOwner;
+    let broker = broker_socket();
+    let gate_dir = PathBuf::from(
+        std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+            .ok_or("missing private gate directory")?,
+    );
+    let StateRoute::BrokerOwned {
+        source_generation,
+        domain_id,
+    } = protocol::state_route_at(&broker).map_err(|e| e.to_string())?
+    else {
+        return Err("private prepared entry requires broker v30 I".into());
+    };
+    let reserved =
+        protocol::request_at(&broker, Operation::ReserveV30Entry).map_err(|e| e.to_string())?;
+    let root = reserved
+        .strip_prefix("reserved ")
+        .and_then(|s| s.strip_suffix('\n'))
+        .ok_or("private v30 E refused")?
+        .to_owned();
+    let supervisor = uuid::Uuid::new_v4().to_string();
+    let (mut parent, child) = UnixStream::pair().map_err(|e| e.to_string())?;
+    let guardian_pid = unsafe { libc::fork() };
+    if guardian_pid < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    if guardian_pid == 0 {
+        drop(parent);
+        let result = private_guardian_prepared(
+            child,
+            &broker,
+            &gate_dir,
+            &root,
+            &domain_id,
+            &supervisor,
+            &source_generation,
+        );
+        if let Err(error) = result {
+            eprintln!("OULIPOLY_KERNEL_PRIVATE_GUARDIAN_GAP={error}");
+            unsafe { libc::_exit(70) }
+        }
+        unsafe { libc::_exit(0) }
+    }
+    drop(child);
+    let result = (|| {
+        let prepared = protocol::prepare_v30_guardian_at(&broker, &root, guardian_pid)
+            .map_err(|e| e.to_string())?;
+        if prepared != format!("prepared {root}\n") {
+            return Err("private guardian P mismatch".into());
+        }
+        parent.write_all(b"P").map_err(|e| e.to_string())?;
+        if private_line(&mut parent)? != format!("bound {root} {domain_id} {supervisor}") {
+            return Err("private guardian G mismatch".into());
+        }
+        if protocol::read_v30_entry_at(&broker, &root).map_err(|e| e.to_string())?
+            != format!("bound-entry {root} {domain_id} {supervisor} {guardian_pid}\n")
+        {
+            return Err("private entry A mismatch".into());
+        }
+        parent.write_all(b"X").map_err(|e| e.to_string())?;
+        let proposal: serde_json::Value =
+            serde_json::from_str(&private_line(&mut parent)?).map_err(|e| e.to_string())?;
+        let owner_generation = proposal["owner_generation"]
+            .as_str()
+            .ok_or("missing owner generation")?;
+        let driver_pid = proposal["driver_pid"]
+            .as_i64()
+            .ok_or("missing driver PID")?;
+        let endpoint = proposal["endpoint"].as_str().ok_or("missing endpoint")?;
+        let root_authority = serde_json::json!({
+            "protocol": "root-authority-v1",
+            "root_id": root,
+            "domain_id": domain_id,
+            "supervisor_authority_id": supervisor,
+            "guardian_identity": {"pid": guardian_pid},
+            "capability": format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple()),
+        }).to_string();
+        let cwd = File::open(".").map_err(|e| e.to_string())?;
+        let (_receipt, completion) = UnixStream::pair().map_err(|e| e.to_string())?;
+        let join = JoinSpec {
+            root_id: root.clone(),
+            domain_id: domain_id.clone(),
+            supervisor_id: supervisor.clone(),
+            guardian_pid,
+            root_authority,
+            args: vec!["--help".into()],
+            environment: vec![],
+        };
+        let held = protocol::join_held_v30_at(
+            &broker,
+            &join,
+            [0, 1, 2, cwd.as_raw_fd(), completion.as_raw_fd()],
+        )
+        .map_err(|e| e.to_string())?;
+        if !held.starts_with(&format!("held-joined {root} ")) {
+            return Err("private J did not return held child".into());
+        }
+        let replay = protocol::join_held_v30_at(
+            &broker,
+            &join,
+            [0, 1, 2, cwd.as_raw_fd(), completion.as_raw_fd()],
+        );
+        if replay.is_ok_and(|reply| !reply.starts_with("error ")) {
+            return Err("held J replay acquired a second child".into());
+        }
+        parent.write_all(b"J").map_err(|e| e.to_string())?;
+        let guardian_row: PreparedBrokerOwner =
+            serde_json::from_str(&private_line(&mut parent)?).map_err(|e| e.to_string())?;
+        let read = protocol::StateReadSpec {
+            protocol: "broker-prepared-read-v30".into(),
+            source_generation: source_generation.clone(),
+            root_id: root.clone(),
+            owner_generation: owner_generation.into(),
+            attempt_id: None,
+        };
+        let entry_row =
+            protocol::read_prepared_owner_at(&broker, &read).map_err(|e| e.to_string())?;
+        if entry_row != guardian_row
+            || entry_row.entry.host_pid != unsafe { libc::getpid() }
+            || entry_row.guardian.host_pid != guardian_pid
+            || entry_row.driver.host_pid != i32::try_from(driver_pid).map_err(|e| e.to_string())?
+            || entry_row.endpoint != endpoint
+        {
+            return Err("entry/guardian exact broker readback mismatch".into());
+        }
+        std::fs::write(
+            gate_dir.join("prepared"),
+            serde_json::to_vec(&entry_row).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        let expect_death = std::env::var_os("AGE319_PRIVATE_EXPECT_GUARDIAN_DEATH_V1").is_some();
+        let mut death_refused = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !gate_dir.join("finish").exists() {
+            if expect_death && !death_refused && gate_dir.join("guardian-dead").exists() {
+                if protocol::read_prepared_owner_at(&broker, &read).is_ok() {
+                    return Err("dead guardian retained prepared read authority".into());
+                }
+                std::fs::write(gate_dir.join("death-refused"), b"yes")
+                    .map_err(|e| e.to_string())?;
+                death_refused = true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("private prepared fixture wait expired".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if expect_death && !death_refused {
+            return Err("guardian death was not read back".into());
+        }
+        Ok(())
+    })();
+    let _ = parent.write_all(b"X");
+    drop(parent);
+    unsafe { libc::waitpid(guardian_pid, std::ptr::null_mut(), 0) };
+    result.and(Err("prepared-only child gate remains closed".into()))
 }
 
 fn stage_host_entry(

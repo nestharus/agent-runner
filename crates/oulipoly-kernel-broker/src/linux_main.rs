@@ -17,7 +17,7 @@ use oulipoly_kernel_broker::protocol::{
 };
 use oulipoly_kernel_broker::registry::RootRegistry;
 use oulipoly_kernel_broker::work_registry::{Scope, WorkRegistry, classify_scope};
-use oulipoly_state::mailbox::BrokerSidecar;
+use oulipoly_state::mailbox::{BrokerSidecar, PreparedBrokerOwner, PreparedProcessStamp};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -91,7 +91,15 @@ fn require_cutover_entry_route(
     if gate_closed {
         return Err(io::Error::other("broker entry gate is durably closed"));
     }
-    if broker_owned_sidecar && !matches!(operation, b'Y' | b'R' | b'W' | b'I') {
+    if !broker_owned_sidecar && matches!(operation, b'e' | b'p' | b'g' | b'a' | b'j') {
+        return Err(io::Error::other("v30 entry requires broker-owned sidecar"));
+    }
+    if broker_owned_sidecar
+        && !matches!(
+            operation,
+            b'Y' | b'R' | b'W' | b'I' | b'e' | b'p' | b'g' | b'a' | b'j'
+        )
+    {
         return Err(io::Error::other(
             "broker-owned v30 sidecar requires installed v30 Runner entry routing",
         ));
@@ -260,11 +268,11 @@ fn recv_request(
         cmsg = unsafe { libc::CMSG_NXTHDR(&msg, cmsg) };
     }
     let valid_length = match request[0] {
-        b'G' => read == 65,
-        b'P' => read == 37,
+        b'G' | b'g' => read == 65,
+        b'P' | b'p' => read == 37,
         b'Q' | b'Z' => read == 33,
-        b'A' => read == 33,
-        b'J' => (18..=48 * 1024 + 17).contains(&read),
+        b'A' | b'a' => read == 33,
+        b'J' | b'j' => (18..=48 * 1024 + 17).contains(&read),
         b'V' | b'S' | b's' | b'T' | b'H' | b'K' | b'B' | b'N' | b'k' | b'R' | b'W' | b'Y' => {
             (18..=2048 + 17).contains(&read)
         }
@@ -278,7 +286,7 @@ fn recv_request(
     }
     if invalid_ancillary
         || match request[0] {
-            b'J' | b'H' => descriptors.len() != 5,
+            b'J' | b'j' | b'H' => descriptors.len() != 5,
             b'N' => descriptors.len() != 3,
             b'k' => descriptors.len() != 4,
             b'K' => descriptors.len() != 7,
@@ -303,16 +311,16 @@ fn recv_request(
     }
     process.verify()?;
     let payload = match request[0] {
-        b'P' => RequestPayload::Prepare {
+        b'P' | b'p' => RequestPayload::Prepare {
             root_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
             guardian_pid: i32::from_ne_bytes(request[33..37].try_into().unwrap()),
         },
-        b'G' => RequestPayload::Bind {
+        b'G' | b'g' => RequestPayload::Bind {
             root_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
             domain_id: uuid::Uuid::from_bytes(request[33..49].try_into().unwrap()).to_string(),
             supervisor_id: uuid::Uuid::from_bytes(request[49..65].try_into().unwrap()).to_string(),
         },
-        b'A' => RequestPayload::Read {
+        b'A' | b'a' => RequestPayload::Read {
             root_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
         },
         b'Q' => RequestPayload::ObserveAcceptedWork {
@@ -321,7 +329,7 @@ fn recv_request(
         b'Z' => RequestPayload::CancelAcceptedWork {
             grant_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
         },
-        b'J' => RequestPayload::Join {
+        b'J' | b'j' => RequestPayload::Join {
             spec: serde_json::from_slice(&request[17..read as usize])?,
             descriptors: descriptors
                 .try_into()
@@ -525,8 +533,10 @@ fn broker_state_generation(
     entries: &EntryRegistry,
     sidecar: &BrokerSidecar,
 ) -> io::Result<String> {
-    if spec.protocol != "broker-state-generation-v1"
-        || roots.has_debt()
+    if !matches!(
+        spec.protocol.as_str(),
+        "broker-state-generation-v1" | "broker-prepared-generation-v30"
+    ) || roots.has_debt()
         || entries.has_uncertain_write()
         || works.has_debt()
         || !matches!(
@@ -602,6 +612,9 @@ fn write_broker_state(
         attempt_id,
     };
     match spec.action {
+        StateWriteAction::Prepare { .. } => {
+            Err(io::Error::other("prepared owner requires v30 protocol"))
+        }
         StateWriteAction::Publish {
             driver_pid,
             endpoint,
@@ -1417,6 +1430,204 @@ fn dispatch_authenticated(
     }
 }
 
+fn prepared_stamp(stamp: &ProcessStamp) -> PreparedProcessStamp {
+    PreparedProcessStamp {
+        host_pid: stamp.host_pid,
+        boot_id: stamp.boot_id.clone(),
+        starttime_ticks: stamp.starttime_ticks,
+        pidns_dev: stamp.pidns_dev,
+        pidns_ino: stamp.pidns_ino,
+    }
+}
+
+/// Require the live, retained gate and all exact registry incarnations. A
+/// persisted prepared row after broker restart is debt, never current owner.
+fn held_prepared_actors(
+    root_id: &str,
+    peer: &PeerIdentity,
+    roots: &RootRegistry,
+    entries: &EntryRegistry,
+    held: &BTreeMap<String, root_join::HeldRootJoin>,
+) -> io::Result<[ProcessStamp; 4]> {
+    if roots.has_debt() || entries.has_uncertain_write() {
+        return Err(io::Error::other("prepared root registry uncertain"));
+    }
+    let handle = held
+        .get(root_id)
+        .ok_or_else(|| io::Error::other("prepared gate absent"))?;
+    if handle.root_id() != root_id {
+        return Err(io::Error::other("prepared gate root changed"));
+    }
+    let actors = handle.actors()?;
+    let record = entries
+        .record(root_id)
+        .ok_or_else(|| io::Error::other("prepared entry absent"))?;
+    let root = roots
+        .live_roots()
+        .find(|root| root.record.root_id == root_id)
+        .ok_or_else(|| io::Error::other("prepared root absent"))?;
+    root.init.verify()?;
+    if !record.join_consumed
+        || record.owner_uid != peer.uid
+        || root.record.owner_uid != peer.uid
+        || record.entry != actors[0]
+        || record.guardian.as_ref() != Some(&actors[1])
+        || record.joined_child.as_ref() != Some(&actors[3])
+        || ProcessStamp::from(&root.init) != actors[2]
+    {
+        return Err(io::Error::other("prepared actor registry changed"));
+    }
+    Ok(actors)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "independent broker actor and State authorities"
+)]
+fn prepare_broker_owner(
+    spec: StateWriteSpec,
+    peer: &PeerIdentity,
+    host_namespace: &File,
+    runner_image: &File,
+    roots: &RootRegistry,
+    entries: &mut EntryRegistry,
+    held: &BTreeMap<String, root_join::HeldRootJoin>,
+    sidecar: &mut BrokerSidecar,
+) -> io::Result<PreparedBrokerOwner> {
+    if spec.protocol != "broker-prepared-write-v30"
+        || spec.source_generation != sidecar.source_generation()
+        || !peer.process.in_namespace(host_namespace)?
+    {
+        return Err(io::Error::other("prepared owner source or version changed"));
+    }
+    let StateWriteAction::Prepare {
+        driver_pid,
+        endpoint,
+    } = spec.action
+    else {
+        return Err(io::Error::other("prepared owner action required"));
+    };
+    if !Path::new(&endpoint).is_absolute() || endpoint.len() > 1024 || endpoint.contains('\0') {
+        return Err(io::Error::other("invalid pending endpoint"));
+    }
+    let actors = held_prepared_actors(&spec.root_id, peer, roots, entries, held)?;
+    let entry_process = PinnedProcess::open(actors[0].host_pid)?;
+    if ProcessStamp::from(&peer.process) != actors[1]
+        || !peer.process.same_executable_as(runner_image)?
+        || !entry_process.same_executable_as(runner_image)?
+    {
+        return Err(io::Error::other(
+            "prepared publication requires original guardian",
+        ));
+    }
+    let driver = PinnedProcess::open(driver_pid)?;
+    if !driver.direct_child_of(&peer.process)?
+        || !driver.same_executable_as(runner_image)?
+        || !driver.in_namespace(host_namespace)?
+        || host_proc_uid(driver_pid)? != peer.uid
+    {
+        return Err(io::Error::other(
+            "prepared driver is not exact guardian child",
+        ));
+    }
+    // The proposed PID is only a lookup hint. The broker first seals the
+    // observed driver incarnation into its durable entry registry, then
+    // constructs State evidence from that sealed stamp.
+    let driver_stamp =
+        entries.bind_prepared_driver(&spec.root_id, peer.uid, &peer.process, &driver)?;
+    let entry = entries
+        .record(&spec.root_id)
+        .ok_or_else(|| io::Error::other("prepared entry absent"))?;
+    let prepared = PreparedBrokerOwner {
+        source_generation: spec.source_generation,
+        root_id: spec.root_id,
+        owner_uid: peer.uid,
+        domain_id: entry
+            .domain_id
+            .clone()
+            .ok_or_else(|| io::Error::other("prepared domain absent"))?,
+        supervisor_authority_id: entry
+            .supervisor_authority_id
+            .clone()
+            .ok_or_else(|| io::Error::other("prepared supervisor absent"))?,
+        owner_generation: spec.owner_generation,
+        endpoint,
+        entry: prepared_stamp(&actors[0]),
+        guardian: prepared_stamp(&actors[1]),
+        driver: prepared_stamp(&driver_stamp),
+        root_init: prepared_stamp(&actors[2]),
+        joined_child: prepared_stamp(&actors[3]),
+    };
+    peer.process.verify()?;
+    driver.verify()?;
+    sidecar
+        .prepare_exact_owner(&prepared)
+        .map_err(io::Error::other)
+}
+
+fn read_prepared_broker_owner(
+    spec: StateReadSpec,
+    peer: &PeerIdentity,
+    host_namespace: &File,
+    runner_image: &File,
+    roots: &RootRegistry,
+    entries: &EntryRegistry,
+    held: &BTreeMap<String, root_join::HeldRootJoin>,
+    sidecar: &BrokerSidecar,
+) -> io::Result<PreparedBrokerOwner> {
+    if spec.protocol != "broker-prepared-read-v30"
+        || spec.attempt_id.is_some()
+        || !peer.process.in_namespace(host_namespace)?
+    {
+        return Err(io::Error::other("invalid prepared read"));
+    }
+    let actors = held_prepared_actors(&spec.root_id, peer, roots, entries, held)?;
+    let row = sidecar
+        .read_exact_prepared_owner(
+            &spec.source_generation,
+            &spec.root_id,
+            &spec.owner_generation,
+        )
+        .map_err(io::Error::other)?;
+    let driver = PinnedProcess::open(row.driver.host_pid)?;
+    let registry_driver = entries
+        .record(&spec.root_id)
+        .and_then(|entry| entry.prepared_driver.as_ref())
+        .ok_or_else(|| io::Error::other("prepared driver registry absent"))?;
+    let entry_process = PinnedProcess::open(actors[0].host_pid)?;
+    let guardian = PinnedProcess::open(actors[1].host_pid)?;
+    let caller = ProcessStamp::from(&peer.process);
+    if row.owner_uid != peer.uid
+        || row.entry != prepared_stamp(&actors[0])
+        || row.guardian != prepared_stamp(&actors[1])
+        || row.root_init != prepared_stamp(&actors[2])
+        || row.joined_child != prepared_stamp(&actors[3])
+        || row.driver != prepared_stamp(&ProcessStamp::from(&driver))
+        || row.driver != prepared_stamp(registry_driver)
+        || !driver.direct_child_of(&guardian)?
+        || !entry_process.same_executable_as(runner_image)?
+        || !guardian.same_executable_as(runner_image)?
+        || !driver.same_executable_as(runner_image)?
+        || !driver.in_namespace(host_namespace)?
+        || host_proc_uid(driver.host_pid)? != peer.uid
+        || (caller != actors[0] && caller != actors[1] && caller != ProcessStamp::from(&driver))
+    {
+        return Err(io::Error::other("prepared read actor changed"));
+    }
+    driver.verify()?;
+    peer.process.verify()?;
+    Ok(row)
+}
+
+fn encode_prepared_owner(owner: &PreparedBrokerOwner) -> io::Result<String> {
+    let mut response = serde_json::to_string(owner)?;
+    response.push('\n');
+    if response.len() > 4096 {
+        return Err(io::Error::other("prepared owner readback too large"));
+    }
+    Ok(response)
+}
+
 fn serve() -> io::Result<()> {
     if unsafe { libc::geteuid() } != 0 {
         return Err(io::Error::other("host root required"));
@@ -1518,6 +1729,9 @@ fn serve() -> io::Result<()> {
     // Ephemeral by design: a broker restart invalidates every pre-wire source
     // decision. No work/cancel action can be authorized by a lost ticket.
     let mut source_tickets = BTreeMap::<String, SourceTicket>::new();
+    // Only this serving incarnation owns the pre-exec gate. A restart opens
+    // durable J/prepared debt but cannot recreate or release a lost gate.
+    let mut held_joins = BTreeMap::<String, root_join::HeldRootJoin>::new();
     let terminal_path = Path::new(&state).join("terminals");
     if !terminal_path.exists() {
         use std::os::unix::fs::DirBuilderExt;
@@ -1568,7 +1782,7 @@ fn serve() -> io::Result<()> {
                     entry_gate.abort_before_publication()?;
                     Ok("entry-gate-v1 legacy-open\n".into())
                 }
-            } else if operation == b'J' {
+            } else if operation == b'J' || operation == b'j' {
                 if !root_launch_admitted(
                     &peer,
                     &classify_scope(&peer, &host_namespace, &registry, &works),
@@ -1579,14 +1793,33 @@ fn serve() -> io::Result<()> {
                 let RequestPayload::Join { spec, descriptors } = payload else {
                     return Err(io::Error::other("invalid root join payload"));
                 };
-                root_join::launch(
-                    spec,
-                    descriptors,
-                    &peer,
-                    &runner_image,
-                    &mut registry,
-                    &mut entries,
-                )
+                if operation == b'j' {
+                    if held_joins.contains_key(&spec.root_id) {
+                        return Err(io::Error::other("root join gate already held"));
+                    }
+                    let held = root_join::hold(
+                        spec,
+                        descriptors,
+                        &peer,
+                        &runner_image,
+                        &mut registry,
+                        &mut entries,
+                        true,
+                    )?;
+                    let actors = held.actors()?;
+                    let root_id = held.root_id().to_owned();
+                    held_joins.insert(root_id.clone(), held);
+                    Ok(format!("held-joined {root_id} {}\n", actors[3].host_pid))
+                } else {
+                    root_join::launch(
+                        spec,
+                        descriptors,
+                        &peer,
+                        &runner_image,
+                        &mut registry,
+                        &mut entries,
+                    )
+                }
             } else if operation == b'V' {
                 let RequestPayload::VerifyOwner { witness, socket } = payload else {
                     return Err(io::Error::other("invalid owner witness payload"));
@@ -1780,17 +2013,31 @@ fn serve() -> io::Result<()> {
                 let sidecar = broker_sidecar
                     .as_ref()
                     .ok_or_else(|| io::Error::other("broker State cutover absent"))?;
-                let readback = read_broker_state(
-                    spec,
-                    &peer,
-                    &host_namespace,
-                    &runner_image,
-                    &registry,
-                    &works,
-                    &entries,
-                    sidecar,
-                )?;
-                encode_state_readback(&readback)
+                if spec.protocol == "broker-prepared-read-v30" {
+                    let readback = read_prepared_broker_owner(
+                        spec,
+                        &peer,
+                        &host_namespace,
+                        &runner_image,
+                        &registry,
+                        &entries,
+                        &held_joins,
+                        sidecar,
+                    )?;
+                    encode_prepared_owner(&readback)
+                } else {
+                    let readback = read_broker_state(
+                        spec,
+                        &peer,
+                        &host_namespace,
+                        &runner_image,
+                        &registry,
+                        &works,
+                        &entries,
+                        sidecar,
+                    )?;
+                    encode_state_readback(&readback)
+                }
             } else if operation == b'W' {
                 let RequestPayload::StateWrite { spec } = payload else {
                     return Err(io::Error::other("invalid broker State write payload"));
@@ -1798,17 +2045,31 @@ fn serve() -> io::Result<()> {
                 let sidecar = broker_sidecar
                     .as_mut()
                     .ok_or_else(|| io::Error::other("broker State cutover absent"))?;
-                let readback = write_broker_state(
-                    spec,
-                    &peer,
-                    &host_namespace,
-                    &runner_image,
-                    &registry,
-                    &works,
-                    &entries,
-                    sidecar,
-                )?;
-                encode_state_readback(&readback)
+                if spec.protocol == "broker-prepared-write-v30" {
+                    let readback = prepare_broker_owner(
+                        spec,
+                        &peer,
+                        &host_namespace,
+                        &runner_image,
+                        &registry,
+                        &mut entries,
+                        &held_joins,
+                        sidecar,
+                    )?;
+                    encode_prepared_owner(&readback)
+                } else {
+                    let readback = write_broker_state(
+                        spec,
+                        &peer,
+                        &host_namespace,
+                        &runner_image,
+                        &registry,
+                        &works,
+                        &entries,
+                        sidecar,
+                    )?;
+                    encode_state_readback(&readback)
+                }
             } else if operation == b'Y' {
                 let RequestPayload::StateGeneration { spec } = payload else {
                     return Err(io::Error::other("invalid broker State generation payload"));
@@ -1842,13 +2103,23 @@ fn serve() -> io::Result<()> {
                 peer.process.verify()?;
                 Ok(match broker_sidecar.as_ref() {
                     Some(sidecar) => {
-                        format!("state-route broker-owned {}\n", sidecar.source_generation())
+                        format!(
+                            "state-route broker-owned {} {}\n",
+                            sidecar.source_generation(),
+                            sidecar.domain_id().map_err(io::Error::other)?
+                        )
                     }
                     None => "state-route legacy\n".into(),
                 })
             } else {
                 dispatch_authenticated(
-                    operation,
+                    match operation {
+                        b'e' => b'E',
+                        b'p' => b'P',
+                        b'g' => b'G',
+                        b'a' => b'A',
+                        other => other,
+                    },
                     payload,
                     &peer,
                     &host_namespace,
@@ -1896,6 +2167,11 @@ mod tests {
         for operation in [b'Y', b'R', b'W', b'I'] {
             assert!(require_cutover_entry_route(operation, true, false).is_ok());
             assert!(require_cutover_entry_route(operation, false, true).is_err());
+        }
+        for operation in [b'e', b'p', b'g', b'a', b'j'] {
+            assert!(require_cutover_entry_route(operation, true, false).is_ok());
+            assert!(require_cutover_entry_route(operation, false, false).is_err());
+            assert!(require_cutover_entry_route(operation, true, true).is_err());
         }
         for operation in [b'i', b'X', b'x'] {
             assert!(require_cutover_entry_route(operation, true, true).is_ok());

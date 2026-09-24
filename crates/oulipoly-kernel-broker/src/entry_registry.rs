@@ -60,6 +60,9 @@ pub struct EntryRecord {
     /// use host owner verification after restart.
     #[serde(default)]
     pub joined_child: Option<ProcessStamp>,
+    /// Bound once after held J and before v30 prepared State publication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_driver: Option<ProcessStamp>,
 }
 
 pub struct EntryRegistry {
@@ -88,6 +91,7 @@ impl EntryRegistry {
                 || record.guardian.is_some() && record.prepared_guardian != record.guardian
                 || record.join_consumed && record.guardian.is_none()
                 || record.joined_child.is_some() && !record.join_consumed
+                || record.prepared_driver.is_some() && record.joined_child.is_none()
                 || record
                     .domain_id
                     .as_ref()
@@ -136,6 +140,7 @@ impl EntryRegistry {
             guardian: None,
             join_consumed: false,
             joined_child: None,
+            prepared_driver: None,
         };
         let path = self.directory.join(format!("{root_id}.json"));
         let result = (|| {
@@ -313,6 +318,46 @@ impl EntryRegistry {
         self.replace(index, bound, entry, &guardian)
     }
 
+    pub fn bind_prepared_driver(
+        &mut self,
+        root_id: &str,
+        uid: u32,
+        guardian: &PinnedProcess,
+        driver: &PinnedProcess,
+    ) -> io::Result<ProcessStamp> {
+        if self.has_debt() {
+            return Err(io::Error::other("prepared driver registry uncertain"));
+        }
+        let index = self
+            .records
+            .iter()
+            .position(|record| record.root_id == root_id)
+            .ok_or_else(|| io::Error::other("prepared driver entry absent"))?;
+        let current = &self.records[index];
+        if current.owner_uid != uid
+            || current.joined_child.is_none()
+            || current.prepared_driver.is_some()
+            || current.guardian.as_ref() != Some(&ProcessStamp::from(guardian))
+            || !driver.direct_child_of(guardian)?
+            || !driver.in_namespace(guardian.namespace())?
+        {
+            return Err(io::Error::other(
+                "prepared driver is not exact guardian child",
+            ));
+        }
+        let entry = PinnedProcess::open(current.entry.host_pid)?;
+        if !current.entry.matches(&entry)? {
+            return Err(io::Error::other("prepared entry incarnation changed"));
+        }
+        driver.verify()?;
+        let stamp = ProcessStamp::from(driver);
+        let mut bound = current.clone();
+        bound.prepared_driver = Some(stamp.clone());
+        self.replace(index, bound, &entry, guardian)?;
+        driver.verify()?;
+        Ok(stamp)
+    }
+
     fn replace(
         &mut self,
         index: usize,
@@ -366,6 +411,12 @@ impl EntryRegistry {
                         .ok()
                         != Some(true)
                     || r.prepared_guardian.as_ref().is_some_and(|stamp| {
+                        PinnedProcess::open(stamp.host_pid)
+                            .and_then(|p| stamp.matches(&p))
+                            .ok()
+                            != Some(true)
+                    })
+                    || r.prepared_driver.as_ref().is_some_and(|stamp| {
                         PinnedProcess::open(stamp.host_pid)
                             .and_then(|p| stamp.matches(&p))
                             .ok()
@@ -474,6 +525,11 @@ mod tests {
         assert_eq!(bound, [2]);
         let reopened = EntryRegistry::open(temp.path()).unwrap();
         let bound = reopened.bound_entry(&root, uid, &entry).unwrap();
+        assert!(
+            !fs::read_to_string(temp.path().join(format!("{root}.json")))
+                .unwrap()
+                .contains("prepared_driver")
+        );
         assert_eq!(bound.guardian.as_ref().unwrap().host_pid, child);
         assert_eq!(
             bound.supervisor_authority_id.as_deref(),

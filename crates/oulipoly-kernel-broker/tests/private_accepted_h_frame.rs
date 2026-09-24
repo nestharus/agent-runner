@@ -406,6 +406,7 @@ fn inner(kill_case: bool, lost_reply_case: bool, cancel_case: bool, helper_probe
             guardian: Some(guardian_stamp),
             join_consumed: true,
             joined_child: Some(ProcessStamp::from(&source)),
+            prepared_driver: None,
         })
         .unwrap(),
     )

@@ -13,7 +13,10 @@ pub const INSTALLED_SOCKET: &str = "/run/oulipoly-kernel-broker/control.sock";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StateRoute {
     Legacy,
-    BrokerOwned { source_generation: String },
+    BrokerOwned {
+        source_generation: String,
+        domain_id: String,
+    },
 }
 
 pub fn state_route_at(path: &Path) -> io::Result<StateRoute> {
@@ -21,17 +24,23 @@ pub fn state_route_at(path: &Path) -> io::Result<StateRoute> {
     if response == "state-route legacy\n" {
         return Ok(StateRoute::Legacy);
     }
-    let generation = response
+    let fields = response
         .strip_prefix("state-route broker-owned ")
         .and_then(|value| value.strip_suffix('\n'))
         .ok_or_else(|| io::Error::other("invalid broker State route"))?;
+    let (generation, domain) = fields
+        .split_once(' ')
+        .ok_or_else(|| io::Error::other("missing broker domain"))?;
     let parsed = uuid::Uuid::parse_str(generation)
         .map_err(|_| io::Error::other("invalid broker State generation"))?;
-    if parsed.to_string() != generation {
+    let parsed_domain =
+        uuid::Uuid::parse_str(domain).map_err(|_| io::Error::other("invalid broker domain"))?;
+    if parsed.to_string() != generation || parsed_domain.to_string() != domain {
         return Err(io::Error::other("noncanonical broker State generation"));
     }
     Ok(StateRoute::BrokerOwned {
         source_generation: generation.into(),
+        domain_id: domain.into(),
     })
 }
 
@@ -57,8 +66,16 @@ pub struct StateGenerationSpec {
 /// Discover the active source generation only for an already bound guardian.
 /// The returned value must accompany every later State read or write.
 pub fn state_generation_at(path: &Path, root_id: &str) -> io::Result<String> {
+    state_generation_versioned_at(path, root_id, "broker-state-generation-v1")
+}
+
+pub fn prepared_generation_at(path: &Path, root_id: &str) -> io::Result<String> {
+    state_generation_versioned_at(path, root_id, "broker-prepared-generation-v30")
+}
+
+fn state_generation_versioned_at(path: &Path, root_id: &str, protocol: &str) -> io::Result<String> {
     let spec = StateGenerationSpec {
-        protocol: "broker-state-generation-v1".into(),
+        protocol: protocol.into(),
         root_id: root_id.into(),
     };
     let body = serde_json::to_vec(&spec)?;
@@ -106,6 +123,10 @@ pub struct StateWriteSpec {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum StateWriteAction {
+    Prepare {
+        driver_pid: i32,
+        endpoint: String,
+    },
     Publish {
         driver_pid: i32,
         endpoint: String,
@@ -116,6 +137,29 @@ pub enum StateWriteAction {
     Accept {
         attempt_id: String,
     },
+}
+
+/// Prepared evidence is inert: it does not elect an owner or open the child gate.
+pub fn prepare_owner_at(
+    path: &Path,
+    spec: &StateWriteSpec,
+) -> io::Result<oulipoly_state::mailbox::PreparedBrokerOwner> {
+    if spec.protocol != "broker-prepared-write-v30"
+        || !matches!(spec.action, StateWriteAction::Prepare { .. })
+    {
+        return Err(io::Error::other("invalid prepared owner request"));
+    }
+    serde_json::from_slice(&send_state_frame_at(path, b'W', spec)?).map_err(io::Error::other)
+}
+
+pub fn read_prepared_owner_at(
+    path: &Path,
+    spec: &StateReadSpec,
+) -> io::Result<oulipoly_state::mailbox::PreparedBrokerOwner> {
+    if spec.protocol != "broker-prepared-read-v30" || spec.attempt_id.is_some() {
+        return Err(io::Error::other("invalid prepared owner read"));
+    }
+    serde_json::from_slice(&send_state_frame_at(path, b'R', spec)?).map_err(io::Error::other)
 }
 
 /// A committed write reply can be lost. Reconcile by `read_state_at` using the
@@ -139,6 +183,14 @@ fn send_state_request_at<T: serde::Serialize>(
     opcode: u8,
     spec: &T,
 ) -> io::Result<oulipoly_state::mailbox::BrokerContinuationReadback> {
+    serde_json::from_slice(&send_state_frame_at(path, opcode, spec)?).map_err(io::Error::other)
+}
+
+fn send_state_frame_at<T: serde::Serialize>(
+    path: &Path,
+    opcode: u8,
+    spec: &T,
+) -> io::Result<Vec<u8>> {
     let body = serde_json::to_vec(spec)?;
     if body.len() > 2048 {
         return Err(io::Error::other("State read request too large"));
@@ -171,7 +223,7 @@ fn send_state_request_at<T: serde::Serialize>(
             String::from_utf8_lossy(&response).into_owned(),
         ));
     }
-    serde_json::from_slice(&response).map_err(io::Error::other)
+    Ok(response)
 }
 
 #[derive(Clone, Copy)]
@@ -183,6 +235,10 @@ pub enum Operation {
     ReserveEntry,
     ReadEntry,
     ReadStateRoute,
+    ReserveV30Entry,
+    ReadV30Entry,
+    PrepareV30Guardian,
+    BindV30Guardian,
     LaunchFixedRunner,
 }
 
@@ -719,6 +775,23 @@ pub fn supported_entry_args(args: &[String]) -> bool {
 /// completion receipt socket held by the entry until the child exits.
 /// A single challenged sendmsg keeps credentials, data and descriptors together.
 pub fn join_at(path: &Path, spec: &JoinSpec, descriptors: [RawFd; 5]) -> io::Result<String> {
+    join_versioned_at(path, spec, descriptors, b'J')
+}
+
+pub fn join_held_v30_at(
+    path: &Path,
+    spec: &JoinSpec,
+    descriptors: [RawFd; 5],
+) -> io::Result<String> {
+    join_versioned_at(path, spec, descriptors, b'j')
+}
+
+fn join_versioned_at(
+    path: &Path,
+    spec: &JoinSpec,
+    descriptors: [RawFd; 5],
+    opcode: u8,
+) -> io::Result<String> {
     let body = serde_json::to_vec(spec)?;
     if body.len() > 48 * 1024 {
         return Err(io::Error::other("join environment too large"));
@@ -727,7 +800,7 @@ pub fn join_at(path: &Path, spec: &JoinSpec, descriptors: [RawFd; 5]) -> io::Res
     let mut challenge = [0u8; 16];
     stream.read_exact(&mut challenge)?;
     let mut request = Vec::with_capacity(17 + body.len());
-    request.push(b'J');
+    request.push(opcode);
     request.extend_from_slice(&challenge);
     request.extend_from_slice(&body);
     let mut iov = libc::iovec {
@@ -897,6 +970,41 @@ pub fn prepare_guardian_at(path: &Path, root_id: &str, guardian_pid: i32) -> io:
     )
 }
 
+pub fn prepare_v30_guardian_at(
+    path: &Path,
+    root_id: &str,
+    guardian_pid: i32,
+) -> io::Result<String> {
+    let root = uuid::Uuid::parse_str(root_id).map_err(|_| io::Error::other("bad root ID"))?;
+    request_frame_at(
+        path,
+        Operation::PrepareV30Guardian,
+        Payload::Prepare(root, guardian_pid),
+    )
+}
+
+pub fn bind_v30_guardian_at(
+    path: &Path,
+    root_id: &str,
+    domain_id: &str,
+    supervisor_id: &str,
+) -> io::Result<String> {
+    let root = uuid::Uuid::parse_str(root_id).map_err(|_| io::Error::other("bad root ID"))?;
+    let domain = uuid::Uuid::parse_str(domain_id).map_err(|_| io::Error::other("bad domain ID"))?;
+    let supervisor =
+        uuid::Uuid::parse_str(supervisor_id).map_err(|_| io::Error::other("bad supervisor ID"))?;
+    request_frame_at(
+        path,
+        Operation::BindV30Guardian,
+        Payload::Bind(root, domain, supervisor),
+    )
+}
+
+pub fn read_v30_entry_at(path: &Path, root_id: &str) -> io::Result<String> {
+    let root = uuid::Uuid::parse_str(root_id).map_err(|_| io::Error::other("bad root ID"))?;
+    request_frame_at(path, Operation::ReadV30Entry, Payload::Read(root))
+}
+
 pub fn prepare_guardian(root_id: &str, guardian_pid: i32) -> io::Result<String> {
     prepare_guardian_at(Path::new(INSTALLED_SOCKET), root_id, guardian_pid)
 }
@@ -958,6 +1066,10 @@ fn request_frame_at(path: &Path, operation: Operation, payload: Payload) -> io::
         Operation::ReserveEntry if matches!(payload, Payload::Bind(..)) => b'G',
         Operation::ReserveEntry => b'E',
         Operation::ReadEntry => b'A',
+        Operation::ReserveV30Entry => b'e',
+        Operation::PrepareV30Guardian => b'p',
+        Operation::BindV30Guardian => b'g',
+        Operation::ReadV30Entry => b'a',
         Operation::ReadStateRoute => b'I',
         Operation::LaunchFixedRunner => b'L',
     };

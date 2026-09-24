@@ -1,6 +1,7 @@
 //! One-use root child placement. The host guardian remains outside this PID
 //! namespace. PID1 is a reaper and retains the root after the broker exits.
 use oulipoly_kernel_broker::entry_registry::EntryRegistry;
+use oulipoly_kernel_broker::entry_registry::ProcessStamp;
 use oulipoly_kernel_broker::identity::{PeerIdentity, PinnedProcess};
 use oulipoly_kernel_broker::protocol::JoinSpec;
 use oulipoly_kernel_broker::registry::{RootRecord, RootRegistry};
@@ -16,7 +17,7 @@ const GATE_ENV: &str = "OULIPOLY_KERNEL_CHILD_JOIN_FD_V1";
 
 /// The broker owns this gate after J has durably consumed the entry and bound
 /// the exact child. Dropping it sends EOF to the child pre-exec read, which
-/// fails closed. No operation currently exposes this held state on v30.
+/// fails closed. v30 retains this object until broker exit; release is closed.
 pub(super) struct HeldRootJoin {
     gate: UnixStream,
     root_id: String,
@@ -28,6 +29,29 @@ pub(super) struct HeldRootJoin {
 }
 
 impl HeldRootJoin {
+    pub(super) fn root_id(&self) -> &str {
+        &self.root_id
+    }
+
+    pub(super) fn actors(&self) -> io::Result<[ProcessStamp; 4]> {
+        self.entry.verify()?;
+        self.guardian.verify()?;
+        self.root_init.verify()?;
+        self.child.verify()?;
+        if !self.guardian.direct_child_of(&self.entry)?
+            || !self.child.direct_child_of(&self.root_init)?
+            || !self.child.in_namespace(self.root_init.namespace())?
+        {
+            return Err(io::Error::other("held join actor incarnation changed"));
+        }
+        Ok([
+            ProcessStamp::from(&self.entry),
+            ProcessStamp::from(&self.guardian),
+            ProcessStamp::from(&self.root_init),
+            ProcessStamp::from(&self.child),
+        ])
+    }
+
     fn release_legacy(mut self) -> io::Result<String> {
         self.entry.verify()?;
         self.guardian.verify()?;
@@ -301,12 +325,12 @@ pub(super) fn launch(
     roots: &mut RootRegistry,
     entries: &mut EntryRegistry,
 ) -> io::Result<String> {
-    hold(spec, descriptors, peer, image, roots, entries)?.release_legacy()
+    hold(spec, descriptors, peer, image, roots, entries, false)?.release_legacy()
 }
 
 /// Return only after the exact joined child has been fsynced while its
-/// pre-exec gate is still held by this broker. Future v30 admission must keep
-/// this handle in the serving broker and add committed release attestation.
+/// pre-exec gate is still held by this broker. v30 keeps the handle in the
+/// serving broker; committed release and post-gate attestation remain closed.
 pub(super) fn hold(
     spec: JoinSpec,
     descriptors: [File; 5],
@@ -314,6 +338,7 @@ pub(super) fn hold(
     image: &File,
     roots: &mut RootRegistry,
     entries: &mut EntryRegistry,
+    _held_v30: bool,
 ) -> io::Result<HeldRootJoin> {
     validate(&spec, &descriptors)?;
     let mut receipt_peer = libc::ucred {
@@ -436,7 +461,8 @@ pub(super) fn hold(
     // gate. A failed write leaves consumed-join debt, never a loose UUID grant.
     entries.bind_joined_child(&root_id, peer.uid, &peer.process, &child)?;
     #[cfg(feature = "age319-private-broker-fixture")]
-    if super::private_fixture()
+    if !_held_v30
+        && super::private_fixture()
         && let Some(directory) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
     {
         let directory = std::path::PathBuf::from(directory);

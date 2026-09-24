@@ -71,8 +71,10 @@ impl PreparedProcessStamp {
     }
 }
 
-/// Inert v30 owner evidence. It has no row in the v18 running-owner table and
-/// grants no election, reservation, acceptance, source, or child execution.
+/// Inert v30 owner evidence. `endpoint` is only the proposed guardian socket;
+/// no completion session or running owner exists at this phase. It has no row
+/// in the v18 running-owner table and grants no election, reservation,
+/// acceptance, source, or child execution.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct PreparedBrokerOwner {
     pub source_generation: String,
@@ -341,6 +343,17 @@ impl BrokerSidecar {
 
     pub fn source_generation(&self) -> &str {
         &self.source_generation
+    }
+
+    /// Domain identity is read from the retained broker connection for v30
+    /// entry. The retired user-side copy never supplies this binding.
+    pub fn domain_id(&self) -> Result<String, String> {
+        #[cfg(unix)]
+        check_storage(&self.mailbox.path, self.storage_owner, &self.storage_anchor)?;
+        broker_main_file_must_be_named(&self.mailbox.conn)?;
+        self.mailbox
+            .completion_continuation_domain()?
+            .ok_or_else(|| "broker completion domain absent".into())
     }
 
     pub fn mailbox(&self) -> &MailboxDb {
