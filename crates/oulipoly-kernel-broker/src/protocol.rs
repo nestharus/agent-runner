@@ -1,6 +1,7 @@
 //! One connection, one challenged request. Entry operations cannot select an
 //! executable, UID, namespace, or mount. The accepted-work guardian operation
 //! carries the initiator's already pinned executable and accepted descriptors.
+use crate::installed_launch::InstalledLaunchSpec;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
@@ -951,6 +952,215 @@ pub fn supported_entry_args(args: &[String]) -> bool {
 /// A single challenged sendmsg keeps credentials, data and descriptors together.
 pub fn join_at(path: &Path, spec: &JoinSpec, descriptors: [RawFd; 5]) -> io::Result<String> {
     join_versioned_at(path, spec, descriptors, b'J')
+}
+
+/// Submit an exact installed CLI/GUI entry. The response is a receipt or an
+/// explicit refusal; a lost reply is uncertain and must never be retried as a
+/// new request ID. The production broker currently refuses before execution.
+pub fn submit_installed_launch_at(
+    path: &Path,
+    spec: &InstalledLaunchSpec,
+    descriptors: &[RawFd],
+) -> io::Result<String> {
+    let stream = checked_connection(path)?;
+    submit_installed_launch_on(stream, spec, descriptors)
+}
+
+fn submit_installed_launch_on(
+    mut stream: UnixStream,
+    spec: &InstalledLaunchSpec,
+    descriptors: &[RawFd],
+) -> io::Result<String> {
+    crate::installed_launch::validate(spec, descriptors)?;
+    let body = serde_json::to_vec(spec)?;
+    if body.len() > 48 * 1024 {
+        return Err(io::Error::other("installed launch request too large"));
+    }
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let mut request = Vec::with_capacity(17 + body.len());
+    request.push(b'L');
+    request.extend_from_slice(&challenge);
+    request.extend_from_slice(&body);
+    let mut iov = libc::iovec {
+        iov_base: request.as_mut_ptr().cast(),
+        iov_len: request.len(),
+    };
+    let mut control = [0u8; 64];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen =
+        unsafe { libc::CMSG_SPACE(std::mem::size_of_val(descriptors) as _) } as usize;
+    unsafe {
+        let header = libc::CMSG_FIRSTHDR(&msg);
+        (*header).cmsg_level = libc::SOL_SOCKET;
+        (*header).cmsg_type = libc::SCM_RIGHTS;
+        (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(descriptors) as _) as usize;
+        std::ptr::copy_nonoverlapping(
+            descriptors.as_ptr(),
+            libc::CMSG_DATA(header).cast(),
+            descriptors.len(),
+        );
+    }
+    if unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) }
+        != request.len() as isize
+    {
+        return Err(io::Error::other("installed launch submission uncertain"));
+    }
+    read_response(stream)
+}
+
+#[cfg(test)]
+mod installed_launch_wire_tests {
+    use super::*;
+    use crate::installed_launch::{EntryKind, capture_from};
+    use std::ffi::OsString;
+    use std::fs::File;
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::thread;
+
+    fn exchange(kind: EntryKind, reply: Option<&'static str>) -> (io::Result<String>, String) {
+        let name = if kind == EntryKind::Gui {
+            "oulipoly-plane"
+        } else {
+            "agents"
+        };
+        let (_master, slave) = if kind == EntryKind::Cli {
+            let mut master = -1;
+            let mut slave = -1;
+            assert_eq!(
+                unsafe {
+                    libc::openpty(
+                        &mut master,
+                        &mut slave,
+                        std::ptr::null_mut(),
+                        std::ptr::null(),
+                        std::ptr::null(),
+                    )
+                },
+                0
+            );
+            (
+                Some(unsafe { OwnedFd::from_raw_fd(master) }),
+                Some(unsafe { OwnedFd::from_raw_fd(slave) }),
+            )
+        } else {
+            (None, None)
+        };
+        let stdio = slave.as_ref().map_or([-1; 3], |fd| [fd.as_raw_fd(); 3]);
+        let captured = capture_from(
+            &uuid::Uuid::new_v4().to_string(),
+            vec![OsString::from(name), OsString::from("a b")],
+            vec![],
+            stdio,
+        )
+        .unwrap();
+        let request_id = captured.spec.request_id.clone();
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || {
+            let challenge = [7u8; 16];
+            server.write_all(&challenge).unwrap();
+            let mut bytes = [0u8; 48 * 1024 + 17];
+            let mut iov = libc::iovec {
+                iov_base: bytes.as_mut_ptr().cast(),
+                iov_len: bytes.len(),
+            };
+            let mut control = [0u8; 128];
+            let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = control.as_mut_ptr().cast();
+            msg.msg_controllen = control.len();
+            let size =
+                unsafe { libc::recvmsg(server.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
+            assert!(size > 17);
+            assert_eq!(bytes[0], b'L');
+            assert_eq!(&bytes[1..17], &challenge);
+            let body: InstalledLaunchSpec =
+                serde_json::from_slice(&bytes[17..size as usize]).unwrap();
+            assert_eq!(body.kind, kind);
+            assert_eq!(body.args, [b"a b".to_vec()]);
+            let mut received = Vec::new();
+            let mut header = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+            while !header.is_null() {
+                let current = unsafe { &*header };
+                if current.cmsg_level == libc::SOL_SOCKET && current.cmsg_type == libc::SCM_RIGHTS {
+                    let count = (current.cmsg_len as usize - unsafe { libc::CMSG_LEN(0) } as usize)
+                        / std::mem::size_of::<RawFd>();
+                    for index in 0..count {
+                        let fd = unsafe { *libc::CMSG_DATA(header).cast::<RawFd>().add(index) };
+                        received.push(unsafe { File::from_raw_fd(fd) });
+                    }
+                }
+                header = unsafe { libc::CMSG_NXTHDR(&msg, header) };
+            }
+            assert_eq!(received.len(), if kind == EntryKind::Cli { 4 } else { 1 });
+            for fd in received.iter().take(received.len() - 1) {
+                assert_eq!(unsafe { libc::isatty(fd.as_raw_fd()) }, 1);
+            }
+            assert!(received.last().unwrap().metadata().unwrap().is_dir());
+            if let Some(reply) = reply {
+                server.write_all(reply.as_bytes()).unwrap();
+            }
+            body.request_id
+        });
+        let result = submit_installed_launch_on(
+            client,
+            &captured.spec,
+            &captured
+                .descriptors
+                .iter()
+                .map(AsRawFd::as_raw_fd)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(worker.join().unwrap(), request_id);
+        (result, request_id)
+    }
+
+    #[test]
+    fn private_cli_gui_second_entrant_and_lost_reply_have_no_retry() {
+        assert_eq!(
+            exchange(EntryKind::Cli, Some("error staged\n")).0.unwrap(),
+            "error staged\n"
+        );
+        let lost = exchange(EntryKind::Gui, None);
+        assert!(lost.0.is_err());
+        let next = exchange(EntryKind::Cli, Some("error staged\n"));
+        assert_ne!(lost.1, next.1);
+        assert_eq!(next.0.unwrap(), "error staged\n");
+        assert_eq!(
+            exchange(EntryKind::Cli, Some("error ungated root launch disabled\n"))
+                .0
+                .unwrap(),
+            "error ungated root launch disabled\n"
+        );
+    }
+
+    #[test]
+    fn missing_installed_socket_refuses_before_handoff() {
+        let captured = capture_from(
+            &uuid::Uuid::new_v4().to_string(),
+            vec![OsString::from("agents")],
+            vec![],
+            [-1; 3],
+        )
+        .unwrap();
+        let missing = std::path::Path::new("/no-such-oulipoly-kernel-broker/control.sock");
+        assert!(
+            submit_installed_launch_at(
+                missing,
+                &captured.spec,
+                &captured
+                    .descriptors
+                    .iter()
+                    .map(AsRawFd::as_raw_fd)
+                    .collect::<Vec<_>>()
+            )
+            .is_err()
+        );
+    }
 }
 
 pub fn join_held_v30_at(

@@ -3,6 +3,9 @@
 ## Source files
 
 - `crates/oulipoly-kernel-broker/src/identity.rs`
+- `crates/oulipoly-kernel-broker/src/installed_launch.rs`
+- `crates/oulipoly-kernel-broker/src/installed_launcher.rs`
+- `crates/oulipoly-kernel-broker/src/installed_pair.rs`
 - `crates/oulipoly-kernel-broker/src/accepted_grant.rs`
 - `crates/oulipoly-kernel-broker/src/cutover_gate.rs`
 - `crates/oulipoly-kernel-broker/src/entry_registry.rs`
@@ -64,6 +67,8 @@
 | Broker restarts after a spent join. | Exact PID1 reattaches if live; spent join remains debt and no second child is launched. |
 | A sibling child tries to bind a prepared guardian's root ID. | Refused on pinned guardian incarnation mismatch. |
 | Legacy `L` request. | Refused; no ungated Runner is released. |
+| Exact paired launcher sends a versioned L request with argv/environment bytes, present stdio/TTY descriptors and cwd. | Broker pins launcher executable and validates generation, request ID and descriptor shape; current production route refuses before Runner or State work. An absent broker or lost reply is an error, never an automatic new launch. |
+| CLI and GUI paired links are staged from one archive. | Both point to the thin launcher; direct fixed Runner remains gated. Legacy `.deb` and raw Runner are not converted. |
 | Host root closes broker ingress with X, then broker restarts. | Durable draining marker refuses ordinary broker opcodes; challenged i reports draining from broker-owned state. |
 | A prerequisite fails before fixed sidecar publication, or fixed sidecar exists. | Explicit host-root x can resume legacy admission only before publication; publication makes abort refuse. |
 | A direct SQLite writer retains main/WAL/SHM handles after ingress closes. | Writer remains live, so the latch gives no `QuiescedCutoverProof` and cannot authorize migration. |
@@ -88,7 +93,7 @@
 ## Boundaries
 
 - Classification is never positive work authority.
-- The source has no service-requiring CLI, TTY/GUI handoff, accepted-work launch, clean physical drain receipt, or retirement operation. H prepares a guardian grant without consumption or launch. Help/offline diagnostics have an authenticated one-use root child join and host-side owner-socket verification. Maintenance and provider PID transport remain incomplete.
+- The source has no admitted service CLI/TTY/GUI workload handoff, installed-entry process custody, clean physical drain receipt, or retirement operation. The paired launcher transports a staged request and the broker refuses before execution. H prepares a guardian grant without consumption or launch. Help/offline diagnostics have an authenticated one-use root child join and host-side owner-socket verification. Maintenance and provider PID transport remain incomplete.
 - The unprivileged user-namespace fixture cannot establish host-root sudo/setuid behavior.
 - Ordinary Runner/Bash entry and allocated-attempt NNP/seccomp remain. The opt-in entry keeps the host guardian outside the root PID namespace and releases only the fixed Runner for help/offline diagnostics.
 
@@ -99,6 +104,7 @@
 - `crates/oulipoly-kernel-broker/tests/private_root_join.rs` runs the actual opt-in Runner and broker binaries in a private user namespace, holds the child at the pre-exec gate, and checks exact root/guardian placement, persisted child stamp, V acceptance and changed-incarnation/socket refusal, replay denial and broker restart debt. Its normal v30 modes use an independently admitted StateDb suffix, a corrupted retired sidecar, and the retained broker connection. The execed driver projects the bounded suffix, rejects wrong root/source/owner and stale/duplicate repair requests, reconciles a lost reply by exact cursor readback, and stops at the missing source grant. Restart retains the repaired cursor without admitting another root.
 - `crates/oulipoly-kernel-broker/src/linux_main.rs` unit tests exercise challenged credentials, a `CAP_SYS_ADMIN` child namespace socket handoff, exact host namespace policy, descriptor rejection, and production dispatch E/P/G ordering.
 - `crates/oulipoly-kernel-broker/src/entry_registry.rs` exercises persisted exact prepare/bind and sibling/replay denial.
+- `crates/oulipoly-kernel-broker/src/installed_launch.rs` and `protocol.rs` unit fixtures capture CLI/GUI argument bytes, environment, cwd, absent stdio, PTY FDs/window size, second entrant, missing socket and a lost reply without an automatic retry. The fixture has no workload execution.
 - `crates/oulipoly-kernel-broker/src/accepted_grant.rs` exercises receipt/intent binding, consumed replay refusal across reopen, and malformed recovery refusal.
 - `src-tauri/src/kernel_entry.rs` exercises read-only preflight and reserve-before-guardian ordering.
 - `src-tauri/tests/age319_persistent_guardian.rs` uses an opt-in private user-namespace broker-like endpoint and the production Runner binary to verify refusal before grant, exact durable owner/root identity, sibling/replay denial, and dead guardian debt.

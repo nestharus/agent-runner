@@ -1644,6 +1644,7 @@ mod tests {
             generation: uuid::Uuid::new_v4().to_string(),
             runner_sha256: "a".repeat(64),
             broker_sha256: "b".repeat(64),
+            launcher_sha256: None,
         };
         let observation = protocol::InstalledPairObservation {
             version: pair.version.clone(),

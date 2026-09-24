@@ -11,6 +11,10 @@ age319-private-broker-fixture = ["oulipoly-state/age319-private-broker-fixture"]
 name = "oulipoly-kernel-broker"
 path = "src/main.rs"
 
+[[bin]]
+name = "oulipoly-installed-launcher"
+path = "src/installed_launcher.rs"
+
 [dependencies]
 libc.workspace = true
 serde.workspace = true

@@ -10,6 +10,7 @@ use std::path::Path;
 pub const MANIFEST: &str = "/usr/local/libexec/oulipoly/install-v1.json";
 pub const RUNNER: &str = "/usr/local/libexec/oulipoly/oulipoly-agent-runner";
 pub const BROKER: &str = "/usr/local/libexec/oulipoly/oulipoly-kernel-broker";
+pub const LAUNCHER: &str = "/usr/local/libexec/oulipoly/oulipoly-installed-launcher";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -19,6 +20,8 @@ pub struct InstalledPair {
     pub generation: String,
     pub runner_sha256: String,
     pub broker_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launcher_sha256: Option<String>,
 }
 
 impl InstalledPair {
@@ -41,6 +44,10 @@ impl InstalledPair {
                 .is_none_or(|id| id.to_string() != pair.generation)
             || !valid_digest(&pair.runner_sha256)
             || !valid_digest(&pair.broker_sha256)
+            || pair
+                .launcher_sha256
+                .as_deref()
+                .is_some_and(|hash| !valid_digest(hash))
         {
             return Err(io::Error::other("incompatible installed pair manifest"));
         }
@@ -152,13 +159,17 @@ mod tests {
     fn fixture(manifest: &Path) -> InstalledPair {
         let executable = std::env::current_exe().unwrap();
         let mut hash = Sha256::new();
-        io::copy(&mut File::open(executable).unwrap(), &mut hash).unwrap();
+        io::copy(&mut File::open(&executable).unwrap(), &mut hash).unwrap();
         let pair = InstalledPair {
             schema: 1,
             version: env!("CARGO_PKG_VERSION").into(),
             generation: uuid::Uuid::new_v4().to_string(),
             runner_sha256: format!("{:x}", hash.finalize()),
             broker_sha256: "a".repeat(64),
+            launcher_sha256: Some(format!(
+                "{:x}",
+                Sha256::digest(fs::read(&executable).unwrap())
+            )),
         };
         fs::write(manifest, serde_json::to_vec(&pair).unwrap()).unwrap();
         pair
@@ -173,6 +184,8 @@ mod tests {
         let executable = std::env::current_exe().unwrap();
         pair.verify_image(&executable, &pair.runner_sha256, false)
             .unwrap();
+        pair.verify_image(&executable, pair.launcher_sha256.as_deref().unwrap(), false)
+            .unwrap();
         assert!(
             pair.verify_image(&executable, &pair.broker_sha256, false)
                 .is_err()
@@ -181,6 +194,10 @@ mod tests {
         fs::copy(&executable, &stale).unwrap();
         assert!(
             pair.verify_image(&stale, &pair.runner_sha256, false)
+                .is_err()
+        );
+        assert!(
+            pair.verify_image(&stale, pair.launcher_sha256.as_deref().unwrap(), false)
                 .is_err()
         );
         let mut old = pair;

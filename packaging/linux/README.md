@@ -1,25 +1,30 @@
 # AGE-319 paired Linux artifact (prerequisite only)
 
-`build_paired_bundle.py` stages one versioned archive with the fixed Runner
-image, broker image, `install-v1.json`, broker service unit, `agents` and
+`build_paired_bundle.py` stages one versioned archive with the fixed Runner,
+broker and thin launcher images, `install-v1.json`, broker service unit, `agents` and
 `oulipoly-agent-runner` CLI links, and an `oulipoly-plane` GUI link and desktop
 entry. The archive is inert: building or extracting it does not enable the
 service or activate v30 State. The existing Tauri `.deb` and raw Runner release
 assets continue to use their legacy paths and are **not** a paired deployment.
 
 The manifest contains the workspace package version, a generation derived from
-the two exact image digests, and those SHA-256 digests. The production broker
-checks root ownership, path safety, both named image digests, its running image,
+all three exact image digests, and those SHA-256 digests. The production broker
+checks root ownership, path safety, all named image digests, its running image,
 and the manifest before
 binding `/run/oulipoly-kernel-broker/control.sock`. A Runner started from the
-fixed `/usr/local/libexec/oulipoly/oulipoly-agent-runner` path (including via
-either link) checks its running image and manifest, then asks the live broker
+fixed `/usr/local/libexec/oulipoly/oulipoly-agent-runner` path checks its running
+image and manifest, then asks the live broker
 for that same generation and an open legacy entry route before any State work.
-An old or replaced image, absent or old broker, changed image, draining gate,
-or v30 route refuses. Direct invocation through the staged CLI and GUI links
-also refuses: the only currently admitted fixed-image entry is an explicit
-broker-owned host or child path, and host mode accepts only help/offline
-diagnostics. This check is per new process, not a continuing lease.
+The `agents`, `oulipoly-agent-runner`, and `oulipoly-plane` links now enter the
+exact installed launcher. It checks its own image and manifest, captures argv,
+environment, stdio/TTY and cwd as bytes and descriptors, then submits a
+challenged `oulipoly-installed-launch/v1` request. The broker pins that peer to
+the launcher image, checks generation and descriptors, and refuses before
+execution while the full supervisor and State routing are unfinished. A lost
+reply is an error with no automatic retry. Direct invocation of the fixed
+Runner also refuses unless it has one of the existing broker-owned entry
+paths. An old or replaced image, absent or old broker, changed image, draining
+gate, or v30 route refuses.
 
 ## Cutover requirements still open
 
@@ -27,8 +32,11 @@ There is **no supported installer activation** for this artifact yet. The
 service currently owns only the broker and uses `KillMode=process`; it cannot
 inventory or stop CLI/GUI/helper descendants. WSL here has no usable writable
 unified cgroup-v2 subtree for that purpose. The broker currently admits only
-help/offline diagnostic host entry and lacks a normal GUI or provider-work
-custody path. Standalone `agent-store`, `agent-scratchpad`, and
+help/offline diagnostic host entry and lacks a normal GUI/PTY or provider-work
+custody path. The staged launcher does not start any workload. Terminal signal
+and window-size relay, GUI display/socket lifecycle, lost-reply readback,
+restart recovery, and cancellation still need a single broker-owned root/PID1
+tree with exact physical drain. Standalone `agent-store`, `agent-scratchpad`, and
 `agent-messenger` assets have no paired ingress contract. Existing `.deb`,
 user-local links, historical binaries and already-running State writers can
 still address the retired user State path. A manifest or process-name scan

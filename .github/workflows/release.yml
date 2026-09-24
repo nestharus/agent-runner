@@ -208,14 +208,14 @@ jobs:
         run: bunx tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
       - name: Build paired Linux broker
         if: runner.os == 'Linux'
-        run: cargo build --locked --release --target ${{ matrix.target }} --target-dir src-tauri/target -p oulipoly-kernel-broker --bin oulipoly-kernel-broker -j 2
+        run: cargo build --locked --release --target ${{ matrix.target }} --target-dir src-tauri/target -p oulipoly-kernel-broker --bin oulipoly-kernel-broker --bin oulipoly-installed-launcher -j 2
       - name: Collect artifacts (Linux)
         if: runner.os == 'Linux'
         run: |
           mkdir -p artifacts
           cp src-tauri/target/${{ matrix.target }}/release/bundle/deb/*.deb artifacts/ 2>/dev/null || true
           cp src-tauri/target/${{ matrix.target }}/release/oulipoly-agent-runner artifacts/oulipoly-agent-runner-${{ matrix.target }} 2>/dev/null || true
-          python3 packaging/linux/build_paired_bundle.py --runner src-tauri/target/${{ matrix.target }}/release/oulipoly-agent-runner --broker src-tauri/target/${{ matrix.target }}/release/oulipoly-kernel-broker --output artifacts/oulipoly-paired-linux-${{ matrix.target }}.tar.gz
+          python3 packaging/linux/build_paired_bundle.py --runner src-tauri/target/${{ matrix.target }}/release/oulipoly-agent-runner --broker src-tauri/target/${{ matrix.target }}/release/oulipoly-kernel-broker --launcher src-tauri/target/${{ matrix.target }}/release/oulipoly-installed-launcher --output artifacts/oulipoly-paired-linux-${{ matrix.target }}.tar.gz
       - name: Collect artifacts (macOS)
         if: runner.os == 'macOS'
         run: |

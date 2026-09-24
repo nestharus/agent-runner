@@ -9,6 +9,7 @@ use oulipoly_kernel_broker::entry_registry::{EntryRegistry, ProcessStamp};
 use oulipoly_kernel_broker::identity::{
     PeerIdentity, PinnedProcess, host_proc_file, host_proc_uid, install_detached_host_proc,
 };
+use oulipoly_kernel_broker::installed_launch::{self, InstalledLaunchSpec};
 use oulipoly_kernel_broker::installed_pair::{self, InstalledPair};
 use oulipoly_kernel_broker::protocol::{
     AcceptedWorkSpec, JoinSpec, JoinedChildWitness, LaunchAcceptedWorkSpec, NativeKSpec,
@@ -175,6 +176,10 @@ enum RequestPayload {
     StateGeneration {
         spec: StateGenerationSpec,
     },
+    InstalledLaunch {
+        spec: InstalledLaunchSpec,
+        descriptors: Vec<File>,
+    },
 }
 
 fn recv_request(
@@ -276,6 +281,7 @@ fn recv_request(
         b'Q' | b'Z' => read == 33,
         b'A' | b'a' => read == 33,
         b'J' | b'j' => (18..=48 * 1024 + 17).contains(&read),
+        b'L' => (18..=48 * 1024 + 17).contains(&read),
         b'V' | b'S' | b's' | b'T' | b'H' | b'K' | b'B' | b'N' | b'k' | b'R' | b'W' | b'Y' => {
             (18..=2048 + 17).contains(&read)
         }
@@ -293,6 +299,7 @@ fn recv_request(
             b'N' => descriptors.len() != 3,
             b'k' => descriptors.len() != 4,
             b'K' => descriptors.len() != 7,
+            b'L' => !(1..=4).contains(&descriptors.len()),
             b'V' | b'S' | b's' | b'T' => descriptors.len() != 1,
             _ => !descriptors.is_empty(),
         }
@@ -385,6 +392,10 @@ fn recv_request(
         },
         b'Y' => RequestPayload::StateGeneration {
             spec: serde_json::from_slice(&request[17..read as usize])?,
+        },
+        b'L' => RequestPayload::InstalledLaunch {
+            spec: serde_json::from_slice(&request[17..read as usize])?,
+            descriptors,
         },
         _ => RequestPayload::None,
     };
@@ -2261,6 +2272,19 @@ fn serve() -> io::Result<()> {
     if let Some(pair) = &installed_pair {
         pair.verify_file(Path::new(&runner), &pair.runner_sha256, true, &runner_image)?;
     }
+    let launcher_image = if let Some(pair) = &installed_pair {
+        let digest = pair
+            .launcher_sha256
+            .as_deref()
+            .ok_or_else(|| io::Error::other("installed launcher missing from pair"))?;
+        let path = Path::new(installed_pair::LAUNCHER);
+        checked_root_path(path, false)?;
+        let image = File::open(path)?;
+        pair.verify_file(path, digest, true, &image)?;
+        Some(image)
+    } else {
+        None
+    };
     let works_path = Path::new(&state).join("works");
     if !works_path.exists() {
         use std::os::unix::fs::DirBuilderExt;
@@ -2354,6 +2378,29 @@ fn serve() -> io::Result<()> {
                 Ok(format!(
                     "installed-pair-v1 {} {} {route}\n",
                     pair.version, pair.generation
+                ))
+            } else if operation == b'L' {
+                let pair = installed_pair
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("installed pair unavailable"))?;
+                let image = launcher_image
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("installed launcher unavailable"))?;
+                if !peer.process.same_executable_as(image)? {
+                    return Err(io::Error::other("installed launcher image mismatch"));
+                }
+                let RequestPayload::InstalledLaunch { spec, descriptors } = payload else {
+                    return Err(io::Error::other("invalid installed launch request"));
+                };
+                if spec.generation != pair.generation {
+                    return Err(io::Error::other("installed launcher generation mismatch"));
+                }
+                installed_launch::validate(&spec, &installed_launch::files_as_raw(&descriptors))?;
+                // The current guardian/State routes cannot keep a GUI, PTY,
+                // provider descendants and arbitrary sudo grandchildren under
+                // one root. Accept no production launch until that is true.
+                Err(io::Error::other(
+                    "installed supervisor transport staged; workload admission closed",
                 ))
             } else if operation == b'X' || operation == b'x' {
                 if peer.uid != 0 || !peer.process.in_namespace(&host_namespace)? {
@@ -2831,6 +2878,8 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oulipoly_kernel_broker::installed_launch::capture_from;
+    use std::ffi::OsString;
 
     #[test]
     fn v30_service_refuses_every_legacy_entry_and_work_operation() {
@@ -2871,6 +2920,71 @@ mod tests {
     use std::io::Read;
     use std::process::Command;
     use std::thread;
+
+    #[test]
+    fn private_installed_launch_frame_preserves_gui_cwd_and_challenged_peer() {
+        let captured = capture_from(
+            &uuid::Uuid::new_v4().to_string(),
+            vec![OsString::from("oulipoly-plane")],
+            vec![(OsString::from("DISPLAY"), OsString::from(":9"))],
+            [-1; 3],
+        )
+        .unwrap();
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let sender = thread::spawn(move || {
+            let mut challenge = [0u8; 16];
+            use std::io::Read;
+            client.read_exact(&mut challenge).unwrap();
+            let mut bytes = vec![b'L'];
+            bytes.extend_from_slice(&challenge);
+            bytes.extend_from_slice(&serde_json::to_vec(&captured.spec).unwrap());
+            let mut iov = libc::iovec {
+                iov_base: bytes.as_mut_ptr().cast(),
+                iov_len: bytes.len(),
+            };
+            let descriptors: Vec<_> = captured
+                .descriptors
+                .iter()
+                .map(AsRawFd::as_raw_fd)
+                .collect();
+            let mut control = [0u8; 64];
+            let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+            message.msg_iov = &mut iov;
+            message.msg_iovlen = 1;
+            message.msg_control = control.as_mut_ptr().cast();
+            message.msg_controllen =
+                unsafe { libc::CMSG_SPACE(std::mem::size_of_val(descriptors.as_slice()) as _) }
+                    as usize;
+            unsafe {
+                let header = libc::CMSG_FIRSTHDR(&message);
+                (*header).cmsg_level = libc::SOL_SOCKET;
+                (*header).cmsg_type = libc::SCM_RIGHTS;
+                (*header).cmsg_len =
+                    libc::CMSG_LEN(std::mem::size_of_val(descriptors.as_slice()) as _) as usize;
+                std::ptr::copy_nonoverlapping(
+                    descriptors.as_ptr(),
+                    libc::CMSG_DATA(header).cast(),
+                    descriptors.len(),
+                );
+                assert_eq!(
+                    libc::sendmsg(client.as_raw_fd(), &message, 0),
+                    bytes.len() as isize
+                );
+            }
+        });
+        let (operation, payload, credentials, process) = recv_request(&mut server).unwrap();
+        sender.join().unwrap();
+        assert_eq!(operation, b'L');
+        assert_eq!(credentials.pid, std::process::id() as i32);
+        process.verify().unwrap();
+        let RequestPayload::InstalledLaunch { spec, descriptors } = payload else {
+            panic!("expected installed launch");
+        };
+        assert_eq!(spec.kind, installed_launch::EntryKind::Gui);
+        assert_eq!(spec.environment[0].1, b":9");
+        installed_launch::validate(&spec, &installed_launch::files_as_raw(&descriptors)).unwrap();
+        assert_eq!(descriptors.len(), 1);
+    }
 
     #[test]
     fn state_read_requires_exact_live_guardian_not_same_uid_sibling_or_copied_owner() {
@@ -3318,7 +3432,7 @@ assert int(caps, 16) & (1 << 21), caps  # CAP_SYS_ADMIN in the child user namesp
 s = socket.socket(fileno=3)
 challenge = s.recv(16)
 assert len(challenge) == 16
-message = b'L' + challenge
+message = b'C' + challenge
 claimed = struct.pack('3i', int(sys.argv[1]), 0, 0)
 try:
     s.sendmsg([message], [(socket.SOL_SOCKET, socket.SCM_CREDENTIALS, claimed)])

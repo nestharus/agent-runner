@@ -7,6 +7,7 @@ pub mod accepted_grant;
 pub mod cutover_gate;
 pub mod entry_registry;
 pub mod identity;
+pub mod installed_launch;
 pub mod installed_pair;
 pub mod native_receipt;
 pub mod protocol;
