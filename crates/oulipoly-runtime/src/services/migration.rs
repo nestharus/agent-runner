@@ -73,7 +73,9 @@ pub(super) fn migrate(
     }
 
     match external_branch_orchestration::select_migration_branch(&request, provider_registry)? {
-        external_branch_orchestration::MigrationBranch::BuiltIn => migrate_built_in(request),
+        external_branch_orchestration::MigrationBranch::BuiltIn => {
+            migrate_built_in(request, provider_registry)
+        }
         external_branch_orchestration::MigrationBranch::External { identity } => {
             // Account endpoints must first advertise rotation. A legacy endpoint
             // that returns rotation=false reaches built-in exact-session behavior
@@ -103,13 +105,14 @@ pub(super) fn migrate(
 
 fn migrate_built_in(
     request: MigrationServiceRequest<'_>,
+    provider_registry: Option<&ProviderRegistryHandle>,
 ) -> Result<MigrationServiceOutput, ServiceError> {
     // AGE-163 WU-A.5: explicit manual-target requests route through the
     // typed `decide_manual_migration`. Rejections surface as the typed
     // `RotationFailed { ManualTarget* }` variants the caller renders as
     // operator-visible diagnostics.
     if let Some(target) = request.manual_target {
-        return migrate_manual(request, target);
+        return migrate_manual(request, target, provider_registry);
     }
     match decide_service_migration(&request) {
         Ok(MigrationDecision::Stay) => Ok(MigrationServiceOutput::Stay),
@@ -117,20 +120,26 @@ fn migrate_built_in(
         Ok(MigrationDecision::Migrate {
             target_provider_index,
             reason,
-        }) => run_service_migration(request, target_provider_index, reason),
+        }) => run_service_migration(request, target_provider_index, reason, provider_registry),
     }
 }
 
 fn migrate_manual(
     mut request: MigrationServiceRequest<'_>,
     target: &str,
+    provider_registry: Option<&ProviderRegistryHandle>,
 ) -> Result<MigrationServiceOutput, ServiceError> {
     match decide_manual_migration(request.migration_model, request.resolved, target) {
         Ok(MigrationDecision::Stay) => Ok(MigrationServiceOutput::Stay),
         Ok(MigrationDecision::Migrate {
             target_provider_index,
             reason,
-        }) => match attempt_migration(&mut request, target_provider_index, reason) {
+        }) => match attempt_migration(
+            &mut request,
+            target_provider_index,
+            reason,
+            provider_registry,
+        ) {
             Ok(segment) => Ok(MigrationServiceOutput::Migrated { segment }),
             Err(err) => Err(error_formatter::migration_dependency_error(err)),
         },
@@ -155,18 +164,28 @@ fn run_service_migration(
     mut request: MigrationServiceRequest<'_>,
     initial_target_index: usize,
     reason: TransitionReason,
+    provider_registry: Option<&ProviderRegistryHandle>,
 ) -> Result<MigrationServiceOutput, ServiceError> {
     let auto_rotate_path =
         request.manual_target.is_none() && reason == TransitionReason::QuotaThreshold;
-    let first = attempt_migration(&mut request, initial_target_index, reason);
+    let first = attempt_migration(
+        &mut request,
+        initial_target_index,
+        reason,
+        provider_registry,
+    );
     match first {
         Ok(segment) => Ok(MigrationServiceOutput::Migrated { segment }),
         Err(
             err @ (crate::migration::MigrationError::SourceMissingStorage { .. }
             | crate::migration::MigrationError::SourceMissing { .. }),
-        ) if auto_rotate_path => {
-            iterate_working_set_candidates(&mut request, initial_target_index, reason, err)
-        }
+        ) if auto_rotate_path => iterate_working_set_candidates(
+            &mut request,
+            initial_target_index,
+            reason,
+            err,
+            provider_registry,
+        ),
         Err(err) => Err(error_formatter::migration_dependency_error(err)),
     }
 }
@@ -175,8 +194,12 @@ fn attempt_migration(
     request: &mut MigrationServiceRequest<'_>,
     target_provider_index: usize,
     reason: TransitionReason,
+    provider_registry: Option<&ProviderRegistryHandle>,
 ) -> Result<crate::migration::MigratedSegment, crate::migration::MigrationError> {
-    crate::migration::migrate_chain_segment(
+    let target = &request.migration_model.providers[target_provider_index].name;
+    let authority =
+        target_provider_authority(provider_registry, &request.resolved.active_provider, target)?;
+    crate::migration::migrate_chain_segment_with_target_authority(
         request.state,
         request.sessions_cfg,
         request.migration_model,
@@ -184,8 +207,47 @@ fn attempt_migration(
         request.effective_cwd,
         target_provider_index,
         reason,
+        authority.as_ref(),
         request.stderr,
     )
+}
+
+fn target_provider_authority(
+    provider_registry: Option<&ProviderRegistryHandle>,
+    source: &str,
+    target: &str,
+) -> Result<Option<oulipoly_state::StoredProviderSessionAuthority>, crate::migration::MigrationError>
+{
+    let Some(registry) = provider_registry.map(ProviderRegistryHandle::current) else {
+        return Ok(None);
+    };
+    if !registry.has_account_endpoint(source) && !registry.has_account_endpoint(target) {
+        return Ok(None);
+    }
+    if !registry.has_account_endpoint(target) {
+        return Err(
+            crate::migration::MigrationError::TargetAuthorityUnavailable {
+                provider: target.into(),
+                message: "selected target has no configured provider endpoint".into(),
+            },
+        );
+    }
+    let endpoint = registry.preflight_account(target).map_err(|error| {
+        crate::migration::MigrationError::TargetAuthorityUnavailable {
+            provider: target.into(),
+            message: error.to_string(),
+        }
+    })?;
+    let identity = endpoint.endpoint_identity().map_err(|message| {
+        crate::migration::MigrationError::TargetAuthorityUnavailable {
+            provider: target.into(),
+            message,
+        }
+    })?;
+    Ok(Some(oulipoly_state::StoredProviderSessionAuthority {
+        provider_instance_id: identity.provider_instance_id,
+        settings_id: identity.settings_id,
+    }))
 }
 
 fn iterate_working_set_candidates(
@@ -193,6 +255,7 @@ fn iterate_working_set_candidates(
     initial_target_index: usize,
     reason: TransitionReason,
     initial_error: crate::migration::MigrationError,
+    provider_registry: Option<&ProviderRegistryHandle>,
 ) -> Result<MigrationServiceOutput, ServiceError> {
     let mut candidates_tried = Vec::new();
     candidate_failure_orchestration::record_failed_candidate(
@@ -216,7 +279,7 @@ fn iterate_working_set_candidates(
                 reason: RotationFailedReason::WorkingSetExhausted { candidates_tried },
             });
         };
-        match attempt_migration(request, candidate_index, reason) {
+        match attempt_migration(request, candidate_index, reason, provider_registry) {
             Ok(segment) => {
                 return Ok(MigrationServiceOutput::AutoRotated {
                     segment,
