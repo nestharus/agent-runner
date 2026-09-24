@@ -29,6 +29,9 @@
 - `crates/oulipoly-state/src/lifecycle_log.rs`
 - `crates/oulipoly-state/src/mailbox.rs`
 - `crates/oulipoly-state/src/mailbox/broker_authority.rs`
+- `crates/oulipoly-state/src/mailbox/fresh_lane.rs`
+- `crates/oulipoly-state/src/mailbox/migrations/0030_fresh_state_identity.sql`
+- `crates/oulipoly-state/tests/age319_fresh_dual_lane.rs`
 - `crates/oulipoly-state/src/mailbox/completion_continuation/attempts.rs`
 - `crates/oulipoly-state/src/mailbox/completion_continuation/mod.rs`
 - `crates/oulipoly-state/src/mailbox/completion_continuation/notification.rs`
