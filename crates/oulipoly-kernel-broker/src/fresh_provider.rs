@@ -1157,8 +1157,14 @@ fn route_evidence(directory: &Path, candidate: &RouteCandidate) -> io::Result<(u
         {
             return Err(io::Error::other("fresh route history grant mismatch"));
         }
-        if exact_file::<Grant>(directory, &format!("{}.consumed.json", grant.id))?.is_none() {
-            continue;
+        let consumed_path = directory.join(format!("{}.consumed.json", grant.id));
+        let consumed: Option<Grant> =
+            exact_file(directory, &format!("{}.consumed.json", grant.id))?;
+        if consumed.as_ref() != Some(&grant) || grant.version != 1 {
+            return Err(io::Error::other(format!(
+                "fresh route history K absent or changed: {}",
+                consumed_path.display()
+            )));
         }
         invocations += 1;
         match observe(directory, &grant.id)? {
@@ -1168,9 +1174,17 @@ fn route_evidence(directory: &Path, candidate: &RouteCandidate) -> io::Result<(u
                     failures += 1;
                 }
             }
-            // A consumed K remains live until a physical Q or a known
-            // outcome. Its age alone cannot authorize another selection.
-            _ => live += 1,
+            // A consumed K remains live until physical Q. Provider exit and
+            // receipt age alone cannot authorize another selection.
+            Observation::Pending | Observation::ProviderExited(_) => live += 1,
+            Observation::Unknown => {
+                return Err(io::Error::other(format!(
+                    "fresh route history K has unknown physical drain: grant={}, K={}, Q={}",
+                    grant.id,
+                    consumed_path.display(),
+                    directory.join(format!("{}.drain.json", grant.id)).display()
+                )));
+            }
         }
     }
     Ok((live, failures, invocations))
@@ -2313,6 +2327,145 @@ mod tests {
             root_pidns_dev: root.pidns_dev,
             root_pidns_ino: root.pidns_ino,
         }
+    }
+
+    #[test]
+    fn unknown_historical_k_refuses_new_route_with_exact_artifacts() {
+        let temp = tempfile::tempdir().unwrap();
+        let process = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+        let previous = fixture_binding(&process, &process);
+        let grant = Grant {
+            version: 1,
+            id: uuid::Uuid::new_v4().to_string(),
+            binding: previous.clone(),
+            plan_sha256: "b".repeat(64),
+        };
+        durable_new(
+            temp.path(),
+            &decision_name(&previous.handoff_id),
+            &RouteDecision {
+                version: 1,
+                binding: previous.clone(),
+                total: 1,
+                pin: None,
+                selection: FreshRouteSelection {
+                    model: "model".into(),
+                    config_sha256: "a".repeat(64),
+                    account: "first".into(),
+                    index: 0,
+                    plan_sha256: grant.plan_sha256.clone(),
+                    observed_live: 0,
+                    observed_failures: 0,
+                    observed_invocations: 0,
+                    policy_version: "fresh-account-effects-v2".into(),
+                    eligible_accounts: vec!["first".into()],
+                    quota_remaining_basis_points: None,
+                },
+            },
+        )
+        .unwrap();
+        durable_new(
+            temp.path(),
+            &format!("{}.fresh-grant.json", previous.handoff_id),
+            &grant,
+        )
+        .unwrap();
+        let k_path = temp.path().join(format!("{}.consumed.json", grant.id));
+        let q_path = temp.path().join(format!("{}.drain.json", grant.id));
+        durable_new(
+            temp.path(),
+            k_path.file_name().unwrap().to_str().unwrap(),
+            &grant,
+        )
+        .unwrap();
+        let current = fixture_binding(&process, &process);
+        let candidate = RouteCandidate {
+            version: 1,
+            binding: current.clone(),
+            model: "model".into(),
+            config_sha256: "a".repeat(64),
+            account: "first".into(),
+            index: 0,
+            total: 1,
+            pin: None,
+            plan_sha256: "c".repeat(64),
+            quota_script: None,
+            auth_refresh_command: None,
+        };
+        durable_new(
+            temp.path(),
+            &candidate_name(&current.handoff_id, 0),
+            &candidate,
+        )
+        .unwrap();
+        let request = FreshRouteRequest {
+            d_key: uuid::Uuid::new_v4().to_string(),
+            model: candidate.model.clone(),
+            config_sha256: candidate.config_sha256.clone(),
+            account: None,
+            index: None,
+            total: 1,
+            pin: None,
+            quota_script: None,
+            auth_refresh_command: None,
+        };
+        assert!(matches!(
+            observe(temp.path(), &grant.id).unwrap(),
+            Observation::Unknown
+        ));
+        let error = select_route(temp.path(), &current, &request)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown physical drain"), "{error}");
+        assert!(error.contains(&format!("grant={}", grant.id)), "{error}");
+        assert!(
+            error.contains(&format!("K={}", k_path.display())),
+            "{error}"
+        );
+        assert!(
+            error.contains(&format!("Q={}", q_path.display())),
+            "{error}"
+        );
+        assert!(
+            !temp
+                .path()
+                .join(decision_name(&current.handoff_id))
+                .exists()
+        );
+        assert!(
+            !temp
+                .path()
+                .join(format!("{}.fresh-grant.json", current.handoff_id))
+                .exists()
+        );
+
+        let mut changed = grant.clone();
+        changed.plan_sha256 = "d".repeat(64);
+        std::fs::write(&k_path, serde_json::to_vec(&changed).unwrap()).unwrap();
+        let error = select_route(temp.path(), &current, &request)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("K absent or changed"), "{error}");
+        assert!(error.contains(&k_path.display().to_string()), "{error}");
+        assert!(
+            !temp
+                .path()
+                .join(decision_name(&current.handoff_id))
+                .exists()
+        );
+
+        std::fs::remove_file(&k_path).unwrap();
+        let error = select_route(temp.path(), &current, &request)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("K absent or changed"), "{error}");
+        assert!(error.contains(&k_path.display().to_string()), "{error}");
+        assert!(
+            !temp
+                .path()
+                .join(decision_name(&current.handoff_id))
+                .exists()
+        );
     }
 
     #[test]
