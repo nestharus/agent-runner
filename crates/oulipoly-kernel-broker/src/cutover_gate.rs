@@ -96,6 +96,19 @@ impl EntryGate {
             Err(error) if error.kind() == io::ErrorKind::NotFound => false,
             Err(error) => return Err(error),
         };
+        // A published sidecar is forward-only. If its durable admission
+        // marker is missing or open, refuse broker restart instead of serving
+        // a v30 sidecar with legacy admission reopened.
+        match fs::symlink_metadata(directory.join("sidecar")) {
+            Ok(_) if !closed => {
+                return Err(io::Error::other(
+                    "published sidecar requires closed durable entry gate",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
         // The lock inode is durable. Recreating it after an interrupted close
         // could detach leases held by an earlier Runner incarnation.
         let admission_path = directory.join(ADMISSION_LOCK);
@@ -346,6 +359,23 @@ mod tests {
         assert!(gate.abort_before_publication().is_err());
         drop(gate);
         assert!(EntryGate::open(directory.path()).unwrap().is_closed());
+    }
+
+    #[test]
+    fn published_sidecar_refuses_restart_without_closed_durable_gate() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("sidecar")).unwrap();
+        assert!(EntryGate::open(directory.path()).is_err());
+
+        fs::remove_dir(directory.path().join("sidecar")).unwrap();
+        let mut gate = EntryGate::open(directory.path()).unwrap();
+        gate.close().unwrap();
+        drop(gate);
+        fs::create_dir(directory.path().join("sidecar")).unwrap();
+        assert!(EntryGate::open(directory.path()).unwrap().is_closed());
+
+        fs::write(directory.path().join("entry-gate.v1"), OPEN).unwrap();
+        assert!(EntryGate::open(directory.path()).is_err());
     }
 
     #[test]

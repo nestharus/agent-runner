@@ -61,3 +61,33 @@ must remain unrestricted.
 The manifest check is an image compatibility prerequisite only. It does not
 prove a global writer census, persistent ingress, process custody, State v30
 routing, or delivery readiness.
+
+## Cold WSL reboot route
+
+A changed Linux boot ID would end old PID namespaces and their open file
+descriptors. It would not settle source, recipient, notification, ACK, or
+terminal obligations recorded by those processes. The old v2 files must be
+retained for reconciliation.
+
+This archive cannot currently establish a cold cutover. The unit is wanted by
+`multi-user.target`, with no early storage-fence unit or installed activation.
+It does not order WSL user commands, existing `.deb`/raw binaries, or user-local
+links behind a broker-held gate. The retired data directory may be selected by
+the old executable's adjacent `config.toml` or `OULIPOLY_DATA_DIR`; it and its
+parent may be user-owned. Changing ownership on only the sidecar file does not
+fence a user who can rename the parent entry or create a fresh sidecar and
+return an old-protocol success. Old Bash helper snapshots with a different
+digest also bypass the paired-image lease.
+
+A future installer must durably arm the preboot gate, establish a root-held
+fence on **every resolved retired State and sidecar main/WAL/SHM path before
+any user entry**, and keep that fence through snapshot, publication,
+activation, and readback. The fence must cover directory replacement and
+aliases as well as writes to existing inodes, while leaving normal provider
+work and host `sudo` unrestricted. The broker must verify the arm record, a
+different boot ID, the same held storage fence, and a closed admission gate
+before a private cold proof can be constructed. An interrupted startup must
+keep admission closed; a published v29 copy requires forward-only recovery.
+The current broker refuses restart when a published `sidecar` exists without
+a closed durable entry gate, but that check alone does not establish the cold
+proof.
