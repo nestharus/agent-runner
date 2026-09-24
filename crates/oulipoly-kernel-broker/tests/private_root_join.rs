@@ -64,6 +64,8 @@ fn inner() {
             | "normal_help"
             | "normal_model_held"
             | "normal_model_provider"
+            | "normal_model_provider_path"
+            | "normal_model_provider_prefix"
             | "normal_model_provider_reply_loss"
             | "normal_model_provider_restart"
     );
@@ -75,6 +77,13 @@ fn inner() {
         std::env::var("OULIPOLY_AGE319_RUNNER_IMAGE").expect("built Runner image required");
     let provider_image = std::env::var("OULIPOLY_AGE319_PROVIDER_IMAGE").unwrap_or_default();
     let temp = tempfile::tempdir().unwrap();
+    let path_provider_mode = matches!(
+        mode.as_str(),
+        "normal_model_provider_path" | "normal_model_provider_prefix"
+    );
+    if path_provider_mode {
+        std::os::unix::fs::symlink(&provider_image, temp.path().join("fixture-provider")).unwrap();
+    }
     let data = temp.path().join("data");
     let broker_state = temp.path().join("broker-state");
     let gate = temp.path().join("gate");
@@ -320,6 +329,18 @@ fn inner() {
                 provider_mode
                     .then_some(("AGE319_PRIVATE_PROVIDER_IMAGE_V1", provider_image.as_str())),
             )
+            .envs(path_provider_mode.then_some((
+                "AGE319_PRIVATE_PROVIDER_COMMAND_V1",
+                if mode == "normal_model_provider_prefix" {
+                    "env -u CLAUDECODE fixture-provider"
+                } else {
+                    "fixture-provider"
+                },
+            )))
+            .envs(path_provider_mode.then_some((
+                "AGE319_PRIVATE_PROVIDER_PATH_V1",
+                format!("{}:/usr/bin:/bin", temp.path().display()),
+            )))
             .envs(provider_mode.then_some((
                 "AGE319_PRIVATE_PROVIDER_MARKER_V1",
                 gate.join("provider-effect").to_str().unwrap(),
@@ -558,6 +579,8 @@ fn inner() {
                     | "normal_help"
                     | "normal_model_held"
                     | "normal_model_provider"
+                    | "normal_model_provider_path"
+                    | "normal_model_provider_prefix"
                     | "normal_model_provider_reply_loss"
                     | "normal_model_provider_restart"
             ) {
@@ -887,6 +910,22 @@ fn inner() {
                     eventually(|| grant_file.exists());
                     let grant: serde_json::Value =
                         serde_json::from_slice(&fs::read(&grant_file).unwrap()).unwrap();
+                    if path_provider_mode {
+                        assert_eq!(
+                            grant["configured_program"],
+                            if mode == "normal_model_provider_prefix" {
+                                "env"
+                            } else {
+                                "fixture-provider"
+                            }
+                        );
+                        assert!(
+                            grant["broker_resolved_path"]
+                                .as_str()
+                                .unwrap()
+                                .starts_with('/')
+                        );
+                    }
                     let grant_id = grant["id"].as_str().unwrap();
                     eventually(|| provider_dir.join(format!("{grant_id}.exit.json")).exists());
                     assert!(
@@ -3044,6 +3083,8 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_help",
         "normal_model_held",
         "normal_model_provider",
+        "normal_model_provider_path",
+        "normal_model_provider_prefix",
         "normal_model_provider_reply_loss",
         "normal_model_provider_restart",
         "normal_guardian_death",

@@ -99,12 +99,14 @@ pub(super) fn binding_from_held(
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Recipe {
+    configured_program: String,
     argv: Vec<String>,
     env: Vec<(String, String)>,
 }
 
 pub(super) struct Plan {
     image: File,
+    configured_program: String,
     broker_resolved_path: PathBuf,
     image_descriptor: ImageDescriptor,
     preflight_image: ImagePreflight,
@@ -436,7 +438,14 @@ pub(super) fn plan(
         return Err(io::Error::last_os_error());
     }
     let mut recipe = unsafe { File::from_raw_fd(recipe_fd) };
-    serde_json::to_writer(&mut recipe, &Recipe { argv, env })?;
+    serde_json::to_writer(
+        &mut recipe,
+        &Recipe {
+            configured_program: image_path.to_string_lossy().into_owned(),
+            argv,
+            env,
+        },
+    )?;
     let seals = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
     if unsafe { libc::fcntl(recipe_fd, libc::F_ADD_SEALS, seals) } < 0 {
         return Err(io::Error::last_os_error());
@@ -460,6 +469,7 @@ pub(super) fn plan(
     );
     Ok(Plan {
         image,
+        configured_program: image_path.to_string_lossy().into_owned(),
         broker_resolved_path: image_path.to_owned(),
         image_descriptor,
         preflight_image,
@@ -474,41 +484,43 @@ pub(super) fn plan(
 
 /// The eventual runtime bridge can pass variable recipe and prompt bytes by
 /// descriptor. The private socket uses this form so its control frame remains
-/// fixed size. The broker resolves the absolute image path and executes its
-/// original mount/inode under K. Preflight bytes and metadata are observations.
+/// fixed size. The resolved path must name the caller's passed inode/mount;
+/// the sealed recipe separately records the configured first command token.
 pub(super) fn plan_from_descriptors(
-    configured_image: &Path,
+    resolved_image: &Path,
     image: File,
     cwd: File,
     input: File,
     recipe: File,
 ) -> io::Result<Plan> {
-    if !configured_image.is_absolute() {
+    if !resolved_image.is_absolute() {
         return Err(io::Error::other(
-            "fresh provider image path is not absolute",
+            "fresh provider resolved image path is not absolute",
         ));
     }
-    let configured = OpenOptions::new()
+    let resolved = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_PATH)
-        .open(configured_image)?;
+        .open(resolved_image)?;
     let image_descriptor = ImageDescriptor::of(&image)?;
-    let configured_descriptor = ImageDescriptor::of(&configured)?;
+    let resolved_descriptor = ImageDescriptor::of(&resolved)?;
     let cwd_meta = cwd.metadata()?;
     if !cwd_meta.is_dir() {
         return Err(io::Error::other("fresh provider cwd is not a directory"));
     }
-    if image_descriptor != configured_descriptor {
+    if image_descriptor != resolved_descriptor {
         return Err(io::Error::other(
             "fresh provider caller image and broker path differ in inode or mount",
         ));
     }
-    let preflight_image = ImagePreflight::observe(&configured, configured_image)?;
+    let preflight_image = ImagePreflight::observe(&resolved, resolved_image)?;
     let mut reader = recipe.try_clone()?;
     reader.seek(SeekFrom::Start(0))?;
     let parsed: Recipe = serde_json::from_reader(reader)?;
     let mut keys = HashSet::new();
-    if parsed.argv.iter().any(|arg| arg.contains('\0'))
+    if parsed.configured_program.is_empty()
+        || parsed.configured_program.contains('\0')
+        || parsed.argv.iter().any(|arg| arg.contains('\0'))
         || parsed.env.iter().any(|(key, value)| {
             key.is_empty()
                 || key.contains(['=', '\0'])
@@ -529,8 +541,8 @@ pub(super) fn plan_from_descriptors(
     let digest = format!(
         "{:x}",
         Sha256::digest(serde_json::to_vec(&(
-            configured_image,
-            &configured_descriptor,
+            resolved_image,
+            &resolved_descriptor,
             cwd_meta.dev(),
             cwd_meta.ino(),
             input_hash,
@@ -540,9 +552,10 @@ pub(super) fn plan_from_descriptors(
         ))?)
     );
     Ok(Plan {
-        image: configured,
-        broker_resolved_path: configured_image.to_owned(),
-        image_descriptor: configured_descriptor,
+        image: resolved,
+        configured_program: parsed.configured_program,
+        broker_resolved_path: resolved_image.to_owned(),
+        image_descriptor: resolved_descriptor,
         preflight_image,
         cwd,
         input,
@@ -560,6 +573,7 @@ struct Grant {
     id: String,
     binding: Binding,
     plan_sha256: String,
+    configured_program: String,
     broker_resolved_path: PathBuf,
     image_descriptor: ImageDescriptor,
     /// Pre-K observation only. Mutable inode bytes/metadata may differ at exec.
@@ -606,9 +620,10 @@ pub(super) fn prepare(directory: &Path, binding: Binding, plan: Plan) -> io::Res
     let path = directory.join(&name);
     let grant = if path.exists() {
         let old: Grant = serde_json::from_reader(File::open(&path)?)?;
-        if old.version != 2
+        if old.version != 3
             || old.binding != binding
             || old.plan_sha256 != plan.digest
+            || old.configured_program != plan.configured_program
             || old.broker_resolved_path != plan.broker_resolved_path
             || old.image_descriptor != plan.image_descriptor
         {
@@ -619,10 +634,11 @@ pub(super) fn prepare(directory: &Path, binding: Binding, plan: Plan) -> io::Res
         old
     } else {
         let grant = Grant {
-            version: 2,
+            version: 3,
             id: uuid::Uuid::new_v4().to_string(),
             binding,
             plan_sha256: plan.digest.clone(),
+            configured_program: plan.configured_program.clone(),
             broker_resolved_path: plan.broker_resolved_path.clone(),
             image_descriptor: plan.image_descriptor.clone(),
             preflight_image: plan.preflight_image.clone(),
@@ -650,7 +666,7 @@ pub(super) fn grant_for_binding(directory: &Path, binding: &Binding) -> io::Resu
     let Some(grant): Option<Grant> = exact_file(directory, &name)? else {
         return Ok(None);
     };
-    if grant.version != 2 || grant.binding != *binding {
+    if grant.version != 3 || grant.binding != *binding {
         return Err(io::Error::other(
             "fresh provider grant readback binding changed",
         ));
@@ -668,9 +684,10 @@ pub(super) fn grant_for_matching_plan(
     let name = format!("{}.fresh-grant.json", binding.handoff_id);
     let grant: Grant = exact_file(directory, &name)?
         .ok_or_else(|| io::Error::other("fresh provider grant absent"))?;
-    if grant.version != 2
+    if grant.version != 3
         || grant.binding != *binding
         || grant.plan_sha256 != plan.digest
+        || grant.configured_program != plan.configured_program
         || grant.broker_resolved_path != plan.broker_resolved_path
         || grant.image_descriptor != plan.image_descriptor
     {
@@ -799,7 +816,7 @@ fn run_init(mut init: Init) -> io::Result<()> {
     init.plan.verify()?;
     let recipe: Recipe = serde_json::from_reader(&init.plan.recipe)?;
     let image = format!("/proc/self/fd/{}", init.plan.image.as_raw_fd());
-    let argv = std::iter::once(image.as_str())
+    let argv = std::iter::once(recipe.configured_program.as_str())
         .chain(recipe.argv.iter().map(String::as_str))
         .map(CString::new)
         .collect::<Result<Vec<_>, _>>()
@@ -1085,6 +1102,7 @@ pub(super) fn launch(
     }
     prepared.plan.verify()?;
     if prepared.plan.digest != prepared.grant.plan_sha256
+        || prepared.plan.configured_program != prepared.grant.configured_program
         || prepared.plan.broker_resolved_path != prepared.grant.broker_resolved_path
         || prepared.plan.image_descriptor != prepared.grant.image_descriptor
     {

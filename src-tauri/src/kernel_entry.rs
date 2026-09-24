@@ -676,6 +676,7 @@ impl oulipoly_runtime::executor::cli::fresh_remote::FreshProviderBackend
             .map_err(|e| format!("fresh provider cwd: {e}"))?;
         let input = private_sealed_bytes(b"fresh-provider-input", &plan.stdin)?;
         let recipe_bytes = serde_json::to_vec(&serde_json::json!({
+            "configured_program": plan.configured_program,
             "argv": plan.argv, "env": plan.environment,
         }))
         .map_err(|e| e.to_string())?;
@@ -711,9 +712,17 @@ impl oulipoly_runtime::executor::cli::fresh_remote::FreshProviderBackend
                         recipe.as_raw_fd(),
                     ]),
                 )
-                .map_err(|e| format!("private provider K unknown: {e}"))?;
+                .map_err(|e| {
+                    format!(
+                        "private provider K unknown for D {}: {e}; caller decides recovery",
+                        self.authority.receipt.d_key
+                    )
+                })?;
                 if state.starts_with("fresh-provider-unknown ") {
-                    return Err("private provider K consumed with unknown physical state".into());
+                    return Err(format!(
+                        "private provider K unknown for D {}: {state}; caller decides recovery",
+                        self.authority.receipt.d_key
+                    ));
                 }
                 state
                     .split_whitespace()
@@ -731,13 +740,16 @@ impl oulipoly_runtime::executor::cli::fresh_remote::FreshProviderBackend
                 b'6',
                 None,
             )
-            .map_err(|e| format!("private provider result readback failed: {e}"))?;
+            .map_err(|e| format!("private provider Q unknown for D {} grant {grant}: {e}; caller decides recovery", self.authority.receipt.d_key))?;
             if state.starts_with(&format!("fresh-provider-exited {grant} ")) {
                 break;
             }
             if state.starts_with("fresh-provider-unknown ") || std::time::Instant::now() >= deadline
             {
-                return Err("private provider result unknown".into());
+                return Err(format!(
+                    "private provider Q unknown for D {} grant {grant}; caller decides recovery",
+                    self.authority.receipt.d_key
+                ));
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
@@ -750,7 +762,7 @@ impl oulipoly_runtime::executor::cli::fresh_remote::FreshProviderBackend
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         protocol::private_fresh_provider_at(&socket, &self.authority.receipt.d_key, b'7', None)
-            .map_err(|e| format!("private provider cancel failed: {e}"))?;
+            .map_err(|e| format!("private provider Q unknown for D {} grant {grant}: cancel {e}; caller decides recovery", self.authority.receipt.d_key))?;
         loop {
             let state = protocol::private_fresh_provider_at(
                 &socket,
@@ -758,19 +770,22 @@ impl oulipoly_runtime::executor::cli::fresh_remote::FreshProviderBackend
                 b'6',
                 None,
             )
-            .map_err(|e| format!("private provider Q readback failed: {e}"))?;
+            .map_err(|e| format!("private provider Q unknown for D {} grant {grant}: {e}; caller decides recovery", self.authority.receipt.d_key))?;
             if state.starts_with(&format!("fresh-provider-drained {grant} ")) {
                 break;
             }
             if state.starts_with("fresh-provider-unknown ") || std::time::Instant::now() >= deadline
             {
-                return Err("private provider Q unknown".into());
+                return Err(format!(
+                    "private provider Q unknown for D {} grant {grant}; caller decides recovery",
+                    self.authority.receipt.d_key
+                ));
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         let output =
             protocol::private_fresh_provider_output_at(&socket, &self.authority.receipt.d_key)
-                .map_err(|e| format!("private provider output readback failed: {e}"))?;
+                .map_err(|e| format!("private provider output unknown for D {} grant {grant}: {e}; caller decides recovery", self.authority.receipt.d_key))?;
         if output.grant_id != grant || !output.cancelled {
             return Err("private provider output grant/Q mismatch".into());
         }
@@ -839,10 +854,15 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
         .map_err(|_| "private provider image absent")?;
     let marker = std::env::var("AGE319_PRIVATE_PROVIDER_MARKER_V1")
         .map_err(|_| "private provider marker absent")?;
+    let command = std::env::var("AGE319_PRIVATE_PROVIDER_COMMAND_V1").unwrap_or(image);
+    let mut provider = ProviderConfig::new(command, vec![marker]);
+    if let Ok(path) = std::env::var("AGE319_PRIVATE_PROVIDER_PATH_V1") {
+        provider.environment.insert("PATH".into(), path);
+    }
     let model = ModelConfig {
         name: "fixture-model".into(),
         prompt_mode: PromptMode::Stdin,
-        providers: vec![ProviderConfig::new(image, vec![marker])],
+        providers: vec![provider],
         inputs: Vec::new(),
         provider: None,
     };

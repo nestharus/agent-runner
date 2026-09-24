@@ -10,6 +10,8 @@ use super::terminal_signal::terminal_status_from_exit_status;
 use crate::executor::ExecutionResult;
 use oulipoly_config::{InvocationMode, ModelConfig, PromptMode};
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
@@ -17,6 +19,9 @@ use std::process::ExitStatus;
 /// A canonical runtime plan. The implementation must pin the named image,
 /// cwd, recipe and input before K; paths and strings alone are not authority.
 pub struct FreshProviderPlan {
+    /// First token from the configured command. The resolved executable is
+    /// separately pinned by the backend for this invocation.
+    pub configured_program: String,
     pub executable: PathBuf,
     pub cwd: PathBuf,
     pub argv: Vec<String>,
@@ -64,8 +69,8 @@ pub fn execute_fresh_headless(
         return Err("fresh broker provider shape unsupported before K".into());
     }
     let parts = super::shell_split(&provider.command);
-    if parts.is_empty() || !Path::new(&parts[0]).is_absolute() {
-        return Err("fresh broker requires an absolute first executable before K".into());
+    if parts.is_empty() {
+        return Err("fresh broker command has no first executable before K".into());
     }
     let input_args = resolve_input_flags(model, &HashMap::new())?;
     if provider
@@ -152,8 +157,10 @@ pub fn execute_fresh_headless(
         .prompt_payload
         .clone()
         .unwrap_or_default();
+    let executable = resolve_first_executable(&parts[0], working_dir, &environment)?;
     let completion = backend.run_to_physical_q(FreshProviderPlan {
-        executable: parts[0].clone().into(),
+        configured_program: parts[0].clone(),
+        executable,
         cwd: working_dir.to_path_buf(),
         argv,
         environment: environment.into_iter().collect(),
@@ -177,6 +184,66 @@ pub fn execute_fresh_headless(
     ))
 }
 
+/// Resolve in the assembled child's environment and cwd, once per attempt.
+/// PATH candidates are probed in order with the caller's effective access;
+/// the backend opens the chosen path and the broker pins that inode/mount.
+fn resolve_first_executable(
+    program: &str,
+    cwd: &Path,
+    environment: &BTreeMap<String, String>,
+) -> Result<PathBuf, String> {
+    if program.is_empty() || program.contains('\0') {
+        return Err("fresh broker first executable is empty or contains NUL".into());
+    }
+    let path = Path::new(program);
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    if program.contains('/') {
+        return Ok(cwd.join(path));
+    }
+    // execvp's default when PATH is absent on Linux is the system path.
+    let search = environment
+        .get("PATH")
+        .map(String::as_str)
+        .unwrap_or("/bin:/usr/bin");
+    for entry in search.split(':') {
+        let directory = if entry.is_empty() {
+            cwd.to_path_buf()
+        } else {
+            let entry = Path::new(entry);
+            if entry.is_absolute() {
+                entry.to_path_buf()
+            } else {
+                cwd.join(entry)
+            }
+        };
+        let candidate = directory.join(program);
+        if !candidate
+            .metadata()
+            .is_ok_and(|metadata| metadata.is_file())
+        {
+            continue;
+        }
+        let c_path = CString::new(candidate.as_os_str().as_bytes())
+            .map_err(|_| "fresh broker PATH candidate contains NUL")?;
+        if unsafe {
+            libc::faccessat(
+                libc::AT_FDCWD,
+                c_path.as_ptr(),
+                libc::X_OK,
+                libc::AT_EACCESS,
+            )
+        } == 0
+        {
+            return Ok(candidate);
+        }
+    }
+    Err(format!(
+        "fresh broker command not found on child PATH before K: {program}"
+    ))
+}
+
 fn forbidden_fresh_environment(key: &str) -> bool {
     key.starts_with("LD_")
         || key.starts_with("DYLD_")
@@ -188,6 +255,8 @@ fn forbidden_fresh_environment(key: &str) -> bool {
 mod tests {
     use super::*;
     use oulipoly_config::ProviderConfig;
+    use std::fs;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -277,6 +346,7 @@ mod tests {
                 plan: FreshProviderPlan,
             ) -> Result<FreshProviderCompletion, String> {
                 assert_eq!(plan.executable, Path::new("/usr/bin/env"));
+                assert_eq!(plan.configured_program, "/usr/bin/env");
                 assert_eq!(plan.argv, ["-u", "CLAUDECODE", "/bin/true", "--fixture"]);
                 Ok(FreshProviderCompletion {
                     wait_status: 0,
@@ -298,6 +368,120 @@ mod tests {
             Some(value) => unsafe { std::env::set_var(oulipoly_state::paths::DATA_DIR_ENV, value) },
             None => unsafe { std::env::remove_var(oulipoly_state::paths::DATA_DIR_ENV) },
         }
+    }
+
+    #[test]
+    fn child_path_resolves_bare_command_and_preserves_prefix_and_configured_args() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let old_data = std::env::var_os(oulipoly_state::paths::DATA_DIR_ENV);
+        unsafe { std::env::set_var(oulipoly_state::paths::DATA_DIR_ENV, data.path()) };
+        let bin = data.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        let image = bin.join("env");
+        fs::write(&image, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&image, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut configured = model("env -u CLAUDECODE claude");
+        configured.providers[0]
+            .environment
+            .insert("PATH".into(), bin.display().to_string());
+        struct CheckBackend {
+            expected: PathBuf,
+        }
+        impl FreshProviderBackend for CheckBackend {
+            fn run_to_physical_q(
+                &mut self,
+                plan: FreshProviderPlan,
+            ) -> Result<FreshProviderCompletion, String> {
+                assert_eq!(plan.configured_program, "env");
+                assert_eq!(plan.executable, self.expected);
+                assert_eq!(plan.argv, ["-u", "CLAUDECODE", "claude", "--fixture"]);
+                assert_eq!(
+                    plan.environment
+                        .iter()
+                        .find(|(key, _)| key == "PATH")
+                        .unwrap()
+                        .1,
+                    self.expected.parent().unwrap().display().to_string()
+                );
+                Ok(FreshProviderCompletion {
+                    wait_status: 0,
+                    stdout: b"done".to_vec(),
+                    stderr: vec![],
+                })
+            }
+        }
+        let result = execute_fresh_headless(
+            &configured,
+            0,
+            "raw prompt",
+            data.path(),
+            &mut CheckBackend { expected: image },
+        )
+        .unwrap();
+        assert_eq!(result.stdout, b"done");
+        let mut absent = model("missing-provider");
+        absent.providers[0]
+            .environment
+            .insert("PATH".into(), bin.display().to_string());
+        let mut backend = ObserveBackend {
+            calls: 0,
+            wait_status: 0,
+        };
+        let error = execute_fresh_headless(&absent, 0, "raw prompt", data.path(), &mut backend)
+            .err()
+            .unwrap();
+        assert!(error.contains("command not found"));
+        assert_eq!(backend.calls, 0, "missing first command reached K backend");
+        match old_data {
+            Some(value) => unsafe { std::env::set_var(oulipoly_state::paths::DATA_DIR_ENV, value) },
+            None => unsafe { std::env::remove_var(oulipoly_state::paths::DATA_DIR_ENV) },
+        }
+    }
+
+    #[test]
+    fn path_order_permissions_and_replacement_are_resolved_per_attempt() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        let first_image = first.join("provider");
+        let second_image = second.join("provider");
+        fs::write(&first_image, b"first").unwrap();
+        fs::write(&second_image, b"second").unwrap();
+        fs::set_permissions(&first_image, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(&second_image, fs::Permissions::from_mode(0o755)).unwrap();
+        let environment = BTreeMap::from([(
+            "PATH".into(),
+            format!("{}:{}", first.display(), second.display()),
+        )]);
+        assert_eq!(
+            resolve_first_executable("provider", temp.path(), &environment).unwrap(),
+            second_image
+        );
+        fs::set_permissions(&first_image, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            resolve_first_executable("provider", temp.path(), &environment).unwrap(),
+            first_image
+        );
+        let pinned = fs::File::open(&first_image).unwrap();
+        fs::rename(&first_image, first.join("old-provider")).unwrap();
+        fs::write(&first_image, b"replacement").unwrap();
+        fs::set_permissions(&first_image, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            resolve_first_executable("provider", temp.path(), &environment).unwrap(),
+            first_image
+        );
+        assert_ne!(
+            pinned.metadata().unwrap().ino(),
+            first_image.metadata().unwrap().ino()
+        );
+        assert!(
+            resolve_first_executable("missing", temp.path(), &environment)
+                .unwrap_err()
+                .contains("command not found")
+        );
     }
 
     #[test]
