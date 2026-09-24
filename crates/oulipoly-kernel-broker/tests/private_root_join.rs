@@ -2250,6 +2250,33 @@ fn inner() {
                             .unwrap(),
                         1
                     );
+                    if mode == "normal_model_provider" {
+                        stop(&mut broker);
+                        broker = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
+                            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
+                            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
+                            .stderr(Stdio::from(
+                                File::create(temp.path().join("root-terminal-restart.log"))
+                                    .unwrap(),
+                            ))
+                            .spawn()
+                            .unwrap();
+                        eventually(|| protocol::request_at(&socket, Operation::Classify).is_ok());
+                        let reopened = FreshV30Lane::open_at(&broker_state).unwrap();
+                        let replay = reopened
+                            .read_private_root_terminal(&receipt, &actor, &session)
+                            .unwrap();
+                        assert_eq!(replay.execution, terminal.execution);
+                        assert_eq!(replay.publication_state, "unknown");
+                        assert_eq!(
+                            reopened
+                                .settle_private_root_terminal(&receipt, &actor, &session)
+                                .unwrap()
+                                .execution,
+                            terminal.execution
+                        );
+                    }
                     stop(&mut broker);
                     return;
                 }
