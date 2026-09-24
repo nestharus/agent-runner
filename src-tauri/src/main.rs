@@ -298,9 +298,18 @@ fn private_gui_probe() -> std::io::Result<()> {
     {
         return Err(std::io::Error::other("GUI credentials changed at exec"));
     }
-    let groups = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
-    if groups != 0 {
-        return Err(std::io::Error::other("GUI inherited supplementary groups"));
+    let group_count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if group_count < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut groups = vec![0 as libc::gid_t; group_count as usize];
+    if unsafe { libc::getgroups(group_count, groups.as_mut_ptr()) } != group_count {
+        return Err(std::io::Error::other("GUI group observation changed"));
+    }
+    if let Some(path) = std::env::var_os("OULIPOLY_AGE319_PRIVATE_GUI_GROUP_FILE_V1") {
+        if std::fs::read(path)? != b"group-access" {
+            return Err(std::io::Error::other("GUI group file content mismatch"));
+        }
     }
 
     let stdio_entry = std::env::var("OULIPOLY_AGE319_PRIVATE_GUI_STDIO_V1")
@@ -371,7 +380,7 @@ fn private_gui_probe() -> std::io::Result<()> {
         -1
     };
     let report = format!(
-        "PRIVATE_GUI_CONNECTED uid={} euid={} gid={} egid={} groups={groups} cwd={} stdio_entry={} nnp={} grandchild_host_pid={}\n",
+        "PRIVATE_GUI_CONNECTED uid={} euid={} gid={} egid={} groups={groups:?} cwd={} stdio_entry={} nnp={} grandchild_host_pid={}\n",
         unsafe { libc::getuid() },
         unsafe { libc::geteuid() },
         unsafe { libc::getgid() },

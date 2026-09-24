@@ -274,10 +274,11 @@ fn inner() {
     eventually(|| gui_report.exists() || gui_entry.try_wait().unwrap().is_some());
     let report = fs::read_to_string(&gui_report).unwrap();
     assert!(
-        report.contains(&format!(
-            "uid=0 euid=0 gid=0 egid=0 groups=0 cwd={}",
-            gui_cwd.display()
-        )),
+        report.contains("uid=0 euid=0 gid=0 egid=0 groups=["),
+        "{report}"
+    );
+    assert!(
+        report.contains(&format!("cwd={}", gui_cwd.display())),
         "{report}"
     );
     assert_eq!(fs::read(temp.path().join("stdio-at-exec")).unwrap(), b"000");
@@ -736,17 +737,38 @@ fn inner() {
         assert_eq!(unsafe { libc::chown(path.as_ptr(), 1, 1) }, 0);
     }
     fs::set_permissions(&plain_gui_dir, fs::Permissions::from_mode(0o755)).unwrap();
-    let user_gui = launcher_command(
-        plain_gui_link.to_str().unwrap(),
-        &plain_socket,
-        &plain_generation,
-    )
-    .uid(1)
-    .gid(1)
-    .env("XDG_RUNTIME_DIR", &user_runtime)
-    .env("WAYLAND_DISPLAY", "wayland-user")
-    .output()
-    .unwrap();
+    let group_file = temp.path().join("group-file");
+    fs::write(&group_file, b"group-access").unwrap();
+    let group_file_c = std::ffi::CString::new(group_file.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::chown(group_file_c.as_ptr(), 0, 3) }, 0);
+    fs::set_permissions(&group_file, fs::Permissions::from_mode(0o640)).unwrap();
+    let grouped_user_gui = || {
+        let mut command = launcher_command(
+            plain_gui_link.to_str().unwrap(),
+            &plain_socket,
+            &plain_generation,
+        );
+        command
+            .env("XDG_RUNTIME_DIR", &user_runtime)
+            .env("OULIPOLY_AGE319_PRIVATE_GUI_GROUP_FILE_V1", &group_file);
+        unsafe {
+            command.pre_exec(|| {
+                let groups: [libc::gid_t; 2] = [2, 3];
+                if libc::setgroups(groups.len(), groups.as_ptr()) != 0
+                    || libc::setresgid(1, 1, 1) != 0
+                    || libc::setresuid(1, 1, 1) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command
+    };
+    let user_gui = grouped_user_gui()
+        .env("WAYLAND_DISPLAY", "wayland-user")
+        .output()
+        .unwrap();
     assert!(
         user_gui.status.success(),
         "launcher: {} broker: {}",
@@ -755,13 +777,38 @@ fn inner() {
     );
     let user_report = fs::read_to_string(user_runtime.join("age319-private-gui-report")).unwrap();
     assert!(
-        user_report.contains("uid=1 euid=1 gid=1 egid=1 groups=0"),
+        user_report.contains("uid=1 euid=1 gid=1 egid=1 groups=[2, 3]"),
         "{user_report}"
     );
     assert!(
         user_report.contains("stdio_entry=111 nnp=0"),
         "{user_report}"
     );
+    // The X11 socket itself needs group 2 for connect; the file above needs
+    // group 3 for read. Both are unavailable through UID 1 or primary GID 1.
+    assert_eq!(x11_mount, 0, "group-dependent X11 fixture mount required");
+    let group_socket = "/tmp/.X11-unix/X59994";
+    let group_listener = UnixListener::bind(group_socket).unwrap();
+    assert_eq!(
+        unsafe { libc::chown(c"/tmp/.X11-unix/X59994".as_ptr(), 0, 2) },
+        0
+    );
+    fs::set_permissions(group_socket, fs::Permissions::from_mode(0o770)).unwrap();
+    fs::remove_file(user_runtime.join("age319-private-gui-report")).unwrap();
+    let group_gui = grouped_user_gui()
+        .env("DISPLAY", ":59994")
+        .output()
+        .unwrap();
+    assert!(
+        group_gui.status.success(),
+        "launcher: {} broker: {}",
+        String::from_utf8_lossy(&group_gui.stderr),
+        fs::read_to_string(&plain_log).unwrap()
+    );
+    let group_report = fs::read_to_string(user_runtime.join("age319-private-gui-report")).unwrap();
+    assert!(group_report.contains("groups=[2, 3]"), "{group_report}");
+    assert!(group_report.contains("nnp=0"), "{group_report}");
+    drop(group_listener);
     drop(user_listener);
     stop(&mut plain_broker);
 }

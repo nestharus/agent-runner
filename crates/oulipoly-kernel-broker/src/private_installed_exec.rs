@@ -183,6 +183,7 @@ struct InitContext {
     child_gate: UnixStream,
     uid: u32,
     gid: u32,
+    gui_groups: Vec<libc::gid_t>,
 }
 
 fn environment<'a>(spec: &'a InstalledLaunchSpec, name: &[u8]) -> Option<&'a OsStr> {
@@ -293,6 +294,7 @@ fn run_init(context: InitContext) -> io::Result<()> {
         child_gate,
         uid,
         gid,
+        gui_groups,
     } = context;
     let mut keep = vec![
         image.as_raw_fd(),
@@ -379,7 +381,9 @@ fn run_init(context: InitContext) -> io::Result<()> {
     let child_gate_fd = child_gate.as_raw_fd();
     unsafe {
         command.pre_exec(move || {
-            if gui && libc::setgroups(0, std::ptr::null()) != 0 {
+            // The broker observed these on the pinned launcher process. Apply
+            // them while still privileged, before dropping to its UID/GID.
+            if gui && libc::setgroups(gui_groups.len(), gui_groups.as_ptr()) != 0 {
                 return Err(io::Error::last_os_error());
             }
             if libc::setsid() < 0
@@ -582,6 +586,14 @@ pub(super) fn launch(
     if unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) } != 0 {
         return Err(io::Error::other("private broker lost sudo semantics"));
     }
+    // The submitted frame carries no group list. The pinned launcher is the
+    // only authority for a GUI's actual session/newgrp supplementary groups.
+    // A failed or ambiguous proc observation refuses launch before reserve.
+    let gui_groups = if spec.kind == EntryKind::Gui {
+        peer.process.supplementary_groups()?
+    } else {
+        Vec::new()
+    };
     let record = Record {
         protocol: RECORD_PROTOCOL.into(),
         generation: spec.generation.clone(),
@@ -623,6 +635,7 @@ pub(super) fn launch(
         child_gate: init_child_gate,
         uid: peer.uid,
         gid: peer.gid,
+        gui_groups,
     };
     let guardian_pid = unsafe { libc::fork() };
     if guardian_pid < 0 {
