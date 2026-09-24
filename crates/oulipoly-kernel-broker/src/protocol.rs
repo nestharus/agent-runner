@@ -763,18 +763,18 @@ pub fn native_k_at(path: &Path, spec: &NativeKSpec, descriptors: [RawFd; 4]) -> 
     )))
 }
 
-/// v30 K preflight carries only the accepted directory/request/receipt.
-/// There is no caller-supplied sidecar descriptor. The current broker returns
-/// a closed attach/release error even after its exact checks pass.
-pub fn native_k_v30_at(path: &Path, spec: &NativeKSpec, descriptors: [RawFd; 3]) -> io::Result<()> {
+/// v30 K carries only the accepted directory/request/receipt. The broker
+/// chooses the fixed image, nested namespace and held worker; a lost reply
+/// must be observed as spent/unknown and never retried by another launch.
+pub fn native_k_v30_at(
+    path: &Path,
+    spec: &NativeKSpec,
+    descriptors: [RawFd; 3],
+) -> io::Result<String> {
     if spec.protocol != "native-continuation-v30" {
         return Err(io::Error::other("v30 native K protocol required"));
     }
-    let response = send_native_descriptors(path, b't', spec, descriptors)?;
-    Err(io::Error::other(format!(
-        "native K v30 closed: {}",
-        response.trim_end()
-    )))
+    send_native_descriptors(path, b't', spec, descriptors)
 }
 
 /// Descriptor order: exact accepted-work directory, immutable
@@ -864,6 +864,32 @@ pub fn cancel_accepted_work_at(path: &Path, grant_id: &str) -> io::Result<String
     stream.read_exact(&mut challenge)?;
     let mut request = Vec::with_capacity(33);
     request.push(b'Z');
+    request.extend_from_slice(&challenge);
+    request.extend_from_slice(id.as_bytes());
+    stream.write_all(&request)?;
+    read_response(stream)
+}
+
+/// Observe native PID1/terminal evidence and settle exact State Q when both
+/// the terminal and parent wait receipts are present. Q does not integrate a
+/// Runner result or release any source/recipient obligation.
+pub fn observe_native_work_v30_at(path: &Path, grant_id: &str) -> io::Result<String> {
+    native_work_control_at(path, b'q', grant_id)
+}
+
+/// Persist exact native cancellation intent before signalling its PID1.
+pub fn cancel_native_work_v30_at(path: &Path, grant_id: &str) -> io::Result<String> {
+    native_work_control_at(path, b'z', grant_id)
+}
+
+fn native_work_control_at(path: &Path, operation: u8, grant_id: &str) -> io::Result<String> {
+    let id =
+        uuid::Uuid::parse_str(grant_id).map_err(|_| io::Error::other("bad native grant ID"))?;
+    let mut stream = checked_connection(path)?;
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let mut request = Vec::with_capacity(33);
+    request.push(operation);
     request.extend_from_slice(&challenge);
     request.extend_from_slice(id.as_bytes());
     stream.write_all(&request)?;

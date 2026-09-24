@@ -1561,6 +1561,118 @@ impl BrokerSidecar {
         }))
     }
 
+    /// Attach only through this retained broker connection after the server
+    /// has authenticated the exact v30 N/t grant and observed a held worker.
+    /// An uncertain insert is resolved by exact readback, never by re-forking.
+    pub fn attach_exact_native_worker_v30(
+        &mut self,
+        source_generation: &str,
+        attempt_id: &str,
+        grant_id: &str,
+        root_id: &str,
+        evidence: &super::BrokerNativeAttachEvidence,
+    ) -> Result<super::NativeWorkerAttach, String> {
+        self.check_mailbox_read(source_generation)?;
+        let binding = self
+            .mailbox
+            .native_grant_binding(attempt_id)?
+            .ok_or("broker native attach binding absent")?;
+        if binding.grant_id != grant_id
+            || binding.kernel_root_id != root_id
+            || binding.attempt_id != attempt_id
+            || evidence.attempt_id != attempt_id
+            || evidence.grant_id != grant_id
+            || evidence.kernel_root_id != root_id
+            || self.mailbox.native_worker_attach(attempt_id)?.is_some()
+        {
+            return Err("broker native attach exact attempt conflict".into());
+        }
+        let attached = self
+            .mailbox
+            .attach_broker_native_worker(&binding, evidence)?;
+        self.check_mailbox_read(source_generation)?;
+        if self.mailbox.native_worker_attach(attempt_id)?.as_ref() != Some(&attached) {
+            return Err("broker native attach readback conflict".into());
+        }
+        Ok(attached)
+    }
+
+    /// Readback is diagnostic while K or Q is uncertain; presence is never
+    /// itself a gate-release or physical-drain certificate.
+    pub fn read_native_worker_attach_v30(
+        &self,
+        source_generation: &str,
+        attempt_id: &str,
+        grant_id: &str,
+    ) -> Result<Option<super::NativeWorkerAttach>, String> {
+        self.check_mailbox_read(source_generation)?;
+        let attached = self.mailbox.native_worker_attach(attempt_id)?;
+        if attached
+            .as_ref()
+            .is_some_and(|row| row.grant_id != grant_id)
+        {
+            return Err("broker native attach grant changed".into());
+        }
+        self.check_mailbox_read(source_generation)?;
+        Ok(attached)
+    }
+
+    /// Commit Q only from broker-observed nested PID1 terminal and parent
+    /// wait receipts for the same previously attached work. Exact readback
+    /// resolves a lost response without manufacturing a second settlement.
+    pub fn settle_exact_native_q_v30(
+        &mut self,
+        source_generation: &str,
+        evidence: &super::BrokerNativeKernelQEvidence,
+    ) -> Result<super::NativeKernelQSettlement, String> {
+        self.check_mailbox_read(source_generation)?;
+        let attached = self
+            .mailbox
+            .native_worker_attach(&evidence.attempt_id)?
+            .ok_or("broker native Q attach absent")?;
+        if attached.grant_id != evidence.grant_id
+            || attached.evidence.work_incarnation_id != evidence.work_incarnation_id
+            || attached.evidence.kernel_root_id != evidence.kernel_root_id
+            || attached.evidence.pid1_identity != evidence.pid1_identity
+            || attached.evidence.worker_identity != evidence.worker_identity
+        {
+            return Err("broker native Q attached work changed".into());
+        }
+        if let Some(existing) = self.mailbox.native_kernel_q(&evidence.attempt_id)? {
+            if existing.grant_id != evidence.grant_id
+                || existing.evidence.terminal_receipt_sha256 != evidence.terminal_receipt_sha256
+                || existing.evidence.pid1_wait_status != evidence.pid1_wait_status
+                || existing.evidence.work_incarnation_id != evidence.work_incarnation_id
+            {
+                return Err("broker native Q replay conflict".into());
+            }
+            return Ok(existing);
+        }
+        let settled = self
+            .mailbox
+            .settle_broker_native_kernel_q(&attached, evidence)?;
+        self.check_mailbox_read(source_generation)?;
+        if self.mailbox.native_kernel_q(&evidence.attempt_id)?.as_ref() != Some(&settled) {
+            return Err("broker native Q readback conflict".into());
+        }
+        Ok(settled)
+    }
+
+    pub fn native_q_settled_v30(
+        &self,
+        source_generation: &str,
+        attempt_id: &str,
+        grant_id: &str,
+    ) -> Result<bool, String> {
+        self.check_mailbox_read(source_generation)?;
+        let row = self.mailbox.native_kernel_q(attempt_id)?;
+        if row.as_ref().is_some_and(|row| row.grant_id != grant_id) {
+            return Err("broker native Q grant conflict".into());
+        }
+        self.check_mailbox_read(source_generation)?;
+        Ok(row.is_some())
+    }
+
     /// Exact owner, reservation, wake claim and acceptance readback in one
     /// read transaction. All selectors are checked against broker registry
     /// facts before this method is called; no caller-selected pathname exists.

@@ -541,9 +541,23 @@ impl GrantRegistry {
         let mut ids = HashSet::new();
         let mut works = HashSet::new();
         let mut native_attempts = HashSet::new();
+        let mut poisoned = false;
         for entry in fs::read_dir(&directory)? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(id) = name
+                .strip_prefix('.')
+                .and_then(|name| name.strip_suffix(".spend"))
+            {
+                // A crash before the atomic replacement may leave a complete
+                // or partial spend intent. Never reopen the prepared grant
+                // for K; retain registry debt while allowing Q inspection.
+                if uuid::Uuid::parse_str(id).is_err() || !entry.file_type()?.is_file() {
+                    return Err(io::Error::other("invalid native spend debt"));
+                }
+                poisoned = true;
+                continue;
+            }
             if !entry.file_type()?.is_file() || !name.ends_with(".json") {
                 return Err(io::Error::other("unrecognized accepted grant entry"));
             }
@@ -651,7 +665,7 @@ impl GrantRegistry {
             directory,
             records,
             native_records,
-            poisoned: false,
+            poisoned,
         })
     }
 
@@ -663,6 +677,54 @@ impl GrantRegistry {
         self.native_records
             .iter()
             .find(|r| r.attempt_id == attempt_id)
+    }
+
+    pub fn native_records(&self) -> &[NativeGrantRecord] {
+        &self.native_records
+    }
+
+    /// Irreversibly spend the exact v30 N grant before any namespace fork.
+    /// A crash or lost K reply retains consumed/unknown debt; no caller can
+    /// turn this record back into a launchable grant.
+    pub fn consume_native_v30(
+        &mut self,
+        verified: &NativeGrantRecord,
+    ) -> io::Result<NativeGrantRecord> {
+        if self.poisoned || verified.version != 5 || verified.kind != "native-continuation-v30" {
+            return Err(io::Error::other("native K consume authority absent"));
+        }
+        let record = self
+            .native_records
+            .iter_mut()
+            .find(|record| {
+                record.grant_id == verified.grant_id && record.attempt_id == verified.attempt_id
+            })
+            .ok_or_else(|| io::Error::other("native K grant absent"))?;
+        if record != verified || record.state != "prepared" {
+            return Err(io::Error::other("native K grant already spent or changed"));
+        }
+        let mut spent = record.clone();
+        spent.state = "consumed".into();
+        let temporary = self.directory.join(format!(".{}.spend", spent.grant_id));
+        let destination = self.directory.join(format!("{}.json", spent.grant_id));
+        let result = (|| {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temporary)?;
+            serde_json::to_writer(&mut file, &spent)?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            fs::rename(&temporary, &destination)?;
+            File::open(&self.directory)?.sync_all()
+        })();
+        if let Err(error) = result {
+            self.poisoned = true;
+            return Err(error);
+        }
+        *record = spent.clone();
+        Ok(spent)
     }
 
     /// A v4 N record can prove request/receipt consistency, but cannot prove

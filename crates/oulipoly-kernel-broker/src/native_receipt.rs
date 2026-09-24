@@ -1028,6 +1028,44 @@ mod tests {
             )
             .is_err()
         );
+        // Physical K spends the exact grant before any fork. A lost reply or
+        // broker reopen can observe debt but cannot prepare or spend it again.
+        let spent = v30.consume_native_v30(&v30_record).unwrap();
+        assert_eq!(spent.state, "consumed");
+        assert!(v30.consume_native_v30(&v30_record).is_err());
+        drop(v30);
+        let mut v30 = GrantRegistry::open(&v30_dir).unwrap();
+        assert_eq!(
+            v30.native_record(&attempt.attempt_id).unwrap().state,
+            "consumed"
+        );
+        assert!(v30.consume_native_v30(&v30_record).is_err());
+        assert!(
+            v30.prepare_native_v30(
+                &roots,
+                &entries,
+                &works,
+                &peer,
+                &host_namespace,
+                &runner_image,
+                &directory,
+                &request,
+                &receipt,
+                &root,
+                &attempt.attempt_id,
+                &owner.owner_generation,
+                &receipt_sha,
+                &generation,
+            )
+            .is_err()
+        );
+        fs::write(
+            v30_dir.join(format!(".{}.spend", v30_record.grant_id)),
+            serde_json::to_vec(&spent).unwrap(),
+        )
+        .unwrap();
+        let interrupted_spend = GrantRegistry::open(&v30_dir).unwrap();
+        assert!(interrupted_spend.has_debt());
         fs::write(&request_path, b"replaced bytes").unwrap();
         assert!(verify(&peer, &bound, &directory, &request, &receipt).is_err());
         assert!(

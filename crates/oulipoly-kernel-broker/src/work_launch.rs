@@ -29,7 +29,7 @@ extern "C" fn request_cancel(_: libc::c_int) {
 /// the caller's PID namespace, including child namespaces but excluding its
 /// parent and siblings. Repeating this during reaping catches late forks and
 /// adopted setsid children without process-group or host-PID guesses.
-fn signal_work_members(signal: libc::c_int) -> io::Result<()> {
+pub(super) fn signal_work_members(signal: libc::c_int) -> io::Result<()> {
     if unsafe { libc::kill(-1, signal) } != 0 {
         let error = io::Error::last_os_error();
         if error.raw_os_error() != Some(libc::ESRCH) {
@@ -60,7 +60,7 @@ struct InitContext {
     groups: Vec<libc::gid_t>,
 }
 
-fn close_other_descriptors(keep: &[RawFd]) -> io::Result<()> {
+pub(super) fn close_other_descriptors(keep: &[RawFd]) -> io::Result<()> {
     let mut discard = Vec::new();
     for entry in fs::read_dir("/proc/self/fd")? {
         let fd: RawFd = entry?.file_name().to_string_lossy().parse().unwrap_or(-1);
@@ -261,7 +261,7 @@ fn run_init(context: InitContext) -> io::Result<()> {
     )
 }
 
-fn child_credential(stream: &UnixStream, expected: u8) -> io::Result<libc::ucred> {
+pub(super) fn child_credential(stream: &UnixStream, expected: u8) -> io::Result<libc::ucred> {
     let mut byte = [0u8; 1];
     let mut iov = libc::iovec {
         iov_base: byte.as_mut_ptr().cast(),

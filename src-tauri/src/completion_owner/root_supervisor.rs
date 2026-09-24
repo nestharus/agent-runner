@@ -236,7 +236,7 @@ fn prepare_native_v30(
     request_path: &Path,
     request_file: &std::fs::File,
     request_bytes: &[u8],
-) -> Result<(String, String), String> {
+) -> Result<(String, String, String), String> {
     let socket = super::linux::owner_broker_socket();
     let route = super::broker_route::V30OwnerRoute::guardian(
         &socket,
@@ -280,9 +280,9 @@ fn prepare_native_v30(
         .and_then(|value| value.strip_suffix('\n'))
         .ok_or("broker did not return exact v30 native grant")?;
     uuid::Uuid::parse_str(grant_id).map_err(|_| "invalid v30 native grant ID")?;
-    // The challenged t path rechecks the retained State binding and the
-    // named descriptor bytes. Its current reply is always a closed gate.
-    let preflight = protocol::native_k_v30_at(
+    // t is irreversible once accepted by the broker. A missing reply remains
+    // spent/unknown debt; never issue a second K for this attempt.
+    let launch = protocol::native_k_v30_at(
         &socket,
         &NativeKSpec {
             protocol: "native-continuation-v30".into(),
@@ -293,12 +293,12 @@ fn prepare_native_v30(
             receipt_sha256: receipt_sha256.clone(),
         },
         descriptors(),
-    );
-    let expected = "native K v30 closed: error v30 native K physical attach/release remains closed";
-    if preflight.err().as_ref().map(ToString::to_string).as_deref() != Some(expected) {
-        return Err("v30 native K preflight did not return exact closed gate".into());
+    )
+    .map_err(|error| format!("v30 native K spent/unknown or refused: {error}"))?;
+    if !launch.starts_with("launched-native-v30 ") {
+        return Err("v30 native K reply is not a physical launch receipt".into());
     }
-    Ok((grant_id.into(), receipt_sha256))
+    Ok((grant_id.into(), receipt_sha256, launch))
 }
 
 #[cfg(test)]
@@ -1212,8 +1212,10 @@ impl RootSupervisor {
                 &request_bytes,
             );
             let (reason, receipt_sha256) = match outcome {
-                Ok((grant_id, digest)) => (
-                    format!("v30 native grant {grant_id} bound; physical K/Q remains closed"),
+                Ok((grant_id, digest, launch)) => (
+                    format!(
+                        "v30 native grant {grant_id} bound; {launch}; terminal Q and normal invocation remain closed"
+                    ),
                     Some(digest),
                 ),
                 Err(error) => (

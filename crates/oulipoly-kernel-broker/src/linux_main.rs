@@ -1,4 +1,6 @@
 //! Opt-in host-root broker for the pinned guardian and one-use root child join.
+#[path = "native_work.rs"]
+mod native_work;
 #[cfg(feature = "age319-private-broker-fixture")]
 #[path = "private_installed_exec.rs"]
 mod private_installed_exec;
@@ -28,7 +30,7 @@ use oulipoly_kernel_broker::work_registry::{Scope, WorkRegistry, classify_scope}
 use oulipoly_state::mailbox::{
     BrokerReleaseEvidence, BrokerSidecar, PreparedBrokerOwner, PreparedProcessStamp,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -101,13 +103,29 @@ fn require_cutover_entry_route(
     if gate_closed {
         return Err(io::Error::other("broker entry gate is durably closed"));
     }
-    if !broker_owned_sidecar && matches!(operation, b'e' | b'p' | b'g' | b'a' | b'j' | b't') {
+    if !broker_owned_sidecar
+        && matches!(
+            operation,
+            b'e' | b'p' | b'g' | b'a' | b'j' | b't' | b'q' | b'z'
+        )
+    {
         return Err(io::Error::other("v30 entry requires broker-owned sidecar"));
     }
     if broker_owned_sidecar
         && !matches!(
             operation,
-            b'Y' | b'R' | b'W' | b'I' | b'e' | b'p' | b'g' | b'a' | b'j' | b'N' | b't'
+            b'Y' | b'R'
+                | b'W'
+                | b'I'
+                | b'e'
+                | b'p'
+                | b'g'
+                | b'a'
+                | b'j'
+                | b'N'
+                | b't'
+                | b'q'
+                | b'z'
         )
     {
         #[cfg(feature = "age319-private-broker-fixture")]
@@ -298,7 +316,7 @@ fn recv_request(
     let valid_length = match request[0] {
         b'G' | b'g' => read == 65,
         b'P' | b'p' => read == 37,
-        b'Q' | b'Z' => read == 33,
+        b'Q' | b'Z' | b'q' | b'z' => read == 33,
         #[cfg(feature = "age319-private-broker-fixture")]
         b'l' | b'M' => read == 49,
         b'A' | b'a' => read == 33,
@@ -354,10 +372,10 @@ fn recv_request(
         b'A' | b'a' => RequestPayload::Read {
             root_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
         },
-        b'Q' => RequestPayload::ObserveAcceptedWork {
+        b'Q' | b'q' => RequestPayload::ObserveAcceptedWork {
             grant_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
         },
-        b'Z' => RequestPayload::CancelAcceptedWork {
+        b'Z' | b'z' => RequestPayload::CancelAcceptedWork {
             grant_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
         },
         b'J' | b'j' => RequestPayload::Join {
@@ -2426,6 +2444,8 @@ fn serve() -> io::Result<()> {
         checked_root_path(&grants_path, true)?;
     }
     let mut grants = GrantRegistry::open(&grants_path)?;
+    let broker_incarnation = uuid::Uuid::new_v4().to_string();
+    let mut settled_native_q = HashSet::new();
     // Ephemeral by design: a broker restart invalidates every pre-wire source
     // decision. No work/cancel action can be authorized by a lost ticket.
     let mut source_tickets = BTreeMap::<String, SourceTicket>::new();
@@ -2442,6 +2462,16 @@ fn serve() -> io::Result<()> {
     if !fixture {
         checked_root_path(&terminal_path, true)?;
     }
+    if let Some(sidecar) = broker_sidecar.as_mut() {
+        native_work::reconcile_after_restart(
+            &grants,
+            &works,
+            sidecar,
+            &broker_incarnation,
+            &terminal_path,
+            &mut settled_native_q,
+        );
+    }
     if let Ok(meta) = fs::symlink_metadata(&socket) {
         if !meta.file_type().is_socket() || meta.uid() != 0 {
             return Err(io::Error::other("unsafe existing socket"));
@@ -2450,8 +2480,27 @@ fn serve() -> io::Result<()> {
     }
     let listener = UnixListener::bind(&socket)?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o660))?;
-    for incoming in listener.incoming() {
-        let Ok(mut stream) = incoming else { continue };
+    listener.set_nonblocking(true)?;
+    loop {
+        let mut stream = match listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if let Some(sidecar) = broker_sidecar.as_mut() {
+                    native_work::reconcile_after_restart(
+                        &grants,
+                        &works,
+                        sidecar,
+                        &broker_incarnation,
+                        &terminal_path,
+                        &mut settled_native_q,
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
         stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
         stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
         let result = peer_from_request(&mut stream).and_then(|(operation, payload, peer)| {
@@ -2853,13 +2902,13 @@ fn serve() -> io::Result<()> {
                 ))
             } else if operation == b't' {
                 let sidecar = broker_sidecar
-                    .as_ref()
+                    .as_mut()
                     .ok_or_else(|| io::Error::other("v30 native K requires broker State"))?;
                 let RequestPayload::NativeKV30 { spec, descriptors } = payload else {
                     return Err(io::Error::other("invalid v30 native K payload"));
                 };
                 let [directory, request, receipt] = descriptors;
-                grants.inspect_native_k_v30(
+                let verified = grants.inspect_native_k_v30(
                     &spec,
                     &registry,
                     &entries,
@@ -2872,9 +2921,60 @@ fn serve() -> io::Result<()> {
                     &receipt,
                     sidecar,
                 )?;
-                Err(io::Error::other(
-                    "v30 native K physical attach/release remains closed",
-                ))
+                // The physical route is exercised only by the private
+                // broker fixture until the normal v30 invocation/session
+                // admission and result-plus-Q integration share this lineage.
+                if !fixture {
+                    return Err(io::Error::other(
+                        "production v30 native K admission closed pending normal invocation and Q settlement",
+                    ));
+                }
+                native_work::launch(
+                    &verified,
+                    request,
+                    &peer,
+                    &runner_image,
+                    &registry,
+                    &mut works,
+                    &mut grants,
+                    sidecar,
+                    &broker_incarnation,
+                    &terminal_path,
+                )
+            } else if operation == b'q' || operation == b'z' {
+                let sidecar = broker_sidecar.as_mut().ok_or_else(|| {
+                    io::Error::other("v30 native observation requires broker State")
+                })?;
+                if operation == b'q' {
+                    let RequestPayload::ObserveAcceptedWork { grant_id } = payload else {
+                        return Err(io::Error::other("invalid v30 native observation"));
+                    };
+                    native_work::observe(
+                        &grant_id,
+                        &peer,
+                        &host_namespace,
+                        &runner_image,
+                        &grants,
+                        &works,
+                        sidecar,
+                        &broker_incarnation,
+                        &terminal_path,
+                    )
+                } else {
+                    let RequestPayload::CancelAcceptedWork { grant_id } = payload else {
+                        return Err(io::Error::other("invalid v30 native cancellation"));
+                    };
+                    native_work::cancel(
+                        &grant_id,
+                        &peer,
+                        &host_namespace,
+                        &runner_image,
+                        &grants,
+                        &works,
+                        sidecar,
+                        &terminal_path,
+                    )
+                }
             } else if operation == b'K' {
                 let RequestPayload::LaunchAcceptedWork { spec, descriptors } = payload else {
                     return Err(io::Error::other("invalid accepted launch payload"));
@@ -3157,7 +3257,6 @@ fn serve() -> io::Result<()> {
             let _ = stream.write_all(response.as_bytes());
         }
     }
-    Ok(())
 }
 
 pub fn run() {
