@@ -88,10 +88,76 @@ fn fresh_v30_session_request(
         .ok_or_else(|| io::Error::other("fresh v30 session allocation refused"))?;
     let session: oulipoly_state::mailbox::FreshV30Session =
         serde_json::from_str(body).map_err(io::Error::other)?;
-    if session.request_id != request_id {
-        return Err(io::Error::other("fresh v30 request readback mismatch"));
-    }
+    validate_fresh_v30_session(&fresh_v30_state_route()?, request_id, &session)?;
     Ok(Some(session))
+}
+
+fn validate_fresh_v30_session(
+    route: &FreshV30Route,
+    request_id: &str,
+    session: &oulipoly_state::mailbox::FreshV30Session,
+) -> io::Result<()> {
+    let suffix = session
+        .session_id
+        .strip_prefix(&format!("v30:{}:", route.lane_id))
+        .ok_or_else(|| io::Error::other("fresh v30 session is not in broker lane"))?;
+    for value in [&session.request_id, &session.allocation_id, suffix] {
+        let parsed = uuid::Uuid::parse_str(value)
+            .map_err(|_| io::Error::other("fresh v30 allocation UUID invalid"))?;
+        if parsed.is_nil() || parsed.to_string() != *value {
+            return Err(io::Error::other(
+                "fresh v30 allocation UUID is noncanonical or nil",
+            ));
+        }
+    }
+    if session.request_id != request_id
+        || session.lane_id != route.lane_id
+        || session.source_generation != route.source_generation
+    {
+        return Err(io::Error::other(
+            "fresh v30 State/session route readback mismatch",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod fresh_session_readback_tests {
+    use super::*;
+    use oulipoly_state::mailbox::FreshV30Session;
+
+    #[test]
+    fn full_fresh_route_and_minted_identity_are_required() {
+        let lane = uuid::Uuid::new_v4().to_string();
+        let generation = uuid::Uuid::new_v4().to_string();
+        let request = uuid::Uuid::new_v4().to_string();
+        let route = FreshV30Route {
+            lane_id: lane.clone(),
+            source_generation: generation.clone(),
+            domain_id: uuid::Uuid::new_v4().to_string(),
+        };
+        let session = FreshV30Session {
+            lane_id: lane.clone(),
+            source_generation: generation,
+            session_id: format!("v30:{lane}:{}", uuid::Uuid::new_v4()),
+            request_id: request.clone(),
+            allocation_id: uuid::Uuid::new_v4().to_string(),
+        };
+        validate_fresh_v30_session(&route, &request, &session).unwrap();
+        let mut wrong = session.clone();
+        wrong.source_generation = uuid::Uuid::new_v4().to_string();
+        assert!(validate_fresh_v30_session(&route, &request, &wrong).is_err());
+        wrong = session.clone();
+        wrong.session_id = format!("v30:{}:{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        assert!(validate_fresh_v30_session(&route, &request, &wrong).is_err());
+        wrong = session.clone();
+        wrong.allocation_id = uuid::Uuid::nil().to_string();
+        assert!(validate_fresh_v30_session(&route, &request, &wrong).is_err());
+        assert!(
+            validate_fresh_v30_session(&route, &uuid::Uuid::new_v4().to_string(), &session)
+                .is_err()
+        );
+    }
 }
 
 /// Entry routing is observed from the live broker before any user-side

@@ -3480,22 +3480,27 @@ fn serve_fresh_v30() -> io::Result<()> {
                     let RequestPayload::FreshSessionRequest { request_id } = payload else {
                         return Err(io::Error::other("fresh session request identity absent"));
                     };
-                    let existing = lane.read_session(&request_id).map_err(io::Error::other)?;
-                    if operation == b'd' && existing.is_none() {
-                        return Ok("fresh-session absent\n".into());
-                    }
-                    if instance.is_closed() {
-                        if existing.is_none() {
-                            return Err(io::Error::other(
-                                "fresh v30 session allocation gate closed",
-                            ));
+                    // d never repairs a half-written pair; only a retry of
+                    // the same D key may finish its State-first admission.
+                    let session = if operation == b'd' {
+                        match lane.read_session(&request_id).map_err(io::Error::other)? {
+                            Some(session) => session,
+                            None => return Ok("fresh-session absent\n".into()),
                         }
-                    }
-                    let session = match existing {
-                        Some(session) => session,
-                        None => lane
-                            .allocate_session(&request_id)
-                            .map_err(io::Error::other)?,
+                    } else {
+                        if instance.is_closed() {
+                            match lane.read_session(&request_id).map_err(io::Error::other)? {
+                                Some(session) => session,
+                                None => {
+                                    return Err(io::Error::other(
+                                        "fresh v30 session allocation gate closed",
+                                    ));
+                                }
+                            }
+                        } else {
+                            lane.allocate_session(&request_id)
+                                .map_err(io::Error::other)?
+                        }
                     };
                     Ok(format!(
                         "fresh-session {}\n",
@@ -3503,7 +3508,7 @@ fn serve_fresh_v30() -> io::Result<()> {
                     ))
                 }
                 _ => Err(io::Error::other(
-                    "fresh v30 effects closed pending source/recipient/K/Q/ACK lineage",
+                    "fresh v30 effects closed pending source/recipient/K/Q/Runner-result/ACK lineage",
                 )),
             }
         })();

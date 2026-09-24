@@ -25,6 +25,7 @@
 - `crates/oulipoly-kernel-broker/tests/private_source_physical.rs`
 - `crates/oulipoly-kernel-broker/tests/private_accepted_h_frame.rs`
 - `crates/oulipoly-kernel-broker/tests/private_installed_exec.rs`
+- `crates/oulipoly-kernel-broker/tests/age319_fresh_lane_socket.rs`
 - `src-tauri/src/kernel_entry.rs`
 - `src-tauri/src/completion_owner/linux.rs`
 - `src-tauri/src/completion_owner/driver.rs`
@@ -55,6 +56,7 @@
 | Prepared grant consumed before a future namespace fork, then broker restart. | Fsynced consumed record remains and replay is refused. |
 | Root or work PID1 missing/changed on restart. | Durable unknown debt, never a drain receipt. |
 | Exact live v30 driver requests the broker-selected reserved source. | The retained sidecar supplies admitted registration/listener bytes. The broker checks original registration, environment and image inodes/hashes, holds one nested PID1 worker before exec, consumes the exact grant once in FULL WAL, fsyncs the physical record and confirmation, rechecks the original names, then opens the worker gate. A lost response never permits a second launch. The Runner driver does not call this route yet. |
+| Fresh D request UUID is sent to the versioned broker socket. | Broker commits an exact new-lane State session admission before the mailbox allocation. It returns only when both rows match the request, lane, source generation, session and allocation UUIDs. A lost reply returns the same pair; a State-first interruption is reconciled only by the same D key. d refuses the incomplete pair and never repairs it. Neither pair grants an invocation, owner, effect, result or ACK. |
 | Broker-owned consumed source grant, pinned root/entry/driver/guardian/held worker, and empty root-only capture files. | One fsynced source physical record binds exact process incarnations, nested PID1 lineage, worker local PID and output inodes before the worker gate opens. A duplicate grant or orphan output blocks another physical binding. The joined child's prior broker stamp remains valid after that child exits. |
 | Source worker exits while an adopted descendant remains live. | Source PID1 retains the worker wait, pumps each pipe to root-only disk with bounded memory and backpressure, reaps to ECHILD without a lifetime cap, syncs and hashes complete stdout/stderr, and writes one terminal receipt. Post-owner readback remains live/pending until the exact PID1 incarnation ends. Read/write/sync failure records incomplete diagnostic debt when storage permits. |
 | Broker restarts after a durable source cancellation intent but before a signal reply. | The fixed root-only registry reopens, reissues the request through the exact PID1 pidfd, and observes the same terminal/drain receipt. A changed PID never receives the signal. |

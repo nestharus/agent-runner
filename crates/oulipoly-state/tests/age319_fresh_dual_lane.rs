@@ -87,6 +87,16 @@ fn private_fresh_dual_lane_live_old_wal_collision_and_restart() {
     );
     assert_eq!(
         state
+            .query_row(
+                "SELECT count(*) FROM fresh_lane_session_admission",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        state
             .query_row("SELECT lane_id FROM fresh_lane_state_identity", [], |r| {
                 r.get::<_, String>(0)
             })
@@ -126,6 +136,89 @@ fn private_fresh_dual_lane_live_old_wal_collision_and_restart() {
                 .get::<_, i64>(0))
             .unwrap(),
         1
+    );
+    let admitted: (String, String, String, String) = state
+        .query_row(
+            "SELECT session_id,allocation_id,lane_id,source_generation
+             FROM fresh_lane_session_admission WHERE request_id=?1",
+            [&request_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        admitted,
+        (
+            session.session_id.clone(),
+            session.allocation_id.clone(),
+            first.lane_id.clone(),
+            first.source_generation.clone()
+        )
+    );
+    // A State-first crash leaves no usable d readback. The same D key
+    // completes the exact allocation after restart without minting a new ID.
+    let incomplete_request = uuid::Uuid::new_v4().to_string();
+    let incomplete_session = format!("v30:{}:{}", first.lane_id, uuid::Uuid::new_v4());
+    let incomplete_allocation = uuid::Uuid::new_v4().to_string();
+    state
+        .execute(
+            "INSERT INTO fresh_lane_session_admission
+         (request_id,session_id,allocation_id,lane_id,source_generation,admitted_at)
+         VALUES(?1,?2,?3,?4,?5,'2026-09-24T00:00:00Z')",
+            params![
+                incomplete_request,
+                incomplete_session,
+                incomplete_allocation,
+                first.lane_id,
+                first.source_generation
+            ],
+        )
+        .unwrap();
+    assert!(lane.read_session(&incomplete_request).is_err());
+    drop(lane);
+    let mut lane = FreshV30Lane::open_at(&broker_root).unwrap();
+    let completed = lane.allocate_session(&incomplete_request).unwrap();
+    assert_eq!(completed.session_id, incomplete_session);
+    assert_eq!(completed.allocation_id, incomplete_allocation);
+    assert_eq!(
+        lane.read_session(&incomplete_request).unwrap(),
+        Some(completed)
+    );
+    let old_only_request = uuid::Uuid::new_v4().to_string();
+    mailbox.execute(
+        "INSERT INTO fresh_lane_session(session_id,request_id,allocation_id,lane_id,source_generation,allocated_at)
+         VALUES(?1,?2,?3,?4,?5,'2026-09-24T00:00:00Z')",
+        params![format!("v30:{}:{}", first.lane_id, uuid::Uuid::new_v4()),
+            old_only_request, uuid::Uuid::new_v4().to_string(), first.lane_id,
+            first.source_generation],
+    ).unwrap();
+    assert!(lane.read_session(&old_only_request).is_err());
+    assert!(lane.allocate_session(&old_only_request).is_err());
+    assert_eq!(
+        state
+            .query_row("SELECT count(*) FROM invocations", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0,
+        "D admission is not a Runner invocation or result"
+    );
+    assert_eq!(
+        mailbox
+            .query_row("SELECT count(*) FROM completion_native_kernel_q", [], |r| r
+                .get::<_, i64>(0),)
+            .unwrap(),
+        0,
+        "D admission cannot imply physical Q"
+    );
+    assert_eq!(
+        mailbox
+            .query_row(
+                "SELECT count(*) FROM broker_fresh_source_admission",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0,
+        "D admission cannot import a v29 source"
     );
     assert!(
         lane.read_session(&uuid::Uuid::new_v4().to_string())

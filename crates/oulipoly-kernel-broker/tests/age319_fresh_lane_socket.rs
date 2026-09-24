@@ -77,6 +77,14 @@ fn private_broker_has_distinct_fresh_route_while_old_wal_writer_survives() {
         )
     );
     assert!(request(&socket, b'C').contains("fresh v30 effects closed"));
+    assert!(request(&socket, b'e').contains("Runner-result/ACK lineage"));
+    for operation in [b'Q', b'q', b'Z', b'z'] {
+        assert!(
+            request_with_id(&socket, operation, uuid::Uuid::new_v4(), true)
+                .contains("fresh v30 effects closed"),
+            "fresh socket accepted physical or cancellation opcode {operation}"
+        );
+    }
     let request_id = uuid::Uuid::new_v4();
     assert_eq!(
         request_with_id(&socket, b'd', request_id, true),
@@ -101,6 +109,39 @@ fn private_broker_has_distinct_fresh_route_while_old_wal_writer_survives() {
             .unwrap(),
         1
     );
+    let fresh_state = Connection::open(broker_root.join("v30/state.db")).unwrap();
+    assert_eq!(
+        fresh_state
+            .query_row(
+                "SELECT session_id FROM fresh_lane_session_admission WHERE request_id=?1",
+                [request_id.to_string()],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap(),
+        session.session_id
+    );
+    let interrupted = uuid::Uuid::new_v4();
+    let interrupted_session = format!("v30:{}:{}", identity.lane_id, uuid::Uuid::new_v4());
+    fresh_state
+        .execute(
+            "INSERT INTO fresh_lane_session_admission
+         (request_id,session_id,allocation_id,lane_id,source_generation,admitted_at)
+         VALUES(?1,?2,?3,?4,?5,'2026-09-24T00:00:00Z')",
+            params![
+                interrupted.to_string(),
+                interrupted_session,
+                uuid::Uuid::new_v4().to_string(),
+                identity.lane_id,
+                identity.source_generation
+            ],
+        )
+        .unwrap();
+    assert!(request_with_id(&socket, b'd', interrupted, true).contains("D is incomplete"));
+    let recovered = request_with_id(&socket, b'D', interrupted, true);
+    let recovered_session: FreshV30Session =
+        serde_json::from_str(recovered.strip_prefix("fresh-session ").unwrap().trim_end()).unwrap();
+    assert_eq!(recovered_session.session_id, interrupted_session);
+    assert_eq!(request_with_id(&socket, b'd', interrupted, true), recovered);
     assert_eq!(session.lane_id, identity.lane_id);
     let lane = FreshV30Lane::open_at(&broker_root).unwrap();
     lane.require_session(&session).unwrap();
@@ -127,7 +168,7 @@ fn private_broker_has_distinct_fresh_route_while_old_wal_writer_survives() {
             .query_row("SELECT count(*) FROM fresh_lane_session", [], |r| r
                 .get::<_, i64>(0))
             .unwrap(),
-        1
+        2
     );
     assert_eq!(
         request(&socket, b'I'),

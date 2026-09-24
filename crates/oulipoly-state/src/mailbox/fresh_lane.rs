@@ -37,6 +37,7 @@ pub struct FreshV30Session {
 pub struct FreshV30Lane {
     sidecar: BrokerSidecar,
     identity: FreshV30LaneIdentity,
+    state_path: PathBuf,
 }
 
 impl FreshV30Lane {
@@ -301,7 +302,24 @@ impl FreshV30Lane {
         {
             return Err("fresh State and mailbox lane identities differ".into());
         }
-        Ok(Self { sidecar, identity })
+        let admission_schema_count: i64 = state_conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE
+                 (type='table' AND name='fresh_lane_session_admission') OR
+                 (type='trigger' AND name IN
+                 ('fresh_lane_session_admission_no_update','fresh_lane_session_admission_no_delete'))",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if admission_schema_count != 3 {
+            return Err("fresh State session admission schema is incomplete".into());
+        }
+        Ok(Self {
+            sidecar,
+            identity,
+            state_path: lane_root.join("state.db"),
+        })
     }
 
     pub fn identity(&self) -> &FreshV30LaneIdentity {
@@ -314,17 +332,42 @@ impl FreshV30Lane {
     /// never selects a session ID or an old ledger.
     pub fn allocate_session(&mut self, request_id: &str) -> Result<FreshV30Session, String> {
         validate_request_id(request_id)?;
-        if let Some(existing) = self.read_session(request_id)? {
-            return Ok(existing);
+        let mailbox_existing: bool = self
+            .sidecar
+            .mailbox()
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM fresh_lane_session WHERE request_id=?1)",
+                [request_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if mailbox_existing {
+            return self
+                .read_session(request_id)?
+                .ok_or_else(|| "fresh mailbox session disappeared".into());
         }
-        let allocation_id = Uuid::new_v4().to_string();
-        let session = FreshV30Session {
+        // State is written first. A crash before the mailbox insert leaves a
+        // non-effect-bearing reservation that the same D request can finish.
+        // A different D key never adopts it. Neither database is copied from
+        // v29, and no session is returned until both exact rows agree.
+        let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        let candidate = FreshV30Session {
             lane_id: self.identity.lane_id.clone(),
             source_generation: self.identity.source_generation.clone(),
             session_id: format!("v30:{}:{}", self.identity.lane_id, Uuid::new_v4()),
             request_id: request_id.to_owned(),
-            allocation_id,
+            allocation_id: Uuid::new_v4().to_string(),
         };
+        state.execute(
+            "INSERT INTO fresh_lane_session_admission(request_id,session_id,allocation_id,lane_id,source_generation,admitted_at)
+             VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(request_id) DO NOTHING",
+            params![candidate.request_id, candidate.session_id, candidate.allocation_id,
+                candidate.lane_id, candidate.source_generation, Utc::now().to_rfc3339()],
+        ).map_err(|e| e.to_string())?;
+        let session = self
+            .read_state_admission_on(&state, request_id)?
+            .ok_or("fresh State session admission absent after commit")?;
         self.sidecar.mailbox().conn.execute(
             "INSERT INTO fresh_lane_session(session_id,request_id,allocation_id,lane_id,source_generation,allocated_at)
              VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(request_id) DO NOTHING",
@@ -365,10 +408,69 @@ impl FreshV30Lane {
             })
             .transpose()
             .map_err(|e| e.to_string())?;
+        let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let admitted = self.read_state_admission_on(&state, request_id)?;
+        if session != admitted {
+            return Err(
+                "fresh mailbox and State session admissions differ or D is incomplete".into(),
+            );
+        }
         if let Some(ref session) = session {
             self.require_session(session)?;
         }
         Ok(session)
+    }
+
+    fn state_connection(&self, flags: OpenFlags) -> Result<Connection, String> {
+        let state = self.sidecar.bound_state()?;
+        if state.path() != self.state_path {
+            return Err("fresh State path changed".into());
+        }
+        Connection::open_with_flags(&self.state_path, flags).map_err(|e| e.to_string())
+    }
+
+    fn read_state_admission_on(
+        &self,
+        state: &Connection,
+        request_id: &str,
+    ) -> Result<Option<FreshV30Session>, String> {
+        let row = state
+            .query_row(
+                "SELECT session_id,request_id,allocation_id,lane_id,source_generation
+             FROM fresh_lane_session_admission WHERE request_id=?1",
+                [request_id],
+                |r| {
+                    Ok(FreshV30Session {
+                        session_id: r.get(0)?,
+                        request_id: r.get(1)?,
+                        allocation_id: r.get(2)?,
+                        lane_id: r.get(3)?,
+                        source_generation: r.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if let Some(ref session) = row {
+            let suffix = session
+                .session_id
+                .strip_prefix(&format!("v30:{}:", self.identity.lane_id))
+                .ok_or("fresh State session ID has wrong lane")?;
+            for id in [&session.request_id, &session.allocation_id, suffix] {
+                let parsed =
+                    Uuid::parse_str(id).map_err(|_| "fresh State admission UUID invalid")?;
+                if parsed.is_nil() || parsed.to_string() != *id {
+                    return Err("fresh State admission UUID is noncanonical or nil".into());
+                }
+            }
+            if session.request_id != request_id
+                || session.lane_id != self.identity.lane_id
+                || session.source_generation != self.identity.source_generation
+            {
+                return Err("fresh State admission has wrong request or generation".into());
+            }
+        }
+        Ok(row)
     }
 
     /// Routing prerequisite for a later v30 resume, wake, recipient or ACK
@@ -399,6 +501,14 @@ impl FreshV30Lane {
             .map_err(|e| e.to_string())?;
         if !exists {
             return Err("session was not allocated by this lane".into());
+        }
+        let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        if self
+            .read_state_admission_on(&state, &session.request_id)?
+            .as_ref()
+            != Some(session)
+        {
+            return Err("session lacks exact fresh State admission".into());
         }
         Ok(())
     }
