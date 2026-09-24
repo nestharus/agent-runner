@@ -168,6 +168,31 @@ pub struct BrokerSourceMaterial {
     pub registration_bytes: Vec<u8>,
 }
 
+/// Exact root-only evidence file seal. The broker verifies the physical and
+/// original bytes before constructing this; State pins it to the consumed
+/// grant and source at the SQLite fence.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BrokerSourceEvidenceSeal {
+    pub manifest_sha256: String,
+    pub manifest_device: u64,
+    pub manifest_inode: u64,
+    pub manifest_byte_len: u64,
+    pub snapshot_sha256: String,
+    pub outcome_sha256: String,
+    pub recovery_stdout_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrokerSourceEvidenceReadback {
+    pub grant_id: String,
+    pub source_generation: String,
+    pub registration_id: String,
+    pub seal: Option<BrokerSourceEvidenceSeal>,
+    pub phase: String,
+    pub revision: i64,
+}
+
 fn consume_source_grant_row(
     conn: &Connection,
     material: &BrokerSourceMaterial,
@@ -854,6 +879,203 @@ impl BrokerSidecar {
         }
         self.check_mailbox_read(&physical_grant.source_generation)?;
         Ok(binding)
+    }
+
+    pub fn read_source_evidence(
+        &self,
+        grant: &BrokerSourceEffectGrant,
+    ) -> Result<Option<BrokerSourceEvidenceReadback>, String> {
+        self.check_mailbox_read(&grant.source_generation)?;
+        let row: Option<(String, String, String, Option<String>, String, i64)> = self
+            .mailbox
+            .conn
+            .query_row(
+                "SELECT grant_id,source_generation,registration_id,seal_json,phase,revision
+                 FROM broker_source_evidence WHERE grant_id=?1",
+                [&grant.grant_id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        row.map(
+            |(grant_id, generation, registration_id, json, phase, revision)| {
+                if grant_id != grant.grant_id
+                    || generation != grant.source_generation
+                    || registration_id != grant.candidate.registration_id
+                    || !matches!(
+                        (phase.as_str(), revision),
+                        ("unknown", 1) | ("captured", 1) | ("accepted", 2)
+                    )
+                    || (phase == "unknown") != json.is_none()
+                {
+                    return Err("broker source evidence row changed".into());
+                }
+                let seal = json
+                    .map(|value| serde_json::from_str(&value).map_err(|e| e.to_string()))
+                    .transpose()?;
+                Ok(BrokerSourceEvidenceReadback {
+                    grant_id,
+                    source_generation: generation,
+                    registration_id,
+                    seal,
+                    phase,
+                    revision,
+                })
+            },
+        )
+        .transpose()
+    }
+
+    /// A failed capture or lost reply must leave one durable unknown row. The
+    /// consumed one-use grant remains debt even if this second write fails.
+    pub fn retain_unknown_source_evidence(
+        &mut self,
+        grant: &BrokerSourceEffectGrant,
+    ) -> Result<BrokerSourceEvidenceReadback, String> {
+        self.check_mailbox_read(&grant.source_generation)?;
+        if grant.phase != "consumed" || grant.revision != 2 {
+            return Err("unknown evidence requires consumed source grant".into());
+        }
+        self.mailbox
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO broker_source_evidence
+             (grant_id,source_generation,registration_id,seal_json,phase,revision)
+             SELECT grant_id,source_generation,registration_id,NULL,'unknown',1
+             FROM broker_source_effect_grant
+             WHERE grant_id=?1 AND source_generation=?2 AND registration_id=?3
+               AND phase='consumed' AND revision=2",
+                params![
+                    grant.grant_id,
+                    grant.source_generation,
+                    grant.candidate.registration_id
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        self.read_source_evidence(grant)?
+            .ok_or("unknown source evidence readback absent".into())
+    }
+
+    /// Pin an already fsynced root-only snapshot. A duplicate capture cannot
+    /// replace its seal, and unknown debt cannot be upgraded by retry.
+    pub fn record_source_evidence_snapshot(
+        &mut self,
+        grant: &BrokerSourceEffectGrant,
+        seal: &BrokerSourceEvidenceSeal,
+    ) -> Result<BrokerSourceEvidenceReadback, String> {
+        let binding = self.read_consumed_source_candidate(grant)?;
+        if seal.manifest_inode == 0
+            || seal.manifest_byte_len == 0
+            || seal.manifest_byte_len > 32 * 1024 * 1024
+            || [
+                &seal.manifest_sha256,
+                &seal.snapshot_sha256,
+                &seal.outcome_sha256,
+                &seal.recovery_stdout_sha256,
+            ]
+            .into_iter()
+            .any(|value| !crate::completion_continuation::is_sha256(value))
+            || binding.registration()?.registration_id != grant.candidate.registration_id
+        {
+            return Err("invalid broker source evidence seal".into());
+        }
+        let json = serde_json::to_string(seal).map_err(|e| e.to_string())?;
+        let changed = self
+            .mailbox
+            .conn
+            .execute(
+                "INSERT INTO broker_source_evidence
+             (grant_id,source_generation,registration_id,seal_json,phase,revision)
+             SELECT grant_id,source_generation,registration_id,?4,'captured',1
+             FROM broker_source_effect_grant
+             WHERE grant_id=?1 AND source_generation=?2 AND registration_id=?3
+               AND phase='consumed' AND revision=2",
+                params![
+                    grant.grant_id,
+                    grant.source_generation,
+                    grant.candidate.registration_id,
+                    json
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        if changed != 1 {
+            return Err("consumed source evidence capture CAS failed".into());
+        }
+        let readback = self
+            .read_source_evidence(grant)?
+            .ok_or("captured source evidence readback absent")?;
+        if readback.phase != "captured"
+            || readback.revision != 1
+            || readback.seal.as_ref() != Some(seal)
+        {
+            return Err("captured source evidence readback conflict".into());
+        }
+        Ok(readback)
+    }
+
+    /// Exact positive fence, intentionally closed until the fresh v30 lane
+    /// writes an independently broker-authenticated admission provenance row.
+    /// Old v29 re-admission, physical zero exit, and a matching hash cannot
+    /// populate that row. This transition does not release or notify.
+    pub fn commit_source_evidence_acceptance(
+        &mut self,
+        grant: &BrokerSourceEffectGrant,
+        seal: &BrokerSourceEvidenceSeal,
+    ) -> Result<BrokerSourceEvidenceReadback, String> {
+        let binding = self.read_consumed_source_candidate(grant)?;
+        let before = self
+            .read_source_evidence(grant)?
+            .ok_or("captured source evidence absent")?;
+        if before.phase != "captured" || before.revision != 1 || before.seal.as_ref() != Some(seal)
+        {
+            return Err("source evidence commit seal changed".into());
+        }
+        let changed = self
+            .mailbox
+            .conn
+            .execute(
+                "UPDATE broker_source_evidence SET phase='accepted',revision=2
+             WHERE grant_id=?1 AND source_generation=?2 AND registration_id=?3
+               AND seal_json=?4 AND phase='captured' AND revision=1
+               AND EXISTS (
+                 SELECT 1 FROM broker_source_effect_grant g
+                 WHERE g.grant_id=?1 AND g.source_generation=?2
+                   AND g.registration_id=?3 AND g.phase='consumed' AND g.revision=2)
+               AND EXISTS (
+                 SELECT 1 FROM broker_fresh_source_admission a
+                 WHERE a.registration_id=?3 AND a.source_generation=?2
+                   AND a.registration_digest=?5 AND a.state_admission_id=?6)",
+                params![
+                    grant.grant_id,
+                    grant.source_generation,
+                    grant.candidate.registration_id,
+                    serde_json::to_string(seal).map_err(|e| e.to_string())?,
+                    binding.registration_digest(),
+                    binding.caller_admission_id(),
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        if changed != 1 {
+            return Err(
+                "fresh v30 source admission authority absent or source commit changed".into(),
+            );
+        }
+        let after = self
+            .read_source_evidence(grant)?
+            .ok_or("accepted source evidence readback absent")?;
+        if after.phase != "accepted" || after.revision != 2 || after.seal.as_ref() != Some(seal) {
+            return Err("accepted source evidence readback conflict".into());
+        }
+        Ok(after)
     }
 
     /// One conditional irreversible transition. A lost reply cannot consume
@@ -2232,6 +2454,12 @@ fn activate_with_owner(path: &Path, owner: u32, anchor: &Path) -> Result<String,
         schema::BROKER_PREPARED_OWNER_RETAIN,
         schema::BROKER_OWNER_RELEASE_SCHEMA,
         schema::BROKER_SOURCE_EFFECT_GRANT_SCHEMA,
+        schema::BROKER_SOURCE_EVIDENCE_SCHEMA,
+        schema::BROKER_FRESH_SOURCE_ADMISSION_SCHEMA,
+        schema::BROKER_SOURCE_EVIDENCE_UPDATE_GUARD,
+        schema::BROKER_SOURCE_EVIDENCE_RETAIN,
+        schema::BROKER_FRESH_SOURCE_ADMISSION_IMMUTABLE,
+        schema::BROKER_FRESH_SOURCE_ADMISSION_RETAIN,
         schema::BROKER_OWNER_RELEASE_IMMUTABLE,
         schema::BROKER_OWNER_RELEASE_RETAIN,
         schema::BROKER_OWNER_RELEASE_EXACT,

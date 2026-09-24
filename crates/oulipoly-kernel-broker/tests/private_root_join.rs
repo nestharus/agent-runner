@@ -48,6 +48,7 @@ fn inner() {
     let normal_mode = mode.starts_with("normal_");
     let real_source = mode.starts_with("normal_bash_source");
     let nonzero_source = mode == "normal_bash_source_nonzero";
+    let io_failure_source = mode == "normal_bash_source_capture_io_failure";
     let runner =
         std::env::var("OULIPOLY_AGE319_RUNNER_IMAGE").expect("built Runner image required");
     let temp = tempfile::tempdir().unwrap();
@@ -564,7 +565,7 @@ fn inner() {
                     assert!(matches!(observation, SourceObservation::Drained {
                         worker_wait_status, cancel_requested: false, ..
                     } if (worker_wait_status == 0) != nonzero_source));
-                    let retained = BrokerSidecar::open_existing(
+                    let mut retained = BrokerSidecar::open_existing(
                         &broker_state.join("sidecar/pid-identity.db"),
                         &broker_state,
                     )
@@ -577,7 +578,38 @@ fn inner() {
                             )
                             .is_err()
                         );
+                        assert!(oulipoly_kernel_broker::source_acceptance::capture_and_stage_v2_evidence(
+                            &mut retained, &custody, &grant_id
+                        ).is_err());
+                        assert_eq!(
+                            retained
+                                .read_source_evidence(&custody.records()[0].grant)
+                                .unwrap()
+                                .unwrap()
+                                .phase,
+                            "unknown"
+                        );
                         drop(damaged_snapshot.take().unwrap());
+                    } else if io_failure_source {
+                        use std::os::unix::fs::OpenOptionsExt;
+                        let evidence_path = physical.join(format!("{grant_id}.evidence.json"));
+                        std::fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .mode(0o600)
+                            .open(&evidence_path)
+                            .unwrap();
+                        assert!(oulipoly_kernel_broker::source_acceptance::capture_and_stage_v2_evidence(
+                            &mut retained, &custody, &grant_id
+                        ).is_err(), "create-new evidence write must fail closed");
+                        assert_eq!(
+                            retained
+                                .read_source_evidence(&custody.records()[0].grant)
+                                .unwrap()
+                                .unwrap()
+                                .phase,
+                            "unknown"
+                        );
                     } else {
                         let assessed =
                             oulipoly_kernel_broker::source_acceptance::assess_v2_candidate(
@@ -592,6 +624,31 @@ fn inner() {
                                 .registration()
                                 .unwrap()
                                 .registration_id
+                        );
+                        let captured =
+                            oulipoly_kernel_broker::source_acceptance::capture_and_stage_v2_evidence(
+                                &mut retained, &custody, &grant_id
+                            ).unwrap();
+                        assert_eq!(captured.candidate, assessed);
+                        assert_eq!(
+                            retained
+                                .read_source_evidence(&custody.records()[0].grant)
+                                .unwrap()
+                                .unwrap()
+                                .phase,
+                            "captured"
+                        );
+                        assert!(oulipoly_kernel_broker::source_acceptance::capture_and_stage_v2_evidence(
+                            &mut retained, &custody, &grant_id
+                        ).is_err(), "duplicate capture cannot replace broker-owned bytes");
+                        assert!(
+                            oulipoly_kernel_broker::source_acceptance::commit_v2_evidence(
+                                &mut retained,
+                                &custody,
+                                &grant_id
+                            )
+                            .is_err(),
+                            "re-admitted old v29 source has no fresh v30 authority"
                         );
                         let reply: serde_json::Value = serde_json::from_slice(
                             &fs::read(physical.join(format!("{grant_id}.stdout"))).unwrap(),
@@ -620,6 +677,13 @@ fn inner() {
                             .is_err(),
                             "changed original snapshot must not pass broker candidate assessment"
                         );
+                        assert!(
+                            oulipoly_kernel_broker::source_acceptance::read_captured_v2_evidence(
+                                &retained, &custody, &grant_id
+                            )
+                            .is_err(),
+                            "changed original snapshot must fail captured readback"
+                        );
                         fs::write(&snapshot, original).unwrap();
                         assert_eq!(
                             oulipoly_kernel_broker::source_acceptance::assess_v2_candidate(
@@ -627,6 +691,33 @@ fn inner() {
                             )
                             .unwrap(),
                             assessed
+                        );
+                        assert_eq!(
+                            oulipoly_kernel_broker::source_acceptance::read_captured_v2_evidence(
+                                &retained, &custody, &grant_id
+                            )
+                            .unwrap(),
+                            captured
+                        );
+                        let evidence_path = physical.join(format!("{grant_id}.evidence.json"));
+                        let owned_bytes = fs::read(&evidence_path).unwrap();
+                        let mut damaged = owned_bytes.clone();
+                        damaged.push(b' ');
+                        fs::write(&evidence_path, &damaged).unwrap();
+                        assert!(
+                            oulipoly_kernel_broker::source_acceptance::read_captured_v2_evidence(
+                                &retained, &custody, &grant_id
+                            )
+                            .is_err(),
+                            "same-inode mutation of broker evidence must fail"
+                        );
+                        fs::write(&evidence_path, owned_bytes).unwrap();
+                        assert_eq!(
+                            oulipoly_kernel_broker::source_acceptance::read_captured_v2_evidence(
+                                &retained, &custody, &grant_id
+                            )
+                            .unwrap(),
+                            captured
                         );
                     }
                     assert_eq!(
@@ -653,7 +744,7 @@ fn inner() {
                                         .ends_with(".terminal.json")
                             )
                             .count(),
-                        1
+                        if nonzero_source { 1 } else { 2 }
                     );
                 }
             }
@@ -735,6 +826,23 @@ fn inner() {
                 .unwrap();
             assert_eq!(grant, ("consumed".into(), 2, 1));
             let grant_id = fs::read_to_string(gate.join("source-grant-ready")).unwrap();
+            let registration_id = pending_binding
+                .as_ref()
+                .unwrap()
+                .registration()
+                .unwrap()
+                .registration_id;
+            let source_phase: String = retained
+                .query_row(
+                    "SELECT phase FROM completion_continuation_source WHERE registration_id=?1",
+                    [&registration_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                source_phase, "registered",
+                "evidence debt must not release the source"
+            );
             assert!(matches!(
                 SourcePhysicalRegistry::open(broker_state.join("source-physical"))
                     .unwrap()
@@ -742,6 +850,33 @@ fn inner() {
                     .unwrap(),
                 SourceObservation::Drained { .. }
             ));
+            let reopened = BrokerSidecar::open_existing(
+                &broker_state.join("sidecar/pid-identity.db"),
+                &broker_state,
+            )
+            .unwrap();
+            let physical =
+                SourcePhysicalRegistry::open(broker_state.join("source-physical")).unwrap();
+            let debt = reopened
+                .read_source_evidence(&physical.records()[0].grant)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                debt.phase,
+                if nonzero_source || io_failure_source {
+                    "unknown"
+                } else {
+                    "captured"
+                }
+            );
+            if !nonzero_source && !io_failure_source {
+                assert!(
+                    oulipoly_kernel_broker::source_acceptance::read_captured_v2_evidence(
+                        &reopened, &physical, &grant_id
+                    )
+                    .is_ok()
+                );
+            }
         }
         stop(&mut restarted);
         unsafe { libc::kill(prepared.root_init.host_pid, libc::SIGKILL) };
@@ -1658,7 +1793,10 @@ fn genuine_bash_source_v30_is_one_use_and_not_accepted_without_commit_custody() 
     };
     assert!(matches!(
         mode.as_str(),
-        "normal_bash_source" | "normal_bash_source_lost_reply" | "normal_bash_source_nonzero"
+        "normal_bash_source"
+            | "normal_bash_source_lost_reply"
+            | "normal_bash_source_nonzero"
+            | "normal_bash_source_capture_io_failure"
     ));
     assert!(std::env::var_os("OULIPOLY_AGE319_RUNNER_IMAGE").is_some());
     assert!(std::env::var_os("AGE319_PRIVATE_BASH_REGISTRATION").is_some());

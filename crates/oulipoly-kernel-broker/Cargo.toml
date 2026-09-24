@@ -12,6 +12,7 @@ name = "oulipoly-kernel-broker"
 path = "src/main.rs"
 
 [dependencies]
+base64 = "0.22"
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true

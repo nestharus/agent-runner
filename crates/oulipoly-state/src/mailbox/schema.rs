@@ -751,9 +751,43 @@ pub(super) fn validate_broker_owned(conn: &Connection) -> Result<String, String>
         return Err("broker source grant schema changed".into());
     }
     for (name, expected) in [
+        ("broker_source_evidence", BROKER_SOURCE_EVIDENCE_SCHEMA),
+        (
+            "broker_fresh_source_admission",
+            BROKER_FRESH_SOURCE_ADMISSION_SCHEMA,
+        ),
+    ] {
+        let actual: String = tx
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                [name],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("broker source evidence schema missing: {error}"))?;
+        if actual != expected {
+            return Err("broker source evidence schema changed".into());
+        }
+    }
+    for (name, expected) in [
         (
             "broker_prepared_owner_immutable",
             BROKER_PREPARED_OWNER_IMMUTABLE,
+        ),
+        (
+            "broker_source_evidence_update_guard",
+            BROKER_SOURCE_EVIDENCE_UPDATE_GUARD,
+        ),
+        (
+            "broker_source_evidence_retain",
+            BROKER_SOURCE_EVIDENCE_RETAIN,
+        ),
+        (
+            "broker_fresh_source_admission_immutable",
+            BROKER_FRESH_SOURCE_ADMISSION_IMMUTABLE,
+        ),
+        (
+            "broker_fresh_source_admission_retain",
+            BROKER_FRESH_SOURCE_ADMISSION_RETAIN,
         ),
         ("broker_prepared_owner_retain", BROKER_PREPARED_OWNER_RETAIN),
         (
@@ -882,6 +916,46 @@ pub(super) const BROKER_SOURCE_EFFECT_GRANT_SCHEMA: &str =
     phase TEXT NOT NULL CHECK(phase IN ('reserved','consumed','unknown')),
     revision INTEGER NOT NULL CHECK(revision>=1)
 )";
+
+// An evidence row remains debt until an exact fresh-lane source admission is
+// present. This branch deliberately has no writer for that provenance table:
+// old v29 re-admission fixtures may capture physical evidence, never accept.
+pub(super) const BROKER_SOURCE_EVIDENCE_SCHEMA: &str = "CREATE TABLE broker_source_evidence (
+    grant_id TEXT PRIMARY KEY REFERENCES broker_source_effect_grant(grant_id),
+    source_generation TEXT NOT NULL,
+    registration_id TEXT NOT NULL UNIQUE,
+    seal_json TEXT,
+    phase TEXT NOT NULL CHECK(phase IN ('unknown','captured','accepted')),
+    revision INTEGER NOT NULL CHECK(revision>=1)
+)";
+
+pub(super) const BROKER_FRESH_SOURCE_ADMISSION_SCHEMA: &str =
+    "CREATE TABLE broker_fresh_source_admission (
+    registration_id TEXT PRIMARY KEY,
+    source_generation TEXT NOT NULL,
+    state_admission_id TEXT NOT NULL,
+    registration_digest TEXT NOT NULL
+)";
+
+pub(super) const BROKER_SOURCE_EVIDENCE_UPDATE_GUARD: &str =
+    "CREATE TRIGGER broker_source_evidence_update_guard
+BEFORE UPDATE ON broker_source_evidence
+WHEN OLD.phase!='captured' OR NEW.phase!='accepted' OR OLD.revision!=1 OR NEW.revision!=2
+ OR NEW.grant_id!=OLD.grant_id OR NEW.source_generation!=OLD.source_generation
+ OR NEW.registration_id!=OLD.registration_id OR NEW.seal_json!=OLD.seal_json
+BEGIN SELECT RAISE(ABORT,'source evidence is immutable'); END";
+pub(super) const BROKER_SOURCE_EVIDENCE_RETAIN: &str =
+    "CREATE TRIGGER broker_source_evidence_retain
+BEFORE DELETE ON broker_source_evidence
+BEGIN SELECT RAISE(ABORT,'source evidence debt must be retained'); END";
+pub(super) const BROKER_FRESH_SOURCE_ADMISSION_IMMUTABLE: &str =
+    "CREATE TRIGGER broker_fresh_source_admission_immutable
+BEFORE UPDATE ON broker_fresh_source_admission
+BEGIN SELECT RAISE(ABORT,'fresh source admission is immutable'); END";
+pub(super) const BROKER_FRESH_SOURCE_ADMISSION_RETAIN: &str =
+    "CREATE TRIGGER broker_fresh_source_admission_retain
+BEFORE DELETE ON broker_fresh_source_admission
+BEGIN SELECT RAISE(ABORT,'fresh source admission must be retained'); END";
 
 pub(super) const BROKER_OWNER_RELEASE_IMMUTABLE: &str =
     "CREATE TRIGGER broker_owner_release_immutable

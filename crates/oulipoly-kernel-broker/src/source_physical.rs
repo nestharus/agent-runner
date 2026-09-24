@@ -349,6 +349,8 @@ impl SourcePhysicalRegistry {
                 ".cancel.json",
                 ".stdout",
                 ".stderr",
+                ".evidence.json",
+                ".evidence-artifact",
             ]
             .into_iter()
             .find_map(|suffix| filename.strip_suffix(suffix))
@@ -393,6 +395,22 @@ impl SourcePhysicalRegistry {
 
     pub fn records(&self) -> &[SourcePhysicalRecord] {
         &self.records
+    }
+
+    /// Only fixed, broker-owned witness names are exposed to the source
+    /// assessor. A caller cannot select a path outside this root-only store.
+    pub fn evidence_path(&self, grant_id: &str, suffix: &str) -> io::Result<PathBuf> {
+        if !matches!(suffix, "evidence.json" | "evidence-artifact") {
+            return Err(io::Error::other("invalid source evidence kind"));
+        }
+        Ok(self.directory.join(name(grant_id, suffix)?))
+    }
+
+    pub fn read_witness(&self, grant_id: &str, suffix: &str, limit: u64) -> io::Result<Vec<u8>> {
+        if !matches!(suffix, "json" | "terminal.json" | "evidence.json") {
+            return Err(io::Error::other("invalid source witness kind"));
+        }
+        exact_bytes(&self.directory, grant_id, suffix, limit)
     }
 
     /// Open the broker-owned captured reply only after complete physical

@@ -19,6 +19,7 @@ use oulipoly_kernel_broker::protocol::{
     StateWriteSpec,
 };
 use oulipoly_kernel_broker::registry::RootRegistry;
+use oulipoly_kernel_broker::source_acceptance::capture_and_stage_v2_evidence;
 use oulipoly_kernel_broker::source_physical::{SourceObservation, SourcePhysicalRegistry};
 use oulipoly_kernel_broker::work_registry::{Scope, WorkRegistry, classify_scope};
 use oulipoly_state::mailbox::{
@@ -2308,6 +2309,47 @@ fn serve() -> io::Result<()> {
                 eprintln!("source physical debt {}: {error}", record.grant.grant_id);
             }
             _ => {}
+        }
+    }
+    // After a broker restart, a drained one-use source can be captured from
+    // retained State and the prior physical record. Never mint another W or
+    // infer source acceptance from zero exit. Failed capture becomes debt.
+    if let Some(sidecar) = broker_sidecar.as_mut() {
+        let grants: Vec<_> = source_physical
+            .records()
+            .iter()
+            .map(|r| r.grant.clone())
+            .collect();
+        for grant in grants {
+            match sidecar.read_source_evidence(&grant) {
+                Ok(Some(_)) => {}
+                Ok(None) => match source_physical.observe(&grant.grant_id) {
+                    Ok(SourceObservation::Drained { .. }) => {
+                        if let Err(error) = capture_and_stage_v2_evidence(
+                            sidecar,
+                            &source_physical,
+                            &grant.grant_id,
+                        ) {
+                            eprintln!("source evidence debt {}: {error}", grant.grant_id);
+                        }
+                    }
+                    Ok(SourceObservation::Unknown { .. }) | Err(_) => {
+                        if let Err(error) = sidecar.retain_unknown_source_evidence(&grant) {
+                            eprintln!(
+                                "source evidence unknown-debt readback failed {}: {error}",
+                                grant.grant_id
+                            );
+                        }
+                    }
+                    _ => {}
+                },
+                Err(error) => {
+                    eprintln!(
+                        "source evidence readback failed {}: {error}",
+                        grant.grant_id
+                    );
+                }
+            }
         }
     }
     let host_namespace = host_proc_file("self/ns/pid")?;
