@@ -492,6 +492,8 @@ struct RouteDecision {
     binding: Binding,
     total: usize,
     pin: Option<String>,
+    #[serde(default)]
+    sequence: u64,
     selection: FreshRouteSelection,
 }
 
@@ -747,7 +749,7 @@ fn reusable_quota_source(
         .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
         .collect::<io::Result<Vec<_>>>()?;
     names.sort();
-    let mut fresh = None;
+    let mut latest = None;
     let mut unresolved = None;
     for name in names {
         if !name.ends_with("-quota-first") && !name.ends_with("-quota-retry") {
@@ -769,24 +771,31 @@ fn reusable_quota_source(
             continue;
         }
         let readback = effect_readback_from_dir(&source_dir, &intent)?;
-        if readback.state == "drained" && readback.outcome.as_deref() == Some("valid_windows") {
-            let after_marker = match marker_q {
-                Some(marker_q) => effect_physical_q_nanos(&source_dir, &intent)? > marker_q,
-                None => true,
-            };
-            if quota_remaining(&readback, Utc::now().timestamp())?.is_some() && after_marker {
-                if fresh
-                    .as_ref()
-                    .is_none_or(|(_, _, prior_time)| readback.completed_unix_seconds > *prior_time)
-                {
-                    fresh = Some((name, intent, readback.completed_unix_seconds));
-                }
-            }
-        } else if readback.state != "drained" && unresolved.is_none() {
+        if readback.state != "drained" && unresolved.is_none() {
             unresolved = Some((name, intent));
+        } else if readback.state == "drained" {
+            let q = effect_physical_q_nanos(&source_dir, &intent)?;
+            if latest.as_ref().is_none_or(|(_, _, prior_q)| q > *prior_q) {
+                latest = Some((name, intent, q));
+            }
         }
     }
-    Ok(unresolved.or_else(|| fresh.map(|(name, intent, _)| (name, intent))))
+    if unresolved.is_some() {
+        return Ok(unresolved);
+    }
+    let Some((name, intent, q)) = latest else {
+        return Ok(None);
+    };
+    let source_dir = parent.join(&name);
+    let readback = effect_readback_from_dir(&source_dir, &intent)?;
+    if readback.outcome.as_deref() == Some("valid_windows")
+        && quota_read_is_fresh(&readback, Utc::now().timestamp())?
+        && marker_q.is_none_or(|marker| q > marker)
+    {
+        Ok(Some((name, intent)))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Serialize the scan and durable auth intent across broker threads and
@@ -1014,12 +1023,16 @@ fn effect_readback_from_dir(
 struct RawEffectWindow {
     used_percent: f64,
     resets_at: String,
+    #[serde(default)]
+    remaining: Option<u64>,
 }
 #[derive(Deserialize)]
 struct RawEffectOutput {
     windows: Option<Vec<RawEffectWindow>>,
     used_percent: Option<f64>,
     resets_at: Option<String>,
+    #[serde(default)]
+    remaining: Option<u64>,
 }
 
 fn parse_effect_windows(raw: &str) -> io::Result<Vec<FreshQuotaWindow>> {
@@ -1034,6 +1047,7 @@ fn parse_effect_windows(raw: &str) -> io::Result<Vec<FreshQuotaWindow>> {
             resets_at: value
                 .resets_at
                 .ok_or_else(|| io::Error::other("quota resets_at absent"))?,
+            remaining: value.remaining,
         }]
     };
     windows
@@ -1048,6 +1062,7 @@ fn parse_effect_windows(raw: &str) -> io::Result<Vec<FreshQuotaWindow>> {
             Ok(FreshQuotaWindow {
                 used_percent: window.used_percent,
                 resets_at: window.resets_at,
+                remaining: window.remaining,
             })
         })
         .collect()
@@ -1324,6 +1339,7 @@ enum TerminalOutcome {
     Cancelled,
     Unknown,
     QuotaRejected,
+    ModelAtCapacity,
     MaybeQuota,
     AuthRejected,
     ProviderUnavailable,
@@ -1335,17 +1351,12 @@ impl TerminalOutcome {
     fn is_marker(self) -> bool {
         !matches!(
             self,
-            Self::Clean | Self::GenericFailure | Self::Cancelled | Self::Unknown
+            Self::Clean
+                | Self::GenericFailure
+                | Self::Cancelled
+                | Self::Unknown
+                | Self::ModelAtCapacity
         )
-    }
-
-    fn release_after(self) -> Option<Duration> {
-        match self {
-            Self::ProviderUnavailable => Some(Duration::from_secs(5 * 60)),
-            Self::StorageContention => Some(Duration::from_secs(2 * 60)),
-            Self::RateLimited => Some(Duration::from_secs(60)),
-            _ => None,
-        }
     }
 }
 
@@ -1372,10 +1383,17 @@ fn file_unix_nanos(path: &Path) -> io::Result<u128> {
 
 fn classify_terminal_outcome(
     kind: TerminalSignalKind,
+    stdout: &[u8],
     stderr: &[u8],
     status: i32,
     cancelled: bool,
 ) -> TerminalOutcome {
+    if [stdout, stderr]
+        .iter()
+        .any(|stream| structured_model_capacity(stream))
+    {
+        return TerminalOutcome::ModelAtCapacity;
+    }
     // A cleanup cancellation may drain adopted descendants after the provider
     // itself has already emitted a typed rejection. Keep that provider result.
     match kind {
@@ -1424,6 +1442,22 @@ fn classify_terminal_outcome(
     }
 }
 
+/// A structured provider error code is required. Free text such as "quota"
+/// in a model capacity explanation cannot turn this into account exhaustion.
+fn structured_model_capacity(stream: &[u8]) -> bool {
+    stream.split(|byte| *byte == b'\n').any(|line| {
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
+            return false;
+        };
+        if value.get("type").and_then(serde_json::Value::as_str) != Some("error") {
+            return false;
+        }
+        ["/error/code", "/error/data/code"].iter().any(|path| {
+            value.pointer(path).and_then(serde_json::Value::as_str) == Some("model_at_capacity")
+        })
+    })
+}
+
 fn terminal_record(
     directory: &Path,
     decision: &RouteDecision,
@@ -1459,7 +1493,13 @@ fn terminal_record(
         &stderr_bytes,
         status,
     );
-    let outcome = classify_terminal_outcome(signal.kind, &stderr_bytes, status, cancelled);
+    let outcome =
+        classify_terminal_outcome(signal.kind, &stdout_bytes, &stderr_bytes, status, cancelled);
+    let signal_kind = if outcome == TerminalOutcome::ModelAtCapacity {
+        "ModelAtCapacity".to_string()
+    } else {
+        format!("{:?}", signal.kind)
+    };
     let name = format!("{}.terminal.json", grant.id);
     if let Some(existing) = exact_file::<TerminalRecord>(directory, &name)? {
         if existing.version != 1
@@ -1467,7 +1507,7 @@ fn terminal_record(
             || existing.selection != decision.selection
             || existing.grant_id != grant.id
             || existing.physical_q_sha256 != q_sha
-            || existing.signal_kind != format!("{:?}", signal.kind)
+            || existing.signal_kind != signal_kind
             || existing.outcome != outcome
         {
             return Err(io::Error::other("fresh terminal ledger changed"));
@@ -1481,7 +1521,7 @@ fn terminal_record(
         grant_id: grant.id.clone(),
         physical_q_sha256: q_sha,
         physical_q_unix_nanos: file_unix_nanos(&q_path)?,
-        signal_kind: format!("{:?}", signal.kind),
+        signal_kind,
         outcome,
     };
     match durable_new(directory, &name, &record) {
@@ -1609,17 +1649,13 @@ fn file_age_less_than(path: &Path, window: Duration) -> io::Result<bool> {
         .is_ok_and(|age| age < window))
 }
 
-fn recent_failure_admitted(failures: u64, has_unsuppressed: bool, pinned: bool) -> bool {
-    pinned || !has_unsuppressed || failures < 3
-}
-
 fn candidate_quota(
     directory: &Path,
     binding: &Binding,
     candidate: &RouteCandidate,
-) -> io::Result<(Option<(u32, Option<u128>)>, Option<String>)> {
+) -> io::Result<(Option<(Option<u32>, Option<u128>)>, Option<String>)> {
     if candidate.quota_script.is_none() {
-        return Ok((Some((0, None)), None)); // no configured quota source, invocation fallback
+        return Ok((Some((None, None)), None)); // explicit unmetered account
     }
     let request = FreshAccountEffectRequest {
         d_key: String::new(),
@@ -1632,7 +1668,10 @@ fn candidate_quota(
     };
     let first_dir = effect_directory(directory, binding, &request);
     let Some(first_intent) = effect_intent(&first_dir)? else {
-        return Ok((None, None));
+        return Ok((
+            None,
+            Some(format!("quota effect absent: {}", first_dir.display())),
+        ));
     };
     if first_intent.version != 1
         || first_intent.binding != *binding
@@ -1685,7 +1724,7 @@ fn candidate_quota(
             )));
         }
         if auth.outcome.as_deref() != Some("refreshed") {
-            return Ok((None, None));
+            return Ok((None, Some(auth.artifact)));
         }
         let retry_dir = effect_directory(
             directory,
@@ -1696,7 +1735,7 @@ fn candidate_quota(
             },
         );
         let Some(retry_intent) = effect_intent(&retry_dir)? else {
-            return Ok((None, None));
+            return Ok((None, Some(retry_dir.display().to_string())));
         };
         if retry_intent.version != 1
             || retry_intent.binding != *binding
@@ -1716,18 +1755,65 @@ fn candidate_quota(
         return Ok((None, Some(result.artifact)));
     }
     if result.outcome.as_deref() != Some("valid_windows") || result.windows.is_empty() {
-        return Ok((None, None));
+        return Ok((None, Some(result.artifact)));
     }
-    let Some(remaining) = quota_remaining(&result, Utc::now().timestamp())? else {
+    let now = Utc::now().timestamp();
+    if !quota_read_is_fresh(&result, now)? {
+        return Ok((None, Some(format!("stale quota read: {}", result.artifact))));
+    }
+    let Some(remaining) = quota_remaining(&result, now)? else {
         return Ok((None, None));
     };
-    Ok((
-        Some((
-            remaining,
-            Some(effect_physical_q_nanos(&verified_dir, &verified_intent)?),
-        )),
-        None,
-    ))
+    let physical_q = effect_physical_q_nanos(&verified_dir, &verified_intent)?;
+    if let Some(artifact) = newer_quota_effect(directory, candidate, &verified_intent, physical_q)?
+    {
+        return Ok((None, Some(artifact)));
+    }
+    Ok((Some((Some(remaining), Some(physical_q))), None))
+}
+
+/// The source Q used by this root must still be the newest resolved account
+/// observation. A different root may begin a new K after this root created
+/// its reuse receipt; that unresolved effect blocks selection and the pre-K
+/// recheck rather than allowing the older healthy reading through.
+fn newer_quota_effect(
+    directory: &Path,
+    candidate: &RouteCandidate,
+    source: &AccountEffectIntent,
+    source_q: u128,
+) -> io::Result<Option<String>> {
+    for entry in std::fs::read_dir(directory.join("account-effects"))? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.ends_with("-quota-first") && !name.ends_with("-quota-retry") {
+            continue;
+        }
+        let dir = entry.path();
+        let Some(intent) = effect_intent(&dir)? else {
+            continue;
+        };
+        if intent.request.model != candidate.model
+            || intent.request.config_sha256 != candidate.config_sha256
+            || intent.request.account != candidate.account
+            || intent.request.index != candidate.index
+            || intent.environment_sha256 != source.environment_sha256
+            || dir.join("reuse.json").exists()
+        {
+            continue;
+        }
+        if intent.version != 1 {
+            return Err(io::Error::other("newer quota effect provenance changed"));
+        }
+        let readback = effect_readback_from_dir(&dir, &intent)?;
+        if readback.state != "drained" || effect_physical_q_nanos(&dir, &intent)? > source_q {
+            return Ok(Some(format!(
+                "newer or unresolved quota effect: {}",
+                dir.display()
+            )));
+        }
+    }
+    Ok(None)
 }
 
 /// Return the physical source Q time, never the time of a reused readback.
@@ -1915,26 +2001,15 @@ fn single_marker_allows_candidate(
     }
     let newer_healthy_quota = quota_q_nanos.is_some_and(|q| q > marker.physical_q_unix_nanos);
     match marker.outcome {
-        TerminalOutcome::QuotaRejected | TerminalOutcome::MaybeQuota => Ok(newer_healthy_quota),
+        TerminalOutcome::QuotaRejected => Ok(newer_healthy_quota),
         TerminalOutcome::AuthRejected => {
             auth_verified_after_marker(directory, binding, candidate, marker)
         }
-        TerminalOutcome::ProviderUnavailable
+        TerminalOutcome::ModelAtCapacity
+        | TerminalOutcome::MaybeQuota
+        | TerminalOutcome::ProviderUnavailable
         | TerminalOutcome::RateLimited
-        | TerminalOutcome::StorageContention => {
-            let release = marker
-                .outcome
-                .release_after()
-                .expect("availability interval");
-            let release_nanos = marker
-                .physical_q_unix_nanos
-                .saturating_add(release.as_nanos());
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(io::Error::other)?
-                .as_nanos();
-            Ok(newer_healthy_quota || now >= release_nanos)
-        }
+        | TerminalOutcome::StorageContention => Ok(true),
         TerminalOutcome::Clean
         | TerminalOutcome::GenericFailure
         | TerminalOutcome::Cancelled
@@ -1943,10 +2018,7 @@ fn single_marker_allows_candidate(
 }
 
 fn quota_remaining(result: &FreshAccountEffectReadback, now: i64) -> io::Result<Option<u32>> {
-    let completed = result
-        .completed_unix_seconds
-        .ok_or_else(|| io::Error::other("fresh quota completion time absent"))?;
-    if now < completed || now - completed >= 30 {
+    if !quota_read_is_fresh(result, now)? {
         return Ok(None);
     }
     let mut binding_remaining = u32::MAX;
@@ -1954,16 +2026,106 @@ fn quota_remaining(result: &FreshAccountEffectReadback, now: i64) -> io::Result<
         let reset = DateTime::parse_from_rfc3339(&window.resets_at)
             .map_err(io::Error::other)?
             .timestamp();
-        if reset <= now {
-            return Ok(None);
-        }
-        if window.used_percent >= 100.0 {
+        // A reset timestamp is evidence about the old window, not a fresh
+        // account reading. Wait for a new authoritative Q.
+        if reset <= now || window.used_percent >= 100.0 || window.remaining == Some(0) {
             return Ok(None);
         }
         binding_remaining =
             binding_remaining.min(((100.0 - window.used_percent) * 100.0).round() as u32);
     }
-    Ok(Some(binding_remaining))
+    Ok((!result.windows.is_empty()).then_some(binding_remaining))
+}
+
+const QUOTA_CACHE_TTL_SECONDS: i64 = 5 * 60 * 60;
+
+fn quota_read_is_fresh(result: &FreshAccountEffectReadback, now: i64) -> io::Result<bool> {
+    let completed = result
+        .completed_unix_seconds
+        .ok_or_else(|| io::Error::other("fresh quota completion time absent"))?;
+    if now < completed || now - completed >= QUOTA_CACHE_TTL_SECONDS || result.windows.is_empty() {
+        return Ok(false);
+    }
+    for window in &result.windows {
+        if DateTime::parse_from_rfc3339(&window.resets_at)
+            .map_err(io::Error::other)?
+            .timestamp()
+            <= now
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+const FRESH_ROUTE_POLICY_VERSION: &str = "fresh-quota-rr-ttl-v3";
+
+/// The fsynced decision files are the cursor. Serialize their scan and the
+/// next durable decision across broker threads and restarts, including roots
+/// that select before their provider K has begun.
+fn route_selection_lock(directory: &Path) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .open(directory.join("route-selection.lock"))?;
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(file);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+fn last_route_cursor(
+    directory: &Path,
+    model: &str,
+    config: &str,
+) -> io::Result<(u64, Option<usize>)> {
+    let mut last = (0, None);
+    let mut sequences = HashSet::new();
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".route-selection.json")
+        {
+            continue;
+        }
+        let decision: RouteDecision = serde_json::from_reader(File::open(entry.path())?)?;
+        if decision.selection.model != model || decision.selection.config_sha256 != config {
+            continue;
+        }
+        if decision.version != 1 || decision.selection.policy_version != FRESH_ROUTE_POLICY_VERSION
+        {
+            return Err(io::Error::other(
+                "fresh route cursor contains incompatible policy decision",
+            ));
+        }
+        if decision.pin.is_none() {
+            if decision.sequence == 0 || !sequences.insert(decision.sequence) {
+                return Err(io::Error::other(
+                    "fresh route cursor sequence missing or repeated",
+                ));
+            }
+            if decision.sequence > last.0 {
+                last = (decision.sequence, Some(decision.selection.index));
+            }
+        } else if decision.sequence != 0 {
+            return Err(io::Error::other("pinned route changed round-robin cursor"));
+        }
+    }
+    if u64::try_from(sequences.len()).ok() != Some(last.0) {
+        return Err(io::Error::other(
+            "fresh route cursor has a missing decision",
+        ));
+    }
+    Ok(last)
 }
 
 /// One fsynced choice for this held J. Selection has no provider effect.
@@ -1977,6 +2139,7 @@ pub(super) fn select_route(
     if request.account.is_some() || request.index.is_some() {
         return Err(io::Error::other("fresh route selection includes candidate"));
     }
+    let _cursor_lock = route_selection_lock(directory)?;
     let candidates = route_candidates(directory, binding, request)?;
     let name = decision_name(&binding.handoff_id);
     if let Some(existing) = exact_file::<RouteDecision>(directory, &name)? {
@@ -1986,7 +2149,7 @@ pub(super) fn select_route(
             || existing.pin != request.pin
             || existing.selection.model != request.model
             || existing.selection.config_sha256 != request.config_sha256
-            || existing.selection.policy_version != "fresh-account-effects-v2"
+            || existing.selection.policy_version != FRESH_ROUTE_POLICY_VERSION
             || !existing
                 .selection
                 .eligible_accounts
@@ -2026,65 +2189,46 @@ pub(super) fn select_route(
             "fresh quota effect unknown: {artifact}"
         )));
     }
-    let all_metered = eligible
-        .iter()
-        .all(|(candidate, _, _)| candidate.quota_script.is_some());
     let eligible_accounts: Vec<String> = eligible
         .iter()
         .map(|(candidate, _, _)| candidate.account.clone())
         .collect();
-    let observations = eligible;
-    let has_unsuppressed = observations.iter().any(|(candidate, _, (_, failures, _))| {
-        request
-            .pin
-            .as_deref()
-            .is_none_or(|pin| pin == candidate.account)
-            && *failures < 3
-    });
-    let mut best: Option<((u64, u32, u64, usize), FreshRouteSelection)> = None;
-    for (candidate, quota_remaining, (live, failures, invocations)) in observations {
-        if request
-            .pin
-            .as_deref()
-            .is_some_and(|pin| pin != candidate.account)
-            || !recent_failure_admitted(failures, has_unsuppressed, request.pin.is_some())
-        {
-            continue;
-        }
-        let score = (
-            live,
-            if all_metered && has_unsuppressed {
-                u32::MAX - quota_remaining
-            } else {
-                0
-            },
-            invocations.saturating_add(if !all_metered && has_unsuppressed {
-                failures.saturating_mul(10)
-            } else {
-                0
-            }),
-            candidate.index,
-        );
-        let selection = FreshRouteSelection {
-            model: candidate.model,
-            config_sha256: candidate.config_sha256,
-            account: candidate.account,
-            index: candidate.index,
-            plan_sha256: candidate.plan_sha256,
-            observed_live: live,
-            observed_failures: failures,
-            observed_invocations: invocations,
-            policy_version: "fresh-account-effects-v2".into(),
-            eligible_accounts: eligible_accounts.clone(),
-            quota_remaining_basis_points: candidate.quota_script.as_ref().map(|_| quota_remaining),
-        };
-        if best.as_ref().is_none_or(|(old, _)| score < *old) {
-            best = Some((score, selection));
-        }
-    }
-    let selection = best
-        .ok_or_else(|| io::Error::other("fresh route has no eligible account or pin"))?
-        .1;
+    let (previous_sequence, previous_index) =
+        last_route_cursor(directory, &request.model, &request.config_sha256)?;
+    let (candidate, quota_remaining, (live, failures, invocations)) = eligible
+        .into_iter()
+        .filter(|(candidate, _, _)| {
+            request
+                .pin
+                .as_deref()
+                .is_none_or(|pin| pin == candidate.account)
+        })
+        .min_by_key(|(candidate, _, _)| {
+            previous_index.map_or(candidate.index, |last| {
+                (candidate.index + request.total - (last + 1) % request.total) % request.total
+            })
+        })
+        .ok_or_else(|| io::Error::other("fresh route has no eligible account or pin"))?;
+    let sequence = if request.pin.is_some() {
+        0
+    } else {
+        previous_sequence
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("fresh route cursor overflow"))?
+    };
+    let selection = FreshRouteSelection {
+        model: candidate.model,
+        config_sha256: candidate.config_sha256,
+        account: candidate.account,
+        index: candidate.index,
+        plan_sha256: candidate.plan_sha256,
+        observed_live: live,
+        observed_failures: failures,
+        observed_invocations: invocations,
+        policy_version: FRESH_ROUTE_POLICY_VERSION.into(),
+        eligible_accounts: eligible_accounts.clone(),
+        quota_remaining_basis_points: quota_remaining,
+    };
     durable_new(
         directory,
         &name,
@@ -2093,6 +2237,7 @@ pub(super) fn select_route(
             binding: binding.clone(),
             total: request.total,
             pin: request.pin.clone(),
+            sequence,
             selection: selection.clone(),
         },
     )?;
@@ -2137,7 +2282,7 @@ pub(super) fn require_selected_plan(
     let (quota, unknown) = candidate_quota(directory, binding, &candidate)?;
     if unknown.is_some()
         || quota.is_none()
-        || candidate.quota_script.as_ref().map(|_| quota.unwrap().0)
+        || quota.and_then(|(remaining, _)| remaining)
             != decision.selection.quota_remaining_basis_points
         || !marker_allows_candidate(
             directory,
@@ -2915,7 +3060,7 @@ mod tests {
             observed_live: 0,
             observed_failures: 0,
             observed_invocations: 0,
-            policy_version: "fresh-account-effects-v2".into(),
+            policy_version: FRESH_ROUTE_POLICY_VERSION.into(),
             eligible_accounts: vec!["opencode-one".into(), "second".into()],
             quota_remaining_basis_points: Some(8000),
         };
@@ -2945,6 +3090,7 @@ mod tests {
             binding,
             total: 2,
             pin: None,
+            sequence: 1,
             selection,
         };
         let q_path = broker.join(format!("{}.drain.json", grant.id));
@@ -3089,12 +3235,13 @@ mod tests {
         let generic = provider.classify("first", b"", b"plain failure", 1 << 8);
         assert_eq!(generic.kind, TerminalSignalKind::NonzeroExit);
         assert_eq!(
-            classify_terminal_outcome(generic.kind, b"plain failure", 1 << 8, false),
+            classify_terminal_outcome(generic.kind, b"", b"plain failure", 1 << 8, false),
             TerminalOutcome::GenericFailure,
         );
         assert_eq!(
             classify_terminal_outcome(
                 generic.kind,
+                b"",
                 b"authentication failed: token expired",
                 1 << 8,
                 false
@@ -3104,6 +3251,7 @@ mod tests {
         assert_eq!(
             classify_terminal_outcome(
                 TerminalSignalKind::QuotaExhaustedInband,
+                b"",
                 b"quota exhausted",
                 0,
                 true
@@ -3111,11 +3259,11 @@ mod tests {
             TerminalOutcome::QuotaRejected,
         );
         assert_eq!(
-            classify_terminal_outcome(generic.kind, b"plain failure", 1 << 8, true),
+            classify_terminal_outcome(generic.kind, b"", b"plain failure", 1 << 8, true),
             TerminalOutcome::Cancelled,
         );
         assert_eq!(
-            classify_terminal_outcome(TerminalSignalKind::Unknown, b"", -1, false),
+            classify_terminal_outcome(TerminalSignalKind::Unknown, b"", b"", -1, false),
             TerminalOutcome::Unknown,
         );
         let contention = FreshTerminalRecognizer::OpenCode.classify(
@@ -3129,13 +3277,13 @@ mod tests {
             TerminalSignalKind::ProviderStorageContention
         );
         assert_eq!(
-            classify_terminal_outcome(contention.kind, b"", 0, false),
+            classify_terminal_outcome(contention.kind, b"", b"", 0, false),
             TerminalOutcome::StorageContention,
         );
     }
 
     #[test]
-    fn recent_failure_window_threshold_fallback_and_pin() {
+    fn recent_failure_observation_is_recorded_without_ranking() {
         let temp = tempfile::tempdir().unwrap();
         let receipt = temp.path().join("drain.json");
         let file = File::create(&receipt).unwrap();
@@ -3146,10 +3294,6 @@ mod tests {
         )
         .unwrap();
         assert!(!file_age_less_than(&receipt, Duration::from_secs(30 * 60)).unwrap());
-        assert!(recent_failure_admitted(2, true, false));
-        assert!(!recent_failure_admitted(3, true, false));
-        assert!(recent_failure_admitted(3, false, false));
-        assert!(recent_failure_admitted(3, true, true));
     }
 
     #[test]
@@ -3361,6 +3505,122 @@ mod tests {
         }
     }
 
+    fn register_unmetered_route(
+        directory: &Path,
+        binding: &Binding,
+        pin: Option<&str>,
+    ) -> FreshRouteRequest {
+        let config_sha256 = "c".repeat(64);
+        for (index, account) in ["first", "second", "third"].iter().enumerate() {
+            durable_new(
+                directory,
+                &candidate_name(&binding.handoff_id, index),
+                &RouteCandidate {
+                    version: 2,
+                    binding: binding.clone(),
+                    model: "fair".into(),
+                    config_sha256: config_sha256.clone(),
+                    account: (*account).into(),
+                    index,
+                    total: 3,
+                    pin: pin.map(str::to_owned),
+                    plan_sha256: format!("{index:064x}"),
+                    quota_script: None,
+                    auth_refresh_command: None,
+                    terminal_recognizer: FreshTerminalRecognizer::OpenCode,
+                },
+            )
+            .unwrap();
+        }
+        FreshRouteRequest {
+            d_key: uuid::Uuid::new_v4().to_string(),
+            model: "fair".into(),
+            config_sha256,
+            account: None,
+            index: None,
+            total: 3,
+            pin: pin.map(str::to_owned),
+            quota_script: None,
+            auth_refresh_command: None,
+        }
+    }
+
+    #[test]
+    fn unmetered_round_robin_is_durable_across_roots_restart_and_concurrent_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let process = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+        let roots: Vec<_> = (0..12)
+            .map(|_| fixture_binding(&process, &process))
+            .collect();
+        let requests: Vec<_> = roots
+            .iter()
+            .map(|binding| register_unmetered_route(temp.path(), binding, None))
+            .collect();
+        let directory = temp.path();
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = roots
+                .iter()
+                .zip(&requests)
+                .map(|(binding, request)| {
+                    scope.spawn(move || select_route(directory, binding, request).unwrap())
+                })
+                .collect();
+            for handle in handles {
+                let choice = handle.join().unwrap();
+                assert_eq!(choice.policy_version, FRESH_ROUTE_POLICY_VERSION);
+                assert_eq!(choice.quota_remaining_basis_points, None);
+            }
+        });
+        let mut by_sequence = Vec::new();
+        for binding in &roots {
+            let decision: RouteDecision =
+                exact_file(temp.path(), &decision_name(&binding.handoff_id))
+                    .unwrap()
+                    .unwrap();
+            by_sequence.push((decision.sequence, decision.selection.index));
+        }
+        by_sequence.sort();
+        assert_eq!(
+            by_sequence,
+            (1..=12)
+                .map(|sequence| (sequence, ((sequence - 1) % 3) as usize))
+                .collect::<Vec<_>>()
+        );
+
+        // A new broker incarnation reads the same fsynced selection files.
+        let pinned = fixture_binding(&process, &process);
+        let pinned_request = register_unmetered_route(temp.path(), &pinned, Some("third"));
+        assert_eq!(
+            select_route(temp.path(), &pinned, &pinned_request)
+                .unwrap()
+                .index,
+            2
+        );
+        let resumed = fixture_binding(&process, &process);
+        let request = register_unmetered_route(temp.path(), &resumed, None);
+        assert_eq!(
+            select_route(temp.path(), &resumed, &request).unwrap().index,
+            0
+        );
+        let decision: RouteDecision = exact_file(temp.path(), &decision_name(&resumed.handoff_id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(decision.sequence, 13);
+        std::fs::copy(
+            temp.path().join(decision_name(&resumed.handoff_id)),
+            temp.path().join("duplicate.route-selection.json"),
+        )
+        .unwrap();
+        let corrupt = fixture_binding(&process, &process);
+        let corrupt_request = register_unmetered_route(temp.path(), &corrupt, None);
+        assert!(
+            select_route(temp.path(), &corrupt, &corrupt_request)
+                .unwrap_err()
+                .to_string()
+                .contains("cursor sequence missing or repeated")
+        );
+    }
+
     #[test]
     fn unknown_historical_k_refuses_new_route_with_exact_artifacts() {
         let temp = tempfile::tempdir().unwrap();
@@ -3380,6 +3640,7 @@ mod tests {
                 binding: previous.clone(),
                 total: 1,
                 pin: None,
+                sequence: 1,
                 selection: FreshRouteSelection {
                     model: "model".into(),
                     config_sha256: "a".repeat(64),
@@ -3389,7 +3650,7 @@ mod tests {
                     observed_live: 0,
                     observed_failures: 0,
                     observed_invocations: 0,
-                    policy_version: "fresh-account-effects-v2".into(),
+                    policy_version: FRESH_ROUTE_POLICY_VERSION.into(),
                     eligible_accounts: vec!["first".into()],
                     quota_remaining_basis_points: None,
                 },
@@ -3600,6 +3861,7 @@ mod tests {
             windows: vec![FreshQuotaWindow {
                 used_percent: 25.0,
                 resets_at: "2099-01-01T00:00:00Z".into(),
+                remaining: None,
             }],
             completed_unix_seconds: Some(now),
             artifact: "/fresh/effect".into(),
@@ -3607,12 +3869,63 @@ mod tests {
             peer_artifact: None,
         };
         assert_eq!(quota_remaining(&result, now).unwrap(), Some(7500));
-        assert_eq!(quota_remaining(&result, now + 30).unwrap(), None);
+        assert_eq!(quota_remaining(&result, now + 30).unwrap(), Some(7500));
+        assert_eq!(
+            quota_remaining(&result, now + QUOTA_CACHE_TTL_SECONDS - 1).unwrap(),
+            Some(7500)
+        );
+        assert_eq!(
+            quota_remaining(&result, now + QUOTA_CACHE_TTL_SECONDS).unwrap(),
+            None
+        );
+        result.windows.push(FreshQuotaWindow {
+            used_percent: 100.0,
+            resets_at: "2099-01-01T00:00:00Z".into(),
+            remaining: None,
+        });
+        assert_eq!(quota_remaining(&result, now).unwrap(), None);
+        result.windows.pop();
+        result.windows[0].remaining = Some(0);
+        assert_eq!(quota_remaining(&result, now).unwrap(), None);
+        result.windows[0].remaining = None;
         result.windows[0].used_percent = 100.0;
         assert_eq!(quota_remaining(&result, now).unwrap(), None);
         result.windows[0].used_percent = 0.0;
         result.windows[0].resets_at = "2020-01-01T00:00:00Z".into();
         assert_eq!(quota_remaining(&result, now).unwrap(), None);
+        let parsed = parse_effect_windows(
+            r#"{"windows":[{"used_percent":12,"remaining":0,"resets_at":"2099-01-01T00:00:00Z"},{"used_percent":7,"resets_at":"2099-01-01T00:00:00Z"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed[0].remaining, Some(0));
+        result.windows = parsed;
+        assert_eq!(quota_remaining(&result, now).unwrap(), None);
+    }
+
+    #[test]
+    fn structured_model_capacity_never_becomes_account_quota_marker() {
+        let event = br#"{"type":"error","error":{"data":{"code":"model_at_capacity","message":"quota exhausted for this model"}}}"#;
+        assert_eq!(
+            classify_terminal_outcome(
+                TerminalSignalKind::QuotaExhaustedInband,
+                event,
+                b"",
+                1 << 8,
+                false
+            ),
+            TerminalOutcome::ModelAtCapacity,
+        );
+        assert!(!TerminalOutcome::ModelAtCapacity.is_marker());
+        assert_eq!(
+            classify_terminal_outcome(
+                TerminalSignalKind::QuotaExhaustedInband,
+                b"quota exhausted",
+                b"",
+                1 << 8,
+                false
+            ),
+            TerminalOutcome::QuotaRejected,
+        );
     }
 
     #[test]
@@ -3756,6 +4069,7 @@ mod tests {
                 binding: held_choice.clone(),
                 total: 2,
                 pin: Some("opencode-first".into()),
+                sequence: 0,
                 selection: first,
             },
         )
@@ -4112,7 +4426,11 @@ mod tests {
         ));
         let mut third_binding = binding.clone();
         third_binding.handoff_id = uuid::Uuid::new_v4().to_string();
-        assert_eq!(route(&third_binding, None).account, "second");
+        assert_eq!(
+            route(&third_binding, None).account,
+            "first",
+            "recent failure history must not override the durable round-robin cursor"
+        );
         let mut pinned_binding = binding.clone();
         pinned_binding.handoff_id = uuid::Uuid::new_v4().to_string();
         assert_eq!(
@@ -4224,8 +4542,8 @@ mod tests {
             )
             .unwrap_err()
             .to_string()
-            .contains("fresh route has no eligible account or pin"),
-            "missing quota evidence was treated as available"
+            .contains("fresh quota effect unknown"),
+            "missing quota evidence was not reported as unknown"
         );
         let effect_d_key = uuid::Uuid::new_v4().to_string();
         let effect = |index: usize, account: &str, kind| FreshAccountEffectRequest {
@@ -4400,7 +4718,7 @@ mod tests {
                 observed_live: 0,
                 observed_failures: 0,
                 observed_invocations: 0,
-                policy_version: "fresh-account-effects-v2".into(),
+                policy_version: FRESH_ROUTE_POLICY_VERSION.into(),
                 eligible_accounts: vec![follower_candidate.account.clone()],
                 quota_remaining_basis_points: Some(8000),
             },
@@ -4697,8 +5015,8 @@ mod tests {
         assert!(
             reusable_quota_source(temporary.path(), &exhausted_sibling, &negative)
                 .unwrap()
-                .is_none(),
-            "an exhausted physical Q was reused instead of allowing a new quota probe"
+                .is_some(),
+            "an authoritative exhausted Q should remain cached until a fresh probe is due"
         );
         assert!(
             select_route(
@@ -4719,6 +5037,30 @@ mod tests {
             .is_err(),
             "an exhausted explicit pin was launched"
         );
+        let unresolved = select_route(
+            temporary.path(),
+            &binding,
+            &FreshRouteRequest {
+                d_key: uuid::Uuid::new_v4().to_string(),
+                model: "model".into(),
+                config_sha256: "a".repeat(64),
+                account: None,
+                index: None,
+                total: 2,
+                pin: None,
+                quota_script: None,
+                auth_refresh_command: None,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            unresolved.contains("newer or unresolved quota effect"),
+            "{unresolved}"
+        );
+        // This pending intent was synthesized above without a real K; remove
+        // only that test artifact to exercise the settled branch below.
+        std::fs::remove_dir_all(&pending_dir).unwrap();
         let selection = select_route(
             temporary.path(),
             &binding,
@@ -4894,10 +5236,8 @@ mod tests {
                 .as_deref(),
             Some("failed")
         );
-        // The synthetic pending intent above deliberately has no K. Remove
-        // that fixture-only artifact and its dependent reuse before testing
-        // a settled post-rejection quota verification.
-        std::fs::remove_dir_all(&pending_dir).unwrap();
+        // The synthetic pending intent above was removed after its refusal;
+        // its dependent alias has no independent physical K.
         std::fs::remove_dir_all(effect_directory(temporary.path(), &another_binding, &first))
             .unwrap();
         let retry_dir = effect_directory(temporary.path(), &binding, &retry);
@@ -4920,7 +5260,7 @@ mod tests {
                 observed_live: 0,
                 observed_failures: 0,
                 observed_invocations: 1,
-                policy_version: "fresh-account-effects-v2".into(),
+                policy_version: FRESH_ROUTE_POLICY_VERSION.into(),
                 eligible_accounts: vec!["recovering".into()],
                 quota_remaining_basis_points: Some(8000),
             },

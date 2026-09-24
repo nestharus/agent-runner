@@ -157,6 +157,8 @@ pub struct FreshAccountEffectReadback {
 pub struct FreshQuotaWindow {
     pub used_percent: f64,
     pub resets_at: String,
+    #[serde(default)]
+    pub remaining: Option<u64>,
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]

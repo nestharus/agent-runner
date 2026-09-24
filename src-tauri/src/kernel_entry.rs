@@ -1049,7 +1049,7 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
             .ok_or("fresh route selection absent before K")?;
     if selected.model != pool.model.name
         || selected.config_sha256 != pool.config_sha256
-        || selected.policy_version != "fresh-account-effects-v2"
+        || selected.policy_version != "fresh-quota-rr-ttl-v3"
         || !selected.eligible_accounts.contains(&selected.account)
         || selected.eligible_accounts.iter().any(|account| {
             !pool
