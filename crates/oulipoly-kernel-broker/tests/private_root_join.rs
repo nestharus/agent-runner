@@ -79,6 +79,10 @@ fn inner() {
             | "normal_model_provider_unsupported"
             | "normal_model_provider_quota"
             | "normal_model_provider_auth"
+            | "normal_model_provider_auth_recovery"
+            | "normal_model_provider_quota_available"
+            | "normal_model_provider_quota_reply_loss"
+            | "normal_model_provider_quota_restart"
             | "normal_model_provider_no_pin"
     );
     let recipient_mode = mode.starts_with("normal_recipient");
@@ -122,12 +126,40 @@ fn inner() {
         } else {
             ""
         };
-        let quota = if mode == "normal_model_provider_quota" {
-            "quota_script = \"quota-must-not-run\"\n"
+        let quota = if matches!(
+            mode.as_str(),
+            "normal_model_provider_quota_available"
+                | "normal_model_provider_quota_reply_loss"
+                | "normal_model_provider_quota_restart"
+        ) {
+            fs::write(
+                gate.join("quota.json"),
+                br#"{"used_percent":20,"resets_at":"2099-01-01T00:00:00Z"}"#,
+            )
+            .unwrap();
+            format!(
+                "quota_script = 'cat {}'\n",
+                gate.join("quota.json").display()
+            )
+        } else if mode == "normal_model_provider_quota" {
+            "quota_script = \"quota-must-not-run\"\n".into()
+        } else if mode == "normal_model_provider_auth_recovery" {
+            fs::write(
+                gate.join("quota.json"),
+                br#"{"used_percent":20,"resets_at":"2099-01-01T00:00:00Z"}"#,
+            )
+            .unwrap();
+            format!(
+                "quota_script = 'test -f {} && cat {}'\nauth_refresh_command = 'printf x >> {}'\n",
+                gate.join("auth-refreshed").display(),
+                gate.join("quota.json").display(),
+                gate.join("auth-refreshed").display(),
+            )
         } else if mode == "normal_model_provider_auth" {
-            "auth_refresh_command = \"auth-must-not-run\"\n"
+            "quota_script = \"quota-must-not-run\"\nauth_refresh_command = \"auth-must-not-run\"\n"
+                .into()
         } else {
-            ""
+            String::new()
         };
         fs::write(
             config_dir.join("providers.toml"),
@@ -339,6 +371,12 @@ fn inner() {
             "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_PROVIDER_K_REPLY_V1",
             "1",
         )))
+        .envs(
+            (mode == "normal_model_provider_quota_reply_loss").then_some((
+                "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_ACCOUNT_EFFECT_REPLY_V1",
+                "1",
+            )),
+        )
         .envs(native_mode.then_some(("OULIPOLY_KERNEL_BROKER_FIXTURE_NATIVE_GATE_V1", &gate)))
         .envs(
             (mode == "held_release_gate_fail")
@@ -896,6 +934,10 @@ fn inner() {
                     | "normal_model_provider_unsupported"
                     | "normal_model_provider_quota"
                     | "normal_model_provider_auth"
+                    | "normal_model_provider_auth_recovery"
+                    | "normal_model_provider_quota_available"
+                    | "normal_model_provider_quota_reply_loss"
+                    | "normal_model_provider_quota_restart"
                     | "normal_model_provider_no_pin"
             ) {
                 let marker: serde_json::Value =
@@ -1182,6 +1224,12 @@ fn inner() {
                         "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_PROVIDER_K_REPLY_V1",
                         "1",
                     )))
+                    .envs(
+                        (mode == "normal_model_provider_quota_reply_loss").then_some((
+                            "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_ACCOUNT_EFFECT_REPLY_V1",
+                            "1",
+                        )),
+                    )
                     .stderr(Stdio::from(
                         File::create(temp.path().join("handoff-restart.log")).unwrap(),
                     ))
@@ -1240,23 +1288,33 @@ fn inner() {
                             "fresh pool has incompatible prompt modes before K"
                         }
                         "normal_model_provider_quota" => {
-                            "fresh provider quota authority unavailable before K"
+                            "fresh route has no eligible account or pin"
                         }
                         "normal_model_provider_auth" => {
-                            "fresh provider quota authority unavailable before K"
+                            "fresh route has no eligible account or pin"
                         }
                         _ => unreachable!(),
                     };
                     assert!(stderr.contains(reason), "{stderr}");
                     assert!(!gate.join("provider-effect").exists());
                     assert!(!gate.join("provider-runtime-result").exists());
-                    assert_eq!(
-                        fs::read_dir(broker_state.join("v30/fresh-provider"))
-                            .unwrap()
-                            .count(),
-                        0,
-                        "pre-K refusal created provider grant/effect"
+                    let provider_dir = broker_state.join("v30/fresh-provider");
+                    assert!(
+                        !provider_dir
+                            .join(format!("{}.fresh-grant.json", receipt.handoff_id))
+                            .exists(),
+                        "negative quota authorized provider K"
                     );
+                    if !matches!(
+                        mode.as_str(),
+                        "normal_model_provider_quota" | "normal_model_provider_auth"
+                    ) {
+                        assert_eq!(
+                            fs::read_dir(&provider_dir).unwrap().count(),
+                            0,
+                            "pre-K refusal created provider grant/effect"
+                        );
+                    }
                     assert_eq!(fs::read(&old_state_path).unwrap(), old_state_before);
                     assert_eq!(fs::read(&old_wal_path).ok(), old_wal_before);
                     assert_eq!(fs::read(&historical_sidecar).unwrap(), v29_main_before);
@@ -1302,6 +1360,76 @@ fn inner() {
                     );
                     assert_eq!(route["selection"]["plan_sha256"], grant["plan_sha256"]);
                     assert_eq!(route["binding"]["handoff_id"], receipt.handoff_id);
+                    if matches!(
+                        mode.as_str(),
+                        "normal_model_provider_quota_available"
+                            | "normal_model_provider_quota_reply_loss"
+                            | "normal_model_provider_quota_restart"
+                    ) {
+                        let effect_dir = provider_dir
+                            .join("account-effects")
+                            .join(format!("{}-1-quota-first", receipt.handoff_id));
+                        let effect: serde_json::Value = serde_json::from_slice(
+                            &fs::read(effect_dir.join("result.json")).unwrap(),
+                        )
+                        .unwrap();
+                        assert_eq!(effect["state"], "drained");
+                        assert_eq!(effect["outcome"], "valid_windows");
+                        if mode == "normal_model_provider_quota_reply_loss" {
+                            assert!(
+                                gate.join("account-effect-reply-dropped").exists(),
+                                "quota effect reply was not actually dropped"
+                            );
+                        }
+                        assert_eq!(route["selection"]["quota_remaining_basis_points"], 8000);
+                        assert_eq!(
+                            route["selection"]["eligible_accounts"],
+                            serde_json::json!(["unused", "local"])
+                        );
+                        assert_eq!(
+                            fs::read_dir(&effect_dir)
+                                .unwrap()
+                                .filter_map(Result::ok)
+                                .filter(|entry| entry
+                                    .file_name()
+                                    .to_string_lossy()
+                                    .ends_with(".consumed.json"))
+                                .count(),
+                            1,
+                            "quota reply loss caused a second effect K"
+                        );
+                    }
+                    if mode == "normal_model_provider_auth_recovery" {
+                        let effect_root = provider_dir.join("account-effects");
+                        for (kind, outcome) in [
+                            ("quota-first", "failed"),
+                            ("auth-refresh", "refreshed"),
+                            ("quota-retry", "valid_windows"),
+                        ] {
+                            let effect_dir =
+                                effect_root.join(format!("{}-1-{kind}", receipt.handoff_id));
+                            let effect: serde_json::Value = serde_json::from_slice(
+                                &fs::read(effect_dir.join("result.json")).unwrap(),
+                            )
+                            .unwrap();
+                            assert_eq!(effect["state"], "drained");
+                            assert_eq!(effect["outcome"], outcome);
+                            assert_eq!(
+                                fs::read_dir(&effect_dir)
+                                    .unwrap()
+                                    .filter_map(Result::ok)
+                                    .filter(|entry| entry
+                                        .file_name()
+                                        .to_string_lossy()
+                                        .ends_with(".consumed.json"))
+                                    .count(),
+                                1,
+                                "account effect was replayed: {kind}"
+                            );
+                        }
+                        assert_eq!(fs::read(gate.join("auth-refreshed")).unwrap(), b"x");
+                        assert_eq!(route["selection"]["quota_remaining_basis_points"], 8000);
+                    }
                     let grant_id = grant["id"].as_str().unwrap();
                     eventually(|| provider_dir.join(format!("{grant_id}.exit.json")).exists());
                     assert!(
@@ -1333,6 +1461,8 @@ fn inner() {
                                 total: 2,
                                 pin: (mode != "normal_model_provider_no_pin")
                                     .then(|| "local".into()),
+                                quota_script: None,
+                                auth_refresh_command: None,
                             },
                             b'f',
                             None,
@@ -1358,7 +1488,10 @@ fn inner() {
                         !gate.join("provider-runtime-result").exists(),
                         "runtime mapped a provider result before physical Q"
                     );
-                    if mode == "normal_model_provider_restart" {
+                    if matches!(
+                        mode.as_str(),
+                        "normal_model_provider_restart" | "normal_model_provider_quota_restart"
+                    ) {
                         let fresh_socket = socket.with_file_name("v30.sock");
                         stop(&mut broker);
                         assert!(
@@ -1455,6 +1588,12 @@ fn inner() {
                     )
                     .unwrap();
                     assert_eq!(mapped["mapped_after_q"], true);
+                    if mode == "normal_model_provider_quota_restart" {
+                        assert_eq!(
+                            mapped["quota_restart_readback"], true,
+                            "quota result was not read back through restarted broker"
+                        );
+                    }
                     assert_eq!(mapped["exit_code"], 0);
                     assert_eq!(
                         mapped["provider_index"],
@@ -3674,6 +3813,10 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_model_provider_unsupported",
         "normal_model_provider_quota",
         "normal_model_provider_auth",
+        "normal_model_provider_auth_recovery",
+        "normal_model_provider_quota_available",
+        "normal_model_provider_quota_reply_loss",
+        "normal_model_provider_quota_restart",
         "normal_model_provider_no_pin",
         "normal_guardian_death",
         "normal_driver_death",

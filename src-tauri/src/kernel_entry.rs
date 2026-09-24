@@ -706,6 +706,7 @@ fn private_provider_unknown(
             "grant_artifact": format!("v30/fresh-provider/{handoff_id}.fresh-grant.json"),
             "effect_artifact_prefix": grant.map(|id| format!("v30/fresh-provider/{id}.")),
             "automatic_replay": false,
+            "caller_retry_duplicate_effect_risk": true,
         })
     )
 }
@@ -923,7 +924,9 @@ fn private_verified_output(
 
 #[cfg(feature = "age319-private-broker-fixture")]
 fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode, String> {
-    use oulipoly_kernel_broker::protocol::{self, FreshRouteRequest};
+    use oulipoly_kernel_broker::protocol::{
+        self, FreshAccountEffectKind, FreshAccountEffectRequest, FreshRouteRequest,
+    };
     use oulipoly_runtime::executor::cli::fresh_remote::{
         load_fresh_headless_pool, prepare_fresh_headless, run_prepared_fresh_headless,
     };
@@ -961,10 +964,53 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
             index: Some(index),
             total,
             pin: provider_pin.map(str::to_owned),
+            quota_script: pool.account_effects[index].0.clone(),
+            auth_refresh_command: pool.account_effects[index].1.clone(),
         };
         let pinned = private_pin_plan(&candidate.plan)?;
         protocol::private_fresh_route_at(&socket, &request, b'h', Some(pinned.descriptors()))
             .map_err(|e| format!("fresh route candidate refused before K: {e}"))?;
+    }
+    let mut quota_receipts = Vec::new();
+    for (index, (quota_script, auth_command)) in pool.account_effects.iter().enumerate() {
+        if quota_script.is_none() {
+            continue;
+        }
+        let mut environment = Vec::new();
+        for (key, value) in std::env::vars_os() {
+            let key = key
+                .into_string()
+                .map_err(|_| "fresh effect environment key is not UTF-8")?;
+            if key.starts_with("LD_")
+                || key.starts_with("DYLD_")
+                || key.starts_with("OULIPOLY_KERNEL_")
+                || matches!(key.as_str(), "GLIBC_TUNABLES" | "GCONV_PATH")
+            {
+                continue;
+            }
+            let value = value
+                .into_string()
+                .map_err(|_| "fresh effect environment value is not UTF-8")?;
+            environment.push((key, value));
+        }
+        environment.sort();
+        let mut effect = FreshAccountEffectRequest {
+            d_key: authority.receipt.d_key.clone(),
+            model: pool.model.name.clone(),
+            config_sha256: pool.config_sha256.clone(),
+            account: pool.model.providers[index].name.clone(),
+            index,
+            kind: FreshAccountEffectKind::QuotaFirst,
+            environment,
+        };
+        let first = private_run_account_effect(&socket, &authority.receipt.handoff_id, &effect)?;
+        quota_receipts.push((effect.clone(), first.effect_id.clone()));
+        if first.outcome.as_deref() != Some("valid_windows") && auth_command.is_some() {
+            effect.kind = FreshAccountEffectKind::AuthRefresh;
+            private_run_account_effect(&socket, &authority.receipt.handoff_id, &effect)?;
+            effect.kind = FreshAccountEffectKind::QuotaRetry;
+            private_run_account_effect(&socket, &authority.receipt.handoff_id, &effect)?;
+        }
     }
     let request = FreshRouteRequest {
         d_key: authority.receipt.d_key.clone(),
@@ -974,17 +1020,30 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
         index: None,
         total,
         pin: provider_pin.map(str::to_owned),
+        quota_script: None,
+        auth_refresh_command: None,
     };
     let selected = protocol::private_fresh_route_at(&socket, &request, b'f', None)
         .map_err(|e| format!("fresh route selection refused before K: {e}"))?
         .ok_or("fresh route selection absent before K")?;
     if selected.model != pool.model.name
         || selected.config_sha256 != pool.config_sha256
+        || selected.policy_version != "fresh-account-effects-v1"
+        || !selected.eligible_accounts.contains(&selected.account)
+        || selected.eligible_accounts.iter().any(|account| {
+            !pool
+                .model
+                .providers
+                .iter()
+                .any(|member| &member.name == account)
+        })
         || pool
             .model
             .providers
             .get(selected.index)
             .is_none_or(|member| member.name != selected.account)
+        || pool.account_effects[selected.index].0.is_some()
+            != selected.quota_remaining_basis_points.is_some()
     {
         return Err("fresh route readback differs from configured pool before K".into());
     }
@@ -994,6 +1053,27 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
         grant_id: None,
     };
     let result = run_prepared_fresh_headless(selected_plan, &mut backend)?;
+    let mut quota_restart_readback = false;
+    if std::env::var("AGE319_PRIVATE_JOIN_MODE").ok().as_deref()
+        == Some("normal_model_provider_quota_restart")
+    {
+        if quota_receipts.is_empty() {
+            return Err("fresh quota restart fixture has no effect receipt".into());
+        }
+        for (effect_request, expected_id) in quota_receipts {
+            let after_restart =
+                protocol::private_fresh_account_effect_at(&socket, &effect_request, false)
+                    .map_err(|e| {
+                        format!("fresh quota readback after broker restart failed: {e}")
+                    })?;
+            if after_restart.effect_id != expected_id
+                || after_restart.outcome.as_deref() != Some("valid_windows")
+            {
+                return Err("fresh quota readback after broker restart changed".into());
+            }
+        }
+        quota_restart_readback = true;
+    }
     let gate = std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1").map_err(|e| {
         backend.unknown(
             backend.grant_id.as_deref(),
@@ -1014,6 +1094,7 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
         "route_observed_live": selected.observed_live,
         "route_observed_failures": selected.observed_failures,
         "route_observed_invocations": selected.observed_invocations,
+        "quota_restart_readback": quota_restart_readback,
         "terminal_reason": result.terminal_reason,
     });
     std::fs::write(
@@ -1036,6 +1117,83 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
     // This private route has no source W / recipient ACK or root terminal
     // publication. A mapped provider result cannot imply CLI completion.
     Err("private provider runtime result mapped after Q; root terminal publication closed".into())
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_run_account_effect(
+    socket: &std::path::Path,
+    handoff_id: &str,
+    request: &oulipoly_kernel_broker::protocol::FreshAccountEffectRequest,
+) -> Result<oulipoly_kernel_broker::protocol::FreshAccountEffectReadback, String> {
+    use oulipoly_kernel_broker::protocol;
+    let started = protocol::private_fresh_account_effect_at(socket, request, true)
+        .or_else(|_| protocol::private_fresh_account_effect_at(socket, request, false))
+        .map_err(|e| {
+            private_account_effect_unknown(
+                handoff_id,
+                request,
+                None,
+                "begin/readback",
+                &e.to_string(),
+            )
+        })?;
+    let mut effect = started;
+    while effect.state == "pending" {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        effect =
+            protocol::private_fresh_account_effect_at(socket, request, false).map_err(|e| {
+                private_account_effect_unknown(
+                    handoff_id,
+                    request,
+                    Some(&effect),
+                    "Q readback",
+                    &e.to_string(),
+                )
+            })?;
+    }
+    if effect.state != "drained" {
+        return Err(private_account_effect_unknown(
+            handoff_id,
+            request,
+            Some(&effect),
+            "Q readback",
+            &effect.state,
+        ));
+    }
+    Ok(effect)
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_account_effect_unknown(
+    handoff_id: &str,
+    request: &oulipoly_kernel_broker::protocol::FreshAccountEffectRequest,
+    readback: Option<&oulipoly_kernel_broker::protocol::FreshAccountEffectReadback>,
+    stage: &str,
+    reason: &str,
+) -> String {
+    use oulipoly_kernel_broker::protocol::FreshAccountEffectKind;
+    let kind = match request.kind {
+        FreshAccountEffectKind::QuotaFirst => "quota-first",
+        FreshAccountEffectKind::AuthRefresh => "auth-refresh",
+        FreshAccountEffectKind::QuotaRetry => "quota-retry",
+    };
+    format!(
+        "fresh account effect unknown: {}",
+        serde_json::json!({
+            "d_key": request.d_key,
+            "handoff_id": handoff_id,
+            "account": request.account,
+            "kind": request.kind,
+            "effect_id": readback.map(|effect| &effect.effect_id),
+            "artifact": readback.map(|effect| effect.artifact.clone()).unwrap_or_else(||
+                format!("v30/fresh-provider/account-effects/{handoff_id}-{}-{kind}", request.index)
+            ),
+            "stage": stage,
+            "reason": reason,
+            "automatic_replay": false,
+            "caller_retry_duplicate_effect_risk": true,
+        })
+    )
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]
@@ -2539,6 +2697,7 @@ mod tests {
             "v30/fresh-provider/grant-id."
         );
         assert_eq!(value["automatic_replay"], false);
+        assert_eq!(value["caller_retry_duplicate_effect_risk"], true);
 
         let lost_k = private_provider_unknown(
             "d-key",
@@ -2554,6 +2713,42 @@ mod tests {
         assert!(lost_k["grant_id"].is_null());
         assert!(lost_k["effect_artifact_prefix"].is_null());
         assert_eq!(lost_k["grant_artifact"], value["grant_artifact"]);
+    }
+
+    #[cfg(feature = "age319-private-broker-fixture")]
+    #[test]
+    fn uncertain_account_effect_retains_attempt_and_caller_risk() {
+        let request = protocol::FreshAccountEffectRequest {
+            d_key: "d-key".into(),
+            model: "model".into(),
+            config_sha256: "a".repeat(64),
+            account: "account".into(),
+            index: 2,
+            kind: protocol::FreshAccountEffectKind::QuotaFirst,
+            environment: Vec::new(),
+        };
+        let error = private_account_effect_unknown(
+            "handoff-id",
+            &request,
+            None,
+            "begin/readback",
+            "broker unavailable",
+        );
+        let value: serde_json::Value = serde_json::from_str(
+            error
+                .strip_prefix("fresh account effect unknown: ")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value["d_key"], "d-key");
+        assert_eq!(value["handoff_id"], "handoff-id");
+        assert_eq!(value["account"], "account");
+        assert_eq!(
+            value["artifact"],
+            "v30/fresh-provider/account-effects/handoff-id-2-quota-first"
+        );
+        assert_eq!(value["automatic_replay"], false);
+        assert_eq!(value["caller_retry_duplicate_effect_risk"], true);
     }
 
     #[test]

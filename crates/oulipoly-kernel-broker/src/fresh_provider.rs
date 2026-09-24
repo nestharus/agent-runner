@@ -3,8 +3,12 @@
 //! ordinary CLI route remains closed; a private typed runtime backend consumes
 //! its Q-gated readbacks without publishing terminal success.
 use super::work_launch;
+use chrono::{DateTime, Utc};
 use oulipoly_kernel_broker::identity::{PinnedProcess, host_proc_file, observed_incarnation_gone};
-use oulipoly_kernel_broker::protocol::{FreshRouteRequest, FreshRouteSelection};
+use oulipoly_kernel_broker::protocol::{
+    FreshAccountEffectKind, FreshAccountEffectReadback, FreshAccountEffectRequest,
+    FreshQuotaWindow, FreshRouteRequest, FreshRouteSelection,
+};
 use oulipoly_state::mailbox::{
     FreshNormalWorkPreparation, FreshReleasedHandoff, FreshRootWorkIntent,
 };
@@ -205,7 +209,6 @@ fn sealed_copy(source: &File, name: &'static std::ffi::CStr) -> io::Result<File>
 /// descriptor and sealed stdin. Unsupported shapes are rejected before spend.
 /// The setuid/setgid image refusal below scopes only this private proof; it is
 /// not an accepted restriction for the eventual unrestricted host-sudo route.
-#[cfg(test)]
 pub(super) fn plan(
     image_path: &Path,
     cwd: &Path,
@@ -426,6 +429,13 @@ fn durable_new<T: Serialize>(directory: &Path, name: &str, value: &T) -> io::Res
     File::open(directory)?.sync_all()
 }
 
+fn durable_result<T: Serialize>(directory: &Path, value: &T) -> io::Result<()> {
+    let temporary = format!("{}.result-pending.json", uuid::Uuid::new_v4());
+    durable_new(directory, &temporary, value)?;
+    std::fs::rename(directory.join(&temporary), directory.join("result.json"))?;
+    File::open(directory)?.sync_all()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct RouteCandidate {
@@ -438,6 +448,8 @@ struct RouteCandidate {
     total: usize,
     pin: Option<String>,
     plan_sha256: String,
+    quota_script: Option<String>,
+    auth_refresh_command: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -474,6 +486,334 @@ fn decision_name(handoff: &str) -> String {
     format!("{handoff}.route-selection.json")
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct AccountEffectIntent {
+    version: u32,
+    id: String,
+    binding: Binding,
+    request: FreshAccountEffectRequest,
+    environment_sha256: String,
+    plan_sha256: String,
+}
+
+fn redacted_effect_request(request: &FreshAccountEffectRequest) -> FreshAccountEffectRequest {
+    FreshAccountEffectRequest {
+        environment: Vec::new(),
+        ..request.clone()
+    }
+}
+
+fn environment_digest(request: &FreshAccountEffectRequest) -> io::Result<String> {
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&request.environment)?)
+    ))
+}
+
+fn effect_directory(
+    directory: &Path,
+    binding: &Binding,
+    request: &FreshAccountEffectRequest,
+) -> PathBuf {
+    let kind = match request.kind {
+        FreshAccountEffectKind::QuotaFirst => "quota-first",
+        FreshAccountEffectKind::AuthRefresh => "auth-refresh",
+        FreshAccountEffectKind::QuotaRetry => "quota-retry",
+    };
+    directory
+        .join("account-effects")
+        .join(format!("{}-{}-{kind}", binding.handoff_id, request.index))
+}
+
+fn effect_candidate(
+    directory: &Path,
+    binding: &Binding,
+    request: &FreshAccountEffectRequest,
+) -> io::Result<RouteCandidate> {
+    let candidate: RouteCandidate = exact_file(
+        directory,
+        &candidate_name(&binding.handoff_id, request.index),
+    )?
+    .ok_or_else(|| io::Error::other("fresh account effect candidate absent"))?;
+    if candidate.version != 1
+        || candidate.binding != *binding
+        || candidate.model != request.model
+        || candidate.config_sha256 != request.config_sha256
+        || candidate.account != request.account
+        || candidate.index != request.index
+    {
+        return Err(io::Error::other("fresh account effect candidate changed"));
+    }
+    Ok(candidate)
+}
+
+fn effect_command<'a>(
+    candidate: &'a RouteCandidate,
+    kind: FreshAccountEffectKind,
+) -> io::Result<&'a str> {
+    let command = match kind {
+        FreshAccountEffectKind::QuotaFirst | FreshAccountEffectKind::QuotaRetry => {
+            candidate.quota_script.as_deref()
+        }
+        FreshAccountEffectKind::AuthRefresh => candidate.auth_refresh_command.as_deref(),
+    };
+    command
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| io::Error::other("fresh account effect command absent"))
+}
+
+fn effect_intent(dir: &Path) -> io::Result<Option<AccountEffectIntent>> {
+    exact_file(dir, "intent.json")
+}
+
+fn refuse_concurrent_auth(directory: &Path, binding: &Binding, account: &str) -> io::Result<()> {
+    let parent = directory.join("account-effects");
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .ends_with("auth-refresh")
+        {
+            continue;
+        }
+        let Some(intent) = effect_intent(&entry.path())? else {
+            continue;
+        };
+        if intent.binding == *binding || intent.request.account != account {
+            continue;
+        }
+        let prior = effect_readback_from_dir(&entry.path(), &intent)?;
+        if prior.state != "drained"
+            || prior
+                .completed_unix_seconds
+                .is_some_and(|completed| Utc::now().timestamp() - completed < 30)
+        {
+            return Err(io::Error::other(
+                "fresh auth refresh already active or recently completed for account",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn effect_readback_from_dir(
+    dir: &Path,
+    intent: &AccountEffectIntent,
+) -> io::Result<FreshAccountEffectReadback> {
+    let artifact = dir.display().to_string();
+    let unknown = |state: &str| FreshAccountEffectReadback {
+        effect_id: intent.id.clone(),
+        state: state.into(),
+        outcome: None,
+        windows: Vec::new(),
+        completed_unix_seconds: None,
+        artifact: artifact.clone(),
+    };
+    let grant = grant_for_binding(dir, &intent.binding)?;
+    let Some(grant) = grant else {
+        return Ok(unknown("unknown"));
+    };
+    match observe(dir, &grant)? {
+        Observation::Unknown => Ok(unknown("unknown")),
+        Observation::Pending | Observation::ProviderExited(_) => Ok(unknown("pending")),
+        Observation::Drained {
+            status, mut stdout, ..
+        } => {
+            let completed = std::fs::metadata(dir.join(format!("{grant}.drain.json")))?
+                .modified()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(io::Error::other)?
+                .as_secs() as i64;
+            let (outcome, windows) = if status != 0 {
+                ("failed".to_string(), Vec::new())
+            } else if intent.request.kind == FreshAccountEffectKind::AuthRefresh {
+                ("refreshed".to_string(), Vec::new())
+            } else {
+                let mut raw = String::new();
+                stdout.read_to_string(&mut raw)?;
+                match parse_effect_windows(&raw) {
+                    Ok(windows) if !windows.is_empty() => ("valid_windows".into(), windows),
+                    Ok(_) => ("empty".into(), Vec::new()),
+                    Err(_) => ("invalid".into(), Vec::new()),
+                }
+            };
+            let receipt = FreshAccountEffectReadback {
+                effect_id: intent.id.clone(),
+                state: "drained".into(),
+                outcome: Some(outcome),
+                windows,
+                completed_unix_seconds: Some(completed),
+                artifact,
+            };
+            if let Some(existing) = exact_file::<FreshAccountEffectReadback>(dir, "result.json")? {
+                if serde_json::to_value(&existing)? != serde_json::to_value(&receipt)? {
+                    return Err(io::Error::other("fresh account effect result changed"));
+                }
+            } else {
+                durable_result(dir, &receipt)?;
+            }
+            Ok(receipt)
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RawEffectWindow {
+    used_percent: f64,
+    resets_at: String,
+}
+#[derive(Deserialize)]
+struct RawEffectOutput {
+    windows: Option<Vec<RawEffectWindow>>,
+    used_percent: Option<f64>,
+    resets_at: Option<String>,
+}
+
+fn parse_effect_windows(raw: &str) -> io::Result<Vec<FreshQuotaWindow>> {
+    let value: RawEffectOutput = serde_json::from_str(raw)?;
+    let windows = if let Some(windows) = value.windows {
+        windows
+    } else {
+        vec![RawEffectWindow {
+            used_percent: value
+                .used_percent
+                .ok_or_else(|| io::Error::other("quota used_percent absent"))?,
+            resets_at: value
+                .resets_at
+                .ok_or_else(|| io::Error::other("quota resets_at absent"))?,
+        }]
+    };
+    windows
+        .into_iter()
+        .map(|window| {
+            if !window.used_percent.is_finite()
+                || !(0.0..=100.0).contains(&window.used_percent)
+                || DateTime::parse_from_rfc3339(&window.resets_at).is_err()
+            {
+                return Err(io::Error::other("invalid quota window"));
+            }
+            Ok(FreshQuotaWindow {
+                used_percent: window.used_percent,
+                resets_at: window.resets_at,
+            })
+        })
+        .collect()
+}
+
+pub(super) fn observe_account_effect(
+    directory: &Path,
+    binding: &Binding,
+    request: &FreshAccountEffectRequest,
+) -> io::Result<FreshAccountEffectReadback> {
+    effect_candidate(directory, binding, request)?;
+    let dir = effect_directory(directory, binding, request);
+    let intent = effect_intent(&dir)?
+        .ok_or_else(|| io::Error::other("fresh account effect intent absent"))?;
+    if intent.version != 1
+        || intent.binding != *binding
+        || intent.request != redacted_effect_request(request)
+        || intent.environment_sha256 != environment_digest(request)?
+    {
+        return Err(io::Error::other("fresh account effect readback mismatch"));
+    }
+    effect_readback_from_dir(&dir, &intent)
+}
+
+/// The intent is fsynced before a separate one-use K. Any failure after that
+/// point is unknown, and a second begin can only be observed, never launched.
+pub(super) fn begin_account_effect(
+    directory: &Path,
+    binding: &Binding,
+    request: &FreshAccountEffectRequest,
+    root: &PinnedProcess,
+    actor: &PinnedProcess,
+    uid: u32,
+    gid: u32,
+) -> io::Result<FreshAccountEffectReadback> {
+    let candidate = effect_candidate(directory, binding, request)?;
+    let command = effect_command(&candidate, request.kind)?;
+    let dir = effect_directory(directory, binding, request);
+    if dir.exists() {
+        return Err(io::Error::other(
+            "fresh account effect already begun; observe exact effect",
+        ));
+    }
+    if request.kind == FreshAccountEffectKind::AuthRefresh {
+        refuse_concurrent_auth(directory, binding, &request.account)?;
+    }
+    let first_request = FreshAccountEffectRequest {
+        kind: FreshAccountEffectKind::QuotaFirst,
+        ..request.clone()
+    };
+    if request.kind != FreshAccountEffectKind::QuotaFirst {
+        let first = observe_account_effect(directory, binding, &first_request)?;
+        if first.state != "drained"
+            || !matches!(
+                first.outcome.as_deref(),
+                Some("failed" | "empty" | "invalid")
+            )
+        {
+            return Err(io::Error::other(
+                "auth refresh has no failed or empty quota prerequisite",
+            ));
+        }
+        if request.kind == FreshAccountEffectKind::QuotaRetry {
+            let auth = observe_account_effect(
+                directory,
+                binding,
+                &FreshAccountEffectRequest {
+                    kind: FreshAccountEffectKind::AuthRefresh,
+                    ..request.clone()
+                },
+            )?;
+            if auth.state != "drained" {
+                return Err(io::Error::other(
+                    "quota retry has no drained auth prerequisite",
+                ));
+            }
+        }
+    }
+    let cwd = std::fs::read_link(format!("/proc/{}/cwd", actor.host_pid))?;
+    let shell = std::fs::canonicalize("/bin/sh")?;
+    let input_fd =
+        unsafe { libc::memfd_create(c"fresh-account-empty-stdin".as_ptr(), libc::MFD_CLOEXEC) };
+    if input_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let input = unsafe { File::from_raw_fd(input_fd) };
+    let plan = plan(
+        &shell,
+        &cwd,
+        &input,
+        vec!["-c".into(), command.into()],
+        request.environment.clone(),
+    )?;
+    let parent = directory.join("account-effects");
+    std::fs::create_dir_all(&parent)?;
+    File::open(directory)?.sync_all()?;
+    std::fs::create_dir(&dir)?;
+    File::open(&parent)?.sync_all()?;
+    let intent = AccountEffectIntent {
+        version: 1,
+        id: uuid::Uuid::new_v4().to_string(),
+        binding: binding.clone(),
+        request: redacted_effect_request(request),
+        environment_sha256: environment_digest(request)?,
+        plan_sha256: plan.digest.clone(),
+    };
+    durable_new(&dir, "intent.json", &intent)?;
+    let prepared = prepare(&dir, binding.clone(), plan)?;
+    launch(prepared, root, actor, uid, gid)?;
+    effect_readback_from_dir(&dir, &intent)
+}
+
 /// A candidate is a broker-pinned exact provider plan. It is durable before
 /// selection and has no fork/effect. Repeated registrations must be identical.
 pub(super) fn register_route_candidate(
@@ -500,6 +840,8 @@ pub(super) fn register_route_candidate(
         total: request.total,
         pin: request.pin.clone(),
         plan_sha256: plan.digest.clone(),
+        quota_script: request.quota_script.clone(),
+        auth_refresh_command: request.auth_refresh_command.clone(),
     };
     let name = candidate_name(&binding.handoff_id, index);
     if let Some(existing) = exact_file::<RouteCandidate>(directory, &name)? {
@@ -530,6 +872,8 @@ fn route_candidates(
             || candidate.index != index
             || candidate.total != request.total
             || candidate.pin != request.pin
+            || request.quota_script.is_some()
+            || request.auth_refresh_command.is_some()
             || !names.insert(candidate.account.clone())
         {
             return Err(io::Error::other("fresh route candidate set changed"));
@@ -585,6 +929,98 @@ fn route_evidence(directory: &Path, candidate: &RouteCandidate) -> io::Result<(u
     Ok((live, failures, invocations))
 }
 
+fn candidate_quota(
+    directory: &Path,
+    binding: &Binding,
+    candidate: &RouteCandidate,
+) -> io::Result<(Option<u32>, Option<String>)> {
+    if candidate.quota_script.is_none() {
+        return Ok((Some(0), None)); // no configured quota source, invocation fallback
+    }
+    let request = FreshAccountEffectRequest {
+        d_key: String::new(),
+        model: candidate.model.clone(),
+        config_sha256: candidate.config_sha256.clone(),
+        account: candidate.account.clone(),
+        index: candidate.index,
+        kind: FreshAccountEffectKind::QuotaFirst,
+        environment: Vec::new(),
+    };
+    let first_dir = effect_directory(directory, binding, &request);
+    let Some(first_intent) = effect_intent(&first_dir)? else {
+        return Ok((None, None));
+    };
+    if first_intent.version != 1
+        || first_intent.binding != *binding
+        || first_intent.request.model != candidate.model
+        || first_intent.request.config_sha256 != candidate.config_sha256
+        || first_intent.request.account != candidate.account
+        || first_intent.request.index != candidate.index
+        || first_intent.request.kind != FreshAccountEffectKind::QuotaFirst
+    {
+        return Err(io::Error::other("fresh quota effect provenance changed"));
+    }
+    let mut result = effect_readback_from_dir(&first_dir, &first_intent)?;
+    if result.state != "drained" {
+        return Ok((None, Some(result.artifact)));
+    }
+    if result.outcome.as_deref() != Some("valid_windows")
+        && candidate.auth_refresh_command.is_some()
+    {
+        let retry_dir = effect_directory(
+            directory,
+            binding,
+            &FreshAccountEffectRequest {
+                kind: FreshAccountEffectKind::QuotaRetry,
+                ..request
+            },
+        );
+        let Some(retry_intent) = effect_intent(&retry_dir)? else {
+            return Ok((None, None));
+        };
+        if retry_intent.version != 1
+            || retry_intent.binding != *binding
+            || retry_intent.request.account != candidate.account
+            || retry_intent.request.config_sha256 != candidate.config_sha256
+            || retry_intent.request.kind != FreshAccountEffectKind::QuotaRetry
+        {
+            return Err(io::Error::other("fresh quota retry provenance changed"));
+        }
+        result = effect_readback_from_dir(&retry_dir, &retry_intent)?;
+    }
+    if result.state != "drained" {
+        return Ok((None, Some(result.artifact)));
+    }
+    if result.outcome.as_deref() != Some("valid_windows") || result.windows.is_empty() {
+        return Ok((None, None));
+    }
+    Ok((quota_remaining(&result, Utc::now().timestamp())?, None))
+}
+
+fn quota_remaining(result: &FreshAccountEffectReadback, now: i64) -> io::Result<Option<u32>> {
+    let completed = result
+        .completed_unix_seconds
+        .ok_or_else(|| io::Error::other("fresh quota completion time absent"))?;
+    if now < completed || now - completed >= 30 {
+        return Ok(None);
+    }
+    let mut binding_remaining = u32::MAX;
+    for window in &result.windows {
+        let reset = DateTime::parse_from_rfc3339(&window.resets_at)
+            .map_err(io::Error::other)?
+            .timestamp();
+        if reset <= now {
+            return Ok(None);
+        }
+        if window.used_percent >= 100.0 {
+            return Ok(None);
+        }
+        binding_remaining =
+            binding_remaining.min(((100.0 - window.used_percent) * 100.0).round() as u32);
+    }
+    Ok(Some(binding_remaining))
+}
+
 /// One fsynced choice for this held J. Selection has no provider effect.
 /// Cached Q and live K are measured only from this fresh broker directory.
 pub(super) fn select_route(
@@ -605,6 +1041,11 @@ pub(super) fn select_route(
             || existing.pin != request.pin
             || existing.selection.model != request.model
             || existing.selection.config_sha256 != request.config_sha256
+            || existing.selection.policy_version != "fresh-account-effects-v1"
+            || !existing
+                .selection
+                .eligible_accounts
+                .contains(&existing.selection.account)
             || candidates.get(existing.selection.index).is_none_or(|c| {
                 c.account != existing.selection.account
                     || c.plan_sha256 != existing.selection.plan_sha256
@@ -614,8 +1055,32 @@ pub(super) fn select_route(
         }
         return Ok(existing.selection);
     }
-    let mut best: Option<((u64, u64, u64, usize), FreshRouteSelection)> = None;
+    let mut eligible = Vec::new();
+    let mut unknown_artifact = None;
     for candidate in candidates {
+        let (quota_remaining, unknown) = candidate_quota(directory, binding, &candidate)?;
+        if unknown.is_some()
+            && request
+                .pin
+                .as_deref()
+                .is_none_or(|pin| pin == candidate.account)
+        {
+            unknown_artifact = unknown;
+        }
+        let Some(quota_remaining) = quota_remaining else {
+            continue;
+        };
+        eligible.push((candidate, quota_remaining));
+    }
+    let all_metered = eligible
+        .iter()
+        .all(|(candidate, _)| candidate.quota_script.is_some());
+    let eligible_accounts: Vec<String> = eligible
+        .iter()
+        .map(|(candidate, _)| candidate.account.clone())
+        .collect();
+    let mut best: Option<((u64, u64, u32, u64, usize), FreshRouteSelection)> = None;
+    for (candidate, quota_remaining) in eligible {
         if request
             .pin
             .as_deref()
@@ -624,7 +1089,17 @@ pub(super) fn select_route(
             continue;
         }
         let (live, failures, invocations) = route_evidence(directory, &candidate)?;
-        let score = (live, failures, invocations, candidate.index);
+        let score = (
+            live,
+            failures,
+            if all_metered {
+                u32::MAX - quota_remaining
+            } else {
+                0
+            },
+            invocations,
+            candidate.index,
+        );
         let selection = FreshRouteSelection {
             model: candidate.model,
             config_sha256: candidate.config_sha256,
@@ -634,13 +1109,21 @@ pub(super) fn select_route(
             observed_live: live,
             observed_failures: failures,
             observed_invocations: invocations,
+            policy_version: "fresh-account-effects-v1".into(),
+            eligible_accounts: eligible_accounts.clone(),
+            quota_remaining_basis_points: candidate.quota_script.as_ref().map(|_| quota_remaining),
         };
         if best.as_ref().is_none_or(|(old, _)| score < *old) {
             best = Some((score, selection));
         }
     }
     let selection = best
-        .ok_or_else(|| io::Error::other("fresh route pin absent"))?
+        .ok_or_else(|| {
+            io::Error::other(match unknown_artifact {
+                Some(artifact) => format!("fresh quota effect unknown: {artifact}"),
+                None => "fresh route has no eligible account or pin".into(),
+            })
+        })?
         .1;
     durable_new(
         directory,
@@ -669,6 +1152,29 @@ pub(super) fn require_selected_plan(
     {
         return Err(io::Error::other(
             "fresh provider K differs from selected route",
+        ));
+    }
+    // Selection and K are separate requests. A delayed K must not spend a
+    // choice whose Q-verified quota evidence has expired in the meantime.
+    let candidate: RouteCandidate = exact_file(
+        directory,
+        &candidate_name(&binding.handoff_id, decision.selection.index),
+    )?
+    .ok_or_else(|| io::Error::other("fresh provider K candidate absent"))?;
+    if candidate.binding != *binding
+        || candidate.account != decision.selection.account
+        || candidate.plan_sha256 != plan.digest
+    {
+        return Err(io::Error::other("fresh provider K candidate changed"));
+    }
+    let (remaining, unknown) = candidate_quota(directory, binding, &candidate)?;
+    if unknown.is_some()
+        || remaining.is_none()
+        || candidate.quota_script.as_ref().map(|_| remaining.unwrap())
+            != decision.selection.quota_remaining_basis_points
+    {
+        return Err(io::Error::other(
+            "fresh provider K quota evidence no longer eligible",
         ));
     }
     Ok(())
@@ -1424,6 +1930,29 @@ mod tests {
     }
 
     #[test]
+    fn quota_window_freshness_and_exhaustion_are_distinct() {
+        let now = Utc::now().timestamp();
+        let mut result = FreshAccountEffectReadback {
+            effect_id: uuid::Uuid::new_v4().to_string(),
+            state: "drained".into(),
+            outcome: Some("valid_windows".into()),
+            windows: vec![FreshQuotaWindow {
+                used_percent: 25.0,
+                resets_at: "2099-01-01T00:00:00Z".into(),
+            }],
+            completed_unix_seconds: Some(now),
+            artifact: "/fresh/effect".into(),
+        };
+        assert_eq!(quota_remaining(&result, now).unwrap(), Some(7500));
+        assert_eq!(quota_remaining(&result, now + 30).unwrap(), None);
+        result.windows[0].used_percent = 100.0;
+        assert_eq!(quota_remaining(&result, now).unwrap(), None);
+        result.windows[0].used_percent = 0.0;
+        result.windows[0].resets_at = "2020-01-01T00:00:00Z".into();
+        assert_eq!(quota_remaining(&result, now).unwrap(), None);
+    }
+
+    #[test]
     fn direct_pinned_provider_has_distinct_exit_output_and_physical_q() {
         if std::env::var_os("AGE319_FRESH_PROVIDER_INNER").is_none() {
             let Some(image) = std::env::var_os("OULIPOLY_AGE319_PROVIDER_IMAGE") else {
@@ -1482,6 +2011,8 @@ mod tests {
                 index,
                 total: 2,
                 pin: pin.map(str::to_owned),
+                quota_script: None,
+                auth_refresh_command: None,
             };
             register_route_candidate(
                 temporary.path(),
@@ -1638,6 +2169,8 @@ mod tests {
             index: None,
             total: 2,
             pin: None,
+            quota_script: None,
+            auth_refresh_command: None,
         };
         assert!(
             select_route(temporary.path(), &second_binding, &changed_config).is_err(),
@@ -1712,6 +2245,291 @@ mod tests {
             "first",
             "explicit pin must retain account identity"
         );
+        actor_child.kill().unwrap();
+        actor_child.wait().unwrap();
+    }
+
+    #[test]
+    fn direct_account_effects_are_one_use_and_gate_eligible_set() {
+        if std::env::var_os("AGE319_FRESH_ACCOUNT_INNER").is_none() {
+            let output = Command::new("unshare")
+                .args(["-Urpfm", "--mount-proc"])
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", "linux_main::fresh_provider::tests::direct_account_effects_are_one_use_and_gate_eligible_set", "--nocapture"])
+                .env("AGE319_FRESH_ACCOUNT_INNER", "1")
+                .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", "/tmp/fresh-account-effect-fixture-socket")
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let marker = temporary.path().join("auth-marker");
+        let input = temporary.path().join("empty-input");
+        std::fs::write(&input, b"").unwrap();
+        let mut actor_child = Command::new("sleep").arg("60").spawn().unwrap();
+        let root = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+        let actor = PinnedProcess::open(actor_child.id() as i32).unwrap();
+        let binding = fixture_binding(&root, &actor);
+        let shell_script = format!(
+            "if test -e '{}'; then printf '{{\"used_percent\":20,\"resets_at\":\"2099-01-01T00:00:00Z\"}}'; else exit 7; fi",
+            marker.display()
+        );
+        let auth_script = format!("printf x >> '{}'", marker.display());
+        let request =
+            |index: usize, account: &str, quota: &str, auth: Option<&str>| FreshRouteRequest {
+                d_key: uuid::Uuid::new_v4().to_string(),
+                model: "model".into(),
+                config_sha256: "a".repeat(64),
+                account: Some(account.into()),
+                index: Some(index),
+                total: 2,
+                pin: None,
+                quota_script: Some(quota.into()),
+                auth_refresh_command: auth.map(str::to_owned),
+            };
+        let image = std::fs::canonicalize("/bin/true").unwrap();
+        for (index, account, quota, auth) in [
+            (
+                0,
+                "recovering",
+                shell_script.as_str(),
+                Some(auth_script.as_str()),
+            ),
+            (
+                1,
+                "exhausted",
+                "printf '{\"used_percent\":100,\"resets_at\":\"2099-01-01T00:00:00Z\"}'",
+                None,
+            ),
+        ] {
+            register_route_candidate(
+                temporary.path(),
+                &binding,
+                &request(index, account, quota, auth),
+                plan(
+                    &image,
+                    temporary.path(),
+                    &File::open(&input).unwrap(),
+                    vec![format!("--{account}")],
+                    vec![],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        assert!(
+            select_route(
+                temporary.path(),
+                &binding,
+                &FreshRouteRequest {
+                    d_key: uuid::Uuid::new_v4().to_string(),
+                    model: "model".into(),
+                    config_sha256: "a".repeat(64),
+                    account: None,
+                    index: None,
+                    total: 2,
+                    pin: None,
+                    quota_script: None,
+                    auth_refresh_command: None,
+                }
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("fresh route has no eligible account or pin"),
+            "missing quota evidence was treated as available"
+        );
+        let effect_d_key = uuid::Uuid::new_v4().to_string();
+        let effect = |index: usize, account: &str, kind| FreshAccountEffectRequest {
+            d_key: effect_d_key.clone(),
+            model: "model".into(),
+            config_sha256: "a".repeat(64),
+            account: account.into(),
+            index,
+            kind,
+            environment: vec![("PATH".into(), "/usr/bin:/bin".into())],
+        };
+        let wait = |request: &FreshAccountEffectRequest| {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                let readback = observe_account_effect(temporary.path(), &binding, request).unwrap();
+                if readback.state == "drained" {
+                    return readback;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "effect did not physically drain: {readback:?}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let first = effect(0, "recovering", FreshAccountEffectKind::QuotaFirst);
+        let begun =
+            begin_account_effect(temporary.path(), &binding, &first, &root, &actor, 0, 0).unwrap();
+        assert!(
+            begin_account_effect(temporary.path(), &binding, &first, &root, &actor, 0, 0).is_err()
+        );
+        let failed = wait(&first);
+        assert_eq!(failed.effect_id, begun.effect_id);
+        assert_eq!(failed.outcome.as_deref(), Some("failed"));
+        assert!(!marker.exists());
+        let auth = effect(0, "recovering", FreshAccountEffectKind::AuthRefresh);
+        begin_account_effect(temporary.path(), &binding, &auth, &root, &actor, 0, 0).unwrap();
+        assert_eq!(wait(&auth).outcome.as_deref(), Some("refreshed"));
+        assert_eq!(std::fs::read(&marker).unwrap(), b"x");
+        assert!(
+            begin_account_effect(temporary.path(), &binding, &auth, &root, &actor, 0, 0).is_err()
+        );
+        let retry = effect(0, "recovering", FreshAccountEffectKind::QuotaRetry);
+        begin_account_effect(temporary.path(), &binding, &retry, &root, &actor, 0, 0).unwrap();
+        assert_eq!(wait(&retry).outcome.as_deref(), Some("valid_windows"));
+        let negative = effect(1, "exhausted", FreshAccountEffectKind::QuotaFirst);
+        begin_account_effect(temporary.path(), &binding, &negative, &root, &actor, 0, 0).unwrap();
+        assert_eq!(wait(&negative).outcome.as_deref(), Some("valid_windows"));
+        assert!(
+            select_route(
+                temporary.path(),
+                &binding,
+                &FreshRouteRequest {
+                    d_key: uuid::Uuid::new_v4().to_string(),
+                    model: "model".into(),
+                    config_sha256: "a".repeat(64),
+                    account: None,
+                    index: None,
+                    total: 2,
+                    pin: Some("exhausted".into()),
+                    quota_script: None,
+                    auth_refresh_command: None,
+                }
+            )
+            .is_err(),
+            "an exhausted explicit pin was launched"
+        );
+        let selection = select_route(
+            temporary.path(),
+            &binding,
+            &FreshRouteRequest {
+                d_key: uuid::Uuid::new_v4().to_string(),
+                model: "model".into(),
+                config_sha256: "a".repeat(64),
+                account: None,
+                index: None,
+                total: 2,
+                pin: None,
+                quota_script: None,
+                auth_refresh_command: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(selection.account, "recovering");
+        assert_eq!(selection.eligible_accounts, ["recovering"]);
+        assert_eq!(selection.quota_remaining_basis_points, Some(8000));
+        let reloaded = observe_account_effect(temporary.path(), &binding, &auth).unwrap();
+        assert_eq!(reloaded.outcome.as_deref(), Some("refreshed"));
+        let auth_dir = effect_directory(temporary.path(), &binding, &auth);
+        let persisted: AccountEffectIntent = exact_file(&auth_dir, "intent.json").unwrap().unwrap();
+        assert_eq!(
+            effect_readback_from_dir(&auth_dir, &persisted)
+                .unwrap()
+                .effect_id,
+            reloaded.effect_id,
+            "persisted intent could not reconstruct Q readback"
+        );
+        assert_eq!(std::fs::read(&marker).unwrap(), b"x", "readback reran auth");
+        let mut uncertain_binding = binding.clone();
+        uncertain_binding.handoff_id = uuid::Uuid::new_v4().to_string();
+        let unknown_route = FreshRouteRequest {
+            d_key: uuid::Uuid::new_v4().to_string(), model: "model".into(),
+            config_sha256: "a".repeat(64), account: Some("slow".into()),
+            index: Some(0), total: 1, pin: Some("slow".into()),
+            quota_script: Some("printf '{\"used_percent\":10,\"resets_at\":\"2099-01-01T00:00:00Z\"}'; sleep 60 & wait".into()),
+            auth_refresh_command: None,
+        };
+        register_route_candidate(
+            temporary.path(),
+            &uncertain_binding,
+            &unknown_route,
+            plan(
+                &image,
+                temporary.path(),
+                &File::open(&input).unwrap(),
+                vec!["--slow".into()],
+                vec![],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let slow = FreshAccountEffectRequest {
+            d_key: effect_d_key.clone(),
+            model: "model".into(),
+            config_sha256: "a".repeat(64),
+            account: "slow".into(),
+            index: 0,
+            kind: FreshAccountEffectKind::QuotaFirst,
+            environment: vec![("PATH".into(), "/usr/bin:/bin".into())],
+        };
+        begin_account_effect(
+            temporary.path(),
+            &uncertain_binding,
+            &slow,
+            &root,
+            &actor,
+            0,
+            0,
+        )
+        .unwrap();
+        let slow_dir = effect_directory(temporary.path(), &uncertain_binding, &slow);
+        let slow_grant = grant_for_binding(&slow_dir, &uncertain_binding)
+            .unwrap()
+            .unwrap();
+        assert!(
+            begin_account_effect(
+                temporary.path(),
+                &uncertain_binding,
+                &slow,
+                &root,
+                &actor,
+                0,
+                0
+            )
+            .is_err(),
+            "an uncertain quota K was replayed"
+        );
+        assert!(
+            select_route(
+                temporary.path(),
+                &uncertain_binding,
+                &FreshRouteRequest {
+                    account: None,
+                    index: None,
+                    quota_script: None,
+                    auth_refresh_command: None,
+                    ..unknown_route
+                }
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("fresh quota effect unknown"),
+            "K without Q was treated as quota availability"
+        );
+        cancel(&slow_dir, &slow_grant).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while observe_account_effect(temporary.path(), &uncertain_binding, &slow)
+            .unwrap()
+            .state
+            != "drained"
+        {
+            assert!(
+                Instant::now() < deadline,
+                "cancelled quota effect did not drain"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
         actor_child.kill().unwrap();
         actor_child.wait().unwrap();
     }

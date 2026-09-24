@@ -108,6 +108,50 @@ pub struct FreshRouteRequest {
     pub index: Option<usize>,
     pub total: usize,
     pub pin: Option<String>,
+    pub quota_script: Option<String>,
+    pub auth_refresh_command: Option<String>,
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FreshAccountEffectRequest {
+    pub d_key: String,
+    pub model: String,
+    pub config_sha256: String,
+    pub account: String,
+    pub index: usize,
+    pub kind: FreshAccountEffectKind,
+    pub environment: Vec<(String, String)>,
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FreshAccountEffectKind {
+    QuotaFirst,
+    AuthRefresh,
+    QuotaRetry,
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreshAccountEffectReadback {
+    pub effect_id: String,
+    pub state: String,
+    pub outcome: Option<String>,
+    pub windows: Vec<FreshQuotaWindow>,
+    pub completed_unix_seconds: Option<i64>,
+    pub artifact: String,
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreshQuotaWindow {
+    pub used_percent: f64,
+    pub resets_at: String,
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]
@@ -122,6 +166,9 @@ pub struct FreshRouteSelection {
     pub observed_live: u64,
     pub observed_failures: u64,
     pub observed_invocations: u64,
+    pub policy_version: String,
+    pub eligible_accounts: Vec<String>,
+    pub quota_remaining_basis_points: Option<u32>,
 }
 
 /// Begin is one-use. If its reply is lost, observe reports `Started`, which
@@ -323,6 +370,44 @@ pub fn private_fresh_route_at(
         .strip_prefix("fresh-route-selected ")
         .ok_or_else(|| io::Error::other("fresh route selection response invalid"))?;
     Ok(Some(serde_json::from_str(value.trim_end())?))
+}
+
+/// Begin a single D/account/kind-bound broker effect or read back that exact
+/// effect. An uncertain begin response is followed only by observe (`n`).
+#[cfg(feature = "age319-private-broker-fixture")]
+pub fn private_fresh_account_effect_at(
+    path: &Path,
+    request: &FreshAccountEffectRequest,
+    begin: bool,
+) -> io::Result<FreshAccountEffectReadback> {
+    let id = uuid::Uuid::parse_str(&request.d_key)
+        .map_err(|_| io::Error::other("invalid fresh effect D key"))?;
+    if id.is_nil() || id.to_string() != request.d_key {
+        return Err(io::Error::other("noncanonical fresh effect D key"));
+    }
+    let body = serde_json::to_vec(request)?;
+    let mut stream = checked_connection(path)?;
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let mut frame = Vec::with_capacity(17 + body.len());
+    frame.push(if begin { b'm' } else { b'n' });
+    frame.extend_from_slice(&challenge);
+    frame.extend_from_slice(&body);
+    stream.write_all(&frame)?;
+    let mut answer_bytes = Vec::new();
+    stream.read_to_end(&mut answer_bytes)?;
+    if !answer_bytes.ends_with(b"\n") {
+        return Err(io::Error::other("fresh account effect response uncertain"));
+    }
+    let answer = std::str::from_utf8(&answer_bytes)
+        .map_err(|_| io::Error::other("fresh account effect response non-UTF8"))?;
+    if let Some(error) = answer.strip_prefix("error ") {
+        return Err(io::Error::other(error.trim_end().to_owned()));
+    }
+    let value = answer
+        .strip_prefix("fresh-account-effect ")
+        .ok_or_else(|| io::Error::other("fresh account effect response invalid"))?;
+    Ok(serde_json::from_str(value.trim_end())?)
 }
 
 /// Q-gated output readback. The broker sends its verified regular files by
