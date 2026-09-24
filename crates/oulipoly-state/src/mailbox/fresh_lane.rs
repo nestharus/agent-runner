@@ -32,6 +32,7 @@ const FRESH_BASH_LISTENER_SCHEMA: &str = include_str!("migrations/0037_fresh_bas
 const FRESH_ROOT_TERMINAL_SCHEMA: &str = include_str!("migrations/0038_fresh_root_terminal.sql");
 const FRESH_NORMAL_WORK_SCHEMA: &str = include_str!("migrations/0034_fresh_normal_work.sql");
 const FRESH_RECIPIENT_SCHEMA: &str = include_str!("migrations/0030_fresh_recipient.sql");
+const FRESH_RECIPIENT_ACK_SCHEMA: &str = include_str!("migrations/0039_fresh_recipient_ack.sql");
 const FRESH_RECIPIENT_STATE_SCHEMA: &str =
     include_str!("migrations/0030_fresh_recipient_state.sql");
 
@@ -283,7 +284,9 @@ impl FreshV30Lane {
         sidecar
             .mailbox()
             .conn
-            .execute_batch(&format!("{FRESH_SCHEMA}\n{FRESH_RECIPIENT_SCHEMA}"))
+            .execute_batch(&format!(
+                "{FRESH_SCHEMA}\n{FRESH_RECIPIENT_SCHEMA}\n{FRESH_RECIPIENT_ACK_SCHEMA}"
+            ))
             .map_err(|e| e.to_string())?;
         sidecar
             .mailbox()
@@ -428,6 +431,36 @@ impl FreshV30Lane {
         if recipient_schema_count != 16 {
             return Err("fresh recipient authority schema is incomplete".into());
         }
+        let ack_schema_count: i64 = sidecar
+            .mailbox()
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE
+             (type='table' AND name='fresh_recipient_ack_evidence') OR
+             (type='trigger' AND name IN ('fresh_recipient_ack_evidence_no_update',
+              'fresh_recipient_ack_evidence_no_delete'))",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        match ack_schema_count {
+            0 => sidecar
+                .mailbox()
+                .conn
+                .execute_batch(FRESH_RECIPIENT_ACK_SCHEMA)
+                .map_err(|e| e.to_string())?,
+            3 => {}
+            _ => return Err("fresh recipient ACK schema is incomplete".into()),
+        }
+        verify_fresh_sql_objects(
+            &sidecar.mailbox().conn,
+            FRESH_RECIPIENT_ACK_SCHEMA,
+            "fresh_recipient_ack_evidence",
+            &[
+                "fresh_recipient_ack_evidence_no_update",
+                "fresh_recipient_ack_evidence_no_delete",
+            ],
+        )?;
         let request_key_columns: i64 = sidecar
             .mailbox()
             .conn

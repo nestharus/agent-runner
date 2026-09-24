@@ -51,6 +51,7 @@ pub struct FreshRootTerminalReadback {
     pub native_receipt_state: String,
     pub listener_policy: Option<String>,
     pub child_request_id: Option<String>,
+    pub unresolved_child_request_ids: Vec<String>,
     pub mailbox_seq: Option<i64>,
     pub delivery_request_id: Option<String>,
     pub delivery_grant_id: Option<String>,
@@ -280,20 +281,26 @@ impl FreshV30Lane {
         Ok((sha.into(), len))
     }
 
-    fn root_child_request(&self, root_id: &str) -> Result<Option<String>, String> {
+    fn root_child_requests(&self, root_id: &str) -> Result<(Option<String>, Vec<String>), String> {
         let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let mut rows = state
-            .prepare("SELECT request_id FROM fresh_bash_child WHERE root_id=?1 ORDER BY request_id")
+            .prepare("SELECT c.request_id, e.request_id IS NOT NULL FROM fresh_bash_child c
+                      LEFT JOIN fresh_bash_selected_event e ON e.request_id=c.request_id
+                      WHERE c.root_id=?1 ORDER BY c.request_id")
             .map_err(|e| e.to_string())?;
         let ids = rows
-            .query_map([root_id], |r| r.get::<_, String>(0))
+            .query_map([root_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?)))
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
-        if ids.len() > 1 {
-            return Err("multiple child C rows need an explicit terminal selection".into());
+        let selected: Vec<_> = ids.iter().filter(|(_, has_w)| *has_w).collect();
+        if selected.len() > 1 {
+            return Err("multiple accepted child W rows under root".into());
         }
-        Ok(ids.into_iter().next())
+        let selected_id = selected.first().map(|(id, _)| id.clone());
+        let unresolved = ids.into_iter().filter_map(|(id, _)|
+            (Some(&id) != selected_id.as_ref()).then_some(id)).collect();
+        Ok((selected_id, unresolved))
     }
 
     /// Record complete physical work only. A missing parent Q or child W is
@@ -309,7 +316,11 @@ impl FreshV30Lane {
             Ok(parent) => parent,
             Err(_) => return self.read_private_root_terminal(root, actor, session),
         };
-        let child_request_id = self.root_child_request(&root.old_release.prepared.root_id)?;
+        let (child_request_id, unresolved) =
+            self.root_child_requests(&root.old_release.prepared.root_id)?;
+        if child_request_id.is_none() && !unresolved.is_empty() {
+            return self.read_private_root_terminal(root, actor, session);
+        }
         let child_event = match &child_request_id {
             Some(id) => match self.selected_private_bash_event(id) {
                 Ok(event) => Some(event),
@@ -356,8 +367,12 @@ impl FreshV30Lane {
         session: &FreshV30Session,
     ) -> Result<FreshRootTerminalReadback, String> {
         self.require_released_invocation(root, actor, session)?;
-        if let Some(id) = self.root_child_request(&root.old_release.prepared.root_id)? {
-            self.repair_captured_private_bash_source(&id)?;
+        let (selected, unresolved) =
+            self.root_child_requests(&root.old_release.prepared.root_id)?;
+        for id in selected.iter().chain(unresolved.iter()) {
+            self.repair_captured_private_bash_source(id)?;
+        }
+        if let Some(id) = self.root_child_requests(&root.old_release.prepared.root_id)?.0 {
             let child = self.require_complete_bash_child(&id)?;
             if self.require_private_bash_listener(&child, None)? == FreshBashListenerPolicy::Notify
             {
@@ -391,6 +406,7 @@ impl FreshV30Lane {
             native_receipt_state: "not_observed".into(),
             listener_policy: None,
             child_request_id: None,
+            unresolved_child_request_ids: Vec::new(),
             mailbox_seq: None,
             delivery_request_id: None,
             delivery_grant_id: None,
@@ -417,8 +433,13 @@ impl FreshV30Lane {
             .optional()
             .map_err(|e| e.to_string())?;
         let actual_parent = self.physical_root_terminal(root, actor, session);
-        let child_id = self.root_child_request(&result.root_id)?;
+        let (child_id, unresolved) = self.root_child_requests(&result.root_id)?;
         result.child_request_id = child_id.clone();
+        for id in &unresolved {
+            result.artifacts.push(format!("unresolved-child-c:{id}"));
+            result.record_unknown(format!("child_c_unresolved:{id}"));
+        }
+        result.unresolved_child_request_ids = unresolved;
         if let Some(id) = &child_id {
             result.artifacts.push(format!("child-c:{id}"));
         }
@@ -514,6 +535,14 @@ impl FreshV30Lane {
         result.terminal_state = if result.execution_state == "unknown" {
             result.refusal = Some("execution_evidence_incomplete".into());
             "execution_unknown"
+        } else if result.execution_state == "failure"
+            && !result.unresolved_child_request_ids.is_empty()
+        {
+            result.refusal = Some("unresolved_child_admission".into());
+            "execution_failed_child_admission_pending"
+        } else if !result.unresolved_child_request_ids.is_empty() {
+            result.refusal = Some("unresolved_child_admission".into());
+            "execution_completed_child_admission_pending"
         } else if result.execution_state == "failure" {
             "execution_failed"
         } else if matches!(
@@ -684,7 +713,7 @@ impl FreshV30Lane {
         if recipient != identity {
             return Err("terminal F grant recipient conflict".into());
         }
-        result.delivery_request_id = Some(delivery_request);
+        result.delivery_request_id = Some(delivery_request.clone());
         result.delivery_grant_id = Some(grant_id.clone());
         result.artifacts.push(format!("fresh-f-grant:{grant_id}"));
         let read = self
@@ -708,18 +737,40 @@ impl FreshV30Lane {
             "unknown" => "f_unknown",
             "submitted" => "f_submitted_native_pending",
             "acked" => {
-                let delivered: bool = self.sidecar.mailbox().conn.query_row(
-                    "SELECT delivered_at IS NOT NULL FROM mailbox WHERE session_id=?1 AND seq=?2",
-                    params![session.session_id,seq], |r| r.get(0),
-                ).map_err(|e| e.to_string())?;
-                if !delivered { return Err("terminal ACK lacks delivered row".into()); }
-                let basis: Option<String> = self.sidecar.mailbox().conn.query_row(
-                    "SELECT acknowledgement_reason FROM completion_event_listener WHERE mailbox_seq=?1",
-                    [seq], |r| r.get(0),
+                let evidence: Option<(String,String,String)> = self.sidecar.mailbox().conn.query_row(
+                    "SELECT e.basis,e.delivery_token_sha256,g.delivery_token
+                     FROM fresh_recipient_ack_evidence e
+                     JOIN fresh_recipient_grant g ON g.grant_id=e.grant_id
+                     JOIN mailbox m ON m.session_id=e.session_id AND m.seq=e.seq
+                     JOIN fresh_recipient_row_source r ON r.session_id=e.session_id AND r.seq=e.seq
+                     WHERE e.grant_id=?1 AND e.session_id=?2 AND e.seq=?3
+                       AND e.source_id=?4 AND e.attempt_id=?5
+                       AND e.recipient_identity=?6 AND e.payload_sha256=?7
+                       AND e.payload_byte_len=?8 AND e.delivery_request_id=?9
+                       AND g.delivery_request_id=e.delivery_request_id
+                       AND g.session_id=e.session_id AND g.seq=e.seq
+                       AND g.source_id=e.source_id AND g.attempt_id=e.attempt_id
+                       AND g.recipient_identity=e.recipient_identity
+                       AND g.payload_sha256=e.payload_sha256 AND g.payload_byte_len=e.payload_byte_len
+                       AND g.phase='acked' AND g.acknowledged_at=e.acknowledged_at
+                       AND m.delivered_at=e.acknowledged_at
+                       AND m.payload_sha256=e.payload_sha256 AND m.payload_byte_len=e.payload_byte_len
+                       AND r.source_id=e.source_id AND r.attempt_id=e.attempt_id
+                       AND r.payload_sha256=e.payload_sha256 AND r.payload_byte_len=e.payload_byte_len
+                       AND ((e.basis='manual_ack' AND e.delegation_id IS NULL
+                             AND m.delivered_by_invocation_uuid=e.grant_id)
+                         OR (e.basis='delegated_manual_ack' AND e.delegation_id IS NOT NULL
+                             AND m.delivered_by_invocation_uuid=e.delegation_id
+                             AND EXISTS (SELECT 1 FROM fresh_recipient_ack_delegation_item i
+                               JOIN fresh_recipient_ack_delegation d ON d.delegation_id=i.delegation_id
+                               WHERE i.grant_id=e.grant_id AND d.delegation_id=e.delegation_id
+                                 AND d.session_id=e.session_id AND d.consumed_at IS NOT NULL)))",
+                    params![grant_id,session.session_id,seq,source,attempt,identity,sha,len,delivery_request],
+                    |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
                 ).optional().map_err(|e| e.to_string())?;
-                let basis = basis.ok_or("terminal ACK basis absent")?;
-                if !matches!(basis.as_str(), "manual_ack" | "delegated_manual_ack") {
-                    return Err("terminal ACK basis unsupported by private fixture".into());
+                let (basis, token_sha, token) = evidence.ok_or("terminal fresh ACK evidence absent or changed")?;
+                if sha256_hex(token.as_bytes()) != token_sha {
+                    return Err("terminal fresh ACK token conflict".into());
                 }
                 result.ack_basis = Some(basis);
                 "acked"
@@ -739,6 +790,9 @@ impl FreshV30Lane {
         artifact: &[u8],
     ) -> Result<FreshRootTerminalReadback, String> {
         let read = self.read_private_root_terminal(root, actor, session)?;
+        if !read.unresolved_child_request_ids.is_empty() {
+            return Err("root terminal has unresolved child C".into());
+        }
         if read.execution.is_none() || read.execution_state == "unknown" {
             return Err("root terminal execution unknown".into());
         }

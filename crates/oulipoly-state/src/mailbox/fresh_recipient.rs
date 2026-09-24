@@ -449,6 +449,15 @@ impl FreshV30Lane {
         validate_request_id(grant_id)?;
         validate_request_id(token)?;
         let identity_json = Self::recipient_identity_json(recipient)?;
+        let grant = self.read_recipient_delivery(grant_id, recipient)?
+            .ok_or("fresh delivery grant or recipient absent")?;
+        let payload = self.lookup_payload(&grant.lane_id, &grant.session_id, grant.seq)?;
+        if grant.lane_id != self.identity.lane_id
+            || i64::try_from(payload.len()).ok() != Some(grant.payload_byte_len)
+            || sha256_hex(&payload) != grant.payload_sha256
+        {
+            return Err("fresh ACK attachment/source/payload changed".into());
+        }
         let tx = self
             .sidecar
             .mailbox_mut()
@@ -480,18 +489,33 @@ impl FreshV30Lane {
         {
             return Err("fresh recipient row already acknowledged or changed".into());
         }
-        tx.execute(
-            "UPDATE completion_event_listener SET acknowledged_at=COALESCE(acknowledged_at,?2),
-              acknowledgement_reason=COALESCE(acknowledgement_reason,'manual_ack'),
-              retirement_pending=0 WHERE mailbox_seq=?1",
-            params![seq, now],
-        )
-        .map_err(|e| e.to_string())?;
-        tx.execute(
+        if tx.execute(
             "UPDATE fresh_recipient_grant SET phase='acked',acknowledged_at=?2 WHERE grant_id=?1",
             params![grant_id, now],
-        )
-        .map_err(|e| e.to_string())?;
+        ).map_err(|e| e.to_string())? != 1 {
+            return Err("fresh recipient grant changed before ACK".into());
+        }
+        let token_sha = sha256_hex(token.as_bytes());
+        let evidence = tx.execute(
+            "INSERT INTO fresh_recipient_ack_evidence
+             (grant_id,delivery_request_id,delivery_token_sha256,session_id,seq,
+              source_id,attempt_id,recipient_identity,payload_sha256,payload_byte_len,
+              basis,delegation_id,acknowledged_at)
+             SELECT g.grant_id,g.delivery_request_id,?4,g.session_id,g.seq,
+                    g.source_id,g.attempt_id,g.recipient_identity,g.payload_sha256,
+                    g.payload_byte_len,'manual_ack',NULL,?5
+             FROM fresh_recipient_grant g
+             JOIN mailbox m ON m.session_id=g.session_id AND m.seq=g.seq
+             JOIN fresh_recipient_row_source r ON r.session_id=g.session_id AND r.seq=g.seq
+             WHERE g.grant_id=?1 AND g.delivery_token=?2 AND g.recipient_identity=?3
+               AND g.phase='acked' AND g.acknowledged_at=?5
+               AND m.delivered_at=?5 AND m.delivered_by_invocation_uuid=?1
+               AND m.payload_sha256=g.payload_sha256 AND m.payload_byte_len=g.payload_byte_len
+               AND r.source_id=g.source_id AND r.attempt_id=g.attempt_id
+               AND r.payload_sha256=g.payload_sha256 AND r.payload_byte_len=g.payload_byte_len",
+            params![grant_id,token,identity_json,token_sha,now],
+        ).map_err(|e| e.to_string())?;
+        if evidence != 1 { return Err("fresh ACK lacks exact row/source/grant/token".into()); }
         tx.commit().map_err(|e| e.to_string())?;
         self.read_recipient_delivery(grant_id, recipient)?
             .ok_or("ACK readback absent".into())
@@ -603,6 +627,13 @@ impl FreshV30Lane {
             let grant = self
                 .read_recipient_delivery(grant_id, owner)?
                 .ok_or("delegated grant does not belong to recipient")?;
+            let payload = self.lookup_payload(&grant.lane_id, &grant.session_id, grant.seq)?;
+            if grant.lane_id != self.identity.lane_id
+                || i64::try_from(payload.len()).ok() != Some(grant.payload_byte_len)
+                || sha256_hex(&payload) != grant.payload_sha256
+            {
+                return Err("delegated ACK attachment/source/payload changed".into());
+            }
             if grant.phase == "acked" {
                 return Err("delegated grant already acknowledged".into());
             }
@@ -661,6 +692,26 @@ impl FreshV30Lane {
     ) -> Result<FreshAckDelegation, String> {
         validate_request_id(delegation_id)?;
         let delegate_json = Self::recipient_identity_json(delegate)?;
+        let retained = self.sidecar.mailbox().conn.prepare(
+            "SELECT g.session_id,g.seq,g.payload_sha256,g.payload_byte_len
+             FROM fresh_recipient_ack_delegation d
+             JOIN fresh_recipient_ack_delegation_item i ON i.delegation_id=d.delegation_id
+             JOIN fresh_recipient_grant g ON g.grant_id=i.grant_id
+             WHERE d.delegation_id=?1 AND d.delegate_identity=?2 AND d.consumed_at IS NULL"
+        ).map_err(|e| e.to_string())?.query_map(params![delegation_id,delegate_json], |r| {
+            Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,
+                r.get::<_,String>(2)?,r.get::<_,i64>(3)?))
+        }).map_err(|e| e.to_string())?.collect::<Result<Vec<_>,_>>()
+            .map_err(|e| e.to_string())?;
+        if retained.is_empty() || retained.len() > 32 {
+            return Err("delegated ACK authority or rows absent".into());
+        }
+        for (session, seq, sha, len) in &retained {
+            let payload = self.lookup_payload(&self.identity.lane_id, session, *seq)?;
+            if i64::try_from(payload.len()).ok() != Some(*len) || sha256_hex(&payload) != *sha {
+                return Err("delegated ACK attachment/source/payload changed".into());
+            }
+        }
         let tx = self
             .sidecar
             .mailbox_mut()
@@ -679,7 +730,7 @@ impl FreshV30Lane {
             .ok_or("delegated ACK authority absent")?;
         let grants = tx
             .prepare(
-                "SELECT g.grant_id,g.seq,g.payload_sha256,g.payload_byte_len
+                "SELECT g.grant_id,g.seq,g.payload_sha256,g.payload_byte_len,g.delivery_token
              FROM fresh_recipient_ack_delegation_item i
              JOIN fresh_recipient_grant g ON g.grant_id=i.grant_id
              WHERE i.delegation_id=?1 AND g.session_id=?2 AND g.phase!='acked'
@@ -692,6 +743,7 @@ impl FreshV30Lane {
                     r.get::<_, i64>(1)?,
                     r.get::<_, String>(2)?,
                     r.get::<_, i64>(3)?,
+                    r.get::<_, String>(4)?,
                 ))
             })
             .map_err(|e| e.to_string())?
@@ -708,7 +760,7 @@ impl FreshV30Lane {
             return Err("delegated ACK batch is incomplete or changed".into());
         }
         let now = Utc::now().to_rfc3339();
-        for (grant_id, seq, sha, len) in &grants {
+        for (grant_id, seq, sha, len, token) in &grants {
             if tx
                 .execute(
                     "UPDATE mailbox SET delivered_at=?3,delivered_by_invocation_uuid=?4,
@@ -722,17 +774,36 @@ impl FreshV30Lane {
             {
                 return Err("delegated ACK row changed".into());
             }
-            tx.execute(
-                "UPDATE completion_event_listener SET acknowledged_at=COALESCE(acknowledged_at,?2),
-                  acknowledgement_reason=COALESCE(acknowledgement_reason,'delegated_manual_ack'),
-                  retirement_pending=0 WHERE mailbox_seq=?1",
-                params![seq, now],
-            )
-            .map_err(|e| e.to_string())?;
-            tx.execute(
+            if tx.execute(
                 "UPDATE fresh_recipient_grant SET phase='acked',acknowledged_at=?2 WHERE grant_id=?1",
                 params![grant_id, now],
+            ).map_err(|e| e.to_string())? != 1 {
+                return Err("delegated fresh grant changed before ACK".into());
+            }
+            let token_sha = sha256_hex(token.as_bytes());
+            let evidence = tx.execute(
+                "INSERT INTO fresh_recipient_ack_evidence
+                 (grant_id,delivery_request_id,delivery_token_sha256,session_id,seq,
+                  source_id,attempt_id,recipient_identity,payload_sha256,payload_byte_len,
+                  basis,delegation_id,acknowledged_at)
+                 SELECT g.grant_id,g.delivery_request_id,?4,g.session_id,g.seq,
+                        g.source_id,g.attempt_id,g.recipient_identity,g.payload_sha256,
+                        g.payload_byte_len,'delegated_manual_ack',?3,?5
+                 FROM fresh_recipient_grant g
+                 JOIN mailbox m ON m.session_id=g.session_id AND m.seq=g.seq
+                 JOIN fresh_recipient_row_source r ON r.session_id=g.session_id AND r.seq=g.seq
+                 JOIN fresh_recipient_ack_delegation_item i ON i.grant_id=g.grant_id
+                 JOIN fresh_recipient_ack_delegation d ON d.delegation_id=i.delegation_id
+                 WHERE g.grant_id=?1 AND g.delivery_token=?2 AND d.delegation_id=?3
+                   AND d.session_id=g.session_id AND d.delegate_identity=?6
+                   AND g.phase='acked' AND g.acknowledged_at=?5
+                   AND m.delivered_at=?5 AND m.delivered_by_invocation_uuid=?3
+                   AND m.payload_sha256=g.payload_sha256 AND m.payload_byte_len=g.payload_byte_len
+                   AND r.source_id=g.source_id AND r.attempt_id=g.attempt_id
+                   AND r.payload_sha256=g.payload_sha256 AND r.payload_byte_len=g.payload_byte_len",
+                params![grant_id,token,delegation_id,token_sha,now,delegate_json],
             ).map_err(|e| e.to_string())?;
+            if evidence != 1 { return Err("delegated ACK lacks exact row/source/grant/token".into()); }
         }
         tx.execute(
             "UPDATE fresh_recipient_ack_delegation SET consumed_at=?2 WHERE delegation_id=?1
@@ -744,7 +815,7 @@ impl FreshV30Lane {
         Ok(FreshAckDelegation {
             delegation_id: delegation_id.into(),
             session_id,
-            grant_ids: grants.into_iter().map(|(id, _, _, _)| id).collect(),
+            grant_ids: grants.into_iter().map(|(id, _, _, _, _)| id).collect(),
         })
     }
 }

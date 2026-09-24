@@ -1515,6 +1515,28 @@ fn inner() {
                     &source
                 );
                 assert_eq!(terminal.publication_state, "not_started");
+                assert_eq!(
+                    terminal.child_request_id.as_deref(),
+                    Some(bash_request.as_str())
+                );
+                assert_eq!(
+                    terminal.unresolved_child_request_ids,
+                    vec![partial.request_id.clone()]
+                );
+                assert_eq!(
+                    terminal.refusal.as_deref(),
+                    Some("unresolved_child_admission")
+                );
+                assert_eq!(terminal.execution_state, "failure");
+                assert_eq!(
+                    terminal.terminal_state,
+                    "execution_failed_child_admission_pending"
+                );
+                assert!(
+                    terminal
+                        .artifacts
+                        .contains(&format!("unresolved-child-c:{}", partial.request_id))
+                );
                 assert_eq!(terminal.native_receipt_state, "not_observed");
                 assert_eq!(
                     terminal.listener_policy.as_deref(),
@@ -1555,16 +1577,15 @@ fn inner() {
                     )
                     .is_err()
                 );
-                let presentation = lane
-                    .begin_private_root_publication(
+                assert!(
+                    lane.begin_private_root_publication(
                         &terminal_root,
                         &terminal_actor,
                         &terminal_session,
-                        b"private caller output and control marker\n",
+                        b"cannot claim all work while another C remains unresolved\n"
                     )
-                    .unwrap();
-                assert_eq!(presentation.publication_state, "unknown");
-                assert_eq!(presentation.execution_state, terminal.execution_state);
+                    .is_err()
+                );
                 assert!(
                     lane.begin_private_root_publication(
                         &terminal_root,
@@ -1596,7 +1617,7 @@ fn inner() {
                     .read_private_root_terminal(&terminal_root, &terminal_actor, &terminal_session)
                     .unwrap();
                 assert_eq!(replay.execution, terminal.execution);
-                assert_eq!(replay.publication_state, "unknown");
+                assert_eq!(replay.publication_state, "not_started");
                 assert_eq!(
                     reopened
                         .settle_private_root_terminal(
