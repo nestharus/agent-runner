@@ -88,7 +88,7 @@ fn require_cutover_entry_route(
     broker_owned_sidecar: bool,
     gate_closed: bool,
 ) -> io::Result<()> {
-    if matches!(operation, b'i' | b'v' | b'X' | b'x') {
+    if matches!(operation, b'i' | b'v' | b'X' | b'x' | b'D') {
         return Ok(());
     }
     if gate_closed {
@@ -2355,11 +2355,18 @@ fn serve() -> io::Result<()> {
                     "installed-pair-v1 {} {} {route}\n",
                     pair.version, pair.generation
                 ))
-            } else if operation == b'X' || operation == b'x' {
+            } else if matches!(operation, b'X' | b'x' | b'D') {
                 if peer.uid != 0 || !peer.process.in_namespace(&host_namespace)? {
                     return Err(io::Error::other("host-root gate transition required"));
                 }
-                if operation == b'X' {
+                if operation == b'D' {
+                    Ok(if entry_gate.fixed_image_writers_drained()? {
+                        "fixed-writer-drain-v1 drained\n"
+                    } else {
+                        "fixed-writer-drain-v1 pending\n"
+                    }
+                    .into())
+                } else if operation == b'X' {
                     entry_gate.close()?;
                     Ok("entry-gate-v1 draining\n".into())
                 } else {
@@ -2854,7 +2861,7 @@ mod tests {
             assert!(require_cutover_entry_route(operation, false, false).is_err());
             assert!(require_cutover_entry_route(operation, true, true).is_err());
         }
-        for operation in [b'i', b'X', b'x'] {
+        for operation in [b'i', b'X', b'x', b'D'] {
             assert!(require_cutover_entry_route(operation, true, true).is_ok());
         }
         for operation in [

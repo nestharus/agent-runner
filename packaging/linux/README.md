@@ -19,7 +19,17 @@ An old or replaced image, absent or old broker, changed image, draining gate,
 or v30 route refuses. Direct invocation through the staged CLI and GUI links
 also refuses: the only currently admitted fixed-image entry is an explicit
 broker-owned host or child path, and host mode accepts only help/offline
-diagnostics. This check is per new process, not a continuing lease.
+diagnostics. Each fixed Runner holds a read lease on the durable root-owned
+`/var/lib/oulipoly-kernel-broker/entry-admission.lock` for its process lifetime.
+The broker closes X durably before checking that all such leases have exited;
+the root-only `D` observation reports only this fixed-image drain. The state
+directory grants the `oulipoly` group search access for this lock, without
+granting access to broker State. Old Runner images and already-running old
+helpers do not hold this lease and remain separate cutover debt.
+Handle-local copies whose bytes match the installed Runner digest take the
+same lease and check the broker's legacy route before doing direct work. A
+different older cached helper remains outside this binary protocol and must
+be found in the old actor inventory.
 
 ## Cutover requirements still open
 

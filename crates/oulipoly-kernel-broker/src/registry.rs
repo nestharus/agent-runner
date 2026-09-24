@@ -98,8 +98,10 @@ impl RootRegistry {
             // EntryGate::open validated these exact files and holds the
             // singleton lock before this registry scan. Unknown files still
             // stop recovery rather than being mistaken for root records.
-            if matches!(name.as_ref(), "entry-gate.lock" | "entry-gate.v1")
-                && entry.file_type()?.is_file()
+            if matches!(
+                name.as_ref(),
+                "entry-gate.lock" | "entry-gate.v1" | "entry-admission.lock"
+            ) && entry.file_type()?.is_file()
             {
                 continue;
             }

@@ -1,7 +1,9 @@
 //! Host-side pinned completion authority and broker-attested root child join.
+use oulipoly_kernel_broker::cutover_gate::FixedImageAdmission;
 use oulipoly_kernel_broker::installed_pair::{self, InstalledPair};
 use oulipoly_kernel_broker::protocol::{self, EntryRoute, JoinSpec, Operation, StateRoute};
 use oulipoly_state::mailbox::MailboxDb;
+use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -45,17 +47,20 @@ fn private_v30_child_mode() -> bool {
 const REQUIRED_ENV: &str = "OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1";
 const CHILD_FD_ENV: &str = "OULIPOLY_KERNEL_CHILD_JOIN_FD_V1";
 const INSTALLED_RUNNER: &str = "/usr/local/libexec/oulipoly/oulipoly-agent-runner";
+const INSTALLED_BROKER_STATE: &str = "/var/lib/oulipoly-kernel-broker";
 
 /// The fixed installed image and the explicit kernel entry path must consult
 /// broker-owned ingress state before worker, helper, CLI, GUI, or State work.
 /// A missing broker is an admission refusal for those supported paths.
-pub(crate) fn verify_installed_entry_route() -> Result<(), String> {
+pub(crate) fn verify_installed_entry_route() -> Result<Option<FixedImageAdmission>, String> {
     let image = std::env::current_exe()
         .map_err(|error| format!("cannot identify Runner image: {error}"))?;
-    if !needs_installed_entry_gate(&image, std::env::var_os(REQUIRED_ENV).is_some()) {
-        return Ok(());
-    }
     if is_fixed_installed_image(&image) {
+        // This lifetime lease covers direct State/mailbox writes made later in
+        // this process. X closes broker admission first; its separate drain
+        // probe then waits for every earlier fixed-image lease to disappear.
+        let admission = FixedImageAdmission::acquire(std::path::Path::new(INSTALLED_BROKER_STATE))
+            .map_err(|error| format!("installed writer admission unavailable: {error}"))?;
         let pair = InstalledPair::load(std::path::Path::new(installed_pair::MANIFEST), true)
             .map_err(|error| format!("installed pair manifest unavailable: {error}"))?;
         pair.verify_image(
@@ -67,10 +72,25 @@ pub(crate) fn verify_installed_entry_route() -> Result<(), String> {
         let observation = protocol::observe_installed_pair_at(&broker_socket())
             .map_err(|error| format!("installed pair broker unavailable: {error}"))?;
         require_pair_route(&pair, &observation)?;
-        return require_paired_launch_mode(
+        require_paired_launch_mode(
             std::env::var_os(REQUIRED_ENV).is_some(),
             std::env::var_os(CHILD_FD_ENV).is_some(),
-        );
+        )?;
+        return Ok(Some(admission));
+    }
+    // Bash snapshots its configured Runner into a handle-local helper path.
+    // Match the installed image bytes, not that path, before direct v29 work.
+    // Older snapshots with a different digest remain inventory debt.
+    if matches_installed_runner_digest()? {
+        let admission = FixedImageAdmission::acquire(std::path::Path::new(INSTALLED_BROKER_STATE))
+            .map_err(|error| format!("installed helper admission unavailable: {error}"))?;
+        let route = protocol::observe_entry_gate_at(&broker_socket())
+            .map_err(|error| format!("installed helper broker unavailable: {error}"))?;
+        require_legacy_entry_route(route)?;
+        return Ok(Some(admission));
+    }
+    if !needs_installed_entry_gate(&image, std::env::var_os(REQUIRED_ENV).is_some()) {
+        return Ok(None);
     }
     let route = protocol::observe_entry_gate_at(&broker_socket())
         .map_err(|error| format!("installed broker entry gate unavailable: {error}"))?;
@@ -78,9 +98,29 @@ pub(crate) fn verify_installed_entry_route() -> Result<(), String> {
     if route == EntryRoute::BrokerV30Closed
         && (private_prepared_mode() || private_normal_mode() || private_v30_child_mode())
     {
-        return Ok(());
+        return Ok(None);
     }
-    require_legacy_entry_route(route)
+    require_legacy_entry_route(route)?;
+    Ok(None)
+}
+
+fn matches_installed_runner_digest() -> Result<bool, String> {
+    let manifest = std::path::Path::new(installed_pair::MANIFEST);
+    if !manifest.exists() {
+        return Ok(false);
+    }
+    let pair = InstalledPair::load(manifest, true)
+        .map_err(|error| format!("installed pair manifest unavailable: {error}"))?;
+    let mut running = File::open("/proc/self/exe")
+        .map_err(|error| format!("cannot open Runner image: {error}"))?;
+    image_matches_digest(&mut running, &pair.runner_sha256)
+}
+
+fn image_matches_digest(running: &mut File, expected: &str) -> Result<bool, String> {
+    let mut digest = Sha256::new();
+    std::io::copy(running, &mut digest)
+        .map_err(|error| format!("cannot hash Runner image: {error}"))?;
+    Ok(format!("{:x}", digest.finalize()) == expected)
 }
 
 fn needs_installed_entry_gate(image: &std::path::Path, explicit_kernel_entry: bool) -> bool {
@@ -1612,6 +1652,19 @@ fn join_child(
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn handle_local_runner_copy_matches_exact_installed_digest() {
+        let directory = tempfile::tempdir().unwrap();
+        let installed = directory.path().join("installed-runner");
+        let cached = directory.path().join("handle-local-helper");
+        std::fs::write(&installed, b"paired-runner-image").unwrap();
+        std::fs::copy(&installed, &cached).unwrap();
+        let expected = format!("{:x}", Sha256::digest(b"paired-runner-image"));
+        assert!(image_matches_digest(&mut File::open(&cached).unwrap(), &expected).unwrap());
+        std::fs::write(&cached, b"older-runner-image").unwrap();
+        assert!(!image_matches_digest(&mut File::open(&cached).unwrap(), &expected).unwrap());
+    }
 
     #[test]
     fn installed_image_refuses_draining_and_unrouteable_v30() {

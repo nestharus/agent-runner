@@ -4,12 +4,13 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 const OPEN: &[u8] = b"oulipoly-entry-gate-v1 open\n";
 const CLOSED: &[u8] = b"oulipoly-entry-gate-v1 closed\n";
+pub const ADMISSION_LOCK: &str = "entry-admission.lock";
 static PROCESS_INSTANCES: OnceLock<Mutex<std::collections::BTreeSet<(u64, u64)>>> = OnceLock::new();
 
 fn process_instances() -> &'static Mutex<std::collections::BTreeSet<(u64, u64)>> {
@@ -21,6 +22,7 @@ pub struct EntryGate {
     // A second broker must not bind a fresh socket while the first one can
     // still admit requests. The lock is held for this process's lifetime.
     _instance: File,
+    admission: File,
     directory_identity: (u64, u64),
     closed: bool,
 }
@@ -72,6 +74,7 @@ impl EntryGate {
         if unsafe { libc::fcntl(instance.as_raw_fd(), libc::F_SETLK, &lock) } != 0 {
             return Err(io::Error::last_os_error());
         }
+        let marker_exists = directory.join("entry-gate.v1").exists();
         let closed = match fs::symlink_metadata(directory.join("entry-gate.v1")) {
             Ok(_) => {
                 let path = directory.join("entry-gate.v1");
@@ -93,9 +96,17 @@ impl EntryGate {
             Err(error) if error.kind() == io::ErrorKind::NotFound => false,
             Err(error) => return Err(error),
         };
+        // The lock inode is durable. Recreating it after an interrupted close
+        // could detach leases held by an earlier Runner incarnation.
+        let admission_path = directory.join(ADMISSION_LOCK);
+        if marker_exists && !admission_path.exists() {
+            return Err(io::Error::other("durable gate lost admission lock inode"));
+        }
+        let admission = open_admission_lock(&admission_path, true)?;
         Ok(Self {
             directory: directory.to_owned(),
             _instance: instance,
+            admission,
             directory_identity: identity,
             closed,
         })
@@ -103,6 +114,28 @@ impl EntryGate {
 
     pub fn is_closed(&self) -> bool {
         self.closed
+    }
+
+    /// A stable negative result means a fixed-image Runner admitted before X
+    /// still owns a process-lifetime lease. A positive result covers only
+    /// those fixed-image processes; old unfenced binaries remain separate debt.
+    pub fn fixed_image_writers_drained(&self) -> io::Result<bool> {
+        if !self.closed {
+            return Err(io::Error::other("fixed-image drain requires closed gate"));
+        }
+        let lock = record_lock(libc::F_WRLCK as _);
+        if unsafe { libc::fcntl(self.admission.as_raw_fd(), libc::F_SETLK, &lock) } != 0 {
+            let error = io::Error::last_os_error();
+            if matches!(error.raw_os_error(), Some(libc::EACCES | libc::EAGAIN)) {
+                return Ok(false);
+            }
+            return Err(error);
+        }
+        let unlock = record_lock(libc::F_UNLCK as _);
+        if unsafe { libc::fcntl(self.admission.as_raw_fd(), libc::F_SETLK, &unlock) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(true)
     }
 
     /// Called only by an authenticated host-root administrative operation in
@@ -128,6 +161,11 @@ impl EntryGate {
         if !self.closed {
             return Ok(());
         }
+        if !self.fixed_image_writers_drained()? {
+            return Err(io::Error::other(
+                "fixed-image writers remain before gate abort",
+            ));
+        }
         self.persist(OPEN)?;
         self.closed = false;
         Ok(())
@@ -149,6 +187,74 @@ impl EntryGate {
         fs::rename(temporary, path)?;
         File::open(&self.directory)?.sync_all()
     }
+}
+
+/// Hold this guard for the entire Runner invocation. A caller must obtain it
+/// before asking the broker for its route. X may close admission meanwhile,
+/// but the broker cannot report a drained fixed-image generation until this
+/// process exits. The guard never grants v30 State authority.
+pub struct FixedImageAdmission {
+    _file: File,
+}
+
+impl FixedImageAdmission {
+    pub fn acquire(directory: &Path) -> io::Result<Self> {
+        let file = open_admission_lock(&directory.join(ADMISSION_LOCK), false)?;
+        let lock = record_lock(libc::F_RDLCK as _);
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLKW, &lock) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { _file: file })
+    }
+}
+
+fn record_lock(kind: libc::c_short) -> libc::flock {
+    libc::flock {
+        l_type: kind,
+        l_whence: libc::SEEK_SET as _,
+        l_start: 1,
+        l_len: 1,
+        l_pid: 0,
+    }
+}
+
+fn open_admission_lock(path: &Path, create: bool) -> io::Result<File> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("missing admission parent"))?;
+    let directory = fs::symlink_metadata(parent)?;
+    if !directory.is_dir() || directory.file_type().is_symlink() || directory.mode() & 0o022 != 0 {
+        return Err(io::Error::other("unsafe admission directory"));
+    }
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    if create {
+        options.write(true);
+    }
+    let file = if create && !path.exists() {
+        let file = options.create_new(true).mode(0o640).open(path)?;
+        // Broker startup precedes socket binding. Set exact read-only group
+        // access even when the process umask is stricter than the unit mode.
+        file.set_permissions(fs::Permissions::from_mode(0o640))?;
+        file
+    } else {
+        options.open(path)?
+    };
+    let opened = file.metadata()?;
+    let named = fs::symlink_metadata(path)?;
+    if !opened.is_file()
+        || named.file_type().is_symlink()
+        || opened.dev() != named.dev()
+        || opened.ino() != named.ino()
+        || opened.nlink() != 1
+        || opened.uid() != directory.uid()
+        || opened.mode() & 0o777 != 0o640
+    {
+        return Err(io::Error::other("unsafe fixed-image admission lock"));
+    }
+    Ok(file)
 }
 
 impl Drop for EntryGate {
@@ -180,6 +286,7 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn close_is_durable_singleton_and_never_reopens_after_restart() {
@@ -266,6 +373,12 @@ mod tests {
     fn active_direct_writer_with_wal_and_shm_survives_ingress_closure() {
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("pid-identity.db");
+        let retired_state = rusqlite::Connection::open(directory.path().join("state.db")).unwrap();
+        retired_state
+            .execute_batch(
+                "CREATE TABLE old_effects(v INTEGER); INSERT INTO old_effects VALUES(1);",
+            )
+            .unwrap();
         let connection = rusqlite::Connection::open(&source).unwrap();
         connection
             .execute_batch(
@@ -278,9 +391,81 @@ mod tests {
         let mut gate = EntryGate::open(directory.path()).unwrap();
         gate.close().unwrap();
         connection.execute("INSERT INTO t VALUES(2)", []).unwrap();
+        retired_state
+            .execute("INSERT INTO old_effects VALUES(2)", [])
+            .unwrap();
+        assert!(
+            gate.fixed_image_writers_drained().unwrap(),
+            "an unleased old writer is invisible to the fixed-image drain"
+        );
         let count: i64 = connection
             .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 2, "the ingress latch cannot prove writer quiescence");
+        let state_count: i64 = retired_state
+            .query_row("SELECT count(*) FROM old_effects", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(state_count, 2, "X cannot stop an old direct State writer");
+    }
+
+    #[test]
+    fn fixed_image_lease_remains_debt_across_close_and_broker_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut gate = EntryGate::open(directory.path()).unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "cutover_gate::tests::fixed_image_lease_child"])
+            .env("OULIPOLY_LEASE_TEST_DIRECTORY", directory.path())
+            .spawn()
+            .unwrap();
+        let ready = directory.path().join("lease-ready");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !ready.exists() {
+            assert!(Instant::now() < deadline, "lease child failed to start");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        gate.close().unwrap();
+        assert!(!gate.fixed_image_writers_drained().unwrap());
+        assert!(gate.abort_before_publication().is_err());
+        drop(gate);
+        let mut restarted = EntryGate::open(directory.path()).unwrap();
+        assert!(restarted.is_closed());
+        assert!(!restarted.fixed_image_writers_drained().unwrap());
+        fs::write(directory.path().join("lease-release"), b"go").unwrap();
+        assert!(child.wait().unwrap().success());
+        assert!(restarted.fixed_image_writers_drained().unwrap());
+        restarted.abort_before_publication().unwrap();
+        assert!(!restarted.is_closed());
+        let _new_lease = FixedImageAdmission::acquire(directory.path()).unwrap();
+    }
+
+    #[test]
+    fn fixed_image_lease_child() {
+        let Some(directory) = std::env::var_os("OULIPOLY_LEASE_TEST_DIRECTORY") else {
+            return;
+        };
+        let directory = Path::new(&directory);
+        let _lease = FixedImageAdmission::acquire(directory).unwrap();
+        fs::write(directory.join("lease-ready"), b"ready").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !directory.join("lease-release").exists() {
+            assert!(
+                Instant::now() < deadline,
+                "test parent did not release lease"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn existing_marker_with_missing_or_replaced_lease_refuses_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut gate = EntryGate::open(directory.path()).unwrap();
+        gate.close().unwrap();
+        drop(gate);
+        let lock = directory.path().join(ADMISSION_LOCK);
+        fs::remove_file(&lock).unwrap();
+        assert!(EntryGate::open(directory.path()).is_err());
+        std::os::unix::fs::symlink("replacement", &lock).unwrap();
+        assert!(EntryGate::open(directory.path()).is_err());
     }
 }

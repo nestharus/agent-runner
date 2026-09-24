@@ -65,7 +65,10 @@
 | A sibling child tries to bind a prepared guardian's root ID. | Refused on pinned guardian incarnation mismatch. |
 | Legacy `L` request. | Refused; no ungated Runner is released. |
 | Host root closes broker ingress with X, then broker restarts. | Durable draining marker refuses ordinary broker opcodes; challenged i reports draining from broker-owned state. |
+| A fixed installed Runner or exact-digest handle-local copy starts before X. | It holds a process-lifetime read lease on the protected admission inode before route observation. Root-only D stays pending after X and broker restart until that process exits; the broker never treats D as a full old-writer proof. |
+| A fixed installed Runner or exact-digest copy starts after X. | It observes draining and exits before CLI, GUI, wake, helper or direct State work. A missing or replaced admission inode refuses broker recovery instead of detaching earlier leases. |
 | A prerequisite fails before fixed sidecar publication, or fixed sidecar exists. | Explicit host-root x can resume legacy admission only before publication; publication makes abort refuse. |
+| A fixed-image process still owns a lease when prepublication x is requested. | Abort refuses until that process exits. Older unleased binaries and Bash descendants remain a separate installer-owned blocker even after D reports drained. |
 | A direct SQLite writer retains main/WAL/SHM handles after ingress closes. | Writer remains live, so the latch gives no `QuiescedCutoverProof` and cannot authorize migration. |
 | A pinned process retains main/WAL/SHM handles or an unlinked old WAL handle. | Broker-side census reports exact PID incarnation, executable inode and each handle as a blocker; a dead or changed PID does not count as the same writer. An empty scan is not a certificate. |
 | Private bounded observation is supplied two live direct WAL writers and a paused helper after X. | It records all three exact process/image identities and the writers' main/WAL/SHM FDs. FD close/reopen and helper delay keep the recorded-exit check false; after all three exit, a newly spawned old writer shows that this bounded observation is still not a production proof. |
@@ -92,6 +95,7 @@
 - Classification is never positive work authority.
 - The source has no service-requiring CLI, TTY/GUI handoff, accepted-work launch, clean physical drain receipt, or retirement operation. H prepares a guardian grant without consumption or launch. Help/offline diagnostics have an authenticated one-use root child join and host-side owner-socket verification. Maintenance and provider PID transport remain incomplete.
 - The unprivileged user-namespace fixture cannot establish host-root sudo/setuid behavior.
+- The fixed-image lease and D observation do not include preinstalled binaries, historical Bash helper snapshots, unpaired entry paths, or forked descendants that do not exec the paired image. No `QuiescedCutoverProof` follows from D alone.
 - Ordinary Runner/Bash entry and allocated-attempt NNP/seccomp remain. The opt-in entry keeps the host guardian outside the root PID namespace and releases only the fixed Runner for help/offline diagnostics.
 
 ## Declared test patterns

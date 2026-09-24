@@ -59,10 +59,13 @@ use crate::usage::cli::Cli;
 
 fn main() -> ExitCode {
     #[cfg(target_os = "linux")]
-    if let Err(error) = kernel_entry::verify_installed_entry_route() {
-        eprintln!("OULIPOLY_KERNEL_ENTRY_GAP={error}");
-        return ExitCode::FAILURE;
-    }
+    let _installed_writer_admission = match kernel_entry::verify_installed_entry_route() {
+        Ok(admission) => admission,
+        Err(error) => {
+            eprintln!("OULIPOLY_KERNEL_ENTRY_GAP={error}");
+            return ExitCode::FAILURE;
+        }
+    };
     ordinary_entrypoint(production_entrypoint)
 }
 

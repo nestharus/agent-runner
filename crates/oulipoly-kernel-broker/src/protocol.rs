@@ -407,6 +407,7 @@ pub enum Operation {
     ObserveInstalledPair,
     CloseEntryGate,
     AbortEntryGate,
+    ObserveFixedWriterDrain,
     ReserveEntry,
     ReadEntry,
     ReadStateRoute,
@@ -1179,6 +1180,16 @@ pub fn abort_entry_gate_at(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Root-only observation of fixed-image leases after X. Old binaries and
+/// unpaired helpers are outside this observation and still block publication.
+pub fn observe_fixed_writer_drain_at(path: &Path) -> io::Result<bool> {
+    match request_at(path, Operation::ObserveFixedWriterDrain)?.as_str() {
+        "fixed-writer-drain-v1 pending\n" => Ok(false),
+        "fixed-writer-drain-v1 drained\n" => Ok(true),
+        _ => Err(io::Error::other("invalid fixed-writer drain response")),
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Payload {
     None,
@@ -1281,6 +1292,7 @@ fn request_frame_at(path: &Path, operation: Operation, payload: Payload) -> io::
             | Operation::ObserveInstalledPair
             | Operation::CloseEntryGate
             | Operation::AbortEntryGate
+            | Operation::ObserveFixedWriterDrain
     ) {
         let timeout = Some(std::time::Duration::from_secs(5));
         stream.set_read_timeout(timeout)?;
@@ -1295,6 +1307,7 @@ fn request_frame_at(path: &Path, operation: Operation, payload: Payload) -> io::
         Operation::ObserveInstalledPair => b'v',
         Operation::CloseEntryGate => b'X',
         Operation::AbortEntryGate => b'x',
+        Operation::ObserveFixedWriterDrain => b'D',
         Operation::ReserveEntry if matches!(payload, Payload::Prepare(..)) => b'P',
         Operation::ReserveEntry if matches!(payload, Payload::Bind(..)) => b'G',
         Operation::ReserveEntry => b'E',
