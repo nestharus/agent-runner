@@ -2,6 +2,8 @@
 //! open handles, including unlinked WAL/SHM files. An empty result is NOT a
 //! quiescence certificate: new processes and new FDs can race this scan until
 //! an installed supervisor fences every supported launcher and respawn path.
+#[cfg(any(test, feature = "age319-private-broker-fixture"))]
+use crate::cutover_gate::EntryGate;
 use crate::entry_registry::ProcessStamp;
 use crate::identity::{PinnedProcess, has_detached_host_proc, host_proc_file};
 use std::ffi::{CString, OsStr};
@@ -27,6 +29,100 @@ pub struct OpenStateHandle {
     pub fd: i32,
     pub artifact: Artifact,
     pub deleted: bool,
+}
+
+/// A bounded observation of explicitly supplied old actors. The pidfds stay
+/// open, so an FD close/reopen cannot make a still-running actor look joined.
+/// This is deliberately not a cutover proof: callers must independently own
+/// the complete launcher/registration inventory, prevent respawn, join every
+/// process tree, and hold that fence through snapshot publication.
+#[cfg(any(test, feature = "age319-private-broker-fixture"))]
+pub struct BoundedWriterObservation {
+    actors: Vec<PinnedProcess>,
+    actor_images: Vec<ObservedActor>,
+    observed_handles: Vec<OpenStateHandle>,
+}
+
+#[cfg(any(test, feature = "age319-private-broker-fixture"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObservedActor {
+    pub process: ProcessStamp,
+    pub executable_dev: u64,
+    pub executable_ino: u64,
+}
+
+#[cfg(any(test, feature = "age319-private-broker-fixture"))]
+impl BoundedWriterObservation {
+    /// Capture known actors after the broker ingress latch has closed. An
+    /// actor without an open State FD (for example a paused Bash helper) is
+    /// still retained until its exact process incarnation exits.
+    pub fn capture(
+        gate: &EntryGate,
+        source: &Path,
+        actors: Vec<PinnedProcess>,
+    ) -> io::Result<Self> {
+        if !gate.is_closed() || actors.is_empty() {
+            return Err(io::Error::other(
+                "bounded writer observation requires a closed gate and explicit actors",
+            ));
+        }
+        let files = source_files(source)?;
+        let mut stamps = std::collections::BTreeSet::new();
+        let mut actor_images = Vec::new();
+        let mut observed_handles = Vec::new();
+        for actor in &actors {
+            actor.verify()?;
+            let stamp = ProcessStamp::from(actor);
+            if !stamps.insert((
+                stamp.host_pid,
+                stamp.boot_id.clone(),
+                stamp.starttime_ticks,
+                stamp.pidns_dev,
+                stamp.pidns_ino,
+            )) {
+                return Err(io::Error::other("duplicate old writer incarnation"));
+            }
+            let image = host_proc_file(&format!("{}/exe", actor.host_pid))?.metadata()?;
+            actor.verify()?;
+            actor_images.push(ObservedActor {
+                process: stamp,
+                executable_dev: image.dev(),
+                executable_ino: image.ino(),
+            });
+            observe_process_handles(actor, &files, &mut observed_handles)?;
+        }
+        for (index, file) in files.iter().enumerate() {
+            if file_identity(&file.path, index == 0)? != file.identity {
+                return Err(io::Error::other(
+                    "State artifact changed during bounded observation",
+                ));
+            }
+        }
+        Ok(Self {
+            actors,
+            actor_images,
+            observed_handles,
+        })
+    }
+
+    pub fn observed_actors(&self) -> &[ObservedActor] {
+        &self.actor_images
+    }
+
+    pub fn observed_handles(&self) -> &[OpenStateHandle] {
+        &self.observed_handles
+    }
+
+    /// Exited is intentionally weaker than joined. In particular this says
+    /// nothing about descendants or a new instance admitted after capture.
+    pub fn all_recorded_exited(&self) -> io::Result<bool> {
+        for actor in &self.actors {
+            if !actor.exited()? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
 }
 
 struct SourceFile {
@@ -245,9 +341,163 @@ fn observe_process_handles(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cutover_gate::EntryGate;
     use std::io::Write;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
+
+    fn await_marker(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !path.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            path.exists(),
+            "missing controlled actor marker: {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn bounded_barrier_tracks_two_wal_writers_and_paused_helper_but_exposes_restart_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("pid-identity.db");
+        let db = rusqlite::Connection::open(&source).unwrap();
+        db.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE items (n INTEGER);")
+            .unwrap();
+        drop(db);
+        let spawn = |name: &str, role: &str| {
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "writer_census::tests::controlled_old_actor_probe",
+                ])
+                .env("OULIPOLY_CENSUS_SOURCE", &source)
+                .env("OULIPOLY_CENSUS_CONTROL", dir.path())
+                .env("OULIPOLY_CENSUS_ACTOR", name)
+                .env("OULIPOLY_CENSUS_ROLE", role)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+        let mut first = spawn("writer-one", "writer");
+        let mut second = spawn("writer-two", "writer");
+        let mut helper = spawn("bash-helper", "helper");
+        for name in ["writer-one", "writer-two", "bash-helper"] {
+            await_marker(&dir.path().join(format!("{name}.ready")));
+        }
+        let mut gate = EntryGate::open(dir.path()).unwrap();
+        let actors = [&first, &second, &helper]
+            .into_iter()
+            .map(|child| PinnedProcess::open(child.id() as i32).unwrap())
+            .collect();
+        assert!(BoundedWriterObservation::capture(&gate, &source, actors).is_err());
+        gate.close().unwrap();
+        assert!(BoundedWriterObservation::capture(&gate, &source, Vec::new()).is_err());
+        let actors = [&first, &second, &helper]
+            .into_iter()
+            .map(|child| PinnedProcess::open(child.id() as i32).unwrap())
+            .collect();
+        let observation = BoundedWriterObservation::capture(&gate, &source, actors).unwrap();
+        assert_eq!(observation.observed_actors().len(), 3);
+        for pid in [first.id(), second.id()] {
+            let handles: Vec<_> = observation
+                .observed_handles()
+                .iter()
+                .filter(|item| item.process.host_pid == pid as i32)
+                .collect();
+            assert!(handles.iter().any(|item| item.artifact == Artifact::Main));
+            assert!(handles.iter().any(|item| item.artifact == Artifact::Wal));
+            assert!(handles.iter().any(|item| item.artifact == Artifact::Shm));
+        }
+        assert!(
+            !observation
+                .observed_handles()
+                .iter()
+                .any(|item| item.process.host_pid == helper.id() as i32)
+        );
+        assert!(!observation.all_recorded_exited().unwrap());
+
+        // The ingress latch does not interrupt a direct old writer. Its FD
+        // close/reopen also cannot discharge the retained pidfd obligation.
+        File::create(dir.path().join("writer-one.reopen")).unwrap();
+        await_marker(&dir.path().join("writer-one.reopened"));
+        assert!(!observation.all_recorded_exited().unwrap());
+        let readback = rusqlite::Connection::open(&source).unwrap();
+        let count: i64 = readback
+            .query_row("SELECT count(*) FROM items", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 3);
+        drop(readback);
+
+        for name in ["writer-one", "writer-two"] {
+            File::create(dir.path().join(format!("{name}.exit"))).unwrap();
+        }
+        assert!(first.wait().unwrap().success());
+        assert!(second.wait().unwrap().success());
+        assert!(
+            !observation.all_recorded_exited().unwrap(),
+            "paused old helper is still an actor"
+        );
+        File::create(dir.path().join("bash-helper.exit")).unwrap();
+        assert!(helper.wait().unwrap().success());
+        assert!(observation.all_recorded_exited().unwrap());
+
+        // A fresh old writer is outside the bounded inventory. This is the
+        // missing launcher/respawn fence, not a successful quiescence proof.
+        let mut restarted = spawn("writer-restarted", "writer");
+        await_marker(&dir.path().join("writer-restarted.ready"));
+        assert!(observation.all_recorded_exited().unwrap());
+        let restarted_process = PinnedProcess::open(restarted.id() as i32).unwrap();
+        let files = source_files(&source).unwrap();
+        let mut reopened_handles = Vec::new();
+        observe_process_handles(&restarted_process, &files, &mut reopened_handles).unwrap();
+        assert!(
+            reopened_handles
+                .iter()
+                .any(|item| item.artifact == Artifact::Main)
+        );
+        File::create(dir.path().join("writer-restarted.exit")).unwrap();
+        assert!(restarted.wait().unwrap().success());
+    }
+
+    #[test]
+    fn controlled_old_actor_probe() {
+        let Some(name) = std::env::var_os("OULIPOLY_CENSUS_ACTOR") else {
+            return;
+        };
+        let root = PathBuf::from(std::env::var_os("OULIPOLY_CENSUS_CONTROL").unwrap());
+        let name = name.to_string_lossy();
+        let source = PathBuf::from(std::env::var_os("OULIPOLY_CENSUS_SOURCE").unwrap());
+        let writer = std::env::var("OULIPOLY_CENSUS_ROLE").unwrap() == "writer";
+        let open_writer = || {
+            let db = rusqlite::Connection::open(&source).unwrap();
+            db.busy_timeout(Duration::from_secs(30)).unwrap();
+            db.execute("INSERT INTO items VALUES (1)", []).unwrap();
+            db
+        };
+        let mut db = writer.then(open_writer);
+        File::create(root.join(format!("{name}.ready"))).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if root.join(format!("{name}.exit")).exists() {
+                break;
+            }
+            if db.is_some() && root.join(format!("{name}.reopen")).exists() {
+                fs::remove_file(root.join(format!("{name}.reopen"))).unwrap();
+                drop(db.take());
+                db = Some(open_writer());
+                File::create(root.join(format!("{name}.reopened"))).unwrap();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "controlled old actor wait expired"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     #[test]
     fn process_holding_main_wal_and_shm_is_observed_then_gone() {

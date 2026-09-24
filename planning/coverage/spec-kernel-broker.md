@@ -68,6 +68,8 @@
 | A prerequisite fails before fixed sidecar publication, or fixed sidecar exists. | Explicit host-root x can resume legacy admission only before publication; publication makes abort refuse. |
 | A direct SQLite writer retains main/WAL/SHM handles after ingress closes. | Writer remains live, so the latch gives no `QuiescedCutoverProof` and cannot authorize migration. |
 | A pinned process retains main/WAL/SHM handles or an unlinked old WAL handle. | Broker-side census reports exact PID incarnation, executable inode and each handle as a blocker; a dead or changed PID does not count as the same writer. An empty scan is not a certificate. |
+| Private bounded observation is supplied two live direct WAL writers and a paused helper after X. | It records all three exact process/image identities and the writers' main/WAL/SHM FDs. FD close/reopen and helper delay keep the recorded-exit check false; after all three exit, a newly spawned old writer shows that this bounded observation is still not a production proof. |
+| Broker restarts with a root-owned, mode-0700 `sidecar-stage-<uuid>` before fixed-name publication. | The stage stays inert and registry recovery permits explicit x rollback. A malformed stage name or unsafe mode refuses startup; publication still forbids rollback. |
 | Host-connected socket inherited by a privileged child PID namespace process. | Ancestor PID claim fails in the kernel; a real child send fails the broker's per-request credential equality check. |
 
 ## Edge cases

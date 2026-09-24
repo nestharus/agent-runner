@@ -2,7 +2,7 @@ use crate::identity::{PinnedProcess, boot_id};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -80,6 +80,19 @@ impl RootRegistry {
             // serve() has already opened and validated this fixed root-only
             // storage before it opens the root registry.
             if name == "sidecar" && entry.file_type()?.is_dir() {
+                continue;
+            }
+            // An interrupted prepublication snapshot is inert. Keep the
+            // broker available for an explicit gate abort while the fixed
+            // sidecar name is absent; never treat this stage as State authority.
+            if let Some(id) = name.strip_prefix("sidecar-stage-")
+                && uuid::Uuid::parse_str(id).is_ok_and(|parsed| parsed.to_string() == id)
+                && entry.file_type()?.is_dir()
+            {
+                let metadata = fs::symlink_metadata(entry.path())?;
+                if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+                    return Err(io::Error::other("unsafe inert sidecar stage"));
+                }
                 continue;
             }
             // EntryGate::open validated these exact files and holds the
@@ -172,5 +185,41 @@ impl RootRegistry {
     /// blocks new outside launches until a future settlement protocol handles it.
     pub fn debt_records(&self) -> &[RootRecord] {
         &self.debt
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cutover_gate::EntryGate;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn prepublication_stage_is_inert_and_gate_can_explicitly_rollback_after_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut gate = EntryGate::open(directory.path()).unwrap();
+        gate.close().unwrap();
+        drop(gate);
+        let stage = directory
+            .path()
+            .join(format!("sidecar-stage-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&stage).unwrap();
+        fs::set_permissions(&stage, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(RootRegistry::open(directory.path()).is_ok());
+        let mut restarted = EntryGate::open(directory.path()).unwrap();
+        assert!(restarted.is_closed());
+        restarted.abort_before_publication().unwrap();
+        assert!(!restarted.is_closed());
+        drop(restarted);
+        fs::set_permissions(&stage, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(RootRegistry::open(directory.path()).is_err());
+    }
+
+    #[test]
+    fn malformed_stage_name_does_not_hide_unknown_registry_entry() {
+        let directory = tempfile::tempdir().unwrap();
+        let stage = directory.path().join("sidecar-stage-not-a-uuid");
+        fs::create_dir(&stage).unwrap();
+        assert!(RootRegistry::open(directory.path()).is_err());
     }
 }
