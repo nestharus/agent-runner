@@ -4,6 +4,8 @@ mod native_work;
 #[cfg(feature = "age319-private-broker-fixture")]
 #[path = "private_installed_exec.rs"]
 mod private_installed_exec;
+#[path = "released_handoff.rs"]
+mod released_handoff;
 #[path = "root_join.rs"]
 mod root_join;
 #[path = "source_launch.rs"]
@@ -34,7 +36,8 @@ use oulipoly_kernel_broker::source_physical::{SourceObservation, SourcePhysicalR
 use oulipoly_kernel_broker::work_registry::{Scope, WorkRegistry, classify_scope};
 use oulipoly_state::mailbox::{
     BrokerReleaseEvidence, BrokerSidecar, BrokerSourceEffectGrant, FreshDeliverySubmission,
-    FreshRecipientIdentity, FreshV30Lane, PreparedBrokerOwner, PreparedProcessStamp,
+    FreshRecipientIdentity, FreshReleasedHandoff, FreshV30Lane, FreshV30LaneIdentity,
+    PreparedBrokerOwner, PreparedProcessStamp,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
@@ -43,6 +46,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::time::{Duration, Instant};
 
 const SOCKET: &str = "/run/oulipoly-kernel-broker/control.sock";
@@ -2224,6 +2228,7 @@ fn attest_released_child(
     entries: &EntryRegistry,
     held: &BTreeMap<String, root_join::HeldRootJoin>,
     sidecar: &BrokerSidecar,
+    retained_gate_required: bool,
 ) -> io::Result<BrokerReleaseEvidence> {
     if spec.protocol != "broker-release-attest-v30"
         || spec.attempt_id.is_some()
@@ -2244,10 +2249,11 @@ fn attest_released_child(
             &spec.owner_generation,
         )
         .map_err(io::Error::other)?;
-    if held
-        .get(&spec.root_id)
-        .and_then(root_join::HeldRootJoin::release_id)
-        != Some(evidence.release_id.as_str())
+    if retained_gate_required
+        && held
+            .get(&spec.root_id)
+            .and_then(root_join::HeldRootJoin::release_id)
+            != Some(evidence.release_id.as_str())
     {
         return Err(io::Error::other(
             "release gate is not retained by this broker",
@@ -2307,6 +2313,94 @@ fn attest_released_child(
     driver.verify()?;
     peer.process.verify()?;
     Ok(evidence)
+}
+
+struct FreshHandoffBridgeRequest {
+    spec: StateReadSpec,
+    peer: PeerIdentity,
+    lane: FreshV30LaneIdentity,
+    read_only: bool,
+    reply: SyncSender<io::Result<FreshReleasedHandoff>>,
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "old gate and fresh identity are separate authorities"
+)]
+fn released_child_handoff(
+    request: FreshHandoffBridgeRequest,
+    host_namespace: &File,
+    runner_image: &File,
+    roots: &RootRegistry,
+    works: &WorkRegistry,
+    entries: &EntryRegistry,
+    held: &BTreeMap<String, root_join::HeldRootJoin>,
+    sidecar: Option<&BrokerSidecar>,
+    registry: &mut released_handoff::ReleasedHandoffRegistry,
+    broker_incarnation: &str,
+) {
+    let result = (|| -> io::Result<FreshReleasedHandoff> {
+        let sidecar = sidecar.ok_or_else(|| io::Error::other("old release sidecar absent"))?;
+        if registry.is_uncertain() {
+            return Err(io::Error::other("released handoff has unknown debt"));
+        }
+        let existing = registry.existing(&request.spec.root_id).cloned();
+        if request.read_only && existing.is_none() {
+            return Err(io::Error::other("released handoff receipt absent"));
+        }
+        if existing.is_none()
+            && !held
+                .get(&request.spec.root_id)
+                .is_some_and(root_join::HeldRootJoin::handoff_intent_ready)
+        {
+            return Err(io::Error::other(
+                "released child has no authenticated Bash launch descriptor; production root admits only help/diagnostics",
+            ));
+        }
+        let evidence = attest_released_child(
+            request.spec,
+            &request.peer,
+            host_namespace,
+            runner_image,
+            roots,
+            works,
+            entries,
+            held,
+            sidecar,
+            existing.is_none(),
+        )?;
+        if let Some(receipt) = existing {
+            if receipt.old_release != evidence || receipt.fresh_lane != request.lane {
+                return Err(io::Error::other(
+                    "released handoff identity or lane changed",
+                ));
+            }
+            return Ok(receipt);
+        }
+        // Only the old loop can mint these. The one-use Bash intent is an
+        // opaque exact descriptor for the later paired Bash protocol. It is
+        // deliberately not a command line or permission to fork workload.
+        let intent = uuid::Uuid::new_v4();
+        let authority = oulipoly_state::CompletionRegistrationAuthority::generate()
+            .map_err(io::Error::other)?;
+        let image = runner_image.metadata()?;
+        let receipt = FreshReleasedHandoff {
+            handoff_id: uuid::Uuid::new_v4().to_string(),
+            d_key: uuid::Uuid::new_v4().to_string(),
+            invocation_uuid: uuid::Uuid::new_v4().to_string(),
+            bash_intent_id: intent.to_string(),
+            bash_handle: format!("ab30_{}", intent.simple()),
+            bash_intent_kind: "agent-bash-run-v30-one-use".into(),
+            broker_incarnation: broker_incarnation.into(),
+            runner_image_device: image.dev(),
+            runner_image_inode: image.ino(),
+            old_release: evidence,
+            fresh_lane: request.lane,
+            registration_authority: authority.process_environment_value().into(),
+        };
+        registry.persist(receipt)
+    })();
+    let _ = request.reply.send(result);
 }
 
 fn encode_release_evidence(evidence: &BrokerReleaseEvidence) -> io::Result<String> {
@@ -2561,6 +2655,13 @@ fn serve() -> io::Result<()> {
         checked_root_path(&entries_path, true)?;
     }
     let mut entries = EntryRegistry::open(&entries_path)?;
+    let handoffs_path = Path::new(&state).join("released-handoffs");
+    if !handoffs_path.exists() {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new().mode(0o700).create(&handoffs_path)?;
+        File::open(Path::new(&state))?.sync_all()?;
+    }
+    let mut released_handoffs = released_handoff::ReleasedHandoffRegistry::open(&handoffs_path)?;
     // A prepared grant can only be consumed by the exact K launch. Its work
     // record and terminal receipt remain separate durable obligations.
     let grants_path = Path::new(&state).join("grants");
@@ -2609,6 +2710,10 @@ fn serve() -> io::Result<()> {
     let listener = UnixListener::bind(&socket)?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o660))?;
     listener.set_nonblocking(true)?;
+    let (handoff_tx, handoff_rx): (
+        SyncSender<FreshHandoffBridgeRequest>,
+        Receiver<FreshHandoffBridgeRequest>,
+    ) = mpsc::sync_channel(8);
     // The old loop alone owns the release gate and mutable kernel registries.
     // Fresh storage stays on another thread and is opened only at the fixed
     // broker-owned v30 directory. Neither handler can wait on the other's
@@ -2617,6 +2722,7 @@ fn serve() -> io::Result<()> {
     if fs::symlink_metadata(&fresh_root).is_ok() {
         let fresh_state_root = PathBuf::from(&state);
         let fresh_runner_image = runner_image.try_clone()?;
+        let fresh_handoff_tx = handoff_tx.clone();
         let fresh_socket = if fixture {
             Path::new(&socket).with_file_name("v30.sock")
         } else {
@@ -2625,14 +2731,31 @@ fn serve() -> io::Result<()> {
         std::thread::Builder::new()
             .name("fresh-v30-lane".into())
             .spawn(move || {
-                if let Err(error) =
-                    serve_fresh_v30_at(&fresh_state_root, &fresh_socket, fresh_runner_image)
-                {
+                if let Err(error) = serve_fresh_v30_at(
+                    &fresh_state_root,
+                    &fresh_socket,
+                    fresh_runner_image,
+                    Some(fresh_handoff_tx),
+                ) {
                     eprintln!("fresh v30 lane closed: {error}");
                 }
             })?;
     }
     loop {
+        if let Ok(request) = handoff_rx.try_recv() {
+            released_child_handoff(
+                request,
+                &host_namespace,
+                &runner_image,
+                &registry,
+                &works,
+                &entries,
+                &held_joins,
+                broker_sidecar.as_ref(),
+                &mut released_handoffs,
+                &broker_incarnation,
+            );
+        }
         let mut stream = match listener.accept() {
             Ok((stream, _)) => stream,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -3214,6 +3337,7 @@ fn serve() -> io::Result<()> {
                         &entries,
                         &held_joins,
                         sidecar,
+                        true,
                     )?;
                     encode_release_evidence(&evidence)
                 } else if spec.protocol == "broker-repair-read-v30" {
@@ -3466,6 +3590,53 @@ fn fresh_payload_reply(
         "payload_base64": base64::engine::general_purpose::STANDARD.encode(submission.payload) }))
 }
 
+fn bridge_released_handoff(
+    bridge: &SyncSender<FreshHandoffBridgeRequest>,
+    spec: StateReadSpec,
+    peer: PeerIdentity,
+    lane: &FreshV30LaneIdentity,
+    read_only: bool,
+    runner_image: &File,
+) -> io::Result<FreshReleasedHandoff> {
+    let expected = FreshRecipientIdentity {
+        host_pid: peer.process.host_pid,
+        boot_id: peer.process.boot_id.clone(),
+        starttime_ticks: peer.process.starttime_ticks,
+        pidns_dev: peer.process.pidns_dev,
+        pidns_ino: peer.process.pidns_ino,
+    };
+    let (reply, answer) = mpsc::sync_channel(1);
+    bridge
+        .send(FreshHandoffBridgeRequest {
+            spec,
+            peer,
+            lane: lane.clone(),
+            read_only,
+            reply,
+        })
+        .map_err(|_| io::Error::other("old release authority unavailable"))?;
+    let receipt = answer
+        .recv_timeout(Duration::from_secs(30))
+        .map_err(|_| io::Error::other("old release authority response uncertain"))??;
+    let current = PinnedProcess::open(expected.host_pid)?;
+    current.verify()?;
+    let image = runner_image.metadata()?;
+    if current.boot_id != expected.boot_id
+        || current.starttime_ticks != expected.starttime_ticks
+        || current.pidns_dev != expected.pidns_dev
+        || current.pidns_ino != expected.pidns_ino
+        || !current.same_executable_as(runner_image)?
+        || receipt.fresh_lane != *lane
+        || receipt.runner_image_device != image.dev()
+        || receipt.runner_image_inode != image.ino()
+        || receipt.old_release.prepared.joined_child
+            != prepared_stamp(&ProcessStamp::from(&current))
+    {
+        return Err(io::Error::other("fresh handoff peer or lane changed"));
+    }
+    Ok(receipt)
+}
+
 #[cfg(feature = "age319-private-broker-fixture")]
 fn serve_fresh_v30() -> io::Result<()> {
     if unsafe { libc::geteuid() } != 0 {
@@ -3520,10 +3691,16 @@ fn serve_fresh_v30() -> io::Result<()> {
         Path::new(&state_root),
         Path::new(&socket),
         File::open(&runner)?,
+        None,
     )
 }
 
-fn serve_fresh_v30_at(state_root: &Path, socket: &Path, runner_image: File) -> io::Result<()> {
+fn serve_fresh_v30_at(
+    state_root: &Path,
+    socket: &Path,
+    runner_image: File,
+    handoff_tx: Option<SyncSender<FreshHandoffBridgeRequest>>,
+) -> io::Result<()> {
     // A missing or incomplete publication cannot bind the new endpoint.
     let mut lane = FreshV30Lane::open_at(state_root).map_err(io::Error::other)?;
     let instance = EntryGate::open(&state_root.join("v30"))?;
@@ -3582,19 +3759,48 @@ fn serve_fresh_v30_at(state_root: &Path, socket: &Path, runner_image: File) -> i
                     lane.identity().domain_id,
                 )),
                 b'U' => {
-                    // The fresh service does not yet share the old broker's
-                    // released-child registry. An installed image alone cannot
-                    // prove that this peer is the child for a Bash handle.
-                    // Keep private protocol fixtures, but issue no production
-                    // request identity until that exact owner join exists.
-                    if !private_fixture() {
-                        return Err(io::Error::other(
-                            "fresh child owner handoff unavailable: released child, Bash handle, and State invocation are not bound",
-                        ));
-                    }
                     let RequestPayload::FreshChildRequest { request } = payload else {
                         return Err(io::Error::other("fresh child request payload absent"));
                     };
+                    if let Some(spec) = request.release {
+                        if !request.request_id.is_empty() || !request.invocation_uuid.is_empty() {
+                            return Err(io::Error::other(
+                                "caller-proposed fresh authority refused",
+                            ));
+                        }
+                        let bridge = handoff_tx.as_ref().ok_or_else(|| {
+                            io::Error::other("in-process release authority unavailable")
+                        })?;
+                        let receipt = bridge_released_handoff(
+                            bridge,
+                            spec,
+                            peer,
+                            lane.identity(),
+                            false,
+                            &runner_image,
+                        )?;
+                        if instance.is_closed() {
+                            lane.require_released_handoff(&receipt.d_key, &receipt, &recipient)
+                                .map_err(io::Error::other)?;
+                        } else {
+                            lane.bind_released_handoff(&receipt, &recipient)
+                                .map_err(io::Error::other)?;
+                        }
+                        return Ok(format!(
+                            "fresh-child-handoff {}\n",
+                            serde_json::to_string(&receipt)?
+                        ));
+                    }
+                    if !private_fixture() {
+                        return Err(io::Error::other(
+                            "fresh U requires live old-gate handoff evidence",
+                        ));
+                    }
+                    if !peer.process.in_namespace(&host_proc_file("self/ns/pid")?)? {
+                        return Err(io::Error::other(
+                            "released child cannot use synthetic private U",
+                        ));
+                    }
                     if instance.is_closed() {
                         lane.require_child_request(
                             &request.request_id,
@@ -3616,23 +3822,59 @@ fn serve_fresh_v30_at(state_root: &Path, socket: &Path, runner_image: File) -> i
                     ))
                 }
                 b'D' | b'd' => {
-                    // d remains a readback for any already committed prefix
-                    // admission. A new D cannot turn an older U-only row into
-                    // a production session without the released owner join.
-                    if operation == b'D' && !private_fixture() {
-                        return Err(io::Error::other(
-                            "fresh child owner handoff unavailable: D requires a released handle-bound invocation",
-                        ));
-                    }
                     let RequestPayload::FreshSessionRequest { request_id } = payload else {
                         return Err(io::Error::other("fresh session request identity absent"));
                     };
-                    lane.require_child_actor(
-                        &request_id,
-                        &recipient,
-                        operation == b'D' && !private_fixture(),
-                    )
-                    .map_err(io::Error::other)?;
+                    let released = match lane.released_handoff_for_child(&request_id, &recipient) {
+                        Ok(receipt) => {
+                            let spec = StateReadSpec {
+                                protocol: "broker-release-attest-v30".into(),
+                                source_generation: receipt
+                                    .old_release
+                                    .prepared
+                                    .source_generation
+                                    .clone(),
+                                root_id: receipt.old_release.prepared.root_id.clone(),
+                                owner_generation: receipt
+                                    .old_release
+                                    .prepared
+                                    .owner_generation
+                                    .clone(),
+                                attempt_id: None,
+                            };
+                            let bridge = handoff_tx.as_ref().ok_or_else(|| {
+                                io::Error::other("in-process release authority unavailable")
+                            })?;
+                            let current = bridge_released_handoff(
+                                bridge,
+                                spec,
+                                peer,
+                                lane.identity(),
+                                true,
+                                &runner_image,
+                            )?;
+                            if current != receipt {
+                                return Err(io::Error::other(
+                                    "old and fresh handoff receipts differ",
+                                ));
+                            }
+                            Some(receipt)
+                        }
+                        Err(error)
+                            if private_fixture()
+                                && error == "fresh released handoff absent before D" =>
+                        {
+                            if !peer.process.in_namespace(&host_proc_file("self/ns/pid")?)? {
+                                return Err(io::Error::other(
+                                    "released child cannot use synthetic private D",
+                                ));
+                            }
+                            lane.require_child_actor(&request_id, &recipient, false)
+                                .map_err(io::Error::other)?;
+                            None
+                        }
+                        Err(error) => return Err(io::Error::other(error)),
+                    };
                     // d never repairs a half-written pair; only a retry of
                     // the same D key may finish its State-first admission.
                     let session = if operation == b'd' {
@@ -3655,6 +3897,15 @@ fn serve_fresh_v30_at(state_root: &Path, socket: &Path, runner_image: File) -> i
                                 .map_err(io::Error::other)?
                         }
                     };
+                    if let Some(receipt) = released {
+                        if operation == b'D' && !instance.is_closed() {
+                            lane.ensure_released_invocation(&receipt, &recipient, &session)
+                                .map_err(io::Error::other)?;
+                        } else {
+                            lane.require_released_invocation(&receipt, &recipient, &session)
+                                .map_err(io::Error::other)?;
+                        }
+                    }
                     Ok(format!(
                         "fresh-session {}\n",
                         serde_json::to_string(&session)?

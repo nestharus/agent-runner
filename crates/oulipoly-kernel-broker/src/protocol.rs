@@ -20,11 +20,11 @@ pub struct FreshV30Route {
 }
 
 pub fn fresh_v30_state_route() -> io::Result<FreshV30Route> {
-    let response = request_frame_at(
-        Path::new(INSTALLED_FRESH_V30_SOCKET),
-        Operation::ReadStateRoute,
-        Payload::None,
-    )?;
+    fresh_v30_state_route_at(Path::new(INSTALLED_FRESH_V30_SOCKET))
+}
+
+pub fn fresh_v30_state_route_at(path: &Path) -> io::Result<FreshV30Route> {
+    let response = request_frame_at(path, Operation::ReadStateRoute, Payload::None)?;
     let fields = response
         .strip_prefix("fresh-v30-route ")
         .and_then(|value| value.strip_suffix('\n'))
@@ -55,21 +55,86 @@ pub fn fresh_v30_state_route() -> io::Result<FreshV30Route> {
 pub fn allocate_fresh_v30_session(
     request_id: &str,
 ) -> io::Result<oulipoly_state::mailbox::FreshV30Session> {
-    fresh_v30_session_request(Operation::AllocateFreshSession, request_id)?
-        .ok_or_else(|| io::Error::other("fresh v30 allocation row absent"))
+    fresh_v30_session_request_at(
+        Path::new(INSTALLED_FRESH_V30_SOCKET),
+        Operation::AllocateFreshSession,
+        request_id,
+    )?
+    .ok_or_else(|| io::Error::other("fresh v30 allocation row absent"))
 }
 
 pub fn read_fresh_v30_session(
     request_id: &str,
 ) -> io::Result<Option<oulipoly_state::mailbox::FreshV30Session>> {
-    fresh_v30_session_request(Operation::ReadFreshSession, request_id)
+    fresh_v30_session_request_at(
+        Path::new(INSTALLED_FRESH_V30_SOCKET),
+        Operation::ReadFreshSession,
+        request_id,
+    )
+}
+
+pub fn allocate_fresh_v30_session_at(
+    path: &Path,
+    request_id: &str,
+) -> io::Result<oulipoly_state::mailbox::FreshV30Session> {
+    fresh_v30_session_request_at(path, Operation::AllocateFreshSession, request_id)?
+        .ok_or_else(|| io::Error::other("fresh v30 allocation row absent"))
+}
+
+pub fn read_fresh_v30_session_at(
+    path: &Path,
+    request_id: &str,
+) -> io::Result<Option<oulipoly_state::mailbox::FreshV30Session>> {
+    fresh_v30_session_request_at(path, Operation::ReadFreshSession, request_id)
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FreshChildRequest {
+    #[serde(default)]
     pub request_id: String,
+    #[serde(default)]
     pub invocation_uuid: String,
+    #[serde(default)]
+    pub release: Option<StateReadSpec>,
+}
+
+/// A released child supplies only the old release locator. The old loop
+/// reattests it and mints every authority field before U can bind the fresh
+/// copy. The same child retries this call after a lost reply.
+pub fn request_released_fresh_handoff_at(
+    path: &Path,
+    release: StateReadSpec,
+) -> io::Result<oulipoly_state::mailbox::FreshReleasedHandoff> {
+    let body = serde_json::to_vec(&FreshChildRequest {
+        request_id: String::new(),
+        invocation_uuid: String::new(),
+        release: Some(release),
+    })?;
+    let mut stream = checked_connection(path)?;
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let mut frame = Vec::with_capacity(17 + body.len());
+    frame.push(b'U');
+    frame.extend_from_slice(&challenge);
+    frame.extend_from_slice(&body);
+    stream.write_all(&frame)?;
+    let mut reply = Vec::new();
+    stream.take(8193).read_to_end(&mut reply)?;
+    if reply.len() > 8192 || !reply.ends_with(b"\n") {
+        return Err(io::Error::other(
+            "fresh released handoff response oversized or incomplete",
+        ));
+    }
+    let reply = String::from_utf8(reply).map_err(io::Error::other)?;
+    if let Some(error) = reply.strip_prefix("error ") {
+        return Err(io::Error::other(error.trim_end().to_owned()));
+    }
+    let body = reply
+        .strip_prefix("fresh-child-handoff ")
+        .and_then(|value| value.strip_suffix('\n'))
+        .ok_or_else(|| io::Error::other("fresh released handoff refused"))?;
+    serde_json::from_str(body).map_err(io::Error::other)
 }
 
 /// Protocol-only reservation for private fixtures. Production U remains
@@ -99,6 +164,7 @@ pub fn reserve_fresh_v30_child_request_at(
     let body = serde_json::to_vec(&FreshChildRequest {
         request_id: request_id.into(),
         invocation_uuid: invocation_uuid.into(),
+        release: None,
     })?;
     let mut stream = checked_connection(path)?;
     let mut challenge = [0u8; 16];
@@ -187,7 +253,8 @@ pub fn fresh_recipient_request_at(
     serde_json::from_slice(&answer).map_err(io::Error::other)
 }
 
-fn fresh_v30_session_request(
+fn fresh_v30_session_request_at(
+    path: &Path,
     operation: Operation,
     request_id: &str,
 ) -> io::Result<Option<oulipoly_state::mailbox::FreshV30Session>> {
@@ -196,13 +263,31 @@ fn fresh_v30_session_request(
     if id.is_nil() || id.to_string() != request_id {
         return Err(io::Error::other("noncanonical or nil fresh request UUID"));
     }
-    let response = request_frame_at(
-        Path::new(INSTALLED_FRESH_V30_SOCKET),
-        operation,
-        Payload::FreshRequest(id),
-    )?;
+    let mut stream = checked_connection(path)?;
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let mut frame = [0u8; 33];
+    frame[0] = match operation {
+        Operation::AllocateFreshSession => b'D',
+        Operation::ReadFreshSession => b'd',
+        _ => return Err(io::Error::other("unsupported fresh session operation")),
+    };
+    frame[1..17].copy_from_slice(&challenge);
+    frame[17..33].copy_from_slice(id.as_bytes());
+    stream.write_all(&frame)?;
+    let mut bytes = Vec::new();
+    stream.take(1025).read_to_end(&mut bytes)?;
+    if bytes.len() > 1024 || !bytes.ends_with(b"\n") {
+        return Err(io::Error::other(
+            "fresh session response oversized or incomplete",
+        ));
+    }
+    let response = String::from_utf8(bytes).map_err(io::Error::other)?;
     if response == "fresh-session absent\n" {
         return Ok(None);
+    }
+    if let Some(error) = response.strip_prefix("error ") {
+        return Err(io::Error::other(error.trim_end().to_owned()));
     }
     let body = response
         .strip_prefix("fresh-session ")
@@ -210,7 +295,7 @@ fn fresh_v30_session_request(
         .ok_or_else(|| io::Error::other("fresh v30 session allocation refused"))?;
     let session: oulipoly_state::mailbox::FreshV30Session =
         serde_json::from_str(body).map_err(io::Error::other)?;
-    validate_fresh_v30_session(&fresh_v30_state_route()?, request_id, &session)?;
+    validate_fresh_v30_session(&fresh_v30_state_route_at(path)?, request_id, &session)?;
     Ok(Some(session))
 }
 
@@ -1822,7 +1907,6 @@ pub fn abort_entry_gate_at(path: &Path) -> io::Result<()> {
 #[derive(Clone, Copy)]
 enum Payload {
     None,
-    FreshRequest(uuid::Uuid),
     Prepare(uuid::Uuid, i32),
     Bind(uuid::Uuid, uuid::Uuid, uuid::Uuid),
     Read(uuid::Uuid),
@@ -1952,10 +2036,6 @@ fn request_frame_at(path: &Path, operation: Operation, payload: Payload) -> io::
     request[1..17].copy_from_slice(&challenge);
     let length = match payload {
         Payload::None => 17,
-        Payload::FreshRequest(id) => {
-            request[17..33].copy_from_slice(id.as_bytes());
-            33
-        }
         Payload::Prepare(root, pid) => {
             request[17..33].copy_from_slice(root.as_bytes());
             request[33..37].copy_from_slice(&pid.to_ne_bytes());

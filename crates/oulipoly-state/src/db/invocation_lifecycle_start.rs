@@ -86,7 +86,7 @@ impl CompletionRegistrationAuthority {
         .map_err(|error| format!("Failed to serialize invocation launch authority: {error}"))
     }
 
-    pub(super) fn digest(&self) -> String {
+    pub(crate) fn digest(&self) -> String {
         completion_registration_authority_digest(&self.secret)
     }
 
@@ -208,11 +208,23 @@ impl StateDb {
         start: &InvocationStart,
     ) -> Result<InvocationStartWithCompletionAuthority, String> {
         let authority = CompletionRegistrationAuthority::generate()?;
+        self.start_invocation_with_prepared_completion_registration_authority(start, &authority)
+    }
+
+    /// The broker persists this authority with its one-use released-child
+    /// receipt before State admission. Replaying the same D key after a crash
+    /// can then recover the exact registration capability, rather than mint a
+    /// different secret for an already started invocation.
+    pub fn start_invocation_with_prepared_completion_registration_authority(
+        &self,
+        start: &InvocationStart,
+        authority: &CompletionRegistrationAuthority,
+    ) -> Result<InvocationStartWithCompletionAuthority, String> {
         let digest = authority.digest();
         let invocation_row_id = self.start_invocation_on(start, Some(&digest))?;
         Ok(InvocationStartWithCompletionAuthority {
             invocation_row_id,
-            completion_registration_authority: authority,
+            completion_registration_authority: authority.clone(),
         })
     }
 

@@ -28,11 +28,24 @@ pub(super) struct HeldRootJoin {
     child: PinnedProcess,
     release_attempted: bool,
     release_id: Option<String>,
+    #[cfg(feature = "age319-private-broker-fixture")]
+    launch_args: Vec<String>,
 }
 
 impl HeldRootJoin {
     pub(super) fn release_id(&self) -> Option<&str> {
         self.release_id.as_deref()
+    }
+
+    pub(super) fn handoff_intent_ready(&self) -> bool {
+        // Production currently admits only help/diagnostics in
+        // supported_entry_args. Neither is a Bash invocation. A real
+        // production handoff must wait for a paired descriptor route.
+        #[cfg(feature = "age319-private-broker-fixture")]
+        if super::private_fixture() && self.launch_args == ["__age319-private-bash-work-v1"] {
+            return true;
+        }
+        false
     }
 
     /// A partial write can open the physical gate. Consume the attempt before
@@ -438,6 +451,8 @@ pub(super) fn hold(
     {
         return Err(io::Error::last_os_error());
     }
+    #[cfg(feature = "age319-private-broker-fixture")]
+    let launch_args = spec.args.clone();
     let context = Box::new(InitContext {
         spec,
         descriptors,
@@ -538,6 +553,8 @@ pub(super) fn hold(
         child,
         release_attempted: false,
         release_id: None,
+        #[cfg(feature = "age319-private-broker-fixture")]
+        launch_args,
     })
 }
 

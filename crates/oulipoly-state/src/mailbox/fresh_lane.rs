@@ -17,6 +17,7 @@ const LANE_PROTOCOL: &str = "fresh-v30-lane-v1";
 const FRESH_SCHEMA: &str = include_str!("migrations/0030_fresh_lane.sql");
 const FRESH_STATE_SCHEMA: &str = include_str!("migrations/0030_fresh_state_identity.sql");
 const FRESH_CHILD_REQUEST_SCHEMA: &str = include_str!("migrations/0030_fresh_child_request.sql");
+const FRESH_HANDOFF_SCHEMA: &str = include_str!("migrations/0031_fresh_released_handoff.sql");
 const FRESH_RECIPIENT_SCHEMA: &str = include_str!("migrations/0030_fresh_recipient.sql");
 const FRESH_RECIPIENT_STATE_SCHEMA: &str =
     include_str!("migrations/0030_fresh_recipient_state.sql");
@@ -26,6 +27,26 @@ pub struct FreshV30LaneIdentity {
     pub lane_id: String,
     pub domain_id: String,
     pub source_generation: String,
+}
+
+/// Minted by the old release authority while its physical gate is retained.
+/// The intent identifies exactly one future Bash run; it does not admit a
+/// command, register a source, or open a workload gate.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreshReleasedHandoff {
+    pub handoff_id: String,
+    pub d_key: String,
+    pub invocation_uuid: String,
+    pub bash_intent_id: String,
+    pub bash_handle: String,
+    pub bash_intent_kind: String,
+    pub broker_incarnation: String,
+    pub runner_image_device: u64,
+    pub runner_image_inode: u64,
+    pub old_release: super::BrokerReleaseEvidence,
+    pub fresh_lane: FreshV30LaneIdentity,
+    pub registration_authority: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -143,7 +164,7 @@ impl FreshV30Lane {
         let state_conn = Connection::open(&state_path).map_err(|e| e.to_string())?;
         state_conn
             .execute_batch(&format!(
-                "{FRESH_STATE_SCHEMA}\n{FRESH_RECIPIENT_STATE_SCHEMA}\n{FRESH_CHILD_REQUEST_SCHEMA}"
+                "{FRESH_STATE_SCHEMA}\n{FRESH_RECIPIENT_STATE_SCHEMA}\n{FRESH_CHILD_REQUEST_SCHEMA}\n{FRESH_HANDOFF_SCHEMA}"
             ))
             .map_err(|e| e.to_string())?;
         state_conn
@@ -394,6 +415,16 @@ impl FreshV30Lane {
         if fresh_child_request_schema_count(&state_conn)? != 3 {
             return Err("fresh child request schema is incomplete".into());
         }
+        match fresh_handoff_schema_count(&state_conn)? {
+            0 => state_conn
+                .execute_batch(FRESH_HANDOFF_SCHEMA)
+                .map_err(|e| e.to_string())?,
+            6 => {}
+            _ => return Err("fresh handoff schema is incomplete".into()),
+        }
+        if fresh_handoff_schema_count(&state_conn)? != 6 {
+            return Err("fresh handoff schema is incomplete".into());
+        }
         state_conn
             .execute_batch("COMMIT")
             .map_err(|e| e.to_string())?;
@@ -406,6 +437,289 @@ impl FreshV30Lane {
 
     pub fn identity(&self) -> &FreshV30LaneIdentity {
         &self.identity
+    }
+
+    /// Copy only an old-authority receipt delivered over the broker's typed
+    /// in-process channel. The caller cannot insert one through the socket.
+    /// A committed old receipt may remain debt if this write is interrupted.
+    pub fn bind_released_handoff(
+        &self,
+        receipt: &FreshReleasedHandoff,
+        actor: &FreshRecipientIdentity,
+    ) -> Result<(), String> {
+        self.validate_released_handoff(receipt, actor)?;
+        let json = serde_json::to_string(receipt).map_err(|e| e.to_string())?;
+        let actor_json = serde_json::to_string(actor).map_err(|e| e.to_string())?;
+        let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        state
+            .execute_batch("PRAGMA synchronous=FULL")
+            .map_err(|e| e.to_string())?;
+        state.execute(
+            "INSERT INTO fresh_released_handoff
+             (handoff_id,d_key,invocation_uuid,bash_handle,root_id,actor_identity,receipt_json,bound_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT DO NOTHING",
+            params![receipt.handoff_id, receipt.d_key, receipt.invocation_uuid,
+                receipt.bash_handle, receipt.old_release.prepared.root_id,
+                actor_json, json, Utc::now().to_rfc3339()],
+        ).map_err(|e| e.to_string())?;
+        drop(state);
+        self.require_released_handoff(&receipt.d_key, receipt, actor)
+    }
+
+    pub fn require_released_handoff(
+        &self,
+        d_key: &str,
+        receipt: &FreshReleasedHandoff,
+        actor: &FreshRecipientIdentity,
+    ) -> Result<(), String> {
+        self.validate_released_handoff(receipt, actor)?;
+        if d_key != receipt.d_key {
+            return Err("fresh handoff D key conflict".into());
+        }
+        let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let row: Option<(String, String)> = state
+            .query_row(
+                "SELECT receipt_json,actor_identity FROM fresh_released_handoff WHERE d_key=?1",
+                [d_key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some((json, actor_json)) = row else {
+            return Err("fresh released handoff absent".into());
+        };
+        let stored: FreshReleasedHandoff =
+            serde_json::from_str(&json).map_err(|e| e.to_string())?;
+        let stored_actor: FreshRecipientIdentity =
+            serde_json::from_str(&actor_json).map_err(|e| e.to_string())?;
+        if stored != *receipt || stored_actor != *actor {
+            return Err("fresh released handoff changed or belongs to another child".into());
+        }
+        Ok(())
+    }
+
+    pub fn released_handoff_for_child(
+        &self,
+        d_key: &str,
+        actor: &FreshRecipientIdentity,
+    ) -> Result<FreshReleasedHandoff, String> {
+        validate_request_id(d_key)?;
+        let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let json: String = state
+            .query_row(
+                "SELECT receipt_json FROM fresh_released_handoff WHERE d_key=?1",
+                [d_key],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .ok_or("fresh released handoff absent before D")?;
+        let receipt: FreshReleasedHandoff =
+            serde_json::from_str(&json).map_err(|e| e.to_string())?;
+        self.require_released_handoff(d_key, &receipt, actor)?;
+        Ok(receipt)
+    }
+
+    fn validate_released_handoff(
+        &self,
+        receipt: &FreshReleasedHandoff,
+        actor: &FreshRecipientIdentity,
+    ) -> Result<(), String> {
+        for id in [
+            &receipt.handoff_id,
+            &receipt.d_key,
+            &receipt.invocation_uuid,
+            &receipt.bash_intent_id,
+            &receipt.broker_incarnation,
+        ] {
+            validate_request_id(id)?;
+        }
+        let child = &receipt.old_release.prepared.joined_child;
+        if receipt.fresh_lane != self.identity
+            || receipt.old_release.prepared.source_generation == self.identity.source_generation
+            || receipt.old_release.prepared.domain_id == self.identity.domain_id
+            || receipt.bash_intent_kind != "agent-bash-run-v30-one-use"
+            || receipt.runner_image_device == 0
+            || receipt.runner_image_inode == 0
+            || receipt.bash_handle != format!("ab30_{}", receipt.bash_intent_id.replace('-', ""))
+            || receipt.old_release.release_id.is_empty()
+            || actor.host_pid != child.host_pid
+            || actor.boot_id != child.boot_id
+            || actor.starttime_ticks != child.starttime_ticks
+            || actor.pidns_dev != child.pidns_dev
+            || actor.pidns_ino != child.pidns_ino
+            || crate::CompletionRegistrationAuthority::from_process_environment_value(
+                receipt.registration_authority.clone(),
+            )
+            .is_err()
+        {
+            return Err("fresh released handoff identity conflict".into());
+        }
+        Ok(())
+    }
+
+    /// D's State invocation and owner association are recoverable under the
+    /// same broker-minted UUID and registration secret. A partial write is
+    /// debt; no different handoff can adopt it.
+    pub fn ensure_released_invocation(
+        &self,
+        receipt: &FreshReleasedHandoff,
+        actor: &FreshRecipientIdentity,
+        session: &FreshV30Session,
+    ) -> Result<(), String> {
+        self.require_released_handoff(&receipt.d_key, receipt, actor)?;
+        self.require_session(session)?;
+        if session.request_id != receipt.d_key {
+            return Err("fresh handoff session D key conflict".into());
+        }
+        let authority = crate::CompletionRegistrationAuthority::from_process_environment_value(
+            receipt.registration_authority.clone(),
+        )?;
+        let state = StateDb::open(&self.state_path)?;
+        if state
+            .get_invocation_by_uuid(&receipt.invocation_uuid)?
+            .is_none()
+        {
+            state.start_invocation_with_prepared_completion_registration_authority(
+                &crate::InvocationStart {
+                    invocation_uuid: receipt.invocation_uuid.clone(),
+                    model_name: "agent-bash".into(),
+                    provider_name: "agent-bash".into(),
+                    provider_index: 0,
+                    parent_invocation_id: None,
+                },
+                &authority,
+            )?;
+        }
+        let row = state
+            .get_invocation_by_uuid(&receipt.invocation_uuid)?
+            .ok_or("fresh handoff invocation absent after start")?;
+        if row.model_name != "agent-bash"
+            || row.provider_name.as_deref() != Some("agent-bash")
+            || row.provider_index != 0
+            || row.parent_invocation_id.is_some()
+            || row
+                .session_id
+                .as_deref()
+                .is_some_and(|id| id != session.session_id)
+        {
+            return Err("fresh handoff invocation row conflict".into());
+        }
+        let read = self.state_connection(OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let digest: Option<String> = read.query_row(
+            "SELECT completion_registration_capability_digest FROM invocations WHERE invocation_uuid=?1",
+            [&receipt.invocation_uuid],
+            |r| r.get(0),
+        ).map_err(|e| e.to_string())?;
+        if digest.as_deref() != Some(authority.digest().as_str()) {
+            return Err("fresh handoff registration authority conflict".into());
+        }
+        state.bind_invocation_provider_session_start(
+            crate::InvocationMutationAuthority::Standalone,
+            row.id,
+            &crate::ProviderSessionBinding {
+                provider_session_id: session.session_id.clone(),
+                capture_method: "broker-released-child-v30",
+                resume_input_id: None,
+                provider_session_resolved_account: None,
+            },
+        )?;
+        let owner = self.state_connection(OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        owner
+            .execute_batch("PRAGMA synchronous=FULL")
+            .map_err(|e| e.to_string())?;
+        owner
+            .execute(
+                "INSERT INTO fresh_released_owner
+             (handoff_id,invocation_uuid,session_id,actor_identity,bound_at)
+             VALUES(?1,?2,?3,?4,?5) ON CONFLICT DO NOTHING",
+                params![
+                    receipt.handoff_id,
+                    receipt.invocation_uuid,
+                    session.session_id,
+                    serde_json::to_string(actor).map_err(|e| e.to_string())?,
+                    Utc::now().to_rfc3339()
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        let rebound = state
+            .get_invocation_by_uuid(&receipt.invocation_uuid)?
+            .ok_or("fresh handoff invocation lost after owner binding")?;
+        if rebound.provider_session_id.as_deref() != Some(session.session_id.as_str()) {
+            return Err("fresh handoff invocation/session/owner readback conflict".into());
+        }
+        self.require_released_invocation(receipt, actor, session)
+    }
+
+    pub fn require_released_invocation(
+        &self,
+        receipt: &FreshReleasedHandoff,
+        actor: &FreshRecipientIdentity,
+        session: &FreshV30Session,
+    ) -> Result<(), String> {
+        self.require_released_handoff(&receipt.d_key, receipt, actor)?;
+        self.require_session(session)?;
+        let authority = crate::CompletionRegistrationAuthority::from_process_environment_value(
+            receipt.registration_authority.clone(),
+        )?;
+        let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let row: Option<(
+            String,
+            String,
+            i64,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+        )> = state
+            .query_row(
+                "SELECT model_name,provider_name,provider_index,parent_invocation_id,
+                 provider_session_id,completion_registration_capability_digest
+                 FROM invocations WHERE invocation_uuid=?1",
+                [&receipt.invocation_uuid],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if row
+            != Some((
+                "agent-bash".into(),
+                "agent-bash".into(),
+                0,
+                None,
+                Some(session.session_id.clone()),
+                Some(authority.digest()),
+            ))
+        {
+            return Err("fresh invocation/session/registration readback conflict".into());
+        }
+        let owner: Option<(String, String, String)> = state
+            .query_row(
+                "SELECT invocation_uuid,session_id,actor_identity FROM fresh_released_owner
+             WHERE handoff_id=?1",
+                [&receipt.handoff_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if owner
+            != Some((
+                receipt.invocation_uuid.clone(),
+                session.session_id.clone(),
+                serde_json::to_string(actor).map_err(|e| e.to_string())?,
+            ))
+        {
+            return Err("fresh child owner association changed".into());
+        }
+        Ok(())
     }
 
     /// The intended caller is a released Runner child retaining both UUIDs
@@ -781,6 +1095,20 @@ fn fresh_child_request_schema_count(state: &Connection) -> Result<i64, String> {
              (type='table' AND name='fresh_lane_child_request') OR
              (type='trigger' AND name IN
              ('fresh_lane_child_request_no_update','fresh_lane_child_request_no_delete'))",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())
+}
+
+fn fresh_handoff_schema_count(state: &Connection) -> Result<i64, String> {
+    state
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE
+         (type='table' AND name IN ('fresh_released_handoff','fresh_released_owner')) OR
+         (type='trigger' AND name IN
+          ('fresh_released_handoff_no_update','fresh_released_handoff_no_delete',
+           'fresh_released_owner_no_update','fresh_released_owner_no_delete'))",
             [],
             |r| r.get(0),
         )

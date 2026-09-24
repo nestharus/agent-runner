@@ -54,6 +54,7 @@ fn inner() {
     );
     let release_mode = mode.starts_with("held_release") || native_mode;
     let normal_mode = mode.starts_with("normal_");
+    let handoff_mode = matches!(mode.as_str(), "normal_handoff" | "normal_handoff_fsync");
     let recipient_mode = mode.starts_with("normal_recipient");
     let real_source = mode.starts_with("normal_bash_source");
     let nonzero_source = mode == "normal_bash_source_nonzero";
@@ -93,49 +94,50 @@ fn inner() {
             other => panic!("recipient fixture enqueue: {other:?}"),
         }
     });
-    let pending_binding = (normal_mode && !recipient_mode && mode != "normal_empty").then(|| {
-        if real_source {
-            let registration =
-                fs::read(std::env::var("AGE319_PRIVATE_BASH_REGISTRATION").unwrap()).unwrap();
-            let source: oulipoly_state::completion_continuation::SourceRegistration =
-                serde_json::from_slice(&registration).unwrap();
-            let state_path = std::env::var("AGE319_PRIVATE_BASH_STATE_DB").unwrap();
-            let committed = rusqlite::Connection::open_with_flags(
-                &state_path,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-            )
-            .unwrap();
-            let bytes: Vec<u8> = committed
-                .query_row(
-                    "SELECT completion_v2_binding FROM invocation_completion_obligations
-                     WHERE event_id=?1 AND completion_v2_binding IS NOT NULL",
-                    [&source.handle],
-                    |row| row.get(0),
+    let pending_binding =
+        (normal_mode && !recipient_mode && mode != "normal_empty" && !handoff_mode).then(|| {
+            if real_source {
+                let registration =
+                    fs::read(std::env::var("AGE319_PRIVATE_BASH_REGISTRATION").unwrap()).unwrap();
+                let source: oulipoly_state::completion_continuation::SourceRegistration =
+                    serde_json::from_slice(&registration).unwrap();
+                let state_path = std::env::var("AGE319_PRIVATE_BASH_STATE_DB").unwrap();
+                let committed = rusqlite::Connection::open_with_flags(
+                    &state_path,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
                 )
                 .unwrap();
-            let binding: AdmittedSourceBinding = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(binding.registration_bytes(), registration);
-            assert_eq!(binding.registration().unwrap(), source);
-            assert!(
-                !binding.caller_admission_id().is_empty(),
-                "Bash source must have a genuine committed State admission"
-            );
-            binding
-        } else {
-            let fixture: serde_json::Value = serde_json::from_str(include_str!(
-                "../../oulipoly-state/tests/fixtures/age360-paired-wire.json"
-            ))
-            .unwrap();
-            AdmittedSourceBinding::new(
-                "fixture-admission",
-                fixture["registration_bytes_utf8"]
-                    .as_str()
-                    .unwrap()
-                    .as_bytes(),
-            )
-            .unwrap()
-        }
-    });
+                let bytes: Vec<u8> = committed
+                    .query_row(
+                        "SELECT completion_v2_binding FROM invocation_completion_obligations
+                     WHERE event_id=?1 AND completion_v2_binding IS NOT NULL",
+                        [&source.handle],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let binding: AdmittedSourceBinding = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(binding.registration_bytes(), registration);
+                assert_eq!(binding.registration().unwrap(), source);
+                assert!(
+                    !binding.caller_admission_id().is_empty(),
+                    "Bash source must have a genuine committed State admission"
+                );
+                binding
+            } else {
+                let fixture: serde_json::Value = serde_json::from_str(include_str!(
+                    "../../oulipoly-state/tests/fixtures/age360-paired-wire.json"
+                ))
+                .unwrap();
+                AdmittedSourceBinding::new(
+                    "fixture-admission",
+                    fixture["registration_bytes_utf8"]
+                        .as_str()
+                        .unwrap()
+                        .as_bytes(),
+                )
+                .unwrap()
+            }
+        });
     let domain = pending_binding
         .as_ref()
         .map(|binding| binding.registration().unwrap().domain_id)
@@ -211,7 +213,22 @@ fn inner() {
     } else {
         None
     };
+    if handoff_mode {
+        rusqlite::Connection::open(broker_state.join("sidecar/pid-identity.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO mailbox(session_id,kind,handle,payload_json,enqueued_at,
+                 state_dir,meta_path,log_path,rc_path,rc)
+                 VALUES('old-pending','fixture','old-unacked','{}','2026-09-24T00:00:00Z',
+                 '/fixture','/fixture/meta','/fixture/log','/fixture/rc',0)",
+                [],
+            )
+            .unwrap();
+    }
     let socket = temp.path().join("broker.sock");
+    if handoff_mode {
+        FreshV30Lane::initialize_at(&broker_state).unwrap();
+    }
     let broker_log = temp.path().join("broker.log");
     let mut broker = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
@@ -222,6 +239,10 @@ fn inner() {
         .envs(
             (mode == "held_release_gate_fail")
                 .then_some(("OULIPOLY_KERNEL_BROKER_FIXTURE_FAIL_GATE_WRITE_V1", "1")),
+        )
+        .envs(
+            (mode == "normal_handoff_fsync")
+                .then_some(("OULIPOLY_KERNEL_BROKER_FIXTURE_FAIL_HANDOFF_SYNC_V1", "1")),
         )
         .stdout(Stdio::null())
         .stderr(Stdio::from(File::create(&broker_log).unwrap()))
@@ -239,13 +260,20 @@ fn inner() {
         let out = temp.path().join("normal.out");
         let err = temp.path().join("normal.err");
         let mut entry = Command::new(&runner)
-            .arg("__age319-private-normal-v30")
+            .arg(if handoff_mode {
+                "__age319-private-bash-work-v1"
+            } else {
+                "__age319-private-normal-v30"
+            })
             .env("OULIPOLY_DATA_DIR", &data)
             .env("OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1", "1")
             .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
             .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
             .env("AGE319_PRIVATE_REPAIR_CHALLENGE_V1", "1")
             .env("AGE319_PRIVATE_SOURCE_SELECTION_CHALLENGE_V1", "1")
+            .envs(
+                (mode == "normal_handoff").then_some(("AGE319_PRIVATE_HANDOFF_REPLY_LOSS_V1", "1")),
+            )
             .envs(pending_binding.as_ref().map(|binding| {
                 (
                     "AGE319_PRIVATE_EXPECT_SOURCE_DIGEST_V1",
@@ -405,6 +433,59 @@ fn inner() {
             let released: oulipoly_state::mailbox::BrokerReleaseEvidence =
                 serde_json::from_slice(&fs::read(gate.join("released")).unwrap()).unwrap();
             assert_eq!(released.prepared, prepared);
+            if mode == "normal_handoff_fsync" {
+                eventually(|| entry.try_wait().unwrap().is_some());
+                assert!(!entry.wait().unwrap().success());
+                assert!(!gate.join("child-handoff").exists());
+                assert!(!gate.join("child-attested").exists());
+                assert!(
+                    fs::read_to_string(&err)
+                        .unwrap()
+                        .contains("private interrupted handoff before fsync")
+                );
+                assert_eq!(
+                    fs::read_to_string(
+                        broker_state
+                            .join("released-handoffs")
+                            .join(format!("{}.json", prepared.root_id))
+                    )
+                    .unwrap(),
+                    "{"
+                );
+                let fresh = rusqlite::Connection::open_with_flags(
+                    broker_state.join("v30/state.db"),
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .unwrap();
+                let started: i64 = fresh
+                    .query_row("SELECT count(*) FROM invocations", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(started, 0, "uncertain old receipt cannot create fresh D");
+                stop(&mut broker);
+                broker = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
+                    .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                    .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
+                    .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
+                    .stderr(Stdio::from(
+                        File::create(temp.path().join("handoff-fsync-restart.log")).unwrap(),
+                    ))
+                    .spawn()
+                    .unwrap();
+                eventually(|| protocol::request_at(&socket, Operation::Classify).is_ok());
+                let old = rusqlite::Connection::open_with_flags(
+                    broker_state.join("sidecar/pid-identity.db"),
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .unwrap();
+                let pending: i64 = old.query_row(
+                    "SELECT count(*) FROM mailbox WHERE handle='old-unacked' AND delivered_at IS NULL",
+                    [], |row| row.get(0),
+                ).unwrap();
+                assert_eq!(pending, 1);
+                assert!(fs::metadata(&out).unwrap().len() == 0);
+                stop(&mut broker);
+                return;
+            }
             eventually(|| {
                 gate.join("child-attested").exists() || entry.try_wait().unwrap().is_some()
             });
@@ -413,6 +494,197 @@ fn inner() {
                 "{}",
                 fs::read_to_string(&err).unwrap()
             );
+            if mode == "normal_handoff" {
+                let marker: serde_json::Value =
+                    serde_json::from_slice(&fs::read(gate.join("child-handoff")).unwrap()).unwrap();
+                let receipt: oulipoly_state::mailbox::FreshReleasedHandoff =
+                    serde_json::from_slice(
+                        &fs::read(
+                            broker_state
+                                .join("released-handoffs")
+                                .join(format!("{}.json", prepared.root_id)),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                assert_eq!(marker["handoff_id"], receipt.handoff_id);
+                assert_eq!(marker["d_key"], receipt.d_key);
+                assert_eq!(marker["invocation_uuid"], receipt.invocation_uuid);
+                assert_eq!(marker["bash_handle"], receipt.bash_handle);
+                assert!(receipt.old_release == released);
+                assert!(receipt.bash_handle.starts_with("ab30_"));
+                let fresh_state = rusqlite::Connection::open_with_flags(
+                    broker_state.join("v30/state.db"),
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .unwrap();
+                let (session, provider): (String, String) = fresh_state.query_row(
+                    "SELECT provider_session_id,provider_name FROM invocations WHERE invocation_uuid=?1",
+                    [&receipt.invocation_uuid],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                ).unwrap();
+                assert_eq!(session, marker["session_id"].as_str().unwrap());
+                assert_eq!(provider, "agent-bash");
+                let bound: i64 = fresh_state.query_row(
+                    "SELECT count(*) FROM fresh_released_handoff WHERE handoff_id=?1 AND d_key=?2",
+                    rusqlite::params![receipt.handoff_id, receipt.d_key],
+                    |row| row.get(0),
+                ).unwrap();
+                assert_eq!(bound, 1);
+                assert_eq!(
+                    fs::metadata(&out).unwrap().len(),
+                    0,
+                    "handoff/D must not start Bash work"
+                );
+                let lane = FreshV30Lane::open_at(&broker_state).unwrap();
+                let child = &prepared.joined_child;
+                let actor = oulipoly_state::mailbox::FreshRecipientIdentity {
+                    host_pid: child.host_pid,
+                    boot_id: child.boot_id.clone(),
+                    starttime_ticks: child.starttime_ticks,
+                    pidns_dev: child.pidns_dev,
+                    pidns_ino: child.pidns_ino,
+                };
+                let mut reused_pid = actor.clone();
+                reused_pid.starttime_ticks += 1;
+                assert!(
+                    lane.require_released_handoff(&receipt.d_key, &receipt, &reused_pid)
+                        .is_err()
+                );
+                let mut wrong_lane = receipt.clone();
+                wrong_lane.fresh_lane.lane_id = uuid::Uuid::new_v4().to_string();
+                assert!(
+                    lane.require_released_handoff(&receipt.d_key, &wrong_lane, &actor)
+                        .is_err()
+                );
+                let mut wrong_domain = receipt.clone();
+                wrong_domain.fresh_lane.domain_id = receipt.old_release.prepared.domain_id.clone();
+                assert!(
+                    lane.require_released_handoff(&receipt.d_key, &wrong_domain, &actor)
+                        .is_err()
+                );
+                let mut wrong_old_lane = receipt.clone();
+                wrong_old_lane.old_release.prepared.source_generation =
+                    receipt.fresh_lane.source_generation.clone();
+                assert!(
+                    lane.require_released_handoff(&receipt.d_key, &wrong_old_lane, &actor)
+                        .is_err()
+                );
+                let mut wrong_handle = receipt.clone();
+                wrong_handle.bash_handle = format!("ab30_{}", uuid::Uuid::new_v4().simple());
+                assert!(
+                    lane.require_released_handoff(&receipt.d_key, &wrong_handle, &actor)
+                        .is_err()
+                );
+                let mut wrong_invocation = receipt.clone();
+                wrong_invocation.invocation_uuid = uuid::Uuid::new_v4().to_string();
+                assert!(
+                    lane.require_released_handoff(&receipt.d_key, &wrong_invocation, &actor)
+                        .is_err()
+                );
+                drop(lane);
+                // A copied locator from this test process has the wrong image
+                // and the wrong physical child. It cannot reserve a second U.
+                assert!(
+                    protocol::request_released_fresh_handoff_at(
+                        &socket.with_file_name("v30.sock"),
+                        protocol::StateReadSpec {
+                            protocol: "broker-release-attest-v30".into(),
+                            source_generation: generation.clone(),
+                            root_id: prepared.root_id.clone(),
+                            owner_generation: prepared.owner_generation.clone(),
+                            attempt_id: None,
+                        },
+                    )
+                    .is_err()
+                );
+                let release_spec = serde_json::to_string(&protocol::StateReadSpec {
+                    protocol: "broker-release-attest-v30".into(),
+                    source_generation: generation.clone(),
+                    root_id: prepared.root_id.clone(),
+                    owner_generation: prepared.owner_generation.clone(),
+                    attempt_id: None,
+                })
+                .unwrap();
+                assert!(
+                    protocol::request_released_fresh_handoff_at(
+                        &socket,
+                        serde_json::from_str(&release_spec).unwrap(),
+                    )
+                    .is_err(),
+                    "old v29 listener admitted a fresh U"
+                );
+                let sibling_u = Command::new(&runner)
+                    .arg("__age319-private-handoff-probe-v1")
+                    .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                    .env("AGE319_PRIVATE_HANDOFF_PROBE_SPEC", &release_spec)
+                    .status()
+                    .unwrap();
+                assert!(!sibling_u.success(), "same-image sibling U was admitted");
+                let sibling_d = Command::new(&runner)
+                    .arg("__age319-private-handoff-probe-v1")
+                    .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                    .env("AGE319_PRIVATE_HANDOFF_PROBE_D_KEY", &receipt.d_key)
+                    .status()
+                    .unwrap();
+                assert!(!sibling_d.success(), "same-image sibling D was admitted");
+                stop(&mut broker);
+                broker = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
+                    .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                    .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
+                    .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
+                    .stderr(Stdio::from(
+                        File::create(temp.path().join("handoff-restart.log")).unwrap(),
+                    ))
+                    .spawn()
+                    .unwrap();
+                eventually(|| {
+                    socket.with_file_name("v30.sock").exists()
+                        && protocol::request_at(&socket, Operation::Classify).is_ok()
+                });
+                fs::write(gate.join("child-retry"), b"yes").unwrap();
+                eventually(|| {
+                    gate.join("child-retried").exists() || entry.try_wait().unwrap().is_some()
+                });
+                assert!(
+                    gate.join("child-retried").exists(),
+                    "retry: {}",
+                    fs::read_to_string(&err).unwrap()
+                );
+                assert_eq!(
+                    fs::read_dir(broker_state.join("released-handoffs"))
+                        .unwrap()
+                        .count(),
+                    1
+                );
+                let old = rusqlite::Connection::open_with_flags(
+                    broker_state.join("sidecar/pid-identity.db"),
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .unwrap();
+                let pending: i64 = old
+                    .query_row(
+                        "SELECT count(*) FROM mailbox WHERE session_id='old-pending'
+                     AND handle='old-unacked' AND delivered_at IS NULL",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(pending, 1, "old pending ACK debt must coexist with fresh D");
+                fs::write(gate.join("child-effect"), b"yes").unwrap();
+                eventually(|| entry.try_wait().unwrap().is_some());
+                assert!(
+                    entry.wait().unwrap().success(),
+                    "handoff child: {}",
+                    fs::read_to_string(&err).unwrap()
+                );
+                assert_eq!(
+                    fs::read_to_string(&out).unwrap(),
+                    format!("OULIPOLY_KERNEL_V30_CHILD_EFFECT={}\n", released.release_id)
+                );
+                stop(&mut broker);
+                return;
+            }
             let repair_read = protocol::StateReadSpec {
                 protocol: "broker-repair-read-v30".into(),
                 source_generation: generation.clone(),
@@ -2289,6 +2561,8 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "native_pid1_loss",
         "native_receipt_pid1_loss",
         "normal_release",
+        "normal_handoff",
+        "normal_handoff_fsync",
         "normal_guardian_death",
         "normal_driver_death",
         "normal_broker_death",

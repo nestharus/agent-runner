@@ -26,7 +26,10 @@ fn private_prepared_mode() -> bool {
 
 #[cfg(feature = "age319-private-broker-fixture")]
 fn private_normal_mode() -> bool {
-    std::env::args().nth(1).as_deref() == Some(PRIVATE_NORMAL_ENTRY)
+    std::env::args()
+        .nth(1)
+        .as_deref()
+        .is_some_and(|arg| arg == PRIVATE_NORMAL_ENTRY || arg == "__age319-private-bash-work-v1")
         && unsafe { libc::geteuid() } == 0
         && std::fs::read_to_string("/proc/self/uid_map")
             .ok()
@@ -369,6 +372,53 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
     {
         return Err("v30 child attestation does not match physical gate".into());
     }
+    #[cfg(feature = "age319-private-broker-fixture")]
+    let private_handoff = private_v30_child_mode()
+        && std::env::args().nth(1).as_deref() == Some("__age319-private-bash-work-v1");
+    #[cfg(feature = "age319-private-broker-fixture")]
+    let request_handoff = private_handoff || !private_v30_child_mode();
+    #[cfg(not(feature = "age319-private-broker-fixture"))]
+    let request_handoff = true;
+    #[cfg(feature = "age319-private-broker-fixture")]
+    let mut private_receipt = None;
+    if request_handoff {
+        let fresh_socket = broker_socket().with_file_name("v30.sock");
+        #[cfg(feature = "age319-private-broker-fixture")]
+        if private_handoff && std::env::var_os("AGE319_PRIVATE_HANDOFF_REPLY_LOSS_V1").is_some() {
+            private_drop_fresh_reply(&fresh_socket, b'U', Some(spec_for_handoff(&spec)), None)?;
+        }
+        let receipt =
+            protocol::request_released_fresh_handoff_at(&fresh_socket, spec_for_handoff(&spec))
+                .map_err(|e| format!("v30 released-child handoff absent: {e}"))?;
+        if receipt.old_release != evidence {
+            return Err("v30 handoff release readback conflict".into());
+        }
+        #[cfg(feature = "age319-private-broker-fixture")]
+        if private_handoff && std::env::var_os("AGE319_PRIVATE_HANDOFF_REPLY_LOSS_V1").is_some() {
+            private_drop_fresh_reply(&fresh_socket, b'D', None, Some(&receipt.d_key))?;
+        }
+        let session = protocol::allocate_fresh_v30_session_at(&fresh_socket, &receipt.d_key)
+            .map_err(|e| format!("v30 released-child D absent: {e}"))?;
+        let readback = protocol::read_fresh_v30_session_at(&fresh_socket, &receipt.d_key)
+            .map_err(|e| format!("v30 released-child d absent: {e}"))?;
+        if readback.as_ref() != Some(&session) || session.request_id != receipt.d_key {
+            return Err("v30 released-child D readback conflict".into());
+        }
+        #[cfg(feature = "age319-private-broker-fixture")]
+        if private_handoff {
+            private_v30_marker(
+                "child-handoff",
+                &serde_json::json!({
+                    "handoff_id": receipt.handoff_id,
+                    "d_key": receipt.d_key,
+                    "invocation_uuid": receipt.invocation_uuid,
+                    "bash_handle": receipt.bash_handle,
+                    "session_id": session.session_id,
+                }),
+            )?;
+            private_receipt = Some(receipt);
+        }
+    }
     drop(gate);
     #[cfg(feature = "age319-private-broker-fixture")]
     if private_v30_child_mode() {
@@ -382,21 +432,128 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
         )
         .map_err(|e| e.to_string())?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut retried = false;
         while !gate_dir.join("child-effect").exists() {
+            if !retried && gate_dir.join("child-retry").exists() {
+                let original = private_receipt
+                    .as_ref()
+                    .ok_or("private handoff retry has no original receipt")?;
+                let fresh_socket = broker_socket().with_file_name("v30.sock");
+                let mut wrong_release = spec_for_handoff(&spec);
+                wrong_release.owner_generation = uuid::Uuid::new_v4().to_string();
+                if protocol::request_released_fresh_handoff_at(&fresh_socket, wrong_release).is_ok()
+                {
+                    return Err("stale owner generation obtained a handoff".into());
+                }
+                let repeated = protocol::request_released_fresh_handoff_at(
+                    &fresh_socket,
+                    spec_for_handoff(&spec),
+                )
+                .map_err(|e| format!("v30 handoff retry failed: {e}"))?;
+                if repeated != *original {
+                    return Err("v30 handoff retry minted another identity".into());
+                }
+                if protocol::allocate_fresh_v30_session_at(
+                    &fresh_socket,
+                    &uuid::Uuid::new_v4().to_string(),
+                )
+                .is_ok()
+                {
+                    return Err("wrong D key allocated a fresh session".into());
+                }
+                let allocated =
+                    protocol::allocate_fresh_v30_session_at(&fresh_socket, &original.d_key)
+                        .map_err(|e| format!("v30 D retry failed: {e}"))?;
+                if protocol::read_fresh_v30_session_at(&fresh_socket, &original.d_key)
+                    .map_err(|e| e.to_string())?
+                    != Some(allocated)
+                {
+                    return Err("v30 D retry readback changed".into());
+                }
+                std::fs::write(gate_dir.join("child-retried"), b"yes")
+                    .map_err(|e| e.to_string())?;
+                retried = true;
+            }
             if std::time::Instant::now() >= deadline {
                 return Err("private v30 child effect wait expired".into());
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        let current = protocol::attest_released_child_at(&broker_socket(), &spec)
-            .map_err(|e| format!("v30 child release no longer live: {e}"))?;
-        if current != evidence {
-            return Err("v30 child release changed before effect".into());
+        if let Some(original) = private_receipt.as_ref() {
+            let current = protocol::request_released_fresh_handoff_at(
+                &broker_socket().with_file_name("v30.sock"),
+                spec_for_handoff(&spec),
+            )
+            .map_err(|e| format!("v30 handoff no longer live: {e}"))?;
+            if current != *original {
+                return Err("v30 released handoff changed before private marker".into());
+            }
+        } else {
+            let current = protocol::attest_released_child_at(&broker_socket(), &spec)
+                .map_err(|e| format!("v30 child release no longer live: {e}"))?;
+            if current != evidence {
+                return Err("v30 child release changed before effect".into());
+            }
         }
         println!("OULIPOLY_KERNEL_V30_CHILD_EFFECT={}", evidence.release_id);
         return Ok(ExitCode::SUCCESS);
     }
     Err("production v30 child requires broker-routed owner work path".into())
+}
+
+fn spec_for_handoff(spec: &protocol::StateReadSpec) -> protocol::StateReadSpec {
+    protocol::StateReadSpec {
+        protocol: spec.protocol.clone(),
+        source_generation: spec.source_generation.clone(),
+        owner_generation: spec.owner_generation.clone(),
+        root_id: spec.root_id.clone(),
+        attempt_id: None,
+    }
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_drop_fresh_reply(
+    socket: &std::path::Path,
+    operation: u8,
+    release: Option<protocol::StateReadSpec>,
+    d_key: Option<&str>,
+) -> Result<(), String> {
+    let mut stream = UnixStream::connect(socket).map_err(|e| e.to_string())?;
+    let mut challenge = [0u8; 16];
+    stream
+        .read_exact(&mut challenge)
+        .map_err(|e| e.to_string())?;
+    let mut frame = Vec::from([operation]);
+    frame.extend_from_slice(&challenge);
+    match operation {
+        b'U' => frame.extend_from_slice(
+            &serde_json::to_vec(&protocol::FreshChildRequest {
+                request_id: String::new(),
+                invocation_uuid: String::new(),
+                release,
+            })
+            .map_err(|e| e.to_string())?,
+        ),
+        b'D' => frame.extend_from_slice(
+            uuid::Uuid::parse_str(d_key.ok_or("private D key absent")?)
+                .map_err(|e| e.to_string())?
+                .as_bytes(),
+        ),
+        _ => return Err("unsupported private lost-reply operation".into()),
+    }
+    stream.write_all(&frame).map_err(|e| e.to_string())?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .map_err(|e| e.to_string())?;
+    let mut first = [0u8; 1];
+    stream.read_exact(&mut first).map_err(|e| e.to_string())?;
+    if first != [b'f'] {
+        return Err("private lost-reply operation was refused".into());
+    }
+    // The broker has committed and started its success reply. Discard the
+    // rest so the same child must recover the result with its original key.
+    drop(stream);
+    Ok(())
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]
@@ -468,6 +625,36 @@ fn private_bash_work() -> Result<ExitCode, String> {
 }
 
 pub(crate) fn host_entry() -> Option<ExitCode> {
+    #[cfg(feature = "age319-private-broker-fixture")]
+    if std::env::args().nth(1).as_deref() == Some("__age319-private-handoff-probe-v1")
+        && unsafe { libc::geteuid() } == 0
+        && std::fs::read_to_string("/proc/self/uid_map")
+            .ok()
+            .is_some_and(|map| map.split_ascii_whitespace().nth(2) == Some("1"))
+        && std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1").is_some()
+    {
+        let result = (|| -> Result<(), String> {
+            let socket = broker_socket().with_file_name("v30.sock");
+            if let Ok(d_key) = std::env::var("AGE319_PRIVATE_HANDOFF_PROBE_D_KEY") {
+                protocol::allocate_fresh_v30_session_at(&socket, &d_key)
+                    .map_err(|e| e.to_string())?;
+            } else {
+                let spec: protocol::StateReadSpec = serde_json::from_str(
+                    &std::env::var("AGE319_PRIVATE_HANDOFF_PROBE_SPEC")
+                        .map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| e.to_string())?;
+                protocol::request_released_fresh_handoff_at(&socket, spec)
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        })();
+        return Some(if result.is_ok() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        });
+    }
     #[cfg(feature = "age319-private-broker-fixture")]
     if private_prepared_mode() {
         return Some(match private_held_prepared_entry() {

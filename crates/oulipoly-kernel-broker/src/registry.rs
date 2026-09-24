@@ -81,6 +81,17 @@ impl RootRegistry {
             if name == "entries" && entry.file_type()?.is_dir() {
                 continue;
             }
+            if name == "released-handoffs" {
+                let meta = fs::symlink_metadata(entry.path())?;
+                if !meta.is_dir()
+                    || meta.file_type().is_symlink()
+                    || meta.uid() != 0
+                    || meta.mode() & 0o777 != 0o700
+                {
+                    return Err(io::Error::other("unsafe released handoff directory"));
+                }
+                continue;
+            }
             if name == "grants" && entry.file_type()?.is_dir() {
                 continue;
             }
