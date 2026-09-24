@@ -441,12 +441,13 @@ fn durable_result<T: Serialize>(directory: &Path, value: &T) -> io::Result<()> {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct RouteCandidate {
-    // v2 freezes the config-selected terminal recognizer with the exact plan.
+    // v3 also freezes the source-owned physical account identity.
     version: u32,
     binding: Binding,
     model: String,
     config_sha256: String,
     account: String,
+    account_identity: String,
     index: usize,
     total: usize,
     pin: Option<String>,
@@ -508,9 +509,15 @@ struct RouteSource {
 }
 
 fn route_request_valid(request: &FreshRouteRequest, binding: &Binding) -> io::Result<()> {
-    if request.d_key.is_empty()
+    if request.protocol_version != 4
+        || request.d_key.is_empty()
         || request.model.is_empty()
         || request.account.as_deref().is_some_and(str::is_empty)
+        || request
+            .account_identity
+            .as_deref()
+            .is_some_and(str::is_empty)
+        || request.account.is_some() != request.account_identity.is_some()
         || request.config_sha256.len() != 64
         || !request.config_sha256.bytes().all(|c| c.is_ascii_hexdigit())
         || request.total == 0
@@ -557,6 +564,8 @@ pub(super) fn validate_route_source(
             .get(index)
             .ok_or_else(|| io::Error::other("fresh config source account effect absent"))?;
         if request.account.as_deref() != Some(member.name.as_str())
+            || request.account_identity.as_deref() != pool.account_identities[index].as_deref()
+            || request.account_identity.is_none()
             || request.quota_script != effect.0
             || request.auth_refresh_command != effect.1
         {
@@ -565,6 +574,7 @@ pub(super) fn validate_route_source(
             ));
         }
     } else if request.account.is_some()
+        || request.account_identity.is_some()
         || request.quota_script.is_some()
         || request.auth_refresh_command.is_some()
     {
@@ -676,7 +686,7 @@ fn effect_candidate(
         &candidate_name(&binding.handoff_id, request.index),
     )?
     .ok_or_else(|| io::Error::other("fresh account effect candidate absent"))?;
-    if candidate.version != 2
+    if candidate.version != 3
         || candidate.binding != *binding
         || candidate.model != request.model
         || candidate.config_sha256 != request.config_sha256
@@ -686,6 +696,19 @@ fn effect_candidate(
         return Err(io::Error::other("fresh account effect candidate changed"));
     }
     Ok(candidate)
+}
+
+/// The identity is source-owned, and the source command must agree too. A
+/// matching label, model name, or member index is never quota authority.
+fn same_physical_effect_source(
+    directory: &Path,
+    target: &RouteCandidate,
+    source: &AccountEffectIntent,
+) -> io::Result<bool> {
+    let prior = effect_candidate(directory, &source.binding, &source.request)?;
+    Ok(prior.account_identity == target.account_identity
+        && prior.quota_script == target.quota_script
+        && prior.auth_refresh_command == target.auth_refresh_command)
 }
 
 fn effect_command<'a>(
@@ -709,7 +732,7 @@ fn effect_intent(dir: &Path) -> io::Result<Option<AccountEffectIntent>> {
 
 fn latest_terminal_marker_time(
     directory: &Path,
-    request: &FreshAccountEffectRequest,
+    candidate: &RouteCandidate,
 ) -> io::Result<Option<u128>> {
     let mut latest = None;
     for entry in std::fs::read_dir(directory)? {
@@ -725,9 +748,20 @@ fn latest_terminal_marker_time(
         if record.version != 1 {
             return Err(io::Error::other("fresh terminal ledger version changed"));
         }
-        if record.selection.model == request.model
-            && record.selection.config_sha256 == request.config_sha256
-            && record.selection.account == request.account
+        let source: RouteCandidate = exact_file(
+            directory,
+            &candidate_name(&record.binding.handoff_id, record.selection.index),
+        )?
+        .ok_or_else(|| io::Error::other("fresh terminal source candidate absent"))?;
+        if source.version != 3
+            || source.binding != record.binding
+            || source.account_identity != record.selection.account_identity
+            || source.account != record.selection.account
+            || source.plan_sha256 != record.selection.plan_sha256
+        {
+            return Err(io::Error::other("fresh terminal source identity changed"));
+        }
+        if record.selection.account_identity == candidate.account_identity
             && record.outcome.is_marker()
         {
             latest = Some(latest.map_or(record.physical_q_unix_nanos, |prior: u128| {
@@ -743,7 +777,8 @@ fn reusable_quota_source(
     binding: &Binding,
     request: &FreshAccountEffectRequest,
 ) -> io::Result<Option<(String, AccountEffectIntent)>> {
-    let marker_q = latest_terminal_marker_time(directory, request)?;
+    let candidate = effect_candidate(directory, binding, request)?;
+    let marker_q = latest_terminal_marker_time(directory, &candidate)?;
     let parent = directory.join("account-effects");
     let mut names = std::fs::read_dir(&parent)?
         .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
@@ -761,10 +796,7 @@ fn reusable_quota_source(
         };
         if intent.version != 1
             || intent.binding == *binding
-            || intent.request.model != request.model
-            || intent.request.config_sha256 != request.config_sha256
-            || intent.request.account != request.account
-            || intent.request.index != request.index
+            || !same_physical_effect_source(directory, &candidate, &intent)?
             || intent.environment_sha256 != environment_digest(request)?
             || source_dir.join("reuse.json").exists()
         {
@@ -827,7 +859,8 @@ fn coalescible_auth_source(
     binding: &Binding,
     request: &FreshAccountEffectRequest,
 ) -> io::Result<Option<(String, AccountEffectIntent)>> {
-    let marker_q = latest_terminal_marker_time(directory, request)?;
+    let candidate = effect_candidate(directory, binding, request)?;
+    let marker_q = latest_terminal_marker_time(directory, &candidate)?;
     let parent = directory.join("account-effects");
     let entries = match std::fs::read_dir(&parent) {
         Ok(entries) => entries,
@@ -850,7 +883,9 @@ fn coalescible_auth_source(
         if intent.auth_source.is_some() {
             continue;
         }
-        if intent.binding == *binding || intent.request.account != request.account {
+        if intent.binding == *binding
+            || !same_physical_effect_source(directory, &candidate, &intent)?
+        {
             continue;
         }
         let prior = effect_readback_from_dir(&source_dir, &intent)?;
@@ -868,9 +903,6 @@ fn coalescible_auth_source(
         {
             if intent.version != 1
                 || intent.request.kind != FreshAccountEffectKind::AuthRefresh
-                || intent.request.model != request.model
-                || intent.request.config_sha256 != request.config_sha256
-                || intent.request.index != request.index
                 || intent.environment_sha256 != environment_digest(request)?
             {
                 return Err(io::Error::other(format!(
@@ -889,6 +921,11 @@ fn effect_readback_from_dir(
     intent: &AccountEffectIntent,
 ) -> io::Result<FreshAccountEffectReadback> {
     let artifact = dir.display().to_string();
+    let broker_directory = dir
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| io::Error::other("fresh effect broker directory absent"))?;
+    let candidate = effect_candidate(broker_directory, &intent.binding, &intent.request)?;
     if let Some(reuse) = &intent.auth_source {
         if intent.request.kind != FreshAccountEffectKind::AuthRefresh
             || reuse.source_directory.contains('/')
@@ -912,10 +949,7 @@ fn effect_readback_from_dir(
             || intent.plan_sha256 != format!("coalesced:{}", source.id)
             || source.binding == intent.binding
             || source.request.kind != FreshAccountEffectKind::AuthRefresh
-            || source.request.model != intent.request.model
-            || source.request.config_sha256 != intent.request.config_sha256
-            || source.request.account != intent.request.account
-            || source.request.index != intent.request.index
+            || !same_physical_effect_source(broker_directory, &candidate, &source)?
             || source.environment_sha256 != intent.environment_sha256
         {
             return Err(io::Error::other("fresh auth reuse provenance changed"));
@@ -946,10 +980,7 @@ fn effect_readback_from_dir(
             .ok_or_else(|| io::Error::other("fresh quota reuse intent absent"))?;
         if source.id != reuse.source_effect_id
             || source.version != 1
-            || source.request.model != intent.request.model
-            || source.request.config_sha256 != intent.request.config_sha256
-            || source.request.account != intent.request.account
-            || source.request.index != intent.request.index
+            || !same_physical_effect_source(broker_directory, &candidate, &source)?
             || source.environment_sha256 != intent.environment_sha256
         {
             return Err(io::Error::other("fresh quota reuse provenance changed"));
@@ -1110,7 +1141,7 @@ pub(super) fn begin_account_effect(
         request.kind,
         FreshAccountEffectKind::AuthRefresh | FreshAccountEffectKind::QuotaFirst
     ) {
-        Some(auth_admission_lock(directory, &request.account)?)
+        Some(auth_admission_lock(directory, &candidate.account_identity)?)
     } else {
         None
     };
@@ -1278,11 +1309,15 @@ pub(super) fn register_route_candidate(
         .as_ref()
         .ok_or_else(|| io::Error::other("fresh route account absent"))?;
     let candidate = RouteCandidate {
-        version: 2,
+        version: 3,
         binding: binding.clone(),
         model: request.model.clone(),
         config_sha256: request.config_sha256.clone(),
         account: account.clone(),
+        account_identity: request
+            .account_identity
+            .clone()
+            .ok_or_else(|| io::Error::other("fresh physical account identity absent"))?,
         index,
         total: request.total,
         pin: request.pin.clone(),
@@ -1309,11 +1344,12 @@ fn route_candidates(
 ) -> io::Result<Vec<RouteCandidate>> {
     let mut candidates = Vec::new();
     let mut names = HashSet::new();
+    let mut identities = HashSet::new();
     for index in 0..request.total {
         let candidate: RouteCandidate =
             exact_file(directory, &candidate_name(&binding.handoff_id, index))?
                 .ok_or_else(|| io::Error::other("fresh route candidate set incomplete"))?;
-        if candidate.version != 2
+        if candidate.version != 3
             || candidate.binding != *binding
             || candidate.model != request.model
             || candidate.config_sha256 != request.config_sha256
@@ -1323,6 +1359,7 @@ fn route_candidates(
             || request.quota_script.is_some()
             || request.auth_refresh_command.is_some()
             || !names.insert(candidate.account.clone())
+            || !identities.insert(candidate.account_identity.clone())
         {
             return Err(io::Error::other("fresh route candidate set changed"));
         }
@@ -1468,9 +1505,10 @@ fn terminal_record(
     mut stderr: File,
     cancelled: bool,
 ) -> io::Result<TerminalRecord> {
-    if candidate.version != 2
+    if candidate.version != 3
         || candidate.binding != decision.binding
         || candidate.account != decision.selection.account
+        || candidate.account_identity != decision.selection.account_identity
         || candidate.model != decision.selection.model
         || candidate.config_sha256 != decision.selection.config_sha256
         || candidate.index != decision.selection.index
@@ -1562,12 +1600,29 @@ fn route_evidence_excluding(
             continue;
         }
         let previous: RouteDecision = serde_json::from_reader(File::open(entry.path())?)?;
-        if previous.version != 1
-            || previous.selection.model != candidate.model
-            || previous.selection.config_sha256 != candidate.config_sha256
-            || previous.selection.account != candidate.account
+        if previous.version != 1 || previous.selection.policy_version != FRESH_ROUTE_POLICY_VERSION
         {
+            return Err(io::Error::other(
+                "fresh route history policy is incompatible",
+            ));
+        }
+        if previous.selection.account_identity != candidate.account_identity {
             continue;
+        }
+        let prior_candidate: RouteCandidate = exact_file(
+            directory,
+            &candidate_name(&previous.binding.handoff_id, previous.selection.index),
+        )?
+        .ok_or_else(|| io::Error::other("fresh route history candidate absent"))?;
+        if prior_candidate.version != 3
+            || prior_candidate.binding != previous.binding
+            || prior_candidate.account_identity != previous.selection.account_identity
+            || prior_candidate.account != previous.selection.account
+            || prior_candidate.plan_sha256 != previous.selection.plan_sha256
+        {
+            return Err(io::Error::other(
+                "fresh route history account identity changed",
+            ));
         }
         // The selected route is durably recorded before its first provider K.
         // During that one pre-K check, its prepared grant is not history.
@@ -1793,10 +1848,7 @@ fn newer_quota_effect(
         let Some(intent) = effect_intent(&dir)? else {
             continue;
         };
-        if intent.request.model != candidate.model
-            || intent.request.config_sha256 != candidate.config_sha256
-            || intent.request.account != candidate.account
-            || intent.request.index != candidate.index
+        if !same_physical_effect_source(directory, candidate, &intent)?
             || intent.environment_sha256 != source.environment_sha256
             || dir.join("reuse.json").exists()
         {
@@ -1818,6 +1870,11 @@ fn newer_quota_effect(
 
 /// Return the physical source Q time, never the time of a reused readback.
 fn effect_physical_q_nanos(dir: &Path, intent: &AccountEffectIntent) -> io::Result<u128> {
+    let broker_directory = dir
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| io::Error::other("fresh effect broker directory absent"))?;
+    let candidate = effect_candidate(broker_directory, &intent.binding, &intent.request)?;
     let (physical_dir, physical_intent) = if let Some(reuse) = &intent.auth_source {
         if intent.request.kind != FreshAccountEffectKind::AuthRefresh
             || reuse.source_directory.contains('/')
@@ -1837,10 +1894,7 @@ fn effect_physical_q_nanos(dir: &Path, intent: &AccountEffectIntent) -> io::Resu
             || source.auth_source.is_some()
             || source.binding == intent.binding
             || source.request.kind != FreshAccountEffectKind::AuthRefresh
-            || source.request.model != intent.request.model
-            || source.request.config_sha256 != intent.request.config_sha256
-            || source.request.account != intent.request.account
-            || source.request.index != intent.request.index
+            || !same_physical_effect_source(broker_directory, &candidate, &source)?
             || source.environment_sha256 != intent.environment_sha256
             || intent.plan_sha256 != format!("coalesced:{}", source.id)
         {
@@ -1862,10 +1916,7 @@ fn effect_physical_q_nanos(dir: &Path, intent: &AccountEffectIntent) -> io::Resu
         let source = effect_intent(&source_dir)?
             .ok_or_else(|| io::Error::other("quota source intent absent"))?;
         if source.id != reuse.source_effect_id
-            || source.request.model != intent.request.model
-            || source.request.config_sha256 != intent.request.config_sha256
-            || source.request.account != intent.request.account
-            || source.request.index != intent.request.index
+            || !same_physical_effect_source(broker_directory, &candidate, &source)?
             || source.environment_sha256 != intent.environment_sha256
             || source_dir.join("reuse.json").exists()
         {
@@ -1941,11 +1992,7 @@ fn auth_verified_after_marker(
         let Some(intent) = effect_intent(&dir)? else {
             continue;
         };
-        if intent.request.model != candidate.model
-            || intent.request.config_sha256 != candidate.config_sha256
-            || intent.request.account != candidate.account
-            || intent.request.index != candidate.index
-        {
+        if !same_physical_effect_source(directory, candidate, &intent)? {
             continue;
         }
         if intent.version != 1 || intent.request.kind != FreshAccountEffectKind::AuthRefresh {
@@ -1991,12 +2038,7 @@ fn single_marker_allows_candidate(
     marker: &TerminalRecord,
     quota_q_nanos: Option<u128>,
 ) -> io::Result<bool> {
-    if marker.version != 1
-        || marker.selection.model != candidate.model
-        || marker.selection.config_sha256 != candidate.config_sha256
-        || marker.selection.account != candidate.account
-        || marker.selection.index != candidate.index
-    {
+    if marker.version != 1 || marker.selection.account_identity != candidate.account_identity {
         return Err(io::Error::other("fresh terminal marker candidate mismatch"));
     }
     let newer_healthy_quota = quota_q_nanos.is_some_and(|q| q > marker.physical_q_unix_nanos);
@@ -2058,7 +2100,7 @@ fn quota_read_is_fresh(result: &FreshAccountEffectReadback, now: i64) -> io::Res
     Ok(true)
 }
 
-const FRESH_ROUTE_POLICY_VERSION: &str = "fresh-quota-rr-ttl-v3";
+const FRESH_ROUTE_POLICY_VERSION: &str = "fresh-quota-account-v4";
 
 /// The fsynced decision files are the cursor. Serialize their scan and the
 /// next durable decision across broker threads and restarts, including roots
@@ -2107,6 +2149,19 @@ fn last_route_cursor(
                 "fresh route cursor contains incompatible policy decision",
             ));
         }
+        let source: RouteCandidate = exact_file(
+            directory,
+            &candidate_name(&decision.binding.handoff_id, decision.selection.index),
+        )?
+        .ok_or_else(|| io::Error::other("fresh route cursor candidate absent"))?;
+        if source.version != 3
+            || source.binding != decision.binding
+            || source.account_identity != decision.selection.account_identity
+            || source.account != decision.selection.account
+            || source.plan_sha256 != decision.selection.plan_sha256
+        {
+            return Err(io::Error::other("fresh route cursor identity changed"));
+        }
         if decision.pin.is_none() {
             if decision.sequence == 0 || !sequences.insert(decision.sequence) {
                 return Err(io::Error::other(
@@ -2149,6 +2204,9 @@ pub(super) fn select_route(
             || existing.pin != request.pin
             || existing.selection.model != request.model
             || existing.selection.config_sha256 != request.config_sha256
+            || candidates
+                .get(existing.selection.index)
+                .is_none_or(|c| c.account_identity != existing.selection.account_identity)
             || existing.selection.policy_version != FRESH_ROUTE_POLICY_VERSION
             || !existing
                 .selection
@@ -2220,6 +2278,7 @@ pub(super) fn select_route(
         model: candidate.model,
         config_sha256: candidate.config_sha256,
         account: candidate.account,
+        account_identity: candidate.account_identity,
         index: candidate.index,
         plan_sha256: candidate.plan_sha256,
         observed_live: live,
@@ -2266,11 +2325,12 @@ pub(super) fn require_selected_plan(
         &candidate_name(&binding.handoff_id, decision.selection.index),
     )?
     .ok_or_else(|| io::Error::other("fresh provider selected candidate absent"))?;
-    if candidate.version != 2
+    if candidate.version != 3
         || candidate.binding != *binding
         || candidate.model != decision.selection.model
         || candidate.config_sha256 != decision.selection.config_sha256
         || candidate.account != decision.selection.account
+        || candidate.account_identity != decision.selection.account_identity
         || candidate.plan_sha256 != plan.digest
     {
         return Err(io::Error::other(
@@ -3055,6 +3115,7 @@ mod tests {
             model: "work".into(),
             config_sha256: "c".repeat(64),
             account: "opencode-one".into(),
+            account_identity: "opencode-one".into(),
             index: 0,
             plan_sha256: grant.plan_sha256.clone(),
             observed_live: 0,
@@ -3065,11 +3126,12 @@ mod tests {
             quota_remaining_basis_points: Some(8000),
         };
         let candidate = RouteCandidate {
-            version: 2,
+            version: 3,
             binding: binding.clone(),
             model: selection.model.clone(),
             config_sha256: selection.config_sha256.clone(),
             account: selection.account.clone(),
+            account_identity: selection.account_identity.clone(),
             index: 0,
             total: 2,
             pin: None,
@@ -3154,6 +3216,7 @@ mod tests {
         );
         let mut other = candidate.clone();
         other.account = "second".into();
+        other.account_identity = "other-physical-account".into();
         other.index = 1;
         assert!(marker_allows_candidate(&broker, &decision.binding, &other, &[], None).unwrap());
         assert!(
@@ -3333,6 +3396,28 @@ mod tests {
             kind: FreshAccountEffectKind::AuthRefresh,
             environment: vec![("PATH".into(), "/usr/bin:/bin".into())],
         };
+        for binding in [&source_binding, &follower_binding] {
+            durable_new(
+                temp.path(),
+                &candidate_name(&binding.handoff_id, 0),
+                &RouteCandidate {
+                    version: 3,
+                    binding: binding.clone(),
+                    model: request.model.clone(),
+                    config_sha256: request.config_sha256.clone(),
+                    account: request.account.clone(),
+                    account_identity: "physical-shared".into(),
+                    index: 0,
+                    total: 1,
+                    pin: None,
+                    plan_sha256: "p".repeat(64),
+                    quota_script: Some("quota-script".into()),
+                    auth_refresh_command: Some("auth-command".into()),
+                    terminal_recognizer: FreshTerminalRecognizer::OpenAiCompat,
+                },
+            )
+            .unwrap();
+        }
         let source_dir = effect_directory(temp.path(), &source_binding, &request);
         std::fs::create_dir(&source_dir).unwrap();
         let source = AccountEffectIntent {
@@ -3345,6 +3430,36 @@ mod tests {
             auth_source: None,
         };
         durable_new(&source_dir, "intent.json", &source).unwrap();
+        let source_candidate: RouteCandidate =
+            exact_file(temp.path(), &candidate_name(&source_binding.handoff_id, 0))
+                .unwrap()
+                .unwrap();
+        for (identity, expected_peer) in [("physical-shared", true), ("other-physical", false)] {
+            let mut alias_binding = fixture_binding(&process, &process);
+            alias_binding.handoff_id = uuid::Uuid::new_v4().to_string();
+            let mut alias_candidate = source_candidate.clone();
+            alias_candidate.binding = alias_binding.clone();
+            alias_candidate.model = "other-model".into();
+            alias_candidate.config_sha256 = "b".repeat(64);
+            alias_candidate.account = "alias".into();
+            alias_candidate.account_identity = identity.into();
+            durable_new(
+                temp.path(),
+                &candidate_name(&alias_binding.handoff_id, 0),
+                &alias_candidate,
+            )
+            .unwrap();
+            let mut alias_request = request.clone();
+            alias_request.model = alias_candidate.model;
+            alias_request.config_sha256 = alias_candidate.config_sha256;
+            alias_request.account = alias_candidate.account;
+            assert_eq!(
+                coalescible_auth_source(temp.path(), &alias_binding, &alias_request)
+                    .unwrap()
+                    .is_some(),
+                expected_peer,
+            );
+        }
         let (source_name, found) =
             coalescible_auth_source(temp.path(), &follower_binding, &request)
                 .unwrap()
@@ -3352,22 +3467,13 @@ mod tests {
         assert_eq!(found.id, source.id);
         let mut different = request.clone();
         different.config_sha256 = "b".repeat(64);
-        assert!(
-            coalescible_auth_source(temp.path(), &follower_binding, &different)
-                .unwrap_err()
-                .to_string()
-                .contains(&source.id)
-        );
+        assert!(coalescible_auth_source(temp.path(), &follower_binding, &different).is_err());
         different = request.clone();
         different.environment.push(("CHANGED".into(), "1".into()));
         assert!(coalescible_auth_source(temp.path(), &follower_binding, &different).is_err());
         different = request.clone();
         different.account = "other-account".into();
-        assert!(
-            coalescible_auth_source(temp.path(), &follower_binding, &different)
-                .unwrap()
-                .is_none()
-        );
+        assert!(coalescible_auth_source(temp.path(), &follower_binding, &different).is_err());
         assert!(
             coalescible_auth_source(temp.path(), &source_binding, &request)
                 .unwrap()
@@ -3418,7 +3524,7 @@ mod tests {
         std::fs::create_dir(temp.path().join("models")).unwrap();
         std::fs::write(
             temp.path().join("providers.toml"),
-            "[first]\ncommand = \"/bin/true\"\nquota_script = \"printf ok\"\n[second]\ncommand = \"/bin/true\"\n",
+            "[first]\ncommand = \"/bin/true\"\nquota_account_id = \"physical-first\"\nquota_script = \"printf ok\"\n[second]\ncommand = \"/bin/true\"\nquota_account_id = \"physical-second\"\n",
         )
         .unwrap();
         let model_path = temp.path().join("models/pool.toml");
@@ -3434,10 +3540,12 @@ mod tests {
         )
         .unwrap();
         let mut request = FreshRouteRequest {
+            protocol_version: 4,
             d_key: uuid::Uuid::new_v4().to_string(),
             model: "pool".into(),
             config_sha256: pool.config_sha256.clone(),
             account: Some("first".into()),
+            account_identity: Some("physical-first".into()),
             index: Some(0),
             total: 2,
             pin: None,
@@ -3445,6 +3553,21 @@ mod tests {
             auth_refresh_command: None,
         };
         validate_route_source(&source, &request).unwrap();
+        let mut old_protocol = serde_json::to_value(&request).unwrap();
+        old_protocol
+            .as_object_mut()
+            .unwrap()
+            .remove("protocol_version");
+        old_protocol
+            .as_object_mut()
+            .unwrap()
+            .remove("account_identity");
+        assert!(serde_json::from_value::<FreshRouteRequest>(old_protocol).is_err());
+        request.account_identity = None;
+        assert!(validate_route_source(&source, &request).is_err());
+        request.account_identity = Some("physical-second".into());
+        assert!(validate_route_source(&source, &request).is_err());
+        request.account_identity = Some("physical-first".into());
         request.account = Some("second".into());
         assert!(validate_route_source(&source, &request).is_err());
         request.account = Some("first".into());
@@ -3458,6 +3581,7 @@ mod tests {
         assert!(validate_route_source(&source, &request).is_err());
         request.config_sha256 = pool.config_sha256;
         request.account = None;
+        request.account_identity = None;
         request.index = None;
         request.quota_script = None;
         validate_route_source(&source, &request).unwrap();
@@ -3478,6 +3602,27 @@ mod tests {
         let duplicate = File::open(&duplicate_dir).unwrap();
         validate_route_source(&duplicate, &request).unwrap();
         assert!(bind_route_source(&broker_dir, &binding, &request, &duplicate, false).is_err());
+        let missing_dir = temp.path().join("missing-identity");
+        std::fs::create_dir_all(missing_dir.join("models")).unwrap();
+        let without_identity = std::fs::read_to_string(temp.path().join("providers.toml"))
+            .unwrap()
+            .replace("quota_account_id = \"physical-first\"\n", "");
+        std::fs::write(missing_dir.join("providers.toml"), without_identity).unwrap();
+        std::fs::copy(&model_path, missing_dir.join("models/pool.toml")).unwrap();
+        let missing_pool = oulipoly_runtime::executor::cli::fresh_remote::load_fresh_headless_pool(
+            &missing_dir,
+            "pool",
+        )
+        .unwrap();
+        let mut missing_request = request.clone();
+        missing_request.config_sha256 = missing_pool.config_sha256;
+        missing_request.account = Some("first".into());
+        missing_request.account_identity = Some("physical-first".into());
+        missing_request.index = Some(0);
+        missing_request.quota_script = Some("printf ok".into());
+        assert!(
+            validate_route_source(&File::open(&missing_dir).unwrap(), &missing_request).is_err()
+        );
         std::fs::write(
             &model_path,
             "[[providers]]\nname = \"second\"\n[[providers]]\nname = \"first\"\n",
@@ -3516,11 +3661,12 @@ mod tests {
                 directory,
                 &candidate_name(&binding.handoff_id, index),
                 &RouteCandidate {
-                    version: 2,
+                    version: 3,
                     binding: binding.clone(),
                     model: "fair".into(),
                     config_sha256: config_sha256.clone(),
                     account: (*account).into(),
+                    account_identity: (*account).into(),
                     index,
                     total: 3,
                     pin: pin.map(str::to_owned),
@@ -3533,16 +3679,46 @@ mod tests {
             .unwrap();
         }
         FreshRouteRequest {
+            protocol_version: 4,
             d_key: uuid::Uuid::new_v4().to_string(),
             model: "fair".into(),
             config_sha256,
             account: None,
+            account_identity: None,
             index: None,
             total: 3,
             pin: pin.map(str::to_owned),
             quota_script: None,
             auth_refresh_command: None,
         }
+    }
+
+    #[test]
+    fn one_pool_cannot_weight_one_physical_account_twice() {
+        let temp = tempfile::tempdir().unwrap();
+        let process = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+        let binding = fixture_binding(&process, &process);
+        let request = register_unmetered_route(temp.path(), &binding, None);
+        let second_name = candidate_name(&binding.handoff_id, 1);
+        let mut second: RouteCandidate = exact_file(temp.path(), &second_name).unwrap().unwrap();
+        second.account_identity = "first".into();
+        std::fs::write(
+            temp.path().join(second_name),
+            serde_json::to_vec(&second).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            select_route(temp.path(), &binding, &request)
+                .unwrap_err()
+                .to_string()
+                .contains("candidate set changed")
+        );
+        assert!(
+            !temp
+                .path()
+                .join(decision_name(&binding.handoff_id))
+                .exists()
+        );
     }
 
     #[test]
@@ -3645,6 +3821,7 @@ mod tests {
                     model: "model".into(),
                     config_sha256: "a".repeat(64),
                     account: "first".into(),
+                    account_identity: "first".into(),
                     index: 0,
                     plan_sha256: grant.plan_sha256.clone(),
                     observed_live: 0,
@@ -3673,11 +3850,12 @@ mod tests {
         .unwrap();
         let current = fixture_binding(&process, &process);
         let candidate = RouteCandidate {
-            version: 2,
+            version: 3,
             binding: current.clone(),
             model: "model".into(),
             config_sha256: "a".repeat(64),
             account: "first".into(),
+            account_identity: "first".into(),
             index: 0,
             total: 1,
             pin: None,
@@ -3692,11 +3870,22 @@ mod tests {
             &candidate,
         )
         .unwrap();
+        let mut previous_candidate = candidate.clone();
+        previous_candidate.binding = previous.clone();
+        previous_candidate.plan_sha256 = grant.plan_sha256.clone();
+        durable_new(
+            temp.path(),
+            &candidate_name(&previous.handoff_id, 0),
+            &previous_candidate,
+        )
+        .unwrap();
         let request = FreshRouteRequest {
+            protocol_version: 4,
             d_key: uuid::Uuid::new_v4().to_string(),
             model: candidate.model.clone(),
             config_sha256: candidate.config_sha256.clone(),
             account: None,
+            account_identity: None,
             index: None,
             total: 1,
             pin: None,
@@ -3780,11 +3969,12 @@ mod tests {
                 temp.path(),
                 &candidate_name(&binding.handoff_id, index),
                 &RouteCandidate {
-                    version: 2,
+                    version: 3,
                     binding: binding.clone(),
                     model: "model".into(),
                     config_sha256: "a".repeat(64),
                     account: account.into(),
+                    account_identity: account.into(),
                     index,
                     total: 2,
                     pin: None,
@@ -3822,10 +4012,12 @@ mod tests {
         )
         .unwrap();
         let request = FreshRouteRequest {
+            protocol_version: 4,
             d_key: effect.d_key,
             model: effect.model,
             config_sha256: effect.config_sha256,
             account: None,
+            account_identity: None,
             index: None,
             total: 2,
             pin: None,
@@ -3963,10 +4155,13 @@ mod tests {
         let mut binding = fixture_binding(&root, &actor);
         let request =
             |_binding: &Binding, index: Option<usize>, pin: Option<&str>| FreshRouteRequest {
+                protocol_version: 4,
                 d_key: uuid::Uuid::new_v4().to_string(),
                 model: "work".into(),
                 config_sha256: "c".repeat(64),
                 account: index
+                    .map(|i| if i == 0 { "opencode-first" } else { "second" }.to_string()),
+                account_identity: index
                     .map(|i| if i == 0 { "opencode-first" } else { "second" }.to_string()),
                 index,
                 total: 2,
@@ -4157,10 +4352,12 @@ mod tests {
         };
         let route = |binding: &Binding, pin: Option<&str>| {
             let request = |index: Option<usize>, account: Option<&str>| FreshRouteRequest {
+                protocol_version: 4,
                 d_key: uuid::Uuid::new_v4().to_string(),
                 model: "configured-model".into(),
                 config_sha256: "a".repeat(64),
                 account: account.map(str::to_owned),
+                account_identity: account.map(str::to_owned),
                 index,
                 total: 2,
                 pin: pin.map(str::to_owned),
@@ -4335,10 +4532,12 @@ mod tests {
             "uncertain K changed the held root's durable choice"
         );
         let mut changed_config = FreshRouteRequest {
+            protocol_version: 4,
             d_key: uuid::Uuid::new_v4().to_string(),
             model: "configured-model".into(),
             config_sha256: "b".repeat(64),
             account: None,
+            account_identity: None,
             index: None,
             total: 2,
             pin: None,
@@ -4483,10 +4682,12 @@ mod tests {
         );
         let request =
             |index: usize, account: &str, quota: &str, auth: Option<&str>| FreshRouteRequest {
+                protocol_version: 4,
                 d_key: uuid::Uuid::new_v4().to_string(),
                 model: "model".into(),
                 config_sha256: "a".repeat(64),
                 account: Some(account.into()),
+                account_identity: Some(account.into()),
                 index: Some(index),
                 total: 2,
                 pin: None,
@@ -4529,10 +4730,12 @@ mod tests {
                 temporary.path(),
                 &binding,
                 &FreshRouteRequest {
+                    protocol_version: 4,
                     d_key: uuid::Uuid::new_v4().to_string(),
                     model: "model".into(),
                     config_sha256: "a".repeat(64),
                     account: None,
+                    account_identity: None,
                     index: None,
                     total: 2,
                     pin: None,
@@ -4713,6 +4916,7 @@ mod tests {
                 model: follower_candidate.model.clone(),
                 config_sha256: follower_candidate.config_sha256.clone(),
                 account: follower_candidate.account.clone(),
+                account_identity: follower_candidate.account_identity.clone(),
                 index: 0,
                 plan_sha256: follower_candidate.plan_sha256.clone(),
                 observed_live: 0,
@@ -4905,6 +5109,107 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reused.outcome.as_deref(), Some("valid_windows"));
+        // A second model may reuse the exact physical Q only when its
+        // source-owned account identity and effect commands agree.
+        let mut cross_model_binding = fixture_binding(&root, &actor);
+        cross_model_binding.handoff_id = uuid::Uuid::new_v4().to_string();
+        let mut cross_model_route = request(0, "alias", &shell_script, Some(&auth_script));
+        cross_model_route.model = "other-model".into();
+        cross_model_route.config_sha256 = "b".repeat(64);
+        cross_model_route.account_identity = Some("recovering".into());
+        register_route_candidate(
+            temporary.path(),
+            &cross_model_binding,
+            &cross_model_route,
+            plan(
+                &image,
+                temporary.path(),
+                &File::open(&input).unwrap(),
+                vec!["--alias".into()],
+                vec![],
+            )
+            .unwrap(),
+            FreshTerminalRecognizer::OpenAiCompat,
+        )
+        .unwrap();
+        let mut cross_model_effect = sibling_first.clone();
+        cross_model_effect.model = cross_model_route.model.clone();
+        cross_model_effect.config_sha256 = cross_model_route.config_sha256.clone();
+        cross_model_effect.account = "alias".into();
+        let cross_model_q = begin_account_effect(
+            temporary.path(),
+            &cross_model_binding,
+            &cross_model_effect,
+            &root,
+            &actor,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(cross_model_q.outcome.as_deref(), Some("valid_windows"));
+        assert!(
+            grant_for_binding(
+                &effect_directory(temporary.path(), &cross_model_binding, &cross_model_effect),
+                &cross_model_binding,
+            )
+            .unwrap()
+            .is_none(),
+            "cross-model reuse launched a second quota K"
+        );
+
+        // The same display label with a distinct explicit identity cannot
+        // borrow that Q, even if the script text happens to match.
+        let mut collision_binding = fixture_binding(&root, &actor);
+        collision_binding.handoff_id = uuid::Uuid::new_v4().to_string();
+        let mut collision_route = request(0, "recovering", &shell_script, Some(&auth_script));
+        collision_route.account_identity = Some("another-physical-account".into());
+        register_route_candidate(
+            temporary.path(),
+            &collision_binding,
+            &collision_route,
+            plan(
+                &image,
+                temporary.path(),
+                &File::open(&input).unwrap(),
+                vec!["--collision".into()],
+                vec![],
+            )
+            .unwrap(),
+            FreshTerminalRecognizer::OpenAiCompat,
+        )
+        .unwrap();
+        let collision_effect = FreshAccountEffectRequest {
+            d_key: uuid::Uuid::new_v4().to_string(),
+            ..first.clone()
+        };
+        begin_account_effect(
+            temporary.path(),
+            &collision_binding,
+            &collision_effect,
+            &root,
+            &actor,
+            0,
+            0,
+        )
+        .unwrap();
+        assert!(
+            grant_for_binding(
+                &effect_directory(temporary.path(), &collision_binding, &collision_effect),
+                &collision_binding,
+            )
+            .unwrap()
+            .is_some(),
+            "different physical identity borrowed another account Q"
+        );
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while observe_account_effect(temporary.path(), &collision_binding, &collision_effect)
+            .unwrap()
+            .state
+            != "drained"
+        {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let sibling_candidate: RouteCandidate = exact_file(
             temporary.path(),
             &candidate_name(&sibling_binding.handoff_id, 0),
@@ -4945,6 +5250,17 @@ mod tests {
         );
         let mut pending_binding = binding.clone();
         pending_binding.handoff_id = uuid::Uuid::new_v4().to_string();
+        let mut pending_candidate: RouteCandidate =
+            exact_file(temporary.path(), &candidate_name(&binding.handoff_id, 0))
+                .unwrap()
+                .unwrap();
+        pending_candidate.binding = pending_binding.clone();
+        durable_new(
+            temporary.path(),
+            &candidate_name(&pending_binding.handoff_id, 0),
+            &pending_candidate,
+        )
+        .unwrap();
         let pending_dir = effect_directory(temporary.path(), &pending_binding, &first);
         std::fs::create_dir(&pending_dir).unwrap();
         let pending_intent = AccountEffectIntent {
@@ -5012,6 +5328,17 @@ mod tests {
         assert_eq!(wait(&negative).outcome.as_deref(), Some("valid_windows"));
         let mut exhausted_sibling = binding.clone();
         exhausted_sibling.handoff_id = uuid::Uuid::new_v4().to_string();
+        let mut exhausted_candidate: RouteCandidate =
+            exact_file(temporary.path(), &candidate_name(&binding.handoff_id, 1))
+                .unwrap()
+                .unwrap();
+        exhausted_candidate.binding = exhausted_sibling.clone();
+        durable_new(
+            temporary.path(),
+            &candidate_name(&exhausted_sibling.handoff_id, 1),
+            &exhausted_candidate,
+        )
+        .unwrap();
         assert!(
             reusable_quota_source(temporary.path(), &exhausted_sibling, &negative)
                 .unwrap()
@@ -5023,10 +5350,12 @@ mod tests {
                 temporary.path(),
                 &binding,
                 &FreshRouteRequest {
+                    protocol_version: 4,
                     d_key: uuid::Uuid::new_v4().to_string(),
                     model: "model".into(),
                     config_sha256: "a".repeat(64),
                     account: None,
+                    account_identity: None,
                     index: None,
                     total: 2,
                     pin: Some("exhausted".into()),
@@ -5041,10 +5370,12 @@ mod tests {
             temporary.path(),
             &binding,
             &FreshRouteRequest {
+                protocol_version: 4,
                 d_key: uuid::Uuid::new_v4().to_string(),
                 model: "model".into(),
                 config_sha256: "a".repeat(64),
                 account: None,
+                account_identity: None,
                 index: None,
                 total: 2,
                 pin: None,
@@ -5065,10 +5396,12 @@ mod tests {
             temporary.path(),
             &binding,
             &FreshRouteRequest {
+                protocol_version: 4,
                 d_key: uuid::Uuid::new_v4().to_string(),
                 model: "model".into(),
                 config_sha256: "a".repeat(64),
                 account: None,
+                account_identity: None,
                 index: None,
                 total: 2,
                 pin: None,
@@ -5095,8 +5428,10 @@ mod tests {
         let mut uncertain_binding = binding.clone();
         uncertain_binding.handoff_id = uuid::Uuid::new_v4().to_string();
         let unknown_route = FreshRouteRequest {
+            protocol_version: 4,
             d_key: uuid::Uuid::new_v4().to_string(), model: "model".into(),
             config_sha256: "a".repeat(64), account: Some("slow".into()),
+            account_identity: Some("slow".into()),
             index: Some(0), total: 1, pin: Some("slow".into()),
             quota_script: Some("printf '{\"used_percent\":10,\"resets_at\":\"2099-01-01T00:00:00Z\"}'; sleep 60 & wait".into()),
             auth_refresh_command: None,
@@ -5204,7 +5539,9 @@ mod tests {
                 temporary.path(),
                 &uncertain_binding,
                 &FreshRouteRequest {
+                    protocol_version: 4,
                     account: None,
+                    account_identity: None,
                     index: None,
                     quota_script: None,
                     auth_refresh_command: None,
@@ -5255,6 +5592,7 @@ mod tests {
                 model: "model".into(),
                 config_sha256: "a".repeat(64),
                 account: "recovering".into(),
+                account_identity: "recovering".into(),
                 index: 0,
                 plan_sha256: selected_candidate.plan_sha256.clone(),
                 observed_live: 0,
@@ -5276,6 +5614,23 @@ mod tests {
             &terminal_marker,
         )
         .unwrap();
+        let cross_model_candidate: RouteCandidate = exact_file(
+            temporary.path(),
+            &candidate_name(&cross_model_binding.handoff_id, 0),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            !marker_allows_candidate(
+                temporary.path(),
+                &cross_model_binding,
+                &cross_model_candidate,
+                std::slice::from_ref(&terminal_marker),
+                Some(old_healthy_q),
+            )
+            .unwrap(),
+            "another model accepted a pre-rejection Q for the same physical account"
+        );
         let mut verification_binding = binding.clone();
         verification_binding.handoff_id = uuid::Uuid::new_v4().to_string();
         register_route_candidate(

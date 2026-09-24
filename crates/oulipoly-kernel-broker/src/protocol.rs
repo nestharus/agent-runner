@@ -101,10 +101,14 @@ pub struct FreshRootEffectRequest {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FreshRouteRequest {
+    /// Required so pre-identity clients cannot silently register a candidate.
+    pub protocol_version: u32,
     pub d_key: String,
     pub model: String,
     pub config_sha256: String,
     pub account: Option<String>,
+    /// Explicit physical account identity asserted against providers.toml.
+    pub account_identity: Option<String>,
     pub index: Option<usize>,
     pub total: usize,
     pub pin: Option<String>,
@@ -168,6 +172,7 @@ pub struct FreshRouteSelection {
     pub model: String,
     pub config_sha256: String,
     pub account: String,
+    pub account_identity: String,
     pub index: usize,
     pub plan_sha256: String,
     pub observed_live: u64,

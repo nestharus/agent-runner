@@ -122,6 +122,7 @@ pub(super) fn raw_entry_to_entry(raw: &RawEntry, invocation_mode: InvocationMode
     ProviderEntry {
         implementation: raw.implementation.clone(),
         settings_id: raw.settings_id.clone(),
+        quota_account_id: raw.quota_account_id.clone(),
         quota_script: raw.quota_script.clone(),
         auth_refresh_command: raw.auth_refresh_command.clone(),
         command: raw.command.clone(),

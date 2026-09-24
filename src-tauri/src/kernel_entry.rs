@@ -961,10 +961,16 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
     }
     for (index, candidate) in prepared.iter().enumerate() {
         let request = FreshRouteRequest {
+            protocol_version: 4,
             d_key: authority.receipt.d_key.clone(),
             model: pool.model.name.clone(),
             config_sha256: pool.config_sha256.clone(),
             account: Some(pool.model.providers[index].name.clone()),
+            account_identity: Some(
+                pool.account_identities[index]
+                    .clone()
+                    .ok_or("private fresh account requires quota_account_id in providers.toml")?,
+            ),
             index: Some(index),
             total,
             pin: provider_pin.map(str::to_owned),
@@ -1033,10 +1039,12 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
         }
     }
     let request = FreshRouteRequest {
+        protocol_version: 4,
         d_key: authority.receipt.d_key.clone(),
         model: pool.model.name.clone(),
         config_sha256: pool.config_sha256.clone(),
         account: None,
+        account_identity: None,
         index: None,
         total,
         pin: provider_pin.map(str::to_owned),
@@ -1049,7 +1057,12 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
             .ok_or("fresh route selection absent before K")?;
     if selected.model != pool.model.name
         || selected.config_sha256 != pool.config_sha256
-        || selected.policy_version != "fresh-quota-rr-ttl-v3"
+        || selected.policy_version != "fresh-quota-account-v4"
+        || pool
+            .account_identities
+            .get(selected.index)
+            .and_then(Option::as_deref)
+            != Some(selected.account_identity.as_str())
         || !selected.eligible_accounts.contains(&selected.account)
         || selected.eligible_accounts.iter().any(|account| {
             !pool

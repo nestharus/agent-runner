@@ -246,6 +246,11 @@ fn assert_success_with_stdout(code: i32, stdout: &str, stderr: &str) {
     );
 }
 
+fn assert_incomplete_with_stdout(code: i32, stdout: &str, stderr: &str) {
+    assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(!stdout.trim().is_empty());
+}
+
 fn assert_contains_all(haystack: &str, needles: &[&str]) {
     for needle in needles {
         assert!(
@@ -798,8 +803,76 @@ fn usage_renders_no_usage_api_row_for_provider_without_quota_script() {
 }
 
 #[test]
-fn usage_renders_in_flight_row_state_when_refresh_outcome_is_in_flight_with_exit_zero_and_no_cache_write()
- {
+fn usage_probes_one_provider_account_once_across_models() {
+    let fixture = Fixture::new();
+    let log = fixture.marker_dir.join("quota.log");
+    let script = fixture.write_quota_script(
+        "shared.sh",
+        &quota_script_json(
+            &log,
+            r#"{"windows":[{"used_percent":24,"resets_at":"2099-01-01T00:00:00Z"}]}"#,
+        ),
+    );
+    fixture.write_model("first", &["shared"]);
+    fixture.write_model("second", &["shared"]);
+    fixture.write_providers(&[ProviderFixture::with_script("shared", "claude", &script)]);
+
+    let (code, stdout, stderr) = run_usage(&fixture);
+    assert_success_with_stdout(code, &stdout, &stderr);
+    assert_eq!(fs::read_to_string(log).unwrap(), "ran");
+    assert_eq!(stdout.matches("shared").count(), 1, "{stdout}");
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+#[test]
+fn usage_refuses_private_manual_refresh_before_legacy_script_runs() {
+    let fixture = Fixture::new();
+    let log = fixture.marker_dir.join("quota.log");
+    let script = fixture.write_quota_script(
+        "private.sh",
+        &quota_script_json(
+            &log,
+            r#"{"windows":[{"used_percent":24,"resets_at":"2099-01-01T00:00:00Z"}]}"#,
+        ),
+    );
+    fixture.write_model("fixture", &["shared"]);
+    fixture.write_providers(&[ProviderFixture::with_script("shared", "claude", &script)]);
+    let output = fixture
+        .usage_command()
+        .env("AGE319_PRIVATE_FRESH_PROVIDER_V1", "1")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no broker quota probe was started"));
+    assert!(!log.exists());
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+#[test]
+fn usage_legacy_refresh_is_annotated_when_private_feature_is_built() {
+    let fixture = Fixture::new();
+    let log = fixture.marker_dir.join("quota.log");
+    let script = fixture.write_quota_script(
+        "legacy.sh",
+        &quota_script_json(
+            &log,
+            r#"{"windows":[{"used_percent":24,"resets_at":"2099-01-01T00:00:00Z"}]}"#,
+        ),
+    );
+    fixture.write_model("fixture", &["shared"]);
+    fixture.write_providers(&[ProviderFixture::with_script("shared", "claude", &script)]);
+    let (code, stdout, stderr) = run_usage(&fixture);
+    assert_success_with_stdout(code, &stdout, &stderr);
+    assert!(
+        stderr.contains("private broker quota Q was not refreshed"),
+        "{stderr}"
+    );
+    assert_eq!(fs::read_to_string(log).unwrap(), "ran");
+    assert_eq!(quota_window_count(&fixture.db_path(), "shared"), 1);
+}
+
+#[test]
+fn usage_renders_in_flight_row_state_with_nonzero_exit_and_no_cache_write() {
     let fixture = Fixture::new();
     let started = fixture.marker_dir.join("started");
     let release = fixture.marker_dir.join("release");
@@ -832,7 +905,7 @@ fn usage_renders_in_flight_row_state_when_refresh_outcome_is_in_flight_with_exit
     let second_stdout = String::from_utf8_lossy(&second_output.stdout);
     let second_stderr = String::from_utf8_lossy(&second_output.stderr);
     assert!(
-        second_output.status.success(),
+        !second_output.status.success(),
         "stdout:\n{second_stdout}\nstderr:\n{second_stderr}"
     );
     assert_contains_all(&second_stdout, &["claude", "(in flight)"]);
@@ -854,8 +927,7 @@ fn usage_renders_in_flight_row_state_when_refresh_outcome_is_in_flight_with_exit
 }
 
 #[test]
-fn usage_renders_error_row_for_any_failed_outcome_variant_with_exit_zero_and_no_fresh_sample_rendered()
- {
+fn usage_renders_error_row_for_failed_outcome_with_nonzero_exit_and_no_fresh_sample_rendered() {
     let script_fail = Fixture::new();
     script_fail.write_model("fixture", &["script-fail"]);
     let failing_script = script_fail.write_quota_script(
@@ -868,7 +940,7 @@ fn usage_renders_error_row_for_any_failed_outcome_variant_with_exit_zero_and_no_
         &failing_script,
     )]);
     let (code, stdout, stderr) = run_usage(&script_fail);
-    assert_success_with_stdout(code, &stdout, &stderr);
+    assert_incomplete_with_stdout(code, &stdout, &stderr);
     assert_contains_all(&stdout, &["script-fail", "(error:", "provider exploded"]);
     assert_not_contains_any(&stdout, &["weekly", "42% / 100%"]);
     assert_eq!(quota_window_count(&script_fail.db_path(), "script-fail"), 0);
@@ -889,7 +961,7 @@ fn usage_renders_error_row_for_any_failed_outcome_variant_with_exit_zero_and_no_
     )]);
     make_quota_window_cache_unwritable(&cache_fail.db_path());
     let (code, stdout, stderr) = run_usage(&cache_fail);
-    assert_success_with_stdout(code, &stdout, &stderr);
+    assert_incomplete_with_stdout(code, &stdout, &stderr);
     // Root storage decision 1 supersedes only the cache-suppression oracle.
     // Preserve this historical ID and the genuine script/auth failure controls.
     assert_contains_all(
@@ -921,7 +993,7 @@ fn usage_renders_error_row_for_any_failed_outcome_variant_with_exit_zero_and_no_
         &auth_script,
     )]);
     let (code, stdout, stderr) = run_usage(&auth_fail);
-    assert_success_with_stdout(code, &stdout, &stderr);
+    assert_incomplete_with_stdout(code, &stdout, &stderr);
     assert_contains_all(&stdout, &["auth-fail", "(error:", "login required"]);
 }
 
@@ -956,7 +1028,7 @@ fn usage_renders_error_row_when_refresh_outcome_failed_due_to_auth_refresh_comma
 
     let (code, stdout, stderr) = run_usage(&fixture);
 
-    assert_success_with_stdout(code, &stdout, &stderr);
+    assert_incomplete_with_stdout(code, &stdout, &stderr);
     assert_contains_all(
         &stdout,
         &[
@@ -1081,7 +1153,7 @@ fn mark_provider_turn_count_caught_up(db: &StateDb, provider_name: &str, session
 }
 
 #[test]
-fn usage_renders_no_windows_row_for_refresh_outcome_success_with_zero_windows_and_exit_zero() {
+fn usage_renders_no_windows_row_for_refresh_outcome_with_nonzero_exit() {
     let fixture = Fixture::new();
     fixture.write_model("fixture", &["claude"]);
     let quota_script = fixture.write_quota_script(
@@ -1096,7 +1168,7 @@ fn usage_renders_no_windows_row_for_refresh_outcome_success_with_zero_windows_an
 
     let (code, stdout, stderr) = run_usage(&fixture);
 
-    assert_success_with_stdout(code, &stdout, &stderr);
+    assert_incomplete_with_stdout(code, &stdout, &stderr);
     assert_contains_all(&stdout, &["claude", "(no windows)"]);
     assert_eq!(quota_window_count(&fixture.db_path(), "claude"), 0);
 }
@@ -1198,7 +1270,7 @@ fn usage_rich_fields_survive_script_to_mapper_path() {
 }
 
 #[test]
-fn usage_partial_provider_failure_exits_zero() {
+fn usage_partial_provider_failure_exits_nonzero() {
     let fixture = Fixture::new();
     fixture.write_model("fixture", &["bad", "good"]);
     let bad_script = fixture.write_quota_script(
@@ -1219,7 +1291,7 @@ fn usage_partial_provider_failure_exits_zero() {
 
     let (code, stdout, stderr) = run_usage(&fixture);
 
-    assert_success_with_stdout(code, &stdout, &stderr);
+    assert_incomplete_with_stdout(code, &stdout, &stderr);
     assert_contains_all(
         &stdout,
         &["bad", "(error:", "upstream timeout", "good", "weekly"],
@@ -1285,7 +1357,7 @@ fn usage_warn_and_skips_when_model_references_provider_missing_from_providers_to
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stderr_lower = stderr.to_lowercase();
 
-    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(
         stdout.contains("claude-present"),
         "present provider must render in stdout:\nstdout:\n{stdout}"
@@ -1308,7 +1380,7 @@ fn usage_warn_and_skips_when_model_references_provider_missing_from_providers_to
 }
 
 #[test]
-fn usage_exits_zero_when_a_refresh_outcome_failed_due_to_cache_write_with_error_row_rendered() {
+fn usage_exits_nonzero_when_cache_write_failed_with_warning_row_rendered() {
     let fixture = Fixture::new();
     fixture.write_model("fixture", &["cache-fail"]);
     let quota_script = fixture.write_quota_script(
@@ -1327,7 +1399,7 @@ fn usage_exits_zero_when_a_refresh_outcome_failed_due_to_cache_write_with_error_
 
     let (code, stdout, stderr) = run_usage(&fixture);
 
-    assert_success_with_stdout(code, &stdout, &stderr);
+    assert_incomplete_with_stdout(code, &stdout, &stderr);
     // Storage Act1 decision 1 supersedes this ID's historical suppression
     // oracle: valid provider observations survive an uncommitted cache write.
     assert_contains_all(

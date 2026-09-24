@@ -1596,6 +1596,7 @@ fn inner() {
                         protocol::private_fresh_route_at(
                             &socket.with_file_name("v30.sock"),
                             &protocol::FreshRouteRequest {
+                                protocol_version: 4,
                                 d_key: receipt.d_key.clone(),
                                 model: "configured-model".into(),
                                 config_sha256: route["selection"]["config_sha256"]
@@ -1603,6 +1604,7 @@ fn inner() {
                                     .unwrap()
                                     .into(),
                                 account: None,
+                                account_identity: None,
                                 index: None,
                                 total: 2,
                                 pin: (mode != "normal_model_provider_no_pin")
