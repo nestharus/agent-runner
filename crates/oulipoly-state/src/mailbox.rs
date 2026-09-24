@@ -1981,12 +1981,17 @@ impl MailboxDb {
         session: &str,
         retained_claims: &[RetainedWakeClaim],
         expected_claim: &Option<ManualWakeClaimIdentity>,
+        span: &DiagnosticSpan,
     ) -> Result<ManualWakeCoordination, String> {
         self.conn
             .busy_timeout(StdDuration::ZERO)
             .map_err(|e| e.to_string())?;
-        self.wake_sessions()
-            .coordinate_manual_resume(session, retained_claims, expected_claim)
+        self.wake_sessions().coordinate_manual_resume(
+            session,
+            retained_claims,
+            expected_claim,
+            span,
+        )
     }
 
     pub(crate) fn manual_wake_claim_identity(
@@ -7108,6 +7113,7 @@ impl WakeSessionRepository<'_> {
         session: &str,
         retained_claims: &[RetainedWakeClaim],
         expected_claim: &Option<ManualWakeClaimIdentity>,
+        parent_span: &DiagnosticSpan,
     ) -> Result<ManualWakeCoordination, String> {
         // A live coherent read is only a wait/release hint, not launch authority.
         // Drop it before acquiring a writer: never upgrade a read transaction.
@@ -7122,10 +7128,35 @@ impl WakeSessionRepository<'_> {
         if let Some(observation) = observation {
             return Ok(observation);
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| e.to_string())?;
+        let start = SpanStart::new(
+            "completed_turn_manual_resume_sidecar_write",
+            "pid_mailbox_sqlite",
+        )
+        .with_sqlite_identity(
+            SqliteEventIdentity::new(
+                SqliteDatabaseRole::PidMailbox,
+                SqlitePathClass::ManagedFile,
+                "completed_turn.manual_resume.sidecar_write",
+            )
+            .with_transaction_mode(SqliteTransactionMode::Immediate),
+        )
+        .with_busy_timeout(StdDuration::ZERO)
+        .with_diagnostic_id(parent_span.diagnostic_id().clone())
+        .with_parent_span_id(parent_span.span_id().clone())
+        .with_hashed_correlation("session_id", session);
+        parent_span.with_deferred_requested_span(start, |span| {
+        let attempt = TransactionAttempt::start();
+        let tx = match self.conn.transaction_with_behavior(TransactionBehavior::Immediate) {
+            Ok(tx) => tx,
+            Err(error) => {
+                record_sqlite_failure(span, &error, attempt);
+                record_unacquired_release(span);
+                return Err(error.to_string());
+            }
+        };
+        let mut phases = TransactionPhaseGuard::acquired(span, attempt);
+        let mut commit_attempted = false;
+        let result = (|| {
         if let Some(observation) = manual_native_custody_on(&tx, session)? {
             return Ok(observation);
         }
@@ -7176,13 +7207,33 @@ impl WakeSessionRepository<'_> {
             if changed != 1 {
                 return Err("manual legacy release changed under writer".into());
             }
-            tx.commit().map_err(|e| e.to_string())?;
+            phases.commit_started();
+            commit_attempted = true;
+            match tx.commit() {
+                Ok(()) => phases.committed(),
+                Err(error) => {
+                    phases.sqlite_failure(&error);
+                    return Err(error.to_string());
+                }
+            }
             return Ok(ManualWakeCoordination::Released);
         }
         Ok(if wake_claim_has_persisted_process_identity(&tx, &claim)? {
             ManualWakeCoordination::LegacyLiveBusy
         } else {
             ManualWakeCoordination::UnknownCustody
+        })
+        })();
+        if result.is_err() {
+            phases.failed("manual_resume_sidecar_write_failed");
+        }
+        // The closure has dropped the transaction on every non-commit path.
+        if commit_attempted {
+            phases.release_after_owner();
+        } else {
+            phases.release_after_rollback();
+        }
+        result
         })
     }
 
