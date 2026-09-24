@@ -103,6 +103,10 @@ fn inner() {
             | "normal_model_provider_bash_causal"
             | "normal_model_provider_bash_causal_success"
             | "normal_model_provider_bash_causal_w_debt"
+            | "normal_model_provider_bash_causal_notify_ack"
+            | "normal_model_provider_bash_causal_notify_lost_pending"
+            | "normal_model_provider_bash_causal_notify_debt"
+            | "normal_model_provider_bash_causal_notify_row_debt"
             | "normal_model_provider_reply_loss"
             | "normal_model_provider_restart"
     );
@@ -318,6 +322,14 @@ fn inner() {
             (mode == "normal_model_provider_bash_causal_w_debt")
                 .then_some(("AGE319_PRIVATE_SOURCE_W_CAPTURE_ONLY_V1", "1")),
         )
+        .envs(
+            (mode == "normal_model_provider_bash_causal_notify_debt")
+                .then_some(("AGE319_PRIVATE_NOTIFY_STATE_ONLY_V1", "1")),
+        )
+        .envs(
+            (mode == "normal_model_provider_bash_causal_notify_row_debt")
+                .then_some(("AGE319_PRIVATE_NOTIFY_ROW_ONLY_V1", "1")),
+        )
         .envs((mode == "normal_model_provider_reply_loss").then_some((
             "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_PROVIDER_K_REPLY_V1",
             "1",
@@ -392,6 +404,22 @@ fn inner() {
             .envs(
                 mode.starts_with("normal_model_provider_bash_causal")
                     .then_some(("AGE319_PRIVATE_PROVIDER_CAUSAL_BASH_V1", "1")),
+            )
+            .envs(
+                (mode == "normal_model_provider_bash_causal_notify_ack")
+                    .then_some(("AGE319_PRIVATE_BASH_RECIPIENT_MODE_V1", "ack")),
+            )
+            .envs(
+                (mode == "normal_model_provider_bash_causal_notify_lost_pending")
+                    .then_some(("AGE319_PRIVATE_BASH_RECIPIENT_MODE_V1", "lost_pending")),
+            )
+            .envs(
+                (mode == "normal_model_provider_bash_causal_notify_debt")
+                    .then_some(("AGE319_PRIVATE_BASH_RECIPIENT_MODE_V1", "ack")),
+            )
+            .envs(
+                (mode == "normal_model_provider_bash_causal_notify_row_debt")
+                    .then_some(("AGE319_PRIVATE_BASH_RECIPIENT_MODE_V1", "ack")),
             )
             .envs(
                 (mode == "normal_model_provider_bash_causal_success")
@@ -805,6 +833,104 @@ fn inner() {
                     result.stdout_sha256, source.stdout_sha256,
                     "Bash O is separate from physical Q"
                 );
+                if mode.ends_with("notify_debt") || mode.ends_with("notify_row_debt") {
+                    let fresh =
+                        rusqlite::Connection::open(broker_state.join("v30/state.db")).unwrap();
+                    eventually(|| {
+                        fresh
+                            .query_row("SELECT count(*) FROM fresh_bash_notify_request", [], |r| {
+                                r.get::<_, i64>(0)
+                            })
+                            .unwrap()
+                            == 1
+                    });
+                    assert_eq!(
+                        fresh
+                            .query_row(
+                                "SELECT count(*) FROM fresh_lane_recipient_attachment",
+                                [],
+                                |r| r.get::<_, i64>(0)
+                            )
+                            .unwrap(),
+                        1
+                    );
+                    eventually(|| entry.try_wait().unwrap().is_some());
+                    let side = rusqlite::Connection::open(
+                        broker_state.join("v30/sidecar/pid-identity.db"),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        side.query_row(
+                            "SELECT count(*) FROM fresh_recipient_row_source",
+                            [],
+                            |r| r.get::<_, i64>(0)
+                        )
+                        .unwrap(),
+                        0
+                    );
+                    let rows: i64 = side
+                        .query_row(
+                            "SELECT count(*) FROM mailbox WHERE handle=?1",
+                            [&source.source_id],
+                            |r| r.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        rows,
+                        if mode.ends_with("notify_row_debt") {
+                            1
+                        } else {
+                            0
+                        }
+                    );
+                    fs::write(gate.join("provider-cancel"), b"yes").unwrap();
+                    stop(&mut broker);
+                    broker = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
+                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
+                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
+                        .env(
+                            "OULIPOLY_KERNEL_BROKER_FIXTURE_BASH_V1",
+                            bash.as_ref().unwrap(),
+                        )
+                        .stderr(Stdio::from(
+                            File::create(temp.path().join("notify-repair.log")).unwrap(),
+                        ))
+                        .spawn()
+                        .unwrap();
+                    eventually(|| protocol::request_at(&socket, Operation::Classify).is_ok());
+                    eventually(|| {
+                        side.query_row("SELECT count(*) FROM fresh_recipient_row_source", [], |r| {
+                            r.get::<_, i64>(0)
+                        })
+                        .unwrap()
+                            == 1
+                    });
+                    let lane = FreshV30Lane::open_at(&broker_state).unwrap();
+                    let root = lane.released_handoff_for_root(&source.root_id).unwrap().0;
+                    let root_session = lane.read_session(&root.d_key).unwrap().unwrap();
+                    let seq: i64 = side
+                        .query_row("SELECT seq FROM fresh_recipient_row_source", [], |r| {
+                            r.get(0)
+                        })
+                        .unwrap();
+                    let payload = lane
+                        .lookup_payload(&lane.identity().lane_id, &root_session.session_id, seq)
+                        .unwrap();
+                    assert!(String::from_utf8_lossy(&payload).contains("fresh-bash-complete-v30"));
+                    assert_eq!(
+                        side.query_row("SELECT count(*) FROM fresh_recipient_grant", [], |r| r
+                            .get::<_, i64>(0))
+                            .unwrap(),
+                        0
+                    );
+                    let old =
+                        rusqlite::Connection::open(broker_state.join("sidecar/pid-identity.db"))
+                            .unwrap();
+                    assert_eq!(old.query_row("SELECT count(*) FROM mailbox WHERE session_id='old-pending' AND delivered_at IS NULL",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+                    stop(&mut broker);
+                    return;
+                }
                 let physical = report["broker_physical_q"].as_str().unwrap();
                 let physical_fields: Vec<_> = physical.split_ascii_whitespace().collect();
                 assert_eq!(physical_fields[0], "fresh-bash-physical-drained");
@@ -963,7 +1089,18 @@ fn inner() {
                     let count: i64 = fresh
                         .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
                         .unwrap();
-                    assert_eq!(count, 0, "private source W minted {table}");
+                    if mode.contains("notify_") {
+                        eventually(|| {
+                            fresh
+                                .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| {
+                                    r.get::<_, i64>(0)
+                                })
+                                .unwrap()
+                                == 1
+                        });
+                    } else {
+                        assert_eq!(count, 0, "private source W minted {table}");
+                    }
                 }
                 assert_eq!(
                     oulipoly_kernel_broker::registry::RootRegistry::open(&broker_state)
@@ -1131,6 +1268,60 @@ fn inner() {
                     "same-root sibling namespace refusal: {sibling_result}"
                 );
                 assert!(!gate.join("sibling-effect").exists());
+                if mode.contains("notify_") {
+                    eventually(|| {
+                        gate.join("bash-recipient-output").exists()
+                            || entry.try_wait().unwrap().is_some()
+                    });
+                    let observed: serde_json::Value = serde_json::from_slice(
+                        &fs::read(gate.join("bash-recipient-output")).unwrap_or_else(|_| {
+                            panic!(
+                                "recipient did not observe F: entry={} broker={}",
+                                fs::read_to_string(&err).unwrap_or_default(),
+                                fs::read_to_string(&broker_log).unwrap_or_default()
+                            )
+                        }),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        fs::read_to_string(gate.join("bash-f-request-id")).unwrap(),
+                        observed["delivery_request_id"].as_str().unwrap()
+                    );
+                    assert_eq!(observed["grant"]["source_id"], source.source_id);
+                    assert_eq!(observed["grant"]["attempt_id"], source.attempt_id);
+                    assert_eq!(
+                        observed["activation"]["evidence"],
+                        "explicit_original_listener_request"
+                    );
+                    let mut lane = FreshV30Lane::open_at(&broker_state).unwrap();
+                    lane.register_private_bash_source(&child).unwrap();
+                    assert!(
+                        lane.request_private_bash_notification(&bash_request, &child.actor)
+                            .is_err(),
+                        "Bash child substituted for original listener"
+                    );
+                    let session = lane.read_session(&root.d_key).unwrap().unwrap();
+                    let seq = observed["grant"]["seq"].as_i64().unwrap();
+                    let payload = lane
+                        .lookup_payload(&lane.identity().lane_id, &session.session_id, seq)
+                        .unwrap();
+                    assert_eq!(
+                        format!("{:x}", Sha256::digest(payload)),
+                        observed["observed_payload_sha256"].as_str().unwrap()
+                    );
+                    let row = rusqlite::Connection::open(
+                        broker_state.join("v30/sidecar/pid-identity.db"),
+                    )
+                    .unwrap();
+                    let acked: bool = row
+                        .query_row(
+                            "SELECT delivered_at IS NOT NULL FROM mailbox WHERE seq=?1",
+                            [seq],
+                            |r| r.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(acked, mode.ends_with("notify_ack"));
+                }
                 fs::write(gate.join("provider-cancel"), b"yes").unwrap();
                 let until = Instant::now() + Duration::from_secs(20);
                 while entry.try_wait().unwrap().is_none() && Instant::now() < until {
@@ -1180,7 +1371,51 @@ fn inner() {
                     reopened.read_private_bash_result(&bash_request).unwrap(),
                     lane.read_private_bash_result(&bash_request).unwrap()
                 );
-                assert_old_debt_and_no_f_ack(&broker_state);
+                if mode.contains("notify_") {
+                    let mut lane = FreshV30Lane::open_at(&broker_state).unwrap();
+                    lane.repair_private_bash_notifications().unwrap();
+                    let state =
+                        rusqlite::Connection::open(broker_state.join("v30/state.db")).unwrap();
+                    assert_eq!(
+                        state
+                            .query_row("SELECT count(*) FROM fresh_bash_notify_request", [], |r| {
+                                r.get::<_, i64>(0)
+                            })
+                            .unwrap(),
+                        1
+                    );
+                    let side = rusqlite::Connection::open(
+                        broker_state.join("v30/sidecar/pid-identity.db"),
+                    )
+                    .unwrap();
+                    let (phase, still_pending): (String, bool) = side
+                        .query_row(
+                            "SELECT g.phase,m.delivered_at IS NULL FROM fresh_recipient_grant g
+                         JOIN mailbox m ON m.session_id=g.session_id AND m.seq=g.seq",
+                            [],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )
+                        .unwrap();
+                    if mode.ends_with("notify_ack") {
+                        assert_eq!(phase, "acked");
+                        assert!(!still_pending);
+                    } else {
+                        assert!(phase == "unknown" || phase == "submitted");
+                        assert!(still_pending, "offline recipient was automatically ACKed");
+                    }
+                    assert_eq!(
+                        side.query_row("SELECT count(*) FROM fresh_recipient_grant", [], |r| r
+                            .get::<_, i64>(0))
+                            .unwrap(),
+                        1
+                    );
+                    let old =
+                        rusqlite::Connection::open(broker_state.join("sidecar/pid-identity.db"))
+                            .unwrap();
+                    assert_eq!(old.query_row("SELECT count(*) FROM mailbox WHERE session_id='old-pending' AND delivered_at IS NULL",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+                } else {
+                    assert_old_debt_and_no_f_ack(&broker_state);
+                }
                 reopened.accept_private_bash_source(&source).unwrap();
                 let selected_event =
                     physical_dir.join(format!("{physical_grant}.source-event.json"));
@@ -3714,6 +3949,10 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_model_provider_bash_causal",
         "normal_model_provider_bash_causal_success",
         "normal_model_provider_bash_causal_w_debt",
+        "normal_model_provider_bash_causal_notify_ack",
+        "normal_model_provider_bash_causal_notify_lost_pending",
+        "normal_model_provider_bash_causal_notify_debt",
+        "normal_model_provider_bash_causal_notify_row_debt",
         "normal_model_provider_reply_loss",
         "normal_model_provider_restart",
         "normal_guardian_death",

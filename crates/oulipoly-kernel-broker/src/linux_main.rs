@@ -3809,6 +3809,9 @@ fn serve_fresh_v30_at(
         if let Err(error) = lane.repair_captured_private_bash_sources() {
             eprintln!("fresh Bash source repair remains unknown: {error}");
         }
+        if let Err(error) = lane.repair_private_bash_notifications() {
+            eprintln!("fresh Bash notification repair remains pending: {error}");
+        }
     }
     let instance = EntryGate::open(&state_root.join("v30"))?;
     // An installed Bash child must match the package's pinned digest. Private
@@ -4534,6 +4537,16 @@ fn serve_fresh_v30_at(
                         return Err(io::Error::other("fresh recipient request absent"));
                     };
                     let reply = match request {
+                        FreshRecipientRequest::ActivateBashSource { request_id } => {
+                            if instance.is_closed() {
+                                return Err(io::Error::other("fresh recipient entry gate closed"));
+                            }
+                            let seq = lane
+                                .request_private_bash_notification(&request_id, &recipient)
+                                .map_err(io::Error::other)?;
+                            serde_json::json!({"kind":"notification_requested", "request_id":request_id,
+                                "seq":seq, "evidence":"explicit_original_listener_request"})
+                        }
                         FreshRecipientRequest::Submit {
                             allocation_request_id,
                             delivery_request_id,
@@ -4577,7 +4590,6 @@ fn serve_fresh_v30_at(
                                     &recipient,
                                 )
                                 .map_err(io::Error::other)?;
-                            submitted_grant = Some(recovered.readback.grant_id.clone());
                             fresh_payload_reply("recovered_delivery", recovered)?
                         }
                         FreshRecipientRequest::Acknowledge {
