@@ -1022,11 +1022,8 @@ fn paired_case(mode: &'static str) {
             "sync output returned; accepted source retained; no notification or ACK; original drain read from source evidence, not suppression"
         );
         let result: serde_json::Value = wait(|| {
-            serde_json::from_slice(
-                &fs::read(PathBuf::from(&source.handle_dir).join("root-work-result-v1.json"))
-                    .ok()?,
-            )
-            .ok()
+            serde_json::from_slice(&fs::read(lost_source.join("root-work-result-v1.json")).ok()?)
+                .ok()
         });
         assert_eq!(result["physical_tree_drained"], true, "{result}");
         return;
@@ -1734,8 +1731,8 @@ fn native_activation_channel_custody(owner_loss: u8, channel: Option<&str>) {
         )
         .unwrap();
     for (role, encoded) in [
-        ("AC", custodian.as_str()),
-        ("original_adopter", adopter.as_str()),
+        ("root_worker", custodian.as_str()),
+        ("guardian", adopter.as_str()),
     ] {
         let identity: oulipoly_state::completion_continuation::SourceProcessIdentity =
             serde_json::from_str(encoded).unwrap();
@@ -1882,12 +1879,30 @@ fn native_activation_channel_custody(owner_loss: u8, channel: Option<&str>) {
             fs::read_to_string(f.root.path().join(format!("{window}.reached"))).unwrap();
         let exact: oulipoly_state::completion_continuation::SourceProcessIdentity =
             serde_json::from_str(&launcher).unwrap();
+        let worker: oulipoly_state::completion_continuation::SourceProcessIdentity =
+            serde_json::from_str(&custodian).unwrap();
         assert_eq!(producer_pid.trim().parse::<i64>().unwrap(), exact.pid);
         assert!(current_identity_matches(&exact));
+        assert_eq!(parent(worker.pid), owner.guardian_identity.pid);
+        assert_eq!(parent(exact.pid), worker.pid);
+        let state = oulipoly_state::StateDb::open(&f.data.join("state.db")).unwrap();
+        let retained: i64 = state.connection().query_row(
+            "SELECT COUNT(*) FROM provider_launch_transition_replays WHERE operation_key LIKE '%/native-custody-receipts'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(
+            retained,
+            if window == "native-after-custody-retention" {
+                1
+            } else {
+                0
+            }
+        );
         println!("actual original executor held at receipt boundary={window} pid={producer_pid}");
         request_linked_cancel(&f, &attempt);
-        // Keep the producer held. Actual AC cancellation, not test release,
-        // terminates it at this exact producer receipt boundary.
+        // Keep the producer held. Actual root-worker cancellation, not test
+        // release, terminates it at this producer receipt boundary.
     } else if matches!(owner_loss, 3 | 6 | 8 | 9 | 10) {
         wait(|| {
             f.root
@@ -2031,6 +2046,23 @@ fn native_activation_channel_custody(owner_loss: u8, channel: Option<&str>) {
     assert_eq!(receipt.0, "drained");
     assert_eq!(receipt.1, 1);
     assert!(receipt.2.contains("ECHILD"));
+    if receipt_window.is_some() {
+        let worker: oulipoly_state::completion_continuation::SourceProcessIdentity =
+            serde_json::from_str(&custodian).unwrap();
+        let retained: serde_json::Value = serde_json::from_str(&receipt.2).unwrap();
+        assert_eq!(retained["authority"], "root_supervisor");
+        assert_eq!(
+            retained["custodian"],
+            serde_json::to_value(&worker).unwrap()
+        );
+        assert_eq!(retained["owned_children"], "ECHILD");
+        assert_eq!(retained["result_retained"], true);
+        assert!(!current_identity_matches(&worker));
+        assert_eq!(
+            fs::read(&attempt.result_path).unwrap(),
+            receipt.2.as_bytes()
+        );
+    }
     if let Some(invocation) = binding_invocation {
         let state = rusqlite::Connection::open_with_flags(
             f.data.join("state.db"),
@@ -2330,6 +2362,30 @@ fn native_root_reconciles_retained_result_across_driver_replacement() {
     f.gate("release-initial-provider");
     f.wait_initial(&mut initial);
     wait(|| f.root.path().join("descendant.pid").exists().then_some(()));
+    let descendant: i64 = fs::read_to_string(f.root.path().join("descendant.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(read_live_process_identity(descendant).unwrap().is_some());
+    assert!(current_identity_matches(&owner.driver_identity));
+    assert_eq!(
+        unsafe { libc::kill(owner.driver_identity.pid as i32, libc::SIGKILL) },
+        0
+    );
+    let replacement = wait(|| {
+        let current = f
+            .mailbox_for_poll()?
+            .completion_continuation_owner()
+            .ok()??;
+        (current.owner_generation != owner.owner_generation).then_some(current)
+    });
+    assert_eq!(replacement.guardian_identity, owner.guardian_identity);
+    assert_eq!(
+        replacement.supervisor_authority_id,
+        owner.supervisor_authority_id
+    );
+    assert!(read_live_process_identity(descendant).unwrap().is_some());
     f.gate("release-descendant");
     wait(|| {
         f.root
@@ -2354,27 +2410,19 @@ fn native_root_reconciles_retained_result_across_driver_replacement() {
     assert_eq!(retained["authority"], "root_supervisor");
     assert_eq!(retained["result_retained"], true);
     assert_eq!(retained["owned_children"], "ECHILD");
+    let worker: oulipoly_state::completion_continuation::SourceProcessIdentity =
+        serde_json::from_value(retained["custodian"].clone()).unwrap();
+    assert!(
+        !current_identity_matches(&worker),
+        "root worker must be reaped before the retained-result barrier"
+    );
     assert!(
         f.mailbox()
             .continuation_activation(SESSION, &claim.claim_token)
             .unwrap()
             .is_some()
     );
-    assert!(current_identity_matches(&owner.driver_identity));
-    assert_eq!(
-        unsafe { libc::kill(owner.driver_identity.pid as i32, libc::SIGKILL) },
-        0
-    );
     fs::remove_file(f.root.path().join("root-result-retained.hold")).unwrap();
-    let replacement = wait(|| {
-        let current = f.mailbox().completion_continuation_owner().ok()??;
-        (current.owner_generation != owner.owner_generation).then_some(current)
-    });
-    assert_eq!(replacement.guardian_identity, owner.guardian_identity);
-    assert_eq!(
-        replacement.supervisor_authority_id,
-        owner.supervisor_authority_id
-    );
     wait(|| {
         f.mailbox()
             .continuation_activation(SESSION, &claim.claim_token)
@@ -2569,16 +2617,210 @@ fn request_linked_cancel(f: &Fixture, attempt: &oulipoly_state::mailbox::Continu
     );
 }
 
+// The production owner is one root worker beneath the guardian. Killing that
+// worker before requesting State cancellation removes the only result writer;
+// the former AC/adopter schedule cannot prove this contract. Instead, keep the
+// exact worker live through token delivery and resistant-tree drain, then hold
+// its retained result after the guardian has waited for it. The second mode
+// replaces the driver while the worker and descendant are live, then proves
+// that the same root drains and integrates the result after replacement.
+fn native_root_state_token_cancellation(replace_driver: bool) {
+    let f = Fixture::new("owner_only");
+    f.gate("test-descendant-enabled");
+    f.gate("cancel-probe-enabled");
+    f.gate("release-resume");
+    f.gate("root-result-retained.hold");
+    let mut initial = f.start_with_hold(true);
+    let owner = f.owner();
+    wait(|| {
+        f.root
+            .path()
+            .join("provider-initial-ready")
+            .exists()
+            .then_some(())
+    });
+    MailboxDb::open(&f.data.join("pid-identity.db"))
+        .unwrap()
+        .enqueue_submitted_input(&oulipoly_state::mailbox::SubmittedInputEnqueue {
+            submission_token: "native-root-state-cancel",
+            target: oulipoly_state::mailbox::InboxTarget {
+                kind: oulipoly_state::mailbox::InboxTargetKind::Session,
+                id: SESSION,
+            },
+            input: b"native-custody-input",
+        })
+        .unwrap();
+    f.gate("release-initial-provider");
+    f.wait_initial(&mut initial);
+    let descendant: i64 = wait(|| {
+        fs::read_to_string(f.root.path().join("descendant.pid"))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    });
+    let descendant_identity = read_live_process_identity(descendant)
+        .unwrap()
+        .expect("published resistant descendant incarnation");
+    wait(|| {
+        let rows = f.mailbox_for_poll()?.list_mailbox(SESSION, true).ok()?;
+        (!rows.is_empty() && rows.iter().all(|row| row.delivered_at.is_some())).then_some(())
+    });
+    let claim = f
+        .mailbox()
+        .wake_session_reader()
+        .wake_claim(SESSION)
+        .unwrap()
+        .unwrap();
+    let attempt = f
+        .mailbox()
+        .continuation_activation(SESSION, &claim.claim_token)
+        .unwrap()
+        .unwrap();
+    let (worker_json, launcher_json): (String, String) = f.sidecar_connection()
+        .query_row(
+            "SELECT custodian_identity,launcher_identity FROM completion_continuation_attempt WHERE attempt_id=?1",
+            [&attempt.attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let worker: oulipoly_state::completion_continuation::SourceProcessIdentity =
+        serde_json::from_str(&worker_json).unwrap();
+    let launcher: oulipoly_state::completion_continuation::SourceProcessIdentity =
+        serde_json::from_str(&launcher_json).unwrap();
+    assert_eq!(parent(worker.pid), owner.guardian_identity.pid);
+    assert_eq!(parent(launcher.pid), worker.pid);
+    assert!(current_identity_matches(&worker));
+    assert!(current_identity_matches(&launcher));
+    assert_eq!(
+        read_live_process_identity(descendant).unwrap(),
+        Some(descendant_identity.clone())
+    );
+    assert!(
+        f.mailbox()
+            .continuation_activation(SESSION, &claim.claim_token)
+            .unwrap()
+            .is_some()
+    );
+    assert!(!f.root.path().join("release-descendant").exists());
+    wait(|| {
+        f.root
+            .path()
+            .join("cancel-descendant-ready")
+            .exists()
+            .then_some(())
+    });
+    if replace_driver {
+        assert!(current_identity_matches(&owner.driver_identity));
+        assert_eq!(
+            unsafe { libc::kill(owner.driver_identity.pid as i32, libc::SIGKILL) },
+            0
+        );
+        let replacement = wait(|| {
+            let current = f
+                .mailbox_for_poll()?
+                .completion_continuation_owner()
+                .ok()??;
+            (current.owner_generation != owner.owner_generation).then_some(current)
+        });
+        assert_eq!(replacement.guardian_identity, owner.guardian_identity);
+        assert_eq!(
+            replacement.supervisor_authority_id,
+            owner.supervisor_authority_id
+        );
+        assert!(current_identity_matches(&worker));
+        assert_eq!(
+            read_live_process_identity(descendant).unwrap(),
+            Some(descendant_identity.clone())
+        );
+    }
+    request_linked_cancel(&f, &attempt);
+    wait(|| {
+        f.root
+            .path()
+            .join("root-result-retained.reached")
+            .exists()
+            .then_some(())
+    });
+    let original = fs::read(&attempt.result_path).unwrap();
+    let retained: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    let token = fs::read_to_string(f.root.path().join("state-cancel-token")).unwrap();
+    assert_eq!(retained["attempt_id"], attempt.attempt_id);
+    assert_eq!(
+        retained["custodian"],
+        serde_json::to_value(&worker).unwrap()
+    );
+    assert_eq!(retained["accepted_cancellation"], token);
+    assert_eq!(retained["authority"], "root_supervisor");
+    assert_eq!(retained["owned_children"], "ECHILD");
+    assert_eq!(retained["result_retained"], true);
+    assert!(retained["root_wait_status"].is_i64());
+    assert!(
+        !current_identity_matches(&worker),
+        "guardian must wait for the original root worker before replay"
+    );
+    assert_ne!(
+        read_live_process_identity(descendant).unwrap(),
+        Some(descendant_identity),
+        "resistant descendant must be physically gone before ECHILD result"
+    );
+    assert!(
+        f.mailbox()
+            .continuation_activation(SESSION, &claim.claim_token)
+            .unwrap()
+            .is_some()
+    );
+    fs::remove_file(f.root.path().join("root-result-retained.hold")).unwrap();
+    wait(|| {
+        f.mailbox_for_poll()?
+            .continuation_activation(SESSION, &claim.claim_token)
+            .ok()?
+            .is_none()
+            .then_some(())
+    });
+    let integrated: (String, i64, String) = f.sidecar_connection()
+        .query_row(
+            "SELECT phase,integrated,drain_receipt FROM completion_continuation_attempt WHERE attempt_id=?1",
+            [&attempt.attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(integrated.0, "drained");
+    assert_eq!(integrated.1, 1);
+    assert_eq!(integrated.2.as_bytes(), original);
+    assert_eq!(
+        fs::read_to_string(f.root.path().join("resume-prompts.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "root result replay must not replay the recipient"
+    );
+    let state = oulipoly_state::StateDb::open(&f.data.join("state.db")).unwrap();
+    let logical_launch = token.split(':').next().unwrap();
+    wait(|| {
+        let status: String = state
+            .connection()
+            .query_row(
+                "SELECT status FROM provider_logical_launches WHERE logical_launch_id=?1",
+                [logical_launch],
+                |row| row.get(0),
+            )
+            .ok()?;
+        (status == "cancelled").then_some(())
+    });
+}
+
 #[test]
 fn native_state_linked_token_cancellation_drains_resistant_activation() {
     if !private_case(false) {
-        native_activation_custody(9);
+        native_root_state_token_cancellation(false);
     }
 }
 #[test]
-fn native_state_linked_token_cancellation_after_ac_loss_drains_original_adopter() {
+fn native_root_state_token_cancellation_retains_result_across_driver_replacement() {
     if !private_case(false) {
-        native_activation_custody(10);
+        native_root_state_token_cancellation(true);
     }
 }
 
