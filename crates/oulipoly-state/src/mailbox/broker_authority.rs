@@ -50,6 +50,17 @@ pub struct BrokerContinuationReadback {
     pub broker_owned: bool,
 }
 
+/// Metadata read from the retained v30 connection. This does not grant
+/// delivery or acknowledgement: a wire caller still needs an independently
+/// proved recipient/session relationship and broker-owned payload custody.
+/// The full row can exceed the current broker response frame; this type is
+/// internal readback, not a wire response.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct BrokerMailboxReadback {
+    pub source_generation: String,
+    pub row: super::MailboxRow,
+}
+
 /// A process incarnation observed by the host broker. Namespace identity is
 /// retained in addition to PID/starttime so a reused PID is not authority.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -147,6 +158,75 @@ pub struct BrokerReleaseEvidence {
 }
 
 impl BrokerSidecar {
+    /// Exact PK lookup for a session. The broker must supply the session from
+    /// its own authority, not accept it as mutation authority from a caller.
+    /// This only reads row metadata; paths inside copied v29 rows are not
+    /// opened and are not evidence that payload bytes are broker-owned.
+    pub fn read_exact_mailbox_row(
+        &self,
+        source_generation: &str,
+        session_id: &str,
+        seq: i64,
+    ) -> Result<Option<BrokerMailboxReadback>, String> {
+        self.check_mailbox_read(source_generation)?;
+        if session_id.is_empty() || seq <= 0 {
+            return Err("broker mailbox exact key is invalid".into());
+        }
+        let row = self
+            .mailbox
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT {MAILBOX_ROW_COLUMNS} FROM mailbox WHERE seq=?1 AND session_id=?2"
+                ),
+                params![seq, session_id],
+                map_mailbox_row,
+            )
+            .optional()
+            .map_err(|error| format!("broker mailbox exact read failed: {error}"))?;
+        self.check_mailbox_read(source_generation)?;
+        Ok(row.map(|row| BrokerMailboxReadback {
+            source_generation: self.source_generation.clone(),
+            row,
+        }))
+    }
+
+    /// Cursor-bound pending read. The existing delivery query uses its live
+    /// indexes and excludes terminal rows; it never scans historical mailbox
+    /// rows or holds a write transaction while the caller consumes a page.
+    pub fn read_pending_mailbox_page(
+        &self,
+        source_generation: &str,
+        session_id: &str,
+        after_seq: i64,
+        limit: usize,
+    ) -> Result<Vec<BrokerMailboxReadback>, String> {
+        self.check_mailbox_read(source_generation)?;
+        if session_id.is_empty() || after_seq < 0 || !(1..=64).contains(&limit) {
+            return Err("broker mailbox page key or limit is invalid".into());
+        }
+        let rows = self
+            .mailbox
+            .list_pending_for_delivery_after(session_id, None, after_seq, limit)?;
+        self.check_mailbox_read(source_generation)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| BrokerMailboxReadback {
+                source_generation: self.source_generation.clone(),
+                row,
+            })
+            .collect())
+    }
+
+    fn check_mailbox_read(&self, source_generation: &str) -> Result<(), String> {
+        if source_generation != self.source_generation {
+            return Err("broker mailbox source generation changed".into());
+        }
+        #[cfg(unix)]
+        check_storage(&self.mailbox.path, self.storage_owner, &self.storage_anchor)?;
+        broker_main_file_must_be_named(&self.mailbox.conn)
+    }
+
     /// Persist only broker-observed preparation on the retained root-owned
     /// connection. A duplicate or copied v29 running generation is refused.
     /// The caller still must prove live pinned actors before invoking this;
@@ -1409,6 +1489,131 @@ mod tests {
     use crate::completion_continuation::{PROTOCOL, SourceProcessIdentity};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mailbox_readback_is_exact_bounded_and_uses_retained_v30_connection() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.pid-identity.db");
+        let mut old = MailboxDb::open(&source).unwrap();
+        let enqueue = |db: &mut MailboxDb, session_id: &str, handle: &str| {
+            let input = AgentBashCompleteEnqueue {
+                session_id,
+                handle,
+                payload_json: r#"{"protocol":"source-retention-release-v1","body":"unread"}"#,
+                owner_invocation_uuid: Some("source-invocation"),
+                matched_os_pid: None,
+                matched_os_boot_id: None,
+                matched_os_pid_starttime_ticks: None,
+                matched_chain_index: None,
+                state_dir: "state",
+                meta_path: "meta",
+                log_path: "log",
+                rc_path: "rc",
+                rc: 0,
+            };
+            match db.enqueue_agent_bash_complete(&input).unwrap() {
+                EnqueueResult::Inserted(row) => row,
+                other => panic!("unexpected enqueue: {other:?}"),
+            }
+        };
+        let first = enqueue(&mut old, "recipient", "first");
+        let sibling = enqueue(&mut old, "sibling", "foreign");
+        let second = enqueue(&mut old, "recipient", "second");
+        drop(old);
+
+        let directory = root.path().join("sidecar");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let target = directory.join("pid-identity.db");
+        let source_conn = Connection::open(&source).unwrap();
+        source_conn
+            .execute("VACUUM INTO ?1", [target.to_str().unwrap()])
+            .unwrap();
+        drop(source_conn);
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let generation = activate_with_owner(&target, uid, root.path()).unwrap();
+        let broker = open_with_owner(&target, uid, root.path()).unwrap();
+
+        assert!(
+            broker
+                .read_exact_mailbox_row("wrong", "recipient", first.seq)
+                .is_err()
+        );
+        assert!(
+            broker
+                .read_exact_mailbox_row(&generation, "recipient", sibling.seq)
+                .unwrap()
+                .is_none()
+        );
+        let read = broker
+            .read_exact_mailbox_row(&generation, "recipient", first.seq)
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.source_generation, generation);
+        assert_eq!(read.row.handle, "first");
+        assert_eq!(
+            read.row.owner_invocation_uuid.as_deref(),
+            Some("source-invocation")
+        );
+        assert_eq!(read.row.payload_sha256, first.payload_sha256);
+        assert_eq!(read.row.payload_byte_len, first.payload_byte_len);
+        assert!(read.row.delivered_at.is_none());
+        // The copied row still names the old user-side payload store. A
+        // metadata read is safe; byte delivery must wait for root-owned copy.
+        assert!(
+            broker
+                .mailbox
+                .payloads()
+                .verify_mailbox_row_payload(&read.row)
+                .is_err()
+        );
+        let page = broker
+            .read_pending_mailbox_page(&generation, "recipient", 0, 1)
+            .unwrap();
+        assert_eq!(
+            page.iter().map(|item| item.row.seq).collect::<Vec<_>>(),
+            vec![first.seq]
+        );
+        let page = broker
+            .read_pending_mailbox_page(&generation, "recipient", first.seq, 1)
+            .unwrap();
+        assert_eq!(
+            page.iter().map(|item| item.row.seq).collect::<Vec<_>>(),
+            vec![second.seq]
+        );
+        assert!(
+            broker
+                .read_pending_mailbox_page(&generation, "recipient", 0, 65)
+                .is_err()
+        );
+
+        drop(broker);
+        let mut retired = MailboxDb::open(&source).unwrap();
+        retired
+            .acknowledge_range("recipient", first.seq, first.seq, "retired")
+            .unwrap();
+        drop(retired);
+        let broker = open_with_owner(&target, uid, root.path()).unwrap();
+        assert!(
+            broker
+                .read_exact_mailbox_row(&generation, "recipient", first.seq)
+                .unwrap()
+                .unwrap()
+                .row
+                .delivered_at
+                .is_none()
+        );
+        fs::rename(&target, directory.join("moved.db")).unwrap();
+        assert!(
+            broker
+                .read_exact_mailbox_row(&generation, "recipient", first.seq)
+                .is_err()
+        );
+        drop(broker);
+        assert!(open_with_owner(&target, uid, root.path()).is_err());
+    }
 
     #[cfg(unix)]
     #[test]

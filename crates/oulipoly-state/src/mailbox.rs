@@ -47,7 +47,8 @@ mod finalization;
 mod native_publication;
 mod retention;
 pub use broker_authority::{
-    BrokerContinuationReadback, BrokerReleaseEvidence, BrokerSidecar, PreparedBrokerOwner,
+    BrokerContinuationReadback, BrokerMailboxReadback, BrokerReleaseEvidence, BrokerSidecar,
+    PreparedBrokerOwner,
     PreparedProcessStamp, QuiescedCutoverProof,
 };
 pub use native_publication::NativePublication;
