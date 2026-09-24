@@ -317,6 +317,12 @@ pub(super) struct RootAuthorities {
     scopes: BTreeMap<String, RootScope>,
 }
 
+#[derive(Clone, Copy)]
+enum FreshAdmission {
+    Independent,
+    AcceptedNative,
+}
+
 impl RootAuthorities {
     pub fn fresh(
         &mut self,
@@ -328,6 +334,25 @@ impl RootAuthorities {
             context,
             uuid::Uuid::new_v4().to_string(),
             LEGACY_CONTROL_PROTOCOL,
+            FreshAdmission::Independent,
+        )
+    }
+
+    pub fn fresh_from_accepted_native(
+        &mut self,
+        owner: &CompletionDomainOwner,
+        context: SourceProcessIdentity,
+        supervisor: &super::root_supervisor::RootSupervisor,
+    ) -> Result<RootAuthorityGrant, String> {
+        if !supervisor.accepted_native_activation_for_peer(&context) {
+            return Err("fresh native activation is no longer exact or accepted".into());
+        }
+        self.fresh_with_protocol(
+            owner,
+            context,
+            uuid::Uuid::new_v4().to_string(),
+            LEGACY_CONTROL_PROTOCOL,
+            FreshAdmission::AcceptedNative,
         )
     }
 
@@ -337,7 +362,13 @@ impl RootAuthorities {
         context: SourceProcessIdentity,
         root_id: String,
     ) -> Result<RootAuthorityGrant, String> {
-        self.fresh_with_protocol(owner, context, root_id, SOURCE_CONTROL_PROTOCOL)
+        self.fresh_with_protocol(
+            owner,
+            context,
+            root_id,
+            SOURCE_CONTROL_PROTOCOL,
+            FreshAdmission::Independent,
+        )
     }
 
     fn fresh_with_protocol(
@@ -346,12 +377,15 @@ impl RootAuthorities {
         context: SourceProcessIdentity,
         root_id: String,
         control_protocol: &str,
+        admission: FreshAdmission,
     ) -> Result<RootAuthorityGrant, String> {
         uuid::Uuid::parse_str(&root_id).map_err(|_| "invalid broker root ID")?;
         if self.scopes.contains_key(&root_id) {
             return Err("duplicate root authority ID".into());
         }
-        if !self.roots_for_peer(&context).is_empty() {
+        if matches!(admission, FreshAdmission::Independent)
+            && !self.roots_for_peer(&context).is_empty()
+        {
             return Err("live context is already inside a root authority".into());
         }
         let capability = format!(
@@ -452,6 +486,24 @@ impl RootAuthorities {
                     .any(|ancestor| exact_descendant(peer, ancestor))
             })
             .map(|(root_id, _)| root_id.clone())
+            .collect()
+    }
+
+    #[cfg(feature = "age360-fault-fixtures")]
+    pub(super) fn private_matching_contexts(
+        &self,
+        peer: &SourceProcessIdentity,
+    ) -> Vec<(usize, SourceProcessIdentity, SourceProcessIdentity)> {
+        self.scopes
+            .values()
+            .enumerate()
+            .flat_map(|(index, scope)| {
+                scope.contexts.iter().filter_map(move |context| {
+                    exact_descendant(peer, context)
+                        .then(|| (index, scope.grant.root_identity.clone(), context.clone()))
+                })
+            })
+            .take(8)
             .collect()
     }
 

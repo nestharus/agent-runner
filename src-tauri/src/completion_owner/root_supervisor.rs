@@ -1027,6 +1027,78 @@ impl RootSupervisor {
         self.original.root_for_peer(peer)
     }
 
+    /// A fresh native wake has no inherited root grant. Only the guardian's
+    /// already accepted, granted activation may cross the founding context's
+    /// ancestor chain while that founder is still alive.
+    pub(super) fn accepted_native_activation_for_peer(
+        &self,
+        peer: &oulipoly_state::completion_continuation::SourceProcessIdentity,
+    ) -> bool {
+        fn parent_pid(pid: i64) -> Option<i64> {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            stat.rsplit_once(')')?
+                .1
+                .split_whitespace()
+                .nth(1)?
+                .parse()
+                .ok()
+        }
+        if super::linux::identity(peer.pid).as_ref() != Ok(peer) {
+            return false;
+        }
+        self.active.iter().any(|operation| {
+            let Some(worker) = operation.worker_identity.as_ref() else {
+                return false;
+            };
+            if !operation.granted
+                || operation.terminal
+                || operation.worker.is_none()
+                || super::linux::identity(worker.pid).as_ref() != Ok(worker)
+                || parent_pid(peer.pid) != Some(worker.pid)
+            {
+                return false;
+            }
+            // The local grant bit was set only after sidecar acceptance,
+            // custodian attachment and execution-grant delivery. Read back
+            // that exact active attempt; stale or changed rows close admission.
+            let Some(session) = operation.attempt.session_id.as_deref() else {
+                return false;
+            };
+            let Some(claim) = operation.attempt.claim_token.as_deref() else {
+                return false;
+            };
+            let recorded = MailboxDb::open_existing_native_authority(&self.path)
+                .and_then(|db| db.continuation_activation(session, claim));
+            recorded.ok().flatten().as_ref() == Some(&operation.attempt)
+                && super::linux::identity(peer.pid).as_ref() == Ok(peer)
+                && super::linux::identity(worker.pid).as_ref() == Ok(worker)
+                && parent_pid(peer.pid) == Some(worker.pid)
+        })
+    }
+
+    #[cfg(feature = "age360-fault-fixtures")]
+    pub(super) fn private_native_activations(
+        &self,
+    ) -> Vec<(
+        String,
+        Option<oulipoly_state::completion_continuation::SourceProcessIdentity>,
+        bool,
+        bool,
+    )> {
+        self.active
+            .iter()
+            .take(8)
+            .map(|operation| {
+                (
+                    operation.attempt.attempt_id.clone(),
+                    operation.worker_identity.clone(),
+                    operation.granted,
+                    operation.terminal,
+                )
+            })
+            .collect()
+    }
+
     pub(super) fn original_worker_pids(&self) -> Vec<i64> {
         self.original.worker_pids()
     }
