@@ -893,7 +893,7 @@ fn private_native_request(
     });
     let args = [
         b"__age319-private-installed-probe-v1".to_vec(),
-        b"ambient".to_vec(),
+        b"provider".to_vec(),
         marker.as_os_str().as_encoded_bytes().to_vec(),
     ];
     let request = serde_json::json!({

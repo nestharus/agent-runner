@@ -922,6 +922,22 @@ where
             ProviderDiagnostics::default(),
         ));
     }
+    // Receipt inspection still uses its legacy group certificate. It cannot
+    // opt into unrestricted execution merely by requesting original-tree mode.
+    #[cfg(target_os = "linux")]
+    if custody.as_ref().is_some_and(|c| c.1) {
+        if receipt_group() != 0 {
+            return Err(host_process_error(
+                HostErrorKind::SpawnFailed,
+                command,
+                std::io::Error::other(
+                    "original-tree provider conflicts with receipt group custody",
+                ),
+            ));
+        }
+        crate::process_custody::require_unrestricted_context()
+            .map_err(|error| host_process_error(HostErrorKind::SpawnFailed, command, error))?;
+    }
     let mut process = build_provider_process(command, envs);
     if custody.as_ref().is_some_and(|c| c.1) {
         #[cfg(target_os = "linux")]
@@ -936,6 +952,12 @@ where
                 attribution,
             )
             .map_err(|error| host_process_error(HostErrorKind::SpawnFailed, command, error))?;
+            // Check after custody setup in the actual executable child. A
+            // caller cannot replace this observation with an environment flag.
+            use std::os::unix::process::CommandExt;
+            unsafe {
+                process.pre_exec(crate::process_custody::require_unrestricted_context);
+            }
             return process
                 .spawn()
                 .map(|child| Child::new(child, custody).with_published_receipt(receipt))
