@@ -72,8 +72,10 @@ pub struct FreshChildRequest {
     pub invocation_uuid: String,
 }
 
-/// The new Runner child calls this before D. A lost reservation reply is
-/// retried with the same UUID pair; the broker binds it to the pinned peer.
+/// Protocol-only reservation for private fixtures. Production U remains
+/// closed until the fresh broker can verify the released child, exact Bash
+/// handle, and real State invocation. A lost fixture reply is retried with
+/// the same UUID pair and the broker pins it to that peer.
 pub fn reserve_fresh_v30_child_request(request_id: &str, invocation_uuid: &str) -> io::Result<()> {
     reserve_fresh_v30_child_request_at(
         Path::new(INSTALLED_FRESH_V30_SOCKET),

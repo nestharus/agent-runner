@@ -396,7 +396,10 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
         println!("OULIPOLY_KERNEL_V30_CHILD_EFFECT={}", evidence.release_id);
         return Ok(ExitCode::SUCCESS);
     }
-    Err("production v30 child requires broker-routed owner work path".into())
+    Err(
+        "production v30 child has no Bash-handle dispatch or fresh State invocation/owner binding; U/D remains closed"
+            .into(),
+    )
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]

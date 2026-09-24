@@ -3551,6 +3551,16 @@ fn serve_fresh_v30() -> io::Result<()> {
                     lane.identity().domain_id,
                 )),
                 b'U' => {
+                    // The fresh service does not yet share the old broker's
+                    // released-child registry. An installed image alone cannot
+                    // prove that this peer is the child for a Bash handle.
+                    // Keep private protocol fixtures, but issue no production
+                    // request identity until that exact owner join exists.
+                    if !private_fixture() {
+                        return Err(io::Error::other(
+                            "fresh child owner handoff unavailable: released child, Bash handle, and State invocation are not bound",
+                        ));
+                    }
                     let RequestPayload::FreshChildRequest { request } = payload else {
                         return Err(io::Error::other("fresh child request payload absent"));
                     };
@@ -3575,6 +3585,14 @@ fn serve_fresh_v30() -> io::Result<()> {
                     ))
                 }
                 b'D' | b'd' => {
+                    // d remains a readback for any already committed prefix
+                    // admission. A new D cannot turn an older U-only row into
+                    // a production session without the released owner join.
+                    if operation == b'D' && !private_fixture() {
+                        return Err(io::Error::other(
+                            "fresh child owner handoff unavailable: D requires a released handle-bound invocation",
+                        ));
+                    }
                     let RequestPayload::FreshSessionRequest { request_id } = payload else {
                         return Err(io::Error::other("fresh session request identity absent"));
                     };
