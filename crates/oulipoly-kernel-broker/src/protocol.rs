@@ -65,6 +65,54 @@ pub fn read_fresh_v30_session(
     fresh_v30_session_request(Operation::ReadFreshSession, request_id)
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreshChildRequest {
+    pub request_id: String,
+    pub invocation_uuid: String,
+}
+
+/// The new Runner child calls this before D. A lost reservation reply is
+/// retried with the same UUID pair; the broker binds it to the pinned peer.
+pub fn reserve_fresh_v30_child_request(request_id: &str, invocation_uuid: &str) -> io::Result<()> {
+    reserve_fresh_v30_child_request_at(
+        Path::new(INSTALLED_FRESH_V30_SOCKET),
+        request_id,
+        invocation_uuid,
+    )
+}
+
+pub fn reserve_fresh_v30_child_request_at(
+    path: &Path,
+    request_id: &str,
+    invocation_uuid: &str,
+) -> io::Result<()> {
+    for value in [request_id, invocation_uuid] {
+        let id = uuid::Uuid::parse_str(value)
+            .map_err(|_| io::Error::other("invalid fresh child UUID"))?;
+        if id.is_nil() || id.to_string() != value {
+            return Err(io::Error::other("noncanonical or nil fresh child UUID"));
+        }
+    }
+    let body = serde_json::to_vec(&FreshChildRequest {
+        request_id: request_id.into(),
+        invocation_uuid: invocation_uuid.into(),
+    })?;
+    let mut stream = checked_connection(path)?;
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let mut frame = Vec::with_capacity(17 + body.len());
+    frame.push(b'U');
+    frame.extend_from_slice(&challenge);
+    frame.extend_from_slice(&body);
+    stream.write_all(&frame)?;
+    let reply = read_response(stream)?;
+    if reply != format!("fresh-child-request {request_id} {invocation_uuid}\n") {
+        return Err(io::Error::other("fresh child request receipt mismatch"));
+    }
+    Ok(())
+}
+
 /// Versioned recipient operations. The caller persists a delivery request UUID
 /// before submission and uses `Read` after an uncertain reply. The broker
 /// derives recipient identity from the pinned socket peer, never these fields.

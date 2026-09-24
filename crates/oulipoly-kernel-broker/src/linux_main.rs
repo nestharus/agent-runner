@@ -23,10 +23,10 @@ use oulipoly_kernel_broker::native_receipt::{
     BoundNativeAuthority, verify as verify_native_receipt,
 };
 use oulipoly_kernel_broker::protocol::{
-    AcceptedWorkSpec, FreshRecipientRequest, JoinSpec, JoinedChildWitness, LaunchAcceptedWorkSpec,
-    NativeKSpec, NativePrepareSpec, OwnerWitness, ProcessWitness, SourceControlUse, SourceScope,
-    SourceSocketWitness, SourceTicketUse, StateGenerationSpec, StateReadSpec, StateWriteAction,
-    StateWriteSpec,
+    AcceptedWorkSpec, FreshChildRequest, FreshRecipientRequest, JoinSpec, JoinedChildWitness,
+    LaunchAcceptedWorkSpec, NativeKSpec, NativePrepareSpec, OwnerWitness, ProcessWitness,
+    SourceControlUse, SourceScope, SourceSocketWitness, SourceTicketUse, StateGenerationSpec,
+    StateReadSpec, StateWriteAction, StateWriteSpec,
 };
 use oulipoly_kernel_broker::registry::RootRegistry;
 use oulipoly_kernel_broker::source_acceptance::capture_and_stage_v2_evidence;
@@ -149,6 +149,9 @@ fn require_cutover_entry_route(
 #[derive(Debug)]
 enum RequestPayload {
     None,
+    FreshChildRequest {
+        request: FreshChildRequest,
+    },
     FreshSessionRequest {
         request_id: String,
     },
@@ -338,6 +341,7 @@ fn recv_request(
         b'V' | b'S' | b's' | b'T' | b'H' | b'K' | b'B' | b'N' | b'k' | b't' | b'R' | b'W'
         | b'Y' => (18..=2048 + 17).contains(&read),
         b'F' => (18..=8192 + 17).contains(&read),
+        b'U' => (18..=512 + 17).contains(&read),
         _ => read == 17,
     };
     if !valid_length
@@ -374,6 +378,9 @@ fn recv_request(
     }
     process.verify()?;
     let payload = match request[0] {
+        b'U' => RequestPayload::FreshChildRequest {
+            request: serde_json::from_slice(&request[17..read as usize])?,
+        },
         b'F' => RequestPayload::FreshRecipientRequest {
             request: serde_json::from_slice(&request[17..read as usize])?,
         },
@@ -3543,10 +3550,40 @@ fn serve_fresh_v30() -> io::Result<()> {
                     lane.identity().source_generation,
                     lane.identity().domain_id,
                 )),
+                b'U' => {
+                    let RequestPayload::FreshChildRequest { request } = payload else {
+                        return Err(io::Error::other("fresh child request payload absent"));
+                    };
+                    if instance.is_closed() {
+                        lane.require_child_request(
+                            &request.request_id,
+                            &request.invocation_uuid,
+                            &recipient,
+                        )
+                        .map_err(io::Error::other)?;
+                    } else {
+                        lane.reserve_child_request(
+                            &request.request_id,
+                            &request.invocation_uuid,
+                            &recipient,
+                        )
+                        .map_err(io::Error::other)?;
+                    }
+                    Ok(format!(
+                        "fresh-child-request {} {}\n",
+                        request.request_id, request.invocation_uuid
+                    ))
+                }
                 b'D' | b'd' => {
                     let RequestPayload::FreshSessionRequest { request_id } = payload else {
                         return Err(io::Error::other("fresh session request identity absent"));
                     };
+                    lane.require_child_actor(
+                        &request_id,
+                        &recipient,
+                        operation == b'D' && !private_fixture(),
+                    )
+                    .map_err(io::Error::other)?;
                     // d never repairs a half-written pair; only a retry of
                     // the same D key may finish its State-first admission.
                     let session = if operation == b'd' {

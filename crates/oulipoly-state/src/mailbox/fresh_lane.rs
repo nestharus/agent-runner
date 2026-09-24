@@ -16,6 +16,7 @@ const LANE_DIRECTORY: &str = "v30";
 const LANE_PROTOCOL: &str = "fresh-v30-lane-v1";
 const FRESH_SCHEMA: &str = include_str!("migrations/0030_fresh_lane.sql");
 const FRESH_STATE_SCHEMA: &str = include_str!("migrations/0030_fresh_state_identity.sql");
+const FRESH_CHILD_REQUEST_SCHEMA: &str = include_str!("migrations/0030_fresh_child_request.sql");
 const FRESH_RECIPIENT_SCHEMA: &str = include_str!("migrations/0030_fresh_recipient.sql");
 const FRESH_RECIPIENT_STATE_SCHEMA: &str =
     include_str!("migrations/0030_fresh_recipient_state.sql");
@@ -142,7 +143,7 @@ impl FreshV30Lane {
         let state_conn = Connection::open(&state_path).map_err(|e| e.to_string())?;
         state_conn
             .execute_batch(&format!(
-                "{FRESH_STATE_SCHEMA}\n{FRESH_RECIPIENT_STATE_SCHEMA}"
+                "{FRESH_STATE_SCHEMA}\n{FRESH_RECIPIENT_STATE_SCHEMA}\n{FRESH_CHILD_REQUEST_SCHEMA}"
             ))
             .map_err(|e| e.to_string())?;
         state_conn
@@ -310,7 +311,7 @@ impl FreshV30Lane {
         }
         let state_conn = Connection::open_with_flags(
             lane_root.join("state.db"),
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
+            OpenFlags::SQLITE_OPEN_READ_WRITE,
         )
         .map_err(|e| e.to_string())?;
         let state_identity = state_conn
@@ -376,6 +377,26 @@ impl FreshV30Lane {
         if accepted_schema_count != 6 {
             return Err("fresh accepted source schema is incomplete".into());
         }
+        // This embedded SQL is the additive upgrade for a previously
+        // published empty v30 lane. Identity and all pre-existing fresh
+        // schemas are checked before any write. The immediate transaction
+        // makes concurrent broker opens see either old or complete new shape.
+        state_conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| e.to_string())?;
+        match fresh_child_request_schema_count(&state_conn)? {
+            0 => state_conn
+                .execute_batch(FRESH_CHILD_REQUEST_SCHEMA)
+                .map_err(|e| e.to_string())?,
+            3 => {}
+            _ => return Err("fresh child request schema is incomplete".into()),
+        }
+        if fresh_child_request_schema_count(&state_conn)? != 3 {
+            return Err("fresh child request schema is incomplete".into());
+        }
+        state_conn
+            .execute_batch("COMMIT")
+            .map_err(|e| e.to_string())?;
         Ok(Self {
             sidecar,
             identity,
@@ -385,6 +406,104 @@ impl FreshV30Lane {
 
     pub fn identity(&self) -> &FreshV30LaneIdentity {
         &self.identity
+    }
+
+    /// The intended caller is a released Runner child retaining both UUIDs
+    /// across U and D. The broker supplies the pinned peer identity; caller
+    /// JSON cannot select an actor. Release and invocation linkage are still
+    /// a later gate. This intent grants no work or registration authority.
+    pub fn reserve_child_request(
+        &self,
+        request_id: &str,
+        invocation_uuid: &str,
+        actor: &FreshRecipientIdentity,
+    ) -> Result<(), String> {
+        validate_request_id(request_id)?;
+        validate_request_id(invocation_uuid)?;
+        if actor.host_pid <= 0 || actor.starttime_ticks == 0 || actor.boot_id.is_empty() {
+            return Err("invalid fresh child actor".into());
+        }
+        let actor_json = serde_json::to_string(actor).map_err(|e| e.to_string())?;
+        let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        state
+            .execute(
+                "INSERT INTO fresh_lane_child_request
+                 (request_id,invocation_uuid,actor_identity,lane_id,source_generation,reserved_at)
+                 VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT DO NOTHING",
+                params![
+                    request_id,
+                    invocation_uuid,
+                    actor_json,
+                    self.identity.lane_id,
+                    self.identity.source_generation,
+                    Utc::now().to_rfc3339()
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        self.require_child_request(request_id, invocation_uuid, actor)
+    }
+
+    pub fn require_child_request(
+        &self,
+        request_id: &str,
+        invocation_uuid: &str,
+        actor: &FreshRecipientIdentity,
+    ) -> Result<(), String> {
+        validate_request_id(request_id)?;
+        validate_request_id(invocation_uuid)?;
+        let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let row: Option<(String, String, String, String)> = state
+            .query_row(
+                "SELECT invocation_uuid,actor_identity,lane_id,source_generation
+                 FROM fresh_lane_child_request WHERE request_id=?1",
+                [request_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some((stored_invocation, stored_actor, lane_id, source_generation)) = row else {
+            return Err("fresh child request absent".into());
+        };
+        if stored_invocation != invocation_uuid
+            || serde_json::from_str::<FreshRecipientIdentity>(&stored_actor)
+                .map_err(|e| e.to_string())?
+                != *actor
+            || lane_id != self.identity.lane_id
+            || source_generation != self.identity.source_generation
+        {
+            return Err("fresh child request actor or lane conflict".into());
+        }
+        Ok(())
+    }
+
+    /// Production D requires a preceding child intent. Private fixtures may
+    /// exercise older D rows, but cannot spend a reserved sibling key.
+    pub fn require_child_actor(
+        &self,
+        request_id: &str,
+        actor: &FreshRecipientIdentity,
+        required: bool,
+    ) -> Result<(), String> {
+        validate_request_id(request_id)?;
+        let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let stored: Option<String> = state
+            .query_row(
+                "SELECT actor_identity FROM fresh_lane_child_request WHERE request_id=?1",
+                [request_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        match stored {
+            Some(stored)
+                if serde_json::from_str::<FreshRecipientIdentity>(&stored)
+                    .map_err(|e| e.to_string())?
+                    == *actor => {}
+            Some(_) => return Err("fresh child request belongs to another actor".into()),
+            None if required => return Err("fresh child request absent before D".into()),
+            None => {}
+        }
+        Ok(())
     }
 
     /// A request UUID is created before the first send and retained by the
@@ -653,6 +772,19 @@ impl FreshV30Lane {
             owner_generation: grant.owner_generation.clone(),
         })
     }
+}
+
+fn fresh_child_request_schema_count(state: &Connection) -> Result<i64, String> {
+    state
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE
+             (type='table' AND name='fresh_lane_child_request') OR
+             (type='trigger' AND name IN
+             ('fresh_lane_child_request_no_update','fresh_lane_child_request_no_delete'))",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())
 }
 
 fn validate_request_id(request_id: &str) -> Result<(), String> {

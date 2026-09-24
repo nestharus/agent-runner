@@ -1,7 +1,7 @@
 #![cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
 
 use oulipoly_state::StateDb;
-use oulipoly_state::mailbox::{FreshV30Lane, FreshV30Session, MailboxDb};
+use oulipoly_state::mailbox::{FreshRecipientIdentity, FreshV30Lane, FreshV30Session, MailboxDb};
 use rusqlite::{Connection, params};
 use std::fs;
 use std::io::{Read, Write};
@@ -13,6 +13,17 @@ use std::time::{Duration, Instant};
 
 #[test]
 fn private_broker_has_distinct_fresh_route_while_old_wal_writer_survives() {
+    if let Ok(socket) = std::env::var("AGE319_FRESH_WRONG_PEER_SOCKET") {
+        let request_id =
+            uuid::Uuid::parse_str(&std::env::var("AGE319_FRESH_WRONG_PEER_REQUEST").unwrap())
+                .unwrap();
+        let response = request_with_id(std::path::Path::new(&socket), b'D', request_id, true);
+        assert!(
+            response.contains("belongs to another actor"),
+            "sibling Runner unexpectedly spent child request: {response}"
+        );
+        return;
+    }
     if std::env::var_os("AGE319_FRESH_SOCKET_CHILD").is_none() {
         let status = Command::new("unshare")
             .args(["-Urpfm", "--mount-proc"])
@@ -57,6 +68,17 @@ fn private_broker_has_distinct_fresh_route_while_old_wal_writer_survives() {
     });
     ready_rx.recv().unwrap();
     let identity = FreshV30Lane::initialize_at(&broker_root).unwrap();
+    // Model a root published by the previous source version: all prior
+    // identity/admission tables exist, while the additive child table does
+    // not. Reopen applies only the embedded fresh-lane migration.
+    Connection::open(broker_root.join("v30/state.db"))
+        .unwrap()
+        .execute_batch("DROP TABLE fresh_lane_child_request")
+        .unwrap();
+    assert_eq!(
+        FreshV30Lane::open_at(&broker_root).unwrap().identity(),
+        &identity
+    );
     let fresh_mailbox = broker_root.join("v30/sidecar/pid-identity.db");
     let fresh = Connection::open(&fresh_mailbox).unwrap();
     assert_eq!(
@@ -216,6 +238,100 @@ fn private_broker_has_distinct_fresh_route_while_old_wal_writer_survives() {
             )
             .unwrap(),
         0
+    );
+
+    // The new child pre-D reservation is tied to the challenged Runner peer,
+    // is idempotent across broker restart, and refuses a sibling Runner image.
+    let child_request = uuid::Uuid::new_v4();
+    let child_invocation = uuid::Uuid::new_v4();
+    oulipoly_kernel_broker::protocol::reserve_fresh_v30_child_request_at(
+        &socket,
+        &child_request.to_string(),
+        &child_invocation.to_string(),
+    )
+    .unwrap();
+    oulipoly_kernel_broker::protocol::reserve_fresh_v30_child_request_at(
+        &socket,
+        &child_request.to_string(),
+        &child_invocation.to_string(),
+    )
+    .unwrap();
+    assert!(
+        oulipoly_kernel_broker::protocol::reserve_fresh_v30_child_request_at(
+            &socket,
+            &child_request.to_string(),
+            &uuid::Uuid::new_v4().to_string(),
+        )
+        .is_err()
+    );
+    assert!(
+        oulipoly_kernel_broker::protocol::reserve_fresh_v30_child_request_at(
+            &socket,
+            &uuid::Uuid::new_v4().to_string(),
+            &uuid::Uuid::new_v4().to_string(),
+        )
+        .is_err(),
+        "one pinned process reserved a second request"
+    );
+    let actor_json: String = fresh_state
+        .query_row(
+            "SELECT actor_identity FROM fresh_lane_child_request WHERE request_id=?1",
+            [child_request.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let actor: FreshRecipientIdentity = serde_json::from_str(&actor_json).unwrap();
+    let lane = FreshV30Lane::open_at(&broker_root).unwrap();
+    lane.require_child_actor(&child_request.to_string(), &actor, true)
+        .unwrap();
+    assert!(
+        lane.require_child_actor(&uuid::Uuid::new_v4().to_string(), &actor, true)
+            .is_err()
+    );
+    let mut forged = actor.clone();
+    forged.starttime_ticks += 1;
+    assert!(
+        lane.require_child_actor(&child_request.to_string(), &forged, true)
+            .is_err()
+    );
+    assert_eq!(
+        fresh_state
+            .query_row("SELECT count(*) FROM invocations", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0,
+        "pre-D request must not masquerade as a real invocation"
+    );
+    drop(lane);
+    let sibling = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("private_broker_has_distinct_fresh_route_while_old_wal_writer_survives")
+        .arg("--nocapture")
+        .env("AGE319_FRESH_SOCKET_CHILD", "1")
+        .env("AGE319_FRESH_WRONG_PEER_SOCKET", &socket)
+        .env("AGE319_FRESH_WRONG_PEER_REQUEST", child_request.to_string())
+        .status()
+        .unwrap();
+    assert!(sibling.success());
+    request_with_id(&socket, b'D', child_request, false);
+    let child_session = request_with_id(&socket, b'd', child_request, true);
+    assert!(child_session.starts_with("fresh-session "));
+    broker.kill().unwrap();
+    broker.wait().unwrap();
+    broker = start_broker(&broker_root, &socket, &runner);
+    oulipoly_kernel_broker::protocol::reserve_fresh_v30_child_request_at(
+        &socket,
+        &child_request.to_string(),
+        &child_invocation.to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        request_with_id(&socket, b'd', child_request, true),
+        child_session
+    );
+    assert_eq!(
+        request_with_id(&socket, b'D', child_request, true),
+        child_session
     );
     broker.kill().unwrap();
     broker.wait().unwrap();
