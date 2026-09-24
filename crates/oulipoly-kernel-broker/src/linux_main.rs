@@ -3842,8 +3842,31 @@ fn serve_fresh_v30_at(
     // quota/auth/manual intent and K, and their readback paths. Offline index
     // rebuild takes the exclusive side before reading any retained evidence.
     #[cfg(feature = "age319-private-broker-fixture")]
-    let _admission = fresh_index::broker_admission_lease(&state_root.join("v30/fresh-provider"))
+    let admission = fresh_index::broker_admission_lease(&state_root.join("v30/fresh-provider"))
         .map_err(io::Error::other)?;
+    #[cfg(feature = "age319-private-broker-fixture")]
+    let route_index = {
+        let root = state_root.join("v30/fresh-provider");
+        match std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_ROUTE_INDEX_V1") {
+            Some(value) if value == "1" && private_fixture() => Some(
+                fresh_index::Index::admit_live_routes(&root, &admission)
+                    .map_err(io::Error::other)?,
+            ),
+            Some(_) => return Err(io::Error::other("route index fixture switch invalid")),
+            None => {
+                match fs::symlink_metadata(root.join("index-v1/manifest.json")) {
+                    Ok(_) => {
+                        return Err(io::Error::other(
+                            "indexed route root requires indexed writer admission",
+                        ));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+                None
+            }
+        }
+    };
     let instance = EntryGate::open(&state_root.join("v30"))?;
     // An installed Bash child must match the package's pinned digest. Private
     // fixtures supply their built source binary only at broker startup.
@@ -4450,14 +4473,38 @@ fn serve_fresh_v30_at(
                             &config_dir,
                             false,
                         )?;
-                        let selection =
-                            fresh_provider::select_route(&directory, &binding, &route_request)?;
+                        let selection = fresh_provider::select_route_with_index(
+                            &directory,
+                            &binding,
+                            &route_request,
+                            route_index.as_ref(),
+                        )?;
                         return Ok(format!(
                             "fresh-route-selected {}\n",
                             serde_json::to_string(&selection)?
                         ));
                     }
                     if let Some(effect_request) = effect_request {
+                        if operation == b'm' {
+                            if let Some(index) = route_index.as_ref() {
+                                let receipt = directory
+                                    .join(format!("{}.route-selection.json", binding.handoff_id));
+                                let receipt_present = match fs::symlink_metadata(receipt) {
+                                    Ok(_) => true,
+                                    Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                                    Err(error) => return Err(error),
+                                };
+                                let decision_present = index
+                                    .decision(&binding.handoff_id)
+                                    .map_err(io::Error::other)?
+                                    .is_some();
+                                if receipt_present || decision_present {
+                                    index
+                                        .require_live_route(&binding.handoff_id)
+                                        .map_err(io::Error::other)?;
+                                }
+                            }
+                        }
                         if instance.is_closed() && operation == b'm' {
                             return Err(io::Error::other("fresh account effect entry gate closed"));
                         }
@@ -4531,7 +4578,15 @@ fn serve_fresh_v30_at(
                             &image, image_fd, cwd, input, recipe,
                         )?;
                         fresh_provider::require_selected_plan(&directory, &binding, &plan)?;
+                        if let Some(index) = route_index.as_ref() {
+                            index
+                                .require_live_route(&binding.handoff_id)
+                                .map_err(io::Error::other)?;
+                        }
                         let prepared = fresh_provider::prepare(&directory, binding, plan)?;
+                        if let Some(index) = route_index.as_ref() {
+                            prepared.require_indexed_route(index)?;
+                        }
                         let grant =
                             fresh_provider::launch(prepared, &root, &actor, actor_uid, actor_gid)?;
                         if std::env::var_os(

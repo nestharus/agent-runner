@@ -263,6 +263,7 @@ pub(crate) fn offline_snapshot(root: &Path, source: &Path) -> io::Result<Offline
             candidate_index: candidate.index,
             pin: decision.pin.is_some(),
             sequence: decision.sequence,
+            receipt: artifact(root, name)?,
         });
         let grant_name = format!("{handoff}.fresh-grant.json");
         if let Some(grant) = exact_file::<Grant>(root, &grant_name)? {
@@ -575,15 +576,6 @@ pub(crate) fn reconcile_offline_account(
             TerminalOutcome::ModelAtCapacity => Some(TerminalMarkerKind::ModelCapacity),
             _ => None,
         };
-        if let Some(kind) = marker {
-            current = index
-                .update_account(
-                    key,
-                    current.revision,
-                    AccountUpdate::RecordTerminalMarker { kind, q: q.clone() },
-                )
-                .map_err(io::Error::other)?;
-        }
         current = index
             .update_account(
                 key,
@@ -592,6 +584,7 @@ pub(crate) fn reconcile_offline_account(
                     id,
                     q,
                     failed: outcome != TerminalOutcome::Clean,
+                    marker,
                 },
             )
             .map_err(io::Error::other)?;

@@ -456,19 +456,21 @@ pub(super) struct Cursor {
     generation: String,
     key: CursorKey,
     pub sequence: u64,
-    index: Option<usize>,
+    pub index: Option<usize>,
     last_handoff: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Decision {
-    generation: String,
-    handoff: String,
-    key: CursorKey,
-    candidate_identity: String,
-    candidate_index: usize,
-    pin: bool,
-    sequence: u64,
+    pub generation: String,
+    pub handoff: String,
+    pub key: CursorKey,
+    pub candidate_identity: String,
+    pub candidate_index: usize,
+    pub pin: bool,
+    pub sequence: u64,
+    #[serde(default)]
+    receipt: Option<Artifact>,
 }
 
 #[derive(Clone, Debug)]
@@ -479,6 +481,7 @@ pub(super) struct OfflineDecision {
     pub candidate_index: usize,
     pub pin: bool,
     pub sequence: u64,
+    pub receipt: Artifact,
 }
 
 #[derive(Default)]
@@ -497,6 +500,196 @@ struct Pending {
 }
 
 impl Index {
+    /// Service admission for the optional live route writer. The caller holds
+    /// this root's broker lease, before binding the request socket. A missing
+    /// manifest is a genesis only when the lease's two files are the entire
+    /// retained root; every other missing-manifest state needs offline repair.
+    pub(super) fn admit_live_routes(root: &Path, lease: &AdmissionLease) -> Result<Self> {
+        let expected = root.canonicalize()?.join("index-v1/admission.lock");
+        if lease.path != expected {
+            return Err(IndexError::Conflict("route index admission lease differs"));
+        }
+        let manifest = root.join("index-v1/manifest.json");
+        let index = if manifest.exists() {
+            Self::open(root)?
+        } else {
+            let base = root.join("index-v1");
+            let root_entries = fs::read_dir(root)?
+                .map(|e| e.map(|e| e.file_name()))
+                .collect::<io::Result<Vec<_>>>()?;
+            let base_entries = fs::read_dir(&base)?
+                .map(|e| e.map(|e| e.file_name()))
+                .collect::<io::Result<std::collections::HashSet<_>>>()?;
+            if root_entries != ["index-v1"]
+                || base_entries
+                    != ["admission.lock".into(), "admission-protocol.json".into()].into()
+            {
+                return Err(IndexError::RebuildRequired(
+                    "pre-index broker evidence exists",
+                ));
+            }
+            if read::<u32>(&base.join("admission-protocol.json"))? != Some(VERSION) {
+                return Err(IndexError::RebuildRequired("admission protocol changed"));
+            }
+            let _guard = locked(&base.join("genesis.lock"))?;
+            for name in ["cursors", "accounts", "decisions"] {
+                fs::create_dir(base.join(name))?;
+                sync_dir(&base.join(name))?;
+            }
+            sync_dir(&base)?;
+            let generation = uuid::Uuid::new_v4().to_string();
+            write_new(
+                &base.join("manifest.json"),
+                &Manifest {
+                    version: VERSION,
+                    generation,
+                    generation_dir: false,
+                },
+            )?;
+            sync_dir(root)?;
+            Self::open(root)?
+        };
+        index.validate_live_routes()?;
+        Ok(index)
+    }
+
+    /// At service admission, compare the entire retained route receipt set to
+    /// the generation. This is deliberately a full scan; choice/effect readers
+    /// have not been converted to bounded index reads.
+    fn validate_live_routes(&self) -> Result<()> {
+        let _lock = locked(&self.base().join("route.lock"))?;
+        self.check_generation()?;
+        self.reconcile_pending()?;
+        let mut indexed = std::collections::HashSet::new();
+        let mut sequences = HashMap::<String, (CursorKey, std::collections::HashSet<u64>)>::new();
+        for entry in fs::read_dir(self.base().join("decisions"))? {
+            let path = entry?.path();
+            if !path.extension().is_some_and(|x| x == "json") {
+                continue;
+            }
+            if path.to_string_lossy().contains(".known.") {
+                let marker: KnownKey<String> =
+                    read(&path)?.ok_or_else(|| corrupt("decision known marker absent"))?;
+                if marker.generation != self.generation
+                    || path != self.known_path("decisions", &marker.key)?
+                    || self.read_decision(&marker.key)?.is_none()
+                {
+                    return Err(corrupt("decision known marker lacks receipt"));
+                }
+                continue;
+            }
+            let decision: Decision =
+                read(&path)?.ok_or_else(|| corrupt("indexed route decision absent"))?;
+            if !self.known("decisions", &decision.handoff)?
+                || path != self.decision_path(&decision.handoff)?
+                || self.read_decision(&decision.handoff)? != Some(decision.clone())
+            {
+                return Err(corrupt("indexed route decision changed"));
+            }
+            let expected_path = format!("{}.route-selection.json", decision.handoff);
+            if decision
+                .receipt
+                .as_ref()
+                .is_none_or(|r| r.path != expected_path)
+            {
+                return Err(IndexError::RebuildRequired(
+                    "indexed route receipt binding absent",
+                ));
+            }
+            super::fresh_provider::validate_indexed_receipt(&self.root, &decision)
+                .map_err(|e| corrupt(format!("indexed broker route receipt: {e}")))?;
+            if !indexed.insert(decision.handoff.clone()) {
+                return Err(corrupt("duplicate indexed route decision"));
+            }
+            if !decision.pin {
+                let entry = sequences
+                    .entry(keyed(&decision.key)?)
+                    .or_insert((decision.key.clone(), std::collections::HashSet::new()));
+                if entry.0 != decision.key {
+                    return Err(corrupt("route cursor key collision"));
+                }
+                if decision.sequence == 0 || !entry.1.insert(decision.sequence) {
+                    return Err(corrupt("route decision sequence repeated or zero"));
+                }
+            }
+        }
+        let mut receipts = std::collections::HashSet::new();
+        for entry in fs::read_dir(&self.root)? {
+            let name = entry?.file_name();
+            let name = name.to_string_lossy();
+            if let Some(handoff) = name.strip_suffix(".route-selection.json") {
+                if !indexed.contains(handoff) || !receipts.insert(handoff.to_owned()) {
+                    return Err(IndexError::RebuildRequired("orphan broker route receipt"));
+                }
+            }
+        }
+        if indexed != receipts {
+            return Err(IndexError::RebuildRequired(
+                "indexed broker route receipt missing",
+            ));
+        }
+        let mut cursor_keys = std::collections::HashSet::new();
+        for entry in fs::read_dir(self.base().join("cursors"))? {
+            let path = entry?.path();
+            if !path.extension().is_some_and(|x| x == "json") {
+                continue;
+            }
+            let key = if path.to_string_lossy().contains(".known.") {
+                let marker: KnownKey<CursorKey> =
+                    read(&path)?.ok_or_else(|| corrupt("cursor known marker absent"))?;
+                if marker.generation != self.generation
+                    || path != self.known_path("cursors", &marker.key)?
+                {
+                    return Err(corrupt("cursor known marker changed"));
+                }
+                marker.key
+            } else {
+                let cursor: Cursor = read(&path)?.ok_or_else(|| corrupt("route cursor absent"))?;
+                if path != self.key_path("cursors", &cursor.key)? {
+                    return Err(corrupt("route cursor path changed"));
+                }
+                cursor.key
+            };
+            cursor_keys.insert(keyed(&key)?);
+        }
+        for digest in cursor_keys {
+            let (key, set) = sequences
+                .remove(&digest)
+                .ok_or_else(|| corrupt("route cursor has no indexed receipts"))?;
+            let count = set.len() as u64;
+            if count == 0
+                || set.iter().copied().min() != Some(1)
+                || set.iter().copied().max() != Some(count)
+                || self.cursor_unlocked(&key)?.sequence != count
+            {
+                return Err(corrupt("route cursor count differs from receipts"));
+            }
+        }
+        if !sequences.is_empty() {
+            return Err(corrupt("route cursor absent for indexed receipts"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn require_live_route(&self, handoff: &str) -> Result<()> {
+        let decision = self.decision(handoff)?.ok_or(IndexError::RebuildRequired(
+            "broker route receipt lacks indexed decision",
+        ))?;
+        if decision
+            .receipt
+            .as_ref()
+            .is_none_or(|r| r.path != format!("{handoff}.route-selection.json"))
+        {
+            return Err(IndexError::RebuildRequired(
+                "indexed route receipt binding absent",
+            ));
+        }
+        if !decision.pin && self.cursor(&decision.key)?.sequence < decision.sequence {
+            return Err(corrupt("indexed route cursor has not published decision"));
+        }
+        super::fresh_provider::validate_indexed_receipt(&self.root, &decision)
+            .map_err(|e| corrupt(format!("indexed broker route receipt: {e}")))
+    }
     /// Detached maintenance only. The caller gives the actual broker socket
     /// and the retained source directory; a changed source is unsupported.
     /// The generation is built off to the side and the manifest is the only
@@ -611,6 +804,7 @@ impl Index {
                 candidate_index: seed.candidate_index,
                 pin: seed.pin,
                 sequence: seed.sequence,
+                receipt: Some(seed.receipt),
             };
             let next = staged.advanced(cursor, &decision)?;
             write_new(&staged.decision_path(&decision.handoff)?, &decision)?;
@@ -643,7 +837,10 @@ impl Index {
             {
                 let record: Decision =
                     read(&path)?.ok_or_else(|| corrupt("staged decision absent"))?;
-                if record.generation != generation || !staged.known("decisions", &record.handoff)? {
+                if record.generation != generation
+                    || !staged.known("decisions", &record.handoff)?
+                    || staged.read_decision(&record.handoff)? != Some(record)
+                {
                     return Err(corrupt("staged decision invalid"));
                 }
             }
@@ -699,6 +896,18 @@ impl Index {
         {
             return Err(corrupt("cursor key, generation or sequence invariant"));
         }
+        if let Some(handoff) = &cursor.last_handoff {
+            let decision = self
+                .read_decision(handoff)?
+                .ok_or_else(|| corrupt("cursor's last decision absent"))?;
+            if decision.key != *key
+                || decision.pin
+                || decision.sequence != cursor.sequence
+                || Some(decision.candidate_index) != cursor.index
+            {
+                return Err(corrupt("cursor's last decision differs"));
+            }
+        }
         Ok(cursor)
     }
     pub(super) fn cursor(&self, key: &CursorKey) -> Result<Cursor> {
@@ -719,6 +928,9 @@ impl Index {
             .is_some_and(|d| d.handoff != handoff || d.generation != self.generation)
         {
             return Err(corrupt("decision key or generation collision"));
+        }
+        if let Some(receipt) = d.as_ref().and_then(|d| d.receipt.as_ref()) {
+            receipt.require_present(&self.root)?;
         }
         Ok(d)
     }
@@ -748,6 +960,25 @@ impl Index {
         } else {
             self.cursor_unlocked(&pending.expected.key)?
         };
+        // A live receipt is the publication point. The index-owned decision
+        // is recoverable only from this exact durable broker receipt. A crash
+        // before receipt visibility leaves the cursor unchanged.
+        if let Some(receipt) = &pending.decision.receipt {
+            if !receipt.verify(&self.root)? {
+                if self.read_decision(&pending.decision.handoff)?.is_some() {
+                    return Err(corrupt("indexed decision lost its broker receipt"));
+                }
+                fs::remove_file(&pending_path)?;
+                sync_dir(&self.base())?;
+                return Ok(());
+            }
+            if self.read_decision(&pending.decision.handoff)?.is_none() {
+                write_new(
+                    &self.decision_path(&pending.decision.handoff)?,
+                    &pending.decision,
+                )?;
+            }
+        }
         let decision = self.read_decision(&pending.decision.handoff)?;
         if let Some(actual) = decision.as_ref() {
             if actual != &pending.decision {
@@ -849,6 +1080,7 @@ impl Index {
                     .checked_add(1)
                     .ok_or(IndexError::Conflict("sequence overflow"))?
             },
+            receipt: None,
         };
         let _next = self.advanced(&current, &decision)?;
         let pending_path = self.base().join("pending.json");
@@ -862,6 +1094,95 @@ impl Index {
             },
         )?;
         write_new(&self.decision_path(&decision.handoff)?, &decision)?;
+        self.reconcile_pending()?;
+        Ok(decision)
+    }
+    /// Publish one externally visible broker route receipt and its cursor as
+    /// a single recoverable choice. The caller holds the broker's selection
+    /// lock, computes `receipt_bytes` from its fully selected RouteDecision,
+    /// and writes exactly those bytes in `publish`. Neither layer chooses a
+    /// second candidate. Readback of a pending receipt publishes the matching
+    /// index decision once, including after a process restart.
+    pub(super) fn commit_live_decision(
+        &self,
+        key: CursorKey,
+        handoff: String,
+        candidate_identity: String,
+        candidate_index: usize,
+        pin: bool,
+        expected_sequence: u64,
+        receipt_path: String,
+        receipt_bytes: &[u8],
+        publish: impl FnOnce() -> io::Result<()>,
+    ) -> Result<Decision> {
+        if key.model.is_empty()
+            || key.config_sha256.is_empty()
+            || handoff.is_empty()
+            || candidate_identity.is_empty()
+        {
+            return Err(IndexError::Conflict("empty decision identity"));
+        }
+        let receipt = Artifact {
+            path: receipt_path,
+            sha256: hash(receipt_bytes),
+        };
+        receipt.validate()?;
+        let _lock = locked(&self.base().join("route.lock"))?;
+        self.check_generation()?;
+        self.reconcile_pending()?;
+        if let Some(existing) = self.read_decision(&handoff)? {
+            if !self.known("decisions", &handoff)? {
+                return Err(corrupt("decision known-key marker absent"));
+            }
+            if existing.key != key
+                || existing.candidate_identity != candidate_identity
+                || existing.candidate_index != candidate_index
+                || existing.pin != pin
+                || existing.receipt.as_ref() != Some(&receipt)
+            {
+                return Err(IndexError::Conflict(
+                    "handoff already has different decision",
+                ));
+            }
+            return Ok(existing);
+        }
+        if receipt.verify(&self.root)? {
+            return Err(IndexError::RebuildRequired(
+                "broker route receipt exists without indexed decision",
+            ));
+        }
+        let current = self.cursor_unlocked(&key)?;
+        if current.sequence != expected_sequence {
+            return Err(IndexError::Conflict("cursor CAS mismatch"));
+        }
+        let decision = Decision {
+            generation: self.generation.clone(),
+            handoff,
+            key,
+            candidate_identity,
+            candidate_index,
+            pin,
+            sequence: if pin {
+                0
+            } else {
+                current
+                    .sequence
+                    .checked_add(1)
+                    .ok_or(IndexError::Conflict("sequence overflow"))?
+            },
+            receipt: Some(receipt),
+        };
+        self.advanced(&current, &decision)?;
+        write_new(
+            &self.base().join("pending.json"),
+            &Pending {
+                generation: self.generation.clone(),
+                expected: current,
+                decision: decision.clone(),
+                decision_sha256: keyed(&decision)?,
+            },
+        )?;
+        publish()?;
         self.reconcile_pending()?;
         Ok(decision)
     }
@@ -1143,7 +1464,12 @@ impl Index {
                     .checked_add(1)
                     .ok_or(IndexError::Conflict("invocation overflow"))?;
             }
-            AccountUpdate::SettleGrant { id, q, failed } => {
+            AccountUpdate::SettleGrant {
+                id,
+                q,
+                failed,
+                marker,
+            } => {
                 let grant = a
                     .grants
                     .get(&id)
@@ -1157,6 +1483,14 @@ impl Index {
                 }
                 q.verify(&self.root)?;
                 a.grants.remove(&id);
+                if let Some(kind) = marker {
+                    let target = match kind {
+                        TerminalMarkerKind::Quota => &mut a.markers.quota_rejection_nanos,
+                        TerminalMarkerKind::Auth => &mut a.markers.auth_rejection_nanos,
+                        TerminalMarkerKind::ModelCapacity => &mut a.markers.model_capacity_nanos,
+                    };
+                    *target = Some(target.unwrap_or(i64::MIN).max(q.completed_unix_nanos));
+                }
                 if failed {
                     a.add_failure(q.completed_unix_nanos)?;
                 }
@@ -1234,20 +1568,6 @@ impl Index {
                     }
                 }
             }
-            AccountUpdate::RecordTerminalMarker { kind, q } => {
-                if q.terminal.is_none() {
-                    return Err(IndexError::Conflict(
-                        "terminal marker lacks terminal record",
-                    ));
-                }
-                q.verify(&self.root)?;
-                let target = match kind {
-                    TerminalMarkerKind::Quota => &mut a.markers.quota_rejection_nanos,
-                    TerminalMarkerKind::Auth => &mut a.markers.auth_rejection_nanos,
-                    TerminalMarkerKind::ModelCapacity => &mut a.markers.model_capacity_nanos,
-                };
-                *target = Some(target.unwrap_or(i64::MIN).max(q.completed_unix_nanos));
-            }
             AccountUpdate::PruneFailures { before_nanos } => {
                 a.recent_failure_nanos.retain(|time| *time >= before_nanos);
             }
@@ -1323,6 +1643,7 @@ pub(super) enum AccountUpdate {
         id: String,
         q: PhysicalQ,
         failed: bool,
+        marker: Option<TerminalMarkerKind>,
     },
     AnnounceEffect {
         id: String,
@@ -1336,10 +1657,6 @@ pub(super) enum AccountUpdate {
         id: String,
         q: PhysicalQ,
         marker: bool,
-    },
-    RecordTerminalMarker {
-        kind: TerminalMarkerKind,
-        q: PhysicalQ,
     },
     PruneFailures {
         before_nanos: i64,
@@ -1379,6 +1696,7 @@ mod tests {
             candidate_index: 2,
             pin,
             sequence,
+            receipt: None,
         }
     }
     fn pending(index: &Index, d: Decision) -> Pending {
@@ -1433,6 +1751,38 @@ mod tests {
             ),
             Err(IndexError::RebuildRequired(_))
         ));
+    }
+    #[test]
+    fn service_admission_creates_only_clean_genesis_and_preserves_old_wal() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("broker");
+        fs::create_dir(&root).unwrap();
+        let wal = temp.path().join("state.db-wal");
+        fs::write(&wal, b"old WAL sentinel").unwrap();
+        let lease = broker_admission_lease(&root).unwrap();
+        let first = Index::admit_live_routes(&root, &lease).unwrap();
+        assert_eq!(first.cursor(&key()).unwrap().sequence, 0);
+        let generation = first.generation().to_owned();
+        drop(lease);
+        let lease = broker_admission_lease(&root).unwrap();
+        assert_eq!(
+            Index::admit_live_routes(&root, &lease)
+                .unwrap()
+                .generation(),
+            generation
+        );
+        assert_eq!(fs::read(&wal).unwrap(), b"old WAL sentinel");
+        drop(lease);
+
+        let other = temp.path().join("old-broker");
+        fs::create_dir(&other).unwrap();
+        fs::write(other.join("old.route-selection.json"), b"old receipt").unwrap();
+        let old_lease = broker_admission_lease(&other).unwrap();
+        assert!(matches!(
+            Index::admit_live_routes(&other, &old_lease),
+            Err(IndexError::RebuildRequired(_))
+        ));
+        assert!(!other.join("index-v1/manifest.json").exists());
     }
     #[test]
     fn decision_reopen_pin_and_same_broker_threads_serialize() {
@@ -1503,6 +1853,113 @@ mod tests {
         assert!(!index.base().join("pending.json").exists());
     }
     #[test]
+    fn live_receipt_and_cursor_share_one_exact_choice() {
+        let (temp, index) = fresh();
+        let body = b"selected physical-a, candidate 2\n";
+        let path = temp.path().join("first.route-selection.json");
+        let receipt = index
+            .commit_live_decision(
+                key(),
+                "first".into(),
+                "physical-a".into(),
+                2,
+                false,
+                0,
+                "first.route-selection.json".into(),
+                body,
+                || fs::write(&path, body),
+            )
+            .unwrap();
+        assert_eq!(receipt.sequence, 1);
+        let reopened = Index::open(temp.path()).unwrap();
+        assert_eq!(reopened.cursor(&key()).unwrap().sequence, 1);
+        assert_eq!(reopened.decision("first").unwrap(), Some(receipt.clone()));
+        assert_eq!(
+            reopened
+                .commit_live_decision(
+                    key(),
+                    "first".into(),
+                    "physical-a".into(),
+                    2,
+                    false,
+                    0,
+                    "first.route-selection.json".into(),
+                    body,
+                    || panic!("idempotent readback must not republish"),
+                )
+                .unwrap(),
+            receipt
+        );
+        fs::write(&path, b"different candidate").unwrap();
+        assert!(matches!(
+            reopened.decision("first"),
+            Err(IndexError::Corrupt(_))
+        ));
+        assert!(matches!(
+            reopened.cursor(&key()),
+            Err(IndexError::Corrupt(_))
+        ));
+    }
+    #[test]
+    fn live_receipt_crash_stages_reconcile_without_duplicate_advance() {
+        let (temp, index) = fresh();
+        let mut before = decision(&index, "before", 1, false);
+        before.receipt = Some(future_artifact("before.route-selection.json", b"before"));
+        write_new(&index.base().join("pending.json"), &pending(&index, before)).unwrap();
+        assert_eq!(index.cursor(&key()).unwrap().sequence, 0);
+        assert!(!index.base().join("pending.json").exists());
+
+        let mut after = decision(&index, "after", 1, false);
+        after.receipt = Some(future_artifact("after.route-selection.json", b"after"));
+        write_new(
+            &index.base().join("pending.json"),
+            &pending(&index, after.clone()),
+        )
+        .unwrap();
+        fs::write(temp.path().join("after.route-selection.json"), b"after").unwrap();
+        let reopened = Index::open(temp.path()).unwrap();
+        assert_eq!(reopened.cursor(&key()).unwrap().sequence, 1);
+        assert_eq!(reopened.decision("after").unwrap(), Some(after));
+        assert_eq!(reopened.cursor(&key()).unwrap().sequence, 1);
+
+        let pin_bytes = b"pin";
+        let pin_path = temp.path().join("pin.route-selection.json");
+        let pin = reopened
+            .commit_live_decision(
+                key(),
+                "pin".into(),
+                "physical-a".into(),
+                2,
+                true,
+                1,
+                "pin.route-selection.json".into(),
+                pin_bytes,
+                || fs::write(&pin_path, pin_bytes),
+            )
+            .unwrap();
+        assert_eq!(pin.sequence, 0);
+        assert_eq!(reopened.cursor(&key()).unwrap().sequence, 1);
+    }
+    #[test]
+    fn unindexed_route_receipt_requires_repair() {
+        let (temp, index) = fresh();
+        fs::write(temp.path().join("orphan.route-selection.json"), b"orphan").unwrap();
+        assert!(matches!(
+            index.commit_live_decision(
+                key(),
+                "orphan".into(),
+                "physical-a".into(),
+                2,
+                false,
+                0,
+                "orphan.route-selection.json".into(),
+                b"orphan",
+                || panic!("unindexed receipt must not be republished"),
+            ),
+            Err(IndexError::RebuildRequired(_))
+        ));
+    }
+    #[test]
     fn pending_mismatch_collision_and_generation_refuse() {
         let (_temp, index) = fresh();
         let d = decision(&index, "h", 1, false);
@@ -1565,14 +2022,16 @@ mod tests {
             index.update_account(
                 "physical",
                 0,
-                AccountUpdate::RecordTerminalMarker {
-                    kind: TerminalMarkerKind::Quota,
+                AccountUpdate::SettleGrant {
+                    id: "g".into(),
                     q: PhysicalQ {
                         physical_k: grant.clone(),
                         q: grant.clone(),
-                        terminal: None,
+                        terminal: Some(grant.clone()),
                         completed_unix_nanos: 1
-                    }
+                    },
+                    failed: true,
+                    marker: Some(TerminalMarkerKind::Quota),
                 }
             ),
             Err(IndexError::Conflict(_))
@@ -1678,11 +2137,13 @@ mod tests {
                         completed_unix_nanos: 10,
                     },
                     failed: true,
+                    marker: Some(TerminalMarkerKind::Quota),
                 },
             )
             .unwrap();
         assert_eq!(a.observed_invocations, 1);
         assert_eq!(a.recent_failure_nanos, vec![10]);
+        assert_eq!(a.markers.quota_rejection_nanos, Some(10));
         assert!(a.grants.is_empty());
         assert_eq!(
             Index::open(temp.path())
@@ -1814,14 +2275,42 @@ mod tests {
             .update_account(
                 "physical",
                 4,
-                AccountUpdate::RecordTerminalMarker {
-                    kind: TerminalMarkerKind::ModelCapacity,
+                AccountUpdate::AnnounceGrant {
+                    id: "model-capacity".into(),
+                    grant: ProviderGrant {
+                        decision_handoff: "model-capacity-decision".into(),
+                        grant: future_artifact("model-capacity-grant", b"G"),
+                        consumed_k: None,
+                        certified_q: None,
+                    },
+                },
+            )
+            .unwrap();
+        artifact(temp.path(), "model-capacity-grant", b"G");
+        index
+            .update_account(
+                "physical",
+                5,
+                AccountUpdate::ConsumeGrant {
+                    id: "model-capacity".into(),
+                    k: physical_k.clone(),
+                },
+            )
+            .unwrap();
+        index
+            .update_account(
+                "physical",
+                6,
+                AccountUpdate::SettleGrant {
+                    id: "model-capacity".into(),
                     q: PhysicalQ {
                         physical_k,
                         q,
                         terminal: Some(terminal),
                         completed_unix_nanos: 35,
                     },
+                    failed: true,
+                    marker: Some(TerminalMarkerKind::ModelCapacity),
                 },
             )
             .unwrap();
@@ -1839,7 +2328,7 @@ mod tests {
         index
             .update_account(
                 "physical",
-                5,
+                7,
                 AccountUpdate::ConsumeEffect {
                     id: "auth".into(),
                     k: auth_k.clone(),
@@ -1850,7 +2339,7 @@ mod tests {
         let a = index
             .update_account(
                 "physical",
-                6,
+                8,
                 AccountUpdate::SettleEffect {
                     id: "auth".into(),
                     q: PhysicalQ {

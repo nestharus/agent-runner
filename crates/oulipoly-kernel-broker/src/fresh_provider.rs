@@ -3,6 +3,7 @@
 //! ordinary CLI route remains closed; a private typed runtime backend consumes
 //! its Q-gated readbacks without publishing terminal success.
 use super::work_launch;
+use crate::linux_main::fresh_index::{CursorKey, Decision, Index};
 use chrono::{DateTime, Utc};
 use oulipoly_kernel_broker::identity::{PinnedProcess, host_proc_file, observed_incarnation_gone};
 use oulipoly_kernel_broker::protocol::{
@@ -41,7 +42,7 @@ extern "C" fn request_cancel(_: libc::c_int) {
 #[serde(deny_unknown_fields)]
 pub(super) struct Binding {
     root_id: String,
-    handoff_id: String,
+    pub(super) handoff_id: String,
     invocation_uuid: String,
     session_id: String,
     owner_generation: String,
@@ -423,14 +424,27 @@ pub(super) struct Prepared {
     directory: PathBuf,
 }
 
+impl Prepared {
+    pub(super) fn require_indexed_route(&self, index: &Index) -> io::Result<()> {
+        index
+            .require_live_route(&self.grant.binding.handoff_id)
+            .map_err(io::Error::other)
+    }
+}
+
 fn durable_new<T: Serialize>(directory: &Path, name: &str, value: &T) -> io::Result<()> {
+    let mut bytes = serde_json::to_vec(value)?;
+    bytes.push(b'\n');
+    durable_new_bytes(directory, name, &bytes)
+}
+
+fn durable_new_bytes(directory: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(directory.join(name))?;
-    serde_json::to_writer(&mut file, value)?;
-    file.write_all(b"\n")?;
+    file.write_all(bytes)?;
     file.sync_all()?;
     File::open(directory)?.sync_all()
 }
@@ -500,6 +514,49 @@ struct RouteDecision {
     #[serde(default)]
     sequence: u64,
     selection: FreshRouteSelection,
+}
+
+pub(super) fn validate_indexed_receipt(directory: &Path, indexed: &Decision) -> io::Result<()> {
+    let decision: RouteDecision = exact_file(directory, &decision_name(&indexed.handoff))?
+        .ok_or_else(|| io::Error::other("indexed route receipt absent"))?;
+    if decision.version != 1
+        || decision.binding.handoff_id != indexed.handoff
+        || decision.selection.policy_version != FRESH_ROUTE_POLICY_VERSION
+        || decision.selection.model != indexed.key.model
+        || decision.selection.config_sha256 != indexed.key.config_sha256
+        || decision.selection.account_identity != indexed.candidate_identity
+        || decision.selection.index != indexed.candidate_index
+        || decision.pin.is_some() != indexed.pin
+        || decision.sequence != indexed.sequence
+        || decision.pin.is_some() != (decision.sequence == 0)
+        || decision.total == 0
+        || decision.selection.index >= decision.total
+        || !decision
+            .selection
+            .eligible_accounts
+            .contains(&decision.selection.account)
+    {
+        return Err(io::Error::other("indexed route receipt identity changed"));
+    }
+    let candidate: RouteCandidate = exact_file(
+        directory,
+        &candidate_name(&indexed.handoff, indexed.candidate_index),
+    )?
+    .ok_or_else(|| io::Error::other("indexed route candidate absent"))?;
+    if candidate.version != 3
+        || candidate.binding != decision.binding
+        || candidate.total != decision.total
+        || candidate.index != decision.selection.index
+        || candidate.pin != decision.pin
+        || candidate.model != decision.selection.model
+        || candidate.config_sha256 != decision.selection.config_sha256
+        || candidate.account_identity != decision.selection.account_identity
+        || candidate.account != decision.selection.account
+        || candidate.plan_sha256 != decision.selection.plan_sha256
+    {
+        return Err(io::Error::other("indexed route candidate changed"));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -2392,10 +2449,20 @@ fn last_route_cursor(
 
 /// One fsynced choice for this held J. Selection has no provider effect.
 /// Cached Q and live K are measured only from this fresh broker directory.
+#[cfg(test)]
 pub(super) fn select_route(
     directory: &Path,
     binding: &Binding,
     request: &FreshRouteRequest,
+) -> io::Result<FreshRouteSelection> {
+    select_route_with_index(directory, binding, request, None)
+}
+
+pub(super) fn select_route_with_index(
+    directory: &Path,
+    binding: &Binding,
+    request: &FreshRouteRequest,
+    index: Option<&Index>,
 ) -> io::Result<FreshRouteSelection> {
     route_request_valid(request, binding)?;
     if request.account.is_some() || request.index.is_some() {
@@ -2425,6 +2492,11 @@ pub(super) fn select_route(
             })
         {
             return Err(io::Error::other("fresh route selection changed"));
+        }
+        if let Some(index) = index {
+            index
+                .require_live_route(&binding.handoff_id)
+                .map_err(io::Error::other)?;
         }
         return Ok(existing.selection);
     }
@@ -2460,6 +2532,19 @@ pub(super) fn select_route(
         .collect();
     let (previous_sequence, previous_index) =
         last_route_cursor(directory, &request.model, &request.config_sha256)?;
+    if let Some(index) = index {
+        let cursor = index
+            .cursor(&CursorKey {
+                model: request.model.clone(),
+                config_sha256: request.config_sha256.clone(),
+            })
+            .map_err(io::Error::other)?;
+        if (cursor.sequence, cursor.index) != (previous_sequence, previous_index) {
+            return Err(io::Error::other(
+                "fresh route index cursor differs from broker receipts",
+            ));
+        }
+    }
     let (candidate, quota_remaining, (live, failures, invocations)) = eligible
         .into_iter()
         .filter(|(candidate, _, _)| {
@@ -2495,18 +2580,39 @@ pub(super) fn select_route(
         eligible_accounts: eligible_accounts.clone(),
         quota_remaining_basis_points: quota_remaining,
     };
-    durable_new(
-        directory,
-        &name,
-        &RouteDecision {
-            version: 1,
-            binding: binding.clone(),
-            total: request.total,
-            pin: request.pin.clone(),
-            sequence,
-            selection: selection.clone(),
-        },
-    )?;
+    let receipt = RouteDecision {
+        version: 1,
+        binding: binding.clone(),
+        total: request.total,
+        pin: request.pin.clone(),
+        sequence,
+        selection: selection.clone(),
+    };
+    if let Some(index) = index {
+        let mut bytes = serde_json::to_vec(&receipt)?;
+        bytes.push(b'\n');
+        index
+            .commit_live_decision(
+                CursorKey {
+                    model: request.model.clone(),
+                    config_sha256: request.config_sha256.clone(),
+                },
+                binding.handoff_id.clone(),
+                selection.account_identity.clone(),
+                selection.index,
+                request.pin.is_some(),
+                previous_sequence,
+                name.clone(),
+                &bytes,
+                || durable_new_bytes(directory, &name, &bytes),
+            )
+            .map_err(io::Error::other)?;
+        index
+            .require_live_route(&binding.handoff_id)
+            .map_err(io::Error::other)?;
+    } else {
+        durable_new(directory, &name, &receipt)?;
+    }
     Ok(selection)
 }
 
@@ -4119,6 +4225,152 @@ mod tests {
             quota_script: None,
             auth_refresh_command: None,
         }
+    }
+
+    #[test]
+    fn indexed_route_writer_admission_readback_and_receipt_damage() {
+        use crate::linux_main::fresh_index::{Index, broker_admission_lease};
+        let temp = tempfile::tempdir().unwrap();
+        let broker = temp.path().join("broker");
+        std::fs::create_dir(&broker).unwrap();
+        let wal = temp.path().join("state.db-wal");
+        std::fs::write(&wal, b"old WAL sentinel").unwrap();
+        let lease = broker_admission_lease(&broker).unwrap();
+        let index = Index::admit_live_routes(&broker, &lease).unwrap();
+        let generation = index.generation().to_owned();
+        let process = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+        let binding = fixture_binding(&process, &process);
+        let request = register_unmetered_route(&broker, &binding, None);
+        let selected = select_route_with_index(&broker, &binding, &request, Some(&index)).unwrap();
+        assert_eq!(selected.index, 0);
+        let name = decision_name(&binding.handoff_id);
+        let exact = std::fs::read(broker.join(&name)).unwrap();
+        assert_eq!(
+            select_route_with_index(&broker, &binding, &request, Some(&index)).unwrap(),
+            selected
+        );
+        assert_eq!(
+            index
+                .cursor(&CursorKey {
+                    model: request.model.clone(),
+                    config_sha256: request.config_sha256.clone()
+                })
+                .unwrap()
+                .sequence,
+            1
+        );
+        assert_eq!(
+            Index::admit_live_routes(&broker, &lease)
+                .unwrap()
+                .generation(),
+            generation
+        );
+        assert_eq!(std::fs::read(&wal).unwrap(), b"old WAL sentinel");
+
+        let cursor_path = std::fs::read_dir(broker.join("index-v1/cursors"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.extension().is_some_and(|ext| ext == "json")
+                    && !path.to_string_lossy().contains(".known.")
+            })
+            .unwrap();
+        let cursor_bytes = std::fs::read(&cursor_path).unwrap();
+        std::fs::remove_file(&cursor_path).unwrap();
+        assert!(index.require_live_route(&binding.handoff_id).is_err());
+        std::fs::write(&cursor_path, cursor_bytes).unwrap();
+        index.require_live_route(&binding.handoff_id).unwrap();
+
+        std::fs::remove_file(broker.join(&name)).unwrap();
+        assert!(index.require_live_route(&binding.handoff_id).is_err());
+        assert!(Index::admit_live_routes(&broker, &lease).is_err());
+        std::fs::write(broker.join(&name), &exact).unwrap();
+        assert!(Index::admit_live_routes(&broker, &lease).is_ok());
+        std::fs::write(broker.join(&name), b"changed route receipt").unwrap();
+        assert!(index.require_live_route(&binding.handoff_id).is_err());
+        assert!(Index::admit_live_routes(&broker, &lease).is_err());
+        std::fs::write(broker.join(&name), &exact).unwrap();
+        std::fs::write(broker.join("orphan.route-selection.json"), &exact).unwrap();
+        assert!(Index::admit_live_routes(&broker, &lease).is_err());
+    }
+
+    #[test]
+    fn indexed_route_receipt_crash_before_index_commit_recovers_at_admission() {
+        use crate::linux_main::fresh_index::{Index, broker_admission_lease};
+        let temp = tempfile::tempdir().unwrap();
+        let broker = temp.path().join("broker");
+        std::fs::create_dir(&broker).unwrap();
+        let lease = broker_admission_lease(&broker).unwrap();
+        let index = Index::admit_live_routes(&broker, &lease).unwrap();
+        let process = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+        let binding = fixture_binding(&process, &process);
+        let request = register_unmetered_route(&broker, &binding, None);
+        let candidate: RouteCandidate =
+            exact_file(&broker, &candidate_name(&binding.handoff_id, 0))
+                .unwrap()
+                .unwrap();
+        let selection = FreshRouteSelection {
+            model: request.model.clone(),
+            config_sha256: request.config_sha256.clone(),
+            account: candidate.account.clone(),
+            account_identity: candidate.account_identity.clone(),
+            index: 0,
+            plan_sha256: candidate.plan_sha256.clone(),
+            observed_live: 0,
+            observed_failures: 0,
+            observed_invocations: 0,
+            policy_version: FRESH_ROUTE_POLICY_VERSION.into(),
+            eligible_accounts: vec![candidate.account.clone()],
+            quota_remaining_basis_points: None,
+        };
+        let receipt = RouteDecision {
+            version: 1,
+            binding: binding.clone(),
+            total: request.total,
+            pin: None,
+            sequence: 1,
+            selection,
+        };
+        let name = decision_name(&binding.handoff_id);
+        let mut bytes = serde_json::to_vec(&receipt).unwrap();
+        bytes.push(b'\n');
+        let result = index.commit_live_decision(
+            CursorKey {
+                model: request.model.clone(),
+                config_sha256: request.config_sha256.clone(),
+            },
+            binding.handoff_id.clone(),
+            candidate.account_identity.clone(),
+            0,
+            false,
+            0,
+            name.clone(),
+            &bytes,
+            || {
+                durable_new_bytes(&broker, &name, &bytes)?;
+                Err(io::Error::other(
+                    "simulated interruption after receipt fsync",
+                ))
+            },
+        );
+        assert!(result.is_err());
+        assert!(broker.join("index-v1/pending.json").exists());
+        drop(index);
+        drop(lease);
+        let lease = broker_admission_lease(&broker).unwrap();
+        let reopened = Index::admit_live_routes(&broker, &lease).unwrap();
+        assert!(!broker.join("index-v1/pending.json").exists());
+        reopened.require_live_route(&binding.handoff_id).unwrap();
+        assert_eq!(
+            reopened
+                .cursor(&CursorKey {
+                    model: request.model,
+                    config_sha256: request.config_sha256
+                })
+                .unwrap()
+                .sequence,
+            1
+        );
     }
 
     #[test]
