@@ -8,7 +8,9 @@ use super::result::{execution_result_from_raw, raw_result_from_supervised_output
 use super::supervision::supervised_output_from_terminal;
 use super::terminal_signal::terminal_status_from_exit_status;
 use crate::executor::ExecutionResult;
-use oulipoly_config::{InvocationMode, ModelConfig, PromptMode, ProvidersConfig};
+use crate::executor::terminal_signal::TerminalSignal;
+use oulipoly_config::{InvocationMode, ModelConfig, PromptMode, ProviderConfig, ProvidersConfig};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::os::unix::process::ExitStatusExt;
@@ -32,6 +34,49 @@ pub struct FreshProviderCompletion {
     pub wait_status: i32,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+}
+
+/// The same recognizer identity used by the normal CLI supervisor, frozen
+/// with a broker-verified route candidate before provider K.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FreshTerminalRecognizer {
+    Codex,
+    OpenCode,
+    OpenAiCompat,
+}
+
+impl FreshTerminalRecognizer {
+    pub fn for_provider(provider: &ProviderConfig) -> Self {
+        match super::provider_identity::ProviderRecognizer::for_provider(provider) {
+            super::provider_identity::ProviderRecognizer::Codex => Self::Codex,
+            super::provider_identity::ProviderRecognizer::OpenCode => Self::OpenCode,
+            super::provider_identity::ProviderRecognizer::OpenAiCompat => Self::OpenAiCompat,
+        }
+    }
+
+    /// Classify the original provider bytes and wait status. Consumers must
+    /// obtain these from the exact physical Q, never a CLI return code alone.
+    pub fn classify(
+        self,
+        provider_name: &str,
+        stdout: &[u8],
+        stderr: &[u8],
+        wait_status: i32,
+    ) -> TerminalSignal {
+        let recognizer = match self {
+            Self::Codex => super::provider_identity::ProviderRecognizer::Codex,
+            Self::OpenCode => super::provider_identity::ProviderRecognizer::OpenCode,
+            Self::OpenAiCompat => super::provider_identity::ProviderRecognizer::OpenAiCompat,
+        };
+        super::terminal_signal::recognize_terminal_signal(
+            provider_name,
+            recognizer,
+            stdout,
+            stderr,
+            terminal_status_from_exit_status(&ExitStatus::from_raw(wait_status)),
+        )
+    }
 }
 
 pub trait FreshProviderBackend {
