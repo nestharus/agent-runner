@@ -464,19 +464,54 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
             if std::env::var_os("AGE319_PRIVATE_BASH_CHILD_V1").is_some() {
                 let bash = std::env::var("AGE319_PRIVATE_BASH_IMAGE")
                     .map_err(|_| "private Bash source image absent")?;
-                let output = std::process::Command::new(bash)
+                let output = std::process::Command::new(&bash)
                     .arg("__age319-private-admit-child-v1")
                     .output()
                     .map_err(|e| e.to_string())?;
-                if !output.status.success() {
+                if output.status.success()
+                    || !String::from_utf8_lossy(&output.stderr)
+                        .contains("consumed causal parent work grant absent")
+                {
                     return Err(format!(
-                        "real private Bash child failed: {}",
+                        "root-only Bash was not refused: {}",
                         String::from_utf8_lossy(&output.stderr)
                     ));
                 }
-                let report: serde_json::Value =
-                    serde_json::from_slice(&output.stdout).map_err(|e| e.to_string())?;
-                private_v30_marker("bash-child", &report)?;
+                // A direct child and a grandchild both lack a consumed parent
+                // K. Their root membership, image and copied environment do
+                // not authorize C.
+                let unrelated_marker = PathBuf::from(
+                    std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                        .ok_or("private gate directory absent")?,
+                )
+                .join(format!("unrelated-bash-{}", uuid::Uuid::new_v4()));
+                let unrelated = std::process::Command::new("/bin/sh")
+                    .args(["-c", "\"$1\" __age319-private-admit-child-v1", "sh", &bash])
+                    .env(
+                        "AGE319_PRIVATE_BASH_REQUEST_KEY",
+                        uuid::Uuid::new_v4().to_string(),
+                    )
+                    .env("AGE319_PRIVATE_BASH_EFFECT_MARKER", &unrelated_marker)
+                    .output()
+                    .map_err(|e| e.to_string())?;
+                if unrelated.status.success() || unrelated_marker.exists() {
+                    return Err("in-root Bash grandchild acquired fresh child admission".into());
+                }
+                if !String::from_utf8_lossy(&unrelated.stderr)
+                    .contains("consumed causal parent work grant absent")
+                {
+                    return Err(format!(
+                        "in-root Bash grandchild refused for unexpected reason: {}",
+                        String::from_utf8_lossy(&unrelated.stderr)
+                    ));
+                }
+                private_v30_marker(
+                    "bash-child-refused",
+                    &serde_json::json!({
+                        "direct": String::from_utf8_lossy(&output.stderr),
+                        "grandchild": String::from_utf8_lossy(&unrelated.stderr),
+                    }),
+                )?;
             }
         }
         effect_binding = Some((receipt, session));
@@ -824,7 +859,9 @@ impl oulipoly_runtime::executor::cli::fresh_remote::FreshProviderBackend
         uuid::Uuid::parse_str(&grant)
             .map_err(|_| self.unknown(Some(&grant), "K reply", "invalid grant"))?;
         self.grant_id = Some(grant.clone());
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let causal = std::env::var_os("AGE319_PRIVATE_PROVIDER_CAUSAL_BASH_V1").is_some();
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(if causal { 90 } else { 20 });
         loop {
             let state = protocol::private_fresh_provider_at(
                 &socket,
@@ -844,7 +881,36 @@ impl oulipoly_runtime::executor::cli::fresh_remote::FreshProviderBackend
         }
         let gate = std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
             .map_err(|e| self.unknown(Some(&grant), "fixture cancellation", &e.to_string()))?;
+        let mut sibling_checked = !causal;
         while !std::path::Path::new(&gate).join("provider-cancel").exists() {
+            if !sibling_checked && std::path::Path::new(&gate).join("sibling-request").exists() {
+                let sibling_effect = std::path::Path::new(&gate).join("sibling-effect");
+                let sibling_bash = std::env::var("AGE319_PRIVATE_BASH_IMAGE")
+                    .map_err(|e| self.unknown(Some(&grant), "sibling image", &e.to_string()))?;
+                let sibling_request = std::env::var("AGE319_PRIVATE_BASH_REQUEST_KEY")
+                    .map_err(|e| self.unknown(Some(&grant), "sibling key", &e.to_string()))?;
+                let output = std::process::Command::new("unshare")
+                    .args(["--pid", "--fork", "--"])
+                    .arg(sibling_bash)
+                    .arg("__age319-private-admit-child-v1")
+                    .arg(&socket)
+                    .arg(sibling_request)
+                    .arg(&sibling_effect)
+                    .env_clear()
+                    .env("PATH", "/usr/bin:/bin")
+                    .output()
+                    .map_err(|e| self.unknown(Some(&grant), "sibling launch", &e.to_string()))?;
+                std::fs::write(
+                    std::path::Path::new(&gate).join("sibling-result.json"),
+                    serde_json::to_vec(&serde_json::json!({
+                        "success": output.status.success(),
+                        "stderr": String::from_utf8_lossy(&output.stderr),
+                    }))
+                    .map_err(|e| self.unknown(Some(&grant), "sibling result", &e.to_string()))?,
+                )
+                .map_err(|e| self.unknown(Some(&grant), "sibling result", &e.to_string()))?;
+                sibling_checked = true;
+            }
             if std::time::Instant::now() >= deadline {
                 return Err(self.unknown(Some(&grant), "fixture cancellation", "expired"));
             }
@@ -953,8 +1019,20 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
     let socket = broker_socket().with_file_name("v30.sock");
     let total = pool.model.providers.len();
     let mut prepared = Vec::with_capacity(total);
+    let causal = std::env::var_os("AGE319_PRIVATE_PROVIDER_CAUSAL_BASH_V1").is_some();
     for index in 0..total {
-        let plan = prepare_fresh_headless(&pool.model, index, prompt, &cwd)?;
+        let mut plan = prepare_fresh_headless(&pool.model, index, prompt, &cwd)?;
+        if causal {
+            plan.plan.argv.extend([
+                std::env::var("AGE319_PRIVATE_BASH_IMAGE")
+                    .map_err(|_| "private Bash image absent")?,
+                socket_for_private_causal_bash().display().to_string(),
+                std::env::var("AGE319_PRIVATE_BASH_REQUEST_KEY")
+                    .map_err(|_| "private Bash request absent")?,
+                std::env::var("AGE319_PRIVATE_BASH_EFFECT_MARKER")
+                    .map_err(|_| "private Bash marker absent")?,
+            ]);
+        }
         prepared.push(plan);
     }
     for (index, candidate) in prepared.iter().enumerate() {
@@ -1203,6 +1281,11 @@ fn private_account_effect_unknown(
             "caller_retry_duplicate_effect_risk": true,
         })
     )
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn socket_for_private_causal_bash() -> PathBuf {
+    broker_socket().with_file_name("v30.sock")
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]

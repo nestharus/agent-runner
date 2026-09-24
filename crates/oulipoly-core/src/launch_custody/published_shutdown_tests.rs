@@ -478,6 +478,28 @@ fn gate_packet(observer: &mut UnixStream, point: u8) -> i32 {
 
 #[test]
 fn ready_transition_retains_group_signals_after_empty_drain() {
+    const MARKER: &str = "OULIPOLY_CORE_DRAIN_GAP_ISOLATED_TEST";
+    if std::env::var_os(MARKER).is_none() {
+        // Earlier tests in this process may leave process-global state that
+        // changes SIGQUIT core-dump timing. Run the entire signal/drain case
+        // as the sole test in a fresh process and require its real result.
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "launch_custody::published_shutdown_tests::ready_transition_retains_group_signals_after_empty_drain",
+                "--nocapture",
+            ])
+            .env(MARKER, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "isolated drain-gap signals: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
     for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
         let mut fixture = Fixture::new(&format!("drain-gap-{signal}"));
         let mut command = fixture.command(
@@ -567,8 +589,16 @@ fn ready_transition_hangup_after_false_probe_still_relays() {
     let workload = children(custodian)[0];
     assert_eq!(unsafe { libc::getpgid(workload) }, published);
     // The first probe has observed a live terminal, W is masked awaiting ACK.
-    fixture.close_last_master();
+    assert!(
+        !fixture.terminal_lost(),
+        "control: terminal live before closure"
+    );
+    // Closing the final master induces HUP synchronously. ACK the gated
+    // custodian before waiting for the slave's POLLHUP: waiting here can
+    // outlast the gate's own deadline under a busy test harness.
+    fixture.master.take();
     observer.write_all(b"A").unwrap();
+    until(|| fixture.terminal_lost().then_some(()));
     fixture.child = Some(spawn.join().unwrap().unwrap());
     fixture.custody.seal();
     let status = fixture.settle();

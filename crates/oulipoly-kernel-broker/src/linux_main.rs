@@ -165,9 +165,17 @@ enum RequestPayload {
     FreshRootEffectRequest {
         request: FreshRootEffectRequest,
     },
+    #[allow(
+        dead_code,
+        reason = "fresh Bash lane is closed without the private fixture"
+    )]
     FreshBashChildRequest {
         request_id: String,
     },
+    #[allow(
+        dead_code,
+        reason = "fresh Bash lane is closed without the private fixture"
+    )]
     FreshBashPrivateResult {
         result: oulipoly_state::mailbox::FreshBashPrivateResult,
     },
@@ -363,6 +371,8 @@ fn recv_request(
         b'G' | b'g' => read == 65,
         b'P' | b'p' => read == 37,
         b'Q' | b'Z' | b'q' | b'z' | b'D' | b'd' | b'C' | b'c' => read == 33,
+        #[cfg(feature = "age319-private-broker-fixture")]
+        b'%' | b'&' | b'!' => read == 33,
         // Legacy E has no body; fresh Bash E carries a request UUID on its
         // separate socket. Preserve both exact wire shapes for pinned images.
         b'E' => read == 17 || read == 33,
@@ -449,6 +459,10 @@ fn recv_request(
             request_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
         },
         b'C' | b'c' => RequestPayload::FreshBashChildRequest {
+            request_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
+        },
+        #[cfg(feature = "age319-private-broker-fixture")]
+        b'%' | b'&' | b'!' => RequestPayload::FreshBashChildRequest {
             request_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
         },
         b'E' if read == 33 => RequestPayload::FreshBashChildRequest {
@@ -3756,12 +3770,17 @@ fn serve_fresh_v30() -> io::Result<()> {
     )
 }
 
+#[cfg(feature = "age319-private-broker-fixture")]
 fn fresh_bash_parent(
     state_root: &Path,
     lane: &FreshV30Lane,
     peer: &PeerIdentity,
     bash_image: Option<&File>,
-) -> io::Result<(FreshReleasedHandoff, FreshRecipientIdentity)> {
+) -> io::Result<(
+    FreshReleasedHandoff,
+    FreshRecipientIdentity,
+    fresh_provider::ParentWork,
+)> {
     let image = bash_image.ok_or_else(|| io::Error::other("installed Bash image absent"))?;
     if !peer.process.same_executable_as(image)? {
         return Err(io::Error::other("Bash child image changed"));
@@ -3769,12 +3788,7 @@ fn fresh_bash_parent(
     let roots = RootRegistry::open(state_root)?;
     let works = WorkRegistry::open(state_root.join("works"), &roots)?;
     let root_id = match classify_scope(peer, &host_proc_file("self/ns/pid")?, &roots, &works) {
-        Scope::Root(id) => id,
-        Scope::Work { .. } => {
-            return Err(io::Error::other(
-                "nested Bash child requires consumed causal work grant",
-            ));
-        }
+        Scope::Root(id) | Scope::Work { root_id: id, .. } => id,
         Scope::Outside => return Err(io::Error::other("Bash child is outside a released root")),
         Scope::Uncertain => return Err(io::Error::other("Bash child scope uncertain")),
     };
@@ -3794,8 +3808,20 @@ fn fresh_bash_parent(
     {
         return Err(io::Error::other("released root PID1 changed"));
     }
+    let root_init = PinnedProcess::open(expected.host_pid)?;
+    let root_session = lane
+        .read_session(&root.d_key)
+        .map_err(io::Error::other)?
+        .ok_or_else(|| io::Error::other("released root D absent"))?;
+    let parent = fresh_provider::parent_for_bash(
+        &state_root.join("v30/fresh-provider"),
+        &root,
+        &root_session.session_id,
+        &peer.process,
+        &root_init,
+    )?;
     peer.process.verify()?;
-    Ok((root, actor))
+    Ok((root, actor, parent))
 }
 
 fn serve_fresh_v30_at(
@@ -3809,6 +3835,7 @@ fn serve_fresh_v30_at(
     let instance = EntryGate::open(&state_root.join("v30"))?;
     // An installed Bash child must match the package's pinned digest. Private
     // fixtures supply their built source binary only at broker startup.
+    #[cfg(feature = "age319-private-broker-fixture")]
     let bash_image = if private_fixture() {
         std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_BASH_V1")
             .map(File::open)
@@ -3862,12 +3889,13 @@ fn serve_fresh_v30_at(
                 }
                 .into());
             }
-            let local_lookup = matches!(
-                &payload,
-                RequestPayload::FreshRecipientRequest {
-                    request: FreshRecipientRequest::Lookup { .. }
-                }
-            ) || matches!(operation, b'C' | b'c' | b'E' | b'O');
+            let local_lookup =
+                matches!(
+                    &payload,
+                    RequestPayload::FreshRecipientRequest {
+                        request: FreshRecipientRequest::Lookup { .. }
+                    }
+                ) || matches!(operation, b'C' | b'c' | b'E' | b'O' | b'%' | b'&' | b'!');
             // The shared front door has its own pinned image. It may observe
             // the live lane identity, but it cannot acquire Runner authority.
             // Every effect-bearing operation still requires the fresh Runner
@@ -3958,7 +3986,12 @@ fn serve_fresh_v30_at(
                         request.request_id, request.invocation_uuid
                     ))
                 }
-                b'C' | b'c' | b'E' | b'O' => {
+                #[cfg(not(feature = "age319-private-broker-fixture"))]
+                b'C' | b'c' | b'E' | b'O' => Err(io::Error::other(
+                    "fresh Bash child/work/result closed until normal root grant and physical result custody",
+                )),
+                #[cfg(feature = "age319-private-broker-fixture")]
+                b'C' | b'c' | b'E' | b'O' | b'%' | b'&' | b'!' => {
                     if !private_fixture() {
                         return Err(io::Error::other(
                             "fresh Bash child/work/result closed until normal root grant and physical result custody",
@@ -3974,11 +4007,18 @@ fn serve_fresh_v30_at(
                         }
                         _ => return Err(io::Error::other("Bash child request absent")),
                     };
-                    let (root, root_actor) =
+                    let (root, root_actor, parent_work) =
                         fresh_bash_parent(state_root, &lane, &peer, bash_image.as_ref())?;
                     let child = if operation == b'C' && !instance.is_closed() {
-                        lane.admit_bash_child(&request_id, &root, &root_actor, &recipient)
-                            .map_err(io::Error::other)?
+                        lane.admit_bash_child(
+                            &request_id,
+                            &root,
+                            &root_actor,
+                            &recipient,
+                            parent_work.grant_id(),
+                            parent_work.work_id(),
+                        )
+                        .map_err(io::Error::other)?
                     } else {
                         let mut child = lane
                             .read_bash_child(&request_id)
@@ -3990,6 +4030,11 @@ fn serve_fresh_v30_at(
                             .ok_or_else(|| io::Error::other("Bash child D incomplete"))?;
                         lane.require_bash_child(&child, &root, &root_actor, &recipient)
                             .map_err(io::Error::other)?;
+                        if child.parent_work_grant_id != parent_work.grant_id()
+                            || child.parent_work_id != parent_work.work_id()
+                        {
+                            return Err(io::Error::other("Bash causal parent work changed"));
+                        }
                         child
                     };
                     peer.process.verify()?;
@@ -4014,6 +4059,88 @@ fn serve_fresh_v30_at(
                                 "fresh-bash-result {}\n",
                                 serde_json::to_string(&result)?
                             ))
+                        }
+                        #[cfg(feature = "age319-private-broker-fixture")]
+                        b'%' | b'&' | b'!' => {
+                            let root_pid = root.old_release.prepared.root_init.host_pid;
+                            let root_init = PinnedProcess::open(root_pid)?;
+                            let actor = PinnedProcess::open(peer.process.host_pid)?;
+                            let binding = fresh_provider::binding_from_bash_child(
+                                &root,
+                                &child,
+                                &actor,
+                                &parent_work,
+                                &root_init,
+                            )?;
+                            let directory = state_root.join("v30/fresh-provider");
+                            if operation == b'%' {
+                                // Fixed private recipe. Bash supplies neither the
+                                // executable nor output claim; production still
+                                // requires a causal parent work grant and W.
+                                let gate = PathBuf::from(
+                                    std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                                        .map_err(io::Error::other)?,
+                                );
+                                let marker = gate.join("bash-physical-effect");
+                                let image = fs::canonicalize("/bin/sh")?;
+                                let fd = unsafe {
+                                    libc::memfd_create(
+                                        c"fresh-bash-empty-input".as_ptr(),
+                                        libc::MFD_CLOEXEC,
+                                    )
+                                };
+                                if fd < 0 {
+                                    return Err(io::Error::last_os_error());
+                                }
+                                let input = unsafe { File::from_raw_fd(fd) };
+                                let plan = fresh_provider::plan(
+                                    &image,
+                                    &gate,
+                                    &input,
+                                    vec![
+                                        "-c".into(),
+                                        "printf 'broker-child-output\\n'; printf 'broker-ran\\n' > \"$1\"; (setsid sh -c 'trap \"\" TERM; while :; do sleep 1; done' >/dev/null 2>&1 &)".into(),
+                                        "sh".into(),
+                                        marker.display().to_string(),
+                                    ],
+                                    vec![("PATH".into(), "/usr/bin:/bin".into())],
+                                )?;
+                                let prepared = fresh_provider::prepare(&directory, binding, plan)?;
+                                let grant = fresh_provider::launch(
+                                    prepared, &root_init, &actor, peer.uid, peer.gid,
+                                )?;
+                                return Ok(format!("fresh-bash-physical-k {grant}\n"));
+                            }
+                            let grant = fresh_provider::grant_for_binding(&directory, &binding)?
+                                .ok_or_else(|| io::Error::other("fresh Bash physical K absent"))?;
+                            if operation == b'!' {
+                                fresh_provider::cancel(&directory, &grant)?;
+                                return Ok(format!("fresh-bash-physical-cancel {grant}\n"));
+                            }
+                            match fresh_provider::observe(&directory, &grant)? {
+                                fresh_provider::Observation::Unknown => {
+                                    Ok(format!("fresh-bash-physical-unknown {grant}\n"))
+                                }
+                                fresh_provider::Observation::Pending => {
+                                    Ok(format!("fresh-bash-physical-pending {grant}\n"))
+                                }
+                                fresh_provider::Observation::ProviderExited(status) => {
+                                    Ok(format!("fresh-bash-physical-exited {grant} {status}\n"))
+                                }
+                                fresh_provider::Observation::Drained {
+                                    status,
+                                    stdout: _,
+                                    stderr: _,
+                                    stdout_len,
+                                    stderr_len,
+                                    stdout_sha256,
+                                    stderr_sha256,
+                                    cancelled,
+                                } => Ok(format!(
+                                    "fresh-bash-physical-drained {grant} {status} {stdout_len} {stderr_len} {cancelled} {} {}\n",
+                                    stdout_sha256, stderr_sha256,
+                                )),
+                            }
                         }
                         _ => unreachable!(),
                     }
@@ -5242,19 +5369,23 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let (op, payload, peer) = peer_from_request(&mut stream).unwrap();
-            assert_eq!(op, b'E');
-            assert!(matches!(payload, RequestPayload::None));
+            assert_eq!(op, b'C');
+            assert!(matches!(
+                payload,
+                RequestPayload::FreshBashChildRequest { .. }
+            ));
             assert_eq!(peer.process.host_pid, std::process::id() as i32);
         });
         let mut client = UnixStream::connect(&socket).unwrap();
         let mut challenge = [0u8; 16];
         client.read_exact(&mut challenge).unwrap();
-        let mut message = [0u8; 17];
-        message[0] = b'E';
-        message[1..].copy_from_slice(&challenge);
+        let mut message = [0u8; 33];
+        message[0] = b'C';
+        message[1..17].copy_from_slice(&challenge);
+        message[17..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
         assert_eq!(
-            unsafe { libc::send(client.as_raw_fd(), message.as_ptr().cast(), 17, 0) },
-            17
+            unsafe { libc::send(client.as_raw_fd(), message.as_ptr().cast(), 33, 0) },
+            33
         );
         server.join().unwrap();
     }
@@ -5271,10 +5402,14 @@ mod tests {
         let mut client = UnixStream::connect(&socket).unwrap();
         let mut challenge = [0u8; 16];
         client.read_exact(&mut challenge).unwrap();
-        let message = [b'E'; 17];
+        let mut message = [0u8; 33];
+        message[0] = b'C';
+        message[1..17].copy_from_slice(&challenge);
+        message[1] ^= 0xff;
+        message[17..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
         assert_eq!(
-            unsafe { libc::send(client.as_raw_fd(), message.as_ptr().cast(), 17, 0) },
-            17
+            unsafe { libc::send(client.as_raw_fd(), message.as_ptr().cast(), 33, 0) },
+            33
         );
         server.join().unwrap();
     }
@@ -5289,9 +5424,15 @@ mod tests {
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                 .unwrap();
-            assert!(peer_from_request(&mut stream).is_err());
+            let error = peer_from_request(&mut stream).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("transferred/inherited socket sender"),
+                "unexpected denial: {error}"
+            );
         });
-        let script = "import os,socket,sys\ns=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.connect(sys.argv[1]);c=s.recv(16);p=os.fork()\nif p==0:\n s.sendall(b'E'+c);os._exit(0)\nos.waitpid(p,0)";
+        let script = "import os,socket,sys\ns=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.connect(sys.argv[1]);c=s.recv(16);p=os.fork()\nif p==0:\n s.sendall(b'C'+c+bytes.fromhex('11111111111141118111111111111111'));os._exit(0)\nos.waitpid(p,0)";
         let output = Command::new("python3")
             .args(["-c", script, socket.to_str().unwrap()])
             .output()
@@ -5331,7 +5472,7 @@ assert int(caps, 16) & (1 << 21), caps  # CAP_SYS_ADMIN in the child user namesp
 s = socket.socket(fileno=3)
 challenge = s.recv(16)
 assert len(challenge) == 16
-message = b'E' + challenge
+message = b'C' + challenge + bytes.fromhex('11111111111141118111111111111111')
 claimed = struct.pack('3i', int(sys.argv[1]), 0, 0)
 try:
     s.sendmsg([message], [(socket.SOL_SOCKET, socket.SCM_CREDENTIALS, claimed)])
@@ -5387,9 +5528,10 @@ assert s.send(message) == len(message)
         let mut client = UnixStream::connect(&socket).unwrap();
         let mut challenge = [0u8; 16];
         client.read_exact(&mut challenge).unwrap();
-        let mut request = [0u8; 17];
+        let mut request = [0u8; 33];
         request[0] = b'C';
-        request[1..].copy_from_slice(&challenge);
+        request[1..17].copy_from_slice(&challenge);
+        request[17..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
         let payload = File::open("/dev/null").unwrap();
         let mut iov = libc::iovec {
             iov_base: request.as_mut_ptr().cast(),
@@ -5408,7 +5550,7 @@ assert s.send(message) == len(message)
             (*cmsg).cmsg_type = libc::SCM_RIGHTS;
             (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<i32>() as _) as _;
             *(libc::CMSG_DATA(cmsg) as *mut i32) = payload.as_raw_fd();
-            assert_eq!(libc::sendmsg(client.as_raw_fd(), &message, 0), 17);
+            assert_eq!(libc::sendmsg(client.as_raw_fd(), &message, 0), 33);
         }
         server.join().unwrap();
     }
