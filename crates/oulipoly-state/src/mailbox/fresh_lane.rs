@@ -31,6 +31,22 @@ pub struct FreshV30Session {
     pub allocation_id: String,
 }
 
+/// Read-only join of a consumed source with this lane's original session.
+/// This is a prerequisite for a future broker admission writer, not an
+/// acceptance or release grant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FreshV30SourceProvenance {
+    pub lane_id: String,
+    pub allocation_id: String,
+    pub session_id: String,
+    pub source_generation: String,
+    pub state_admission_id: String,
+    pub registration_id: String,
+    pub registration_digest: String,
+    pub root_id: String,
+    pub owner_generation: String,
+}
+
 /// A broker-retained connection; no caller supplies a ledger path to an
 /// operation. The public path argument is an installation root for bootstrap
 /// and private fixtures only, never a wire selector.
@@ -530,6 +546,67 @@ impl FreshV30Lane {
             return Err("mailbox row is not in this lane".into());
         }
         Ok(())
+    }
+
+    /// A caller cannot nominate a session or registration for source
+    /// admission. Resolve the listener's session from this immutable ledger,
+    /// then re-read the consumed grant's exact State, owner, registration and
+    /// listener projection. No provenance row is written by this method.
+    pub fn source_provenance(
+        &self,
+        grant: &super::BrokerSourceEffectGrant,
+    ) -> Result<FreshV30SourceProvenance, String> {
+        if grant.source_generation != self.identity.source_generation
+            || !Self::is_reserved_session_id(&grant.candidate.listener.session_id)
+        {
+            return Err("source is outside the fresh lane generation/session".into());
+        }
+        let session = self
+            .sidecar
+            .mailbox()
+            .conn
+            .query_row(
+                "SELECT session_id,request_id,allocation_id,lane_id,source_generation
+                 FROM fresh_lane_session WHERE session_id=?1",
+                [&grant.candidate.listener.session_id],
+                |row| {
+                    Ok(FreshV30Session {
+                        session_id: row.get(0)?,
+                        request_id: row.get(1)?,
+                        allocation_id: row.get(2)?,
+                        lane_id: row.get(3)?,
+                        source_generation: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .ok_or("source listener has no broker-minted fresh session")?;
+        self.require_session(&session)?;
+        let binding = self.sidecar.read_consumed_source_candidate(grant)?;
+        let source = binding.registration()?;
+        let listener = binding.admission_listener()?;
+        if source.domain_id != self.identity.domain_id
+            || source.owner_session_id != session.session_id
+            || listener.session_id != session.session_id
+            || listener.owner_invocation_uuid != source.owner_invocation_uuid
+            || listener != grant.candidate.listener
+            || source.registration_id != grant.candidate.registration_id
+            || binding.registration_digest() != grant.candidate.registration_digest
+        {
+            return Err("fresh source State/session/owner/listener provenance changed".into());
+        }
+        Ok(FreshV30SourceProvenance {
+            lane_id: session.lane_id,
+            allocation_id: session.allocation_id,
+            session_id: session.session_id,
+            source_generation: grant.source_generation.clone(),
+            state_admission_id: binding.caller_admission_id().into(),
+            registration_id: source.registration_id,
+            registration_digest: binding.registration_digest().into(),
+            root_id: grant.root_id.clone(),
+            owner_generation: grant.owner_generation.clone(),
+        })
     }
 }
 

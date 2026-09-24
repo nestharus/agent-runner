@@ -1,7 +1,9 @@
 #![cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
 
 use oulipoly_state::StateDb;
-use oulipoly_state::mailbox::{FreshV30Lane, MailboxDb};
+use oulipoly_state::mailbox::{
+    BrokerSourceCandidate, BrokerSourceEffectGrant, FreshV30Lane, MailboxDb,
+};
 use rusqlite::{Connection, params};
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -125,6 +127,49 @@ fn private_fresh_dual_lane_live_old_wal_collision_and_restart() {
     let request_id = uuid::Uuid::new_v4().to_string();
     assert!(lane.read_session(&request_id).unwrap().is_none());
     let session = lane.allocate_session(&request_id).unwrap();
+    let mut unadmitted = BrokerSourceEffectGrant {
+        grant_id: uuid::Uuid::new_v4().to_string(),
+        source_generation: first.source_generation.clone(),
+        root_id: uuid::Uuid::new_v4().to_string(),
+        owner_generation: uuid::Uuid::new_v4().to_string(),
+        driver_identity: oulipoly_state::completion_continuation::SourceProcessIdentity {
+            pid: 1,
+            boot_id: uuid::Uuid::new_v4().to_string(),
+            starttime_ticks: 1,
+        },
+        authority_ordinal: 1,
+        candidate: BrokerSourceCandidate {
+            registration_id: uuid::Uuid::new_v4().to_string(),
+            registration_digest: "0".repeat(64),
+            listener_revision: 1,
+            listener: oulipoly_state::completion_continuation::ListenerIdentity {
+                listener_id: uuid::Uuid::new_v4().to_string(),
+                session_id: session.session_id.clone(),
+                owner_invocation_uuid: uuid::Uuid::new_v4().to_string(),
+            },
+        },
+        phase: "consumed".into(),
+        revision: 2,
+    };
+    // A caller string that spells an allocated session has no source
+    // authority. Nor can a v29 generation or a sibling session join it.
+    assert!(lane.source_provenance(&unadmitted).is_err());
+    unadmitted.source_generation = uuid::Uuid::new_v4().to_string();
+    assert!(lane.source_provenance(&unadmitted).is_err());
+    unadmitted.source_generation = first.source_generation.clone();
+    unadmitted.candidate.listener.session_id =
+        format!("v30:{}:{}", first.lane_id, uuid::Uuid::new_v4());
+    assert!(lane.source_provenance(&unadmitted).is_err());
+    assert_eq!(
+        mailbox
+            .query_row(
+                "SELECT count(*) FROM broker_fresh_source_admission",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
     assert_eq!(lane.allocate_session(&request_id).unwrap(), session);
     assert_eq!(
         lane.read_session(&request_id).unwrap(),

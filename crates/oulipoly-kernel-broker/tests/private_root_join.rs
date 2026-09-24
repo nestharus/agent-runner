@@ -276,7 +276,10 @@ fn inner() {
                 (mode == "normal_bash_source_lost_reply")
                     .then_some(("AGE319_PRIVATE_SOURCE_LAUNCH_REPLY_LOSS_V1", "1")),
             )
-            .envs(nonzero_source.then_some(("AGE319_PRIVATE_SOURCE_PRELAUNCH_BARRIER_V1", "1")))
+            .envs(
+                (nonzero_source || io_failure_source)
+                    .then_some(("AGE319_PRIVATE_SOURCE_PRELAUNCH_BARRIER_V1", "1")),
+            )
             .env_remove("LD_LIBRARY_PATH")
             .stdin(Stdio::null())
             .stdout(Stdio::from(File::create(&out).unwrap()))
@@ -506,6 +509,22 @@ fn inner() {
                     // The original guardian must stay pinned until W has
                     // consumed the grant and acknowledged the held worker.
                     eventually(|| gate.join("source-launched").exists());
+                } else if io_failure_source {
+                    // Active capture races the test after terminal. Occupy
+                    // the create-new name before W can release the worker.
+                    use std::os::unix::fs::OpenOptionsExt;
+                    let grant_id = fs::read_to_string(gate.join("source-grant-ready")).unwrap();
+                    let evidence_path = broker_state
+                        .join("source-physical")
+                        .join(format!("{grant_id}.evidence.json"));
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(evidence_path)
+                        .unwrap();
+                    fs::write(gate.join("source-allow-launch"), b"yes").unwrap();
+                    eventually(|| gate.join("source-launched").exists());
                 } else if real_source {
                     eventually(|| gate.join("source-grant-consumed-readback").exists());
                 }
@@ -685,6 +704,12 @@ fn inner() {
                         )
                         .unwrap();
                         let custody = SourcePhysicalRegistry::open(&physical).unwrap();
+                        eventually(|| {
+                            retained
+                                .read_source_evidence(&custody.records()[0].grant)
+                                .unwrap()
+                                .is_some()
+                        });
                         if nonzero_source {
                             assert!(
                                 oulipoly_kernel_broker::source_acceptance::assess_v2_candidate(
@@ -705,14 +730,6 @@ fn inner() {
                             );
                             drop(damaged_snapshot.take().unwrap());
                         } else if io_failure_source {
-                            use std::os::unix::fs::OpenOptionsExt;
-                            let evidence_path = physical.join(format!("{grant_id}.evidence.json"));
-                            std::fs::OpenOptions::new()
-                                .write(true)
-                                .create_new(true)
-                                .mode(0o600)
-                                .open(&evidence_path)
-                                .unwrap();
                             assert!(oulipoly_kernel_broker::source_acceptance::capture_and_stage_v2_evidence(
                             &mut retained, &custody, &grant_id
                         ).is_err(), "create-new evidence write must fail closed");
@@ -740,9 +757,9 @@ fn inner() {
                                     .registration_id
                             );
                             let captured =
-                            oulipoly_kernel_broker::source_acceptance::capture_and_stage_v2_evidence(
-                                &mut retained, &custody, &grant_id
-                            ).unwrap();
+                                oulipoly_kernel_broker::source_acceptance::read_captured_v2_evidence(
+                                    &retained, &custody, &grant_id
+                                ).unwrap();
                             assert_eq!(captured.candidate, assessed);
                             assert_eq!(
                                 retained
