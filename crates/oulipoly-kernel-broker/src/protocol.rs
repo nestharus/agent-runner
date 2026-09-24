@@ -144,6 +144,11 @@ pub struct FreshAccountEffectReadback {
     pub windows: Vec<FreshQuotaWindow>,
     pub completed_unix_seconds: Option<i64>,
     pub artifact: String,
+    /// Exact auth K whose Q is being observed for this root, when coalesced.
+    #[serde(default)]
+    pub peer_effect_id: Option<String>,
+    #[serde(default)]
+    pub peer_artifact: Option<String>,
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]
