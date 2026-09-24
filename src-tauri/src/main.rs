@@ -37,6 +37,8 @@ mod native_receipt;
 #[allow(dead_code)]
 #[path = "main/owned_turn_event_ingest.rs"]
 mod owned_turn_event_ingest;
+#[cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
+mod private_provider_probe;
 mod provider_artifact;
 mod provider_proof;
 mod quota_zero_turn;
@@ -231,6 +233,15 @@ fn private_installed_probe() -> Option<ExitCode> {
             println!("PRIVATE_AMBIENT_PARENT_EXIT child={child}");
             Some(ExitCode::SUCCESS)
         }
+        Some("provider") if args.len() == 3 => Some(
+            match private_provider_probe::run(std::path::Path::new(&args[2])) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("PRIVATE_PROVIDER_PROBE_GAP={error}");
+                    ExitCode::FAILURE
+                }
+            },
+        ),
         Some("setuid") if args.len() == 2 => {
             use std::os::fd::AsRawFd;
             let image = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();

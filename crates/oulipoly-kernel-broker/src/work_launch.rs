@@ -135,6 +135,7 @@ fn run_init(context: InitContext) -> io::Result<()> {
     ])?;
     if unsafe { libc::getpid() } != 1
         || unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) } != 0
+        || unsafe { libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0) } != 0
     {
         return Err(io::Error::other("work PID1 lost host sudo semantics"));
     }
@@ -186,9 +187,15 @@ fn run_init(context: InitContext) -> io::Result<()> {
                 || (!fixture && libc::setgroups(groups.len(), groups.as_ptr()) != 0)
                 || libc::setresgid(owner_gid, owner_gid, owner_gid) != 0
                 || libc::setresuid(owner_uid, owner_uid, owner_uid) != 0
-                || libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) != 0
             {
                 return Err(io::Error::last_os_error());
+            }
+            if libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) != 0
+                || libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0) != 0
+            {
+                return Err(io::Error::other(
+                    "work worker inherited NNP or seccomp restriction",
+                ));
             }
             for fd in worker_fds {
                 let flags = libc::fcntl(fd, libc::F_GETFD);
@@ -418,6 +425,7 @@ pub(super) fn launch(
     if !peer.process.same_executable_as(runner_image)?
         || !peer.process.in_namespace(host_namespace)?
         || unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) } != 0
+        || unsafe { libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0) } != 0
     {
         return Err(io::Error::other(
             "work launch lost host guardian or sudo semantics",

@@ -211,6 +211,7 @@ fn run_init(mut context: InitContext) -> io::Result<()> {
     ])?;
     if unsafe { libc::getpid() } != 1
         || unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) } != 0
+        || unsafe { libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0) } != 0
     {
         return Err(io::Error::other("native PID1 lost host sudo semantics"));
     }
@@ -255,9 +256,15 @@ fn run_init(mut context: InitContext) -> io::Result<()> {
                 || (!fixture && libc::setgroups(groups.len(), groups.as_ptr()) != 0)
                 || libc::setresgid(gid, gid, gid) != 0
                 || libc::setresuid(uid, uid, uid) != 0
-                || libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) != 0
             {
                 return Err(io::Error::last_os_error());
+            }
+            if libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) != 0
+                || libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0) != 0
+            {
+                return Err(io::Error::other(
+                    "native worker inherited NNP or seccomp restriction",
+                ));
             }
             for fd in [gate_fd, request_fd, cancel_fd] {
                 let flags = libc::fcntl(fd, libc::F_GETFD);
@@ -487,6 +494,15 @@ pub(super) fn launch(
     broker_incarnation: &str,
     terminal_dir: &Path,
 ) -> io::Result<String> {
+    // Neither a nested PID namespace nor exec can clear inherited filters.
+    // Reject before consuming the grant; PID1 and the held child recheck.
+    if unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) } != 0
+        || unsafe { libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0) } != 0
+    {
+        return Err(io::Error::other(
+            "native launch inherited NNP or seccomp restriction",
+        ));
+    }
     // The request is copied from the exact descriptor verified by t into a
     // sealed memfd. Its named inode can no longer change the worker's recipe.
     let request = sealed_request(&request, &verified.custodian_request_sha256)?;
