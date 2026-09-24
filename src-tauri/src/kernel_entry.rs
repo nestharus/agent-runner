@@ -891,11 +891,21 @@ fn private_native_request(
     } else {
         "native-sibling-effect"
     });
-    let args = [
-        b"__age319-private-installed-probe-v1".to_vec(),
-        b"provider".to_vec(),
-        marker.as_os_str().as_encoded_bytes().to_vec(),
-    ];
+    let args = if std::env::var_os("AGE319_PRIVATE_RECEIPT_HELPER_PROBE_V1").is_some() {
+        [
+            crate::native_receipt::helper::ARG.as_bytes().to_vec(),
+            crate::native_receipt::helper::PRIVATE_BROKER_PROBE_ARG
+                .as_bytes()
+                .to_vec(),
+            marker.as_os_str().as_encoded_bytes().to_vec(),
+        ]
+    } else {
+        [
+            b"__age319-private-installed-probe-v1".to_vec(),
+            b"provider".to_vec(),
+            marker.as_os_str().as_encoded_bytes().to_vec(),
+        ]
+    };
     let request = serde_json::json!({
         "path": std::path::PathBuf::from(std::env::var("OULIPOLY_DATA_DIR")
             .map_err(|error| error.to_string())?).join("state.db"),

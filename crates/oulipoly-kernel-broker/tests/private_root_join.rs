@@ -46,7 +46,10 @@ impl Drop for SnapshotRestore {
 fn inner() {
     let mode = std::env::var("AGE319_PRIVATE_JOIN_MODE").unwrap_or_else(|_| "help".into());
     let native_mode = mode.starts_with("native_");
-    let native_live = matches!(mode.as_str(), "native_cancel" | "native_drain");
+    let native_live = matches!(
+        mode.as_str(),
+        "native_cancel" | "native_drain" | "native_receipt_cancel" | "native_receipt_drain"
+    );
     let release_mode = mode.starts_with("held_release") || native_mode;
     let normal_mode = mode.starts_with("normal_");
     let recipient_mode = mode.starts_with("normal_recipient");
@@ -1099,6 +1102,10 @@ fn inner() {
             )
             .envs(native_mode.then_some(("AGE319_PRIVATE_NATIVE_LINEAGE_V30", "1")))
             .envs(
+                mode.starts_with("native_receipt_")
+                    .then_some(("AGE319_PRIVATE_RECEIPT_HELPER_PROBE_V1", "1")),
+            )
+            .envs(
                 (mode == "held_release_exec_driver")
                     .then_some(("AGE319_PRIVATE_EXEC_DRIVER_ROUTE_V30", "1")),
             )
@@ -1405,7 +1412,10 @@ fn inner() {
                 let pid1: serde_json::Value = serde_json::from_str(&pid1_json).unwrap();
                 let pid1 = pid1["pid"].as_i64().unwrap() as i32;
                 assert!(pid1 > 0);
-                if mode == "native_pid1_loss" {
+                if matches!(
+                    mode.as_str(),
+                    "native_pid1_loss" | "native_receipt_pid1_loss"
+                ) {
                     assert_eq!(unsafe { libc::kill(pid1, libc::SIGKILL) }, 0);
                     fs::write(gate.join("native-pid1-loss"), b"yes").unwrap();
                 }
@@ -1417,6 +1427,13 @@ fn inner() {
                 let mut provider_descendant = None;
                 if native_live {
                     eventually(|| gate.join("native-effect").exists());
+                    if mode.starts_with("native_receipt_") {
+                        assert_eq!(
+                            fs::read(gate.join("native-effect").with_extension("helper-entry"))
+                                .unwrap(),
+                            b"receipt-helper nnp=0 seccomp=0"
+                        );
+                    }
                     let provider = fs::read_to_string(gate.join("native-effect")).unwrap();
                     assert!(
                         provider.starts_with(
@@ -1494,7 +1511,7 @@ fn inner() {
                             .unwrap(),
                         0
                     );
-                    if mode == "native_drain" {
+                    if matches!(mode.as_str(), "native_drain" | "native_receipt_drain") {
                         fs::write(gate.join("native-drain"), b"yes").unwrap();
                         fs::write(gate.join("native-effect.release"), b"yes").unwrap();
                     }
@@ -1560,8 +1577,11 @@ fn inner() {
                     .unwrap();
                     let physical: serde_json::Value = serde_json::from_slice(&terminal).unwrap();
                     assert_eq!(physical["physical_tree_drained"], true);
-                    assert_eq!(physical["cancellation_observed"], mode == "native_cancel");
-                    if mode == "native_drain" {
+                    assert_eq!(
+                        physical["cancellation_observed"],
+                        matches!(mode.as_str(), "native_cancel" | "native_receipt_cancel")
+                    );
+                    if matches!(mode.as_str(), "native_drain" | "native_receipt_drain") {
                         assert_eq!(physical["worker_wait_status"], 0);
                     }
                     assert!(
@@ -2227,7 +2247,10 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "held_release_gate_fail",
         "native_cancel",
         "native_drain",
+        "native_receipt_cancel",
+        "native_receipt_drain",
         "native_pid1_loss",
+        "native_receipt_pid1_loss",
         "normal_release",
         "normal_guardian_death",
         "normal_driver_death",
