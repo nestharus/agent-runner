@@ -172,7 +172,7 @@ fn run_v30_repair_boundary(
             // this preview is not an executable grant. The native recipient
             // route must bind an actual session and the one-use provider K
             // before any claim, transport submission, or delivery result.
-            return Err("v30 recipient effect requires actual session authentication, one-use broker work grant, and provider K".into());
+            return Err("v30 recipient effect closed: no broker-authenticated live recipient or exact wake successor, durable one-use work grant, or pinned provider K/physical child tree".into());
         }
         return Err("v30 no pending broker recipient; wake effect refused".into());
     }
