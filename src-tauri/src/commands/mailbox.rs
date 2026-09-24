@@ -130,6 +130,7 @@ pub(crate) fn run_status(session_id: &str, json: bool) -> Result<i32, String> {
 }
 
 pub(crate) fn run_pause(session_id: &str, paused: bool, json: bool) -> Result<i32, String> {
+    crate::completion_owner::require_legacy_recipient_effect_route()?;
     let mut db = MailboxDb::open_default()?;
     let wake = set_pause_and_request_wake(&mut db, session_id, paused, || {
         crate::wake_coordinator::trigger_notify_wake(session_id)
@@ -166,6 +167,7 @@ pub(crate) fn run_ack(
     delivered_by: &str,
     json: bool,
 ) -> Result<i32, String> {
+    crate::completion_owner::require_legacy_recipient_effect_route()?;
     let mut db = MailboxDb::open_default()?;
     let acknowledged_count = db.acknowledge_range(session_id, from_seq, to_seq, delivered_by)?;
     let remaining_pending = db.pending_delivery_count(session_id, None)?;

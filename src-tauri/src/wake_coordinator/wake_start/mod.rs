@@ -40,6 +40,9 @@ pub(crate) fn trigger_notify_wake(session_id: &str) -> WakeDiagnostic {
 }
 
 pub(super) fn start_wake_chain(input: StartWakeInput<'_>) -> WakeDiagnostic {
+    if let Err(error) = crate::completion_owner::require_legacy_recipient_effect_route() {
+        return storage_error_diagnostic(error);
+    }
     match crate::completion_owner::defer_wake_to_owner() {
         Ok(true) => return WakeDiagnostic::status("independent_owner_pending"),
         Err(error) => return storage_error_diagnostic(error),

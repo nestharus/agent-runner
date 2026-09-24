@@ -237,6 +237,35 @@ pub fn defer_wake_to_owner() -> Result<bool, String> {
     }
 }
 
+/// Legacy mailbox mutations may use the user sidecar only while the live
+/// broker still reports a legacy entry route. The v30 copy is retained by the
+/// broker; a user-side copy (including an intact one) is never write authority.
+/// Local installs without a broker keep their existing mailbox behavior.
+pub(crate) fn require_legacy_recipient_effect_route() -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        use oulipoly_kernel_broker::protocol::{self, EntryRoute};
+        let socket = linux::owner_broker_socket();
+        if !socket.exists() {
+            if std::env::var_os("OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1").is_some() {
+                return Err("recipient broker entry route unavailable".into());
+            }
+            return Ok(());
+        }
+        return match protocol::observe_entry_gate_at(&socket) {
+            Ok(EntryRoute::LegacyOpen) => Ok(()),
+            Ok(EntryRoute::BrokerV30Closed) => Err(
+                "v30 recipient write requires broker-authenticated recipient grant; retired sidecar refused"
+                    .into(),
+            ),
+            Ok(EntryRoute::Draining) => Err("recipient broker entry gate is draining".into()),
+            Err(error) => Err(format!("recipient broker entry route unavailable: {error}")),
+        };
+    }
+    #[cfg(not(target_os = "linux"))]
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn custodian_entry() -> Option<Result<(), String>> {
     match std::env::args().nth(1).as_deref() {

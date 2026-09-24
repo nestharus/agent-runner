@@ -84,6 +84,16 @@ pub(crate) fn attempt_pty_mailbox_delivery_with_trigger(
     session_id: &str,
     trigger: &str,
 ) -> PtyMailboxDeliveryDiagnostic {
+    if let Err(error) = crate::completion_owner::require_legacy_recipient_effect_route() {
+        return pty_status(
+            false,
+            "authority_unavailable",
+            None,
+            Vec::new(),
+            None,
+            Some(error),
+        );
+    }
     let diagnostic = attempt_pty_mailbox_delivery_inner(mailbox, session_id);
     trace_notify_pty_attempt(trigger, session_id, &diagnostic);
     diagnostic

@@ -380,13 +380,14 @@ fn inner() {
                 "normal_guardian_post"
                     | "normal_driver_post"
                     | "normal_broker_post"
+                    | "normal_recipient_broker_post"
                     | "normal_recipient_driver_post"
             );
             if mode == "normal_guardian_post" {
                 unsafe { libc::kill(prepared.guardian.host_pid, libc::SIGKILL) };
             } else if mode == "normal_driver_post" || mode == "normal_recipient_driver_post" {
                 unsafe { libc::kill(prepared.driver.host_pid, libc::SIGKILL) };
-            } else if mode == "normal_broker_post" {
+            } else if mode == "normal_broker_post" || mode == "normal_recipient_broker_post" {
                 stop(&mut broker);
                 let restart_log = temp.path().join("normal-post-restart.log");
                 broker = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
@@ -405,7 +406,7 @@ fn inner() {
                 assert_eq!(fs::metadata(&out).unwrap().len(), 0);
             } else {
                 let expected_stop = if recipient_mode {
-                    "v30 recipient effect requires actual session authentication, one-use broker work grant, and provider K"
+                    "v30 recipient effect closed: no broker-authenticated live recipient or exact wake successor, durable one-use work grant, or pinned provider K/physical child tree"
                 } else if mode == "normal_empty" {
                     "v30 no pending broker recipient; wake effect refused"
                 } else {
@@ -463,6 +464,54 @@ fn inner() {
                     .unwrap();
                 assert_eq!(attempts, 0, "source preview cannot reserve or launch");
                 if let Some(mail) = &recipient_mail {
+                    // A human CLI's arbitrary audit label and exact row
+                    // selectors cannot turn the retired copy into ACK
+                    // authority while the retained broker route is active.
+                    for session in ["fixture-recipient", "sibling-recipient"] {
+                        for _ in 0..2 {
+                            let ack = Command::new(&runner)
+                                .args([
+                                    "mailbox",
+                                    "ack",
+                                    "--session-id",
+                                    session,
+                                    "--from-seq",
+                                    &mail.seq.to_string(),
+                                    "--to-seq",
+                                    &mail.seq.to_string(),
+                                    "--delivered-by",
+                                    "forged-recipient",
+                                ])
+                                .env("OULIPOLY_DATA_DIR", &data)
+                                .env("OULIPOLY_CONFIG_HOME", &data)
+                                .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                                .output()
+                                .unwrap();
+                            assert!(!ack.status.success());
+                            assert!(
+                                String::from_utf8_lossy(&ack.stderr).contains(
+                                    "v30 recipient write requires broker-authenticated recipient grant; retired sidecar refused"
+                                ),
+                                "{}",
+                                String::from_utf8_lossy(&ack.stderr)
+                            );
+                        }
+                    }
+                    let pause = Command::new(&runner)
+                        .args(["mailbox", "pause", "--session-id", "fixture-recipient"])
+                        .env("OULIPOLY_DATA_DIR", &data)
+                        .env("OULIPOLY_CONFIG_HOME", &data)
+                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                        .output()
+                        .unwrap();
+                    assert!(!pause.status.success());
+                    assert!(
+                        String::from_utf8_lossy(&pause.stderr).contains(
+                            "v30 recipient write requires broker-authenticated recipient grant"
+                        ),
+                        "{}",
+                        String::from_utf8_lossy(&pause.stderr)
+                    );
                     let (session, digest, delivered): (String, String, Option<String>) = projected
                         .query_row(
                             "SELECT session_id,payload_sha256,delivered_at FROM mailbox WHERE seq=?1",
@@ -473,6 +522,14 @@ fn inner() {
                     assert_eq!(session, "fixture-recipient");
                     assert_eq!(digest, mail.payload_sha256.as_deref().unwrap());
                     assert!(delivered.is_none(), "selection must not autoACK");
+                    let paused: i64 = projected
+                        .query_row(
+                            "SELECT count(*) FROM mailbox_notification_control WHERE session_id='fixture-recipient' AND paused=1",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(paused, 0, "retired pause cannot change retained control");
                     let claims: i64 = projected
                         .query_row("SELECT count(*) FROM session_wake_claim", [], |row| {
                             row.get(0)
@@ -1405,6 +1462,7 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_repair_lost_reply",
         "normal_recipient",
         "normal_recipient_driver_post",
+        "normal_recipient_broker_post",
         "normal_empty",
         "normal_guardian_post",
         "normal_driver_post",
