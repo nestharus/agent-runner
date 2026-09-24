@@ -2,8 +2,8 @@
 //! not source release, notification, recipient ACK, or native work authority.
 use crate::source_physical::{CapturedOutput, SourceObservation, SourcePhysicalRegistry};
 use oulipoly_state::completion_continuation::{
-    CompletionOutput, MAX_OUTPUT_BYTES, MAX_REGISTRATION_BYTES, VerifiedCompletion,
-    open_source_file, sha256,
+    CompletionOutput, MAX_REGISTRATION_BYTES, OutputArtifact, VerifiedCompletion,
+    copy_verified_raw, open_source_file, open_source_output, require_unchanged_output, sha256,
 };
 use oulipoly_state::mailbox::{BrokerSidecar, BrokerSourceEffectGrant, BrokerSourceEvidenceSeal};
 use serde::{Deserialize, Serialize};
@@ -85,27 +85,23 @@ fn source_bytes(dir: &Path, name: &str, limit: usize) -> Result<(Vec<u8>, FileId
 }
 
 fn artifact_stamp(file: &File, expected: &str, len: u64) -> Result<FileIdentity, String> {
-    use sha2::{Digest, Sha256};
     let mut file = file.try_clone().map_err(|e| e.to_string())?;
-    let mut hash = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
-    let mut size = 0u64;
-    loop {
-        let n = file.read(&mut buffer).map_err(|e| e.to_string())?;
-        if n == 0 {
-            break;
-        }
-        size += n as u64;
-        if size > len {
-            return Err("source artifact grew".into());
-        }
-        hash.update(&buffer[..n]);
-    }
-    let digest = format!("{:x}", hash.finalize());
-    if size != len || digest != expected {
-        return Err("source artifact hash/length conflict".into());
-    }
-    identity(&file, digest, size)
+    copy_verified_raw(&mut file, len, expected, &mut std::io::sink())?;
+    identity(&file, expected.into(), len)
+}
+
+fn source_artifact_stamp(
+    dir: &Path,
+    name: &str,
+    expected: &str,
+    len: u64,
+) -> Result<FileIdentity, String> {
+    let file = open_source_output(dir, name)?;
+    let before = file.metadata().map_err(|e| e.to_string())?;
+    let stamp = artifact_stamp(&file, expected, len)?;
+    let named = open_source_output(dir, name)?;
+    require_unchanged_output(&before, &named.metadata().map_err(|e| e.to_string())?)?;
+    Ok(stamp)
 }
 
 fn owned_artifact(path: &Path, expected: &str, len: u64) -> Result<FileIdentity, String> {
@@ -123,7 +119,48 @@ fn owned_artifact(path: &Path, expected: &str, len: u64) -> Result<FileIdentity,
     {
         return Err("owned artifact file identity changed".into());
     }
-    artifact_stamp(&file, expected, len)
+    let stamp = artifact_stamp(&file, expected, len)?;
+    require_unchanged_output(
+        &meta,
+        &fs::symlink_metadata(path).map_err(|e| e.to_string())?,
+    )?;
+    Ok(stamp)
+}
+
+// Leave a partial create-new file as evidence debt on error. No manifest or
+// positive seal may reference it; capture_and_stage records unknown custody.
+fn capture_artifact(
+    dir: &Path,
+    artifact: &OutputArtifact,
+    path: &Path,
+) -> Result<(FileIdentity, FileIdentity), String> {
+    let mut input = open_source_output(dir, &artifact.relative)?;
+    let mut owned = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|e| format!("artifact capture create failed: {e}"))?;
+    // Hash and transfer the same pinned original descriptor, then fence its
+    // name again after the durable owned copy has been independently verified.
+    let before = copy_verified_raw(&mut input, artifact.byte_len, &artifact.sha256, &mut owned)?;
+    let original = identity(&input, artifact.sha256.clone(), artifact.byte_len)?;
+    owned
+        .sync_all()
+        .map_err(|e| format!("artifact capture sync failed: {e}"))?;
+    File::open(path.parent().ok_or("evidence parent absent")?)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| format!("artifact directory sync failed: {e}"))?;
+    let own = owned_artifact(path, &artifact.sha256, artifact.byte_len)?;
+    let again =
+        source_artifact_stamp(dir, &artifact.relative, &artifact.sha256, artifact.byte_len)?;
+    let named = open_source_output(dir, &artifact.relative)?;
+    require_unchanged_output(&before, &named.metadata().map_err(|e| e.to_string())?)?;
+    if again != original {
+        return Err("original artifact changed during capture".into());
+    }
+    Ok((original, own))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -272,35 +309,10 @@ pub fn capture_v2_evidence(
     verified.validate_source_reply(&serde_json::from_slice(&reply).map_err(|e| e.to_string())?)?;
     let (artifact_original, artifact_owned) =
         if let CompletionOutput::Artifact(a) = &verified.snapshot.output {
-            let original = artifact_stamp(
-                &open_source_file(dir, &a.relative, MAX_OUTPUT_BYTES)?,
-                &a.sha256,
-                a.byte_len,
-            )?;
             let path = physical
                 .evidence_path(id, "evidence-artifact")
                 .map_err(|e| e.to_string())?;
-            let mut owned = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(&path)
-                .map_err(|e| e.to_string())?;
-            a.copy_verified(dir, &mut owned)?;
-            owned.sync_all().map_err(|e| e.to_string())?;
-            File::open(path.parent().ok_or("evidence parent absent")?)
-                .and_then(|f| f.sync_all())
-                .map_err(|e| e.to_string())?;
-            let own = owned_artifact(&path, &a.sha256, a.byte_len)?;
-            let again = artifact_stamp(
-                &open_source_file(dir, &a.relative, MAX_OUTPUT_BYTES)?,
-                &a.sha256,
-                a.byte_len,
-            )?;
-            if again != original {
-                return Err("original artifact changed during capture".into());
-            }
+            let (original, own) = capture_artifact(dir, a, &path)?;
             (Some(original), Some(own))
         } else {
             (None, None)
@@ -450,12 +462,7 @@ pub fn read_captured_v2_evidence(
         &captured.artifact_owned,
     ) {
         (CompletionOutput::Artifact(a), Some(original), Some(owned)) => {
-            if &artifact_stamp(
-                &open_source_file(dir, &a.relative, MAX_OUTPUT_BYTES)?,
-                &a.sha256,
-                a.byte_len,
-            )? != original
-            {
+            if &source_artifact_stamp(dir, &a.relative, &a.sha256, a.byte_len)? != original {
                 return Err("original artifact changed after capture".into());
             }
             let path = physical
@@ -555,4 +562,67 @@ pub fn commit_v2_evidence(
         return Err("source evidence changed across commit readback".into());
     }
     Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "streams/copies 1 GiB + 1 byte under mapped root; synthetic raw-capture control"]
+    fn artifact_above_old_cap_passes_broker_capture_and_readback() {
+        if unsafe { libc::geteuid() } != 0 {
+            let name = std::thread::current().name().unwrap().to_owned();
+            let result = std::process::Command::new("unshare")
+                .args(["-Ur", "--"])
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--ignored", "--nocapture"])
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            println!("{}", String::from_utf8_lossy(&result.stdout));
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let length = 1024 * 1024 * 1024 + 1u64;
+        let digest = "6d9bfe50425f2dfe4e2ac07efee1f0bc9d567348ad4aed62704ffe6f5884e9a8";
+        let artifact = OutputArtifact {
+            representation: "retained-output-v1".into(),
+            relative: "completion-output-v2.bin".into(),
+            sha256: digest.into(),
+            byte_len: length,
+            encoding: "raw".into(),
+        };
+        let source = File::create(root.path().join(&artifact.relative)).unwrap();
+        source.set_len(length).unwrap();
+        let path = root.path().join("owned-artifact");
+        let (original, owned) = capture_artifact(root.path(), &artifact, &path).unwrap();
+        assert_eq!(original.byte_len, length);
+        assert_eq!(owned.byte_len, length);
+        assert_eq!(owned.sha256, digest);
+        assert_ne!(original.inode, owned.inode);
+        assert_eq!(owned_artifact(&path, digest, length).unwrap(), owned);
+        assert!(
+            capture_artifact(root.path(), &artifact, &path).is_err(),
+            "duplicate capture may not overwrite"
+        );
+        source.set_len(length - 1).unwrap();
+        assert!(source_artifact_stamp(root.path(), &artifact.relative, digest, length).is_err());
+        assert_eq!(owned_artifact(&path, digest, length).unwrap(), owned);
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(length - 1)
+            .unwrap();
+        assert!(owned_artifact(&path, digest, length).is_err());
+        println!(
+            "broker raw capture/readback bytes={length} sha256={digest}; no State acceptance authority minted"
+        );
+    }
 }

@@ -3,14 +3,13 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use oulipoly_state::completion_continuation::{
     AdmittedSourceBinding, MAX_REGISTRATION_BYTES, PROTOCOL, SourceRegistration,
-    VerifiedCompletion, read_source_file,
+    VerifiedCompletion, copy_verified_raw, read_source_file, require_unchanged_output,
 };
 use oulipoly_state::mailbox::{CompletionEventTriggerInput, MailboxDb};
 use oulipoly_state::{InvocationMutationAuthority, StateDb};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
@@ -175,37 +174,13 @@ fn recovery_read_from(
         json!({"kind":"selected_missing_output", "evidence":selected,
             "exact_raw_bytes_available":false})
     } else if selected["representation"] == "retained-output-v1" {
-        let artifact = &payload["output_artifact"];
-        let digest = required_string(selected, "sha256")?;
-        let len = selected["byte_len"]
-            .as_u64()
-            .ok_or("selected output length missing")?;
-        let domain = required_string(&record, "domain_id")?;
-        if uuid::Uuid::parse_str(domain).is_err()
-            || digest.len() != 64
-            || !digest.bytes().all(|b| b.is_ascii_hexdigit())
-            || selected["relative"] != "completion-output-v2.bin"
-            || !matches!(selected["encoding"].as_str(), Some("raw" | "utf8-lossy"))
-            || len > oulipoly_state::completion_continuation::MAX_OUTPUT_BYTES as u64
-        {
-            return Err("unsupported selected raw output descriptor".into());
-        }
-        let path = data_root
-            .join("completion-continuation")
-            .join(domain)
-            .join("outputs")
-            .join(digest);
-        if artifact["path"] != path.to_string_lossy().as_ref()
-            || artifact["sha256"] != digest
-            || artifact["byte_len"] != len
-            || artifact["encoding"] != selected["encoding"]
-        {
-            return Err("retained raw artifact conflicts with selected output".into());
-        }
-        verify_and_copy_raw(&path, len, digest, output)?;
-        json!({"kind":"raw_bytes", "byte_len":len, "sha256":digest,
-            "verified":true, "output_file":output,
-            "exact_raw_bytes_available":true})
+        read_retained_raw_output(
+            selected,
+            &payload["output_artifact"],
+            required_string(&record, "domain_id")?,
+            data_root,
+            output,
+        )?
     } else {
         return Err("unknown selected output representation".into());
     };
@@ -221,6 +196,43 @@ fn recovery_read_from(
         "presentation_and_ack":presentation,
         "physical_drain":physical_drain,
     }))
+}
+
+fn read_retained_raw_output(
+    selected: &Value,
+    artifact: &Value,
+    domain: &str,
+    data_root: &Path,
+    output: Option<&Path>,
+) -> Result<Value, String> {
+    let digest = required_string(selected, "sha256")?;
+    let len = selected["byte_len"]
+        .as_u64()
+        .ok_or("selected output length missing")?;
+    if uuid::Uuid::parse_str(domain).is_err()
+        || digest.len() != 64
+        || !digest.bytes().all(|b| b.is_ascii_hexdigit())
+        || selected["relative"] != "completion-output-v2.bin"
+        || !matches!(selected["encoding"].as_str(), Some("raw" | "utf8-lossy"))
+    {
+        return Err("unsupported selected raw output descriptor".into());
+    }
+    let path = data_root
+        .join("completion-continuation")
+        .join(domain)
+        .join("outputs")
+        .join(digest);
+    if artifact["path"] != path.to_string_lossy().as_ref()
+        || artifact["sha256"] != digest
+        || artifact["byte_len"] != len
+        || artifact["encoding"] != selected["encoding"]
+    {
+        return Err("retained raw artifact conflicts with selected output".into());
+    }
+    verify_and_copy_raw(&path, len, digest, output)?;
+    Ok(json!({"kind":"raw_bytes", "byte_len":len, "sha256":digest,
+            "verified":true, "output_file":output,
+            "exact_raw_bytes_available":true}))
 }
 
 fn required_string<'a>(value: &'a Value, field: &str) -> Result<&'a str, String> {
@@ -239,7 +251,15 @@ fn verify_and_copy_raw(
     if !metadata.is_file() || metadata.len() != expected_len {
         return Err("retained selected output length/type conflict".into());
     }
-    let mut input = File::open(path).map_err(|e| e.to_string())?;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    }
+    let mut input = options.open(path).map_err(|e| e.to_string())?;
+    require_unchanged_output(&metadata, &input.metadata().map_err(|e| e.to_string())?)?;
     let mut staged = destination
         .map(|target| {
             tempfile::NamedTempFile::new_in(
@@ -251,27 +271,20 @@ fn verify_and_copy_raw(
             .map_err(|e| e.to_string())
         })
         .transpose()?;
-    let mut hasher = Sha256::new();
-    let mut total = 0u64;
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let count = input.read(&mut buffer).map_err(|e| e.to_string())?;
-        if count == 0 {
-            break;
-        }
-        total += count as u64;
-        if total > expected_len {
-            return Err("retained selected output grew during read".into());
-        }
-        hasher.update(&buffer[..count]);
-        if let Some(file) = staged.as_mut() {
-            file.write_all(&buffer[..count])
-                .map_err(|e| e.to_string())?;
-        }
+    if let Some(file) = staged.as_mut() {
+        copy_verified_raw(&mut input, expected_len, expected_digest, file)?;
+    } else {
+        copy_verified_raw(
+            &mut input,
+            expected_len,
+            expected_digest,
+            &mut std::io::sink(),
+        )?;
     }
-    if total != expected_len || format!("{:x}", hasher.finalize()) != expected_digest {
-        return Err("retained selected output digest/length conflict".into());
-    }
+    require_unchanged_output(
+        &metadata,
+        &fs::symlink_metadata(path).map_err(|e| e.to_string())?,
+    )?;
     if let (Some(file), Some(target)) = (staged, destination) {
         file.as_file().sync_all().map_err(|e| e.to_string())?;
         file.persist_noclobber(target).map_err(|e| e.to_string())?;
@@ -679,6 +692,77 @@ mod tests {
             .is_err()
         );
         assert!(!destination.exists());
+    }
+
+    #[test]
+    #[ignore = "streams/copies 1 GiB + 1 byte; explicit manual descriptor/export control"]
+    fn artifact_above_old_cap_passes_manual_lookup_and_atomic_export() {
+        use serde_json::json;
+        use std::fs;
+        let root = tempfile::tempdir().unwrap();
+        let domain = uuid::Uuid::new_v4().to_string();
+        let directory = root
+            .path()
+            .join("completion-continuation")
+            .join(&domain)
+            .join("outputs");
+        fs::create_dir_all(&directory).unwrap();
+        let digest = "6d9bfe50425f2dfe4e2ac07efee1f0bc9d567348ad4aed62704ffe6f5884e9a8";
+        let length = 1024 * 1024 * 1024 + 1u64;
+        let path = directory.join(digest);
+        fs::File::create(&path).unwrap().set_len(length).unwrap();
+        let selected = json!({"representation":"retained-output-v1", "relative":"completion-output-v2.bin", "sha256":digest, "byte_len":length, "encoding":"raw"});
+        let artifact = json!({"path":path, "sha256":digest, "byte_len":length, "encoding":"raw"});
+        let output = root.path().join("export.bin");
+        let result = super::read_retained_raw_output(
+            &selected,
+            &artifact,
+            &domain,
+            root.path(),
+            Some(&output),
+        )
+        .unwrap();
+        assert_eq!(result["byte_len"], length);
+        assert_eq!(result["verified"], true);
+        assert!(serde_json::to_vec(&result).unwrap().len() < 512);
+        assert_eq!(fs::metadata(&output).unwrap().len(), length);
+        verify_and_copy_raw(&output, length, digest, None).unwrap();
+        fs::remove_file(&output).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(length - 1)
+            .unwrap();
+        assert!(
+            super::read_retained_raw_output(
+                &selected,
+                &artifact,
+                &domain,
+                root.path(),
+                Some(&output)
+            )
+            .is_err()
+        );
+        assert!(!output.exists());
+        println!("manual verified/exported bytes={length} sha256={digest}; no recipient ACK");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manual_raw_read_rejects_symlink_and_never_clobbers_existing_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let alias = root.path().join("alias");
+        let target = root.path().join("target");
+        std::fs::write(&source, b"body").unwrap();
+        std::fs::write(&target, b"keep").unwrap();
+        std::os::unix::fs::symlink(&source, &alias).unwrap();
+        let digest = format!("{:x}", Sha256::digest(b"body"));
+        assert!(verify_and_copy_raw(&alias, 4, &digest, None).is_err());
+        assert!(verify_and_copy_raw(&source, 4, &digest, Some(&target)).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 3);
     }
 
     #[test]
