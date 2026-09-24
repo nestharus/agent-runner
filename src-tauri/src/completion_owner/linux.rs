@@ -28,6 +28,9 @@ use control::{ControlRequest, ControlService, JoinRefusal, JoinRequest, RefusalR
 #[path = "context_leases.rs"]
 mod context_leases;
 use context_leases::ContextLeases;
+#[cfg(feature = "age360-fault-fixtures")]
+#[path = "j01_private_trace.rs"]
+mod j01_private_trace;
 
 pub(super) fn identity(pid: i64) -> Result<SourceProcessIdentity, String> {
     // `pid` is a key in this process's procfs observer, never getpid(),
@@ -907,6 +910,8 @@ fn guardian(
             &contexts.identities(),
             &root_supervisor.original_active_root_ids(),
         );
+        #[cfg(feature = "age360-fault-fixtures")]
+        j01_private_trace::after_context_release(path);
         if !closing
             && contexts.is_empty()
             && pending.is_empty()
@@ -1118,9 +1123,21 @@ fn retain_pending_context(
         &request.request.mode,
         super::original_work::RootJoinMode::Fresh
     ) {
+        #[cfg(feature = "age360-fault-fixtures")]
+        j01_private_trace::at_fresh_join(
+            path,
+            owner,
+            &request.context,
+            contexts,
+            root_authorities,
+            root_supervisor,
+        );
         let existing_context_roots = root_authorities.roots_for_peer(&request.context);
         let active_root = root_supervisor.original_root_for_peer(&request.context);
-        if !existing_context_roots.is_empty() || active_root.is_some() {
+        if active_root.is_some()
+            || (!existing_context_roots.is_empty()
+                && !root_supervisor.accepted_native_activation_for_peer(&request.context))
+        {
             refuse_join_identity(
                 owner,
                 &mut request,
@@ -1242,7 +1259,16 @@ fn retain_pending_context(
     }
     let grant = match &request.request.mode {
         super::original_work::RootJoinMode::Fresh => {
-            match root_authorities.fresh(owner, request.context.clone()) {
+            let fresh = if root_authorities.roots_for_peer(&request.context).is_empty() {
+                root_authorities.fresh(owner, request.context.clone())
+            } else {
+                root_authorities.fresh_from_accepted_native(
+                    owner,
+                    request.context.clone(),
+                    root_supervisor,
+                )
+            };
+            match fresh {
                 Ok(grant) => grant,
                 Err(error) => {
                     refuse_join_identity(

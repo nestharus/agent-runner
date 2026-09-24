@@ -37,6 +37,15 @@ impl ContextLeases {
         self.0.iter().map(|lease| lease.identity.clone()).collect()
     }
 
+    #[cfg(feature = "age360-fault-fixtures")]
+    pub fn private_lease_presence(&self, context: &SourceProcessIdentity) -> (bool, usize) {
+        self.0
+            .iter()
+            .find(|lease| &lease.identity == context)
+            .map(|lease| (true, lease.sockets.len()))
+            .unwrap_or((false, 0))
+    }
+
     pub fn admit(&mut self, path: &Path, context: &SourceProcessIdentity) -> Result<(), String> {
         let db = MailboxDb::open(path)?;
         // A previously ambiguous retain can have left a row without a local
