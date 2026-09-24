@@ -836,6 +836,59 @@ fn read_bounded_repair(
 
 #[expect(
     clippy::too_many_arguments,
+    reason = "broker actor and retained source authorities are independent"
+)]
+fn read_bounded_source_selection(
+    spec: StateReadSpec,
+    peer: &PeerIdentity,
+    host_namespace: &File,
+    runner_image: &File,
+    roots: &RootRegistry,
+    works: &WorkRegistry,
+    entries: &EntryRegistry,
+    sidecar: &BrokerSidecar,
+) -> io::Result<oulipoly_state::mailbox::BrokerSourceSelection> {
+    if spec.protocol != "broker-source-selection-v30" || spec.attempt_id.is_some() {
+        return Err(io::Error::other("broker source selection version conflict"));
+    }
+    let exact = read_broker_state(
+        StateReadSpec {
+            protocol: "broker-state-read-v1".into(),
+            ..spec
+        },
+        peer,
+        host_namespace,
+        runner_image,
+        roots,
+        works,
+        entries,
+        sidecar,
+    )?;
+    if !exact.broker_owned || exact.owner.driver_identity.pid != i64::from(peer.process.host_pid) {
+        return Err(io::Error::other(
+            "broker source selection requires exact driver",
+        ));
+    }
+    sidecar
+        .read_bounded_source_selection(&exact.source_generation, &exact.root_id, &exact.owner)
+        .map_err(io::Error::other)
+}
+
+fn encode_source_selection(
+    selection: &oulipoly_state::mailbox::BrokerSourceSelection,
+) -> io::Result<String> {
+    let mut response = serde_json::to_string(selection)?;
+    response.push('\n');
+    if response.len() > 4096 {
+        return Err(io::Error::other(
+            "broker source selection readback too large",
+        ));
+    }
+    Ok(response)
+}
+
+#[expect(
+    clippy::too_many_arguments,
     reason = "broker actor and retained State authorities are independent"
 )]
 fn write_bounded_repair(
@@ -2485,6 +2538,18 @@ fn serve() -> io::Result<()> {
                         sidecar,
                     )?;
                     encode_repair_readback(&readback)
+                } else if spec.protocol == "broker-source-selection-v30" {
+                    let selection = read_bounded_source_selection(
+                        spec,
+                        &peer,
+                        &host_namespace,
+                        &runner_image,
+                        &registry,
+                        &works,
+                        &entries,
+                        sidecar,
+                    )?;
+                    encode_source_selection(&selection)
                 } else {
                     let readback = read_broker_state(
                         spec,

@@ -135,8 +135,15 @@ fn run_v30_repair_boundary(
         if page.has_more {
             continue;
         }
-        if !page.pending_registration_ids.is_empty() {
-            return Err("v30 source recovery requires broker source grant".into());
+        let selected = route.source_selection(owner, &page)?;
+        if selected.candidate.is_some() {
+            // This metadata came from the retained broker connection. The
+            // snapshot and recovery image are still outside broker custody;
+            // neither a reservation nor an effect is authorized here.
+            return Err(
+                "v30 source recovery requires broker snapshot custody and one-use effect grant"
+                    .into(),
+            );
         }
         return Err("v30 wake selection requires broker recipient grant".into());
     }

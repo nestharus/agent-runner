@@ -5,8 +5,8 @@ use oulipoly_kernel_broker::protocol::{
     self, StateReadSpec, StateRoute, StateWriteAction, StateWriteSpec,
 };
 use oulipoly_state::mailbox::{
-    BrokerContinuationReadback, BrokerReleaseEvidence, BrokerRepairReadback, CompletionDomainOwner,
-    ContinuationAttempt, PreparedBrokerOwner,
+    BrokerContinuationReadback, BrokerReleaseEvidence, BrokerRepairReadback, BrokerSourceSelection,
+    CompletionDomainOwner, ContinuationAttempt, PreparedBrokerOwner,
 };
 use std::path::{Path, PathBuf};
 
@@ -20,6 +20,92 @@ pub(crate) struct V30OwnerRoute {
 }
 
 impl V30OwnerRoute {
+    pub(crate) fn source_selection(
+        &self,
+        owner: &CompletionDomainOwner,
+        completed: &BrokerRepairReadback,
+    ) -> Result<BrokerSourceSelection, String> {
+        if completed.has_more {
+            return Err("broker source selection before State projection completed".into());
+        }
+        self.check_repair_readback(completed)?;
+        self.read_running(owner, None)?;
+        let selection = protocol::read_bounded_source_selection_at(
+            &self.socket,
+            &self.read_spec("broker-source-selection-v30", None),
+        )
+        .map_err(|e| e.to_string())?;
+        #[cfg(feature = "age319-private-broker-fixture")]
+        if std::env::var_os("AGE319_PRIVATE_SOURCE_SELECTION_CHALLENGE_V1").is_some() {
+            for (field, value) in [
+                ("root", uuid::Uuid::new_v4().to_string()),
+                ("source", uuid::Uuid::new_v4().to_string()),
+                ("owner", uuid::Uuid::new_v4().to_string()),
+            ] {
+                let mut wrong = self.read_spec("broker-source-selection-v30", None);
+                match field {
+                    "root" => wrong.root_id = value,
+                    "source" => wrong.source_generation = value,
+                    _ => wrong.owner_generation = value,
+                }
+                if protocol::read_bounded_source_selection_at(&self.socket, &wrong).is_ok() {
+                    return Err(
+                        "private wrong-root/stale-source/sibling-owner source selection accepted"
+                            .into(),
+                    );
+                }
+            }
+        }
+        if selection.source_generation != self.source_generation
+            || selection.root_id != self.root_id
+            || selection.owner_generation != self.owner_generation
+            || selection.authority_ordinal != completed.authority_ordinal
+            || selection
+                .candidate
+                .as_ref()
+                .map(|source| &source.registration_id)
+                != completed.pending_registration_ids.first()
+        {
+            return Err("broker source selection/repair readback conflict".into());
+        }
+        #[cfg(feature = "age319-private-broker-fixture")]
+        if let Some(expected) = std::env::var_os("AGE319_PRIVATE_EXPECT_SOURCE_DIGEST_V1") {
+            let source = selection
+                .candidate
+                .as_ref()
+                .ok_or("private expected source selection absent")?;
+            if source.registration_digest != expected.to_string_lossy()
+                || source.listener_revision == 0
+                || source.listener.listener_id.is_empty()
+            {
+                return Err("private source digest/listener selection conflict".into());
+            }
+            let denied_attempt = ContinuationAttempt {
+                attempt_id: uuid::Uuid::new_v4().to_string(),
+                owner_generation: self.owner_generation.clone(),
+                operation: "source_recovery".into(),
+                request_sha256: source.registration_digest.clone(),
+                source_registration_id: Some(source.registration_id.clone()),
+                source_listener_revision: Some(source.listener_revision as i64),
+                session_id: None,
+                claim_token: None,
+                result_path: "/private/denied-source-result".into(),
+            };
+            let bypass = self.write_spec(
+                "broker-state-write-v1",
+                StateWriteAction::Reserve {
+                    attempt: denied_attempt,
+                },
+            );
+            if protocol::write_state_at(&self.socket, &bypass).is_ok()
+                || protocol::write_state_at(&self.socket, &bypass).is_ok()
+            {
+                return Err("private ungranted source reservation/replay accepted".into());
+            }
+        }
+        Ok(selection)
+    }
+
     pub(crate) fn repair_page(
         &self,
         owner: &CompletionDomainOwner,

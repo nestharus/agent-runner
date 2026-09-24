@@ -122,6 +122,27 @@ pub struct BrokerRepairReadback {
     pub pending_registration_ids: Vec<String>,
 }
 
+/// Bounded source selection from the retained v30 sidecar. This is a preview,
+/// not an executable grant: the registered snapshot and recovery image have
+/// not yet been moved into broker custody. In particular, a caller must not
+/// use this record to open the registration's original handle directory.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct BrokerSourceSelection {
+    pub source_generation: String,
+    pub root_id: String,
+    pub owner_generation: String,
+    pub authority_ordinal: i64,
+    pub candidate: Option<BrokerSourceCandidate>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct BrokerSourceCandidate {
+    pub registration_id: String,
+    pub registration_digest: String,
+    pub listener_revision: u64,
+    pub listener: crate::completion_continuation::ListenerIdentity,
+}
+
 /// Installer-owned proof that the old service images and every sidecar writer
 /// were stopped, joined and fenced. No production constructor exists yet:
 /// the installed service/launcher census and new-entry fence must be added
@@ -301,6 +322,53 @@ impl BrokerSidecar {
             authority_ordinal: ordinal,
             has_more,
             pending_registration_ids,
+        })
+    }
+
+    /// Select the first still-registered source under the current supervisor
+    /// scope, only after all admitted State rows have reached the sidecar.
+    /// The server must establish the live root, guardian and exact driver
+    /// before calling this. No caller registration ID or path is accepted.
+    pub fn read_bounded_source_selection(
+        &self,
+        source_generation: &str,
+        root_id: &str,
+        owner: &CompletionDomainOwner,
+    ) -> Result<BrokerSourceSelection, String> {
+        self.check_mailbox_read(source_generation)?;
+        let state = self.bound_state()?;
+        let head = self.mailbox.completion_continuity_head()?;
+        if state.completion_repair_has_suffix(head.as_ref())? {
+            return Err("broker source selection requires complete State projection".into());
+        }
+        let candidate = self
+            .mailbox
+            .unaccepted_completion_continuations(&owner.supervisor_authority_id, 1)?
+            .into_iter()
+            .next()
+            .map(|binding| -> Result<BrokerSourceCandidate, String> {
+                let source = binding.registration()?;
+                if source.domain_id != owner.domain_id {
+                    return Err("broker selected source domain conflict".into());
+                }
+                Ok(BrokerSourceCandidate {
+                    registration_id: source.registration_id,
+                    registration_digest: binding.registration_digest().into(),
+                    listener_revision: source.listener_revision,
+                    listener: binding.admission_listener()?,
+                })
+            })
+            .transpose()?;
+        if state.completion_repair_has_suffix(head.as_ref())? {
+            return Err("broker State source changed during selection".into());
+        }
+        self.check_mailbox_read(source_generation)?;
+        Ok(BrokerSourceSelection {
+            source_generation: self.source_generation.clone(),
+            root_id: root_id.into(),
+            owner_generation: owner.owner_generation.clone(),
+            authority_ordinal: head.map_or(0, |head| head.authority_ordinal),
+            candidate,
         })
     }
 
@@ -885,6 +953,9 @@ impl BrokerSidecar {
         root_id: &str,
         attempt: &super::ContinuationAttempt,
     ) -> Result<BrokerContinuationReadback, String> {
+        if attempt.operation == "source_recovery" {
+            return Err("broker source recovery requires custody-bound one-use grant".into());
+        }
         let before = self.read_exact_continuation(
             &self.source_generation,
             root_id,
@@ -985,6 +1056,11 @@ impl BrokerSidecar {
         ),
         String,
     > {
+        if attempt.operation == "source_recovery" {
+            return Err(
+                "broker source recovery acceptance requires physical effect custody".into(),
+            );
+        }
         let before = self.read_exact_continuation(
             &self.source_generation,
             root_id,
@@ -3021,6 +3097,24 @@ mod tests {
             claim_token: None,
             result_path: "/fixture/transport-result".into(),
         };
+        let ungranted_source = super::super::ContinuationAttempt {
+            attempt_id: uuid::Uuid::new_v4().to_string(),
+            operation: "source_recovery".into(),
+            source_registration_id: Some(uuid::Uuid::new_v4().to_string()),
+            ..new_attempt.clone()
+        };
+        assert!(
+            broker
+                .reserve_exact_attempt(&new_owner, &root_id, &ungranted_source)
+                .unwrap_err()
+                .contains("custody-bound one-use grant")
+        );
+        assert!(
+            broker
+                .accept_exact_attempt(&new_owner, &root_id, &ungranted_source)
+                .unwrap_err()
+                .contains("physical effect custody")
+        );
         let new_reserved = broker
             .reserve_exact_attempt(&new_owner, &root_id, &new_attempt)
             .unwrap();

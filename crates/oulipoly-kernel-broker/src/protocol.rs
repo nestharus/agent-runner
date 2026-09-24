@@ -287,6 +287,18 @@ pub fn read_bounded_repair_at(
     serde_json::from_slice(&send_state_frame_at(path, b'R', spec)?).map_err(io::Error::other)
 }
 
+/// Read the next broker-selected source without receiving a path or an effect
+/// grant. The broker authenticates the exact live driver for every request.
+pub fn read_bounded_source_selection_at(
+    path: &Path,
+    spec: &StateReadSpec,
+) -> io::Result<oulipoly_state::mailbox::BrokerSourceSelection> {
+    if spec.protocol != "broker-source-selection-v30" || spec.attempt_id.is_some() {
+        return Err(io::Error::other("invalid bounded source selection read"));
+    }
+    serde_json::from_slice(&send_state_frame_at(path, b'R', spec)?).map_err(io::Error::other)
+}
+
 pub fn write_bounded_repair_at(
     path: &Path,
     spec: &StateWriteSpec,

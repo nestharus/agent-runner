@@ -140,6 +140,11 @@ fn inner() {
             .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
             .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
             .env("AGE319_PRIVATE_REPAIR_CHALLENGE_V1", "1")
+            .env("AGE319_PRIVATE_SOURCE_SELECTION_CHALLENGE_V1", "1")
+            .env(
+                "AGE319_PRIVATE_EXPECT_SOURCE_DIGEST_V1",
+                pending_binding.as_ref().unwrap().registration_digest(),
+            )
             .envs(
                 (mode == "normal_prepare_lost_reply")
                     .then_some(("AGE319_PRIVATE_NORMAL_PREPARE_REPLY_LOSS_V1", "1")),
@@ -287,6 +292,14 @@ fn inner() {
                 attempt_id: None,
             };
             assert!(protocol::read_bounded_repair_at(&socket, &repair_read).is_err());
+            let source_read = protocol::StateReadSpec {
+                protocol: "broker-source-selection-v30".into(),
+                source_generation: generation.clone(),
+                root_id: prepared.root_id.clone(),
+                owner_generation: prepared.owner_generation.clone(),
+                attempt_id: None,
+            };
+            assert!(protocol::read_bounded_source_selection_at(&socket, &source_read).is_err());
             let repair_write = protocol::StateWriteSpec {
                 protocol: "broker-repair-write-v30".into(),
                 source_generation: generation.clone(),
@@ -327,7 +340,7 @@ fn inner() {
                 assert!(
                     fs::read_to_string(&err)
                         .unwrap_or_default()
-                        .contains("v30 source recovery requires broker source grant"),
+                        .contains("v30 source recovery requires broker snapshot custody and one-use effect grant"),
                     "normal repair boundary: entry={} broker={}",
                     fs::read_to_string(&err).unwrap_or_default(),
                     fs::read_to_string(&broker_log).unwrap_or_default(),
@@ -363,6 +376,14 @@ fn inner() {
                     )
                     .unwrap();
                 assert_eq!(phase, "registered");
+                let attempts: i64 = projected
+                    .query_row(
+                        "SELECT count(*) FROM completion_continuation_attempt WHERE operation='source_recovery'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(attempts, 0, "source preview cannot reserve or launch");
             }
             assert_eq!(
                 fs::read(data.join("pid-identity.db")).unwrap(),
