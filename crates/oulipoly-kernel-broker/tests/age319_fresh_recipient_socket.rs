@@ -342,6 +342,63 @@ fn private_fresh_recipient_delivery_ack_collision_and_restart() {
         .unwrap();
         assert_eq!(ack["grant"]["phase"].as_str(), Some("acked"));
     }
+    let evidence = fresh
+        .prepare(
+            "SELECT e.basis,e.delivery_token_sha256,g.delivery_token,e.session_id,e.seq,
+                e.source_id,e.attempt_id,e.payload_sha256,e.payload_byte_len
+         FROM fresh_recipient_ack_evidence e
+         JOIN fresh_recipient_grant g ON g.grant_id=e.grant_id ORDER BY e.seq",
+        )
+        .unwrap()
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, String>(7)?,
+                r.get::<_, i64>(8)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(evidence.len(), 4);
+    for (
+        index,
+        (basis, token_sha, token, row_session, seq, row_source, row_attempt, row_sha, row_len),
+    ) in evidence.iter().enumerate()
+    {
+        assert_eq!(
+            basis,
+            if index == 1 || index == 3 {
+                "delegated_manual_ack"
+            } else {
+                "manual_ack"
+            }
+        );
+        assert_eq!(
+            *token_sha,
+            format!("{:x}", Sha256::digest(token.as_bytes()))
+        );
+        assert_eq!(row_session, &session.session_id);
+        assert_eq!(*seq, seqs[index]);
+        assert_eq!(row_source, &source_id);
+        assert_eq!(row_attempt, &attempt_id);
+        assert_eq!(row_sha, &format!("{:x}", Sha256::digest(&payloads[index])));
+        assert_eq!(*row_len, payloads[index].len() as i64);
+    }
+    assert_eq!(
+        fresh
+            .query_row("SELECT count(*) FROM completion_event_listener", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
+    );
     assert!(
         fresh_recipient_request_at(
             &socket,

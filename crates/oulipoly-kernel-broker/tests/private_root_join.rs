@@ -581,6 +581,17 @@ fn inner() {
             .envs(model_mode.then_some(("AGE319_PRIVATE_NORMAL_ROOT_V1", "1")))
             .envs(provider_mode.then_some(("AGE319_PRIVATE_FRESH_PROVIDER_V1", "1")))
             .envs(
+                matches!(
+                    mode.as_str(),
+                    "normal_model_provider"
+                        | "normal_model_provider_bash_causal"
+                        | "normal_model_provider_bash_causal_success"
+                        | "normal_model_provider_bash_causal_notify_ack"
+                        | "normal_model_provider_bash_causal_notify_lost_pending"
+                )
+                .then_some(("AGE319_PRIVATE_ROOT_TERMINAL_V1", "1")),
+            )
+            .envs(
                 mode.starts_with("normal_model_provider_bash_causal")
                     .then_some(("AGE319_PRIVATE_PROVIDER_CAUSAL_BASH_V1", "1")),
             )
@@ -1132,6 +1143,29 @@ fn inner() {
                             0
                         }
                     );
+                    let partial_lane = FreshV30Lane::open_at(&broker_state).unwrap();
+                    let (partial_root, partial_actor) = partial_lane
+                        .released_handoff_for_root(&source.root_id)
+                        .unwrap();
+                    let partial_session = partial_lane
+                        .read_session(&partial_root.d_key)
+                        .unwrap()
+                        .unwrap();
+                    let partial_terminal = partial_lane
+                        .read_private_root_terminal(&partial_root, &partial_actor, &partial_session)
+                        .unwrap();
+                    assert_eq!(partial_terminal.execution_state, "unknown");
+                    assert_eq!(partial_terminal.notification_state, "repair_required");
+                    assert_eq!(
+                        partial_terminal.unknown_stage.as_deref(),
+                        Some("notify_sidecar_row_absent_reconcile_required")
+                    );
+                    assert!(
+                        partial_terminal
+                            .unknown_stages
+                            .iter()
+                            .any(|stage| stage.starts_with("parent_k_q:"))
+                    );
                     fs::write(gate.join("provider-cancel"), b"yes").unwrap();
                     stop(&mut broker);
                     broker = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
@@ -1158,6 +1192,11 @@ fn inner() {
                     let lane = FreshV30Lane::open_at(&broker_state).unwrap();
                     let root = lane.released_handoff_for_root(&source.root_id).unwrap().0;
                     let root_session = lane.read_session(&root.d_key).unwrap().unwrap();
+                    let repaired_terminal = lane
+                        .read_private_root_terminal(&partial_root, &partial_actor, &partial_session)
+                        .unwrap();
+                    assert_eq!(repaired_terminal.notification_state, "pending_f");
+                    assert!(repaired_terminal.delivery_grant_id.is_none());
                     let seq: i64 = side
                         .query_row("SELECT seq FROM fresh_recipient_row_source", [], |r| {
                             r.get(0)
@@ -1387,6 +1426,22 @@ fn inner() {
                 let lane = FreshV30Lane::open_at(&broker_state).unwrap();
                 lane.repair_captured_private_bash_sources().unwrap();
                 lane.accept_private_bash_source(&source).unwrap();
+                lane.repair_captured_private_bash_source(&bash_request)
+                    .unwrap();
+                let (pre_q_root, pre_q_actor) =
+                    lane.released_handoff_for_root(&prepared.root_id).unwrap();
+                let pre_q_session = lane.read_session(&pre_q_root.d_key).unwrap().unwrap();
+                let pre_q_terminal = lane
+                    .read_private_root_terminal(&pre_q_root, &pre_q_actor, &pre_q_session)
+                    .unwrap();
+                assert_eq!(pre_q_terminal.execution_state, "unknown");
+                assert!(
+                    pre_q_terminal
+                        .unknown_stage
+                        .as_deref()
+                        .unwrap()
+                        .starts_with("parent_k_q:")
+                );
                 let mut wrong_source = source.clone();
                 wrong_source.parent_work_id = uuid::Uuid::new_v4().to_string();
                 assert!(lane.accept_private_bash_source(&wrong_source).is_err());
@@ -1617,6 +1672,125 @@ fn inner() {
                         "causal parent physical {suffix} absent"
                     );
                 }
+                let (terminal_root, terminal_actor) =
+                    lane.released_handoff_for_root(&prepared.root_id).unwrap();
+                let terminal_session = lane.read_session(&terminal_root.d_key).unwrap().unwrap();
+                let terminal = lane
+                    .settle_private_root_terminal(
+                        &terminal_root,
+                        &terminal_actor,
+                        &terminal_session,
+                    )
+                    .unwrap();
+                let wire: oulipoly_state::mailbox::FreshRootTerminalReadback =
+                    serde_json::from_slice(
+                        &fs::read(gate.join("root-terminal-readback.json")).unwrap(),
+                    )
+                    .unwrap();
+                assert_eq!(wire.execution, terminal.execution);
+                assert_eq!(wire.notification_state, terminal.notification_state);
+                assert_eq!(terminal.handoff_id, root.handoff_id);
+                assert_eq!(terminal.invocation_uuid, root.invocation_uuid);
+                assert_eq!(terminal.session_id, terminal_session.session_id);
+                assert!(
+                    terminal.execution.is_some(),
+                    "terminal evidence: {terminal:#?}"
+                );
+                assert_eq!(
+                    terminal.execution.as_ref().unwrap().parent.grant_id,
+                    parent_grant_id
+                );
+                assert_eq!(
+                    terminal
+                        .execution
+                        .as_ref()
+                        .unwrap()
+                        .child_event
+                        .as_ref()
+                        .unwrap(),
+                    &source
+                );
+                assert_eq!(terminal.publication_state, "not_started");
+                assert_eq!(
+                    terminal.child_request_id.as_deref(),
+                    Some(bash_request.as_str())
+                );
+                assert_eq!(
+                    terminal.unresolved_child_request_ids,
+                    vec![partial.request_id.clone()]
+                );
+                assert_eq!(
+                    terminal.refusal.as_deref(),
+                    Some("unresolved_child_admission")
+                );
+                assert_eq!(terminal.execution_state, "failure");
+                assert_eq!(
+                    terminal.terminal_state,
+                    "execution_failed_child_admission_pending"
+                );
+                assert!(
+                    terminal
+                        .artifacts
+                        .contains(&format!("unresolved-child-c:{}", partial.request_id))
+                );
+                assert_eq!(terminal.native_receipt_state, "not_observed");
+                assert_eq!(
+                    terminal.listener_policy.as_deref(),
+                    Some(if mode.contains("notify_") {
+                        "notify"
+                    } else {
+                        "response_only"
+                    })
+                );
+                if mode.contains("notify_") {
+                    assert!(matches!(
+                        terminal.notification_state.as_str(),
+                        "repair_required"
+                            | "pending_f"
+                            | "f_unknown"
+                            | "f_submitted_native_pending"
+                            | "acked"
+                    ));
+                    if mode.ends_with("notify_ack") {
+                        assert_eq!(terminal.notification_state, "acked");
+                        assert_eq!(terminal.ack_basis.as_deref(), Some("manual_ack"));
+                        assert_eq!(terminal.native_receipt_state, "not_observed");
+                    } else {
+                        assert_ne!(terminal.notification_state, "acked");
+                    }
+                } else {
+                    assert_eq!(terminal.notification_state, "response_only");
+                    assert!(terminal.delivery_grant_id.is_none());
+                    assert!(terminal.ack_basis.is_none());
+                }
+                let mut wrong_terminal_actor = terminal_actor.clone();
+                wrong_terminal_actor.starttime_ticks += 1;
+                assert!(
+                    lane.read_private_root_terminal(
+                        &terminal_root,
+                        &wrong_terminal_actor,
+                        &terminal_session
+                    )
+                    .is_err()
+                );
+                assert!(
+                    lane.begin_private_root_publication(
+                        &terminal_root,
+                        &terminal_actor,
+                        &terminal_session,
+                        b"cannot claim all work while another C remains unresolved\n"
+                    )
+                    .is_err()
+                );
+                assert!(
+                    lane.begin_private_root_publication(
+                        &terminal_root,
+                        &terminal_actor,
+                        &terminal_session,
+                        b"changed caller output\n"
+                    )
+                    .is_err()
+                );
                 // Preserve the original child's durable-result readback
                 // check after a broker restart, now on the causal route.
                 stop(&mut broker);
@@ -1635,6 +1809,22 @@ fn inner() {
                     .unwrap();
                 eventually(|| protocol::request_at(&socket, Operation::Classify).is_ok());
                 let reopened = FreshV30Lane::open_at(&broker_state).unwrap();
+                let replay = reopened
+                    .read_private_root_terminal(&terminal_root, &terminal_actor, &terminal_session)
+                    .unwrap();
+                assert_eq!(replay.execution, terminal.execution);
+                assert_eq!(replay.publication_state, "not_started");
+                assert_eq!(
+                    reopened
+                        .settle_private_root_terminal(
+                            &terminal_root,
+                            &terminal_actor,
+                            &terminal_session
+                        )
+                        .unwrap()
+                        .execution,
+                    terminal.execution
+                );
                 assert_eq!(
                     reopened.read_private_bash_result(&bash_request).unwrap(),
                     lane.read_private_bash_result(&bash_request).unwrap()
@@ -2512,6 +2702,99 @@ fn inner() {
                             "missing {suffix}"
                         );
                     }
+                    let terminal_lane = FreshV30Lane::open_at(&broker_state).unwrap();
+                    let terminal = terminal_lane
+                        .settle_private_root_terminal(&receipt, &actor, &session)
+                        .unwrap();
+                    if mode == "normal_model_provider" {
+                        let wire: oulipoly_state::mailbox::FreshRootTerminalReadback =
+                            serde_json::from_slice(
+                                &fs::read(gate.join("root-terminal-readback.json")).unwrap(),
+                            )
+                            .unwrap();
+                        assert_eq!(wire, terminal);
+                    }
+                    assert_eq!(
+                        terminal.execution.as_ref().unwrap().parent.grant_id,
+                        grant_id
+                    );
+                    assert!(terminal.execution.as_ref().unwrap().child_event.is_none());
+                    assert_eq!(terminal.notification_state, "not_applicable");
+                    assert!(terminal.delivery_grant_id.is_none());
+                    assert_eq!(terminal.publication_state, "not_started");
+                    if mode == "normal_model_provider" {
+                        let mut wrong_actor = actor.clone();
+                        wrong_actor.starttime_ticks += 1;
+                        assert!(
+                            terminal_lane
+                                .read_private_root_terminal(&receipt, &wrong_actor, &session)
+                                .is_err()
+                        );
+                        let mut wrong_session = session.clone();
+                        wrong_session.session_id.push_str("-wrong");
+                        assert!(
+                            terminal_lane
+                                .read_private_root_terminal(&receipt, &actor, &wrong_session)
+                                .is_err()
+                        );
+                        let q = provider_dir.join(format!("{grant_id}.drain.json"));
+                        let held = provider_dir.join(format!("{grant_id}.drain.held"));
+                        fs::rename(&q, &held).unwrap();
+                        let unknown = terminal_lane
+                            .read_private_root_terminal(&receipt, &actor, &session)
+                            .unwrap();
+                        assert_eq!(unknown.execution_state, "unknown");
+                        assert_eq!(unknown.terminal_state, "execution_unknown");
+                        assert!(
+                            unknown
+                                .unknown_stages
+                                .iter()
+                                .any(|stage| stage.starts_with("parent_k_q:"))
+                        );
+                        assert!(
+                            terminal_lane
+                                .begin_private_root_publication(
+                                    &receipt,
+                                    &actor,
+                                    &session,
+                                    b"cannot publish unverified Q"
+                                )
+                                .is_err()
+                        );
+                        fs::rename(&held, &q).unwrap();
+                        assert_eq!(
+                            terminal_lane
+                                .read_private_root_terminal(&receipt, &actor, &session)
+                                .unwrap()
+                                .execution,
+                            terminal.execution
+                        );
+                        let artifact = b"caller-output\nOULIPOLY_RESULT fixture\n";
+                        let publication = terminal_lane
+                            .begin_private_root_publication(&receipt, &actor, &session, artifact)
+                            .unwrap();
+                        assert_eq!(publication.publication_state, "unknown");
+                        assert_eq!(publication.execution_state, terminal.execution_state);
+                        assert_eq!(
+                            terminal_lane
+                                .begin_private_root_publication(
+                                    &receipt, &actor, &session, artifact
+                                )
+                                .unwrap()
+                                .publication_sha256,
+                            publication.publication_sha256
+                        );
+                        assert!(
+                            terminal_lane
+                                .begin_private_root_publication(
+                                    &receipt,
+                                    &actor,
+                                    &session,
+                                    b"different caller bytes"
+                                )
+                                .is_err()
+                        );
+                    }
                     assert_eq!(
                         fresh_state
                             .query_row::<i64, _, _>(
@@ -2536,6 +2819,33 @@ fn inner() {
                     assert_eq!(fs::read(&old_wal_path).ok(), old_wal_before);
                     assert_eq!(fs::read(&historical_sidecar).unwrap(), v29_main_before);
                     assert_eq!(fs::read(&v29_wal).ok(), v29_wal_before);
+                    if mode == "normal_model_provider" {
+                        stop(&mut broker);
+                        broker = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
+                            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
+                            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
+                            .stderr(Stdio::from(
+                                File::create(temp.path().join("root-terminal-restart.log"))
+                                    .unwrap(),
+                            ))
+                            .spawn()
+                            .unwrap();
+                        eventually(|| protocol::request_at(&socket, Operation::Classify).is_ok());
+                        let reopened = FreshV30Lane::open_at(&broker_state).unwrap();
+                        let replay = reopened
+                            .read_private_root_terminal(&receipt, &actor, &session)
+                            .unwrap();
+                        assert_eq!(replay.execution, terminal.execution);
+                        assert_eq!(replay.publication_state, "unknown");
+                        assert_eq!(
+                            reopened
+                                .settle_private_root_terminal(&receipt, &actor, &session)
+                                .unwrap()
+                                .execution,
+                            terminal.execution
+                        );
+                    }
                     stop(&mut broker);
                     return;
                 }

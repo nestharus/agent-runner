@@ -776,6 +776,23 @@ pub fn reserve_fresh_v30_child_request_at(
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FreshRecipientRequest {
+    /// Private exact root result/readback. D and the socket's pinned original
+    /// actor must both match; this never performs K, F, ACK or caller output.
+    ReadRootTerminal {
+        d_key: String,
+    },
+    SettleRootTerminal {
+        d_key: String,
+    },
+    RepairRootTerminal {
+        d_key: String,
+    },
+    /// The caller retains its exact bounded artifact bytes. This stores only
+    /// their hash/length as publication unknown, never a delivered assertion.
+    BeginRootPublication {
+        d_key: String,
+        artifact_base64: String,
+    },
     /// Explicit request by the original pinned root listener for a source
     /// registered response-only. An original async C can select notify itself.
     ActivateBashSource {
@@ -845,6 +862,26 @@ pub fn fresh_recipient_request_at(
         ));
     }
     serde_json::from_slice(&answer).map_err(io::Error::other)
+}
+
+pub fn fresh_root_terminal_request_at(
+    path: &Path,
+    request: &FreshRecipientRequest,
+) -> io::Result<oulipoly_state::mailbox::FreshRootTerminalReadback> {
+    if !matches!(
+        request,
+        FreshRecipientRequest::ReadRootTerminal { .. }
+            | FreshRecipientRequest::SettleRootTerminal { .. }
+            | FreshRecipientRequest::RepairRootTerminal { .. }
+            | FreshRecipientRequest::BeginRootPublication { .. }
+    ) {
+        return Err(io::Error::other("not a fresh root terminal request"));
+    }
+    let value = fresh_recipient_request_at(path, request)?;
+    if value["kind"] != "root_terminal_readback" {
+        return Err(io::Error::other("fresh root terminal reply kind changed"));
+    }
+    serde_json::from_value(value["terminal"].clone()).map_err(io::Error::other)
 }
 
 fn fresh_v30_session_request_at(

@@ -1303,8 +1303,42 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
             &e.to_string(),
         )
     })?;
-    // This private route has no source W / recipient ACK or root terminal
-    // publication. A mapped provider result cannot imply CLI completion.
+    if std::env::var_os("AGE319_PRIVATE_ROOT_TERMINAL_V1").is_some() {
+        use protocol::FreshRecipientRequest;
+        let d_key = backend.authority.receipt.d_key.clone();
+        let recorded = protocol::fresh_root_terminal_request_at(
+            &socket,
+            &FreshRecipientRequest::SettleRootTerminal {
+                d_key: d_key.clone(),
+            },
+        )
+        .map_err(|e| format!("private root terminal settle failed: {e}"))?;
+        let read = protocol::fresh_root_terminal_request_at(
+            &socket,
+            &FreshRecipientRequest::ReadRootTerminal {
+                d_key: d_key.clone(),
+            },
+        )
+        .map_err(|e| format!("private root terminal readback failed: {e}"))?;
+        if recorded != read {
+            return Err("private root terminal lost reply readback changed".into());
+        }
+        let repaired = protocol::fresh_root_terminal_request_at(
+            &socket,
+            &FreshRecipientRequest::RepairRootTerminal { d_key },
+        )
+        .map_err(|e| format!("private root terminal repair readback failed: {e}"))?;
+        if repaired != read {
+            return Err("private root terminal exact repair changed record".into());
+        }
+        std::fs::write(
+            std::path::Path::new(&gate).join("root-terminal-readback.json"),
+            serde_json::to_vec(&read).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    // The private mapped result and terminal readback do not activate the
+    // ordinary caller publication path.
     Err("private provider runtime result mapped after Q; root terminal publication closed".into())
 }
 

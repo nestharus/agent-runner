@@ -6842,6 +6842,25 @@
       }
     },
     {
+      "id": "state.mailbox.fresh-root-terminal.verify-buffer-bytes",
+      "owner": "state/mailbox/fresh_root_terminal",
+      "class": "resource_guard",
+      "protected_resource": "stack scratch memory while verifying broker-retained parent output for private terminal readback",
+      "exhaustion_behavior": "Verification hashes successive chunks until EOF; this buffer imposes no total output limit.",
+      "observability": "A read, length, inode, or digest mismatch returns an exact parent output verification error.",
+      "configurability": "Fixed private terminal verification chunk size with no runtime override.",
+      "rationale": "The 64 KiB scratch buffer bounds each read while checking complete parent output against the physical Q receipt.",
+      "default_value": "64 * 1024",
+      "source": "crates/oulipoly-state/src/mailbox/fresh_root_terminal.rs",
+      "symbol": "FRESH_ROOT_TERMINAL_VERIFY_BUFFER_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/mailbox/fresh_root_terminal.rs",
+        "scope": "module::impl:FreshV30Lane::fn:terminal_output",
+        "kind": "direct_control"
+      }
+    },
+    {
       "id": "state.mailbox.payload-digest-buffer-bytes",
       "owner": "state/mailbox",
       "class": "resource_guard",

@@ -151,6 +151,8 @@ fn private_fresh_dual_lane_live_old_wal_collision_and_restart() {
     let schemas = [
         "fresh_released_handoff",
         "fresh_root_effect",
+        "fresh_root_terminal",
+        "fresh_root_publication",
         "fresh_bash_child",
         "fresh_normal_work_preparation",
     ];

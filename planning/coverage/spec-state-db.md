@@ -34,6 +34,7 @@
 - `crates/oulipoly-state/src/mailbox/fresh_bash_source.rs`
 - `crates/oulipoly-state/src/mailbox/fresh_bash_notify.rs`
 - `crates/oulipoly-state/src/mailbox/fresh_bash_listener.rs`
+- `crates/oulipoly-state/src/mailbox/fresh_root_terminal.rs`
 - `crates/oulipoly-state/src/mailbox/migrations/0031_fresh_released_handoff.sql`
 - `crates/oulipoly-state/src/mailbox/migrations/0032_fresh_root_effect.sql`
 - `crates/oulipoly-state/src/mailbox/migrations/0033_fresh_bash_child.sql`
@@ -41,6 +42,8 @@
 - `crates/oulipoly-state/src/mailbox/migrations/0035_fresh_bash_source.sql`
 - `crates/oulipoly-state/src/mailbox/migrations/0036_fresh_bash_notify.sql`
 - `crates/oulipoly-state/src/mailbox/migrations/0037_fresh_bash_listener.sql`
+- `crates/oulipoly-state/src/mailbox/migrations/0038_fresh_root_terminal.sql`
+- `crates/oulipoly-state/src/mailbox/migrations/0039_fresh_recipient_ack.sql`
 - `crates/oulipoly-state/src/mailbox/migrations/0030_fresh_state_identity.sql`
 - `crates/oulipoly-state/tests/age319_fresh_dual_lane.rs`
 - `crates/oulipoly-state/src/mailbox/fresh_recipient.rs`
@@ -123,6 +126,8 @@
 | Original Bash C registers its listener policy. | State retains exact response-only or notify policy with C/D, source, attempt, original root recipient, and owner generation. Same-ID C/c readback refuses changed policy. |
 | The broker freezes a Bash child source event after consumed child K and physical Q. | State checks C/D, parent consumed K/work, child K/exit/drain/PID1 wait and original output bytes against the broker's captured receipt. Selected W and accepted-source fact commit together; interrupted acceptance is repaired from the same event without a new K. Bash O cannot substitute for physical output. |
 | An original notify listener settles an accepted W, or the pinned root explicitly requests notification. | State retains the exact request and original recipient attachment before sidecar F materialization from verified raw stdout/stderr. Restart repairs partial materialization from the same W. Response-only W alone produces no F; F submission and token ACK remain separate, and offline pending delivery is not settled by repair. |
+| A private released root reaches complete physical provider Q, with an optional accepted Bash W. | An immutable terminal row binds D/handoff, J/session, original actor/owner generation, independently checked parent K/Q/hashed output and exact child C/D/K/Q/W when present. Readback derives listener F/ACK and caller publication separately; unknown or submitted F is pending, manual ACK is labeled, and publication unknown cannot turn work into failure or replay. Missing physical evidence stays explicit unknown. |
+| A fresh recipient manually or delegated-manually acknowledges an exact F grant. | The same transaction records an immutable ACK evidence row joining the delivery row, grant, token digest, recipient, accepted source and retained payload with the manual or delegated basis. A zero-row update, legacy listener row, or ACKed grant without this evidence cannot make terminal readback report ACK. |
 | A released root with typed normal CLI intent reaches fresh preparation. | One immutable `held` row binds the exact U/D handoff, invocation, session, actor and intent. Retry reads that row; there is no provider fork, native K/Q, result or physical-drain transition. |
 | Existing DB at a known-incompatible past version (no migration path). | Open fails with `MigrationUnsupported`; advise the operator to reset or restore. |
 | Concurrent reader during writer migration. | SQLite WAL + retry handles short waits; long contention surfaces as `DbBusy`. |
