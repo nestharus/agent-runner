@@ -14,6 +14,9 @@ use oulipoly_kernel_broker::identity::{
 };
 use oulipoly_kernel_broker::installed_launch::{self, InstalledLaunchSpec};
 use oulipoly_kernel_broker::installed_pair::{self, InstalledPair};
+use oulipoly_kernel_broker::native_receipt::{
+    BoundNativeAuthority, verify as verify_native_receipt,
+};
 use oulipoly_kernel_broker::protocol::{
     AcceptedWorkSpec, JoinSpec, JoinedChildWitness, LaunchAcceptedWorkSpec, NativeKSpec,
     NativePrepareSpec, OwnerWitness, ProcessWitness, SourceControlUse, SourceScope,
@@ -82,8 +85,8 @@ fn checked_root_path(path: &Path, directory: bool) -> io::Result<()> {
 
 // The current installed Runner still has direct user-sidecar writers. A v30
 // database must not admit that image into a new root or let it exercise the
-// old source/control/work endpoint. Y/R/W are the staged, generation-bound
-// broker State protocol; I is a read-only live route observation. None can
+// old source/control/work endpoint. Y/R/W and v30 N/t are generation-bound
+// broker authority checks; I is a read-only live route observation. None can
 // create a root on their own. Remove this gate only with the complete
 // production caller routing and image-version
 // admission protocol, never as part of ordinary broker startup.
@@ -98,13 +101,13 @@ fn require_cutover_entry_route(
     if gate_closed {
         return Err(io::Error::other("broker entry gate is durably closed"));
     }
-    if !broker_owned_sidecar && matches!(operation, b'e' | b'p' | b'g' | b'a' | b'j') {
+    if !broker_owned_sidecar && matches!(operation, b'e' | b'p' | b'g' | b'a' | b'j' | b't') {
         return Err(io::Error::other("v30 entry requires broker-owned sidecar"));
     }
     if broker_owned_sidecar
         && !matches!(
             operation,
-            b'Y' | b'R' | b'W' | b'I' | b'e' | b'p' | b'g' | b'a' | b'j'
+            b'Y' | b'R' | b'W' | b'I' | b'e' | b'p' | b'g' | b'a' | b'j' | b'N' | b't'
         )
     {
         #[cfg(feature = "age319-private-broker-fixture")]
@@ -163,6 +166,10 @@ enum RequestPayload {
     NativeK {
         spec: NativeKSpec,
         descriptors: [File; 4],
+    },
+    NativeKV30 {
+        spec: NativeKSpec,
+        descriptors: [File; 3],
     },
     LaunchAcceptedWork {
         spec: LaunchAcceptedWorkSpec,
@@ -297,9 +304,8 @@ fn recv_request(
         b'A' | b'a' => read == 33,
         b'J' | b'j' => (18..=48 * 1024 + 17).contains(&read),
         b'L' => (18..=48 * 1024 + 17).contains(&read),
-        b'V' | b'S' | b's' | b'T' | b'H' | b'K' | b'B' | b'N' | b'k' | b'R' | b'W' | b'Y' => {
-            (18..=2048 + 17).contains(&read)
-        }
+        b'V' | b'S' | b's' | b'T' | b'H' | b'K' | b'B' | b'N' | b'k' | b't' | b'R' | b'W'
+        | b'Y' => (18..=2048 + 17).contains(&read),
         _ => read == 17,
     };
     if !valid_length
@@ -311,7 +317,7 @@ fn recv_request(
     if invalid_ancillary
         || match request[0] {
             b'J' | b'j' | b'H' => descriptors.len() != 5,
-            b'N' => descriptors.len() != 3,
+            b'N' | b't' => descriptors.len() != 3,
             b'k' => descriptors.len() != 4,
             b'K' => descriptors.len() != 7,
             b'L' => !(1..=4).contains(&descriptors.len()),
@@ -392,6 +398,12 @@ fn recv_request(
             descriptors: descriptors
                 .try_into()
                 .map_err(|_| io::Error::other("native K descriptors"))?,
+        },
+        b't' => RequestPayload::NativeKV30 {
+            spec: serde_json::from_slice(&request[17..read as usize])?,
+            descriptors: descriptors
+                .try_into()
+                .map_err(|_| io::Error::other("v30 native K descriptors"))?,
         },
         b'K' => RequestPayload::LaunchAcceptedWork {
             spec: serde_json::from_slice(&request[17..read as usize])?,
@@ -2701,18 +2713,99 @@ fn serve() -> io::Result<()> {
                 )?;
                 Ok(format!("prepared-work {}\n", grant.grant_id))
             } else if operation == b'N' {
-                if broker_sidecar.is_some() {
-                    return Err(io::Error::other(
-                        "legacy native prepare is closed after broker sidecar cutover",
-                    ));
-                }
                 let RequestPayload::PrepareNative { spec, descriptors } = payload else {
                     return Err(io::Error::other("invalid native prepare payload"));
                 };
+                let [directory, request, receipt] = descriptors;
+                if let Some(sidecar) = broker_sidecar.as_mut() {
+                    if spec.protocol != "native-continuation-v30" {
+                        return Err(io::Error::other("v30 native prepare protocol required"));
+                    }
+                    let exact = read_broker_state(
+                        StateReadSpec {
+                            protocol: "broker-state-read-v1".into(),
+                            source_generation: sidecar.source_generation().into(),
+                            root_id: spec.root_id.clone(),
+                            owner_generation: spec.owner_generation.clone(),
+                            attempt_id: Some(spec.attempt_id.clone()),
+                        },
+                        &peer,
+                        &host_namespace,
+                        &runner_image,
+                        &registry,
+                        &works,
+                        &entries,
+                        sidecar,
+                    )?;
+                    if !exact.broker_owned
+                        || exact.owner.guardian_identity.pid != i64::from(peer.process.host_pid)
+                        || exact.attempt.as_ref().map(|a| a.attempt_id.as_str())
+                            != Some(spec.attempt_id.as_str())
+                        || exact.phase.as_deref() != Some("accepted")
+                        || exact.revision != Some(2)
+                        || !exact.claim_present
+                        || exact
+                            .attempt
+                            .as_ref()
+                            .is_none_or(|attempt| attempt.operation != "activation")
+                    {
+                        return Err(io::Error::other(
+                            "v30 native prepare lacks broker-owned acceptance",
+                        ));
+                    }
+                    let guardian = ProcessStamp::from(&peer.process);
+                    let bound = BoundNativeAuthority {
+                        root_id: &spec.root_id,
+                        domain_id: &exact.owner.domain_id,
+                        supervisor_authority_id: &exact.owner.supervisor_authority_id,
+                        owner_generation: &spec.owner_generation,
+                        owner_uid: peer.uid,
+                        guardian: &guardian,
+                        host_namespace: &host_namespace,
+                        runner_image: &runner_image,
+                        receipt_sha256: &spec.receipt_sha256,
+                    };
+                    let verified =
+                        verify_native_receipt(&peer, &bound, &directory, &request, &receipt)?;
+                    if verified.attempt_id != spec.attempt_id
+                        || exact.attempt.as_ref() != Some(&verified.accepted_snapshot.attempt)
+                    {
+                        return Err(io::Error::other(
+                            "v30 native receipt differs from accepted attempt",
+                        ));
+                    }
+                    let grant = grants.prepare_native_v30(
+                        &registry,
+                        &entries,
+                        &works,
+                        &peer,
+                        &host_namespace,
+                        &runner_image,
+                        &directory,
+                        &request,
+                        &receipt,
+                        &spec.root_id,
+                        &spec.attempt_id,
+                        &spec.owner_generation,
+                        &spec.receipt_sha256,
+                        sidecar.source_generation(),
+                    )?;
+                    let generation = sidecar.source_generation().to_owned();
+                    sidecar
+                        .bind_exact_native_grant_v30(
+                            &generation,
+                            &spec.root_id,
+                            &exact.owner,
+                            &verified.accepted_snapshot,
+                            &grant.grant_id,
+                            &verified.custodian_request_sha256,
+                        )
+                        .map_err(io::Error::other)?;
+                    return Ok(format!("prepared-native-v30 {}\n", grant.grant_id));
+                }
                 if spec.protocol != "native-continuation-v1" {
                     return Err(io::Error::other("unsupported native prepare protocol"));
                 }
-                let [directory, request, receipt] = descriptors;
                 let grant = grants.prepare_native(
                     &registry,
                     &entries,
@@ -2757,6 +2850,30 @@ fn serve() -> io::Result<()> {
                 )?;
                 Err(io::Error::other(
                     "native K fixed Runner attach/release closed",
+                ))
+            } else if operation == b't' {
+                let sidecar = broker_sidecar
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("v30 native K requires broker State"))?;
+                let RequestPayload::NativeKV30 { spec, descriptors } = payload else {
+                    return Err(io::Error::other("invalid v30 native K payload"));
+                };
+                let [directory, request, receipt] = descriptors;
+                grants.inspect_native_k_v30(
+                    &spec,
+                    &registry,
+                    &entries,
+                    &works,
+                    &peer,
+                    &host_namespace,
+                    &runner_image,
+                    &directory,
+                    &request,
+                    &receipt,
+                    sidecar,
+                )?;
+                Err(io::Error::other(
+                    "v30 native K physical attach/release remains closed",
                 ))
             } else if operation == b'K' {
                 let RequestPayload::LaunchAcceptedWork { spec, descriptors } = payload else {
@@ -3063,8 +3180,8 @@ mod tests {
     #[test]
     fn v30_service_refuses_every_legacy_entry_and_work_operation() {
         for operation in [
-            b'E', b'P', b'G', b'A', b'J', b'B', b'V', b'S', b's', b'T', b'H', b'N', b'k', b'K',
-            b'Q', b'Z', b'C', b'L',
+            b'E', b'P', b'G', b'A', b'J', b'B', b'V', b'S', b's', b'T', b'H', b'k', b'K', b'Q',
+            b'Z', b'C', b'L',
         ] {
             assert!(
                 require_cutover_entry_route(operation, true, false).is_err(),
@@ -3073,7 +3190,7 @@ mod tests {
             );
             assert!(require_cutover_entry_route(operation, false, false).is_ok());
         }
-        for operation in [b'Y', b'R', b'W', b'I'] {
+        for operation in [b'Y', b'R', b'W', b'I', b'N', b't'] {
             assert!(require_cutover_entry_route(operation, true, false).is_ok());
             assert!(require_cutover_entry_route(operation, false, true).is_err());
         }
@@ -3086,8 +3203,8 @@ mod tests {
             assert!(require_cutover_entry_route(operation, true, true).is_ok());
         }
         for operation in [
-            b'E', b'P', b'G', b'A', b'J', b'B', b'V', b'S', b's', b'T', b'H', b'N', b'k', b'K',
-            b'Q', b'Z', b'C', b'L', b'Y', b'R', b'W', b'I',
+            b'E', b'P', b'G', b'A', b'J', b'B', b'V', b'S', b's', b'T', b'H', b'N', b'k', b't',
+            b'K', b'Q', b'Z', b'C', b'L', b'Y', b'R', b'W', b'I',
         ] {
             assert!(
                 require_cutover_entry_route(operation, false, true).is_err(),
@@ -3822,6 +3939,80 @@ assert s.send(message) == len(message)
                 assert_eq!(
                     libc::sendmsg(client.as_raw_fd(), &message, 0),
                     request.len() as isize
+                );
+            }
+        }
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn v30_native_k_frame_has_no_sidecar_descriptor_or_argv() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("socket");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let spec = NativeKSpec {
+            protocol: "native-continuation-v30".into(),
+            grant_id: uuid::Uuid::new_v4().to_string(),
+            root_id: uuid::Uuid::new_v4().to_string(),
+            attempt_id: uuid::Uuid::new_v4().to_string(),
+            owner_generation: uuid::Uuid::new_v4().to_string(),
+            receipt_sha256: "a".repeat(64),
+        };
+        let server = thread::spawn(move || {
+            for index in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                if index == 0 {
+                    let (operation, payload, _) = peer_from_request(&mut stream).unwrap();
+                    assert_eq!(operation, b't');
+                    let RequestPayload::NativeKV30 { spec, descriptors } = payload else {
+                        panic!("v30 native K decoded as another operation");
+                    };
+                    assert_eq!(spec.protocol, "native-continuation-v30");
+                    assert_eq!(descriptors.len(), 3);
+                } else {
+                    assert!(peer_from_request(&mut stream).is_err());
+                }
+            }
+        });
+        for index in 0..3 {
+            let mut client = UnixStream::connect(&socket).unwrap();
+            let mut challenge = [0u8; 16];
+            client.read_exact(&mut challenge).unwrap();
+            let mut body = serde_json::to_value(&spec).unwrap();
+            if index == 2 {
+                body["argv"] = serde_json::json!(["/bin/sh"]);
+            }
+            let mut frame = vec![b't'];
+            frame.extend_from_slice(&challenge);
+            frame.extend_from_slice(&serde_json::to_vec(&body).unwrap());
+            let files: Vec<_> = (0..if index == 1 { 4 } else { 3 })
+                .map(|_| File::open("/dev/null").unwrap())
+                .collect();
+            let fds: Vec<_> = files.iter().map(AsRawFd::as_raw_fd).collect();
+            let mut iov = libc::iovec {
+                iov_base: frame.as_mut_ptr().cast(),
+                iov_len: frame.len(),
+            };
+            let mut control = [0u8; 128];
+            let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+            message.msg_iov = &mut iov;
+            message.msg_iovlen = 1;
+            message.msg_control = control.as_mut_ptr().cast();
+            message.msg_controllen =
+                unsafe { libc::CMSG_SPACE(std::mem::size_of_val(fds.as_slice()) as _) } as _;
+            unsafe {
+                let cmsg = libc::CMSG_FIRSTHDR(&message);
+                (*cmsg).cmsg_level = libc::SOL_SOCKET;
+                (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+                (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(fds.as_slice()) as _) as _;
+                std::ptr::copy_nonoverlapping(
+                    fds.as_ptr(),
+                    libc::CMSG_DATA(cmsg).cast(),
+                    fds.len(),
+                );
+                assert_eq!(
+                    libc::sendmsg(client.as_raw_fd(), &message, 0),
+                    frame.len() as isize
                 );
             }
         }

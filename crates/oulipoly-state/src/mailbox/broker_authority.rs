@@ -321,6 +321,14 @@ pub struct BrokerReleaseEvidence {
     pub owner: super::CompletionDomainOwner,
 }
 
+/// Exact native grant readback from the retained v30 connection. This is
+/// acceptance and one-to-one binding evidence, not worker execution or Q.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct BrokerNativeGrantReadback {
+    pub source_generation: String,
+    pub binding: super::NativeGrantBinding,
+}
+
 impl BrokerSidecar {
     fn bound_state(&self) -> Result<StateDb, String> {
         let source = self
@@ -1431,6 +1439,126 @@ impl BrokerSidecar {
             return Err("broker acceptance readback conflict".into());
         }
         Ok((snapshot, after))
+    }
+
+    /// Bind a broker grant only to this connection's accepted, broker-owned
+    /// attempt. The accepted snapshot is checked against the live row by the
+    /// existing State CAS; a copied v29 row or a caller-selected MailboxDb can
+    /// never enter this method. Exact readback also resolves a lost CAS reply.
+    pub fn bind_exact_native_grant_v30(
+        &mut self,
+        source_generation: &str,
+        root_id: &str,
+        owner: &super::CompletionDomainOwner,
+        accepted: &super::AcceptedNativeGrantSnapshot,
+        grant_id: &str,
+        request_sha256: &str,
+    ) -> Result<BrokerNativeGrantReadback, String> {
+        let existing = self.read_exact_native_grant_v30(
+            source_generation,
+            root_id,
+            owner,
+            accepted,
+            grant_id,
+            request_sha256,
+        )?;
+        if let Some(existing) = existing {
+            return Ok(existing);
+        }
+        self.mailbox
+            .bind_exact_native_grant(accepted, grant_id, request_sha256)?;
+        self.read_exact_native_grant_v30(
+            source_generation,
+            root_id,
+            owner,
+            accepted,
+            grant_id,
+            request_sha256,
+        )?
+        .ok_or("broker native binding absent after commit".into())
+    }
+
+    /// Exact PK readback for N/K uncertainty. A historical copied v29 native
+    /// binding remains in the database, but its owner lacks broker provenance.
+    pub fn read_exact_native_grant_v30(
+        &self,
+        source_generation: &str,
+        root_id: &str,
+        owner: &super::CompletionDomainOwner,
+        accepted: &super::AcceptedNativeGrantSnapshot,
+        grant_id: &str,
+        request_sha256: &str,
+    ) -> Result<Option<BrokerNativeGrantReadback>, String> {
+        self.check_mailbox_read(source_generation)?;
+        let exact = self.read_exact_continuation(
+            source_generation,
+            root_id,
+            &owner.domain_id,
+            &owner.supervisor_authority_id,
+            &owner.owner_generation,
+            Some(&accepted.attempt.attempt_id),
+        )?;
+        if !exact.broker_owned
+            || exact.owner != *owner
+            || exact.attempt.as_ref() != Some(&accepted.attempt)
+            || exact.phase.as_deref() != Some("accepted")
+            || exact.revision != Some(2)
+            || !exact.claim_present
+            || accepted.phase != "accepted"
+            || accepted.revision != 2
+            || accepted.integrated
+            || accepted.custodian_identity.is_some()
+            || accepted.adopter_identity.is_some()
+            || accepted.domain_id != owner.domain_id
+            || accepted.kernel_root_id != root_id
+            || accepted.supervisor_authority_id != owner.supervisor_authority_id
+            || accepted.owner_generation != owner.owner_generation
+            || accepted.guardian_identity != owner.guardian_identity
+            || accepted.attempt.operation != "activation"
+        {
+            return Err("broker native K requires exact v30 accepted owner/attempt".into());
+        }
+        let (integrated, custodian, adopter): (i64, Option<String>, Option<String>) = self
+            .mailbox
+            .conn
+            .query_row(
+                "SELECT integrated,custodian_identity,adopter_identity
+                 FROM completion_continuation_attempt WHERE attempt_id=?1",
+                [&accepted.attempt.attempt_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|error| error.to_string())?;
+        if integrated != 0 || custodian.is_some() || adopter.is_some() {
+            return Err("broker native K attempt already has physical custody".into());
+        }
+        let binding = self
+            .mailbox
+            .native_grant_binding(&accepted.attempt.attempt_id)?;
+        let Some(binding) = binding else {
+            return Ok(None);
+        };
+        let accepted_sha256 = crate::completion_continuation::sha256(
+            &serde_json::to_vec(accepted).map_err(|error| error.to_string())?,
+        );
+        if binding.attempt_id != accepted.attempt.attempt_id
+            || binding.grant_id != grant_id
+            || binding.protocol != "native-continuation-v1"
+            || binding.accepted_revision != 2
+            || binding.domain_id != owner.domain_id
+            || binding.kernel_root_id != root_id
+            || binding.supervisor_authority_id != owner.supervisor_authority_id
+            || binding.owner_generation != owner.owner_generation
+            || binding.guardian_identity != owner.guardian_identity
+            || binding.accepted_snapshot_sha256 != accepted_sha256
+            || binding.custodian_request_sha256 != request_sha256
+        {
+            return Err("broker native K exact binding conflict".into());
+        }
+        self.check_mailbox_read(source_generation)?;
+        Ok(Some(BrokerNativeGrantReadback {
+            source_generation: source_generation.into(),
+            binding,
+        }))
     }
 
     /// Exact owner, reservation, wake claim and acceptance readback in one
@@ -3476,10 +3604,31 @@ mod tests {
             Some("reserved"),
             "a stale writer's retired source cannot alter the broker endpoint"
         );
-        broker
+        let copied_snapshot = broker
             .mailbox_mut()
             .accept_exact_native_attempt(&attempt, &owner, &root_id)
             .unwrap();
+        broker
+            .mailbox_mut()
+            .bind_exact_native_grant(
+                &copied_snapshot,
+                &uuid::Uuid::new_v4().to_string(),
+                &"c".repeat(64),
+            )
+            .unwrap();
+        assert!(
+            broker
+                .read_exact_native_grant_v30(
+                    &generation,
+                    &root_id,
+                    &owner,
+                    &copied_snapshot,
+                    &uuid::Uuid::new_v4().to_string(),
+                    &"c".repeat(64)
+                )
+                .is_err(),
+            "retained copied v29 owner cannot authorize native K"
+        );
         let accepted = read(
             &broker,
             &generation,
@@ -3549,10 +3698,134 @@ mod tests {
                 .is_err(),
             "reservation replay must not create a second row"
         );
-        let (_, new_accepted) = broker
+        let (new_snapshot, new_accepted) = broker
             .accept_exact_attempt(&new_owner, &root_id, &new_attempt)
             .unwrap();
         assert_eq!(new_accepted.phase.as_deref(), Some("accepted"));
+        assert!(
+            broker
+                .bind_exact_native_grant_v30(
+                    &generation,
+                    &root_id,
+                    &new_owner,
+                    &new_snapshot,
+                    &uuid::Uuid::new_v4().to_string(),
+                    &"d".repeat(64),
+                )
+                .is_err(),
+            "a transport row is not an accepted provider invocation"
+        );
+        broker.mailbox_mut().conn.execute(
+            "INSERT INTO session_wake_claim(session_id,claim_token,claimed_at,reason,auto_wake_count) VALUES('native-session','native-claim','2026-09-23T00:00:00Z','fixture',1)",
+            [],
+        ).unwrap();
+        let native_attempt = super::super::ContinuationAttempt {
+            attempt_id: uuid::Uuid::new_v4().to_string(),
+            operation: "activation".into(),
+            session_id: Some("native-session".into()),
+            claim_token: Some("native-claim".into()),
+            result_path: "/fixture/native-result".into(),
+            ..new_attempt.clone()
+        };
+        broker
+            .reserve_exact_attempt(&new_owner, &root_id, &native_attempt)
+            .unwrap();
+        let (native_snapshot, _) = broker
+            .accept_exact_attempt(&new_owner, &root_id, &native_attempt)
+            .unwrap();
+        let native_grant = uuid::Uuid::new_v4().to_string();
+        let request_digest = "d".repeat(64);
+        let native = broker
+            .bind_exact_native_grant_v30(
+                &generation,
+                &root_id,
+                &new_owner,
+                &native_snapshot,
+                &native_grant,
+                &request_digest,
+            )
+            .unwrap();
+        assert_eq!(native.source_generation, generation);
+        assert_eq!(native.binding.grant_id, native_grant);
+        assert_eq!(
+            broker
+                .bind_exact_native_grant_v30(
+                    &generation,
+                    &root_id,
+                    &new_owner,
+                    &native_snapshot,
+                    &native_grant,
+                    &request_digest,
+                )
+                .unwrap(),
+            native,
+            "lost bind reply reads the same grant"
+        );
+        let restarted = open_with_owner(&target, uid, root.path()).unwrap();
+        assert_eq!(
+            restarted
+                .read_exact_native_grant_v30(
+                    &generation,
+                    &root_id,
+                    &new_owner,
+                    &native_snapshot,
+                    &native_grant,
+                    &request_digest,
+                )
+                .unwrap(),
+            Some(native.clone()),
+            "broker restart reads one retained State binding"
+        );
+        assert!(
+            broker
+                .read_exact_native_grant_v30(
+                    "retired-generation",
+                    &root_id,
+                    &new_owner,
+                    &native_snapshot,
+                    &native_grant,
+                    &request_digest,
+                )
+                .is_err()
+        );
+        assert!(
+            broker
+                .read_exact_native_grant_v30(
+                    &generation,
+                    &uuid::Uuid::new_v4().to_string(),
+                    &new_owner,
+                    &native_snapshot,
+                    &native_grant,
+                    &request_digest,
+                )
+                .is_err()
+        );
+        let mut wrong_snapshot = native_snapshot.clone();
+        wrong_snapshot.attempt.result_path = "/fixture/sibling-result".into();
+        assert!(
+            broker
+                .read_exact_native_grant_v30(
+                    &generation,
+                    &root_id,
+                    &new_owner,
+                    &wrong_snapshot,
+                    &native_grant,
+                    &request_digest,
+                )
+                .is_err()
+        );
+        assert!(
+            broker
+                .read_exact_native_grant_v30(
+                    &generation,
+                    &root_id,
+                    &new_owner,
+                    &native_snapshot,
+                    &uuid::Uuid::new_v4().to_string(),
+                    &request_digest,
+                )
+                .is_err()
+        );
         assert!(
             broker
                 .accept_exact_attempt(&new_owner, &root_id, &new_attempt)

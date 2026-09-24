@@ -991,6 +991,20 @@ impl RootSupervisor {
         if attempt.owner_generation != owner.owner_generation {
             return Err("root supervisor rejected a foreign owner generation".into());
         }
+        if self.kernel_pinned
+            && matches!(
+                protocol::state_route_at(&super::linux::owner_broker_socket()),
+                Ok(protocol::StateRoute::BrokerOwned { .. })
+            )
+        {
+            // The v29 path below opens self.path and owns its local worker.
+            // A v30 attempt must first cross the broker's retained acceptance
+            // and physical attach route; neither a user-sidecar nor this local
+            // child may be promoted to K.
+            return Err(
+                "v30 native worker requires broker-routed acceptance and physical attach".into(),
+            );
+        }
         let request_path = super::custody::request_path(attempt)?;
         let request_file = std::fs::OpenOptions::new()
             .read(true)

@@ -54,6 +54,7 @@ pub struct BoundNativeAuthority<'a> {
 #[derive(Debug, PartialEq, Eq)]
 pub struct VerifiedNativeReceipt {
     pub attempt_id: String,
+    pub accepted_snapshot: AcceptedNativeGrantSnapshot,
     /// Path in the guardian's immutable, digest-bound request, never a K claim.
     pub state_path: PathBuf,
     pub accepted_snapshot_sha256: String,
@@ -173,6 +174,7 @@ pub fn verify(
     }
     Ok(VerifiedNativeReceipt {
         attempt_id: accepted.attempt.attempt_id.clone(),
+        accepted_snapshot: accepted.clone(),
         state_path: request_identity.path,
         accepted_snapshot_sha256: evidence.accepted_sha256,
         custodian_request_sha256: evidence.custodian_request_sha256,
@@ -955,6 +957,77 @@ mod tests {
             ..bound
         };
         assert!(verify(&peer, &wrong_sha, &directory, &request, &receipt).is_err());
+        let v30_dir = dir.path().join("v30-grants");
+        fs::create_dir(&v30_dir).unwrap();
+        let generation = uuid::Uuid::new_v4().to_string();
+        let mut v30 = GrantRegistry::open(&v30_dir).unwrap();
+        let v30_record = v30
+            .prepare_native_v30(
+                &roots,
+                &entries,
+                &works,
+                &peer,
+                &host_namespace,
+                &runner_image,
+                &directory,
+                &request,
+                &receipt,
+                &root,
+                &attempt.attempt_id,
+                &owner.owner_generation,
+                &receipt_sha,
+                &generation,
+            )
+            .unwrap();
+        assert_eq!(v30_record.version, 5);
+        assert_eq!(v30_record.kind, "native-continuation-v30");
+        assert_eq!(
+            v30_record.source_generation.as_deref(),
+            Some(generation.as_str())
+        );
+        assert!(v30_record.state_path.is_none() && v30_record.state_file.is_none());
+        drop(v30);
+        let mut v30 = GrantRegistry::open(&v30_dir).unwrap();
+        assert_eq!(
+            v30.prepare_native_v30(
+                &roots,
+                &entries,
+                &works,
+                &peer,
+                &host_namespace,
+                &runner_image,
+                &directory,
+                &request,
+                &receipt,
+                &root,
+                &attempt.attempt_id,
+                &owner.owner_generation,
+                &receipt_sha,
+                &generation,
+            )
+            .unwrap(),
+            v30_record,
+            "lost v30 N reply must reuse one grant"
+        );
+        assert!(
+            v30.prepare_native_v30(
+                &roots,
+                &entries,
+                &works,
+                &peer,
+                &host_namespace,
+                &runner_image,
+                &directory,
+                &request,
+                &receipt,
+                &root,
+                &attempt.attempt_id,
+                &owner.owner_generation,
+                &receipt_sha,
+                &uuid::Uuid::new_v4().to_string(),
+            )
+            .is_err()
+        );
         fs::write(&request_path, b"replaced bytes").unwrap();
         assert!(verify(&peer, &bound, &directory, &request, &receipt).is_err());
         assert!(

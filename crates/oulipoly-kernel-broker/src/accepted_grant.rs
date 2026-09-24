@@ -7,7 +7,7 @@ use crate::native_receipt::{BoundNativeAuthority, verify as verify_native_receip
 use crate::protocol::NativeKSpec;
 use crate::registry::RootRegistry;
 use crate::work_registry::WorkRegistry;
-use oulipoly_state::mailbox::{MailboxDb, NativeGrantBinding};
+use oulipoly_state::mailbox::{BrokerSidecar, MailboxDb, NativeGrantBinding};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -187,6 +187,10 @@ pub struct NativeGrantRecord {
     pub receipt: FileStamp,
     pub request_byte_len: u64,
     pub receipt_byte_len: u64,
+    /// Present only on a v30 grant prepared against the retained broker
+    /// sidecar. A v4 record, including one copied at cutover, is never K.
+    #[serde(default)]
+    pub source_generation: Option<String>,
     /// The sidecar named by the guardian's digest-bound request at N. This is
     /// diagnostic evidence only: the name was observed after acceptance and
     /// cannot identify the connection or WAL that committed acceptance.
@@ -546,9 +550,20 @@ impl GrantRegistry {
             let bytes = fs::read(entry.path())?;
             let value: serde_json::Value = serde_json::from_slice(&bytes)?;
             let version = value.get("version").and_then(|v| v.as_u64());
-            if version == Some(4) {
+            if matches!(version, Some(4 | 5)) {
                 let record: NativeGrantRecord = serde_json::from_slice(&bytes)?;
-                if record.kind != "native-continuation-v1"
+                if (record.version == 4
+                    && (record.kind != "native-continuation-v1"
+                        || record.source_generation.is_some()))
+                    || (record.version == 5
+                        && (record.kind != "native-continuation-v30"
+                            || record.state_path.is_some()
+                            || record.state_file.is_some()
+                            || record.source_generation.as_ref().is_none_or(|generation| {
+                                uuid::Uuid::parse_str(generation)
+                                    .map(|id| id.to_string() != *generation)
+                                    .unwrap_or(true)
+                            })))
                     || !matches!(record.state.as_str(), "prepared" | "consumed")
                     || uuid::Uuid::parse_str(&record.grant_id).is_err()
                     || format!("{}.json", record.grant_id) != name
@@ -688,6 +703,135 @@ impl GrantRegistry {
         Err(io::Error::other(
             "native K requires broker-owned accepted State authority; v4 N is preparation debt",
         ))
+    }
+
+    /// Closed v30 K preflight. All State evidence comes from the broker's
+    /// retained root-only connection. A successful return still cannot open
+    /// the worker gate until an exact physical attach/release record exists.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "independent process, receipt, and State authorities"
+    )]
+    pub fn inspect_native_k_v30(
+        &self,
+        spec: &NativeKSpec,
+        roots: &RootRegistry,
+        entries: &EntryRegistry,
+        works: &WorkRegistry,
+        caller: &PeerIdentity,
+        host_namespace: &File,
+        runner_image: &File,
+        directory: &File,
+        request: &File,
+        receipt: &File,
+        sidecar: &BrokerSidecar,
+    ) -> io::Result<NativeGrantRecord> {
+        if self.has_debt() || roots.has_debt() || entries.has_debt() || works.has_debt() {
+            return Err(io::Error::other("native K registry debt"));
+        }
+        let record = self
+            .native_records
+            .iter()
+            .find(|record| record.grant_id == spec.grant_id)
+            .ok_or_else(|| io::Error::other("native K grant absent"))?;
+        if record.version != 5
+            || record.kind != "native-continuation-v30"
+            || record.state != "prepared"
+            || record.source_generation.as_deref() != Some(sidecar.source_generation())
+            || record.state_path.is_some()
+            || record.state_file.is_some()
+            || spec.protocol != record.kind
+            || spec.root_id != record.root_id
+            || spec.attempt_id != record.attempt_id
+            || spec.owner_generation != record.owner_generation
+            || spec.receipt_sha256 != record.receipt_sha256
+        {
+            return Err(io::Error::other("native K v30 grant conflict"));
+        }
+        let root = roots
+            .live_roots()
+            .find(|root| root.record.root_id == record.root_id)
+            .ok_or_else(|| io::Error::other("native K root absent"))?;
+        let entry = entries
+            .record(&record.root_id)
+            .ok_or_else(|| io::Error::other("native K entry absent"))?;
+        if !entry.join_consumed
+            || entry.guardian.as_ref() != Some(&record.guardian)
+            || entry.joined_child.as_ref() != Some(&record.joined_child)
+            || entry.domain_id.as_deref() != Some(record.domain_id.as_str())
+            || entry.supervisor_authority_id.as_deref()
+                != Some(record.supervisor_authority_id.as_str())
+            || entry.owner_uid != record.owner_uid
+            || root.record.owner_uid != record.owner_uid
+            || ProcessStamp::from(&root.init) != record.root_init
+            || ProcessStamp::from(&caller.process) != record.guardian
+            || caller.uid != record.owner_uid
+            || !caller.process.in_namespace(host_namespace)?
+            || !caller.process.same_executable_as(runner_image)?
+        {
+            return Err(io::Error::other(
+                "native K v30 owner/root incarnation changed",
+            ));
+        }
+        let verified = verify_native_receipt(
+            caller,
+            &BoundNativeAuthority {
+                root_id: &record.root_id,
+                domain_id: &record.domain_id,
+                supervisor_authority_id: &record.supervisor_authority_id,
+                owner_generation: &record.owner_generation,
+                owner_uid: record.owner_uid,
+                guardian: &record.guardian,
+                host_namespace,
+                runner_image,
+                receipt_sha256: &record.receipt_sha256,
+            },
+            directory,
+            request,
+            receipt,
+        )?;
+        if verified.attempt_id != record.attempt_id
+            || verified.accepted_snapshot_sha256 != record.accepted_snapshot_sha256
+            || verified.custodian_request_sha256 != record.custodian_request_sha256
+            || FileStamp::of(directory)? != record.directory
+            || FileStamp::of(request)? != record.request
+            || FileStamp::of(receipt)? != record.receipt
+            || request.metadata()?.len() != record.request_byte_len
+            || receipt.metadata()?.len() != record.receipt_byte_len
+        {
+            return Err(io::Error::other("native K v30 receipt changed"));
+        }
+        let exact = sidecar
+            .read_exact_continuation(
+                sidecar.source_generation(),
+                &record.root_id,
+                &record.domain_id,
+                &record.supervisor_authority_id,
+                &record.owner_generation,
+                Some(&record.attempt_id),
+            )
+            .map_err(io::Error::other)?;
+        if !exact.broker_owned
+            || exact.owner.guardian_identity.pid != i64::from(caller.process.host_pid)
+        {
+            return Err(io::Error::other("native K v30 State owner absent"));
+        }
+        let bound = sidecar
+            .read_exact_native_grant_v30(
+                sidecar.source_generation(),
+                &record.root_id,
+                &exact.owner,
+                &verified.accepted_snapshot,
+                &record.grant_id,
+                &verified.custodian_request_sha256,
+            )
+            .map_err(io::Error::other)?;
+        if bound.is_none() {
+            return Err(io::Error::other("native K v30 State binding absent"));
+        }
+        root.init.verify()?;
+        caller.process.verify()?;
+        Ok(record.clone())
     }
 
     /// Diagnostic only: the guardian's N request names a sidecar, and N pins
@@ -846,6 +990,92 @@ impl GrantRegistry {
         owner_generation: &str,
         receipt_sha256: &str,
     ) -> io::Result<NativeGrantRecord> {
+        self.prepare_native_inner(
+            roots,
+            entries,
+            works,
+            caller,
+            host_namespace,
+            runner_image,
+            directory,
+            request,
+            receipt,
+            root_id,
+            attempt_id,
+            owner_generation,
+            receipt_sha256,
+            None,
+        )
+    }
+
+    /// v30 preparation records the broker's retained source generation. It
+    /// never opens the request's State path and cannot upgrade a v4 record.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "independent broker and receipt authorities"
+    )]
+    pub fn prepare_native_v30(
+        &mut self,
+        roots: &RootRegistry,
+        entries: &EntryRegistry,
+        works: &WorkRegistry,
+        caller: &PeerIdentity,
+        host_namespace: &File,
+        runner_image: &File,
+        directory: &File,
+        request: &File,
+        receipt: &File,
+        root_id: &str,
+        attempt_id: &str,
+        owner_generation: &str,
+        receipt_sha256: &str,
+        source_generation: &str,
+    ) -> io::Result<NativeGrantRecord> {
+        if uuid::Uuid::parse_str(source_generation)
+            .map(|id| id.to_string() != source_generation)
+            .unwrap_or(true)
+        {
+            return Err(io::Error::other("invalid native source generation"));
+        }
+        self.prepare_native_inner(
+            roots,
+            entries,
+            works,
+            caller,
+            host_namespace,
+            runner_image,
+            directory,
+            request,
+            receipt,
+            root_id,
+            attempt_id,
+            owner_generation,
+            receipt_sha256,
+            Some(source_generation),
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "independent broker and receipt authorities"
+    )]
+    fn prepare_native_inner(
+        &mut self,
+        roots: &RootRegistry,
+        entries: &EntryRegistry,
+        works: &WorkRegistry,
+        caller: &PeerIdentity,
+        host_namespace: &File,
+        runner_image: &File,
+        directory: &File,
+        request: &File,
+        receipt: &File,
+        root_id: &str,
+        attempt_id: &str,
+        owner_generation: &str,
+        receipt_sha256: &str,
+        source_generation: Option<&str>,
+    ) -> io::Result<NativeGrantRecord> {
         if self.has_debt()
             || roots.has_debt()
             || entries.has_debt()
@@ -898,11 +1128,19 @@ impl GrantRegistry {
         }
         root.init.verify()?;
         caller.process.verify()?;
-        let state_file = open_named_sidecar(&verified.state_path)?;
+        let state_file = if source_generation.is_none() {
+            Some(open_named_sidecar(&verified.state_path)?)
+        } else {
+            None
+        };
         let existing = self.native_record(attempt_id);
         let record = NativeGrantRecord {
-            version: 4,
-            kind: "native-continuation-v1".into(),
+            version: if source_generation.is_some() { 5 } else { 4 },
+            kind: if source_generation.is_some() {
+                "native-continuation-v30".into()
+            } else {
+                "native-continuation-v1".into()
+            },
             grant_id: existing
                 .map_or_else(|| uuid::Uuid::new_v4().to_string(), |r| r.grant_id.clone()),
             attempt_id: attempt_id.into(),
@@ -922,8 +1160,9 @@ impl GrantRegistry {
             receipt: FileStamp::of(receipt)?,
             request_byte_len: request.metadata()?.len(),
             receipt_byte_len: receipt.metadata()?.len(),
-            state_path: Some(verified.state_path),
-            state_file: Some(FileStamp::of(&state_file)?),
+            source_generation: source_generation.map(str::to_owned),
+            state_path: source_generation.is_none().then_some(verified.state_path),
+            state_file: state_file.as_ref().map(FileStamp::of).transpose()?,
             state: "prepared".into(),
         };
         if let Some(existing) = existing {

@@ -763,6 +763,20 @@ pub fn native_k_at(path: &Path, spec: &NativeKSpec, descriptors: [RawFd; 4]) -> 
     )))
 }
 
+/// v30 K preflight carries only the accepted directory/request/receipt.
+/// There is no caller-supplied sidecar descriptor. The current broker returns
+/// a closed attach/release error even after its exact checks pass.
+pub fn native_k_v30_at(path: &Path, spec: &NativeKSpec, descriptors: [RawFd; 3]) -> io::Result<()> {
+    if spec.protocol != "native-continuation-v30" {
+        return Err(io::Error::other("v30 native K protocol required"));
+    }
+    let response = send_native_descriptors(path, b't', spec, descriptors)?;
+    Err(io::Error::other(format!(
+        "native K v30 closed: {}",
+        response.trim_end()
+    )))
+}
+
 /// Descriptor order: exact accepted-work directory, immutable
 /// custodian-request.json, and native-continuation-accepted-v1.json.
 pub fn prepare_native_at(
