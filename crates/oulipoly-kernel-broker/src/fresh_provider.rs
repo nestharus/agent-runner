@@ -5,7 +5,8 @@
 use super::work_launch;
 use oulipoly_kernel_broker::identity::{PinnedProcess, host_proc_file, observed_incarnation_gone};
 use oulipoly_state::mailbox::{
-    FreshBashChild, FreshNormalWorkPreparation, FreshReleasedHandoff, FreshRootWorkIntent,
+    FreshBashChild, FreshBashSourceEvent, FreshNormalWorkPreparation, FreshReleasedHandoff,
+    FreshRootWorkIntent,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1373,6 +1374,119 @@ pub(super) fn observe(dir: &Path, grant_id: &str) -> io::Result<Observation> {
     } else {
         Ok(Observation::Pending)
     }
+}
+
+/// Freeze the first eligible tree event after the broker's own K has a
+/// verified provider wait, complete namespace drain, PID1 wait and closed raw
+/// outputs. The create-new receipt is the cross-file captured debt fence.
+pub(super) fn select_bash_tree_event(
+    directory: &Path,
+    binding: &Binding,
+    child: &FreshBashChild,
+    lane_id: &str,
+    source_generation: &str,
+    registration_digest: &str,
+) -> io::Result<FreshBashSourceEvent> {
+    let grant_id = grant_for_binding(directory, binding)?
+        .ok_or_else(|| io::Error::other("fresh Bash physical K absent"))?;
+    let name = format!("{grant_id}.source-event.json");
+    if let Some(original) = exact_file::<FreshBashSourceEvent>(directory, &name)? {
+        if original.physical_grant_id != grant_id
+            || original.request_id != child.request_id
+            || original.source_id != child.handle
+            || original.attempt_id != child.invocation_uuid
+            || original.registration_digest != registration_digest
+            || original.parent_work_grant_id != child.parent_work_grant_id
+            || original.parent_work_id != child.parent_work_id
+            || original.lane_id != lane_id
+            || original.source_generation != source_generation
+        {
+            return Err(io::Error::other("captured source event identity changed"));
+        }
+        // This is readback of the frozen event. State independently rereads
+        // the original K/Q files and bytes before accepting or replaying W.
+        return Ok(original);
+    }
+    let grant: Grant = exact_file(directory, &format!("{grant_id}.consumed.json"))?
+        .ok_or_else(|| io::Error::other("fresh Bash physical K unconsumed"))?;
+    let attach: Attach = exact_file(directory, &format!("{grant_id}.attach.json"))?
+        .ok_or_else(|| io::Error::other("fresh Bash physical attach absent"))?;
+    if grant.id != grant_id
+        || grant.binding != *binding
+        || attach.grant_id != grant_id
+        || attach.work_id.is_empty()
+        || child.request_id != binding.grant_key
+        || child.invocation_uuid != binding.invocation_uuid
+        || child.session.session_id != binding.session_id
+        || child.parent_work_grant_id
+            != binding
+                .causal_parent
+                .as_ref()
+                .ok_or_else(|| io::Error::other("fresh Bash causal parent absent"))?
+                .grant_id
+        || child.parent_work_id != binding.causal_parent.as_ref().unwrap().work_id
+    {
+        return Err(io::Error::other("fresh Bash source K/C/parent changed"));
+    }
+    let Observation::Drained {
+        status,
+        stdout,
+        stderr,
+        stdout_len,
+        stderr_len,
+        cancelled,
+    } = observe(directory, &grant_id)?
+    else {
+        return Err(io::Error::other(
+            "fresh Bash source Q pending, unknown or lost",
+        ));
+    };
+    let cancel_grant_id = if cancelled {
+        let intent: serde_json::Value = exact_file(directory, &format!("{grant_id}.cancel.json"))?
+            .ok_or_else(|| io::Error::other("cancelled source lacks original intent"))?;
+        if intent.get("grant_id").and_then(|v| v.as_str()) != Some(grant_id.as_str())
+            || intent.get("work_id").and_then(|v| v.as_str()) != Some(attach.work_id.as_str())
+        {
+            return Err(io::Error::other("cancelled source intent changed"));
+        }
+        Some(grant_id.clone())
+    } else {
+        None
+    };
+    let event = FreshBashSourceEvent {
+        request_id: child.request_id.clone(),
+        source_id: child.handle.clone(),
+        attempt_id: child.invocation_uuid.clone(),
+        state_admission_id: child.session.allocation_id.clone(),
+        registration_digest: registration_digest.to_owned(),
+        lane_id: lane_id.to_owned(),
+        source_generation: source_generation.to_owned(),
+        session_id: child.session.session_id.clone(),
+        root_id: child.root_id.clone(),
+        owner_generation: binding.owner_generation.clone(),
+        parent_work_grant_id: child.parent_work_grant_id.clone(),
+        parent_work_id: child.parent_work_id.clone(),
+        physical_grant_id: grant_id.clone(),
+        physical_work_id: attach.work_id,
+        completion_policy: "tree".into(),
+        selected_kind: if cancelled {
+            "cancelled"
+        } else {
+            "tree_drained"
+        }
+        .into(),
+        wait_status: status,
+        cancelled,
+        cancel_grant_id,
+        tree_drained: true,
+        output_closed: true,
+        stdout_sha256: verified_hash(&stdout)?,
+        stdout_len,
+        stderr_sha256: verified_hash(&stderr)?,
+        stderr_len,
+    };
+    durable_new(directory, &name, &event)?;
+    Ok(event)
 }
 
 pub(super) fn cancel(dir: &Path, grant_id: &str) -> io::Result<()> {

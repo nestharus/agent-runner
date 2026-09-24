@@ -363,7 +363,7 @@ fn recv_request(
         b'P' | b'p' => read == 37,
         b'Q' | b'Z' | b'q' | b'z' | b'D' | b'd' | b'C' | b'c' | b'E' => read == 33,
         #[cfg(feature = "age319-private-broker-fixture")]
-        b'8' | b'9' | b'!' => read == 33,
+        b'8' | b'9' | b'!' | b'%' => read == 33,
         #[cfg(feature = "age319-private-broker-fixture")]
         b'l' | b'M' => read == 49,
         b'A' | b'a' => read == 33,
@@ -438,7 +438,7 @@ fn recv_request(
             request_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
         },
         #[cfg(feature = "age319-private-broker-fixture")]
-        b'8' | b'9' | b'!' => RequestPayload::FreshBashChildRequest {
+        b'8' | b'9' | b'!' | b'%' => RequestPayload::FreshBashChildRequest {
             request_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
         },
         b'O' => RequestPayload::FreshBashPrivateResult {
@@ -3802,6 +3802,14 @@ fn serve_fresh_v30_at(
 ) -> io::Result<()> {
     // A missing or incomplete publication cannot bind the new endpoint.
     let mut lane = FreshV30Lane::open_at(state_root).map_err(io::Error::other)?;
+    // Captured sidecar events are explicit debt after a State write failure or
+    // lost W reply. Rejoin exact receipts at startup; never relaunch K.
+    #[cfg(feature = "age319-private-broker-fixture")]
+    if private_fixture() {
+        if let Err(error) = lane.repair_captured_private_bash_sources() {
+            eprintln!("fresh Bash source repair remains unknown: {error}");
+        }
+    }
     let instance = EntryGate::open(&state_root.join("v30"))?;
     // An installed Bash child must match the package's pinned digest. Private
     // fixtures supply their built source binary only at broker startup.
@@ -3860,7 +3868,7 @@ fn serve_fresh_v30_at(
                 }
             ) || matches!(operation, b'C' | b'c' | b'E' | b'O')
                 || cfg!(feature = "age319-private-broker-fixture")
-                    && matches!(operation, b'8' | b'9' | b'!');
+                    && matches!(operation, b'8' | b'9' | b'!' | b'%');
             // The shared front door has its own pinned image. It may observe
             // the live lane identity, but it cannot acquire Runner authority.
             // Every effect-bearing operation still requires the fresh Runner
@@ -3952,11 +3960,11 @@ fn serve_fresh_v30_at(
                     ))
                 }
                 #[cfg(not(feature = "age319-private-broker-fixture"))]
-                b'C' | b'c' | b'E' | b'O' | b'8' | b'9' | b'!' => Err(io::Error::other(
+                b'C' | b'c' | b'E' | b'O' | b'8' | b'9' | b'!' | b'%' => Err(io::Error::other(
                     "fresh Bash child/work/result closed until normal root grant and physical result custody",
                 )),
                 #[cfg(feature = "age319-private-broker-fixture")]
-                b'C' | b'c' | b'E' | b'O' | b'8' | b'9' | b'!' => {
+                b'C' | b'c' | b'E' | b'O' | b'8' | b'9' | b'!' | b'%' => {
                     if !private_fixture() {
                         return Err(io::Error::other(
                             "fresh Bash child/work/result closed until normal root grant and physical result custody",
@@ -4003,6 +4011,10 @@ fn serve_fresh_v30_at(
                         child
                     };
                     peer.process.verify()?;
+                    if matches!(operation, b'C' | b'c') {
+                        lane.register_private_bash_source(&child)
+                            .map_err(io::Error::other)?;
+                    }
                     match operation {
                         b'C' | b'c' => Ok(format!(
                             "fresh-bash-child {}\n",
@@ -4026,7 +4038,7 @@ fn serve_fresh_v30_at(
                             ))
                         }
                         #[cfg(feature = "age319-private-broker-fixture")]
-                        b'8' | b'9' | b'!' => {
+                        b'8' | b'9' | b'!' | b'%' => {
                             let root_pid = root.old_release.prepared.root_init.host_pid;
                             let root_init = PinnedProcess::open(root_pid)?;
                             let actor = PinnedProcess::open(peer.process.host_pid)?;
@@ -4038,6 +4050,54 @@ fn serve_fresh_v30_at(
                                 &root_init,
                             )?;
                             let directory = state_root.join("v30/fresh-provider");
+                            if operation == b'%' {
+                                let registration_digest =
+                                    FreshV30Lane::private_bash_source_registration_digest(&child)
+                                        .map_err(io::Error::other)?;
+                                let event = fresh_provider::select_bash_tree_event(
+                                    &directory,
+                                    &binding,
+                                    &child,
+                                    &lane.identity().lane_id,
+                                    &lane.identity().source_generation,
+                                    &registration_digest,
+                                )
+                                .map_err(|error| {
+                                    io::Error::other(format!(
+                                        "source W unknown for C {}; physical artifact {}; {error}",
+                                        child.request_id,
+                                        directory.display()
+                                    ))
+                                })?;
+                                if std::env::var_os("AGE319_PRIVATE_SOURCE_W_CAPTURE_ONLY_V1")
+                                    .is_some()
+                                {
+                                    return Err(io::Error::other(format!(
+                                        "source W captured before State; exact repair debt at {}",
+                                        directory
+                                            .join(format!(
+                                                "{}.source-event.json",
+                                                event.physical_grant_id
+                                            ))
+                                            .display()
+                                    )));
+                                }
+                                lane.accept_private_bash_source(&event).map_err(|error| {
+                                    io::Error::other(format!(
+                                        "source W unknown; captured artifact {}: {error}",
+                                        directory
+                                            .join(format!(
+                                                "{}.source-event.json",
+                                                event.physical_grant_id
+                                            ))
+                                            .display()
+                                    ))
+                                })?;
+                                return Ok(format!(
+                                    "fresh-bash-source-accepted {}\n",
+                                    serde_json::to_string(&event)?
+                                ));
+                            }
                             if operation == b'8' {
                                 // Fixed private recipe. Bash supplies neither the
                                 // executable nor output claim; production still
@@ -4058,13 +4118,22 @@ fn serve_fresh_v30_at(
                                     return Err(io::Error::last_os_error());
                                 }
                                 let input = unsafe { File::from_raw_fd(fd) };
+                                let command = if std::env::var_os(
+                                    "AGE319_PRIVATE_BASH_SOURCE_SUCCESS_V1",
+                                )
+                                .is_some()
+                                {
+                                    "printf 'broker-child-output\\n'; printf 'broker-ran\\n' > \"$1\""
+                                } else {
+                                    "printf 'broker-child-output\\n'; printf 'broker-ran\\n' > \"$1\"; (setsid sh -c 'trap \"\" TERM; while :; do sleep 1; done' >/dev/null 2>&1 &)"
+                                };
                                 let plan = fresh_provider::plan(
                                     &image,
                                     &gate,
                                     &input,
                                     vec![
                                         "-c".into(),
-                                        "printf 'broker-child-output\\n'; printf 'broker-ran\\n' > \"$1\"; (setsid sh -c 'trap \"\" TERM; while :; do sleep 1; done' >/dev/null 2>&1 &)".into(),
+                                        command.into(),
                                         "sh".into(),
                                         marker.display().to_string(),
                                     ],

@@ -36,6 +36,39 @@ fn stop(child: &mut Child) {
     let _ = child.wait();
 }
 
+fn assert_old_debt_and_no_f_ack(broker_state: &Path) {
+    let old = rusqlite::Connection::open_with_flags(
+        broker_state.join("sidecar/pid-identity.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let pending: i64 = old
+        .query_row(
+            "SELECT count(*) FROM mailbox WHERE session_id='old-pending'
+         AND handle='old-unacked' AND delivered_at IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(pending, 1, "old v29 unsettled row changed");
+    let fresh = rusqlite::Connection::open_with_flags(
+        broker_state.join("v30/sidecar/pid-identity.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    for table in [
+        "fresh_recipient_source",
+        "fresh_recipient_row_source",
+        "fresh_recipient_grant",
+        "fresh_recipient_ack_delegation",
+    ] {
+        let count: i64 = fresh
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "source W minted {table}");
+    }
+}
+
 struct SnapshotRestore {
     path: std::path::PathBuf,
     bytes: Vec<u8>,
@@ -68,6 +101,8 @@ fn inner() {
             | "normal_model_held"
             | "normal_model_provider"
             | "normal_model_provider_bash_causal"
+            | "normal_model_provider_bash_causal_success"
+            | "normal_model_provider_bash_causal_w_debt"
             | "normal_model_provider_reply_loss"
             | "normal_model_provider_restart"
     );
@@ -77,8 +112,9 @@ fn inner() {
     let io_failure_source = mode == "normal_bash_source_capture_io_failure";
     let runner =
         std::env::var("OULIPOLY_AGE319_RUNNER_IMAGE").expect("built Runner image required");
-    let bash = (mode == "normal_handoff_bash_child" || mode == "normal_model_provider_bash_causal")
-        .then(|| std::env::var("OULIPOLY_AGE319_BASH_IMAGE").expect("built Bash image required"));
+    let bash = (mode == "normal_handoff_bash_child"
+        || mode.starts_with("normal_model_provider_bash_causal"))
+    .then(|| std::env::var("OULIPOLY_AGE319_BASH_IMAGE").expect("built Bash image required"));
     let bash_request = uuid::Uuid::new_v4().to_string();
     let provider_image = std::env::var("OULIPOLY_AGE319_PROVIDER_IMAGE").unwrap_or_default();
     let temp = tempfile::tempdir().unwrap();
@@ -274,6 +310,14 @@ fn inner() {
                 .map(|path| ("OULIPOLY_KERNEL_BROKER_FIXTURE_BASH_V1", path)),
         )
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+        .envs(
+            (mode == "normal_model_provider_bash_causal_success")
+                .then_some(("AGE319_PRIVATE_BASH_SOURCE_SUCCESS_V1", "1")),
+        )
+        .envs(
+            (mode == "normal_model_provider_bash_causal_w_debt")
+                .then_some(("AGE319_PRIVATE_SOURCE_W_CAPTURE_ONLY_V1", "1")),
+        )
         .envs((mode == "normal_model_provider_reply_loss").then_some((
             "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_PROVIDER_K_REPLY_V1",
             "1",
@@ -346,8 +390,12 @@ fn inner() {
             .envs(model_mode.then_some(("AGE319_PRIVATE_NORMAL_ROOT_V1", "1")))
             .envs(provider_mode.then_some(("AGE319_PRIVATE_FRESH_PROVIDER_V1", "1")))
             .envs(
-                (mode == "normal_model_provider_bash_causal")
+                mode.starts_with("normal_model_provider_bash_causal")
                     .then_some(("AGE319_PRIVATE_PROVIDER_CAUSAL_BASH_V1", "1")),
+            )
+            .envs(
+                (mode == "normal_model_provider_bash_causal_success")
+                    .then_some(("AGE319_PRIVATE_BASH_SOURCE_SUCCESS_V1", "1")),
             )
             .envs(
                 provider_mode
@@ -616,8 +664,88 @@ fn inner() {
                 stop(&mut broker);
                 return;
             }
-            if mode == "normal_model_provider_bash_causal" {
+            if mode.starts_with("normal_model_provider_bash_causal") {
+                let success_source = mode.ends_with("_success");
                 fs::write(gate.join("child-effect"), b"yes").unwrap();
+                if mode.ends_with("_w_debt") {
+                    eventually(|| {
+                        fs::read_to_string(gate.join("bash-causal-error"))
+                            .is_ok_and(|error| error.contains("source W captured before State"))
+                    });
+                    let physical_dir = broker_state.join("v30/fresh-provider");
+                    let captured = fs::read_dir(&physical_dir)
+                        .unwrap()
+                        .filter_map(Result::ok)
+                        .filter(|entry| {
+                            entry
+                                .file_name()
+                                .to_string_lossy()
+                                .ends_with(".source-event.json")
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(captured.len(), 1, "one immutable captured event debt");
+                    let event: oulipoly_state::mailbox::FreshBashSourceEvent =
+                        serde_json::from_slice(&fs::read(captured[0].path()).unwrap()).unwrap();
+                    let fresh =
+                        rusqlite::Connection::open(broker_state.join("v30/state.db")).unwrap();
+                    assert_eq!(
+                        fresh
+                            .query_row("SELECT count(*) FROM fresh_lane_accepted_source", [], |r| {
+                                r.get::<_, i64>(0)
+                            })
+                            .unwrap(),
+                        0
+                    );
+                    fs::write(gate.join("provider-cancel"), b"yes").unwrap();
+                    eventually(|| entry.try_wait().unwrap().is_some());
+                    stop(&mut broker);
+                    broker = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
+                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
+                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
+                        .env(
+                            "OULIPOLY_KERNEL_BROKER_FIXTURE_BASH_V1",
+                            bash.as_ref().unwrap(),
+                        )
+                        .stderr(Stdio::from(
+                            File::create(temp.path().join("source-w-repair.log")).unwrap(),
+                        ))
+                        .spawn()
+                        .unwrap();
+                    eventually(|| protocol::request_at(&socket, Operation::Classify).is_ok());
+                    eventually(|| {
+                        fresh
+                            .query_row("SELECT count(*) FROM fresh_lane_accepted_source", [], |r| {
+                                r.get::<_, i64>(0)
+                            })
+                            .unwrap()
+                            == 1
+                    });
+                    let lane = FreshV30Lane::open_at(&broker_state).unwrap();
+                    lane.accept_private_bash_source(&event).unwrap();
+                    assert_eq!(
+                        fs::read(physical_dir.join(format!("{}.stdout", event.physical_grant_id)))
+                            .unwrap(),
+                        b"broker-child-output\n"
+                    );
+                    assert_eq!(
+                        fs::read(data.join("pid-identity.db")).unwrap(),
+                        b"retired copied owner"
+                    );
+                    assert_eq!(
+                        fresh
+                            .query_row(
+                                "SELECT count(*) FROM fresh_lane_recipient_attachment",
+                                [],
+                                |r| { r.get::<_, i64>(0) }
+                            )
+                            .unwrap(),
+                        0
+                    );
+                    assert_old_debt_and_no_f_ack(&broker_state);
+                    stop(&mut broker);
+                    return;
+                }
                 let until = Instant::now() + Duration::from_secs(20);
                 while fs::read(gate.join("bash-causal-output"))
                     .ok()
@@ -652,12 +780,41 @@ fn inner() {
                 let result: oulipoly_state::mailbox::FreshBashPrivateResult =
                     serde_json::from_value(report["bash_reported_result"].clone()).unwrap();
                 assert_eq!(report["result_provenance"], "bash-self-report-only");
+                let source: oulipoly_state::mailbox::FreshBashSourceEvent =
+                    serde_json::from_value(report["fresh_source_w"].clone()).unwrap();
+                assert_eq!(source.request_id, child.request_id);
+                assert_eq!(source.source_id, child.handle);
+                assert_eq!(source.attempt_id, child.invocation_uuid);
+                assert_eq!(source.completion_policy, "tree");
+                assert_eq!(
+                    source.selected_kind,
+                    if success_source {
+                        "tree_drained"
+                    } else {
+                        "cancelled"
+                    }
+                );
+                assert_eq!(source.cancelled, !success_source);
+                assert!(source.tree_drained && source.output_closed);
+                assert_eq!(
+                    source.stdout_sha256,
+                    format!("{:x}", Sha256::digest(b"broker-child-output\n"))
+                );
+                assert_eq!(source.stdout_len, b"broker-child-output\n".len() as u64);
+                assert_ne!(
+                    result.stdout_sha256, source.stdout_sha256,
+                    "Bash O is separate from physical Q"
+                );
                 let physical = report["broker_physical_q"].as_str().unwrap();
                 let physical_fields: Vec<_> = physical.split_ascii_whitespace().collect();
                 assert_eq!(physical_fields[0], "fresh-bash-physical-drained");
                 let physical_grant = physical_fields[1];
+                assert_eq!(source.physical_grant_id, physical_grant);
                 assert_eq!(physical_fields[2], "0");
-                assert_eq!(physical_fields[5], "true");
+                assert_eq!(
+                    physical_fields[5],
+                    if success_source { "false" } else { "true" }
+                );
                 assert_eq!(
                     fs::read(gate.join("bash-physical-effect")).unwrap(),
                     b"broker-ran\n"
@@ -671,6 +828,15 @@ fn inner() {
                         "broker physical {suffix} absent"
                     );
                 }
+                assert!(
+                    physical_dir
+                        .join(format!("{physical_grant}.source-event.json"))
+                        .exists()
+                );
+                assert_eq!(
+                    fs::read(physical_dir.join(format!("{physical_grant}.stdout"))).unwrap(),
+                    b"broker-child-output\n"
+                );
                 let root: oulipoly_state::mailbox::FreshReleasedHandoff = serde_json::from_slice(
                     &fs::read(
                         broker_state
@@ -772,14 +938,32 @@ fn inner() {
                         .unwrap(),
                     1
                 );
-                for table in [
-                    "fresh_lane_accepted_source",
-                    "fresh_lane_recipient_attachment",
-                ] {
+                let accepted: (String, String, String, String, String) = fresh
+                    .query_row(
+                        "SELECT source_id,attempt_id,state_admission_id,root_id,owner_generation
+                     FROM fresh_lane_accepted_source",
+                        [],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                    )
+                    .unwrap();
+                assert_eq!(accepted.0, source.source_id);
+                assert_eq!(accepted.1, source.attempt_id);
+                assert_eq!(accepted.2, source.state_admission_id);
+                assert_eq!(accepted.3, source.root_id);
+                assert_eq!(accepted.4, source.owner_generation);
+                assert_eq!(
+                    fresh
+                        .query_row("SELECT count(*) FROM fresh_bash_selected_event", [], |r| {
+                            r.get::<_, i64>(0)
+                        })
+                        .unwrap(),
+                    1
+                );
+                for table in ["fresh_lane_recipient_attachment"] {
                     let count: i64 = fresh
                         .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
                         .unwrap();
-                    assert_eq!(count, 0, "private Bash report or Q minted {table}");
+                    assert_eq!(count, 0, "private source W minted {table}");
                 }
                 assert_eq!(
                     oulipoly_kernel_broker::registry::RootRegistry::open(&broker_state)
@@ -790,6 +974,23 @@ fn inner() {
                     "Bash child must not mint a supervisor/root"
                 );
                 let lane = FreshV30Lane::open_at(&broker_state).unwrap();
+                lane.repair_captured_private_bash_sources().unwrap();
+                lane.accept_private_bash_source(&source).unwrap();
+                let mut wrong_source = source.clone();
+                wrong_source.parent_work_id = uuid::Uuid::new_v4().to_string();
+                assert!(lane.accept_private_bash_source(&wrong_source).is_err());
+                wrong_source = source.clone();
+                wrong_source.physical_grant_id = uuid::Uuid::new_v4().to_string();
+                assert!(lane.accept_private_bash_source(&wrong_source).is_err());
+                wrong_source = source.clone();
+                wrong_source.stdout_sha256 = result.stdout_sha256.clone();
+                assert!(
+                    lane.accept_private_bash_source(&wrong_source).is_err(),
+                    "Bash O substituted for broker output"
+                );
+                wrong_source = source.clone();
+                wrong_source.completion_policy = "ready".into();
+                assert!(lane.accept_private_bash_source(&wrong_source).is_err());
                 assert_eq!(
                     lane.read_private_bash_result(&bash_request).unwrap(),
                     Some(result)
@@ -978,6 +1179,36 @@ fn inner() {
                 assert_eq!(
                     reopened.read_private_bash_result(&bash_request).unwrap(),
                     lane.read_private_bash_result(&bash_request).unwrap()
+                );
+                assert_old_debt_and_no_f_ack(&broker_state);
+                reopened.accept_private_bash_source(&source).unwrap();
+                let selected_event =
+                    physical_dir.join(format!("{physical_grant}.source-event.json"));
+                let held_event = physical_dir.join(format!("{physical_grant}.source-event.held"));
+                fs::rename(&selected_event, &held_event).unwrap();
+                assert!(
+                    reopened
+                        .repair_captured_private_bash_sources()
+                        .unwrap_err()
+                        .contains("selected source event lost")
+                );
+                fs::rename(&held_event, &selected_event).unwrap();
+                let lost_output = physical_dir.join(format!("{physical_grant}.stdout"));
+                fs::remove_file(&lost_output).unwrap();
+                assert!(
+                    reopened.accept_private_bash_source(&source).is_err(),
+                    "lost raw output became empty success"
+                );
+                assert_eq!(
+                    reopened.repair_captured_private_bash_sources().is_err(),
+                    true
+                );
+                assert_eq!(
+                    fresh
+                        .query_row("SELECT count(*) FROM fresh_lane_accepted_source", [], |r| r
+                            .get::<_, i64>(0))
+                        .unwrap(),
+                    1
                 );
                 stop(&mut broker);
                 return;
@@ -3481,6 +3712,8 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_model_held",
         "normal_model_provider",
         "normal_model_provider_bash_causal",
+        "normal_model_provider_bash_causal_success",
+        "normal_model_provider_bash_causal_w_debt",
         "normal_model_provider_reply_loss",
         "normal_model_provider_restart",
         "normal_guardian_death",

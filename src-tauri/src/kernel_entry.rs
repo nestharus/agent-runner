@@ -715,7 +715,7 @@ fn private_fresh_provider(
         .map_err(|e| e.to_string())?;
     let input = private_sealed_bytes(b"fresh-provider-input", args[2].as_bytes())?;
     let argv = if causal {
-        vec![
+        let mut argv = vec![
             marker,
             std::env::var("AGE319_PRIVATE_BASH_IMAGE").map_err(|_| "private Bash image absent")?,
             socket_for_private_causal_bash().display().to_string(),
@@ -723,7 +723,11 @@ fn private_fresh_provider(
                 .map_err(|_| "private Bash request absent")?,
             std::env::var("AGE319_PRIVATE_BASH_EFFECT_MARKER")
                 .map_err(|_| "private Bash marker absent")?,
-        ]
+        ];
+        if std::env::var_os("AGE319_PRIVATE_BASH_SOURCE_SUCCESS_V1").is_some() {
+            argv.push("no-cancel".into());
+        }
+        argv
     } else {
         vec![marker]
     };

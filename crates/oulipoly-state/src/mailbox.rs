@@ -59,10 +59,11 @@ pub use broker_authority::{
 };
 #[cfg(target_os = "linux")]
 pub use fresh_lane::{
-    FreshAckDelegation, FreshBashChild, FreshBashPrivateResult, FreshDeliveryReadback,
-    FreshDeliverySubmission, FreshNormalWorkPreparation, FreshRecipientIdentity,
-    FreshReleasedHandoff, FreshRootEffect, FreshRootEffectState, FreshRootWorkIntent, FreshV30Lane,
-    FreshV30LaneIdentity, FreshV30Session, normal_root_arguments,
+    FreshAckDelegation, FreshBashChild, FreshBashPrivateResult, FreshBashSourceEvent,
+    FreshDeliveryReadback, FreshDeliverySubmission, FreshNormalWorkPreparation,
+    FreshRecipientIdentity, FreshReleasedHandoff, FreshRootEffect, FreshRootEffectState,
+    FreshRootWorkIntent, FreshV30Lane, FreshV30LaneIdentity, FreshV30Session,
+    normal_root_arguments,
 };
 pub use native_publication::NativePublication;
 #[path = "mailbox/schema.rs"]
