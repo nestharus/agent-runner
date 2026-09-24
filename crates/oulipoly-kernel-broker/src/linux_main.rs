@@ -175,6 +175,10 @@ enum RequestPayload {
         request: oulipoly_kernel_broker::protocol::FreshRouteRequest,
         descriptors: Vec<File>,
     },
+    #[cfg(feature = "age319-private-broker-fixture")]
+    FreshAccountEffectRequest {
+        request: oulipoly_kernel_broker::protocol::FreshAccountEffectRequest,
+    },
     FreshRecipientRequest {
         request: FreshRecipientRequest,
     },
@@ -363,7 +367,7 @@ fn recv_request(
         #[cfg(feature = "age319-private-broker-fixture")]
         b'5' | b'6' | b'7' | b'8' | b'9' => (18..=2048 + 17).contains(&read),
         #[cfg(feature = "age319-private-broker-fixture")]
-        b'c' | b'f' => (18..=48 * 1024 + 17).contains(&read),
+        b'c' | b'f' | b'm' | b'n' => (18..=48 * 1024 + 17).contains(&read),
         b'F' => (18..=8192 + 17).contains(&read),
         b'U' => (18..=512 + 17).contains(&read),
         _ => read == 17,
@@ -424,6 +428,10 @@ fn recv_request(
         b'c' | b'f' => RequestPayload::FreshRouteRequest {
             request: serde_json::from_slice(&request[17..read as usize])?,
             descriptors,
+        },
+        #[cfg(feature = "age319-private-broker-fixture")]
+        b'm' | b'n' => RequestPayload::FreshAccountEffectRequest {
+            request: serde_json::from_slice(&request[17..read as usize])?,
         },
         b'D' | b'd' => RequestPayload::FreshSessionRequest {
             request_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
@@ -3751,6 +3759,8 @@ fn serve_fresh_v30_at(
         #[cfg(feature = "age319-private-broker-fixture")]
         let mut drop_provider_k_reply = false;
         #[cfg(feature = "age319-private-broker-fixture")]
+        let mut drop_account_effect_reply = false;
+        #[cfg(feature = "age319-private-broker-fixture")]
         let mut provider_output_files: Option<[File; 2]> = None;
         let answer = (|| -> io::Result<String> {
             let (operation, payload, peer) = peer_from_request(&mut stream)?;
@@ -4075,19 +4085,22 @@ fn serve_fresh_v30_at(
                     }
                 }
                 #[cfg(feature = "age319-private-broker-fixture")]
-                b'5' | b'6' | b'7' | b'8' | b'9' | b'c' | b'f' => {
+                b'5' | b'6' | b'7' | b'8' | b'9' | b'c' | b'f' | b'm' | b'n' => {
                     if !private_fixture() {
                         return Err(io::Error::other("fresh provider fixture route closed"));
                     }
-                    let (d_key, route_request, descriptors) = match payload {
+                    let (d_key, route_request, effect_request, descriptors) = match payload {
                         RequestPayload::FreshProviderRequest {
                             request,
                             descriptors,
-                        } if request.success.is_none() => (request.d_key, None, descriptors),
+                        } if request.success.is_none() => (request.d_key, None, None, descriptors),
                         RequestPayload::FreshRouteRequest {
                             request,
                             descriptors,
-                        } => (request.d_key.clone(), Some(request), descriptors),
+                        } => (request.d_key.clone(), Some(request), None, descriptors),
+                        RequestPayload::FreshAccountEffectRequest { request } => {
+                            (request.d_key.clone(), None, Some(request), Vec::new())
+                        }
                         _ => return Err(io::Error::other("fresh provider/route request absent")),
                     };
                     let receipt = lane
@@ -4195,6 +4208,67 @@ fn serve_fresh_v30_at(
                         return Ok(format!(
                             "fresh-route-selected {}\n",
                             serde_json::to_string(&selection)?
+                        ));
+                    }
+                    if let Some(effect_request) = effect_request {
+                        if instance.is_closed() && operation == b'm' {
+                            return Err(io::Error::other("fresh account effect entry gate closed"));
+                        }
+                        let expected_pin = match &held.intent {
+                            oulipoly_state::mailbox::FreshRootWorkIntent::NormalCli(args)
+                                if args.len() == 3
+                                    && args[0] == "--model"
+                                    && args[1] == effect_request.model =>
+                            {
+                                None
+                            }
+                            oulipoly_state::mailbox::FreshRootWorkIntent::NormalCli(args)
+                                if args.len() == 5
+                                    && args[0] == "--model"
+                                    && args[1] == effect_request.model
+                                    && args[2] == "--pin-provider" =>
+                            {
+                                Some(args[3].as_str())
+                            }
+                            _ => {
+                                return Err(io::Error::other(
+                                    "fresh effect model differs from held root intent",
+                                ));
+                            }
+                        };
+                        if expected_pin.is_some_and(|pin| pin != effect_request.account) {
+                            return Err(io::Error::other(
+                                "fresh effect account differs from held pin",
+                            ));
+                        }
+                        let effect = if operation == b'm' {
+                            fresh_provider::begin_account_effect(
+                                &directory,
+                                &binding,
+                                &effect_request,
+                                &root,
+                                &actor,
+                                actor_uid,
+                                actor_gid,
+                            )?
+                        } else {
+                            fresh_provider::observe_account_effect(
+                                &directory,
+                                &binding,
+                                &effect_request,
+                            )?
+                        };
+                        if operation == b'm'
+                            && std::env::var_os(
+                                "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_ACCOUNT_EFFECT_REPLY_V1",
+                            )
+                            .is_some()
+                        {
+                            drop_account_effect_reply = true;
+                        }
+                        return Ok(format!(
+                            "fresh-account-effect {}\n",
+                            serde_json::to_string(&effect)?
                         ));
                     }
                     if operation == b'5' {
@@ -4395,7 +4469,7 @@ fn serve_fresh_v30_at(
             }
         })();
         #[cfg(feature = "age319-private-broker-fixture")]
-        if drop_provider_k_reply {
+        if drop_provider_k_reply || drop_account_effect_reply {
             continue;
         }
         let response = answer.unwrap_or_else(|error| format!("error {error}\n"));

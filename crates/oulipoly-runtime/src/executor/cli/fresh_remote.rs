@@ -52,6 +52,7 @@ pub struct PreparedFreshHeadless {
 pub struct FreshConfiguredPool {
     pub model: ModelConfig,
     pub config_sha256: String,
+    pub account_effects: Vec<(Option<String>, Option<String>)>,
 }
 
 /// The two source files are identified as bytes before any provider plan is
@@ -94,6 +95,7 @@ pub fn load_fresh_headless_pool(
         .map_err(|e| format!("fresh model config invalid before K: {e}"))?;
     let mut members = HashSet::new();
     let mut prompt_mode = None;
+    let mut account_effects = Vec::new();
     for member in &mut model.providers {
         if !members.insert(member.name.clone()) {
             return Err("fresh model has duplicate provider accounts before K".into());
@@ -101,9 +103,10 @@ pub fn load_fresh_headless_pool(
         let account = providers
             .get(&member.name)
             .ok_or_else(|| format!("fresh provider {:?} absent before K", member.name))?;
-        if account.quota_script.is_some() || account.auth_refresh_command.is_some() {
-            return Err("fresh provider quota authority unavailable before K".into());
-        }
+        let effect = crate::quota::fresh_refresh_source(&member.name, &providers)
+            .map(|(quota, auth)| (Some(quota), auth))
+            .unwrap_or((None, account.auth_refresh_command.clone()));
+        account_effects.push(effect);
         let (effective, mode) = providers
             .effective_provider(member)
             .map_err(|e| format!("fresh provider config invalid before K: {e}"))?;
@@ -125,6 +128,7 @@ pub fn load_fresh_headless_pool(
     Ok(FreshConfiguredPool {
         model,
         config_sha256: format!("{:x}", hash.finalize()),
+        account_effects,
     })
 }
 
@@ -341,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn real_config_prepares_two_accounts_and_refuses_unowned_quota() {
+    fn real_config_prepares_two_accounts_and_records_quota_source() {
         let root = tempfile::tempdir().unwrap();
         fs::create_dir(root.path().join("models")).unwrap();
         fs::write(
@@ -380,10 +384,10 @@ mod tests {
             "[other]\ncommand = '/bin/false'\n[chosen]\ncommand = '/bin/true'\nquota_script = 'must-not-run'\n",
         )
         .unwrap();
-        assert!(
-            load_fresh_headless_pool(root.path(), "work")
-                .unwrap_err()
-                .contains("quota authority unavailable")
+        let metered = load_fresh_headless_pool(root.path(), "work").unwrap();
+        assert_eq!(
+            metered.account_effects[1].0.as_deref(),
+            Some("must-not-run")
         );
     }
 
