@@ -865,6 +865,40 @@ fn inner() {
                 )
                 .unwrap();
                 assert_eq!(child.parent_work_id, parent_attach["work_id"]);
+                let child_selection: serde_json::Value = serde_json::from_slice(
+                    &fs::read(
+                        physical_dir
+                            .join(format!("{}.child-work-selection.json", child.request_id)),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(child_selection["role"], "bash-child-private-fixed-v1");
+                assert_eq!(child_selection["child_d_key"], child.d_key);
+                assert_eq!(child_selection["child_request_id"], child.request_id);
+                assert_eq!(
+                    child_selection["binding"]["causal_parent"]["grant_id"],
+                    child.parent_work_grant_id
+                );
+                assert_eq!(
+                    child_selection["binding"]["causal_parent"]["work_id"],
+                    child.parent_work_id
+                );
+                assert_eq!(
+                    child_selection["child_receipt_sha256"],
+                    format!("{:x}", Sha256::digest(serde_json::to_vec(&child).unwrap()))
+                );
+                let root_selection: serde_json::Value = serde_json::from_slice(
+                    &fs::read(
+                        physical_dir.join(format!("{}.route-selection.json", root.handoff_id)),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                assert_ne!(
+                    child_selection["plan_sha256"],
+                    root_selection["selection"]["plan_sha256"]
+                );
                 assert_eq!(fs::read(gate.join("causal-env-count")).unwrap(), b"0");
                 assert_eq!(fs::read(gate.join("causal-fd-clear")).unwrap(), b"closed");
                 let keyring_result =

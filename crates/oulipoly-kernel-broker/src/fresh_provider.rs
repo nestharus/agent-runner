@@ -800,6 +800,120 @@ struct RouteDecision {
     selection: FreshRouteSelection,
 }
 
+/// A Bash child selects work independently of the root provider route. Only
+/// the broker creates this record, after C/D and the consumed parent work have
+/// been verified. The receipt hash pins the original admitted child row.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ChildWorkSelection {
+    version: u32,
+    role: String,
+    child_request_id: String,
+    child_d_key: String,
+    child_receipt_sha256: String,
+    binding: Binding,
+    plan_sha256: String,
+    configured_program: String,
+    broker_resolved_path: PathBuf,
+    image_descriptor: ImageDescriptor,
+}
+
+fn child_selection_name(request_id: &str) -> String {
+    format!("{request_id}.child-work-selection.json")
+}
+
+pub(super) fn select_private_child_work(
+    directory: &Path,
+    child: &FreshBashChild,
+    binding: &Binding,
+    plan: &Plan,
+) -> io::Result<()> {
+    let parent = binding
+        .causal_parent
+        .as_ref()
+        .ok_or_else(|| io::Error::other("child work selection has no consumed parent"))?;
+    if binding.grant_key() != child.request_id
+        || binding.invocation_uuid != child.invocation_uuid
+        || binding.session_id != child.session.session_id
+        || child.session.request_id != child.d_key
+        || parent.grant_id != child.parent_work_grant_id
+        || parent.work_id != child.parent_work_id
+    {
+        return Err(io::Error::other(
+            "child work selection C/D or parent mismatch",
+        ));
+    }
+    plan.verify()?;
+    let selection = ChildWorkSelection {
+        version: 1,
+        role: "bash-child-private-fixed-v1".into(),
+        child_request_id: child.request_id.clone(),
+        child_d_key: child.d_key.clone(),
+        child_receipt_sha256: format!("{:x}", Sha256::digest(serde_json::to_vec(child)?)),
+        binding: binding.clone(),
+        plan_sha256: plan.digest.clone(),
+        configured_program: plan.configured_program.clone(),
+        broker_resolved_path: plan.broker_resolved_path.clone(),
+        image_descriptor: plan.image_descriptor.clone(),
+    };
+    let name = child_selection_name(&child.request_id);
+    match exact_file::<ChildWorkSelection>(directory, &name)? {
+        Some(existing) if existing == selection => Ok(()),
+        Some(_) => Err(io::Error::other("child work selection conflict")),
+        None => durable_new(directory, &name, &selection),
+    }
+}
+
+pub(super) fn require_child_work_plan(
+    directory: &Path,
+    binding: &Binding,
+    plan: &Plan,
+) -> io::Result<()> {
+    if binding.causal_parent.is_none() {
+        return Err(io::Error::other(
+            "root provider cannot use child work selection",
+        ));
+    }
+    let selection: ChildWorkSelection =
+        exact_file(directory, &child_selection_name(binding.grant_key()))?
+            .ok_or_else(|| io::Error::other("child work selection absent before K"))?;
+    if selection.version != 1
+        || selection.role != "bash-child-private-fixed-v1"
+        || selection.child_request_id != binding.grant_key()
+        || selection.child_d_key.is_empty()
+        || selection.child_receipt_sha256.len() != 64
+        || selection.binding != *binding
+        || selection.plan_sha256 != plan.digest
+        || selection.configured_program != plan.configured_program
+        || selection.broker_resolved_path != plan.broker_resolved_path
+        || selection.image_descriptor != plan.image_descriptor
+    {
+        return Err(io::Error::other(
+            "fresh Bash K differs from child work selection",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn require_admitted_child_work_plan(
+    directory: &Path,
+    child: &FreshBashChild,
+    binding: &Binding,
+    plan: &Plan,
+) -> io::Result<()> {
+    require_child_work_plan(directory, binding, plan)?;
+    let selection: ChildWorkSelection =
+        exact_file(directory, &child_selection_name(binding.grant_key()))?
+            .ok_or_else(|| io::Error::other("child work selection absent before K"))?;
+    if selection.child_d_key != child.d_key
+        || selection.child_receipt_sha256
+            != format!("{:x}", Sha256::digest(serde_json::to_vec(child)?))
+    {
+        return Err(io::Error::other("fresh Bash K differs from admitted C/D"));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct RouteSource {
@@ -3134,7 +3248,9 @@ pub(super) fn launch(
     {
         return Err(io::Error::other("fresh provider plan changed before K"));
     }
-    if prepared
+    if b.causal_parent.is_some() {
+        require_child_work_plan(&prepared.directory, b, &prepared.plan)?;
+    } else if prepared
         .directory
         .join(decision_name(&b.handoff_id))
         .exists()
@@ -4172,6 +4288,83 @@ mod tests {
             root_pidns_ino: root.pidns_ino,
             causal_parent: None,
         }
+    }
+
+    #[test]
+    fn child_work_selection_has_separate_role_and_exact_c_d_parent_recipe() {
+        let temp = tempfile::tempdir().unwrap();
+        let process = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+        let mut binding = fixture_binding(&process, &process);
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let d_key = uuid::Uuid::new_v4().to_string();
+        let parent_grant = uuid::Uuid::new_v4().to_string();
+        let parent_work = uuid::Uuid::new_v4().to_string();
+        binding.grant_key = Some(request_id.clone());
+        binding.causal_parent = Some(ParentWorkStamp {
+            grant_id: parent_grant.clone(),
+            work_id: parent_work.clone(),
+            init_pid: process.host_pid,
+            init_starttime: process.starttime_ticks,
+            pidns_dev: process.pidns_dev,
+            pidns_ino: process.pidns_ino,
+        });
+        let child: FreshBashChild = serde_json::from_value(serde_json::json!({
+            "request_id": request_id,
+            "d_key": d_key,
+            "invocation_uuid": binding.invocation_uuid,
+            "handle": format!("ab30_{}", uuid::Uuid::new_v4().simple()),
+            "root_handoff_id": binding.handoff_id,
+            "root_id": binding.root_id,
+            "parent_invocation_uuid": uuid::Uuid::new_v4().to_string(),
+            "parent_work_grant_id": parent_grant,
+            "parent_work_id": parent_work,
+            "actor": {
+                "host_pid": process.host_pid,
+                "boot_id": process.boot_id,
+                "starttime_ticks": process.starttime_ticks,
+                "pidns_dev": process.pidns_dev,
+                "pidns_ino": process.pidns_ino,
+            },
+            "registration_authority": "fixture-only",
+            "session": {
+                "lane_id": uuid::Uuid::new_v4().to_string(),
+                "source_generation": uuid::Uuid::new_v4().to_string(),
+                "session_id": binding.session_id,
+                "request_id": d_key,
+                "allocation_id": uuid::Uuid::new_v4().to_string(),
+            }
+        }))
+        .unwrap();
+        let input = temp.path().join("empty");
+        std::fs::write(&input, []).unwrap();
+        let make_plan = |argument: &str| {
+            plan(
+                Path::new("/bin/true"),
+                temp.path(),
+                &File::open(&input).unwrap(),
+                vec![argument.into()],
+                vec![],
+            )
+            .unwrap()
+        };
+        let selected = make_plan("fixed");
+        assert!(require_child_work_plan(temp.path(), &binding, &selected).is_err());
+        select_private_child_work(temp.path(), &child, &binding, &selected).unwrap();
+        require_child_work_plan(temp.path(), &binding, &selected).unwrap();
+        assert!(require_child_work_plan(temp.path(), &binding, &make_plan("changed")).is_err());
+        assert!(
+            select_private_child_work(temp.path(), &child, &binding, &make_plan("changed"))
+                .is_err()
+        );
+        let mut sibling = binding.clone();
+        sibling.causal_parent.as_mut().unwrap().work_id = uuid::Uuid::new_v4().to_string();
+        assert!(require_child_work_plan(temp.path(), &sibling, &selected).is_err());
+        let mut copied_key = binding.clone();
+        copied_key.actor_starttime += 1;
+        assert!(require_child_work_plan(temp.path(), &copied_key, &selected).is_err());
+        let mut root = binding.clone();
+        root.causal_parent = None;
+        assert!(require_child_work_plan(temp.path(), &root, &selected).is_err());
     }
 
     #[test]

@@ -3837,6 +3837,34 @@ fn fresh_bash_parent(
     Ok((root, actor, parent))
 }
 
+#[cfg(feature = "age319-private-broker-fixture")]
+fn fixed_private_bash_child_plan() -> io::Result<fresh_provider::Plan> {
+    // This is broker-owned fixture policy. No field of C, c or % supplies an
+    // executable, argument, environment value or output assertion.
+    let gate = PathBuf::from(
+        std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1").map_err(io::Error::other)?,
+    );
+    let marker = gate.join("bash-physical-effect");
+    let image = fs::canonicalize("/bin/sh")?;
+    let fd = unsafe { libc::memfd_create(c"fresh-bash-empty-input".as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let input = unsafe { File::from_raw_fd(fd) };
+    fresh_provider::plan(
+        &image,
+        &gate,
+        &input,
+        vec![
+            "-c".into(),
+            "printf 'broker-child-output\\n'; printf 'broker-ran\\n' > \"$1\"; (setsid sh -c 'trap \"\" TERM; while :; do sleep 1; done' >/dev/null 2>&1 &)".into(),
+            "sh".into(),
+            marker.display().to_string(),
+        ],
+        vec![("PATH".into(), "/usr/bin:/bin".into())],
+    )
+}
+
 fn serve_fresh_v30_at(
     state_root: &Path,
     socket: &Path,
@@ -4052,10 +4080,31 @@ fn serve_fresh_v30_at(
                     };
                     peer.process.verify()?;
                     match operation {
-                        b'C' | b'c' => Ok(format!(
-                            "fresh-bash-child {}\n",
-                            serde_json::to_string(&child)?
-                        )),
+                        b'C' | b'c' => {
+                            if operation == b'C' {
+                                let root_init = PinnedProcess::open(
+                                    root.old_release.prepared.root_init.host_pid,
+                                )?;
+                                let binding = fresh_provider::binding_from_bash_child(
+                                    &root,
+                                    &child,
+                                    &peer.process,
+                                    &parent_work,
+                                    &root_init,
+                                )?;
+                                let plan = fixed_private_bash_child_plan()?;
+                                fresh_provider::select_private_child_work(
+                                    &state_root.join("v30/fresh-provider"),
+                                    &child,
+                                    &binding,
+                                    &plan,
+                                )?;
+                            }
+                            Ok(format!(
+                                "fresh-bash-child {}\n",
+                                serde_json::to_string(&child)?
+                            ))
+                        }
                         b'E' => {
                             let grant = lane
                                 .admit_private_bash_work(&child)
@@ -4087,36 +4136,9 @@ fn serve_fresh_v30_at(
                             )?;
                             let directory = state_root.join("v30/fresh-provider");
                             if operation == b'%' {
-                                // Fixed private recipe. Bash supplies neither the
-                                // executable nor output claim; production still
-                                // requires a causal parent work grant and W.
-                                let gate = PathBuf::from(
-                                    std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
-                                        .map_err(io::Error::other)?,
-                                );
-                                let marker = gate.join("bash-physical-effect");
-                                let image = fs::canonicalize("/bin/sh")?;
-                                let fd = unsafe {
-                                    libc::memfd_create(
-                                        c"fresh-bash-empty-input".as_ptr(),
-                                        libc::MFD_CLOEXEC,
-                                    )
-                                };
-                                if fd < 0 {
-                                    return Err(io::Error::last_os_error());
-                                }
-                                let input = unsafe { File::from_raw_fd(fd) };
-                                let plan = fresh_provider::plan(
-                                    &image,
-                                    &gate,
-                                    &input,
-                                    vec![
-                                        "-c".into(),
-                                        "printf 'broker-child-output\\n'; printf 'broker-ran\\n' > \"$1\"; (setsid sh -c 'trap \"\" TERM; while :; do sleep 1; done' >/dev/null 2>&1 &)".into(),
-                                        "sh".into(),
-                                        marker.display().to_string(),
-                                    ],
-                                    vec![("PATH".into(), "/usr/bin:/bin".into())],
+                                let plan = fixed_private_bash_child_plan()?;
+                                fresh_provider::require_admitted_child_work_plan(
+                                    &directory, &child, &binding, &plan,
                                 )?;
                                 let prepared = fresh_provider::prepare(&directory, binding, plan)?;
                                 let grant = fresh_provider::launch(
