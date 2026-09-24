@@ -32,7 +32,8 @@ use oulipoly_kernel_broker::source_acceptance::capture_and_stage_v2_evidence;
 use oulipoly_kernel_broker::source_physical::{SourceObservation, SourcePhysicalRegistry};
 use oulipoly_kernel_broker::work_registry::{Scope, WorkRegistry, classify_scope};
 use oulipoly_state::mailbox::{
-    BrokerReleaseEvidence, BrokerSidecar, FreshV30Lane, PreparedBrokerOwner, PreparedProcessStamp,
+    BrokerReleaseEvidence, BrokerSidecar, BrokerSourceEffectGrant, FreshV30Lane,
+    PreparedBrokerOwner, PreparedProcessStamp,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
@@ -2302,6 +2303,57 @@ fn encode_release_evidence(evidence: &BrokerReleaseEvidence) -> io::Result<Strin
     Ok(response)
 }
 
+// Observe terminal receipts while this broker is serving as well as after a
+// restart. A source can finish after its W reply with no further socket
+// traffic, so capture cannot depend on a later caller request. This only
+// stages evidence; it never accepts, releases, or notifies a source.
+fn capture_terminal_sources(
+    sidecar: &mut BrokerSidecar,
+    physical: &SourcePhysicalRegistry,
+    pending: &mut BTreeMap<String, BrokerSourceEffectGrant>,
+) {
+    let grants: Vec<_> = pending.values().cloned().collect();
+    for grant in grants {
+        match sidecar.read_source_evidence(&grant) {
+            Ok(Some(_)) => {
+                pending.remove(&grant.grant_id);
+            }
+            Ok(None) => match physical.observe(&grant.grant_id) {
+                Ok(SourceObservation::Drained { .. }) => {
+                    if let Err(error) =
+                        capture_and_stage_v2_evidence(sidecar, physical, &grant.grant_id)
+                    {
+                        eprintln!("source evidence debt {}: {error}", grant.grant_id);
+                    }
+                    if sidecar
+                        .read_source_evidence(&grant)
+                        .is_ok_and(|row| row.is_some())
+                    {
+                        pending.remove(&grant.grant_id);
+                    }
+                }
+                Ok(SourceObservation::Unknown { .. }) | Err(_) => {
+                    if let Err(error) = sidecar.retain_unknown_source_evidence(&grant) {
+                        eprintln!(
+                            "source evidence unknown-debt readback failed {}: {error}",
+                            grant.grant_id
+                        );
+                    } else {
+                        pending.remove(&grant.grant_id);
+                    }
+                }
+                _ => {}
+            },
+            Err(error) => {
+                eprintln!(
+                    "source evidence readback failed {}: {error}",
+                    grant.grant_id
+                );
+            }
+        }
+    }
+}
+
 fn serve() -> io::Result<()> {
     if unsafe { libc::geteuid() } != 0 {
         return Err(io::Error::other("host root required"));
@@ -2473,43 +2525,14 @@ fn serve() -> io::Result<()> {
     // After a broker restart, a drained one-use source can be captured from
     // retained State and the prior physical record. Never mint another W or
     // infer source acceptance from zero exit. Failed capture becomes debt.
+    let mut pending_source_evidence: BTreeMap<_, _> = source_physical
+        .records()
+        .iter()
+        .map(|record| (record.grant.grant_id.clone(), record.grant.clone()))
+        .collect();
+    let mut tracked_source_records = source_physical.records().len();
     if let Some(sidecar) = broker_sidecar.as_mut() {
-        let grants: Vec<_> = source_physical
-            .records()
-            .iter()
-            .map(|r| r.grant.clone())
-            .collect();
-        for grant in grants {
-            match sidecar.read_source_evidence(&grant) {
-                Ok(Some(_)) => {}
-                Ok(None) => match source_physical.observe(&grant.grant_id) {
-                    Ok(SourceObservation::Drained { .. }) => {
-                        if let Err(error) = capture_and_stage_v2_evidence(
-                            sidecar,
-                            &source_physical,
-                            &grant.grant_id,
-                        ) {
-                            eprintln!("source evidence debt {}: {error}", grant.grant_id);
-                        }
-                    }
-                    Ok(SourceObservation::Unknown { .. }) | Err(_) => {
-                        if let Err(error) = sidecar.retain_unknown_source_evidence(&grant) {
-                            eprintln!(
-                                "source evidence unknown-debt readback failed {}: {error}",
-                                grant.grant_id
-                            );
-                        }
-                    }
-                    _ => {}
-                },
-                Err(error) => {
-                    eprintln!(
-                        "source evidence readback failed {}: {error}",
-                        grant.grant_id
-                    );
-                }
-            }
-        }
+        capture_terminal_sources(sidecar, &source_physical, &mut pending_source_evidence);
     }
     let host_namespace = host_proc_file("self/ns/pid")?;
     let mut registry = RootRegistry::open(&state)?;
@@ -2576,6 +2599,11 @@ fn serve() -> io::Result<()> {
             Ok((stream, _)) => stream,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 if let Some(sidecar) = broker_sidecar.as_mut() {
+                    capture_terminal_sources(
+                        sidecar,
+                        &source_physical,
+                        &mut pending_source_evidence,
+                    );
                     native_work::reconcile_after_restart(
                         &grants,
                         &works,
@@ -3379,6 +3407,13 @@ fn serve() -> io::Result<()> {
         let response = result.unwrap_or_else(|error| format!("error {error}\n"));
         if !response.is_empty() {
             let _ = stream.write_all(response.as_bytes());
+        }
+        for record in &source_physical.records()[tracked_source_records..] {
+            pending_source_evidence.insert(record.grant.grant_id.clone(), record.grant.clone());
+        }
+        tracked_source_records = source_physical.records().len();
+        if let Some(sidecar) = broker_sidecar.as_mut() {
+            capture_terminal_sources(sidecar, &source_physical, &mut pending_source_evidence);
         }
     }
 }
