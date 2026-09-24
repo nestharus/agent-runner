@@ -72,6 +72,7 @@ pub(in crate::run) fn prepare_resume(
     working_dir: Option<&Path>,
     models_dir_override: Option<&Path>,
 ) -> Result<Result<execution::PreparedHeadlessResumeExecution, i32>, String> {
+    crate::completion_owner::require_unqualified_legacy_session(session_id)?;
     if let Some(exit_code) = execution::reject_invalid_resume_input(session_id) {
         return Ok(Err(exit_code));
     }

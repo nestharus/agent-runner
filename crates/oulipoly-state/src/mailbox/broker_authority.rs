@@ -1,6 +1,6 @@
-//! Root-owned sidecar cutover boundary. This opens the same State database;
-//! there is no second acceptance ledger. Offline publication carries the
-//! quiesced v29 database and its retained payloads in one directory.
+//! Root-owned copy-cutover boundary. Its offline publication carries a
+//! quiesced v29 sidecar and retained payloads; fresh independent v30 storage
+//! is initialized separately by `fresh_lane` and never uses this copy path.
 use super::*;
 use crate::StateDb;
 #[cfg(unix)]
@@ -19,15 +19,15 @@ pub struct BrokerSidecar {
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
-struct BoundStateSource {
-    path: std::path::PathBuf,
-    owner: u32,
-    device: u64,
-    inode: u64,
+pub(super) struct BoundStateSource {
+    pub(super) path: std::path::PathBuf,
+    pub(super) owner: u32,
+    pub(super) device: u64,
+    pub(super) inode: u64,
 }
 
 #[cfg(unix)]
-fn verify_bound_state_source(source: &BoundStateSource) -> Result<(), String> {
+pub(super) fn verify_bound_state_source(source: &BoundStateSource) -> Result<(), String> {
     let meta = std::fs::symlink_metadata(&source.path).map_err(|e| e.to_string())?;
     if !source.path.is_absolute()
         || source.path.file_name() != Some(std::ffi::OsStr::new("state.db"))
@@ -330,7 +330,7 @@ pub struct BrokerNativeGrantReadback {
 }
 
 impl BrokerSidecar {
-    fn bound_state(&self) -> Result<StateDb, String> {
+    pub(super) fn bound_state(&self) -> Result<StateDb, String> {
         let source = self
             .state_source
             .as_ref()
@@ -1810,7 +1810,7 @@ impl BrokerSidecar {
 }
 
 #[cfg(unix)]
-fn require_root_owned_ancestors(path: &Path) -> Result<(), String> {
+pub(super) fn require_root_owned_ancestors(path: &Path) -> Result<(), String> {
     if !path.is_absolute() {
         return Err("cutover storage root must be absolute".into());
     }
@@ -2230,7 +2230,11 @@ fn open_with_owner(path: &Path, owner: u32, anchor: &Path) -> Result<BrokerSidec
 }
 
 #[cfg(unix)]
-fn activate_with_owner(path: &Path, owner: u32, anchor: &Path) -> Result<String, String> {
+pub(super) fn activate_with_owner(
+    path: &Path,
+    owner: u32,
+    anchor: &Path,
+) -> Result<String, String> {
     check_storage(path, owner, anchor)?;
     let authority = MailboxAuthorityFence::acquire_exclusive(path).map_err(|e| e.to_string())?;
     harden_artifacts(path, owner)?;

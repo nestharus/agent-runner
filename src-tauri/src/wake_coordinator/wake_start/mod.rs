@@ -40,6 +40,11 @@ pub(crate) fn trigger_notify_wake(session_id: &str) -> WakeDiagnostic {
 }
 
 pub(super) fn start_wake_chain(input: StartWakeInput<'_>) -> WakeDiagnostic {
+    if let Err(error) =
+        crate::completion_owner::require_unqualified_legacy_session(input.session_id)
+    {
+        return storage_error_diagnostic(error);
+    }
     if let Err(error) = crate::completion_owner::require_legacy_recipient_effect_route() {
         return storage_error_diagnostic(error);
     }
