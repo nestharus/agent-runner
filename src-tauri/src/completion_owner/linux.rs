@@ -1,4 +1,5 @@
 use super::*;
+use oulipoly_kernel_broker::protocol::StateRoute;
 use oulipoly_kernel_broker::protocol::{self, JoinedChildWitness, OwnerWitness, ProcessWitness};
 use oulipoly_state::completion_continuation::{PROTOCOL, SourceProcessIdentity};
 use oulipoly_state::diagnostic_recorder::{
@@ -405,6 +406,12 @@ pub(crate) fn run_pinned_guardian(
     pin: &super::PinnedGuardian,
     announce: UnixStream,
 ) -> Result<(), String> {
+    if matches!(
+        protocol::state_route_at(&owner_broker_socket()).map_err(|e| e.to_string())?,
+        StateRoute::BrokerOwned { .. }
+    ) {
+        return Err("v30 guardian requires broker-held J before owner startup".into());
+    }
     let path = MailboxDb::default_path()?;
     path.parent().ok_or("sidecar parent absent")?;
     let transition = std::fs::OpenOptions::new()
@@ -479,6 +486,12 @@ pub(crate) fn verify_pinned_owner_ready(
     pin: &super::PinnedGuardian,
     guardian_pid: i32,
 ) -> Result<String, String> {
+    if matches!(
+        protocol::state_route_at(&owner_broker_socket()).map_err(|e| e.to_string())?,
+        StateRoute::BrokerOwned { .. }
+    ) {
+        return Err("v30 guardian owner readback requires held-J broker route".into());
+    }
     let grant = await_guardian_ready(announce, guardian_pid)?;
     let expected_guardian = identity(i64::from(guardian_pid))?;
     let expected_entry = current_identity()?;

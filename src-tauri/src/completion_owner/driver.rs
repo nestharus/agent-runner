@@ -1,6 +1,9 @@
-//! The driver schedules committed State obligations even when no sidecar source
-//! row exists.  It proposes immutable reservations to the root supervisor; it
-//! does not fork, reap, cancel, integrate terminal results, or succeed the root.
+//! The legacy driver schedules committed State obligations even when no sidecar
+//! source row exists. It proposes immutable reservations to the root supervisor;
+//! it does not fork, reap, cancel, integrate terminal results, or succeed the
+//! root. The selected v30 route currently refuses before scheduling because
+//! bounded repair and wake still require broker-owned operations.
+use oulipoly_kernel_broker::protocol::{self, StateRoute};
 use oulipoly_state::StateDb;
 use oulipoly_state::mailbox::{CompletionDomainOwner, ContinuationAttempt, MailboxDb};
 use std::collections::{BTreeSet, HashMap};
@@ -34,16 +37,59 @@ pub(super) fn entry() -> Result<(), String> {
     let mut channel = unsafe { UnixStream::from_raw_fd(fd) };
     let owner = super::linux::read_driver_owner(&mut channel)?;
     unsafe { std::env::set_var(super::ENDPOINT_ENV, &owner.endpoint) };
-    run(&path, &owner, channel)
+    // A held-J v30 guardian supplies the root selector. The broker still
+    // authenticates this process and derives the source from I; argv is never
+    // owner or storage authority. Legacy guardians omit this argument.
+    let root_id = std::env::args().nth(4);
+    run_with_root(&path, &owner, channel, root_id.as_deref())
 }
 
+#[cfg(test)]
 pub(super) fn run(
     path: &Path,
     owner: &CompletionDomainOwner,
     launch_channel: UnixStream,
 ) -> Result<(), String> {
+    run_with_root(path, owner, launch_channel, None)
+}
+
+fn run_with_root(
+    path: &Path,
+    owner: &CompletionDomainOwner,
+    launch_channel: UnixStream,
+    root_id: Option<&str>,
+) -> Result<(), String> {
     super::root_supervisor::install_driver_channel(launch_channel);
-    let result = run_owned(path, owner);
+    let result = (|| match root_id {
+        Some(root_id) => match protocol::state_route_at(&super::linux::owner_broker_socket())
+            .map_err(|error| format!("completion driver broker route unavailable: {error}"))?
+        {
+            StateRoute::Legacy => Err("v30 driver root selector has no broker-owned source".into()),
+            StateRoute::BrokerOwned { .. } => {
+                let route = super::broker_route::V30OwnerRoute::driver(
+                    &super::linux::owner_broker_socket(),
+                    root_id,
+                    owner,
+                )?;
+                route.read_running(owner, None)?;
+                #[cfg(feature = "age319-private-broker-fixture")]
+                if std::env::var_os("AGE319_PRIVATE_EXEC_DRIVER_ROUTE_V30").is_some() {
+                    let gate_dir = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                        .ok_or("private exec driver gate directory missing")?;
+                    let attested = Path::new(&gate_dir).join("child-attested");
+                    let deadline = Instant::now() + Duration::from_secs(20);
+                    while !attested.exists() {
+                        if Instant::now() >= deadline {
+                            return Err("private exec driver child attestation timed out".into());
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                }
+                Err("v30 driver bounded State repair and wake route is not available".into())
+            }
+        },
+        None => run_owned(path, owner),
+    })();
     // Preserve the original failure, but not at the price of discarding its
     // uniquely capable witness. Only evidence integration continues on this cut.
     #[cfg(test)]

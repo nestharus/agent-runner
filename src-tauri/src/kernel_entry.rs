@@ -626,6 +626,38 @@ fn private_guardian_prepared(
     }
     if driver_pid == 0 {
         drop(driver_parent);
+        if std::env::var_os("AGE319_PRIVATE_EXEC_DRIVER_ROUTE_V30").is_some() {
+            let fd = driver_child.as_raw_fd();
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0
+            {
+                unsafe { libc::_exit(70) }
+            }
+            unsafe { std::env::remove_var(REQUIRED_ENV) };
+            let executable = std::ffi::CString::new("/proc/self/exe").unwrap();
+            let arg0 = std::ffi::CString::new("oulipoly-agent-runner").unwrap();
+            let mode = std::ffi::CString::new(crate::completion_owner::PRIVATE_DRIVER_ARG).unwrap();
+            let retired_path = std::path::PathBuf::from(
+                std::env::var_os("OULIPOLY_DATA_DIR").expect("private data directory"),
+            )
+            .join("pid-identity.db");
+            let retired =
+                std::ffi::CString::new(retired_path.to_string_lossy().as_bytes()).unwrap();
+            let fd_arg = std::ffi::CString::new(fd.to_string()).unwrap();
+            let root_arg = std::ffi::CString::new(root).unwrap();
+            let argv = [
+                arg0.as_ptr(),
+                mode.as_ptr(),
+                retired.as_ptr(),
+                fd_arg.as_ptr(),
+                root_arg.as_ptr(),
+                std::ptr::null(),
+            ];
+            unsafe {
+                libc::execv(executable.as_ptr(), argv.as_ptr());
+                libc::_exit(70)
+            }
+        }
         let result = private_v30_driver_route(&mut driver_child, broker, gate_dir, root);
         if let Err(error) = result {
             eprintln!("OULIPOLY_KERNEL_PRIVATE_DRIVER_GAP={error}");
@@ -798,6 +830,10 @@ fn private_guardian_prepared(
                 attempt.attempt_id.as_bytes(),
             )
             .map_err(|e| e.to_string())?;
+        } else if std::env::var_os("AGE319_PRIVATE_EXEC_DRIVER_ROUTE_V30").is_some() {
+            serde_json::to_writer(&mut driver_parent, &readback.owner)
+                .map_err(|e| e.to_string())?;
+            driver_parent.write_all(b"\n").map_err(|e| e.to_string())?;
         }
     }
     let _ = channel.read_exact(&mut byte);

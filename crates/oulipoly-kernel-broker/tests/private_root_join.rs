@@ -112,6 +112,10 @@ fn inner() {
                     .then_some(("AGE319_PRIVATE_DRIVER_ROUTE_V30", "1")),
             )
             .envs(
+                (mode == "held_release_exec_driver")
+                    .then_some(("AGE319_PRIVATE_EXEC_DRIVER_ROUTE_V30", "1")),
+            )
+            .envs(
                 (mode == "held_release_lost_reply")
                     .then_some(("AGE319_PRIVATE_RELEASE_LOST_REPLY_V1", "1")),
             )
@@ -362,6 +366,34 @@ fn inner() {
                     attempt_id: Some(attempt_id),
                 };
                 assert!(protocol::read_state_at(&socket, &read).is_err()); // entry is not guardian/driver
+            }
+            if mode == "held_release_exec_driver" {
+                eventually(|| {
+                    fs::read_to_string(&err)
+                        .unwrap_or_default()
+                        .contains("v30 driver bounded State repair and wake route is not available")
+                        || entry.try_wait().unwrap().is_some()
+                });
+                assert!(
+                    fs::read_to_string(&err).unwrap().contains(
+                        "v30 driver bounded State repair and wake route is not available"
+                    ),
+                    "execed driver did not reach broker running-owner readback: {}",
+                    fs::read_to_string(&err).unwrap()
+                );
+                assert_eq!(
+                    fs::read(data.join("pid-identity.db")).unwrap(),
+                    b"retired copied owner"
+                );
+                assert_eq!(
+                    db.query_row::<i64, _, _>(
+                        "SELECT count(*) FROM completion_continuation_attempt",
+                        [],
+                        |row| row.get(0)
+                    )
+                    .unwrap(),
+                    0
+                );
             }
             if mode == "held_release_guardian_death" {
                 unsafe {
@@ -911,6 +943,7 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "held_release_lost_reply",
         "held_release_prepare_lost_reply",
         "held_release_driver_route",
+        "held_release_exec_driver",
         "held_release_commit_fail",
         "held_release_child_predeath",
         "held_release_gate_fail",
