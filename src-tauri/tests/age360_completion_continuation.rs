@@ -2653,11 +2653,37 @@ fn native_root_state_token_cancellation(replace_driver: bool) {
     f.gate("release-initial-provider");
     f.wait_initial(&mut initial);
     let descendant: i64 = wait(|| {
-        fs::read_to_string(f.root.path().join("descendant.pid"))
+        if let Ok(pid) = fs::read_to_string(f.root.path().join("descendant.pid")) {
+            return pid.trim().parse().ok();
+        }
+        // The retained result is the earliest durable evidence that this
+        // launcher has exited. A pre-provider refusal cannot publish a PID;
+        // report its causal stderr now instead of waiting 45 seconds.
+        if let Some(claim) = f
+            .mailbox_for_poll()?
+            .wake_session_reader()
+            .wake_claim(SESSION)
             .ok()?
-            .trim()
-            .parse()
-            .ok()
+            && let Some(attempt) = f
+                .mailbox_for_poll()?
+                .continuation_activation(SESSION, &claim.claim_token)
+                .ok()?
+            && let Ok(bytes) = fs::read(&attempt.result_path)
+        {
+            let result: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("retained root result JSON");
+            let stderr = fs::read_to_string(
+                std::path::Path::new(&attempt.result_path)
+                    .parent()
+                    .unwrap()
+                    .join("launcher.stderr"),
+            )
+            .unwrap_or_else(|error| format!("launcher stderr unavailable: {error}"));
+            panic!(
+                "resumed launcher exited before descendant publication: root_result={result} launcher.stderr={stderr}"
+            );
+        }
+        None
     });
     let descendant_identity = read_live_process_identity(descendant)
         .unwrap()
@@ -2824,6 +2850,160 @@ fn native_state_linked_token_cancellation_drains_resistant_activation() {
     if !private_case(false) {
         native_root_state_token_cancellation(false);
     }
+}
+
+#[cfg(feature = "age360-fault-fixtures")]
+#[test]
+fn native_join_identity_refusal_retains_failure_and_releases_claim() {
+    if private_case(false) {
+        return;
+    }
+    let f = Fixture::new("owner_only");
+    f.gate("test-descendant-enabled");
+    f.gate("release-resume");
+    f.gate("root-result-retained.hold");
+    let mut initial = f.start_with_hold(true);
+    wait(|| {
+        f.root
+            .path()
+            .join("provider-initial-ready")
+            .exists()
+            .then_some(())
+    });
+    // The feature-only owner hook applies only to an inherited join. The
+    // initial provider has already established the session at this point.
+    f.gate("force-join-identity-refusal");
+    MailboxDb::open(&f.data.join("pid-identity.db"))
+        .unwrap()
+        .enqueue_submitted_input(&oulipoly_state::mailbox::SubmittedInputEnqueue {
+            submission_token: "native-join-refusal",
+            target: oulipoly_state::mailbox::InboxTarget {
+                kind: oulipoly_state::mailbox::InboxTargetKind::Session,
+                id: SESSION,
+            },
+            input: b"native-custody-input",
+        })
+        .unwrap();
+    f.gate("release-initial-provider");
+    f.wait_initial(&mut initial);
+    wait(|| {
+        f.root
+            .path()
+            .join("root-result-retained.reached")
+            .exists()
+            .then_some(())
+    });
+    let claim = f
+        .mailbox()
+        .wake_session_reader()
+        .wake_claim(SESSION)
+        .unwrap()
+        .unwrap();
+    let attempt = f
+        .mailbox()
+        .continuation_activation(SESSION, &claim.claim_token)
+        .unwrap()
+        .unwrap();
+    let original = fs::read(&attempt.result_path).unwrap();
+    let retained: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    let stderr = fs::read_to_string(
+        std::path::Path::new(&attempt.result_path)
+            .parent()
+            .unwrap()
+            .join("launcher.stderr"),
+    )
+    .unwrap();
+    println!("controlled join refusal: {}", stderr.trim());
+    assert!(stderr.contains("J90_FIXTURE_REFUSAL"), "{stderr}");
+    assert!(
+        stderr.contains("mode=fresh"),
+        "current-root launcher join mode: {stderr}"
+    );
+    assert_eq!(retained["root_exit_code"], 1);
+    assert_eq!(retained["root_wait_status"], 256);
+    assert_eq!(retained["spawn_failed"], false);
+    assert_eq!(retained["result_retained"], true);
+    assert_eq!(retained["owned_children"], "ECHILD");
+    assert!(retained["accepted_cancellation"].is_null());
+    assert!(
+        !f.root.path().join("resume-prompts.jsonl").exists(),
+        "resumed provider must have no effect"
+    );
+    assert!(
+        !f.root.path().join("descendant.pid").exists(),
+        "provider must not create a descendant"
+    );
+    assert!(
+        !f.root.path().join("state-cancel-token").exists(),
+        "no State token was requested"
+    );
+    fs::remove_file(f.root.path().join("root-result-retained.hold")).unwrap();
+    wait(|| {
+        f.mailbox_for_poll()?
+            .continuation_activation(SESSION, &claim.claim_token)
+            .ok()?
+            .is_none()
+            .then_some(())
+    });
+    wait(|| {
+        f.mailbox_for_poll()?
+            .wake_session_reader()
+            .wake_claim(SESSION)
+            .ok()?
+            .is_none()
+            .then_some(())
+    });
+    let integrated: (String, i64, String) = f.sidecar_connection()
+        .query_row(
+            "SELECT phase,integrated,drain_receipt FROM completion_continuation_attempt WHERE attempt_id=?1",
+            [&attempt.attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+    assert_eq!(integrated.0, "drained");
+    assert_eq!(integrated.1, 1);
+    assert_eq!(integrated.2.as_bytes(), original);
+    assert!(
+        !f.root.path().join("resume-prompts.jsonl").exists(),
+        "settlement must not replay provider"
+    );
+    let state = oulipoly_state::StateDb::open(&f.data.join("state.db")).unwrap();
+    let resumed_attempts: i64 = state
+        .connection()
+        .query_row("SELECT COUNT(*) FROM provider_launch_attempts", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let false_successes: i64 = state
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM provider_logical_launches WHERE start_mode='resume' AND status='succeeded'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        resumed_attempts, 0,
+        "refused launcher must not reach provider launch"
+    );
+    assert_eq!(
+        false_successes, 0,
+        "refused launcher must not settle as success"
+    );
+    let activation_count: i64 = f
+        .sidecar_connection()
+        .query_row(
+            "SELECT COUNT(*) FROM completion_continuation_attempt WHERE session_id=?1",
+            [SESSION],
+            |row| row.get(0),
+        )
+        .unwrap();
+    println!(
+        "refusal settlement: activation_attempts={activation_count} provider_attempts={resumed_attempts} false_successes={false_successes}"
+    );
+    assert_eq!(
+        activation_count, 1,
+        "failure settlement must not re-activate"
+    );
 }
 #[test]
 fn native_root_state_token_cancellation_retains_result_across_driver_replacement() {

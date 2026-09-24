@@ -350,6 +350,120 @@ fn join_refusal_compatibility_and_identity_boundaries() {
 }
 
 #[test]
+fn identity_refusal_codes_keep_fresh_root_and_image_guards_closed() {
+    fn refusal(
+        path: &Path,
+        owner: &CompletionDomainOwner,
+        contexts: &mut ContextLeases,
+        authorities: &mut super::original_work::RootAuthorities,
+        supervisor: &super::root_supervisor::RootSupervisor,
+        context: SourceProcessIdentity,
+        protocol: &str,
+    ) -> JoinRefusal {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        retain_pending_context(
+            path,
+            owner,
+            contexts,
+            authorities,
+            supervisor,
+            JoinRequest {
+                socket: server,
+                context,
+                request: super::original_work::RootJoinRequest {
+                    protocol: protocol.into(),
+                    mode: super::original_work::RootJoinMode::Fresh,
+                },
+            },
+        );
+        let mut frame = Vec::new();
+        loop {
+            let mut byte = [0];
+            client.read_exact(&mut byte).unwrap();
+            if byte == [b'\n'] {
+                break;
+            }
+            frame.push(byte[0]);
+        }
+        assert!(serde_json::from_slice::<CompletionDomainOwner>(&frame).is_err());
+        assert!(!String::from_utf8_lossy(&frame).contains("capability"));
+        serde_json::from_slice(&frame).unwrap()
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("pid-identity.db");
+    let owner = test_owner(&root.path().join("owner.sock"));
+    let mut contexts = ContextLeases::inherit(&path).unwrap();
+    let (driver, _driver_peer) = UnixStream::pair().unwrap();
+    let supervisor = super::root_supervisor::RootSupervisor::new(&path, driver).unwrap();
+    let mut authorities = super::original_work::RootAuthorities::default();
+    let self_identity = owner.guardian_identity.clone();
+
+    let wrong_protocol = refusal(
+        &path,
+        &owner,
+        &mut contexts,
+        &mut authorities,
+        &supervisor,
+        self_identity.clone(),
+        "wrong-protocol",
+    );
+    assert!(
+        wrong_protocol
+            .diagnostic
+            .unwrap()
+            .starts_with("J03_PROTOCOL mode=fresh")
+    );
+
+    let mut foreign_image = std::process::Command::new("/usr/bin/sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let foreign_identity = identity(i64::from(foreign_image.id())).unwrap();
+    let different_image = refusal(
+        &path,
+        &owner,
+        &mut contexts,
+        &mut authorities,
+        &supervisor,
+        foreign_identity,
+        super::original_work::ROOT_PROTOCOL,
+    );
+    assert!(
+        different_image
+            .diagnostic
+            .unwrap()
+            .starts_with("J02_FRESH_IMAGE mode=fresh")
+    );
+    foreign_image.kill().unwrap();
+    foreign_image.wait().unwrap();
+
+    authorities.fresh(&owner, self_identity.clone()).unwrap();
+    let inside_root = refusal(
+        &path,
+        &owner,
+        &mut contexts,
+        &mut authorities,
+        &supervisor,
+        self_identity,
+        super::original_work::ROOT_PROTOCOL,
+    );
+    assert!(
+        inside_root
+            .diagnostic
+            .unwrap()
+            .starts_with("J01_FRESH_INSIDE_ROOT mode=fresh")
+    );
+    assert!(
+        MailboxDb::open(&path)
+            .unwrap()
+            .completion_contexts()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn saturated_reader_refuses_without_admission_and_bounds_collection() {
     let root = tempfile::tempdir().unwrap();
     let endpoint = root.path().join("owner.sock");
