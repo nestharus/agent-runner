@@ -35,7 +35,7 @@ pub(super) fn terminal_outcome_from_status(status: ExitStatus) -> SupervisedTerm
     )
 }
 
-pub(super) fn supervised_output_from_terminal(
+pub(in crate::executor::cli) fn supervised_output_from_terminal(
     provider_name: &str,
     recognizer: ProviderRecognizer,
     stdout: Vec<u8>,

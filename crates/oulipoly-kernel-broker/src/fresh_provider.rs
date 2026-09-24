@@ -1,7 +1,7 @@
 //! Private first provider K: the broker, not a Runner worker, forks the pinned
 //! executable. Private socket opcodes carry descriptor-backed plans; the
-//! ordinary CLI route remains closed until a typed runtime backend can consume
-//! its readbacks.
+//! ordinary CLI route remains closed; a private typed runtime backend consumes
+//! its Q-gated readbacks without publishing terminal success.
 use super::work_launch;
 use oulipoly_kernel_broker::identity::{PinnedProcess, host_proc_file, observed_incarnation_gone};
 use oulipoly_state::mailbox::{
@@ -491,6 +491,22 @@ pub(super) fn grant_for_binding(directory: &Path, binding: &Binding) -> io::Resu
     Ok(Some(grant.id))
 }
 
+/// Resolve an uncertain K only against the exact pinned plan submitted by
+/// this caller. A D-bound grant for a different recipe is not a retry result.
+pub(super) fn grant_for_matching_plan(
+    directory: &Path,
+    binding: &Binding,
+    plan: &Plan,
+) -> io::Result<String> {
+    let name = format!("{}.fresh-grant.json", binding.handoff_id);
+    let grant: Grant = exact_file(directory, &name)?
+        .ok_or_else(|| io::Error::other("fresh provider grant absent"))?;
+    if grant.version != 1 || grant.binding != *binding || grant.plan_sha256 != plan.digest {
+        return Err(io::Error::other("fresh provider K readback plan mismatch"));
+    }
+    Ok(grant.id)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Attach {
@@ -935,6 +951,8 @@ pub(super) enum Observation {
         stderr: File,
         stdout_len: u64,
         stderr_len: u64,
+        stdout_sha256: String,
+        stderr_sha256: String,
         cancelled: bool,
     },
 }
@@ -1069,6 +1087,8 @@ pub(super) fn observe(dir: &Path, grant_id: &str) -> io::Result<Observation> {
             stderr,
             stdout_len: drain.stdout.bytes,
             stderr_len: drain.stderr.bytes,
+            stdout_sha256: drain.stdout.sha256,
+            stderr_sha256: drain.stderr.sha256,
             cancelled: drain.cancelled,
         });
     }
@@ -1256,13 +1276,31 @@ mod tests {
         assert!(!marker.exists(), "pre-consume refusal had provider effects");
         let same = prepare(
             temporary.path(),
-            binding,
+            binding.clone(),
             prepare_plan(vec![marker.display().to_string()]),
         )
         .unwrap();
         assert_eq!(same.grant.id, prepared.grant.id);
         let id = launch(prepared, &root, &actor, 0, 0).unwrap();
         assert_eq!(id, same.grant.id);
+        assert_eq!(
+            grant_for_matching_plan(
+                temporary.path(),
+                &binding,
+                &prepare_plan(vec![marker.display().to_string()])
+            )
+            .unwrap(),
+            id
+        );
+        assert!(
+            grant_for_matching_plan(
+                temporary.path(),
+                &binding,
+                &prepare_plan(vec!["changed-after-k".into()])
+            )
+            .is_err(),
+            "changed plan recovered a consumed K"
+        );
         assert!(
             launch(same, &root, &actor, 0, 0).is_err(),
             "second K succeeded"
@@ -1295,6 +1333,7 @@ mod tests {
                 stdout_len,
                 stderr_len,
                 cancelled,
+                ..
             } = observe(temporary.path(), &id).unwrap()
             {
                 drained = Some((status, stdout, stderr, stdout_len, stderr_len, cancelled));

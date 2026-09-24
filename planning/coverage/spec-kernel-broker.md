@@ -114,7 +114,8 @@
 
 - Classification is never positive work authority.
 - Fresh v30 session allocation and recipient submit/readback/token-ACK/delegated-ACK socket mechanics are broker-owned. Production source acceptance, recipient runtime attachment, provider transport, and native K/Q remain closed. The recipient fixture supplies a synthetic private accepted source/attempt and exact process binding; it is no proof of ordinary Runner delivery. The installed launcher and normal v30 entry remain gated pending combined lineage and host-root proof.
-- The fresh provider K/Q opcode is feature and private-fixture gated. It does not activate the normal production selector, publish source W or recipient ACK, or route ordinary runtime provider results. The private root CLI deliberately returns failure after verified Q until that backend exists.
+- The fresh provider K/Q opcode is feature and private-fixture gated. It does not activate the normal production selector or publish source W or recipient ACK. The private root maps the broker's verified output and provider wait status through the runtime only after physical Q, then returns failure because root terminal publication remains closed.
+- A lost private provider K reply is read back against the exact descriptor plan. Unresolved K, exit, Q, or output readback returns an explicit unknown with D, handoff, session, grant when known, and broker artifact references; it never submits another K automatically.
 - The unprivileged user-namespace fixture cannot establish host-root sudo/setuid behavior.
 - Ordinary Runner/Bash entry and allocated-attempt NNP/seccomp remain. The opt-in entry keeps the host guardian outside the root PID namespace and releases only the fixed Runner for help/offline diagnostics.
 

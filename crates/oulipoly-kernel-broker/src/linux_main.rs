@@ -365,7 +365,7 @@ fn recv_request(
         b'V' | b'S' | b's' | b'T' | b'H' | b'K' | b'B' | b'N' | b'k' | b't' | b'R' | b'W'
         | b'Y' | b'0' | b'1' | b'2' | b'3' | b'4' => (18..=2048 + 17).contains(&read),
         #[cfg(feature = "age319-private-broker-fixture")]
-        b'5' | b'6' | b'7' => (18..=2048 + 17).contains(&read),
+        b'5' | b'6' | b'7' | b'8' | b'9' => (18..=2048 + 17).contains(&read),
         b'F' => (18..=8192 + 17).contains(&read),
         b'O' => (18..=1024 + 17).contains(&read),
         b'U' => (18..=512 + 17).contains(&read),
@@ -384,7 +384,7 @@ fn recv_request(
             b'k' => descriptors.len() != 4,
             b'K' => descriptors.len() != 7,
             #[cfg(feature = "age319-private-broker-fixture")]
-            b'5' => descriptors.len() != 4,
+            b'5' | b'9' => descriptors.len() != 4,
             b'L' => !(1..=4).contains(&descriptors.len()),
             b'V' | b'S' | b's' | b'T' => descriptors.len() != 1,
             _ => !descriptors.is_empty(),
@@ -417,7 +417,7 @@ fn recv_request(
             request: serde_json::from_slice(&request[17..read as usize])?,
         },
         #[cfg(feature = "age319-private-broker-fixture")]
-        b'5' | b'6' | b'7' => RequestPayload::FreshProviderRequest {
+        b'5' | b'6' | b'7' | b'8' | b'9' => RequestPayload::FreshProviderRequest {
             request: serde_json::from_slice(&request[17..read as usize])?,
             descriptors,
         },
@@ -3818,6 +3818,8 @@ fn serve_fresh_v30_at(
         let mut submitted_grant = None;
         #[cfg(feature = "age319-private-broker-fixture")]
         let mut drop_provider_k_reply = false;
+        #[cfg(feature = "age319-private-broker-fixture")]
+        let mut provider_output_files: Option<[File; 2]> = None;
         let answer = (|| -> io::Result<String> {
             let (operation, payload, peer) = peer_from_request(&mut stream)?;
             peer.process.verify()?;
@@ -4209,7 +4211,7 @@ fn serve_fresh_v30_at(
                     }
                 }
                 #[cfg(feature = "age319-private-broker-fixture")]
-                b'5' | b'6' | b'7' => {
+                b'5' | b'6' | b'7' | b'8' | b'9' => {
                     if !private_fixture() {
                         return Err(io::Error::other("fresh provider fixture route closed"));
                     }
@@ -4299,8 +4301,21 @@ fn serve_fresh_v30_at(
                         }
                         return Ok(format!("fresh-provider-k {grant}\n"));
                     }
-                    let grant = fresh_provider::grant_for_binding(&directory, &binding)?
-                        .ok_or_else(|| io::Error::other("fresh provider grant absent"))?;
+                    let grant = if operation == b'9' {
+                        let [image_fd, cwd, input, recipe]: [File; 4] =
+                            descriptors.try_into().map_err(|_| {
+                                io::Error::other("fresh provider readback descriptors absent")
+                            })?;
+                        let image =
+                            fs::read_link(format!("/proc/self/fd/{}", image_fd.as_raw_fd()))?;
+                        let plan = fresh_provider::plan_from_descriptors(
+                            &image, image_fd, cwd, input, recipe,
+                        )?;
+                        fresh_provider::grant_for_matching_plan(&directory, &binding, &plan)?
+                    } else {
+                        fresh_provider::grant_for_binding(&directory, &binding)?
+                            .ok_or_else(|| io::Error::other("fresh provider grant absent"))?
+                    };
                     if operation == b'7' {
                         fresh_provider::cancel(&directory, &grant)?;
                         return Ok(format!("fresh-provider-cancel {grant}\n"));
@@ -4321,13 +4336,20 @@ fn serve_fresh_v30_at(
                             stderr,
                             stdout_len,
                             stderr_len,
+                            stdout_sha256,
+                            stderr_sha256,
                             cancelled,
                         } => {
-                            drop(stdout);
-                            drop(stderr);
-                            format!(
-                                "fresh-provider-drained {grant} {status} {stdout_len} {stderr_len} {cancelled}\n"
-                            )
+                            if operation == b'8' {
+                                provider_output_files = Some([stdout, stderr]);
+                                format!(
+                                    "fresh-provider-output {grant} {status} {stdout_len} {stdout_sha256} {stderr_len} {stderr_sha256} {cancelled}\n"
+                                )
+                            } else {
+                                format!(
+                                    "fresh-provider-drained {grant} {status} {stdout_len} {stderr_len} {cancelled}\n"
+                                )
+                            }
                         }
                     };
                     Ok(result)
@@ -4456,6 +4478,30 @@ fn serve_fresh_v30_at(
             continue;
         }
         let response = answer.unwrap_or_else(|error| format!("error {error}\n"));
+        #[cfg(feature = "age319-private-broker-fixture")]
+        if let Some(files) = provider_output_files {
+            let fds = [files[0].as_raw_fd(), files[1].as_raw_fd()];
+            let mut iov = libc::iovec {
+                iov_base: response.as_ptr().cast_mut().cast(),
+                iov_len: response.len(),
+            };
+            let mut control = [0u8; 64];
+            let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = control.as_mut_ptr().cast();
+            msg.msg_controllen =
+                unsafe { libc::CMSG_SPACE(std::mem::size_of_val(&fds) as _) } as usize;
+            unsafe {
+                let header = libc::CMSG_FIRSTHDR(&msg);
+                (*header).cmsg_level = libc::SOL_SOCKET;
+                (*header).cmsg_type = libc::SCM_RIGHTS;
+                (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(&fds) as _) as usize;
+                std::ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(header).cast(), 2);
+                libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL);
+            }
+            continue;
+        }
         if stream.write_all(response.as_bytes()).is_ok() {
             if let Some(grant_id) = submitted_grant {
                 let _ = lane.mark_recipient_submitted(&grant_id);
