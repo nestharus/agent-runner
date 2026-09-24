@@ -126,7 +126,9 @@ fn main() -> std::io::Result<()> {
     if args.len() == 5 {
         return causal_bash(&args);
     }
-    if args.len() != 1 && !(args.len() == 2 && matches!(args[1].as_str(), "--fail" | "--quota")) {
+    if args.len() != 1
+        && !(args.len() == 2 && matches!(args[1].as_str(), "--fail" | "--quota" | "--auth"))
+    {
         return Err(std::io::Error::other("provider fixture arguments changed"));
     }
     if quota {
