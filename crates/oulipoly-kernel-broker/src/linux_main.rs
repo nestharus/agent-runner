@@ -1,4 +1,17 @@
 //! Opt-in host-root broker for the pinned guardian and one-use root child join.
+
+const SOURCE_TICKET_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+const BROKER_ACCEPT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+const BROKER_INGRESS_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const RELEASED_HANDOFF_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const FRESH_V30_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const FRESH_V30_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+const FRESH_HANDOFF_QUEUE_CAPACITY: usize = 8;
+const RELEASED_HANDOFF_REPLY_CAPACITY: usize = 1;
+
+const REQUEST_RECEIVE_BUFFER_BYTES: usize = 64 * 1024;
+
 #[cfg(feature = "age319-private-broker-fixture")]
 #[path = "fresh_provider.rs"]
 mod fresh_provider;
@@ -50,7 +63,7 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 const SOCKET: &str = "/run/oulipoly-kernel-broker/control.sock";
 const STATE: &str = "/var/lib/oulipoly-kernel-broker";
@@ -298,7 +311,7 @@ fn recv_request(
     // live through classification and dispatch.
     let challenge = *uuid::Uuid::new_v4().as_bytes();
     stream.write_all(&challenge)?;
-    let mut request = [0u8; 64 * 1024];
+    let mut request = [0u8; REQUEST_RECEIVE_BUFFER_BYTES];
     let mut iov = libc::iovec {
         iov_base: request.as_mut_ptr().cast(),
         iov_len: request.len(),
@@ -1643,7 +1656,7 @@ fn issue_source_ticket(
     peer: &PeerIdentity,
     tickets: &mut BTreeMap<String, SourceTicket>,
 ) -> io::Result<String> {
-    tickets.retain(|_, ticket| ticket.created.elapsed() < Duration::from_secs(30));
+    tickets.retain(|_, ticket| ticket.created.elapsed() < SOURCE_TICKET_TTL);
     if tickets.len() >= 128 {
         return Err(io::Error::other("source ticket capacity exhausted"));
     }
@@ -1700,7 +1713,7 @@ fn consume_source_ticket(
     let ticket = tickets
         .remove(&spec.ticket)
         .ok_or_else(|| io::Error::other("source ticket absent or already consumed"))?;
-    if ticket.created.elapsed() >= Duration::from_secs(30) {
+    if ticket.created.elapsed() >= SOURCE_TICKET_TTL {
         return Err(io::Error::other("source ticket expired"));
     }
     let root_id = ticket.witness.root_id.clone();
@@ -2750,7 +2763,7 @@ fn serve() -> io::Result<()> {
     let (handoff_tx, handoff_rx): (
         SyncSender<FreshHandoffBridgeRequest>,
         Receiver<FreshHandoffBridgeRequest>,
-    ) = mpsc::sync_channel(8);
+    ) = mpsc::sync_channel(FRESH_HANDOFF_QUEUE_CAPACITY);
     // The old loop alone owns the release gate and mutable kernel registries.
     // Fresh storage stays on another thread and is opened only at the fixed
     // broker-owned v30 directory. Neither handler can wait on the other's
@@ -2811,14 +2824,14 @@ fn serve() -> io::Result<()> {
                         &mut settled_native_q,
                     );
                 }
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(BROKER_ACCEPT_POLL_INTERVAL);
                 continue;
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
         };
-        stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
-        stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
+        stream.set_read_timeout(Some(BROKER_INGRESS_IO_TIMEOUT))?;
+        stream.set_write_timeout(Some(BROKER_INGRESS_IO_TIMEOUT))?;
         let result = peer_from_request(&mut stream).and_then(|(operation, payload, peer)| {
             // Request parsing is bounded. Root launch/recovery readiness is
             // governed by exact gates and process death, not a 5s cutoff.
@@ -3642,7 +3655,7 @@ fn bridge_released_handoff(
         pidns_dev: peer.process.pidns_dev,
         pidns_ino: peer.process.pidns_ino,
     };
-    let (reply, answer) = mpsc::sync_channel(1);
+    let (reply, answer) = mpsc::sync_channel(RELEASED_HANDOFF_REPLY_CAPACITY);
     bridge
         .send(FreshHandoffBridgeRequest {
             spec,
@@ -3653,7 +3666,7 @@ fn bridge_released_handoff(
         })
         .map_err(|_| io::Error::other("old release authority unavailable"))?;
     let receipt = answer
-        .recv_timeout(Duration::from_secs(30))
+        .recv_timeout(RELEASED_HANDOFF_REPLY_TIMEOUT)
         .map_err(|_| io::Error::other("old release authority response uncertain"))??;
     let current = PinnedProcess::open(expected.host_pid)?;
     current.verify()?;
@@ -3831,8 +3844,8 @@ fn serve_fresh_v30_at(
     fs::set_permissions(socket, fs::Permissions::from_mode(0o660))?;
     for incoming in listener.incoming() {
         let Ok(mut stream) = incoming else { continue };
-        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+        stream.set_read_timeout(Some(FRESH_V30_READ_TIMEOUT))?;
+        stream.set_write_timeout(Some(FRESH_V30_WRITE_TIMEOUT))?;
         let mut submitted_grant = None;
         #[cfg(feature = "age319-private-broker-fixture")]
         let mut drop_provider_k_reply = false;

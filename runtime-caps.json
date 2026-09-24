@@ -154,6 +154,956 @@
       }
     },
     {
+      "id": "kernel-broker.accepted-grant.image-digest-buffer-bytes",
+      "owner": "kernel-broker/accepted_grant",
+      "class": "resource_guard",
+      "protected_resource": "image hash scratch memory",
+      "exhaustion_behavior": "Hashing streams all file chunks through this fixed buffer.",
+      "observability": "The owning read or I/O error reports failure; a full streaming chunk alone is not terminal.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "A fixed 64 * 1024 byte scratch buffer bounds allocation for image_digest without imposing a total input ceiling.",
+      "default_value": "64 * 1024",
+      "source": "crates/oulipoly-kernel-broker/src/accepted_grant.rs",
+      "symbol": "IMAGE_DIGEST_BUFFER_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/accepted_grant.rs",
+        "scope": "module::fn:image_digest",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.accepted-grant.max-artifact",
+      "owner": "crates/oulipoly-kernel-broker/src/accepted_grant",
+      "class": "resource_guard",
+      "protected_resource": "memory and I/O for accepted-work artifact reads",
+      "exhaustion_behavior": "read_bounded rejects a file larger than 1 MiB before allocating its contents",
+      "observability": "The accepted-work artifact too large error is returned to the broker caller",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "Artifact reads must stay bounded before allocation and provenance checks.",
+      "default_value": "1024 * 1024",
+      "source": "crates/oulipoly-kernel-broker/src/accepted_grant.rs",
+      "symbol": "MAX_ARTIFACT",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/accepted_grant.rs",
+        "scope": "module::fn:read_bounded",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.fresh-provider.cancellation-escalation-delay",
+      "owner": "kernel-broker/fresh_provider",
+      "class": "external_protocol_deadline",
+      "protected_resource": "cancelled child process termination",
+      "exhaustion_behavior": "After SIGTERM has had two seconds, the existing PID1 path sends SIGKILL to child members.",
+      "observability": "The PID1 wait and terminal record expose child settlement.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "The existing 2 secs value controls cancelled child process termination; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_secs (2)",
+      "source": "crates/oulipoly-kernel-broker/src/fresh_provider.rs",
+      "symbol": "CANCELLATION_ESCALATION_DELAY",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/fresh_provider.rs",
+        "scope": "module::fn:run_init",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.fresh-provider.pid1-reap-poll-interval",
+      "owner": "kernel-broker/fresh_provider",
+      "class": "polling_cadence",
+      "protected_resource": "PID1 child reaping wake frequency",
+      "exhaustion_behavior": "The waitpid loop sleeps between nonblocking polls; this value does not terminate it.",
+      "observability": "The PID1 wait and terminal record expose child settlement.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "The existing 20 millis value controls PID1 child reaping wake frequency; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_millis (20)",
+      "source": "crates/oulipoly-kernel-broker/src/fresh_provider.rs",
+      "symbol": "PID1_REAP_POLL_INTERVAL",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/fresh_provider.rs",
+        "scope": "module::fn:run_init",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.fresh-provider.sealed-copy-buffer-bytes",
+      "owner": "kernel-broker/fresh_provider",
+      "class": "resource_guard",
+      "protected_resource": "fresh provider sealed copy scratch memory",
+      "exhaustion_behavior": "Copying streams all file chunks through this fixed buffer.",
+      "observability": "The owning read or I/O error reports failure; a full streaming chunk alone is not terminal.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "A fixed 64 * 1024 byte scratch buffer bounds allocation for sealed_copy without imposing a total input ceiling.",
+      "default_value": "64 * 1024",
+      "source": "crates/oulipoly-kernel-broker/src/fresh_provider.rs",
+      "symbol": "SEALED_COPY_BUFFER_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/fresh_provider.rs",
+        "scope": "module::fn:sealed_copy",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.fresh-provider.sha-file-buffer-bytes",
+      "owner": "kernel-broker/fresh_provider",
+      "class": "resource_guard",
+      "protected_resource": "fresh provider image hash scratch memory",
+      "exhaustion_behavior": "Hashing streams all file chunks through this fixed buffer.",
+      "observability": "The owning read or I/O error reports failure; a full streaming chunk alone is not terminal.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "A fixed 64 * 1024 byte scratch buffer bounds allocation for sha_file without imposing a total input ceiling.",
+      "default_value": "64 * 1024",
+      "source": "crates/oulipoly-kernel-broker/src/fresh_provider.rs",
+      "symbol": "SHA_FILE_BUFFER_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/fresh_provider.rs",
+        "scope": "module::fn:sha_file",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.fresh-provider.verified-output-buffer-bytes",
+      "owner": "kernel-broker/fresh_provider",
+      "class": "resource_guard",
+      "protected_resource": "verified output hash scratch memory",
+      "exhaustion_behavior": "Output verification streams chunks through this fixed buffer.",
+      "observability": "The owning read or I/O error reports failure; a full streaming chunk alone is not terminal.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "A fixed 64 * 1024 byte scratch buffer bounds allocation for verified_output without imposing a total input ceiling.",
+      "default_value": "64 * 1024",
+      "source": "crates/oulipoly-kernel-broker/src/fresh_provider.rs",
+      "symbol": "VERIFIED_OUTPUT_BUFFER_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/fresh_provider.rs",
+        "scope": "module::fn:verified_output",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.installed-pair.installed-pair-read-bytes",
+      "owner": "kernel-broker/installed_pair",
+      "class": "resource_guard",
+      "protected_resource": "installed-pair metadata read memory",
+      "exhaustion_behavior": "Reads one byte past the 4096-byte accepted payload limit to reject oversized metadata.",
+      "observability": "The owning call returns an I/O or channel error when work cannot proceed.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "This declaration names the existing 4097 limit at load.",
+      "default_value": "4097",
+      "source": "crates/oulipoly-kernel-broker/src/installed_pair.rs",
+      "symbol": "INSTALLED_PAIR_READ_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/installed_pair.rs",
+        "scope": "module::impl:InstalledPair::fn:load",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.linux-main.broker-accept-poll-interval",
+      "owner": "kernel-broker/linux_main",
+      "class": "polling_cadence",
+      "protected_resource": "broker accept-loop wake frequency",
+      "exhaustion_behavior": "The nonblocking listener sleeps between checks; this does not expire launch work.",
+      "observability": "The listener and peer result expose progress or failure.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "The existing 100 millis value controls broker accept-loop wake frequency; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_millis (100)",
+      "source": "crates/oulipoly-kernel-broker/src/linux_main.rs",
+      "symbol": "BROKER_ACCEPT_POLL_INTERVAL",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/linux_main.rs",
+        "scope": "module::fn:serve",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.linux-main.broker-ingress-io-timeout",
+      "owner": "kernel-broker/linux_main",
+      "class": "external_protocol_deadline",
+      "protected_resource": "preclassification broker request I/O",
+      "exhaustion_behavior": "Socket reads and writes of the initial request time out after five seconds; later launch readiness has no socket timeout.",
+      "observability": "The broker returns an I/O error on incomplete ingress.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "The existing 5 secs value controls preclassification broker request I/O; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_secs (5)",
+      "source": "crates/oulipoly-kernel-broker/src/linux_main.rs",
+      "symbol": "BROKER_INGRESS_IO_TIMEOUT",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/linux_main.rs",
+        "scope": "module::fn:serve",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.linux-main.fresh-handoff-queue-capacity",
+      "owner": "kernel-broker/linux_main",
+      "class": "resource_guard",
+      "protected_resource": "fresh handoff bridge queue slots",
+      "exhaustion_behavior": "The bounded channel backpressures sends when eight bridge requests are queued.",
+      "observability": "The owning call returns an I/O or channel error when work cannot proceed.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "This declaration names the existing 8 limit at serve.",
+      "default_value": "8",
+      "source": "crates/oulipoly-kernel-broker/src/linux_main.rs",
+      "symbol": "FRESH_HANDOFF_QUEUE_CAPACITY",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/linux_main.rs",
+        "scope": "module::fn:serve",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.linux-main.fresh-v30-read-timeout",
+      "owner": "kernel-broker/linux_main",
+      "class": "external_protocol_deadline",
+      "protected_resource": "fresh v30 request socket read",
+      "exhaustion_behavior": "A peer that does not supply a request within five seconds fails the socket read.",
+      "observability": "The v30 handler returns or logs the socket I/O error.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "The existing 5 secs value controls fresh v30 request socket read; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_secs (5)",
+      "source": "crates/oulipoly-kernel-broker/src/linux_main.rs",
+      "symbol": "FRESH_V30_READ_TIMEOUT",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/linux_main.rs",
+        "scope": "module::fn:serve_fresh_v30_at",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.linux-main.fresh-v30-write-timeout",
+      "owner": "kernel-broker/linux_main",
+      "class": "external_protocol_deadline",
+      "protected_resource": "fresh v30 response socket write",
+      "exhaustion_behavior": "A peer that cannot receive a response within thirty seconds fails the socket write.",
+      "observability": "The v30 handler returns or logs the socket I/O error.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "The existing 30 secs value controls fresh v30 response socket write; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_secs (30)",
+      "source": "crates/oulipoly-kernel-broker/src/linux_main.rs",
+      "symbol": "FRESH_V30_WRITE_TIMEOUT",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/linux_main.rs",
+        "scope": "module::fn:serve_fresh_v30_at",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.linux-main.released-handoff-reply-capacity",
+      "owner": "kernel-broker/linux_main",
+      "class": "resource_guard",
+      "protected_resource": "released handoff reply slots",
+      "exhaustion_behavior": "The one-slot reply channel prevents unbounded queued reply memory.",
+      "observability": "The owning call returns an I/O or channel error when work cannot proceed.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "This declaration names the existing 1 limit at bridge_released_handoff.",
+      "default_value": "1",
+      "source": "crates/oulipoly-kernel-broker/src/linux_main.rs",
+      "symbol": "RELEASED_HANDOFF_REPLY_CAPACITY",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/linux_main.rs",
+        "scope": "module::fn:bridge_released_handoff",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.linux-main.released-handoff-reply-timeout",
+      "owner": "kernel-broker/linux_main",
+      "class": "provisional_stopgap",
+      "protected_resource": "released handoff bridge reply wait",
+      "exhaustion_behavior": "The existing recv_timeout returns an uncertain response error after thirty seconds.",
+      "observability": "The caller receives old release authority response uncertain.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "The existing 30 secs value controls released handoff bridge reply wait; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_secs (30)",
+      "source": "crates/oulipoly-kernel-broker/src/linux_main.rs",
+      "symbol": "RELEASED_HANDOFF_REPLY_TIMEOUT",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/linux_main.rs",
+        "scope": "module::fn:bridge_released_handoff",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.linux-main.request-receive-buffer-bytes",
+      "owner": "kernel-broker/linux_main",
+      "class": "resource_guard",
+      "protected_resource": "broker request frame receive memory",
+      "exhaustion_behavior": "One recvmsg is bounded by this frame buffer; request validation rejects malformed or truncated frames.",
+      "observability": "The owning read or I/O error reports failure; a full streaming chunk alone is not terminal.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "A fixed 64 * 1024 byte scratch buffer bounds allocation for recv_request without imposing a total input ceiling.",
+      "default_value": "64 * 1024",
+      "source": "crates/oulipoly-kernel-broker/src/linux_main.rs",
+      "symbol": "REQUEST_RECEIVE_BUFFER_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/linux_main.rs",
+        "scope": "module::fn:recv_request",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.linux-main.source-ticket-ttl",
+      "owner": "kernel-broker/linux_main",
+      "class": "structural_safety_bound",
+      "protected_resource": "unconsumed source ticket lifetime",
+      "exhaustion_behavior": "Old tickets are removed at issue and rejected when consumed after thirty seconds.",
+      "observability": "Ticket capacity or expiry returns a typed broker error.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "The existing 30 secs value controls unconsumed source ticket lifetime; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_secs (30)",
+      "source": "crates/oulipoly-kernel-broker/src/linux_main.rs",
+      "symbol": "SOURCE_TICKET_TTL",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/linux_main.rs",
+        "scope": "module::fn:issue_source_ticket",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.native-receipt.max-receipt",
+      "owner": "crates/oulipoly-kernel-broker/src/native_receipt",
+      "class": "resource_guard",
+      "protected_resource": "memory and parsing work for native guardian receipts",
+      "exhaustion_behavior": "verify rejects a receipt larger than 1 MiB before parsing",
+      "observability": "read_exact_bounded returns a receipt verification error",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "A guardian receipt is control metadata, so an oversized body cannot be admitted.",
+      "default_value": "1024 * 1024",
+      "source": "crates/oulipoly-kernel-broker/src/native_receipt.rs",
+      "symbol": "MAX_RECEIPT",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/native_receipt.rs",
+        "scope": "module::fn:verify",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.native-receipt.max-request",
+      "owner": "crates/oulipoly-kernel-broker/src/native_receipt",
+      "class": "resource_guard",
+      "protected_resource": "memory and parsing work for native request artifacts",
+      "exhaustion_behavior": "verify rejects a request larger than 4 MiB before comparing identity and digest",
+      "observability": "read_exact_bounded returns a native request verification error",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "Native request metadata is bounded before custody verification.",
+      "default_value": "4 * 1024 * 1024",
+      "source": "crates/oulipoly-kernel-broker/src/native_receipt.rs",
+      "symbol": "MAX_REQUEST",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/native_receipt.rs",
+        "scope": "module::fn:verify",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.native-work.cancellation-escalation-delay",
+      "owner": "kernel-broker/native_work",
+      "class": "external_protocol_deadline",
+      "protected_resource": "cancelled child process termination",
+      "exhaustion_behavior": "After SIGTERM has had two seconds, the existing PID1 path sends SIGKILL to child members.",
+      "observability": "The PID1 wait and terminal record expose child settlement.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "The existing 2 secs value controls cancelled child process termination; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_secs (2)",
+      "source": "crates/oulipoly-kernel-broker/src/native_work.rs",
+      "symbol": "CANCELLATION_ESCALATION_DELAY",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/native_work.rs",
+        "scope": "module::fn:run_init",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.native-work.capture-output-buffer-bytes",
+      "owner": "kernel-broker/native_work",
+      "class": "resource_guard",
+      "protected_resource": "native output capture scratch memory",
+      "exhaustion_behavior": "Capture streams output through this fixed buffer.",
+      "observability": "The owning read or I/O error reports failure; a full streaming chunk alone is not terminal.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "A fixed 8192 byte scratch buffer bounds allocation for capture_output without imposing a total input ceiling.",
+      "default_value": "8192",
+      "source": "crates/oulipoly-kernel-broker/src/native_work.rs",
+      "symbol": "CAPTURE_OUTPUT_BUFFER_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/native_work.rs",
+        "scope": "module::fn:capture_output",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.native-work.hash-output-buffer-bytes",
+      "owner": "kernel-broker/native_work",
+      "class": "resource_guard",
+      "protected_resource": "native work output hash scratch memory",
+      "exhaustion_behavior": "Hashing streams all output chunks through this fixed buffer.",
+      "observability": "The owning read or I/O error reports failure; a full streaming chunk alone is not terminal.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "A fixed 64 * 1024 byte scratch buffer bounds allocation for hash_output without imposing a total input ceiling.",
+      "default_value": "64 * 1024",
+      "source": "crates/oulipoly-kernel-broker/src/native_work.rs",
+      "symbol": "HASH_OUTPUT_BUFFER_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/native_work.rs",
+        "scope": "module::fn:hash_output",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.native-work.launch-read-buffer-bytes",
+      "owner": "kernel-broker/native_work",
+      "class": "resource_guard",
+      "protected_resource": "native launch input scratch memory",
+      "exhaustion_behavior": "The launch read loop uses fixed chunks rather than allocating input-sized scratch memory.",
+      "observability": "The owning read or I/O error reports failure; a full streaming chunk alone is not terminal.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "A fixed 64 * 1024 byte scratch buffer bounds allocation for launch without imposing a total input ceiling.",
+      "default_value": "64 * 1024",
+      "source": "crates/oulipoly-kernel-broker/src/native_work.rs",
+      "symbol": "LAUNCH_READ_BUFFER_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/native_work.rs",
+        "scope": "module::fn:launch",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.native-work.pid1-reap-poll-interval",
+      "owner": "kernel-broker/native_work",
+      "class": "polling_cadence",
+      "protected_resource": "PID1 child reaping wake frequency",
+      "exhaustion_behavior": "The waitpid loop sleeps between nonblocking polls; this value does not terminate it.",
+      "observability": "The PID1 wait and terminal record expose child settlement.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "The existing 20 millis value controls PID1 child reaping wake frequency; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_millis (20)",
+      "source": "crates/oulipoly-kernel-broker/src/native_work.rs",
+      "symbol": "PID1_REAP_POLL_INTERVAL",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/native_work.rs",
+        "scope": "module::fn:run_init",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.native-work.private-native-gate-poll",
+      "owner": "kernel-broker/native_work",
+      "class": "polling_cadence",
+      "protected_resource": "private native fixture gate checks",
+      "exhaustion_behavior": "The fixture polls for release every twenty milliseconds.",
+      "observability": "Fixture result exposes release or timeout.",
+      "configurability": "Fixed source declaration; private fixture values require its explicit feature and environment.",
+      "rationale": "The existing 20 millis value controls private native fixture gate checks; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_millis (20)",
+      "source": "crates/oulipoly-kernel-broker/src/native_work.rs",
+      "symbol": "PRIVATE_NATIVE_GATE_POLL",
+      "declaration_scope": "module::cfg:feature=\"age319-private-broker-fixture\"",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/native_work.rs",
+        "scope": "module::fn:launch",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.native-work.private-native-gate-wait",
+      "owner": "kernel-broker/native_work",
+      "class": "test_only_patience",
+      "protected_resource": "private native fixture release gate",
+      "exhaustion_behavior": "Only an explicit private fixture gate can fail after twenty seconds.",
+      "observability": "The fixture reports native-release timeout.",
+      "configurability": "Fixed source declaration; private fixture values require its explicit feature and environment.",
+      "rationale": "The existing 20 secs value controls private native fixture release gate; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_secs (20)",
+      "source": "crates/oulipoly-kernel-broker/src/native_work.rs",
+      "symbol": "PRIVATE_NATIVE_GATE_WAIT",
+      "declaration_scope": "module::cfg:feature=\"age319-private-broker-fixture\"",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/native_work.rs",
+        "scope": "module::fn:launch",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.private-installed-exec.private-installed-reap-poll",
+      "owner": "kernel-broker/private_installed_exec",
+      "class": "polling_cadence",
+      "protected_resource": "private installed worker reap wake frequency",
+      "exhaustion_behavior": "The worker wait loop sleeps between checks without a terminal clock.",
+      "observability": "The private execution result exposes child settlement.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "The existing 200 millis value controls private installed worker reap wake frequency; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_millis (200)",
+      "source": "crates/oulipoly-kernel-broker/src/private_installed_exec.rs",
+      "symbol": "PRIVATE_INSTALLED_REAP_POLL",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/private_installed_exec.rs",
+        "scope": "module::fn:run_init",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.protocol.broker-response-read-bytes",
+      "owner": "kernel-broker/protocol",
+      "class": "resource_guard",
+      "protected_resource": "broker response read memory",
+      "exhaustion_behavior": "Reads one byte beyond the 256-byte response limit before rejecting overflow.",
+      "observability": "The owning call returns an I/O or channel error when work cannot proceed.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "This declaration names the existing 257 limit at read_response.",
+      "default_value": "257",
+      "source": "crates/oulipoly-kernel-broker/src/protocol.rs",
+      "symbol": "BROKER_RESPONSE_READ_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/protocol.rs",
+        "scope": "module::fn:read_response",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.protocol.entry-observation-io-timeout",
+      "owner": "kernel-broker/protocol",
+      "class": "external_protocol_deadline",
+      "protected_resource": "entry observation and close socket I/O",
+      "exhaustion_behavior": "Observation and close operations use a five-second socket timeout.",
+      "observability": "The request returns an I/O error.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "The existing 5 secs value controls entry observation and close socket I/O; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_secs (5)",
+      "source": "crates/oulipoly-kernel-broker/src/protocol.rs",
+      "symbol": "ENTRY_OBSERVATION_IO_TIMEOUT",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/protocol.rs",
+        "scope": "module::fn:request_frame_at",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.protocol.fresh-recipient-io-timeout",
+      "owner": "kernel-broker/protocol",
+      "class": "external_protocol_deadline",
+      "protected_resource": "fresh recipient request socket I/O",
+      "exhaustion_behavior": "A stalled fresh recipient read or write returns a socket timeout.",
+      "observability": "The request returns an I/O error.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "The existing 30 secs value controls fresh recipient request socket I/O; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_secs (30)",
+      "source": "crates/oulipoly-kernel-broker/src/protocol.rs",
+      "symbol": "FRESH_RECIPIENT_IO_TIMEOUT",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/protocol.rs",
+        "scope": "module::fn:fresh_recipient_request_at",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.protocol.fresh-session-reply-read-bytes",
+      "owner": "kernel-broker/protocol",
+      "class": "resource_guard",
+      "protected_resource": "fresh session reply read memory",
+      "exhaustion_behavior": "Reads one byte beyond the 1024-byte reply limit before rejecting overflow.",
+      "observability": "The owning call returns an I/O or channel error when work cannot proceed.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "This declaration names the existing 1025 limit at fresh_v30_session_request_at.",
+      "default_value": "1025",
+      "source": "crates/oulipoly-kernel-broker/src/protocol.rs",
+      "symbol": "FRESH_SESSION_REPLY_READ_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/protocol.rs",
+        "scope": "module::fn:fresh_v30_session_request_at",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.protocol.normal-work-reply-read-bytes",
+      "owner": "kernel-broker/protocol",
+      "class": "resource_guard",
+      "protected_resource": "normal work reply read memory",
+      "exhaustion_behavior": "Reads one byte beyond the 8192-byte reply limit before rejecting overflow.",
+      "observability": "The owning call returns an I/O or channel error when work cannot proceed.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "This declaration names the existing 8193 limit at normal_work_request_at.",
+      "default_value": "8193",
+      "source": "crates/oulipoly-kernel-broker/src/protocol.rs",
+      "symbol": "NORMAL_WORK_REPLY_READ_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/protocol.rs",
+        "scope": "module::fn:normal_work_request_at",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.protocol.released-handoff-reply-read-bytes",
+      "owner": "kernel-broker/protocol",
+      "class": "resource_guard",
+      "protected_resource": "released handoff reply read memory",
+      "exhaustion_behavior": "Reads one byte beyond the 8192-byte reply limit before rejecting overflow.",
+      "observability": "The owning call returns an I/O or channel error when work cannot proceed.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "This declaration names the existing 8193 limit at request_released_fresh_handoff_at.",
+      "default_value": "8193",
+      "source": "crates/oulipoly-kernel-broker/src/protocol.rs",
+      "symbol": "RELEASED_HANDOFF_REPLY_READ_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/protocol.rs",
+        "scope": "module::fn:request_released_fresh_handoff_at",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.protocol.root-effect-reply-read-bytes",
+      "owner": "kernel-broker/protocol",
+      "class": "resource_guard",
+      "protected_resource": "root effect reply read memory",
+      "exhaustion_behavior": "Reads one byte beyond the 8192-byte reply limit before rejecting overflow.",
+      "observability": "The owning call returns an I/O or channel error when work cannot proceed.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "This declaration names the existing 8193 limit at root_effect_request_at.",
+      "default_value": "8193",
+      "source": "crates/oulipoly-kernel-broker/src/protocol.rs",
+      "symbol": "ROOT_EFFECT_REPLY_READ_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/protocol.rs",
+        "scope": "module::fn:root_effect_request_at",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.protocol.state-frame-reply-read-bytes",
+      "owner": "kernel-broker/protocol",
+      "class": "resource_guard",
+      "protected_resource": "State frame reply read memory",
+      "exhaustion_behavior": "Reads one byte beyond the 4096-byte reply limit before rejecting overflow.",
+      "observability": "The owning call returns an I/O or channel error when work cannot proceed.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "This declaration names the existing 4097 limit at send_state_frame_at.",
+      "default_value": "4097",
+      "source": "crates/oulipoly-kernel-broker/src/protocol.rs",
+      "symbol": "STATE_FRAME_REPLY_READ_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/protocol.rs",
+        "scope": "module::fn:send_state_frame_at",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.root-join.private-root-gate-poll",
+      "owner": "kernel-broker/root_join",
+      "class": "polling_cadence",
+      "protected_resource": "private root release gate checks",
+      "exhaustion_behavior": "The fixture waits for release with twenty-millisecond checks and no deadline.",
+      "observability": "The held child and peer are verified on each check.",
+      "configurability": "Fixed source declaration; private fixture values require its explicit feature and environment.",
+      "rationale": "The existing 20 millis value controls private root release gate checks; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_millis (20)",
+      "source": "crates/oulipoly-kernel-broker/src/root_join.rs",
+      "symbol": "PRIVATE_ROOT_GATE_POLL",
+      "declaration_scope": "module::cfg:feature=\"age319-private-broker-fixture\"",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/root_join.rs",
+        "scope": "module::fn:hold",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.shared-front-door.broker-observe-io-timeout",
+      "owner": "kernel-broker/shared_front_door",
+      "class": "external_protocol_deadline",
+      "protected_resource": "shared front door observation socket I/O",
+      "exhaustion_behavior": "The broker observation socket read and write time out after five seconds.",
+      "observability": "Observation returns the socket I/O error.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "The existing 5 secs value controls shared front door observation socket I/O; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_secs (5)",
+      "source": "crates/oulipoly-kernel-broker/src/shared_front_door.rs",
+      "symbol": "BROKER_OBSERVE_IO_TIMEOUT",
+      "declaration_scope": "module::mod:linux",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/shared_front_door.rs",
+        "scope": "module::mod:linux::fn:observe_broker",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.shared-front-door.observe-response-read-bytes",
+      "owner": "kernel-broker/shared_front_door",
+      "class": "resource_guard",
+      "protected_resource": "broker observation response read memory",
+      "exhaustion_behavior": "Reads one byte beyond the 256-byte observation response limit before rejecting overflow.",
+      "observability": "The owning call returns an I/O or channel error when work cannot proceed.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "This declaration names the existing 257 limit at observe_broker.",
+      "default_value": "257",
+      "source": "crates/oulipoly-kernel-broker/src/shared_front_door.rs",
+      "symbol": "OBSERVE_RESPONSE_READ_BYTES",
+      "declaration_scope": "module::mod:linux",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/shared_front_door.rs",
+        "scope": "module::mod:linux::fn:observe_broker",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.source-acceptance.max-manifest",
+      "owner": "crates/oulipoly-kernel-broker/src/source_acceptance",
+      "class": "resource_guard",
+      "protected_resource": "captured source evidence manifest storage and read memory",
+      "exhaustion_behavior": "capture_v2_evidence rejects serialized evidence above 32 MiB; readback uses the same ceiling",
+      "observability": "An oversized manifest returns source acceptance error",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "Evidence size is checked before durable write and bounded readback.",
+      "default_value": "32 * 1024 * 1024",
+      "source": "crates/oulipoly-kernel-broker/src/source_acceptance.rs",
+      "symbol": "MAX_MANIFEST",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/source_acceptance.rs",
+        "scope": "module::fn:capture_v2_evidence",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.source-acceptance.max-reply",
+      "owner": "crates/oulipoly-kernel-broker/src/source_acceptance",
+      "class": "resource_guard",
+      "protected_resource": "source recovery reply memory",
+      "exhaustion_behavior": "reply reads one byte beyond twice the registration bound and rejects overflow",
+      "observability": "Recovery reply returns an incomplete or oversized error",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "The reply cannot grow without bound while broker verifies captured stdout.",
+      "default_value": "MAX_REGISTRATION_BYTES * 2",
+      "source": "crates/oulipoly-kernel-broker/src/source_acceptance.rs",
+      "symbol": "MAX_REPLY",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/source_acceptance.rs",
+        "scope": "module::fn:reply",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.source-acceptance.max-snapshot",
+      "owner": "crates/oulipoly-kernel-broker/src/source_acceptance",
+      "class": "resource_guard",
+      "protected_resource": "captured Runner source snapshot memory and file I/O",
+      "exhaustion_behavior": "source_bytes rejects snapshots larger than 16 MiB during capture and readback",
+      "observability": "Source acceptance returns a snapshot size error",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "The accepted executable snapshot has a finite pre-hash size ceiling.",
+      "default_value": "16 * 1024 * 1024",
+      "source": "crates/oulipoly-kernel-broker/src/source_acceptance.rs",
+      "symbol": "MAX_SNAPSHOT",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/source_acceptance.rs",
+        "scope": "module::fn:capture_v2_evidence",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.source-candidate.image-limit",
+      "owner": "crates/oulipoly-kernel-broker/src/source_candidate",
+      "class": "resource_guard",
+      "protected_resource": "pinned Runner executable image read and hash work",
+      "exhaustion_behavior": "pin and verify_at_use reject an image above 256 MiB",
+      "observability": "SourcePinnedCandidate returns a source image error",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "Executable identity verification is bounded before admission.",
+      "default_value": "256 * 1024 * 1024",
+      "source": "crates/oulipoly-kernel-broker/src/source_candidate.rs",
+      "symbol": "IMAGE_LIMIT",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/source_candidate.rs",
+        "scope": "module::impl:SourcePinnedCandidate::fn:pin",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.source-candidate.stamp-buffer-bytes",
+      "owner": "kernel-broker/source_candidate",
+      "class": "resource_guard",
+      "protected_resource": "source candidate hashing scratch memory",
+      "exhaustion_behavior": "Stamping streams source bytes through this fixed buffer.",
+      "observability": "The owning read or I/O error reports failure; a full streaming chunk alone is not terminal.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "A fixed 64 * 1024 byte scratch buffer bounds allocation for stamp without imposing a total input ceiling.",
+      "default_value": "64 * 1024",
+      "source": "crates/oulipoly-kernel-broker/src/source_candidate.rs",
+      "symbol": "STAMP_BUFFER_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/source_candidate.rs",
+        "scope": "module::fn:stamp",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.source-physical.cancellation-escalation-delay",
+      "owner": "kernel-broker/source_physical",
+      "class": "external_protocol_deadline",
+      "protected_resource": "cancelled child process termination",
+      "exhaustion_behavior": "After SIGTERM has had two seconds, the existing PID1 path sends SIGKILL to child members.",
+      "observability": "The PID1 wait and terminal record expose child settlement.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "The existing 2 secs value controls cancelled child process termination; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_secs (2)",
+      "source": "crates/oulipoly-kernel-broker/src/source_physical.rs",
+      "symbol": "CANCELLATION_ESCALATION_DELAY",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/source_physical.rs",
+        "scope": "module::fn:reap_source_pid1",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.source-physical.capture-buffer-bytes",
+      "owner": "crates/oulipoly-kernel-broker/src/source_physical",
+      "class": "resource_guard",
+      "protected_resource": "scratch memory for physical source capture and hashing",
+      "exhaustion_behavior": "capture_stream_to_disk uses 64 KiB chunks and continues streaming larger inputs",
+      "observability": "Normal captured byte counts and I/O errors expose progress or failure",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "Chunk size bounds temporary allocation without capping the whole stream.",
+      "default_value": "64 * 1024",
+      "source": "crates/oulipoly-kernel-broker/src/source_physical.rs",
+      "symbol": "CAPTURE_BUFFER_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/source_physical.rs",
+        "scope": "module::fn:capture_stream_to_disk",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.source-physical.pid1-reap-poll-interval",
+      "owner": "kernel-broker/source_physical",
+      "class": "polling_cadence",
+      "protected_resource": "PID1 child reaping wake frequency",
+      "exhaustion_behavior": "The waitpid loop sleeps between nonblocking polls; this value does not terminate it.",
+      "observability": "The PID1 wait and terminal record expose child settlement.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "The existing 20 millis value controls PID1 child reaping wake frequency; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_millis (20)",
+      "source": "crates/oulipoly-kernel-broker/src/source_physical.rs",
+      "symbol": "PID1_REAP_POLL_INTERVAL",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/source_physical.rs",
+        "scope": "module::fn:reap_source_pid1",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.work-launch.cancellation-escalation-delay",
+      "owner": "kernel-broker/work_launch",
+      "class": "external_protocol_deadline",
+      "protected_resource": "cancelled child process termination",
+      "exhaustion_behavior": "After SIGTERM has had two seconds, the existing PID1 path sends SIGKILL to child members.",
+      "observability": "The PID1 wait and terminal record expose child settlement.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "The existing 2 secs value controls cancelled child process termination; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_secs (2)",
+      "source": "crates/oulipoly-kernel-broker/src/work_launch.rs",
+      "symbol": "CANCELLATION_ESCALATION_DELAY",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/work_launch.rs",
+        "scope": "module::fn:run_init",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.work-launch.pid1-reap-poll-interval",
+      "owner": "kernel-broker/work_launch",
+      "class": "polling_cadence",
+      "protected_resource": "PID1 child reaping wake frequency",
+      "exhaustion_behavior": "The waitpid loop sleeps between nonblocking polls; this value does not terminate it.",
+      "observability": "The PID1 wait and terminal record expose child settlement.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "The existing 20 millis value controls PID1 child reaping wake frequency; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_millis (20)",
+      "source": "crates/oulipoly-kernel-broker/src/work_launch.rs",
+      "symbol": "PID1_REAP_POLL_INTERVAL",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/work_launch.rs",
+        "scope": "module::fn:run_init",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.writer-census.fd-target-buffer-bytes",
+      "owner": "kernel-broker/writer_census",
+      "class": "resource_guard",
+      "protected_resource": "procfs fd symlink read memory",
+      "exhaustion_behavior": "A link that fills the buffer is rejected as truncated.",
+      "observability": "The owning read or I/O error reports failure; a full streaming chunk alone is not terminal.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "A fixed 4096 byte scratch buffer bounds allocation for fd_target without imposing a total input ceiling.",
+      "default_value": "4096",
+      "source": "crates/oulipoly-kernel-broker/src/writer_census.rs",
+      "symbol": "FD_TARGET_BUFFER_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/writer_census.rs",
+        "scope": "module::fn:fd_target",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.writer-census.proc-dirents-buffer-bytes",
+      "owner": "kernel-broker/writer_census",
+      "class": "resource_guard",
+      "protected_resource": "procfs directory enumeration scratch memory",
+      "exhaustion_behavior": "getdents repeats until EOF with this fixed syscall buffer.",
+      "observability": "The owning read or I/O error reports failure; a full streaming chunk alone is not terminal.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "A fixed 8192 byte scratch buffer bounds allocation for numeric_entries without imposing a total input ceiling.",
+      "default_value": "8192",
+      "source": "crates/oulipoly-kernel-broker/src/writer_census.rs",
+      "symbol": "PROC_DIRENTS_BUFFER_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/writer_census.rs",
+        "scope": "module::fn:numeric_entries",
+        "kind": "direct_control"
+      }
+    },
+    {
       "id": "provider.client.default-handshake-timeout",
       "owner": "provider/client",
       "class": "external_protocol_deadline",
@@ -601,8 +1551,8 @@
       "rationale": "PREVIEW_BYTES bounds UI-facing preview retention without rejecting the provider result.",
       "default_value": "4096",
       "source": "src-tauri/src/commands/test_model/mapper.rs",
-      "declaration_scope": "module::fn:map_test_model_result",
       "symbol": "PREVIEW_BYTES",
+      "declaration_scope": "module::fn:map_test_model_result",
       "controlling_use": {
         "source": "src-tauri/src/commands/test_model/mapper.rs",
         "scope": "module::fn:map_test_model_result",
@@ -625,44 +1575,6 @@
       "controlling_use": {
         "source": "src-tauri/src/completion_owner/control.rs",
         "scope": "module::fn:serve",
-        "kind": "direct_control"
-      }
-    },
-    {
-      "id": "runner.completion-control.client-io-timeout",
-      "owner": "runner/completion_owner/linux",
-      "class": "external_protocol_deadline",
-      "protected_resource": "completion-owner client connection and handshake",
-      "exhaustion_behavior": "return a typed local protocol failure",
-      "observability": "caller completion lifecycle trace records the failure",
-      "configurability": "fixed protocol default",
-      "rationale": "Bounds a local peer handshake while peer PID identity supplies liveness evidence.",
-      "default_value": "Duration :: from_secs (2)",
-      "source": "src-tauri/src/completion_owner/linux.rs",
-      "symbol": "CLIENT_CONTROL_IO_TIMEOUT",
-      "declaration_scope": "module",
-      "controlling_use": {
-        "source": "src-tauri/src/completion_owner/linux.rs",
-        "scope": "module::fn:connect_context",
-        "kind": "direct_control"
-      }
-    },
-    {
-      "id": "runner.completion-control.server-io-timeout",
-      "owner": "runner/completion_owner/control",
-      "class": "external_protocol_deadline",
-      "protected_resource": "completion-owner server connection slots",
-      "exhaustion_behavior": "drop an unresponsive local protocol connection",
-      "observability": "owner protocol outcome remains in the completion lifecycle trace",
-      "configurability": "fixed protocol default",
-      "rationale": "Bounds untrusted local control-frame peers before queue admission.",
-      "default_value": "Duration :: from_millis (50)",
-      "source": "src-tauri/src/completion_owner/control.rs",
-      "symbol": "SERVER_CONTROL_IO_TIMEOUT",
-      "declaration_scope": "module",
-      "controlling_use": {
-        "source": "src-tauri/src/completion_owner/control.rs",
-        "scope": "module::fn:serve_request",
         "kind": "direct_control"
       }
     },
@@ -966,7 +1878,7 @@
       "declaration_scope": "module",
       "controlling_use": {
         "source": "src-tauri/src/native_receipt_helper.rs",
-        "scope": "module::fn:entry_target",
+        "scope": "module::fn:supervise",
         "kind": "direct_control"
       }
     },
@@ -1627,8 +2539,8 @@
       "rationale": "ROLLING_WINDOW_UNAVAILABLE_HOURS maps FailureClass::RollingWindow5h to its explicit routing cooldown rather than an anonymous duration.",
       "default_value": "5",
       "source": "crates/oulipoly-runtime/src/balancer/forensics.rs",
-      "declaration_scope": "module",
       "symbol": "ROLLING_WINDOW_UNAVAILABLE_HOURS",
+      "declaration_scope": "module",
       "controlling_use": {
         "source": "crates/oulipoly-runtime/src/balancer/forensics.rs",
         "scope": "module::impl:FailureClass::fn:next_available_at_offset",
@@ -1646,8 +2558,8 @@
       "rationale": "STORAGE_CONTENTION_UNAVAILABLE_MINUTES maps FailureClass::ProviderStorageContention to its explicit routing cooldown rather than an anonymous duration.",
       "default_value": "2",
       "source": "crates/oulipoly-runtime/src/balancer/forensics.rs",
-      "declaration_scope": "module",
       "symbol": "STORAGE_CONTENTION_UNAVAILABLE_MINUTES",
+      "declaration_scope": "module",
       "controlling_use": {
         "source": "crates/oulipoly-runtime/src/balancer/forensics.rs",
         "scope": "module::impl:FailureClass::fn:next_available_at_offset",
@@ -1665,8 +2577,8 @@
       "rationale": "UPSTREAM_OUTAGE_UNAVAILABLE_MINUTES maps FailureClass::UpstreamApiDown to its explicit routing cooldown rather than an anonymous duration.",
       "default_value": "5",
       "source": "crates/oulipoly-runtime/src/balancer/forensics.rs",
-      "declaration_scope": "module",
       "symbol": "UPSTREAM_OUTAGE_UNAVAILABLE_MINUTES",
+      "declaration_scope": "module",
       "controlling_use": {
         "source": "crates/oulipoly-runtime/src/balancer/forensics.rs",
         "scope": "module::impl:FailureClass::fn:next_available_at_offset",
@@ -1684,8 +2596,8 @@
       "rationale": "WEEKLY_UNAVAILABLE_DAYS maps FailureClass::WeeklyOrLonger to its explicit routing cooldown rather than an anonymous duration.",
       "default_value": "7",
       "source": "crates/oulipoly-runtime/src/balancer/forensics.rs",
-      "declaration_scope": "module",
       "symbol": "WEEKLY_UNAVAILABLE_DAYS",
+      "declaration_scope": "module",
       "controlling_use": {
         "source": "crates/oulipoly-runtime/src/balancer/forensics.rs",
         "scope": "module::impl:FailureClass::fn:next_available_at_offset",
@@ -2121,8 +3033,8 @@
       "rationale": "SNAPSHOT_IDLE_MULTIPLIER enforces four idle units per work unit, targeting a 20 percent duty cycle.",
       "default_value": "4",
       "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/snapshot_worker.rs",
-      "declaration_scope": "module",
       "symbol": "SNAPSHOT_IDLE_MULTIPLIER",
+      "declaration_scope": "module",
       "controlling_use": {
         "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/snapshot_worker.rs",
         "scope": "module::fn:snapshot_idle_duration",
@@ -2159,8 +3071,8 @@
       "rationale": "BACKGROUND_RENDER_FPS reduces background frame work independently of terminal policy.",
       "default_value": "10",
       "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs",
-      "declaration_scope": "module",
       "symbol": "BACKGROUND_RENDER_FPS",
+      "declaration_scope": "module",
       "controlling_use": {
         "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs",
         "scope": "module::fn:run_render_loop",
@@ -2273,8 +3185,8 @@
       "rationale": "FOREGROUND_RENDER_FPS controls interactive frame pacing independently of terminal policy.",
       "default_value": "60",
       "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs",
-      "declaration_scope": "module",
       "symbol": "FOREGROUND_RENDER_FPS",
+      "declaration_scope": "module",
       "controlling_use": {
         "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs",
         "scope": "module::fn:snapshot_render_fps",
@@ -2406,8 +3318,8 @@
       "rationale": "TOP_PANE_SCROLLBACK_ROWS bounds retained terminal history in the interactive pane.",
       "default_value": "10_000",
       "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs",
-      "declaration_scope": "module",
       "symbol": "TOP_PANE_SCROLLBACK_ROWS",
+      "declaration_scope": "module",
       "controlling_use": {
         "source": "crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs",
         "scope": "module::fn:relay_until_exit_observed",
@@ -3014,8 +3926,8 @@
       "rationale": "The freshness window collapses a dispatch burst so queued holders do not rotate the same single-use refresh token again.",
       "default_value": "60",
       "source": "crates/oulipoly-runtime/src/quota/auth_refresh_lock.rs",
-      "declaration_scope": "module",
       "symbol": "DEFAULT_AUTH_REFRESH_COALESCE_SECS",
+      "declaration_scope": "module",
       "controlling_use": {
         "source": "crates/oulipoly-runtime/src/quota/auth_refresh_lock.rs",
         "scope": "module::fn:coalesce_window_secs",
@@ -3166,8 +4078,8 @@
       "rationale": "The slack compensates for scheduling and clock edge effects around next_available_at; it is not a hard wait deadline.",
       "default_value": "60",
       "source": "crates/oulipoly-runtime/src/quota/marker_verification/config.rs",
-      "declaration_scope": "module",
       "symbol": "DEFAULT_MARKER_RELEASE_SLACK_SECS",
+      "declaration_scope": "module",
       "controlling_use": {
         "source": "crates/oulipoly-runtime/src/quota/marker_verification/config.rs",
         "scope": "module::fn:release_slack_secs",
@@ -4097,8 +5009,8 @@
       "rationale": "READ_CHUNK_SIZE bounds each nonblocking pipe read without imposing a response deadline.",
       "default_value": "64 * 1024",
       "source": "scripts/opencode-cwd",
-      "declaration_scope": "script",
       "symbol": "READ_CHUNK_SIZE",
+      "declaration_scope": "script",
       "controlling_use": {
         "source": "scripts/opencode-cwd",
         "scope": "script",
@@ -4173,8 +5085,8 @@
       "rationale": "DEFAULT_WINDOW_HOURS limits default historical discovery work and is separate from call/deadline timeouts.",
       "default_value": "6.0",
       "source": "scripts/opencode-turns",
-      "declaration_scope": "script",
       "symbol": "DEFAULT_WINDOW_HOURS",
+      "declaration_scope": "script",
       "controlling_use": {
         "source": "scripts/opencode-turns",
         "scope": "script",
@@ -4382,8 +5294,8 @@
       "rationale": "INVOCATION_QUERY_PROGRESS_OPS bounds cancellation polling work without acting as a query deadline.",
       "default_value": "100",
       "source": "crates/oulipoly-state/src/db/invocation_records.rs",
-      "declaration_scope": "module",
       "symbol": "INVOCATION_QUERY_PROGRESS_OPS",
+      "declaration_scope": "module",
       "controlling_use": {
         "source": "crates/oulipoly-state/src/db/invocation_records.rs",
         "scope": "module::impl:StateDb::fn:with_invocation_query_cancellation",
@@ -4539,6 +5451,139 @@
       "controlling_use": {
         "source": "crates/oulipoly-state/src/db/opening_write.rs",
         "scope": "module::fn:state_writer_busy_timeout",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "state.detached-maintenance.default-discovery-nodes",
+      "owner": "state/detached_maintenance",
+      "class": "resource_guard",
+      "protected_resource": "discovery graph nodes per opportunity",
+      "exhaustion_behavior": "The configured limit bounds one maintenance slice; remaining work is carried to a later opportunity.",
+      "observability": "The maintenance result reports completion or remaining work.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "This is the existing default for max_discovery_nodes, used to bound one maintenance work slice.",
+      "default_value": "128",
+      "source": "crates/oulipoly-state/src/detached_maintenance.rs",
+      "symbol": "DEFAULT_DISCOVERY_NODES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/detached_maintenance.rs",
+        "scope": "module::impl:OpportunityWorkLimits::fn:default",
+        "kind": "configuration_source"
+      }
+    },
+    {
+      "id": "state.detached-maintenance.default-partitions-per-run",
+      "owner": "state/detached_maintenance",
+      "class": "resource_guard",
+      "protected_resource": "event partitions visited per opportunity",
+      "exhaustion_behavior": "The configured limit bounds one maintenance slice; remaining work is carried to a later opportunity.",
+      "observability": "The maintenance result reports completion or remaining work.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "This is the existing default for max_partitions_per_run, used to bound one maintenance work slice.",
+      "default_value": "4",
+      "source": "crates/oulipoly-state/src/detached_maintenance.rs",
+      "symbol": "DEFAULT_PARTITIONS_PER_RUN",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/detached_maintenance.rs",
+        "scope": "module::impl:OpportunityWorkLimits::fn:default",
+        "kind": "configuration_source"
+      }
+    },
+    {
+      "id": "state.detached-maintenance.default-retirement-unlink-entries",
+      "owner": "state/detached_maintenance",
+      "class": "resource_guard",
+      "protected_resource": "retirement unlink entries per opportunity",
+      "exhaustion_behavior": "The configured limit bounds one maintenance slice; remaining work is carried to a later opportunity.",
+      "observability": "The maintenance result reports completion or remaining work.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "This is the existing default for max_unlink_entries, used to bound one maintenance work slice.",
+      "default_value": "4",
+      "source": "crates/oulipoly-state/src/detached_maintenance.rs",
+      "symbol": "DEFAULT_RETIREMENT_UNLINK_ENTRIES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/detached_maintenance.rs",
+        "scope": "module::impl:OpportunityWorkLimits::fn:default",
+        "kind": "configuration_source"
+      }
+    },
+    {
+      "id": "state.detached-maintenance.default-retirement-validation-bytes",
+      "owner": "state/detached_maintenance",
+      "class": "resource_guard",
+      "protected_resource": "retirement validation bytes per opportunity",
+      "exhaustion_behavior": "The configured limit bounds one maintenance slice; remaining work is carried to a later opportunity.",
+      "observability": "The maintenance result reports completion or remaining work.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "This is the existing default for max_validation_bytes, used to bound one maintenance work slice.",
+      "default_value": "8 * 1024 * 1024",
+      "source": "crates/oulipoly-state/src/detached_maintenance.rs",
+      "symbol": "DEFAULT_RETIREMENT_VALIDATION_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/detached_maintenance.rs",
+        "scope": "module::impl:OpportunityWorkLimits::fn:default",
+        "kind": "configuration_source"
+      }
+    },
+    {
+      "id": "state.detached-maintenance.default-retirement-validation-rows",
+      "owner": "state/detached_maintenance",
+      "class": "resource_guard",
+      "protected_resource": "retirement validation rows per opportunity",
+      "exhaustion_behavior": "The configured limit bounds one maintenance slice; remaining work is carried to a later opportunity.",
+      "observability": "The maintenance result reports completion or remaining work.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "This is the existing default for max_validation_rows, used to bound one maintenance work slice.",
+      "default_value": "256",
+      "source": "crates/oulipoly-state/src/detached_maintenance.rs",
+      "symbol": "DEFAULT_RETIREMENT_VALIDATION_ROWS",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/detached_maintenance.rs",
+        "scope": "module::impl:OpportunityWorkLimits::fn:default",
+        "kind": "configuration_source"
+      }
+    },
+    {
+      "id": "state.detached-maintenance.max-retained-discovery-issue-bytes",
+      "owner": "crates/oulipoly-state/src/detached_maintenance",
+      "class": "resource_guard",
+      "protected_resource": "bytes per detached maintenance discovery issue",
+      "exhaustion_behavior": "retain_discovery_issue truncates each issue to 160 UTF-8 bytes",
+      "observability": "The persisted cursor contains the truncated issue and discovery_gap",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "Error detail cannot make durable progress cursors arbitrarily large.",
+      "default_value": "160",
+      "source": "crates/oulipoly-state/src/detached_maintenance.rs",
+      "symbol": "MAX_RETAINED_DISCOVERY_ISSUE_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/detached_maintenance.rs",
+        "scope": "module::fn:retain_discovery_issue",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "state.detached-maintenance.max-retained-discovery-issues",
+      "owner": "crates/oulipoly-state/src/detached_maintenance",
+      "class": "resource_guard",
+      "protected_resource": "issue strings retained in detached maintenance cursor",
+      "exhaustion_behavior": "retain_discovery_issue evicts the oldest issue when four are retained",
+      "observability": "The cursor records discovery_gap and the last four issue strings",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "Cursor evidence remains bounded while discovery continues.",
+      "default_value": "4",
+      "source": "crates/oulipoly-state/src/detached_maintenance.rs",
+      "symbol": "MAX_RETAINED_DISCOVERY_ISSUES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/detached_maintenance.rs",
+        "scope": "module::fn:retain_discovery_issue",
         "kind": "direct_control"
       }
     },
@@ -4804,7 +5849,7 @@
       "declaration_scope": "module",
       "controlling_use": {
         "source": "crates/oulipoly-state/src/diagnostic_recorder.rs",
-        "scope": "module::fn:activate_legacy_preservation",
+        "scope": "module::fn:activate_legacy_preservation_serialized",
         "kind": "direct_control"
       }
     },
@@ -4823,7 +5868,7 @@
       "declaration_scope": "module",
       "controlling_use": {
         "source": "crates/oulipoly-state/src/diagnostic_recorder.rs",
-        "scope": "module::fn:activate_legacy_preservation",
+        "scope": "module::fn:activate_legacy_preservation_serialized",
         "kind": "direct_control"
       }
     },
@@ -4899,7 +5944,7 @@
       "declaration_scope": "module",
       "controlling_use": {
         "source": "crates/oulipoly-state/src/diagnostic_recorder.rs",
-        "scope": "module::fn:activate_legacy_preservation",
+        "scope": "module::fn:activate_legacy_preservation_serialized",
         "kind": "direct_control"
       }
     },
@@ -5189,6 +6234,101 @@
       }
     },
     {
+      "id": "state.event-store.detached.default-unlink-entries",
+      "owner": "state/event_store/detached",
+      "class": "resource_guard",
+      "protected_resource": "event retirement unlink entries",
+      "exhaustion_behavior": "The configured limit bounds one maintenance slice; remaining work is carried to a later opportunity.",
+      "observability": "The maintenance result reports completion or remaining work.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "This is the existing default for max_unlink_entries, used to bound one maintenance work slice.",
+      "default_value": "4",
+      "source": "crates/oulipoly-state/src/event_store/detached.rs",
+      "symbol": "DEFAULT_UNLINK_ENTRIES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/event_store/detached.rs",
+        "scope": "module::impl:EventRetirementWorkLimits::fn:default",
+        "kind": "configuration_source"
+      }
+    },
+    {
+      "id": "state.event-store.detached.default-validation-bytes",
+      "owner": "state/event_store/detached",
+      "class": "resource_guard",
+      "protected_resource": "event retirement validation bytes",
+      "exhaustion_behavior": "The configured limit bounds one maintenance slice; remaining work is carried to a later opportunity.",
+      "observability": "The maintenance result reports completion or remaining work.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "This is the existing default for max_validation_bytes, used to bound one maintenance work slice.",
+      "default_value": "8 * 1024 * 1024",
+      "source": "crates/oulipoly-state/src/event_store/detached.rs",
+      "symbol": "DEFAULT_VALIDATION_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/event_store/detached.rs",
+        "scope": "module::impl:EventRetirementWorkLimits::fn:default",
+        "kind": "configuration_source"
+      }
+    },
+    {
+      "id": "state.event-store.detached.default-validation-rows",
+      "owner": "state/event_store/detached",
+      "class": "resource_guard",
+      "protected_resource": "event retirement validation rows",
+      "exhaustion_behavior": "The configured limit bounds one maintenance slice; remaining work is carried to a later opportunity.",
+      "observability": "The maintenance result reports completion or remaining work.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "This is the existing default for max_validation_rows, used to bound one maintenance work slice.",
+      "default_value": "256",
+      "source": "crates/oulipoly-state/src/event_store/detached.rs",
+      "symbol": "DEFAULT_VALIDATION_ROWS",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/event_store/detached.rs",
+        "scope": "module::impl:EventRetirementWorkLimits::fn:default",
+        "kind": "configuration_source"
+      }
+    },
+    {
+      "id": "state.event-store.detached.retirement-hash-buffer-bytes",
+      "owner": "state/event_store/detached",
+      "class": "resource_guard",
+      "protected_resource": "retirement file hash scratch memory",
+      "exhaustion_behavior": "Hashing streams all file chunks through this fixed buffer.",
+      "observability": "The owning read or I/O error reports failure; a full streaming chunk alone is not terminal.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "A fixed 64 * 1024 byte scratch buffer bounds allocation for hash_file without imposing a total input ceiling.",
+      "default_value": "64 * 1024",
+      "source": "crates/oulipoly-state/src/event_store/detached.rs",
+      "symbol": "RETIREMENT_HASH_BUFFER_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/event_store/detached.rs",
+        "scope": "module::fn:hash_file",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "state.event-store.maintenance-discovery.max-directory-fanout",
+      "owner": "crates/oulipoly-state/src/event_store/maintenance_discovery",
+      "class": "resource_guard",
+      "protected_resource": "maintenance discovery trie traversal work per directory",
+      "exhaustion_behavior": "walk_directory stops enumerating after 256 children and records an issue",
+      "observability": "Discovery issues report the fanout excess and coverage loss",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "A malformed trie directory cannot force unbounded one-directory traversal.",
+      "default_value": "256",
+      "source": "crates/oulipoly-state/src/event_store/maintenance_discovery.rs",
+      "symbol": "MAX_DIRECTORY_FANOUT",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/event_store/maintenance_discovery.rs",
+        "scope": "module::fn:walk_directory",
+        "kind": "direct_control"
+      }
+    },
+    {
       "id": "state.event-writer.default-queue-capacity",
       "owner": "state/event_store/writer",
       "class": "resource_guard",
@@ -5298,7 +6438,7 @@
       "declaration_scope": "module",
       "controlling_use": {
         "source": "crates/oulipoly-state/src/event_store/writer.rs",
-        "scope": "module::impl:ProcessEventWriter::fn:try_append",
+        "scope": "module::impl:ProcessEventWriterSubmission::fn:try_append",
         "kind": "direct_control"
       }
     },
@@ -5341,6 +6481,196 @@
       }
     },
     {
+      "id": "state.longitudinal-metrics.clock-discontinuity-tolerance-micros",
+      "owner": "crates/oulipoly-state/src/longitudinal_metrics",
+      "class": "structural_safety_bound",
+      "protected_resource": "metric clock-discontinuity classification",
+      "exhaustion_behavior": "aggregate_read increments the discontinuity count only when recorded time exceeds ingestion by over five minutes",
+      "observability": "MetricQueryReport exposes clock_discontinuities",
+      "configurability": "Fixed metric interpretation threshold; no query override.",
+      "rationale": "Small timestamp skew is tolerated before reporting a discontinuity.",
+      "default_value": "5 * 60 * 1_000_000",
+      "source": "crates/oulipoly-state/src/longitudinal_metrics.rs",
+      "symbol": "CLOCK_DISCONTINUITY_TOLERANCE_MICROS",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/longitudinal_metrics.rs",
+        "scope": "module::fn:aggregate_read",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "state.longitudinal-metrics.default-discovery-entry-limit",
+      "owner": "crates/oulipoly-state/src/longitudinal_metrics",
+      "class": "resource_guard",
+      "protected_resource": "default number of metric discovery entries",
+      "exhaustion_behavior": "MetricQuery::recent puts 256 into discovery and read limits; coverage reports omissions",
+      "observability": "Metric query report includes discovery issues and coverage_complete",
+      "configurability": "MetricQuery callers can construct a different entry limit.",
+      "rationale": "Default metric queries bound discovery and record scanning.",
+      "default_value": "256",
+      "source": "crates/oulipoly-state/src/longitudinal_metrics.rs",
+      "symbol": "DEFAULT_DISCOVERY_ENTRY_LIMIT",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/longitudinal_metrics.rs",
+        "scope": "module::impl:MetricQuery::fn:recent",
+        "kind": "configuration_source"
+      }
+    },
+    {
+      "id": "state.longitudinal-metrics.default-discovery-node-limit",
+      "owner": "crates/oulipoly-state/src/longitudinal_metrics",
+      "class": "resource_guard",
+      "protected_resource": "default metric discovery trie nodes",
+      "exhaustion_behavior": "MetricQuery::recent sets a 16384-node traversal budget",
+      "observability": "Metric query report includes discovery issues and coverage_complete",
+      "configurability": "MetricQuery callers can construct a different node limit.",
+      "rationale": "Default metrics lookup must have finite trie traversal work.",
+      "default_value": "16_384",
+      "source": "crates/oulipoly-state/src/longitudinal_metrics.rs",
+      "symbol": "DEFAULT_DISCOVERY_NODE_LIMIT",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/longitudinal_metrics.rs",
+        "scope": "module::impl:MetricQuery::fn:recent",
+        "kind": "configuration_source"
+      }
+    },
+    {
+      "id": "state.longitudinal-metrics.default-metric-payload-limit",
+      "owner": "crates/oulipoly-state/src/longitudinal_metrics",
+      "class": "resource_guard",
+      "protected_resource": "default event-store payload bytes read for metrics",
+      "exhaustion_behavior": "MetricQuery::recent configures a 64 MiB ReadLimits payload ceiling",
+      "observability": "BoundedRead reports omitted partitions and incomplete coverage",
+      "configurability": "MetricQuery callers can supply different ReadLimits.",
+      "rationale": "Default metric queries prevent unlimited payload reading.",
+      "default_value": "64 * 1024 * 1024",
+      "source": "crates/oulipoly-state/src/longitudinal_metrics.rs",
+      "symbol": "DEFAULT_METRIC_PAYLOAD_LIMIT",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/longitudinal_metrics.rs",
+        "scope": "module::impl:MetricQuery::fn:recent",
+        "kind": "configuration_source"
+      }
+    },
+    {
+      "id": "state.longitudinal-metrics.default-metric-record-limit",
+      "owner": "crates/oulipoly-state/src/longitudinal_metrics",
+      "class": "resource_guard",
+      "protected_resource": "default event-store records read for metrics",
+      "exhaustion_behavior": "MetricQuery::recent configures a 20000-record ReadLimits ceiling",
+      "observability": "BoundedRead reports omitted partitions and incomplete coverage",
+      "configurability": "MetricQuery callers can supply different ReadLimits.",
+      "rationale": "Default metric queries prevent unlimited record scanning.",
+      "default_value": "20_000",
+      "source": "crates/oulipoly-state/src/longitudinal_metrics.rs",
+      "symbol": "DEFAULT_METRIC_RECORD_LIMIT",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/longitudinal_metrics.rs",
+        "scope": "module::impl:MetricQuery::fn:recent",
+        "kind": "configuration_source"
+      }
+    },
+    {
+      "id": "state.longitudinal-metrics.max-exemplars-per-series",
+      "owner": "crates/oulipoly-state/src/longitudinal_metrics",
+      "class": "resource_guard",
+      "protected_resource": "metric exemplar memory per aggregate series",
+      "exhaustion_behavior": "Aggregate::observe sorts and truncates exemplars to three",
+      "observability": "MetricQueryReport contains at most three exemplars per series",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "The series keeps representative high values with bounded memory.",
+      "default_value": "3",
+      "source": "crates/oulipoly-state/src/longitudinal_metrics.rs",
+      "symbol": "MAX_EXEMPLARS_PER_SERIES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/longitudinal_metrics.rs",
+        "scope": "module::impl:Aggregate::fn:observe",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "state.longitudinal-metrics.max-metric-label-value-bytes",
+      "owner": "crates/oulipoly-state/src/longitudinal_metrics",
+      "class": "resource_guard",
+      "protected_resource": "metric label value bytes",
+      "exhaustion_behavior": "MetricSample::validate rejects values above 96 bytes and normalize_label_value truncates generated labels",
+      "observability": "Invalid decoded labels return validation error",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "Dynamic diagnostic labels remain finite and privacy normalized.",
+      "default_value": "96",
+      "source": "crates/oulipoly-state/src/longitudinal_metrics.rs",
+      "symbol": "MAX_METRIC_LABEL_VALUE_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/longitudinal_metrics.rs",
+        "scope": "module::fn:normalize_label_value",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "state.longitudinal-metrics.max-metric-labels",
+      "owner": "crates/oulipoly-state/src/longitudinal_metrics",
+      "class": "resource_guard",
+      "protected_resource": "label cardinality and serialized size per metric sample",
+      "exhaustion_behavior": "push_label stops accepting labels at six; validate rejects larger decoded samples",
+      "observability": "push_label silently omits overflow labels; validate returns a bound error for decoded samples",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "Metric samples cannot acquire unlimited label dimensions.",
+      "default_value": "6",
+      "source": "crates/oulipoly-state/src/longitudinal_metrics.rs",
+      "symbol": "MAX_METRIC_LABELS",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/longitudinal_metrics.rs",
+        "scope": "module::impl:MetricSample::fn:push_label",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "state.longitudinal-metrics.max-process-metric-series",
+      "owner": "crates/oulipoly-state/src/longitudinal_metrics",
+      "class": "resource_guard",
+      "protected_resource": "process-local metric series registry cardinality",
+      "exhaustion_behavior": "admit_sample replaces overflow series with a dropped-diagnostic sample",
+      "observability": "DROPPED_SAMPLES and DroppedDiagnosticEvents expose lost series",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "High-cardinality labels cannot grow the process registry without bound.",
+      "default_value": "256",
+      "source": "crates/oulipoly-state/src/longitudinal_metrics.rs",
+      "symbol": "MAX_PROCESS_METRIC_SERIES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/longitudinal_metrics.rs",
+        "scope": "module::fn:admit_sample",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "state.longitudinal-metrics.retention-window-micros",
+      "owner": "crates/oulipoly-state/src/longitudinal_metrics",
+      "class": "structural_safety_bound",
+      "protected_resource": "claimed completeness of recent metric coverage",
+      "exhaustion_behavior": "aggregate_read marks queries older than thirty days retention_window_truncated",
+      "observability": "MetricQueryReport exposes retention_window_truncated",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "The report must disclose when a requested window extends beyond normal retained history.",
+      "default_value": "30 * 24 * 60 * 60 * 1_000_000",
+      "source": "crates/oulipoly-state/src/longitudinal_metrics.rs",
+      "symbol": "RETENTION_WINDOW_MICROS",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/longitudinal_metrics.rs",
+        "scope": "module::fn:aggregate_read",
+        "kind": "direct_control"
+      }
+    },
+    {
       "id": "state.mailbox.authority-retry-interval",
       "owner": "state/mailbox",
       "class": "polling_cadence",
@@ -5379,6 +6709,25 @@
       }
     },
     {
+      "id": "state.mailbox.completion-continuation.source.recovery-attempt-page-limit",
+      "owner": "crates/oulipoly-state/src/mailbox/completion_continuation/source",
+      "class": "resource_guard",
+      "protected_resource": "mailbox recovery query work and page memory",
+      "exhaustion_behavior": "completion_recovery_attempts reads at most 129 links and emits a 128-item page cursor",
+      "observability": "The next-page cursor preserves remaining recovery work",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "Paged recovery avoids an unbounded single SQLite query and response.",
+      "default_value": "128",
+      "source": "crates/oulipoly-state/src/mailbox/completion_continuation/source.rs",
+      "symbol": "RECOVERY_ATTEMPT_PAGE_LIMIT",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/mailbox/completion_continuation/source.rs",
+        "scope": "module::impl:MailboxDb::fn:completion_recovery_attempts",
+        "kind": "direct_control"
+      }
+    },
+    {
       "id": "state.mailbox.payload-digest-buffer-bytes",
       "owner": "state/mailbox",
       "class": "resource_guard",
@@ -5406,10 +6755,10 @@
       "observability": "The schema compatibility error names the observed and supported versions before open fails.",
       "configurability": "Fixed by the ordered mailbox migration set and changed only with a new migration.",
       "rationale": "CURRENT_VERSION is the migration target consumed by ensure_with_deadline; it is distinct from protocol version identifiers.",
-      "default_value": "22",
+      "default_value": "31",
       "source": "crates/oulipoly-state/src/mailbox/schema.rs",
-      "declaration_scope": "module",
       "symbol": "CURRENT_VERSION",
+      "declaration_scope": "module",
       "controlling_use": {
         "source": "crates/oulipoly-state/src/mailbox/schema.rs",
         "scope": "module::fn:ensure_with_deadline",
@@ -5455,25 +6804,6 @@
       }
     },
     {
-      "id": "state.mailbox.terminal-history-keep-rows",
-      "owner": "state/mailbox",
-      "class": "resource_guard",
-      "protected_resource": "recent terminal-history rows retained during pruning",
-      "exhaustion_behavior": "prune_terminal_history deletes only rows beyond the retention count after applying payload-custody predicates.",
-      "observability": "The prune result exposes deleted/retained work; protected payload rows remain authoritative.",
-      "configurability": "Fixed source declaration TERMINAL_HISTORY_KEEP_ROWS; no runtime override exists at the bound prune terminal history use.",
-      "rationale": "TERMINAL_HISTORY_KEEP_ROWS bounds durable history growth while retaining the newest terminal evidence.",
-      "default_value": "1_024",
-      "source": "crates/oulipoly-state/src/mailbox.rs",
-      "symbol": "TERMINAL_HISTORY_KEEP_ROWS",
-      "declaration_scope": "module",
-      "controlling_use": {
-        "source": "crates/oulipoly-state/src/mailbox.rs",
-        "scope": "module::impl:MailboxDb::fn:prune_terminal_history",
-        "kind": "direct_control"
-      }
-    },
-    {
       "id": "state.mailbox.wal-retry-interval",
       "owner": "state/mailbox",
       "class": "polling_cadence",
@@ -5508,6 +6838,63 @@
       "controlling_use": {
         "source": "crates/oulipoly-state/src/mailbox.rs",
         "scope": "module::fn:mailbox_writer_sqlite_timeout",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "state.maintenance.max-maintenance-cursor-bytes",
+      "owner": "crates/oulipoly-state/src/maintenance",
+      "class": "resource_guard",
+      "protected_resource": "persisted maintenance cursor bytes",
+      "exhaustion_behavior": "MaintenanceCheckpoint::validate rejects a cursor over 1024 bytes",
+      "observability": "Maintenance validation returns a cursor bound error",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "Durable resumable progress cannot grow its cursor without limit.",
+      "default_value": "1_024",
+      "source": "crates/oulipoly-state/src/maintenance.rs",
+      "symbol": "MAX_MAINTENANCE_CURSOR_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/maintenance.rs",
+        "scope": "module::impl:MaintenanceCheckpoint::fn:validate",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "state.maintenance.max-maintenance-partition-bytes",
+      "owner": "crates/oulipoly-state/src/maintenance",
+      "class": "resource_guard",
+      "protected_resource": "persisted maintenance partition identifier bytes",
+      "exhaustion_behavior": "MaintenanceJobKey::validate rejects identifiers over 256 bytes",
+      "observability": "Maintenance key validation returns a partition error",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "Partition keys are bounded before durable storage.",
+      "default_value": "256",
+      "source": "crates/oulipoly-state/src/maintenance.rs",
+      "symbol": "MAX_MAINTENANCE_PARTITION_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/maintenance.rs",
+        "scope": "module::impl:MaintenanceJobKey::fn:validate",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "state.maintenance.max-maintenance-schedule-basis-bytes",
+      "owner": "crates/oulipoly-state/src/maintenance",
+      "class": "resource_guard",
+      "protected_resource": "persisted maintenance scheduling basis bytes",
+      "exhaustion_behavior": "MaintenanceCheckpoint::validate rejects a basis over 128 bytes",
+      "observability": "Maintenance checkpoint validation returns a basis error",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "Schedule identity metadata is bounded before storage.",
+      "default_value": "128",
+      "source": "crates/oulipoly-state/src/maintenance.rs",
+      "symbol": "MAX_MAINTENANCE_SCHEDULE_BASIS_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/maintenance.rs",
+        "scope": "module::impl:MaintenanceCheckpoint::fn:validate",
         "kind": "direct_control"
       }
     },
@@ -5683,6 +7070,44 @@
       }
     },
     {
+      "id": "state.retention.default-terminal-retention-days",
+      "owner": "crates/oulipoly-state/src/retention",
+      "class": "resource_guard",
+      "protected_resource": "default lifetime for terminal State records",
+      "exhaustion_behavior": "The thirty-day value initializes DEFAULT_TERMINAL_RETENTION_MICROS",
+      "observability": "RetentionPolicy::default_30_days publishes the resulting horizon",
+      "configurability": "A caller may supply another validated RetentionPolicy.",
+      "rationale": "The day count is the source of the default terminal-record retention horizon.",
+      "default_value": "30",
+      "source": "crates/oulipoly-state/src/retention.rs",
+      "symbol": "DEFAULT_TERMINAL_RETENTION_DAYS",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/retention.rs",
+        "scope": "module::const:DEFAULT_TERMINAL_RETENTION_MICROS",
+        "kind": "configuration_source"
+      }
+    },
+    {
+      "id": "state.retention.default-terminal-retention-micros",
+      "owner": "crates/oulipoly-state/src/retention",
+      "class": "resource_guard",
+      "protected_resource": "default terminal State record lifetime",
+      "exhaustion_behavior": "RetentionPolicy::default_30_days assigns this cutoff to every retention family",
+      "observability": "Retention policy and cleanup candidate results expose the horizon",
+      "configurability": "A caller may supply another validated RetentionPolicy.",
+      "rationale": "Terminal record cleanup is governed by a finite thirty-day default.",
+      "default_value": "DEFAULT_TERMINAL_RETENTION_DAYS * 24 * 60 * 60 * 1_000_000",
+      "source": "crates/oulipoly-state/src/retention.rs",
+      "symbol": "DEFAULT_TERMINAL_RETENTION_MICROS",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/retention.rs",
+        "scope": "module::impl:RetentionPolicy::fn:default_30_days",
+        "kind": "configuration_source"
+      }
+    },
+    {
       "id": "state.schema.current-version",
       "owner": "state/schema",
       "class": "structural_safety_bound",
@@ -5691,10 +7116,10 @@
       "observability": "SchemaCompatibility reports current, migratable, or future status with the stored version.",
       "configurability": "Fixed by the ordered State database migrations; changes require a new migration and registry update.",
       "rationale": "CURRENT_SCHEMA_VERSION is the migration target used with the minimum supported boundary.",
-      "default_value": "26",
+      "default_value": "27",
       "source": "crates/oulipoly-state/src/schema.rs",
-      "declaration_scope": "module",
       "symbol": "CURRENT_SCHEMA_VERSION",
+      "declaration_scope": "module",
       "controlling_use": {
         "source": "crates/oulipoly-state/src/schema.rs",
         "scope": "module::fn:is_migratable_schema_version",
@@ -5712,8 +7137,8 @@
       "rationale": "MINIMUM_SUPPORTED_SCHEMA_VERSION prevents unsupported legacy layouts from entering current migrations.",
       "default_value": "3",
       "source": "crates/oulipoly-state/src/schema.rs",
-      "declaration_scope": "module",
       "symbol": "MINIMUM_SUPPORTED_SCHEMA_VERSION",
+      "declaration_scope": "module",
       "controlling_use": {
         "source": "crates/oulipoly-state/src/schema.rs",
         "scope": "module::fn:is_migratable_schema_version",
@@ -5755,6 +7180,101 @@
       "controlling_use": {
         "source": "crates/oulipoly-state/src/sqlite_observability.rs",
         "scope": "module::fn:capture_query_plan",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "tauri.commands.notify-continuation.completion-registration-retry-interval",
+      "owner": "src-tauri/src/commands/notify_continuation",
+      "class": "polling_cadence",
+      "protected_resource": "registration retry wake frequency during mailbox contention",
+      "exhaustion_behavior": "register_with_backpressure sleeps ten milliseconds then retries the complete operation",
+      "observability": "Operation result reports eventual success or a non-contention error",
+      "configurability": "Fixed retry cadence; no runtime override.",
+      "rationale": "Contention is backpressure after the State transaction releases its lock, not a terminal retry count.",
+      "default_value": "Duration :: from_millis (10)",
+      "source": "src-tauri/src/commands/notify_continuation.rs",
+      "symbol": "COMPLETION_REGISTRATION_RETRY_INTERVAL",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "src-tauri/src/commands/notify_continuation.rs",
+        "scope": "module::fn:register_with_backpressure",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "tauri.commands.offline-diagnostics.discovery-generations",
+      "owner": "src-tauri/src/commands/offline_diagnostics",
+      "class": "resource_guard",
+      "protected_resource": "offline diagnostic search generation count",
+      "exhaustion_behavior": "search_with_bounds passes 256 as its discovery entry ceiling",
+      "observability": "Search report exposes discovery coverage and omissions",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "Offline diagnostics must bound discovery breadth.",
+      "default_value": "256",
+      "source": "src-tauri/src/commands/offline_diagnostics.rs",
+      "symbol": "DISCOVERY_GENERATIONS",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "src-tauri/src/commands/offline_diagnostics.rs",
+        "scope": "module::fn:search_with_bounds",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "tauri.commands.offline-diagnostics.discovery-nodes",
+      "owner": "src-tauri/src/commands/offline_diagnostics",
+      "class": "resource_guard",
+      "protected_resource": "offline diagnostic trie traversal work",
+      "exhaustion_behavior": "search_with_bounds passes 16384 as its node ceiling",
+      "observability": "Search report exposes discovery coverage and issues",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "Offline diagnostics must bound trie traversal work.",
+      "default_value": "16_384",
+      "source": "src-tauri/src/commands/offline_diagnostics.rs",
+      "symbol": "DISCOVERY_NODES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "src-tauri/src/commands/offline_diagnostics.rs",
+        "scope": "module::fn:search_with_bounds",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "tauri.commands.offline-diagnostics.read-bytes",
+      "owner": "src-tauri/src/commands/offline_diagnostics",
+      "class": "resource_guard",
+      "protected_resource": "offline diagnostic event payload bytes",
+      "exhaustion_behavior": "run_event_trace constructs a 64 MiB ReadLimits ceiling",
+      "observability": "BoundedRead reports omitted partitions and coverage",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "An offline query cannot load unlimited event payload data.",
+      "default_value": "64 * 1024 * 1024",
+      "source": "src-tauri/src/commands/offline_diagnostics.rs",
+      "symbol": "READ_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "src-tauri/src/commands/offline_diagnostics.rs",
+        "scope": "module::fn:run_event_trace",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "tauri.commands.offline-diagnostics.read-records",
+      "owner": "src-tauri/src/commands/offline_diagnostics",
+      "class": "resource_guard",
+      "protected_resource": "offline diagnostic event record count",
+      "exhaustion_behavior": "run_event_trace constructs a 20000-record ReadLimits ceiling",
+      "observability": "BoundedRead reports omitted partitions and coverage",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "An offline query cannot scan unlimited event records.",
+      "default_value": "20_000",
+      "source": "src-tauri/src/commands/offline_diagnostics.rs",
+      "symbol": "READ_RECORDS",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "src-tauri/src/commands/offline_diagnostics.rs",
+        "scope": "module::fn:run_event_trace",
         "kind": "direct_control"
       }
     },
@@ -5816,6 +7336,576 @@
       }
     },
     {
+      "id": "tauri.completion-owner.control.credential-read-buffer-bytes",
+      "owner": "tauri/completion_owner/control",
+      "class": "resource_guard",
+      "protected_resource": "control request read scratch memory",
+      "exhaustion_behavior": "The bounded chunk is reused while receiving the request frame.",
+      "observability": "Control read errors are returned to the owner.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "A fixed chunk bounds scratch allocation during credentialled control request intake.",
+      "default_value": "4096",
+      "source": "src-tauri/src/completion_owner/control.rs",
+      "symbol": "CREDENTIAL_READ_BUFFER_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "src-tauri/src/completion_owner/control.rs",
+        "scope": "module::fn:receive_request_from_first",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "tauri.completion-owner.control.max-request-bytes",
+      "owner": "src-tauri/src/completion_owner/control",
+      "class": "resource_guard",
+      "protected_resource": "root control request frame memory",
+      "exhaustion_behavior": "receive_request_from_first rejects a frame at 64 KiB",
+      "observability": "Control channel returns root control request exceeds its bounded frame",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "Credentialled control messages are metadata and must stay bounded.",
+      "default_value": "64 * 1024",
+      "source": "src-tauri/src/completion_owner/control.rs",
+      "symbol": "MAX_REQUEST_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "src-tauri/src/completion_owner/control.rs",
+        "scope": "module::fn:receive_pinned_request",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "tauri.completion-owner.control.peer-identity-poll-interval",
+      "owner": "src-tauri/src/completion_owner/control",
+      "class": "polling_cadence",
+      "protected_resource": "peer identity progress observation and wake frequency",
+      "exhaustion_behavior": "wait_for_peer_progress polls at fifty milliseconds while checking peer state",
+      "observability": "Peer progress or failure returns through the control result",
+      "configurability": "Fixed poll cadence; no runtime override.",
+      "rationale": "The cadence paces liveness observation without itself expiring the peer.",
+      "default_value": "Duration :: from_millis (50)",
+      "source": "src-tauri/src/completion_owner/control.rs",
+      "symbol": "PEER_IDENTITY_POLL_INTERVAL",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "src-tauri/src/completion_owner/control.rs",
+        "scope": "module::fn:wait_for_peer_progress",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "tauri.completion-owner.control.pinned-eof-deadline",
+      "owner": "tauri/completion_owner/control",
+      "class": "provisional_stopgap",
+      "protected_resource": "source peer EOF observation",
+      "exhaustion_behavior": "The current loop errors if pinned peer EOF is not observed within ten seconds.",
+      "observability": "The control result reports the EOF wait failure.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "The existing 10 secs value controls source peer EOF observation; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_secs (10)",
+      "source": "src-tauri/src/completion_owner/control.rs",
+      "symbol": "PINNED_EOF_DEADLINE",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "src-tauri/src/completion_owner/control.rs",
+        "scope": "module::fn:receive_pinned_eof",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "tauri.completion-owner.control.source-ticket-receive-deadline",
+      "owner": "tauri/completion_owner/control",
+      "class": "external_protocol_deadline",
+      "protected_resource": "credentialled source ticket marker and frame wait",
+      "exhaustion_behavior": "The pinned request rejects a peer that does not finish each bounded receive phase.",
+      "observability": "The source control request returns a frame error.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "The existing 10 secs value controls credentialled source ticket marker and frame wait; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_secs (10)",
+      "source": "src-tauri/src/completion_owner/control.rs",
+      "symbol": "SOURCE_TICKET_RECEIVE_DEADLINE",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "src-tauri/src/completion_owner/control.rs",
+        "scope": "module::fn:receive_pinned_request",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "tauri.completion-owner.driver.private-child-attestation-poll",
+      "owner": "tauri/completion_owner/driver",
+      "class": "polling_cadence",
+      "protected_resource": "private child attestation gate checks",
+      "exhaustion_behavior": "The fixture checks for attestation every twenty milliseconds.",
+      "observability": "Fixture result exposes attestation or timeout.",
+      "configurability": "Fixed source declaration; private fixture values require its explicit feature and environment.",
+      "rationale": "The existing 20 millis value controls private child attestation gate checks; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_millis (20)",
+      "source": "src-tauri/src/completion_owner/driver.rs",
+      "symbol": "PRIVATE_CHILD_ATTESTATION_POLL",
+      "declaration_scope": "module::cfg:feature=\"age319-private-broker-fixture\"",
+      "controlling_use": {
+        "source": "src-tauri/src/completion_owner/driver.rs",
+        "scope": "module::fn:run_with_root",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "tauri.completion-owner.driver.private-child-attestation-wait",
+      "owner": "tauri/completion_owner/driver",
+      "class": "test_only_patience",
+      "protected_resource": "private child attestation fixture gate",
+      "exhaustion_behavior": "The explicit fixture returns an attestation timeout after twenty seconds.",
+      "observability": "The fixture returns child attestation timed out.",
+      "configurability": "Fixed source declaration; private fixture values require its explicit feature and environment.",
+      "rationale": "The existing 20 secs value controls private child attestation fixture gate; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_secs (20)",
+      "source": "src-tauri/src/completion_owner/driver.rs",
+      "symbol": "PRIVATE_CHILD_ATTESTATION_WAIT",
+      "declaration_scope": "module::cfg:feature=\"age319-private-broker-fixture\"",
+      "controlling_use": {
+        "source": "src-tauri/src/completion_owner/driver.rs",
+        "scope": "module::fn:run_with_root",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "tauri.completion-owner.driver.private-source-prelaunch-poll",
+      "owner": "tauri/completion_owner/driver",
+      "class": "polling_cadence",
+      "protected_resource": "private source prelaunch gate checks",
+      "exhaustion_behavior": "The fixture checks for release every twenty milliseconds.",
+      "observability": "Fixture result exposes release or timeout.",
+      "configurability": "Fixed source declaration; private fixture values require its explicit feature and environment.",
+      "rationale": "The existing 20 millis value controls private source prelaunch gate checks; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_millis (20)",
+      "source": "src-tauri/src/completion_owner/driver.rs",
+      "symbol": "PRIVATE_SOURCE_PRELAUNCH_POLL",
+      "declaration_scope": "module::cfg:feature=\"age319-private-broker-fixture\"",
+      "controlling_use": {
+        "source": "src-tauri/src/completion_owner/driver.rs",
+        "scope": "module::fn:run_v30_repair_boundary",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "tauri.completion-owner.driver.private-source-prelaunch-wait",
+      "owner": "tauri/completion_owner/driver",
+      "class": "test_only_patience",
+      "protected_resource": "private source prelaunch fixture gate",
+      "exhaustion_behavior": "The explicit fixture returns an expired barrier after twenty seconds.",
+      "observability": "The fixture returns prelaunch barrier expired.",
+      "configurability": "Fixed source declaration; private fixture values require its explicit feature and environment.",
+      "rationale": "The existing 20 secs value controls private source prelaunch fixture gate; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_secs (20)",
+      "source": "src-tauri/src/completion_owner/driver.rs",
+      "symbol": "PRIVATE_SOURCE_PRELAUNCH_WAIT",
+      "declaration_scope": "module::cfg:feature=\"age319-private-broker-fixture\"",
+      "controlling_use": {
+        "source": "src-tauri/src/completion_owner/driver.rs",
+        "scope": "module::fn:run_v30_repair_boundary",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "tauri.completion-owner.original-work.max-intent-bytes",
+      "owner": "src-tauri/src/completion_owner/original_work",
+      "class": "resource_guard",
+      "protected_resource": "original-work intent and result artifact read memory",
+      "exhaustion_behavior": "submit_inner and recovery reads reject artifacts above 1 MiB",
+      "observability": "read_bounded returns an original-work artifact error",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "Control and recovery artifacts are bounded before JSON parsing.",
+      "default_value": "1024 * 1024",
+      "source": "src-tauri/src/completion_owner/original_work.rs",
+      "symbol": "MAX_INTENT_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "src-tauri/src/completion_owner/original_work.rs",
+        "scope": "module::impl:OriginalWorkSupervisor::fn:submit_inner",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "tauri.completion-owner.original-work.retry-base",
+      "owner": "src-tauri/src/completion_owner/original_work",
+      "class": "polling_cadence",
+      "protected_resource": "original-work retry wake frequency",
+      "exhaustion_behavior": "RetrySchedule::record_failure starts backoff at fifty milliseconds",
+      "observability": "RetrySchedule retains retry_at; no terminal failure is caused by this value",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "Transient original-work failures need paced retry without a count stop.",
+      "default_value": "Duration :: from_millis (50)",
+      "source": "src-tauri/src/completion_owner/original_work.rs",
+      "symbol": "RETRY_BASE",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "src-tauri/src/completion_owner/original_work.rs",
+        "scope": "module::impl:RetrySchedule::fn:record_failure",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "tauri.completion-owner.original-work.retry-max",
+      "owner": "src-tauri/src/completion_owner/original_work",
+      "class": "polling_cadence",
+      "protected_resource": "maximum delay between original-work retry attempts",
+      "exhaustion_behavior": "RetrySchedule::record_failure clamps exponential delay at five seconds",
+      "observability": "RetrySchedule retains retry_at; no terminal failure is caused by this value",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "Backoff stops growing while retry authority remains active.",
+      "default_value": "Duration :: from_secs (5)",
+      "source": "src-tauri/src/completion_owner/original_work.rs",
+      "symbol": "RETRY_MAX",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "src-tauri/src/completion_owner/original_work.rs",
+        "scope": "module::impl:RetrySchedule::fn:record_failure",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "tauri.completion-owner.root-supervisor.max-native-request-bytes",
+      "owner": "src-tauri/src/completion_owner/root_supervisor",
+      "class": "resource_guard",
+      "protected_resource": "root supervisor native request read memory",
+      "exhaustion_behavior": "exact_request_bytes rejects a native request above 4 MiB before allocation",
+      "observability": "Root supervisor returns descriptor/name conflict",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "Native custody request metadata must be bounded before read and digest.",
+      "default_value": "4 * 1024 * 1024",
+      "source": "src-tauri/src/completion_owner/root_supervisor.rs",
+      "symbol": "MAX_NATIVE_REQUEST_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "src-tauri/src/completion_owner/root_supervisor.rs",
+        "scope": "module::fn:exact_request_bytes",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "tauri.completion-owner.root-supervisor.private-native-drain-wait",
+      "owner": "tauri/completion_owner/root_supervisor",
+      "class": "test_only_patience",
+      "protected_resource": "private native drain fixture gate",
+      "exhaustion_behavior": "The explicit fixture returns a drain wait error after fifteen seconds.",
+      "observability": "The fixture reports the private drain failure.",
+      "configurability": "Fixed source declaration; private fixture values require its explicit feature and environment.",
+      "rationale": "The existing 15 secs value controls private native drain fixture gate; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_secs (15)",
+      "source": "src-tauri/src/completion_owner/root_supervisor.rs",
+      "symbol": "PRIVATE_NATIVE_DRAIN_WAIT",
+      "declaration_scope": "module::cfg:feature=\"age319-private-broker-fixture\"",
+      "controlling_use": {
+        "source": "src-tauri/src/completion_owner/root_supervisor.rs",
+        "scope": "module::fn:private_native_lineage",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "tauri.completion-owner.root-supervisor.private-native-gate-poll",
+      "owner": "tauri/completion_owner/root_supervisor",
+      "class": "polling_cadence",
+      "protected_resource": "private native lineage gate checks",
+      "exhaustion_behavior": "The fixture polls for gate progress without making this interval terminal.",
+      "observability": "Fixture result exposes progress or timeout.",
+      "configurability": "Fixed source declaration; private fixture values require its explicit feature and environment.",
+      "rationale": "The existing 20 millis value controls private native lineage gate checks; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_millis (20)",
+      "source": "src-tauri/src/completion_owner/root_supervisor.rs",
+      "symbol": "PRIVATE_NATIVE_GATE_POLL",
+      "declaration_scope": "module::cfg:feature=\"age319-private-broker-fixture\"",
+      "controlling_use": {
+        "source": "src-tauri/src/completion_owner/root_supervisor.rs",
+        "scope": "module::fn:private_native_lineage",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "tauri.completion-owner.root-supervisor.private-native-gate-wait",
+      "owner": "tauri/completion_owner/root_supervisor",
+      "class": "test_only_patience",
+      "protected_resource": "private native lineage fixture gate",
+      "exhaustion_behavior": "The explicit fixture wait returns an error after twenty seconds.",
+      "observability": "The fixture returns private native timed out.",
+      "configurability": "Fixed source declaration; private fixture values require its explicit feature and environment.",
+      "rationale": "The existing 20 secs value controls private native lineage fixture gate; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_secs (20)",
+      "source": "src-tauri/src/completion_owner/root_supervisor.rs",
+      "symbol": "PRIVATE_NATIVE_GATE_WAIT",
+      "declaration_scope": "module::cfg:feature=\"age319-private-broker-fixture\"",
+      "controlling_use": {
+        "source": "src-tauri/src/completion_owner/root_supervisor.rs",
+        "scope": "module::fn:private_native_lineage",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "tauri.kernel-entry.private-child-effect-poll",
+      "owner": "tauri/kernel_entry",
+      "class": "polling_cadence",
+      "protected_resource": "private child effect gate checks",
+      "exhaustion_behavior": "The fixture polls for effect without making this cadence terminal.",
+      "observability": "Private child result exposes effect or timeout.",
+      "configurability": "Fixed source declaration; private fixture values require its explicit feature and environment.",
+      "rationale": "The existing 20 millis value controls private child effect gate checks; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_millis (20)",
+      "source": "src-tauri/src/kernel_entry.rs",
+      "symbol": "PRIVATE_CHILD_EFFECT_POLL",
+      "declaration_scope": "module::cfg:feature=\"age319-private-broker-fixture\"",
+      "controlling_use": {
+        "source": "src-tauri/src/kernel_entry.rs",
+        "scope": "module::fn:child_v30_entry",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "tauri.kernel-entry.private-child-effect-wait",
+      "owner": "tauri/kernel_entry",
+      "class": "test_only_patience",
+      "protected_resource": "private child effect fixture gate",
+      "exhaustion_behavior": "The explicit fixture returns an error after twenty seconds.",
+      "observability": "The private child returns a fixture timeout.",
+      "configurability": "Fixed source declaration; private fixture values require its explicit feature and environment.",
+      "rationale": "The existing 20 secs value controls private child effect fixture gate; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_secs (20)",
+      "source": "src-tauri/src/kernel_entry.rs",
+      "symbol": "PRIVATE_CHILD_EFFECT_WAIT",
+      "declaration_scope": "module::cfg:feature=\"age319-private-broker-fixture\"",
+      "controlling_use": {
+        "source": "src-tauri/src/kernel_entry.rs",
+        "scope": "module::fn:child_v30_entry",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "tauri.kernel-entry.private-lost-reply-read-timeout",
+      "owner": "tauri/kernel_entry",
+      "class": "test_only_patience",
+      "protected_resource": "private lost-reply fixture socket read",
+      "exhaustion_behavior": "The fixture read times out after five seconds.",
+      "observability": "The private fixture returns a socket error.",
+      "configurability": "Fixed source declaration; private fixture values require its explicit feature and environment.",
+      "rationale": "The existing 5 secs value controls private lost-reply fixture socket read; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_secs (5)",
+      "source": "src-tauri/src/kernel_entry.rs",
+      "symbol": "PRIVATE_LOST_REPLY_READ_TIMEOUT",
+      "declaration_scope": "module::cfg:feature=\"age319-private-broker-fixture\"",
+      "controlling_use": {
+        "source": "src-tauri/src/kernel_entry.rs",
+        "scope": "module::fn:private_drop_fresh_reply",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "tauri.kernel-entry.private-prepared-finish-wait",
+      "owner": "tauri/kernel_entry",
+      "class": "test_only_patience",
+      "protected_resource": "private prepared finish fixture wait",
+      "exhaustion_behavior": "The explicit fixture returns an expired wait after twenty seconds.",
+      "observability": "The private fixture returns finish wait expired.",
+      "configurability": "Fixed source declaration; private fixture values require its explicit feature and environment.",
+      "rationale": "The existing 20 secs value controls private prepared finish fixture wait; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_secs (20)",
+      "source": "src-tauri/src/kernel_entry.rs",
+      "symbol": "PRIVATE_PREPARED_FINISH_WAIT",
+      "declaration_scope": "module::cfg:feature=\"age319-private-broker-fixture\"",
+      "controlling_use": {
+        "source": "src-tauri/src/kernel_entry.rs",
+        "scope": "module::fn:private_held_prepared_entry",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "tauri.kernel-entry.private-prepared-gate-poll",
+      "owner": "tauri/kernel_entry",
+      "class": "polling_cadence",
+      "protected_resource": "private prepared gate checks",
+      "exhaustion_behavior": "The fixture polls for release and finish without this interval being terminal.",
+      "observability": "The private fixture returns gate progress or timeout.",
+      "configurability": "Fixed source declaration; private fixture values require its explicit feature and environment.",
+      "rationale": "The existing 20 millis value controls private prepared gate checks; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_millis (20)",
+      "source": "src-tauri/src/kernel_entry.rs",
+      "symbol": "PRIVATE_PREPARED_GATE_POLL",
+      "declaration_scope": "module::cfg:feature=\"age319-private-broker-fixture\"",
+      "controlling_use": {
+        "source": "src-tauri/src/kernel_entry.rs",
+        "scope": "module::fn:private_held_prepared_entry",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "tauri.kernel-entry.private-prepared-release-wait",
+      "owner": "tauri/kernel_entry",
+      "class": "test_only_patience",
+      "protected_resource": "private prepared release fixture wait",
+      "exhaustion_behavior": "The explicit fixture returns an expired wait after twenty seconds.",
+      "observability": "The private fixture returns release wait expired.",
+      "configurability": "Fixed source declaration; private fixture values require its explicit feature and environment.",
+      "rationale": "The existing 20 secs value controls private prepared release fixture wait; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_secs (20)",
+      "source": "src-tauri/src/kernel_entry.rs",
+      "symbol": "PRIVATE_PREPARED_RELEASE_WAIT",
+      "declaration_scope": "module::cfg:feature=\"age319-private-broker-fixture\"",
+      "controlling_use": {
+        "source": "src-tauri/src/kernel_entry.rs",
+        "scope": "module::fn:private_held_prepared_entry",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "tauri.kernel-entry.private-provider-result-poll",
+      "owner": "tauri/kernel_entry",
+      "class": "polling_cadence",
+      "protected_resource": "private provider result and cancellation checks",
+      "exhaustion_behavior": "The private fixture polls for result, cancellation, and drain.",
+      "observability": "The private provider result reports each gate failure.",
+      "configurability": "Fixed source declaration; private fixture values require its explicit feature and environment.",
+      "rationale": "The existing 20 millis value controls private provider result and cancellation checks; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_millis (20)",
+      "source": "src-tauri/src/kernel_entry.rs",
+      "symbol": "PRIVATE_PROVIDER_RESULT_POLL",
+      "declaration_scope": "module::cfg:feature=\"age319-private-broker-fixture\"",
+      "controlling_use": {
+        "source": "src-tauri/src/kernel_entry.rs",
+        "scope": "module::fn:private_fresh_provider",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "tauri.kernel-entry.private-provider-result-wait",
+      "owner": "tauri/kernel_entry",
+      "class": "test_only_patience",
+      "protected_resource": "private provider result fixture wait",
+      "exhaustion_behavior": "The explicit fixture returns unknown result after twenty seconds.",
+      "observability": "The private provider result is reported as unknown.",
+      "configurability": "Fixed source declaration; private fixture values require its explicit feature and environment.",
+      "rationale": "The existing 20 secs value controls private provider result fixture wait; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_secs (20)",
+      "source": "src-tauri/src/kernel_entry.rs",
+      "symbol": "PRIVATE_PROVIDER_RESULT_WAIT",
+      "declaration_scope": "module::cfg:feature=\"age319-private-broker-fixture\"",
+      "controlling_use": {
+        "source": "src-tauri/src/kernel_entry.rs",
+        "scope": "module::fn:private_fresh_provider",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "tauri.kernel-entry.private-v30-barrier-poll",
+      "owner": "tauri/kernel_entry",
+      "class": "polling_cadence",
+      "protected_resource": "private v30 barrier checks",
+      "exhaustion_behavior": "The fixture polls for barrier release without this interval being terminal.",
+      "observability": "The private fixture returns barrier progress or timeout.",
+      "configurability": "Fixed source declaration; private fixture values require its explicit feature and environment.",
+      "rationale": "The existing 20 millis value controls private v30 barrier checks; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_millis (20)",
+      "source": "src-tauri/src/kernel_entry.rs",
+      "symbol": "PRIVATE_V30_BARRIER_POLL",
+      "declaration_scope": "module::cfg:feature=\"age319-private-broker-fixture\"",
+      "controlling_use": {
+        "source": "src-tauri/src/kernel_entry.rs",
+        "scope": "module::fn:private_v30_barrier",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "tauri.kernel-entry.private-v30-barrier-wait",
+      "owner": "tauri/kernel_entry",
+      "class": "test_only_patience",
+      "protected_resource": "private v30 barrier fixture wait",
+      "exhaustion_behavior": "The explicit fixture returns an expired wait after twenty seconds.",
+      "observability": "The private fixture returns barrier wait expired.",
+      "configurability": "Fixed source declaration; private fixture values require its explicit feature and environment.",
+      "rationale": "The existing 20 secs value controls private v30 barrier fixture wait; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_secs (20)",
+      "source": "src-tauri/src/kernel_entry.rs",
+      "symbol": "PRIVATE_V30_BARRIER_WAIT",
+      "declaration_scope": "module::cfg:feature=\"age319-private-broker-fixture\"",
+      "controlling_use": {
+        "source": "src-tauri/src/kernel_entry.rs",
+        "scope": "module::fn:private_v30_barrier",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "tauri.maintenance-worker.launch-cleanup-entries-per-run",
+      "owner": "src-tauri/src/maintenance_worker",
+      "class": "resource_guard",
+      "protected_resource": "launch evidence files removed per maintenance opportunity",
+      "exhaustion_behavior": "run_launch_evidence_cleanup stops after 64 removed entries and keeps its cursor",
+      "observability": "Maintenance checkpoint records continuing cleanup progress",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "A cleanup opportunity has bounded filesystem deletion work.",
+      "default_value": "64",
+      "source": "src-tauri/src/maintenance_worker.rs",
+      "symbol": "LAUNCH_CLEANUP_ENTRIES_PER_RUN",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "src-tauri/src/maintenance_worker.rs",
+        "scope": "module::fn:run_launch_evidence_cleanup",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "tauri.maintenance-worker.launch-cleanup-epochs-per-run",
+      "owner": "src-tauri/src/maintenance_worker",
+      "class": "resource_guard",
+      "protected_resource": "launch evidence epochs examined per maintenance opportunity",
+      "exhaustion_behavior": "run_launch_evidence_cleanup stops after four epochs and keeps its cursor",
+      "observability": "Maintenance checkpoint records remaining epoch position",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "A cleanup opportunity has bounded directory traversal work.",
+      "default_value": "4",
+      "source": "src-tauri/src/maintenance_worker.rs",
+      "symbol": "LAUNCH_CLEANUP_EPOCHS_PER_RUN",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "src-tauri/src/maintenance_worker.rs",
+        "scope": "module::fn:run_launch_evidence_cleanup",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "tauri.maintenance-worker.launch-retention-days",
+      "owner": "src-tauri/src/maintenance_worker",
+      "class": "resource_guard",
+      "protected_resource": "terminal launch evidence lifetime before cleanup eligibility",
+      "exhaustion_behavior": "run_launch_evidence_cleanup computes a thirty-day epoch cutoff",
+      "observability": "Cleanup cursor and durable launch records show what remains",
+      "configurability": "Fixed retention period; no runtime override.",
+      "rationale": "Terminal launch evidence remains available for thirty days before reclamation.",
+      "default_value": "30",
+      "source": "src-tauri/src/maintenance_worker.rs",
+      "symbol": "LAUNCH_RETENTION_DAYS",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "src-tauri/src/maintenance_worker.rs",
+        "scope": "module::fn:run_launch_evidence_cleanup",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "tauri.maintenance-worker.midnight-allowance-seconds",
+      "owner": "src-tauri/src/maintenance_worker",
+      "class": "structural_safety_bound",
+      "protected_resource": "validity window for detached maintenance opportunity epoch",
+      "exhaustion_behavior": "validate_worker_epoch accepts yesterday only within fifteen minutes after UTC midnight",
+      "observability": "Invalid opportunity epoch returns a validation error",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "The handoff window accepts near-midnight scheduling lag without accepting stale epochs.",
+      "default_value": "15 * 60",
+      "source": "src-tauri/src/maintenance_worker.rs",
+      "symbol": "MIDNIGHT_ALLOWANCE_SECONDS",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "src-tauri/src/maintenance_worker.rs",
+        "scope": "module::fn:validate_worker_epoch",
+        "kind": "direct_control"
+      }
+    },
+    {
       "id": "tauri.native-receipt.max-inline-body-bytes",
       "owner": "src-tauri/native_receipt",
       "class": "resource_guard",
@@ -5831,6 +7921,25 @@
       "controlling_use": {
         "source": "src-tauri/src/native_receipt.rs",
         "scope": "module::fn:confirm_delivery_observation_bounded",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "tauri.private-provider-probe.private-custody-quiescence-poll",
+      "owner": "tauri/private_provider_probe",
+      "class": "polling_cadence",
+      "protected_resource": "private provider proof custody checks",
+      "exhaustion_behavior": "The fixture polls for complete custody quiescence without a deadline.",
+      "observability": "The private proof returns after physical custody drains.",
+      "configurability": "Fixed source declaration; private fixture values require its explicit feature and environment.",
+      "rationale": "The existing 10 millis value controls private provider proof custody checks; the named declaration preserves that behavior.",
+      "default_value": "std :: time :: Duration :: from_millis (10)",
+      "source": "src-tauri/src/private_provider_probe.rs",
+      "symbol": "PRIVATE_CUSTODY_QUIESCENCE_POLL",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "src-tauri/src/private_provider_probe.rs",
+        "scope": "module::fn:run",
         "kind": "direct_control"
       }
     },

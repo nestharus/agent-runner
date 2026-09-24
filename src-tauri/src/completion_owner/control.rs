@@ -1,5 +1,11 @@
 //! The control reader does no durable work. The guardian remains the sole
 //! context/custody/retirement writer and joins this thread before every fork.
+
+const SOURCE_TICKET_RECEIVE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+const PINNED_EOF_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+const CREDENTIAL_READ_BUFFER_BYTES: usize = 4096;
+
 use super::original_work::{
     CancelSubmission, FD_COUNT, InboundCancel, InboundWork, RootJoinRequest, WorkSubmission,
 };
@@ -543,7 +549,7 @@ fn receive_request_from_first(
     let mut request = vec![first];
     let required_lines = if first == b'h' { 1 } else { 2 };
     let mut lines = usize::from(first == b'\n');
-    let mut chunk = [0_u8; 4096];
+    let mut chunk = [0_u8; CREDENTIAL_READ_BUFFER_BYTES];
     let mut reader = socket;
     while lines < required_lines {
         if request.len() >= MAX_REQUEST_BYTES {
@@ -607,9 +613,12 @@ fn receive_pinned_request(
     {
         return Err((None, std::io::Error::last_os_error().to_string()));
     }
-    let (first, fds, marker_sender) =
-        receive_credentialled_byte(socket, peer, Some(Instant::now() + Duration::from_secs(10)))
-            .map_err(|error| (None, error))?;
+    let (first, fds, marker_sender) = receive_credentialled_byte(
+        socket,
+        peer,
+        Some(Instant::now() + SOURCE_TICKET_RECEIVE_DEADLINE),
+    )
+    .map_err(|error| (None, error))?;
     if first != b'@' {
         // The old join/hello exchange is still used to establish the owner.
         // A pinned work/cancel request without S-v2 is refused below.
@@ -623,7 +632,7 @@ fn receive_pinned_request(
         ));
     }
     let mut ticket = [0u8; 16];
-    let marker_deadline = Instant::now() + Duration::from_secs(10);
+    let marker_deadline = Instant::now() + SOURCE_TICKET_RECEIVE_DEADLINE;
     for byte in &mut ticket {
         let (next, fds, sender) = receive_credentialled_byte(socket, peer, Some(marker_deadline))
             .map_err(|error| (Some(first), error))?;
@@ -636,7 +645,7 @@ fn receive_pinned_request(
     let mut frame = Vec::new();
     let mut descriptors = Vec::new();
     let mut lines = 0;
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + SOURCE_TICKET_RECEIVE_DEADLINE;
     loop {
         if frame.len() >= MAX_REQUEST_BYTES || Instant::now() >= deadline {
             return Err((
@@ -832,7 +841,7 @@ fn attest_source_frame(
 }
 
 fn receive_pinned_eof(socket: &UnixStream, peer: &SourceProcessIdentity) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + PINNED_EOF_DEADLINE;
     let mut byte = [0u8; 1];
     loop {
         if Instant::now() >= deadline {

@@ -1,5 +1,8 @@
 //! Private, feature-gated CLI execution. This is deliberately separate from
 //! production L: no installed State or service route calls this module.
+
+const PRIVATE_INSTALLED_REAP_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+
 use oulipoly_kernel_broker::entry_registry::ProcessStamp;
 use oulipoly_kernel_broker::identity::{PeerIdentity, PinnedProcess};
 use oulipoly_kernel_broker::installed_launch::{self, EntryKind, InstalledLaunchSpec};
@@ -430,7 +433,7 @@ fn run_init(context: InitContext) -> io::Result<()> {
     loop {
         if CANCELLED.swap(false, Ordering::Relaxed) {
             unsafe { libc::kill(-1, libc::SIGTERM) };
-            std::thread::sleep(std::time::Duration::from_millis(200));
+            std::thread::sleep(PRIVATE_INSTALLED_REAP_POLL);
             unsafe { libc::kill(-1, libc::SIGKILL) };
         }
         let mut child_status = 0;

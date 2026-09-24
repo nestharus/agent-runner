@@ -2,6 +2,14 @@
 //! executable. Private socket opcodes carry descriptor-backed plans; the
 //! ordinary CLI route remains closed until a typed runtime backend can consume
 //! its readbacks.
+
+const CANCELLATION_ESCALATION_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+const PID1_REAP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
+const SHA_FILE_BUFFER_BYTES: usize = 64 * 1024;
+const SEALED_COPY_BUFFER_BYTES: usize = 64 * 1024;
+const VERIFIED_OUTPUT_BUFFER_BYTES: usize = 64 * 1024;
+
 use super::work_launch;
 use oulipoly_kernel_broker::identity::{PinnedProcess, host_proc_file, observed_incarnation_gone};
 use oulipoly_state::mailbox::{
@@ -19,7 +27,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 static CANCEL: AtomicBool = AtomicBool::new(false);
 extern "C" fn request_cancel(_: libc::c_int) {
@@ -227,7 +235,7 @@ fn sha_file(file: &File) -> io::Result<(String, u64)> {
     let before = file.metadata()?;
     let mut hash = Sha256::new();
     let mut count = 0u64;
-    let mut buf = [0u8; 64 * 1024];
+    let mut buf = [0u8; SHA_FILE_BUFFER_BYTES];
     loop {
         let n = file.read_at(&mut buf, count)?;
         if n == 0 {
@@ -265,7 +273,7 @@ fn sealed_copy(source: &File, name: &'static std::ffi::CStr) -> io::Result<File>
         return Err(io::Error::other("provider source is not regular"));
     }
     let mut offset = 0u64;
-    let mut buf = [0u8; 64 * 1024];
+    let mut buf = [0u8; SEALED_COPY_BUFFER_BYTES];
     loop {
         let n = source.read_at(&mut buf, offset)?;
         if n == 0 {
@@ -753,11 +761,13 @@ fn run_init(mut init: Init) -> io::Result<()> {
     loop {
         if CANCEL.load(Ordering::Relaxed) {
             let started = *cancellation_started.get_or_insert_with(Instant::now);
-            work_launch::signal_work_members(if started.elapsed() >= Duration::from_secs(2) {
-                libc::SIGKILL
-            } else {
-                libc::SIGTERM
-            })?;
+            work_launch::signal_work_members(
+                if started.elapsed() >= CANCELLATION_ESCALATION_DELAY {
+                    libc::SIGKILL
+                } else {
+                    libc::SIGTERM
+                },
+            )?;
         }
         let mut status = 0;
         let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
@@ -779,7 +789,7 @@ fn run_init(mut init: Init) -> io::Result<()> {
             continue;
         }
         if pid == 0 {
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(PID1_REAP_POLL_INTERVAL);
             continue;
         }
         let error = io::Error::last_os_error();
@@ -1102,7 +1112,7 @@ fn verified_output(dir: &Path, name: &str, expected: &Output) -> io::Result<File
     }
     let mut hash = Sha256::new();
     let mut offset = 0u64;
-    let mut buf = [0u8; 64 * 1024];
+    let mut buf = [0u8; VERIFIED_OUTPUT_BUFFER_BYTES];
     loop {
         let n = file.read_at(&mut buf, offset)?;
         if n == 0 {

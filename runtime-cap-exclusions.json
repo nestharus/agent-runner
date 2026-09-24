@@ -2,6 +2,41 @@
   "schema_version": 1,
   "exclusions": [
     {
+      "source": "crates/oulipoly-kernel-broker/src/accepted_grant.rs",
+      "declaration_scope": "module::fn:sealed_executable",
+      "symbol": "REQUIRED",
+      "value_expression": "libc :: F_SEAL_SEAL | libc :: F_SEAL_SHRINK | libc :: F_SEAL_GROW | libc :: F_SEAL_WRITE",
+      "reason": "Linux memfd seal bitmask required for executable immutability; these flags select kernel ABI features rather than set a resource budget."
+    },
+    {
+      "source": "crates/oulipoly-kernel-broker/src/cutover_gate.rs",
+      "declaration_scope": "module",
+      "symbol": "CLOSED",
+      "value_expression": "b\"oulipoly-entry-gate-v1 closed\\n\"",
+      "reason": "Serialized closed-state marker for the entry-gate protocol; its bytes identify a state and the marker length is not a policy ceiling."
+    },
+    {
+      "source": "crates/oulipoly-kernel-broker/src/cutover_gate.rs",
+      "declaration_scope": "module",
+      "symbol": "OPEN",
+      "value_expression": "b\"oulipoly-entry-gate-v1 open\\n\"",
+      "reason": "Serialized open-state marker for the entry-gate protocol; its bytes identify a state and do not limit work or lifetime."
+    },
+    {
+      "source": "crates/oulipoly-kernel-broker/src/cutover_gate.rs",
+      "declaration_scope": "module",
+      "symbol": "PROCESS_INSTANCES",
+      "value_expression": "OnceLock :: new ()",
+      "reason": "Process-local OnceLock initialization for the live entry-gate instance set; the static is a container, with no numeric ceiling."
+    },
+    {
+      "source": "crates/oulipoly-kernel-broker/src/shared_front_door.rs",
+      "declaration_scope": "module::cfg:feature=\"age319-private-broker-fixture\"",
+      "symbol": "FIXTURE_ONLY_MARKER",
+      "value_expression": "* b\"OULIPOLY_AGE319_FRONT_DOOR_FIXTURE_ONLY_UNSAFE\"",
+      "reason": "Feature-gated private broker fixture marker bytes; the literal identifies unsafe fixture traffic and carries no size or retry policy."
+    },
+    {
       "source": "crates/oulipoly-provider/src/process.rs",
       "declaration_scope": "module::fn:configure_process_group",
       "symbol": "CREATE_NEW_PROCESS_GROUP",
@@ -481,7 +516,7 @@
       "source": "crates/oulipoly-state/src/diagnostic_recorder.rs",
       "declaration_scope": "module",
       "symbol": "DIAGNOSTIC_SCHEMA_VERSION",
-      "value_expression": "1",
+      "value_expression": "2",
       "reason": "Serialized-format version identifier compared for compatibility; it is neither a migration range bound nor a runtime budget."
     },
     {
@@ -513,6 +548,20 @@
       "reason": "Serialized derived-catalog control-record format identifier compared for compatibility; it does not bound work, storage, waiting, or retries."
     },
     {
+      "source": "crates/oulipoly-state/src/event_store/maintenance_discovery.rs",
+      "declaration_scope": "module",
+      "symbol": "FORMAT_VERSION",
+      "value_expression": "1",
+      "reason": "Maintenance discovery record format discriminator used in serialization and validation; version one is an ABI identity."
+    },
+    {
+      "source": "crates/oulipoly-state/src/event_store/maintenance_discovery.rs",
+      "declaration_scope": "module",
+      "symbol": "IDENTITY_BYTES",
+      "value_expression": "32",
+      "reason": "Fixed 32-byte encoded discovery identity layout for writer and generation components; this is a wire format width, not a traversal limit."
+    },
+    {
       "source": "crates/oulipoly-state/src/event_store/mod.rs",
       "declaration_scope": "module",
       "symbol": "EVENT_SCHEMA_VERSION",
@@ -525,6 +574,20 @@
       "symbol": "HEX",
       "value_expression": "b\"0123456789abcdef\"",
       "reason": "Hexadecimal encoding alphabet used for deterministic path fingerprints; its digits are protocol symbols and do not bound runtime work."
+    },
+    {
+      "source": "crates/oulipoly-state/src/longitudinal_metrics.rs",
+      "declaration_scope": "module",
+      "symbol": "HISTOGRAM_UPPER_BOUNDS",
+      "value_expression": "[100 , 1_000 , 10_000 , 100_000 , 1_000_000 , 10_000_000 , u64 :: MAX]",
+      "reason": "Metric histogram bucket boundaries classify observed values; they neither reject observations nor cap count or memory."
+    },
+    {
+      "source": "crates/oulipoly-state/src/longitudinal_metrics.rs",
+      "declaration_scope": "module",
+      "symbol": "METRIC_SCHEMA_VERSION",
+      "value_expression": "1",
+      "reason": "Metric sample serialization version checked during validation; it is a format discriminator, not a runtime budget."
     },
     {
       "source": "crates/oulipoly-state/src/mailbox.rs",
@@ -541,11 +604,67 @@
       "reason": "Serialized-format version identifier compared for compatibility; it is neither a migration range bound nor a runtime budget."
     },
     {
+      "source": "crates/oulipoly-state/src/mailbox.rs",
+      "declaration_scope": "module",
+      "symbol": "TERMINAL_HISTORY_KEEP_ROWS",
+      "value_expression": "1_024",
+      "reason": "Legacy 1024-row test fixture threshold; production prune_terminal_history now uses caller limit and age policy, and this declaration has no production use."
+    },
+    {
+      "source": "crates/oulipoly-state/src/mailbox/schema.rs",
+      "declaration_scope": "module",
+      "symbol": "BROKER_OWNED_VERSION",
+      "value_expression": "32",
+      "reason": "Mailbox database schema version required by broker-owned sidecar SQL; it identifies a durable layout, not a work bound."
+    },
+    {
+      "source": "crates/oulipoly-state/src/maintenance.rs",
+      "declaration_scope": "module",
+      "symbol": "MAINTENANCE_FORMAT_VERSION",
+      "value_expression": "1",
+      "reason": "Maintenance record format discriminator checked by durable record validators; it does not impose a resource ceiling."
+    },
+    {
       "source": "crates/oulipoly-state/src/sqlite_observability.rs",
       "declaration_scope": "module",
       "symbol": "DEFAULT_SQLITE_SLOW_THRESHOLD",
       "value_expression": "Duration :: from_millis (100)",
       "reason": "Observability sampling threshold that labels completed SQLite operations as slow; it neither interrupts nor degrades the operation."
+    },
+    {
+      "source": "src-tauri/src/completion_owner/original_work.rs",
+      "declaration_scope": "module",
+      "symbol": "FD_COUNT",
+      "value_expression": "4",
+      "reason": "Four fixed original-work descriptor roles in the launch protocol; the array width is an ABI cardinality, not a configurable capacity."
+    },
+    {
+      "source": "src-tauri/src/maintenance_worker.rs",
+      "declaration_scope": "module",
+      "symbol": "LAUNCH_FALLBACK_FORMAT_VERSION",
+      "value_expression": "1",
+      "reason": "Fallback launch record version one identifies the durable JSON layout and is checked as a format discriminator."
+    },
+    {
+      "source": "src-tauri/src/maintenance_worker.rs",
+      "declaration_scope": "module",
+      "symbol": "LAUNCH_FORMAT_VERSION",
+      "value_expression": "2",
+      "reason": "Launch record version two identifies the durable JSON layout and is checked as a format discriminator."
+    },
+    {
+      "source": "src-tauri/src/maintenance_worker.rs",
+      "declaration_scope": "module::fn:configure_detached",
+      "symbol": "CREATE_NEW_PROCESS_GROUP",
+      "value_expression": "0x0000_0200",
+      "reason": "Windows process creation flag 0x200 requests a new process group; it is an OS ABI bit, not a numeric budget."
+    },
+    {
+      "source": "src-tauri/src/maintenance_worker.rs",
+      "declaration_scope": "module::fn:configure_detached",
+      "symbol": "DETACHED_PROCESS",
+      "value_expression": "0x0000_0008",
+      "reason": "Windows process creation flag 0x8 requests detached launch; it is an OS ABI bit, not a numeric budget."
     },
     {
       "source": "src-tauri/src/run/continuation_request.rs",

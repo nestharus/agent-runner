@@ -1,5 +1,8 @@
 //! Read-only identity contract for the opt-in Linux paired artifact.
 //! This is an ingress prerequisite, not process custody or a State cutover proof.
+
+const INSTALLED_PAIR_READ_BYTES: u64 = 4097;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
@@ -35,7 +38,8 @@ impl InstalledPair {
         let file = File::open(path)?;
         trusted_file(&file, require_root)?;
         let mut bytes = Vec::new();
-        file.take(4097).read_to_end(&mut bytes)?;
+        file.take(INSTALLED_PAIR_READ_BYTES)
+            .read_to_end(&mut bytes)?;
         if bytes.len() > 4096 {
             return Err(io::Error::other("oversized installed pair manifest"));
         }

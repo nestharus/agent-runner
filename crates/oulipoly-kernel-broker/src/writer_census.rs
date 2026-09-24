@@ -2,6 +2,10 @@
 //! open handles, including unlinked WAL/SHM files. An empty result is NOT a
 //! quiescence certificate: new processes and new FDs can race this scan until
 //! an installed supervisor fences every supported launcher and respawn path.
+
+const PROC_DIRENTS_BUFFER_BYTES: usize = 8192;
+const FD_TARGET_BUFFER_BYTES: usize = 4096;
+
 use crate::entry_registry::ProcessStamp;
 use crate::identity::{PinnedProcess, has_detached_host_proc, host_proc_file};
 use std::ffi::{CString, OsStr};
@@ -82,7 +86,7 @@ fn source_files(source: &Path) -> io::Result<[SourceFile; 3]> {
 // pinned with pidfd, boot ID, starttime and PID namespace.
 fn numeric_entries(directory: File) -> io::Result<Vec<i32>> {
     let mut result = Vec::new();
-    let mut bytes = [0u8; 8192];
+    let mut bytes = [0u8; PROC_DIRENTS_BUFFER_BYTES];
     loop {
         let count = unsafe {
             libc::syscall(
@@ -130,7 +134,7 @@ fn numeric_entries(directory: File) -> io::Result<Vec<i32>> {
 
 fn fd_target(directory: &File, fd: i32) -> io::Result<(Vec<u8>, (u64, u64))> {
     let name = CString::new(fd.to_string()).unwrap();
-    let mut link = [0u8; 4096];
+    let mut link = [0u8; FD_TARGET_BUFFER_BYTES];
     let length = unsafe {
         libc::readlinkat(
             directory.as_raw_fd(),

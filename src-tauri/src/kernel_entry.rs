@@ -1,4 +1,26 @@
 //! Host-side pinned completion authority and broker-attested root child join.
+
+#[cfg(feature = "age319-private-broker-fixture")]
+const PRIVATE_CHILD_EFFECT_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+#[cfg(feature = "age319-private-broker-fixture")]
+const PRIVATE_CHILD_EFFECT_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+#[cfg(feature = "age319-private-broker-fixture")]
+const PRIVATE_PROVIDER_RESULT_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+#[cfg(feature = "age319-private-broker-fixture")]
+const PRIVATE_PROVIDER_RESULT_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+#[cfg(feature = "age319-private-broker-fixture")]
+const PRIVATE_LOST_REPLY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(feature = "age319-private-broker-fixture")]
+const PRIVATE_PREPARED_RELEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+#[cfg(feature = "age319-private-broker-fixture")]
+const PRIVATE_PREPARED_FINISH_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+#[cfg(feature = "age319-private-broker-fixture")]
+const PRIVATE_PREPARED_GATE_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+#[cfg(feature = "age319-private-broker-fixture")]
+const PRIVATE_V30_BARRIER_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+#[cfg(feature = "age319-private-broker-fixture")]
+const PRIVATE_V30_BARRIER_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
 use oulipoly_kernel_broker::installed_pair::{self, InstalledPair};
 use oulipoly_kernel_broker::protocol::{self, EntryRoute, JoinSpec, Operation, StateRoute};
 use oulipoly_state::mailbox::MailboxDb;
@@ -522,7 +544,7 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
             evidence.release_id.as_bytes(),
         )
         .map_err(|e| e.to_string())?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let deadline = std::time::Instant::now() + PRIVATE_CHILD_EFFECT_WAIT;
         let mut retried = false;
         while !gate_dir.join("child-effect").exists() {
             if !retried && gate_dir.join("child-retry").exists() {
@@ -568,7 +590,7 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
             if std::time::Instant::now() >= deadline {
                 return Err("private v30 child effect wait expired".into());
             }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(PRIVATE_CHILD_EFFECT_POLL);
         }
         if let Some(original) = private_receipt.as_ref() {
             let current = protocol::request_released_fresh_handoff_at(
@@ -759,7 +781,7 @@ fn private_fresh_provider(
     {
         return Err("private provider duplicate K was accepted".into());
     }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let deadline = std::time::Instant::now() + PRIVATE_PROVIDER_RESULT_WAIT;
     loop {
         let state = protocol::private_fresh_provider_at(&socket, &receipt.d_key, b'6', None)
             .map_err(|e| format!("private provider result readback failed: {e}"))?;
@@ -769,7 +791,7 @@ fn private_fresh_provider(
         if state.starts_with("fresh-provider-unknown ") || std::time::Instant::now() >= deadline {
             return Err("private provider result unknown".into());
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(PRIVATE_PROVIDER_RESULT_POLL);
     }
     let gate = std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
         .map_err(|_| "private provider gate directory absent")?;
@@ -777,7 +799,7 @@ fn private_fresh_provider(
         if std::time::Instant::now() >= deadline {
             return Err("private provider cancellation fixture expired".into());
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(PRIVATE_PROVIDER_RESULT_POLL);
     }
     protocol::private_fresh_provider_at(&socket, &receipt.d_key, b'7', None)
         .map_err(|e| format!("private provider cancel failed: {e}"))?;
@@ -796,7 +818,7 @@ fn private_fresh_provider(
         if state.starts_with("fresh-provider-unknown ") || std::time::Instant::now() >= deadline {
             return Err("private provider Q unknown".into());
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(PRIVATE_PROVIDER_RESULT_POLL);
     }
 }
 
@@ -916,7 +938,7 @@ fn private_drop_fresh_reply(
     }
     stream.write_all(&frame).map_err(|e| e.to_string())?;
     stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .set_read_timeout(Some(PRIVATE_LOST_REPLY_READ_TIMEOUT))
         .map_err(|e| e.to_string())?;
     let mut first = [0u8; 1];
     stream.read_exact(&mut first).map_err(|e| e.to_string())?;
@@ -1750,12 +1772,12 @@ fn private_held_prepared_entry() -> Result<(), String> {
         )
         .map_err(|e| e.to_string())?;
         if std::env::var_os("AGE319_PRIVATE_RELEASE_V30").is_some() {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            let deadline = std::time::Instant::now() + PRIVATE_PREPARED_RELEASE_WAIT;
             while !gate_dir.join("release").exists() {
                 if std::time::Instant::now() >= deadline {
                     return Err("private release wait expired".into());
                 }
-                std::thread::sleep(std::time::Duration::from_millis(20));
+                std::thread::sleep(PRIVATE_PREPARED_GATE_POLL);
             }
             parent.write_all(b"L").map_err(|e| e.to_string())?;
             let committed: oulipoly_state::mailbox::BrokerReleaseEvidence =
@@ -1771,7 +1793,7 @@ fn private_held_prepared_entry() -> Result<(), String> {
         }
         let expect_death = std::env::var_os("AGE319_PRIVATE_EXPECT_GUARDIAN_DEATH_V1").is_some();
         let mut death_refused = false;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let deadline = std::time::Instant::now() + PRIVATE_PREPARED_FINISH_WAIT;
         while !gate_dir.join("finish").exists() {
             if expect_death && !death_refused && gate_dir.join("guardian-dead").exists() {
                 if protocol::read_prepared_owner_at(&broker, &read).is_ok() {
@@ -1784,7 +1806,7 @@ fn private_held_prepared_entry() -> Result<(), String> {
             if std::time::Instant::now() >= deadline {
                 return Err("private prepared fixture wait expired".into());
             }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(PRIVATE_PREPARED_GATE_POLL);
         }
         if expect_death && !death_refused {
             return Err("guardian death was not read back".into());
@@ -2076,12 +2098,12 @@ fn private_v30_barrier(name: &str) -> Result<(), String> {
         std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
             .ok_or("private v30 gate directory absent")?,
     );
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let deadline = std::time::Instant::now() + PRIVATE_V30_BARRIER_WAIT;
     while !directory.join(name).exists() {
         if std::time::Instant::now() >= deadline {
             return Err(format!("private v30 {name} wait expired"));
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(PRIVATE_V30_BARRIER_POLL);
     }
     Ok(())
 }
