@@ -396,10 +396,7 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
         println!("OULIPOLY_KERNEL_V30_CHILD_EFFECT={}", evidence.release_id);
         return Ok(ExitCode::SUCCESS);
     }
-    Err(
-        "production v30 child has no Bash-handle dispatch or fresh State invocation/owner binding; U/D remains closed"
-            .into(),
-    )
+    Err("production v30 child requires broker-routed owner work path".into())
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]
@@ -894,11 +891,21 @@ fn private_native_request(
     } else {
         "native-sibling-effect"
     });
-    let args = [
-        b"__age319-private-installed-probe-v1".to_vec(),
-        b"ambient".to_vec(),
-        marker.as_os_str().as_encoded_bytes().to_vec(),
-    ];
+    let args = if std::env::var_os("AGE319_PRIVATE_RECEIPT_HELPER_PROBE_V1").is_some() {
+        [
+            crate::native_receipt::helper::ARG.as_bytes().to_vec(),
+            crate::native_receipt::helper::PRIVATE_BROKER_PROBE_ARG
+                .as_bytes()
+                .to_vec(),
+            marker.as_os_str().as_encoded_bytes().to_vec(),
+        ]
+    } else {
+        [
+            b"__age319-private-installed-probe-v1".to_vec(),
+            b"provider".to_vec(),
+            marker.as_os_str().as_encoded_bytes().to_vec(),
+        ]
+    };
     let request = serde_json::json!({
         "path": std::path::PathBuf::from(std::env::var("OULIPOLY_DATA_DIR")
             .map_err(|error| error.to_string())?).join("state.db"),

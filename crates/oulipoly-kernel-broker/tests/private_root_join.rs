@@ -9,7 +9,7 @@ use oulipoly_state::completion_continuation::AdmittedSourceBinding;
 use oulipoly_state::mailbox::{AgentBashCompleteEnqueue, BrokerSidecar, EnqueueResult, MailboxDb};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -46,6 +46,10 @@ impl Drop for SnapshotRestore {
 fn inner() {
     let mode = std::env::var("AGE319_PRIVATE_JOIN_MODE").unwrap_or_else(|_| "help".into());
     let native_mode = mode.starts_with("native_");
+    let native_live = matches!(
+        mode.as_str(),
+        "native_cancel" | "native_drain" | "native_receipt_cancel" | "native_receipt_drain"
+    );
     let release_mode = mode.starts_with("held_release") || native_mode;
     let normal_mode = mode.starts_with("normal_");
     let recipient_mode = mode.starts_with("normal_recipient");
@@ -1098,6 +1102,10 @@ fn inner() {
             )
             .envs(native_mode.then_some(("AGE319_PRIVATE_NATIVE_LINEAGE_V30", "1")))
             .envs(
+                mode.starts_with("native_receipt_")
+                    .then_some(("AGE319_PRIVATE_RECEIPT_HELPER_PROBE_V1", "1")),
+            )
+            .envs(
                 (mode == "held_release_exec_driver")
                     .then_some(("AGE319_PRIVATE_EXEC_DRIVER_ROUTE_V30", "1")),
             )
@@ -1404,7 +1412,10 @@ fn inner() {
                 let pid1: serde_json::Value = serde_json::from_str(&pid1_json).unwrap();
                 let pid1 = pid1["pid"].as_i64().unwrap() as i32;
                 assert!(pid1 > 0);
-                if mode == "native_pid1_loss" {
+                if matches!(
+                    mode.as_str(),
+                    "native_pid1_loss" | "native_receipt_pid1_loss"
+                ) {
                     assert_eq!(unsafe { libc::kill(pid1, libc::SIGKILL) }, 0);
                     fs::write(gate.join("native-pid1-loss"), b"yes").unwrap();
                 }
@@ -1413,8 +1424,30 @@ fn inner() {
                     gate.join("native-t-sent").exists() || entry.try_wait().unwrap().is_some()
                 });
                 assert!(gate.join("native-t-sent").exists());
-                if mode == "native_cancel" {
+                let mut provider_descendant = None;
+                if native_live {
                     eventually(|| gate.join("native-effect").exists());
+                    if mode.starts_with("native_receipt_") {
+                        assert_eq!(
+                            fs::read(gate.join("native-effect").with_extension("helper-entry"))
+                                .unwrap(),
+                            b"receipt-helper nnp=0 seccomp=0"
+                        );
+                    }
+                    let provider = fs::read_to_string(gate.join("native-effect")).unwrap();
+                    assert!(
+                        provider.starts_with(
+                            "nnp=0 seccomp=0 setsid=ok unshare=ok adopted=1 host_pid="
+                        ),
+                        "{provider}"
+                    );
+                    let pid: i32 = provider.trim().rsplit_once('=').unwrap().1.parse().unwrap();
+                    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
+                    assert!(
+                        fd >= 0,
+                        "provider descendant disappeared before cancellation"
+                    );
+                    provider_descendant = Some(unsafe { File::from_raw_fd(fd) });
                     assert_eq!(
                         fs::read_to_string(gate.join("native-effect"))
                             .unwrap()
@@ -1450,7 +1483,7 @@ fn inner() {
                     fs::read_to_string(&restart_log).unwrap()
                 );
                 fs::write(gate.join("native-restarted"), b"yes").unwrap();
-                if mode == "native_cancel" {
+                if native_live {
                     eventually(|| {
                         gate.join("native-q-pending").exists()
                             || entry.try_wait().unwrap().is_some()
@@ -1478,6 +1511,10 @@ fn inner() {
                             .unwrap(),
                         0
                     );
+                    if matches!(mode.as_str(), "native_drain" | "native_receipt_drain") {
+                        fs::write(gate.join("native-drain"), b"yes").unwrap();
+                        fs::write(gate.join("native-effect.release"), b"yes").unwrap();
+                    }
                     fs::write(gate.join("native-cancel"), b"yes").unwrap();
                 }
                 eventually(|| {
@@ -1515,8 +1552,15 @@ fn inner() {
                 assert_eq!(sibling["state"], "prepared");
                 assert!(!gate.join("native-sibling-effect").exists());
                 assert_eq!(fs::read_dir(broker_state.join("works")).unwrap().count(), 1);
-                if mode == "native_cancel" {
+                if native_live {
                     assert!(q.starts_with("native-q-settled "), "{q}");
+                    let mut exit = libc::pollfd {
+                        fd: provider_descendant.as_ref().unwrap().as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    assert_eq!(unsafe { libc::poll(&mut exit, 1, 0) }, 1);
+                    assert_ne!(exit.revents & libc::POLLIN, 0, "Q preceded descendant exit");
                     assert_eq!(settled, 1);
                     assert_eq!(
                         fs::read_to_string(gate.join("native-effect"))
@@ -1533,7 +1577,13 @@ fn inner() {
                     .unwrap();
                     let physical: serde_json::Value = serde_json::from_slice(&terminal).unwrap();
                     assert_eq!(physical["physical_tree_drained"], true);
-                    assert_eq!(physical["cancellation_observed"], true);
+                    assert_eq!(
+                        physical["cancellation_observed"],
+                        matches!(mode.as_str(), "native_cancel" | "native_receipt_cancel")
+                    );
+                    if matches!(mode.as_str(), "native_drain" | "native_receipt_drain") {
+                        assert_eq!(physical["worker_wait_status"], 0);
+                    }
                     assert!(
                         physical["output"]
                             .as_array()
@@ -2196,7 +2246,11 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "held_release_child_predeath",
         "held_release_gate_fail",
         "native_cancel",
+        "native_drain",
+        "native_receipt_cancel",
+        "native_receipt_drain",
         "native_pid1_loss",
+        "native_receipt_pid1_loss",
         "normal_release",
         "normal_guardian_death",
         "normal_driver_death",
