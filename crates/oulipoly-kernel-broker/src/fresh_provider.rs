@@ -106,6 +106,7 @@ struct Recipe {
 pub(super) struct Plan {
     image: File,
     image_identity: ImageIdentity,
+    script: bool,
     cwd: File,
     input: File,
     recipe: File,
@@ -152,6 +153,55 @@ struct ImageIdentity {
     ctime_nsec: i64,
     mtime: i64,
     mtime_nsec: i64,
+    immutable: bool,
+    xattrs_sha256: String,
+}
+
+fn image_xattrs_sha256(file: &File) -> io::Result<String> {
+    let fd = file.as_raw_fd();
+    let names_len = unsafe { libc::flistxattr(fd, std::ptr::null_mut(), 0) };
+    if names_len < 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EOPNOTSUPP) {
+            return Ok(format!("{:x}", Sha256::digest(b"xattrs-unsupported")));
+        }
+        return Err(error);
+    }
+    let mut names = vec![0u8; names_len as usize];
+    let listed = unsafe { libc::flistxattr(fd, names.as_mut_ptr().cast(), names.len()) };
+    if listed < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if listed != names_len || names.last().is_some_and(|last| *last != 0) {
+        return Err(io::Error::other(
+            "fresh provider image xattrs changed while listing",
+        ));
+    }
+    let mut entries = Vec::new();
+    for name in names
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+    {
+        let name = CString::new(name)?;
+        let value_len = unsafe { libc::fgetxattr(fd, name.as_ptr(), std::ptr::null_mut(), 0) };
+        if value_len < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut value = vec![0u8; value_len as usize];
+        let read =
+            unsafe { libc::fgetxattr(fd, name.as_ptr(), value.as_mut_ptr().cast(), value.len()) };
+        if read != value_len {
+            return Err(io::Error::other(
+                "fresh provider image xattr changed while reading",
+            ));
+        }
+        entries.push((name.into_bytes(), value));
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&entries)?)
+    ))
 }
 
 impl ImageIdentity {
@@ -168,6 +218,30 @@ impl ImageIdentity {
             .ok_or_else(|| io::Error::other("fresh provider image mount ID unavailable"))?
             .parse()
             .map_err(|_| io::Error::other("fresh provider image mount ID invalid"))?;
+        // FS_IMMUTABLE_FL is an inode property, including across writable
+        // aliases of a read-only bind mount. A read-only mount alone does not
+        // establish that another alias cannot modify the same inode.
+        let mut flags: libc::c_int = 0;
+        let immutable = unsafe { libc::ioctl(file.as_raw_fd(), libc::FS_IOC_GETFLAGS, &mut flags) }
+            == 0
+            && flags & 0x10 != 0; // FS_IMMUTABLE_FL, linux/fs.h
+        let xattrs_sha256 = image_xattrs_sha256(file)?;
+        let after = file.metadata()?;
+        if meta.dev() != after.dev()
+            || meta.ino() != after.ino()
+            || meta.len() != after.len()
+            || meta.uid() != after.uid()
+            || meta.gid() != after.gid()
+            || meta.mode() != after.mode()
+            || meta.ctime() != after.ctime()
+            || meta.ctime_nsec() != after.ctime_nsec()
+            || meta.mtime() != after.mtime()
+            || meta.mtime_nsec() != after.mtime_nsec()
+        {
+            return Err(io::Error::other(
+                "fresh provider image metadata changed while inspecting",
+            ));
+        }
         Ok(Self {
             device: meta.dev(),
             inode: meta.ino(),
@@ -181,19 +255,28 @@ impl ImageIdentity {
             ctime_nsec: meta.ctime_nsec(),
             mtime: meta.mtime(),
             mtime_nsec: meta.mtime_nsec(),
+            immutable,
+            xattrs_sha256,
         })
     }
 
     fn require_stable_host_image(&self) -> io::Result<()> {
-        if self.mode & libc::S_IFMT != libc::S_IFREG
-            || self.mode & 0o111 == 0
-            || self.uid != 0
-            || self.mode & 0o022 != 0
-        {
+        if self.mode & libc::S_IFMT != libc::S_IFREG || self.mode & 0o111 == 0 {
             return Err(io::Error::other(
-                "fresh provider original-inode execution unavailable: image must be root-owned and not group/other writable",
+                "fresh provider original-inode execution unavailable: image is not an executable regular file",
             ));
         }
+        if self.immutable {
+            return Ok(());
+        }
+        if self.uid != 0 || self.mode & 0o022 != 0 {
+            return Err(io::Error::other(
+                "fresh provider original-inode execution unavailable: mutable image needs a race-safe executable snapshot",
+            ));
+        }
+        // This pre-existing private-fixture branch relies on cooperative host
+        // root. A normal in-place package write can still race the last
+        // userspace recheck and exec. It is not general production admission.
         // A userspace or remote filesystem can report root ownership while
         // allowing an ordinary server process to replace inode contents.
         // These local kernel filesystems enforce the inode's write policy.
@@ -207,6 +290,20 @@ impl ImageIdentity {
         }
         Ok(())
     }
+}
+
+fn image_kind(image: &File) -> io::Result<bool> {
+    let mut magic = [0u8; 4];
+    let n = image.read_at(&mut magic, 0)?;
+    if n >= 4 && magic == *b"\x7fELF" {
+        return Ok(false);
+    }
+    if n >= 2 && magic[..2] == *b"#!" {
+        return Ok(true);
+    }
+    Err(io::Error::other(
+        "fresh provider original-inode execution unavailable: unsupported executable format",
+    ))
 }
 
 fn sha_file(file: &File) -> io::Result<(String, u64)> {
@@ -274,7 +371,7 @@ fn sealed_copy(source: &File, name: &'static std::ffi::CStr) -> io::Result<File>
     Ok(target)
 }
 
-/// One deterministic ELF executable, absolute path, exact argv/env, directory
+/// One deterministic ELF or shebang executable, absolute path, exact argv/env, directory
 /// descriptor and sealed stdin. Unsupported shapes are rejected before spend.
 #[cfg(test)]
 pub(super) fn plan(
@@ -307,12 +404,7 @@ pub(super) fn plan(
         .open(image_path)?;
     let image_identity = ImageIdentity::of(&image)?;
     image_identity.require_stable_host_image()?;
-    let mut magic = [0u8; 4];
-    if image.read_at(&mut magic, 0)? != 4 || magic != *b"\x7fELF" {
-        return Err(io::Error::other(
-            "fresh provider original-inode execution unavailable: script/interpreter launch not yet supported",
-        ));
-    }
+    let script = image_kind(&image)?;
     let cwd = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
@@ -357,6 +449,7 @@ pub(super) fn plan(
     Ok(Plan {
         image,
         image_identity,
+        script,
         cwd,
         input,
         recipe,
@@ -370,7 +463,7 @@ pub(super) fn plan(
 /// The eventual runtime bridge can pass variable recipe and prompt bytes by
 /// descriptor. The private socket uses this form so its control frame remains
 /// fixed size. The broker resolves the absolute image path and executes its
-/// original mount/inode under K. Mutable or non-root-owned images fail closed.
+/// original mount/inode under K. Mutable non-root-owned images fail closed.
 pub(super) fn plan_from_descriptors(
     configured_image: &Path,
     image: File,
@@ -391,7 +484,6 @@ pub(super) fn plan_from_descriptors(
     let configured_identity = ImageIdentity::of(&configured)?;
     image_identity.require_stable_host_image()?;
     let cwd_meta = cwd.metadata()?;
-    let mut magic = [0u8; 4];
     if !cwd_meta.is_dir() {
         return Err(io::Error::other("fresh provider cwd is not a directory"));
     }
@@ -400,11 +492,7 @@ pub(super) fn plan_from_descriptors(
             "fresh provider original-inode execution unavailable: caller image and broker path differ in inode, mount, or metadata",
         ));
     }
-    if image.read_at(&mut magic, 0)? != 4 || magic != *b"\x7fELF" {
-        return Err(io::Error::other(
-            "fresh provider original-inode execution unavailable: script/interpreter launch not yet supported",
-        ));
-    }
+    let script = image_kind(&image)?;
     let mut reader = recipe.try_clone()?;
     reader.seek(SeekFrom::Start(0))?;
     let parsed: Recipe = serde_json::from_reader(reader)?;
@@ -458,6 +546,7 @@ pub(super) fn plan_from_descriptors(
     Ok(Plan {
         image: configured,
         image_identity: configured_identity,
+        script,
         cwd,
         input,
         recipe,
@@ -732,6 +821,7 @@ fn run_init(mut init: Init) -> io::Result<()> {
     let gid = init.gid;
     let groups = init.groups;
     let image_fd = init.plan.image.as_raw_fd();
+    let script = init.plan.script;
     let fixture = super::private_fixture();
     unsafe {
         command.pre_exec(move || {
@@ -755,10 +845,17 @@ fn run_init(mut init: Init) -> io::Result<()> {
             if libc::read(gate_fd, (&mut byte as *mut u8).cast(), 1) != 1 || byte != b'R' {
                 return Err(io::Error::other("fresh provider pre-exec gate refused"));
             }
-            // The kernel executes the original pinned file and its mount,
-            // including its set-ID bits, security.capability and LSM label.
-            // Script interpreters need different fd lifetime handling and
-            // are refused by the ELF-only planner above.
+            // The interpreter opens /dev/fd/N for a shebang image. Keep that
+            // exact descriptor across exec; ELF images retain CLOEXEC.
+            if script {
+                let flags = libc::fcntl(image_fd, libc::F_GETFD);
+                if flags < 0 || libc::fcntl(image_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            // The kernel executes the original inode and mount, including
+            // the host's set-ID, file-capability and LSM decisions.
             let _keep_strings_alive = (&argv, &env);
             libc::syscall(
                 libc::SYS_execveat,
@@ -1284,7 +1381,7 @@ mod tests {
             let Some(image) = std::env::var_os("OULIPOLY_AGE319_PROVIDER_IMAGE") else {
                 return;
             };
-            for mode in ["normal", "setid"] {
+            for mode in ["normal", "setid", "script"] {
                 let output = Command::new("unshare")
                     .args(["-Urpfm", "--mount-proc"])
                     .arg(std::env::current_exe().unwrap())
@@ -1318,8 +1415,17 @@ mod tests {
         let source =
             Path::new(&std::env::var("OULIPOLY_AGE319_PROVIDER_IMAGE").unwrap()).to_owned();
         let image = temporary.path().join("pinned-provider");
-        std::fs::copy(source, &image).unwrap();
-        let setid = std::env::var("AGE319_FRESH_PROVIDER_IMAGE_MODE").unwrap() == "setid";
+        let mode = std::env::var("AGE319_FRESH_PROVIDER_IMAGE_MODE").unwrap();
+        let setid = mode == "setid";
+        if mode == "script" {
+            std::fs::write(
+                &image,
+                format!("#!/bin/sh\nexec '{}' \"$@\"\n", source.display()),
+            )
+            .unwrap();
+        } else {
+            std::fs::copy(&source, &image).unwrap();
+        }
         std::fs::set_permissions(
             &image,
             std::fs::Permissions::from_mode(if setid { 0o6755 } else { 0o755 }),
@@ -1549,6 +1655,44 @@ mod tests {
                 .is_err(),
             "replaced path accepted the old pinned inode"
         );
+        let bind_image = temporary.path().join("bind-image");
+        std::fs::write(&bind_image, b"placeholder").unwrap();
+        let bind_source = CString::new(image.as_os_str().as_encoded_bytes()).unwrap();
+        let bind_target = CString::new(bind_image.as_os_str().as_encoded_bytes()).unwrap();
+        if unsafe {
+            libc::mount(
+                bind_source.as_ptr(),
+                bind_target.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND,
+                std::ptr::null(),
+            )
+        } == 0
+        {
+            let caller = prepare_plan(fixture_args());
+            assert_ne!(
+                ImageIdentity::of(&caller.image).unwrap().mount_id,
+                ImageIdentity::of(&File::open(&bind_image).unwrap())
+                    .unwrap()
+                    .mount_id
+            );
+            assert!(
+                plan_from_descriptors(
+                    &bind_image,
+                    caller.image,
+                    caller.cwd,
+                    caller.input,
+                    caller.recipe,
+                )
+                .is_err(),
+                "different bind mount accepted the caller descriptor"
+            );
+        } else {
+            eprintln!(
+                "SKIP wrong-mount bind fixture: {}",
+                io::Error::last_os_error()
+            );
+        }
         std::fs::set_permissions(&image, std::fs::Permissions::from_mode(0o775)).unwrap();
         let gap = plan(
             &image,
@@ -1566,16 +1710,15 @@ mod tests {
         let script = temporary.path().join("provider-script");
         std::fs::write(&script, b"#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let script_gap = plan(
+        let script_plan = plan(
             &script,
             temporary.path(),
             &File::open(&stdin_path).unwrap(),
             fixture_args(),
             vec![],
         )
-        .err()
-        .expect("script was silently executed as an ELF");
-        assert!(script_gap.to_string().contains("script/interpreter launch"));
+        .expect("pinned shebang image was refused before K");
+        assert!(script_plan.script);
         std::fs::set_permissions(&image, std::fs::Permissions::from_mode(0o755)).unwrap();
         let race_binding = fixture_binding(&root, &actor);
         let race_prepared =
@@ -1593,6 +1736,70 @@ mod tests {
                 .exists(),
             "raced original inode spent K"
         );
+        let in_place_image = temporary.path().join("in-place-provider");
+        std::fs::copy(&source, &in_place_image).unwrap();
+        std::fs::set_permissions(&in_place_image, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let in_place = plan(
+            &in_place_image,
+            temporary.path(),
+            &File::open(&stdin_path).unwrap(),
+            fixture_args(),
+            vec![],
+        )
+        .unwrap();
+        let in_place_prepared =
+            prepare(temporary.path(), fixture_binding(&root, &actor), in_place).unwrap();
+        let in_place_grant = in_place_prepared.grant.id.clone();
+        OpenOptions::new()
+            .write(true)
+            .open(&in_place_image)
+            .unwrap()
+            .write_at(b"X", 0)
+            .unwrap();
+        assert!(
+            in_place_prepared.plan.verify().is_err(),
+            "in-place update passed challenge"
+        );
+        assert!(launch(in_place_prepared, &root, &actor, 0, 0).is_err());
+        assert!(
+            !temporary
+                .path()
+                .join(format!("{in_place_grant}.consumed.json"))
+                .exists(),
+            "in-place update spent K"
+        );
+        let xattr_image = temporary.path().join("xattr-provider");
+        std::fs::copy(&source, &xattr_image).unwrap();
+        std::fs::set_permissions(&xattr_image, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let xattr_plan = plan(
+            &xattr_image,
+            temporary.path(),
+            &File::open(&stdin_path).unwrap(),
+            fixture_args(),
+            vec![],
+        )
+        .unwrap();
+        let value = b"changed";
+        let result = unsafe {
+            libc::fsetxattr(
+                xattr_plan.image.as_raw_fd(),
+                c"user.age319".as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+            )
+        };
+        if result == 0 {
+            assert!(
+                xattr_plan.verify().is_err(),
+                "xattr change passed challenge"
+            );
+        } else {
+            eprintln!(
+                "SKIP xattr mutation fixture: {}",
+                io::Error::last_os_error()
+            );
+        }
         let stdout_path = temporary.path().join(format!("{id}.stdout"));
         let hidden = temporary.path().join("missing-output");
         std::fs::rename(&stdout_path, &hidden).unwrap();
@@ -1603,5 +1810,30 @@ mod tests {
         std::fs::rename(hidden, stdout_path).unwrap();
         actor_child.kill().unwrap();
         actor_child.wait().unwrap();
+    }
+
+    #[test]
+    fn user_owned_mutable_executable_refuses_before_k() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("SKIP user-owned mutable image fixture under host root");
+            return;
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let image = temporary.path().join("user-image");
+        std::fs::copy(std::env::current_exe().unwrap(), &image).unwrap();
+        std::fs::set_permissions(&image, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(image.metadata().unwrap().uid(), unsafe { libc::geteuid() });
+        let input_path = temporary.path().join("input");
+        std::fs::write(&input_path, b"").unwrap();
+        let gap = plan(
+            &image,
+            temporary.path(),
+            &File::open(input_path).unwrap(),
+            vec![],
+            vec![],
+        )
+        .err()
+        .expect("mutable user-owned image crossed the pre-K boundary");
+        assert!(gap.to_string().contains("race-safe executable snapshot"));
     }
 }
