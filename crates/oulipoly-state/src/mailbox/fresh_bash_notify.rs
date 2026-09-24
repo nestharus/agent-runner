@@ -68,9 +68,9 @@ impl FreshV30Lane {
         Ok(event)
     }
 
-    /// Called only for a broker-challenged, pinned original root actor. The
-    /// private C registration is response-only unless this explicit request is
-    /// committed. The State request and attachment are one durable fence;
+    /// Called for the pinned original root actor, either by its explicit
+    /// request or by settlement of an original C `notify` listener policy.
+    /// The State request and attachment are one durable fence;
     /// missing sidecar materialization is repair debt, never an implicit ACK.
     pub fn request_private_bash_notification(
         &mut self,

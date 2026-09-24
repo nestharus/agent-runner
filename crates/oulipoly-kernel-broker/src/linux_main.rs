@@ -38,9 +38,9 @@ use oulipoly_kernel_broker::source_acceptance::capture_and_stage_v2_evidence;
 use oulipoly_kernel_broker::source_physical::{SourceObservation, SourcePhysicalRegistry};
 use oulipoly_kernel_broker::work_registry::{Scope, WorkRegistry, classify_scope};
 use oulipoly_state::mailbox::{
-    BrokerReleaseEvidence, BrokerSidecar, BrokerSourceEffectGrant, FreshDeliverySubmission,
-    FreshRecipientIdentity, FreshReleasedHandoff, FreshV30Lane, FreshV30LaneIdentity,
-    PreparedBrokerOwner, PreparedProcessStamp,
+    BrokerReleaseEvidence, BrokerSidecar, BrokerSourceEffectGrant, FreshBashListenerPolicy,
+    FreshDeliverySubmission, FreshRecipientIdentity, FreshReleasedHandoff, FreshV30Lane,
+    FreshV30LaneIdentity, PreparedBrokerOwner, PreparedProcessStamp,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
@@ -171,6 +171,7 @@ enum RequestPayload {
     )]
     FreshBashChildRequest {
         request_id: String,
+        listener_policy: Option<FreshBashListenerPolicy>,
     },
     #[allow(
         dead_code,
@@ -361,7 +362,8 @@ fn recv_request(
     let valid_length = match request[0] {
         b'G' | b'g' => read == 65,
         b'P' | b'p' => read == 37,
-        b'Q' | b'Z' | b'q' | b'z' | b'D' | b'd' | b'C' | b'c' | b'E' => read == 33,
+        b'Q' | b'Z' | b'q' | b'z' | b'D' | b'd' | b'c' | b'E' => read == 33,
+        b'C' => read == 33 || read == 34,
         #[cfg(feature = "age319-private-broker-fixture")]
         b'8' | b'9' | b'!' | b'%' => read == 33,
         #[cfg(feature = "age319-private-broker-fixture")]
@@ -433,13 +435,24 @@ fn recv_request(
         },
         b'C' | b'c' => RequestPayload::FreshBashChildRequest {
             request_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
+            listener_policy: if request[0] == b'C' {
+                Some(match request.get(33).copied().unwrap_or(0) {
+                    0 => FreshBashListenerPolicy::ResponseOnly,
+                    1 => FreshBashListenerPolicy::Notify,
+                    _ => return Err(io::Error::other("fresh Bash C listener policy invalid")),
+                })
+            } else {
+                None
+            },
         },
         b'E' => RequestPayload::FreshBashChildRequest {
             request_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
+            listener_policy: None,
         },
         #[cfg(feature = "age319-private-broker-fixture")]
         b'8' | b'9' | b'!' | b'%' => RequestPayload::FreshBashChildRequest {
             request_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
+            listener_policy: None,
         },
         b'O' => RequestPayload::FreshBashPrivateResult {
             result: serde_json::from_slice(&request[17..read as usize])?,
@@ -3809,6 +3822,9 @@ fn serve_fresh_v30_at(
         if let Err(error) = lane.repair_captured_private_bash_sources() {
             eprintln!("fresh Bash source repair remains unknown: {error}");
         }
+        if let Err(error) = lane.repair_private_bash_listener_notifications() {
+            eprintln!("fresh Bash listener repair remains pending: {error}");
+        }
         if let Err(error) = lane.repair_private_bash_notifications() {
             eprintln!("fresh Bash notification repair remains pending: {error}");
         }
@@ -3976,10 +3992,13 @@ fn serve_fresh_v30_at(
                     if matches!(operation, b'E' | b'8') && instance.is_closed() {
                         return Err(io::Error::other("fresh Bash private work gate closed"));
                     }
-                    let request_id = match &payload {
-                        RequestPayload::FreshBashChildRequest { request_id } => request_id.clone(),
+                    let (request_id, listener_policy) = match &payload {
+                        RequestPayload::FreshBashChildRequest {
+                            request_id,
+                            listener_policy,
+                        } => (request_id.clone(), *listener_policy),
                         RequestPayload::FreshBashPrivateResult { result } => {
-                            result.request_id.clone()
+                            (result.request_id.clone(), None)
                         }
                         _ => return Err(io::Error::other("Bash child request absent")),
                     };
@@ -3993,6 +4012,8 @@ fn serve_fresh_v30_at(
                             &recipient,
                             parent_work.grant_id(),
                             parent_work.work_id(),
+                            listener_policy
+                                .ok_or_else(|| io::Error::other("fresh Bash C policy absent"))?,
                         )
                         .map_err(io::Error::other)?
                     } else {
@@ -4017,6 +4038,18 @@ fn serve_fresh_v30_at(
                     if matches!(operation, b'C' | b'c') {
                         lane.register_private_bash_source(&child)
                             .map_err(io::Error::other)?;
+                        if operation == b'C' {
+                            lane.register_private_bash_listener(
+                                &child,
+                                listener_policy.ok_or_else(|| {
+                                    io::Error::other("fresh Bash C policy absent")
+                                })?,
+                            )
+                            .map_err(io::Error::other)?;
+                        } else {
+                            lane.require_private_bash_listener(&child, None)
+                                .map_err(io::Error::other)?;
+                        }
                     }
                     match operation {
                         b'C' | b'c' => Ok(format!(
@@ -4096,6 +4129,14 @@ fn serve_fresh_v30_at(
                                             .display()
                                     ))
                                 })?;
+                                if let Err(error) = lane.settle_private_bash_listener(&request_id) {
+                                    // W is already accepted. The retained C
+                                    // policy and W are repair debt for F; do
+                                    // not imply that F reached a recipient.
+                                    eprintln!(
+                                        "source W accepted; listener settlement pending for C {request_id}: {error}"
+                                    );
+                                }
                                 return Ok(format!(
                                     "fresh-bash-source-accepted {}\n",
                                     serde_json::to_string(&event)?

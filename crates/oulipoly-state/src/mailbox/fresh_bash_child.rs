@@ -16,8 +16,13 @@ pub struct FreshBashChild {
     pub parent_work_id: String,
     pub actor: FreshRecipientIdentity,
     pub registration_authority: String,
+    #[serde(default = "default_bash_listener_policy", skip_serializing_if = "is_response_only_bash_listener")]
+    pub listener_policy: String,
     pub session: FreshV30Session,
 }
+
+fn default_bash_listener_policy() -> String { "response_only".into() }
+fn is_response_only_bash_listener(value: &String) -> bool { value == "response_only" }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -144,6 +149,7 @@ impl FreshV30Lane {
         actor: &FreshRecipientIdentity,
         parent_work_grant_id: &str,
         parent_work_id: &str,
+        listener_policy: FreshBashListenerPolicy,
     ) -> Result<FreshBashChild, String> {
         validate_request_id(request_id)?;
         validate_request_id(parent_work_grant_id)?;
@@ -169,6 +175,7 @@ impl FreshV30Lane {
             actor: actor.clone(),
             registration_authority: crate::CompletionRegistrationAuthority::generate()?
                 .process_environment_value().into(),
+            listener_policy: listener_policy.as_str().into(),
             // Stored separately by D. This field is filled only after exact
             // State and sidecar readback, never inserted from caller JSON.
             session: FreshV30Session {
@@ -200,6 +207,7 @@ impl FreshV30Lane {
             || stored.actor != *actor
             || stored.parent_work_grant_id != parent_work_grant_id
             || stored.parent_work_id != parent_work_id
+            || stored.listener_policy != listener_policy.as_str()
         {
             return Err("Bash child actor or parent conflict".into());
         }
@@ -306,6 +314,7 @@ impl FreshV30Lane {
             || child.session.session_id == root_session.session_id
             || child.session.request_id != child.d_key
             || !child.handle.starts_with("ab30_")
+            || !matches!(child.listener_policy.as_str(), "response_only" | "notify")
         {
             return Err("Bash child actor/root/session conflict".into());
         }

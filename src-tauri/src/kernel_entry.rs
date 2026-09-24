@@ -726,6 +726,8 @@ fn private_fresh_provider(
         ];
         if std::env::var_os("AGE319_PRIVATE_BASH_SOURCE_SUCCESS_V1").is_some() {
             argv.push("no-cancel".into());
+        } else if std::env::var_os("AGE319_PRIVATE_BASH_ORIGINAL_NOTIFY_V1").is_some() {
+            argv.push("notify".into());
         }
         argv
     } else {
@@ -882,16 +884,6 @@ fn private_bash_recipient_probe(
         return Err("invalid private Bash recipient mode".into());
     }
     let request_id = std::env::var("AGE319_PRIVATE_BASH_REQUEST_KEY").map_err(|e| e.to_string())?;
-    let activated = protocol::fresh_recipient_request_at(
-        socket,
-        &FreshRecipientRequest::ActivateBashSource {
-            request_id: request_id.clone(),
-        },
-    )
-    .map_err(|e| format!("fresh listener activation unknown: {e}"))?;
-    let seq = activated["seq"]
-        .as_i64()
-        .ok_or("fresh listener row absent")?;
     let delivery_request_id = uuid::Uuid::new_v4().to_string();
     let request_path = std::path::Path::new(gate).join("bash-f-request-id");
     let mut request_file = std::fs::OpenOptions::new()
@@ -972,10 +964,8 @@ fn private_bash_recipient_probe(
         .map_err(|e| e.to_string())?
     };
     let grant = &delivered["grant"];
-    if grant["seq"] != seq
-        || grant["source_id"].as_str().is_none()
-        || grant["attempt_id"].as_str().is_none()
-    {
+    let seq = grant["seq"].as_i64().ok_or("fresh F row absent")?;
+    if grant["source_id"].as_str().is_none() || grant["attempt_id"].as_str().is_none() {
         return Err("fresh F exact source/row binding absent".into());
     }
     let bytes = base64::engine::general_purpose::STANDARD
@@ -1053,9 +1043,11 @@ fn private_bash_recipient_probe(
     }
     std::fs::write(
         std::path::Path::new(gate).join("bash-recipient-output"),
-        serde_json::to_vec(&serde_json::json!({"mode":mode,"activation":activated,
+        serde_json::to_vec(
+            &serde_json::json!({"mode":mode,"listener_policy":"notify_at_admission",
             "delivery_request_id":delivery_request_id,"grant":grant,"readback":read,
-            "observed_payload_sha256":format!("{:x}",sha2::Sha256::digest(&bytes))}))
+            "observed_payload_sha256":format!("{:x}",sha2::Sha256::digest(&bytes))}),
+        )
         .map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
