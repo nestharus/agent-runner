@@ -140,7 +140,11 @@ fn run_v30_repair_boundary(
             // Reserve a unique broker-owned debt for the exact State-selected
             // registration/listener and running driver. A grant remains inert
             // until an actual recovery child can be held and consumed by the
-            // root broker. The production effect/accept gates stay closed.
+            // root broker. The guardian currently exits after the joined
+            // original child reports D; a recovery PID1 can outlive that
+            // guardian and driver. Post-effect observation therefore needs a
+            // broker-owned durable witness that remains usable after this
+            // live-driver read route closes. The effect/accept gates stay closed.
             let grant = match route.read_source_grant(owner)? {
                 Some(existing) => existing,
                 None => route.reserve_source_grant(owner, &selected)?,
