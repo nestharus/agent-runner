@@ -965,6 +965,26 @@ fn inner() {
             .spawn()
             .unwrap();
         eventually(|| protocol::request_at(&socket, Operation::Classify).is_ok());
+        if mode == "normal_recipient" {
+            let mail = recipient_mail.as_ref().unwrap();
+            let retained = rusqlite::Connection::open_with_flags(
+                broker_state.join("sidecar/pid-identity.db"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let (digest, delivered): (String, Option<String>) = retained
+                .query_row(
+                    "SELECT payload_sha256,delivered_at FROM mailbox WHERE seq=?1",
+                    [mail.seq],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(digest, mail.payload_sha256.as_deref().unwrap());
+            assert!(
+                delivered.is_none(),
+                "restart must retain pending old ACK debt"
+            );
+        }
         let second = Command::new(&runner)
             .arg("__age319-private-normal-v30")
             .env("OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1", "1")
