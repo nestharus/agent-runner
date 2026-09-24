@@ -700,7 +700,9 @@ fn reusable_quota_source(
             unresolved = Some((name, intent));
         }
     }
-    Ok(fresh.map(|(name, intent, _)| (name, intent)).or(unresolved))
+    // A matching effect without Q is still in progress (or uncertain).
+    // A fresh Q from a different effect cannot settle it for another root.
+    Ok(unresolved.or_else(|| fresh.map(|(name, intent, _)| (name, intent))))
 }
 
 /// Serialize the scan and durable auth intent across broker threads and
@@ -1146,9 +1148,18 @@ fn route_evidence(directory: &Path, candidate: &RouteCandidate) -> io::Result<(u
         {
             return Err(io::Error::other("fresh route history grant mismatch"));
         }
-        let consumed_path = directory.join(format!("{}.consumed.json", grant.id));
-        if exact_file::<Grant>(directory, &format!("{}.consumed.json", grant.id))?.is_none() {
+        let Some(consumed) =
+            exact_file::<Grant>(directory, &format!("{}.consumed.json", grant.id))?
+        else {
             continue;
+        };
+        if consumed != grant || grant.version != 1 {
+            return Err(io::Error::other(format!(
+                "fresh route history K changed: {}",
+                directory
+                    .join(format!("{}.consumed.json", grant.id))
+                    .display()
+            )));
         }
         invocations += 1;
         match observe(directory, &grant.id)? {
@@ -1158,18 +1169,30 @@ fn route_evidence(directory: &Path, candidate: &RouteCandidate) -> io::Result<(u
                     failures += 1;
                 }
             }
-            _ if file_age_less_than(&consumed_path, Duration::from_secs(60 * 60))? => live += 1,
-            _ => (),
+            Observation::Pending | Observation::ProviderExited(_) => live += 1,
+            Observation::Unknown => {
+                return Err(io::Error::other(format!(
+                    "fresh route history K has unknown physical drain: grant={}, K={}, Q={}",
+                    grant.id,
+                    directory
+                        .join(format!("{}.consumed.json", grant.id))
+                        .display(),
+                    directory.join(format!("{}.drain.json", grant.id)).display()
+                )));
+            }
         }
     }
     Ok((live, failures, invocations))
 }
 
 fn file_age_less_than(path: &Path, window: Duration) -> io::Result<bool> {
-    Ok(std::fs::metadata(path)?
-        .modified()?
-        .elapsed()
-        .is_ok_and(|age| age < window))
+    let completed = std::fs::metadata(path)?.modified()?;
+    let age = std::time::SystemTime::now()
+        .duration_since(completed)
+        .map_err(|_| {
+            io::Error::other(format!("future physical Q timestamp: {}", path.display()))
+        })?;
+    Ok(age < window)
 }
 
 fn recent_failure_admitted(failures: u64, has_unsuppressed: bool, pinned: bool) -> bool {
@@ -2166,6 +2189,12 @@ mod tests {
         )
         .unwrap();
         assert!(!file_age_less_than(&receipt, Duration::from_secs(30 * 60)).unwrap());
+        file.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::now() + Duration::from_secs(60)),
+        )
+        .unwrap();
+        assert!(file_age_less_than(&receipt, Duration::from_secs(30 * 60)).is_err());
         assert!(recent_failure_admitted(2, true, false));
         assert!(!recent_failure_admitted(3, true, false));
         assert!(recent_failure_admitted(3, false, false));
@@ -2279,6 +2308,122 @@ mod tests {
             root_pidns_dev: root.pidns_dev,
             root_pidns_ino: root.pidns_ino,
         }
+    }
+
+    #[test]
+    fn consumed_k_without_attach_remains_explicitly_unknown_on_readback() {
+        let temp = tempfile::tempdir().unwrap();
+        let process = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+        let previous = fixture_binding(&process, &process);
+        let grant = Grant {
+            version: 1,
+            id: uuid::Uuid::new_v4().to_string(),
+            binding: previous.clone(),
+            plan_sha256: "b".repeat(64),
+        };
+        let selection = FreshRouteSelection {
+            model: "model".into(),
+            config_sha256: "a".repeat(64),
+            account: "first".into(),
+            index: 0,
+            plan_sha256: grant.plan_sha256.clone(),
+            observed_live: 0,
+            observed_failures: 0,
+            observed_invocations: 0,
+            policy_version: "fresh-account-effects-v2".into(),
+            eligible_accounts: vec!["first".into()],
+            quota_remaining_basis_points: None,
+        };
+        durable_new(
+            temp.path(),
+            &decision_name(&previous.handoff_id),
+            &RouteDecision {
+                version: 1,
+                binding: previous.clone(),
+                total: 1,
+                pin: None,
+                selection,
+            },
+        )
+        .unwrap();
+        durable_new(
+            temp.path(),
+            &format!("{}.fresh-grant.json", previous.handoff_id),
+            &grant,
+        )
+        .unwrap();
+        let consumed = format!("{}.consumed.json", grant.id);
+        durable_new(temp.path(), &consumed, &grant).unwrap();
+        File::open(temp.path().join(&consumed))
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() - Duration::from_secs(61 * 60)),
+            )
+            .unwrap();
+        let candidate = RouteCandidate {
+            version: 1,
+            binding: previous.clone(),
+            model: "model".into(),
+            config_sha256: "a".repeat(64),
+            account: "first".into(),
+            index: 0,
+            total: 1,
+            pin: None,
+            plan_sha256: grant.plan_sha256.clone(),
+            quota_script: None,
+            auth_refresh_command: None,
+        };
+        for _ in 0..2 {
+            assert!(matches!(
+                observe(temp.path(), &grant.id).unwrap(),
+                Observation::Unknown
+            ));
+            let error = route_evidence(temp.path(), &candidate)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("unknown physical drain") && error.contains(&consumed));
+        }
+        let mut current = fixture_binding(&process, &process);
+        for pin in [None, Some("first".to_string())] {
+            current.handoff_id = uuid::Uuid::new_v4().to_string();
+            let mut current_candidate = candidate.clone();
+            current_candidate.binding = current.clone();
+            current_candidate.pin = pin.clone();
+            durable_new(
+                temp.path(),
+                &candidate_name(&current.handoff_id, 0),
+                &current_candidate,
+            )
+            .unwrap();
+            let request = FreshRouteRequest {
+                d_key: uuid::Uuid::new_v4().to_string(),
+                model: "model".into(),
+                config_sha256: "a".repeat(64),
+                account: None,
+                index: None,
+                total: 1,
+                pin,
+                quota_script: None,
+                auth_refresh_command: None,
+            };
+            assert!(
+                select_route(temp.path(), &current, &request)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unknown physical drain")
+            );
+            assert!(
+                !temp
+                    .path()
+                    .join(decision_name(&current.handoff_id))
+                    .exists()
+            );
+        }
+        assert!(
+            temp.path().join(consumed).exists(),
+            "unknown K was discarded"
+        );
     }
 
     #[test]
@@ -2518,6 +2663,41 @@ mod tests {
             loaded_route.account, "second",
             "genuine consumed K without Q must count as live"
         );
+        let consumed_path = temporary.path().join(format!("{id}.consumed.json"));
+        File::open(&consumed_path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() - Duration::from_secs(61 * 60)),
+            )
+            .unwrap();
+        let first_candidate: RouteCandidate =
+            exact_file(temporary.path(), &candidate_name(&binding.handoff_id, 0))
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            route_evidence(temporary.path(), &first_candidate).unwrap(),
+            (1, 0, 1)
+        );
+        let mut aged_binding = binding.clone();
+        aged_binding.handoff_id = uuid::Uuid::new_v4().to_string();
+        assert_eq!(route(&aged_binding, None).account, "second");
+        let mut aged_pin = binding.clone();
+        aged_pin.handoff_id = uuid::Uuid::new_v4().to_string();
+        assert_eq!(route(&aged_pin, Some("first")).account, "first");
+        assert!(matches!(
+            observe(temporary.path(), &id).unwrap(),
+            Observation::ProviderExited(_)
+        ));
+        assert!(
+            prepare(
+                temporary.path(),
+                binding.clone(),
+                prepare_plan(vec![marker.display().to_string()])
+            )
+            .is_err(),
+            "aged consumed K authorized a second provider effect"
+        );
         assert_eq!(
             route(&binding, None),
             first_route,
@@ -2588,15 +2768,27 @@ mod tests {
             "Q plus provider exit certified missing stdout"
         );
         std::fs::rename(hidden, stdout_path).unwrap();
-        let first_candidate: RouteCandidate =
-            exact_file(temporary.path(), &candidate_name(&binding.handoff_id, 0))
-                .unwrap()
-                .unwrap();
         assert_eq!(
             route_evidence(temporary.path(), &first_candidate).unwrap(),
             (0, 1, 1),
             "only physical Q may turn the nonzero exit into failure evidence"
         );
+        File::open(temporary.path().join(format!("{id}.drain.json")))
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() - Duration::from_secs(31 * 60)),
+            )
+            .unwrap();
+        assert_eq!(
+            route_evidence(temporary.path(), &first_candidate).unwrap(),
+            (0, 0, 1),
+            "old completed Q is neither live nor a recent failure"
+        );
+        assert!(matches!(
+            observe(temporary.path(), &id).unwrap(),
+            Observation::Drained { .. }
+        ));
         let mut third_binding = binding.clone();
         third_binding.handoff_id = uuid::Uuid::new_v4().to_string();
         assert_eq!(route(&third_binding, None).account, "second");
@@ -2791,6 +2983,68 @@ mod tests {
                 .unwrap()
                 .effect_id,
             reused.effect_id,
+        );
+        let mut pending_binding = binding.clone();
+        pending_binding.handoff_id = uuid::Uuid::new_v4().to_string();
+        let pending_dir = effect_directory(temporary.path(), &pending_binding, &first);
+        std::fs::create_dir(&pending_dir).unwrap();
+        let pending_intent = AccountEffectIntent {
+            version: 1,
+            id: uuid::Uuid::new_v4().to_string(),
+            binding: pending_binding.clone(),
+            request: redacted_effect_request(&first),
+            environment_sha256: environment_digest(&first).unwrap(),
+            plan_sha256: "pending-plan".into(),
+        };
+        durable_new(&pending_dir, "intent.json", &pending_intent).unwrap();
+        assert_eq!(
+            reusable_quota_source(temporary.path(), &sibling_binding, &first)
+                .unwrap()
+                .unwrap()
+                .1
+                .id,
+            pending_intent.id,
+            "a cached Q hid a matching unresolved quota effect"
+        );
+        let mut another_binding = binding.clone();
+        another_binding.handoff_id = uuid::Uuid::new_v4().to_string();
+        register_route_candidate(
+            temporary.path(),
+            &another_binding,
+            &request(0, "recovering", &shell_script, Some(&auth_script)),
+            plan(
+                &image,
+                temporary.path(),
+                &File::open(&input).unwrap(),
+                vec!["--recovering".into()],
+                vec![],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let blocked = begin_account_effect(
+            temporary.path(),
+            &another_binding,
+            &first,
+            &root,
+            &actor,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(blocked.state, "unknown");
+        assert!(
+            blocked
+                .artifact
+                .contains(&pending_dir.display().to_string())
+        );
+        assert!(
+            grant_for_binding(
+                &effect_directory(temporary.path(), &another_binding, &first),
+                &another_binding
+            )
+            .unwrap()
+            .is_none()
         );
         let negative = effect(1, "exhausted", FreshAccountEffectKind::QuotaFirst);
         begin_account_effect(temporary.path(), &binding, &negative, &root, &actor, 0, 0).unwrap();
