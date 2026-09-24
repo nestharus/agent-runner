@@ -87,6 +87,10 @@ fn inner() {
             | "normal_model_provider_quota"
             | "normal_model_provider_auth"
             | "normal_model_provider_auth_recovery"
+            | "normal_model_provider_auth_after_healthy"
+            | "normal_model_provider_auth_success"
+            | "normal_model_provider_auth_reply_loss"
+            | "normal_model_provider_auth_restart"
             | "normal_model_provider_quota_available"
             | "normal_model_provider_quota_reply_loss"
             | "normal_model_provider_quota_restart"
@@ -176,6 +180,16 @@ fn inner() {
             )
         } else if mode == "normal_model_provider_quota" {
             "quota_script = \"quota-must-not-run\"\n".into()
+        } else if mode == "normal_model_provider_auth_after_healthy" {
+            fs::write(
+                gate.join("quota.json"),
+                br#"{"used_percent":20,"resets_at":"2099-01-01T00:00:00Z"}"#,
+            )
+            .unwrap();
+            format!(
+                "quota_script = 'cat {0}/quota.json'\nauth_refresh_command = 'printf x >> {0}/auth-ok'\n",
+                gate.display()
+            )
         } else if mode == "normal_model_provider_auth_recovery" {
             fs::write(
                 gate.join("quota.json"),
@@ -191,13 +205,33 @@ fn inner() {
         } else if mode == "normal_model_provider_auth" {
             "quota_script = \"quota-must-not-run\"\nauth_refresh_command = \"auth-must-not-run\"\n"
                 .into()
+        } else if matches!(
+            mode.as_str(),
+            "normal_model_provider_auth_success"
+                | "normal_model_provider_auth_reply_loss"
+                | "normal_model_provider_auth_restart"
+        ) {
+            fs::write(
+                gate.join("quota.json"),
+                br#"{"used_percent":20,"resets_at":"2099-01-01T00:00:00Z"}"#,
+            )
+            .unwrap();
+            format!(
+                "quota_script = 'if test -e {0}/auth-ok; then cat {0}/quota.json; else exit 7; fi'\nauth_refresh_command = 'printf x >> {0}/auth-ok'\n",
+                gate.display()
+            )
         } else {
             String::new()
+        };
+        let local_args = if mode == "normal_model_provider_auth_after_healthy" {
+            format!("{marker}, \"--auth\"")
+        } else {
+            marker.clone()
         };
         fs::write(
             config_dir.join("providers.toml"),
             format!(
-                "[unused]\ncommand = {provider_command}\nargs = [{unused_marker}]\n{provider_environment}[{provider_name}]\ncommand = {provider_command}\nargs = [{marker}]\n{provider_environment}{prompt_mode}{quota}"
+                "[unused]\ncommand = {provider_command}\nargs = [{unused_marker}]\n{provider_environment}[{provider_name}]\ncommand = {provider_command}\nargs = [{local_args}]\n{provider_environment}{prompt_mode}{quota}"
             ),
         )
         .unwrap();
@@ -405,7 +439,11 @@ fn inner() {
             "1",
         )))
         .envs(
-            (mode == "normal_model_provider_quota_reply_loss").then_some((
+            matches!(
+                mode.as_str(),
+                "normal_model_provider_quota_reply_loss" | "normal_model_provider_auth_reply_loss"
+            )
+            .then_some((
                 "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_ACCOUNT_EFFECT_REPLY_V1",
                 "1",
             )),
@@ -1114,6 +1152,10 @@ fn inner() {
                     | "normal_model_provider_quota"
                     | "normal_model_provider_auth"
                     | "normal_model_provider_auth_recovery"
+                    | "normal_model_provider_auth_after_healthy"
+                    | "normal_model_provider_auth_success"
+                    | "normal_model_provider_auth_reply_loss"
+                    | "normal_model_provider_auth_restart"
                     | "normal_model_provider_quota_available"
                     | "normal_model_provider_quota_reply_loss"
                     | "normal_model_provider_quota_restart"
@@ -1503,6 +1545,99 @@ fn inner() {
                     stop(&mut broker);
                     return;
                 }
+                if mode == "normal_model_provider_auth_after_healthy" {
+                    let provider_dir = broker_state.join("v30/fresh-provider");
+                    eventually(|| {
+                        gate.join("provider-effect").exists() || entry.try_wait().unwrap().is_some()
+                    });
+                    assert!(
+                        gate.join("provider-effect").exists(),
+                        "runner: {}; broker: {}",
+                        fs::read_to_string(&err).unwrap(),
+                        fs::read_to_string(temp.path().join("handoff-restart.log")).unwrap()
+                    );
+                    let route: serde_json::Value = serde_json::from_slice(
+                        &fs::read(
+                            provider_dir
+                                .join(format!("{}.route-selection.json", receipt.handoff_id)),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(route["selection"]["account"], "local");
+                    let grant: serde_json::Value = serde_json::from_slice(
+                        &fs::read(
+                            provider_dir.join(format!("{}.fresh-grant.json", receipt.handoff_id)),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    let grant_id = grant["id"].as_str().unwrap();
+                    eventually(|| provider_dir.join(format!("{grant_id}.exit.json")).exists());
+                    fs::write(gate.join("provider-cancel"), b"yes").unwrap();
+                    eventually(|| entry.try_wait().unwrap().is_some());
+                    assert!(!entry.wait().unwrap().success());
+                    assert!(
+                        provider_dir
+                            .join(format!("{grant_id}.terminal.json"))
+                            .exists(),
+                        "runner stderr: {}; witness: {:?}",
+                        fs::read_to_string(&err).unwrap(),
+                        fs::read_to_string(gate.join("provider-runtime-result"))
+                    );
+                    let terminal: serde_json::Value = serde_json::from_slice(
+                        &fs::read(provider_dir.join(format!("{grant_id}.terminal.json"))).unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(terminal["outcome"], "auth_rejected");
+                    assert!(provider_dir.join(format!("{grant_id}.drain.json")).exists());
+                    let effects = provider_dir.join("account-effects");
+                    for (kind, outcome) in [
+                        ("quota-first", "valid_windows"),
+                        ("auth-refresh", "refreshed"),
+                        ("quota-retry", "valid_windows"),
+                    ] {
+                        let dir = effects.join(format!("{}-1-{kind}", receipt.handoff_id));
+                        let result: serde_json::Value =
+                            serde_json::from_slice(&fs::read(dir.join("result.json")).unwrap())
+                                .unwrap();
+                        assert_eq!(result["outcome"], outcome);
+                        assert_eq!(
+                            fs::read_dir(dir)
+                                .unwrap()
+                                .filter_map(Result::ok)
+                                .filter(|entry| entry
+                                    .file_name()
+                                    .to_string_lossy()
+                                    .ends_with(".consumed.json"))
+                                .count(),
+                            1
+                        );
+                    }
+                    assert_eq!(fs::read(gate.join("auth-ok")).unwrap(), b"x");
+                    assert_eq!(
+                        fs::read_dir(&provider_dir)
+                            .unwrap()
+                            .filter_map(Result::ok)
+                            .filter(|entry| entry
+                                .file_name()
+                                .to_string_lossy()
+                                .ends_with(".consumed.json"))
+                            .count(),
+                        1
+                    );
+                    let mapped: serde_json::Value = serde_json::from_slice(
+                        &fs::read(gate.join("provider-runtime-result")).unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(mapped["auth_after_provider_q"], true);
+                    assert_eq!(fs::read(&old_state_path).unwrap(), old_state_before);
+                    assert_eq!(fs::read(&old_wal_path).ok(), old_wal_before);
+                    assert_eq!(fs::read(&historical_sidecar).unwrap(), v29_main_before);
+                    assert_eq!(fs::read(&v29_wal).ok(), v29_wal_before);
+                    stop(&mut broker);
+                    return;
+                }
                 if provider_mode {
                     let provider_dir = broker_state.join("v30/fresh-provider");
                     let selected_marker = if mode == "normal_model_provider_no_pin" {
@@ -1603,21 +1738,27 @@ fn inner() {
                             "quota reply loss caused a second effect K"
                         );
                     }
-                    if mode == "normal_model_provider_auth_recovery" {
-                        let effect_root = provider_dir.join("account-effects");
-                        for (kind, outcome) in [
+                    if matches!(
+                        mode.as_str(),
+                        "normal_model_provider_auth_recovery"
+                            | "normal_model_provider_auth_success"
+                            | "normal_model_provider_auth_reply_loss"
+                            | "normal_model_provider_auth_restart"
+                    ) {
+                        let effects = provider_dir.join("account-effects");
+                        for (kind, expected) in [
                             ("quota-first", "failed"),
                             ("auth-refresh", "refreshed"),
                             ("quota-retry", "valid_windows"),
                         ] {
                             let effect_dir =
-                                effect_root.join(format!("{}-1-{kind}", receipt.handoff_id));
+                                effects.join(format!("{}-1-{kind}", receipt.handoff_id));
                             let effect: serde_json::Value = serde_json::from_slice(
                                 &fs::read(effect_dir.join("result.json")).unwrap(),
                             )
                             .unwrap();
                             assert_eq!(effect["state"], "drained");
-                            assert_eq!(effect["outcome"], outcome);
+                            assert_eq!(effect["outcome"], expected);
                             assert_eq!(
                                 fs::read_dir(&effect_dir)
                                     .unwrap()
@@ -1628,10 +1769,15 @@ fn inner() {
                                         .ends_with(".consumed.json"))
                                     .count(),
                                 1,
-                                "account effect was replayed: {kind}"
+                                "auth reply loss caused a duplicate {kind} K"
                             );
                         }
-                        assert_eq!(fs::read(gate.join("auth-refreshed")).unwrap(), b"x");
+                        let auth_marker = if mode == "normal_model_provider_auth_recovery" {
+                            "auth-refreshed"
+                        } else {
+                            "auth-ok"
+                        };
+                        assert_eq!(fs::read(gate.join(auth_marker)).unwrap(), b"x");
                         assert_eq!(route["selection"]["quota_remaining_basis_points"], 8000);
                     }
                     let grant_id = grant["id"].as_str().unwrap();
@@ -1694,7 +1840,9 @@ fn inner() {
                     );
                     if matches!(
                         mode.as_str(),
-                        "normal_model_provider_restart" | "normal_model_provider_quota_restart"
+                        "normal_model_provider_restart"
+                            | "normal_model_provider_quota_restart"
+                            | "normal_model_provider_auth_restart"
                     ) {
                         let fresh_socket = socket.with_file_name("v30.sock");
                         stop(&mut broker);
@@ -1792,7 +1940,11 @@ fn inner() {
                     )
                     .unwrap();
                     assert_eq!(mapped["mapped_after_q"], true);
-                    if mode == "normal_model_provider_quota_restart" {
+                    if matches!(
+                        mode.as_str(),
+                        "normal_model_provider_quota_restart"
+                            | "normal_model_provider_auth_restart"
+                    ) {
                         assert_eq!(
                             mapped["quota_restart_readback"], true,
                             "quota result was not read back through restarted broker"
@@ -4025,6 +4177,10 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_model_provider_quota",
         "normal_model_provider_auth",
         "normal_model_provider_auth_recovery",
+        "normal_model_provider_auth_after_healthy",
+        "normal_model_provider_auth_success",
+        "normal_model_provider_auth_reply_loss",
+        "normal_model_provider_auth_restart",
         "normal_model_provider_quota_available",
         "normal_model_provider_quota_reply_loss",
         "normal_model_provider_quota_restart",

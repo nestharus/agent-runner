@@ -113,6 +113,7 @@ fn main() -> std::io::Result<()> {
         .ok_or_else(|| std::io::Error::other("marker absent"))?;
     let fail = std::env::args().nth(2).as_deref() == Some("--fail");
     let quota = std::env::args().nth(2).as_deref() == Some("--quota");
+    let auth = std::env::args().nth(2).as_deref() == Some("--auth");
     let mut input = Vec::new();
     std::io::stdin().read_to_end(&mut input)?;
     let mut file = OpenOptions::new()
@@ -154,6 +155,10 @@ fn main() -> std::io::Result<()> {
     }
     std::io::stdout().write_all(b"provider-stdout:")?;
     std::io::stdout().write_all(&input)?;
+    if auth {
+        std::io::stderr().write_all(b"authentication failed: token expired")?;
+        std::process::exit(1);
+    }
     std::io::stderr().write_all(b"provider-stderr\n")?;
     if fail {
         std::process::exit(9);
