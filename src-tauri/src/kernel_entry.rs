@@ -26,11 +26,11 @@ fn private_prepared_mode() -> bool {
 
 #[cfg(feature = "age319-private-broker-fixture")]
 fn private_normal_mode() -> bool {
-    std::env::args()
-        .nth(1)
-        .as_deref()
-        .is_some_and(|arg| arg == PRIVATE_NORMAL_ENTRY || arg == "__age319-private-bash-work-v1")
-        && unsafe { libc::geteuid() } == 0
+    std::env::args().nth(1).as_deref().is_some_and(|arg| {
+        arg == PRIVATE_NORMAL_ENTRY
+            || arg == "__age319-private-bash-work-v1"
+            || arg == "__age319-private-root-handoff-v1"
+    }) && unsafe { libc::geteuid() } == 0
         && std::fs::read_to_string("/proc/self/uid_map")
             .ok()
             .is_some_and(|map| map.split_ascii_whitespace().nth(2) == Some("1"))
@@ -374,7 +374,7 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
     }
     #[cfg(feature = "age319-private-broker-fixture")]
     let private_handoff = private_v30_child_mode()
-        && std::env::args().nth(1).as_deref() == Some("__age319-private-bash-work-v1");
+        && std::env::args().nth(1).as_deref() == Some("__age319-private-root-handoff-v1");
     #[cfg(feature = "age319-private-broker-fixture")]
     let request_handoff = private_handoff || !private_v30_child_mode();
     #[cfg(not(feature = "age319-private-broker-fixture"))]
@@ -406,14 +406,45 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
         }
         #[cfg(feature = "age319-private-broker-fixture")]
         if private_handoff {
+            // A later process in this same root namespace cannot reuse the
+            // root's U or D authority. It needs its own broker admission.
+            let child = std::env::current_exe().map_err(|e| e.to_string())?;
+            let release_json = serde_json::to_string(&spec).map_err(|e| e.to_string())?;
+            for (key, value) in [
+                ("AGE319_PRIVATE_HANDOFF_PROBE_SPEC", release_json.as_str()),
+                ("AGE319_PRIVATE_HANDOFF_PROBE_D_KEY", receipt.d_key.as_str()),
+            ] {
+                let outcome = std::process::Command::new(&child)
+                    .arg("__age319-private-handoff-probe-v1")
+                    .env_remove(REQUIRED_ENV)
+                    .env_remove(CHILD_FD_ENV)
+                    .env_remove("AGE319_PRIVATE_HANDOFF_PROBE_SPEC")
+                    .env_remove("AGE319_PRIVATE_HANDOFF_PROBE_D_KEY")
+                    .env(key, value)
+                    .status()
+                    .map_err(|e| e.to_string())?;
+                if outcome.success() {
+                    return Err("unregistered later root descendant reused root U/D".into());
+                }
+            }
+            let status = std::fs::read_to_string("/proc/self/status").map_err(|e| e.to_string())?;
+            let status_value = |name: &str| -> Result<u32, String> {
+                status
+                    .lines()
+                    .find_map(|line| line.strip_prefix(name))
+                    .and_then(|value| value.trim().parse().ok())
+                    .ok_or_else(|| format!("root child status field {name} absent"))
+            };
             private_v30_marker(
                 "child-handoff",
                 &serde_json::json!({
                     "handoff_id": receipt.handoff_id,
                     "d_key": receipt.d_key,
                     "invocation_uuid": receipt.invocation_uuid,
-                    "bash_handle": receipt.bash_handle,
+                    "root_work_intent": receipt.root_work_intent,
                     "session_id": session.session_id,
+                    "no_new_privs": status_value("NoNewPrivs:")?,
+                    "seccomp": status_value("Seccomp:")?,
                 }),
             )?;
             private_receipt = Some(receipt);
@@ -498,7 +529,7 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
         println!("OULIPOLY_KERNEL_V30_CHILD_EFFECT={}", evidence.release_id);
         return Ok(ExitCode::SUCCESS);
     }
-    Err("production v30 child requires broker-routed owner work path".into())
+    Err("production v30 root U/D has no broker-controlled pre-effect grant into process_entrypoint or native provider result/unknown custody".into())
 }
 
 fn spec_for_handoff(spec: &protocol::StateReadSpec) -> protocol::StateReadSpec {

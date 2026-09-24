@@ -137,9 +137,8 @@ pub fn request_released_fresh_handoff_at(
     serde_json::from_str(body).map_err(io::Error::other)
 }
 
-/// Protocol-only reservation for private fixtures. Production U remains
-/// closed until the fresh broker can verify the released child, exact Bash
-/// handle, and real State invocation. A lost fixture reply is retried with
+/// Protocol-only reservation for private fixtures. Production U uses only
+/// the old-authority released root handoff. A lost fixture reply is retried with
 /// the same UUID pair and the broker pins it to that peer.
 pub fn reserve_fresh_v30_child_request(request_id: &str, invocation_uuid: &str) -> io::Result<()> {
     reserve_fresh_v30_child_request_at(
@@ -1417,7 +1416,7 @@ pub fn supported_entry_args(args: &[String]) -> bool {
                 .is_some_and(|map| map.split_ascii_whitespace().nth(2) == Some("1"));
     }
     #[cfg(feature = "age319-private-broker-fixture")]
-    if matches!(args, [only] if only == "__age319-private-join-only-v1" || only == "__age319-private-bash-work-v1" || only == "__age319-private-normal-v30")
+    if matches!(args, [only] if only == "__age319-private-join-only-v1" || only == "__age319-private-bash-work-v1" || only == "__age319-private-normal-v30" || only == "__age319-private-root-handoff-v1")
         && unsafe { libc::geteuid() } == 0
         && std::fs::read_to_string("/proc/self/uid_map")
             .ok()

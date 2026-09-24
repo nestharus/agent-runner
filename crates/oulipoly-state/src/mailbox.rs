@@ -60,7 +60,7 @@ pub use broker_authority::{
 #[cfg(target_os = "linux")]
 pub use fresh_lane::{
     FreshAckDelegation, FreshDeliveryReadback, FreshDeliverySubmission, FreshRecipientIdentity,
-    FreshReleasedHandoff, FreshV30Lane, FreshV30LaneIdentity, FreshV30Session,
+    FreshReleasedHandoff, FreshRootWorkIntent, FreshV30Lane, FreshV30LaneIdentity, FreshV30Session,
 };
 pub use native_publication::NativePublication;
 #[path = "mailbox/schema.rs"]

@@ -2345,17 +2345,9 @@ fn released_child_handoff(
             return Err(io::Error::other("released handoff has unknown debt"));
         }
         let existing = registry.existing(&request.spec.root_id).cloned();
+        let root_id = request.spec.root_id.clone();
         if request.read_only && existing.is_none() {
             return Err(io::Error::other("released handoff receipt absent"));
-        }
-        if existing.is_none()
-            && !held
-                .get(&request.spec.root_id)
-                .is_some_and(root_join::HeldRootJoin::handoff_intent_ready)
-        {
-            return Err(io::Error::other(
-                "released child has no authenticated Bash launch descriptor; production root admits only help/diagnostics",
-            ));
         }
         let evidence = attest_released_child(
             request.spec,
@@ -2377,10 +2369,12 @@ fn released_child_handoff(
             }
             return Ok(receipt);
         }
-        // Only the old loop can mint these. The one-use Bash intent is an
-        // opaque exact descriptor for the later paired Bash protocol. It is
-        // deliberately not a command line or permission to fork workload.
-        let intent = uuid::Uuid::new_v4();
+        let root_work_intent = held
+            .get(&root_id)
+            .ok_or_else(|| io::Error::other("released root has no held child"))?
+            .root_work_intent()?;
+        // Only the old loop can mint root authority. A later Bash descendant
+        // must use a separate registration and grant; this root has no handle.
         let authority = oulipoly_state::CompletionRegistrationAuthority::generate()
             .map_err(io::Error::other)?;
         let image = runner_image.metadata()?;
@@ -2388,9 +2382,7 @@ fn released_child_handoff(
             handoff_id: uuid::Uuid::new_v4().to_string(),
             d_key: uuid::Uuid::new_v4().to_string(),
             invocation_uuid: uuid::Uuid::new_v4().to_string(),
-            bash_intent_id: intent.to_string(),
-            bash_handle: format!("ab30_{}", intent.simple()),
-            bash_intent_kind: "agent-bash-run-v30-one-use".into(),
+            root_work_intent,
             broker_incarnation: broker_incarnation.into(),
             runner_image_device: image.dev(),
             runner_image_inode: image.ino(),

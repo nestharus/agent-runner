@@ -29,18 +29,54 @@ pub struct FreshV30LaneIdentity {
     pub source_generation: String,
 }
 
+/// The old release authority records the exact root entry it has already
+/// placed. This describes the root invocation; a later Bash child needs its
+/// own separately admitted handle and registration.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "arguments",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum FreshRootWorkIntent {
+    CliHelp(Vec<String>),
+    CliDiagnostics(Vec<String>),
+    PrivateProbe(Vec<String>),
+}
+
+impl FreshRootWorkIntent {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::CliHelp(_) => "cli_help",
+            Self::CliDiagnostics(_) => "cli_diagnostics",
+            Self::PrivateProbe(_) => "private_probe",
+        }
+    }
+
+    fn valid(&self) -> bool {
+        match self {
+            Self::CliHelp(args) => {
+                matches!(args.as_slice(), [only] if only == "--help" || only == "-h")
+            }
+            Self::CliDiagnostics(args) => args.first().is_some_and(|first| first == "diagnostics"),
+            Self::PrivateProbe(args) => {
+                cfg!(feature = "age319-private-broker-fixture")
+                    && matches!(args.as_slice(), [only] if only == "__age319-private-root-handoff-v1")
+            }
+        }
+    }
+}
+
 /// Minted by the old release authority while its physical gate is retained.
-/// The intent identifies exactly one future Bash run; it does not admit a
-/// command, register a source, or open a workload gate.
+/// U/D create a root invocation and session, not a Bash descendant.
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FreshReleasedHandoff {
     pub handoff_id: String,
     pub d_key: String,
     pub invocation_uuid: String,
-    pub bash_intent_id: String,
-    pub bash_handle: String,
-    pub bash_intent_kind: String,
+    pub root_work_intent: FreshRootWorkIntent,
     pub broker_incarnation: String,
     pub runner_image_device: u64,
     pub runner_image_inode: u64,
@@ -425,6 +461,25 @@ impl FreshV30Lane {
         if fresh_handoff_schema_count(&state_conn)? != 6 {
             return Err("fresh handoff schema is incomplete".into());
         }
+        let root_intent_columns: i64 = state_conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('fresh_released_handoff')
+             WHERE name='root_intent_kind' AND \"notnull\"=1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        let old_bash_columns: i64 = state_conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('fresh_released_handoff')
+             WHERE name='bash_handle'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if root_intent_columns != 1 || old_bash_columns != 0 {
+            return Err("fresh root handoff schema conflicts with Bash placeholder schema".into());
+        }
         state_conn
             .execute_batch("COMMIT")
             .map_err(|e| e.to_string())?;
@@ -456,10 +511,10 @@ impl FreshV30Lane {
             .map_err(|e| e.to_string())?;
         state.execute(
             "INSERT INTO fresh_released_handoff
-             (handoff_id,d_key,invocation_uuid,bash_handle,root_id,actor_identity,receipt_json,bound_at)
+             (handoff_id,d_key,invocation_uuid,root_intent_kind,root_id,actor_identity,receipt_json,bound_at)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT DO NOTHING",
             params![receipt.handoff_id, receipt.d_key, receipt.invocation_uuid,
-                receipt.bash_handle, receipt.old_release.prepared.root_id,
+                receipt.root_work_intent.kind(), receipt.old_release.prepared.root_id,
                 actor_json, json, Utc::now().to_rfc3339()],
         ).map_err(|e| e.to_string())?;
         drop(state);
@@ -529,7 +584,6 @@ impl FreshV30Lane {
             &receipt.handoff_id,
             &receipt.d_key,
             &receipt.invocation_uuid,
-            &receipt.bash_intent_id,
             &receipt.broker_incarnation,
         ] {
             validate_request_id(id)?;
@@ -538,10 +592,9 @@ impl FreshV30Lane {
         if receipt.fresh_lane != self.identity
             || receipt.old_release.prepared.source_generation == self.identity.source_generation
             || receipt.old_release.prepared.domain_id == self.identity.domain_id
-            || receipt.bash_intent_kind != "agent-bash-run-v30-one-use"
+            || !receipt.root_work_intent.valid()
             || receipt.runner_image_device == 0
             || receipt.runner_image_inode == 0
-            || receipt.bash_handle != format!("ab30_{}", receipt.bash_intent_id.replace('-', ""))
             || receipt.old_release.release_id.is_empty()
             || actor.host_pid != child.host_pid
             || actor.boot_id != child.boot_id
@@ -583,8 +636,8 @@ impl FreshV30Lane {
             state.start_invocation_with_prepared_completion_registration_authority(
                 &crate::InvocationStart {
                     invocation_uuid: receipt.invocation_uuid.clone(),
-                    model_name: "agent-bash".into(),
-                    provider_name: "agent-bash".into(),
+                    model_name: "agent-runner-root".into(),
+                    provider_name: "agent-runner".into(),
                     provider_index: 0,
                     parent_invocation_id: None,
                 },
@@ -594,8 +647,8 @@ impl FreshV30Lane {
         let row = state
             .get_invocation_by_uuid(&receipt.invocation_uuid)?
             .ok_or("fresh handoff invocation absent after start")?;
-        if row.model_name != "agent-bash"
-            || row.provider_name.as_deref() != Some("agent-bash")
+        if row.model_name != "agent-runner-root"
+            || row.provider_name.as_deref() != Some("agent-runner")
             || row.provider_index != 0
             || row.parent_invocation_id.is_some()
             || row
@@ -619,7 +672,7 @@ impl FreshV30Lane {
             row.id,
             &crate::ProviderSessionBinding {
                 provider_session_id: session.session_id.clone(),
-                capture_method: "broker-released-child-v30",
+                capture_method: "broker-released-root-v30",
                 resume_input_id: None,
                 provider_session_resolved_account: None,
             },
@@ -691,8 +744,8 @@ impl FreshV30Lane {
             .map_err(|e| e.to_string())?;
         if row
             != Some((
-                "agent-bash".into(),
-                "agent-bash".into(),
+                "agent-runner-root".into(),
+                "agent-runner".into(),
                 0,
                 None,
                 Some(session.session_id.clone()),
@@ -722,7 +775,7 @@ impl FreshV30Lane {
         Ok(())
     }
 
-    /// The intended caller is a released Runner child retaining both UUIDs
+    /// The intended caller is a released Runner root retaining both UUIDs
     /// across U and D. The broker supplies the pinned peer identity; caller
     /// JSON cannot select an actor. Release and invocation linkage are still
     /// a later gate. This intent grants no work or registration authority.

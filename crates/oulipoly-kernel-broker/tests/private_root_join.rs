@@ -261,7 +261,7 @@ fn inner() {
         let err = temp.path().join("normal.err");
         let mut entry = Command::new(&runner)
             .arg(if handoff_mode {
-                "__age319-private-bash-work-v1"
+                "__age319-private-root-handoff-v1"
             } else {
                 "__age319-private-normal-v30"
             })
@@ -510,9 +510,28 @@ fn inner() {
                 assert_eq!(marker["handoff_id"], receipt.handoff_id);
                 assert_eq!(marker["d_key"], receipt.d_key);
                 assert_eq!(marker["invocation_uuid"], receipt.invocation_uuid);
-                assert_eq!(marker["bash_handle"], receipt.bash_handle);
+                assert_eq!(
+                    marker["root_work_intent"],
+                    serde_json::to_value(&receipt.root_work_intent).unwrap()
+                );
+                assert_eq!(
+                    marker["no_new_privs"], 0,
+                    "root child final exec must permit setuid"
+                );
+                assert_eq!(
+                    marker["seccomp"], 0,
+                    "root child final exec has no Runner seccomp filter"
+                );
                 assert!(receipt.old_release == released);
-                assert!(receipt.bash_handle.starts_with("ab30_"));
+                assert_eq!(
+                    receipt.root_work_intent,
+                    oulipoly_state::mailbox::FreshRootWorkIntent::PrivateProbe(vec![
+                        "__age319-private-root-handoff-v1".into()
+                    ])
+                );
+                let receipt_json = serde_json::to_string(&receipt).unwrap();
+                assert!(!receipt_json.contains("ab30_"));
+                assert!(!receipt_json.contains("bash_handle"));
                 let fresh_state = rusqlite::Connection::open_with_flags(
                     broker_state.join("v30/state.db"),
                     rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -524,13 +543,43 @@ fn inner() {
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 ).unwrap();
                 assert_eq!(session, marker["session_id"].as_str().unwrap());
-                assert_eq!(provider, "agent-bash");
+                assert_eq!(provider, "agent-runner");
+                let root_model: String = fresh_state
+                    .query_row(
+                        "SELECT model_name FROM invocations WHERE invocation_uuid=?1",
+                        [&receipt.invocation_uuid],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(root_model, "agent-runner-root");
+                let invocation_count: i64 = fresh_state
+                    .query_row("SELECT count(*) FROM invocations", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(
+                    invocation_count, 1,
+                    "root with no Bash child has one root invocation"
+                );
+                let bash_column_count: i64 = fresh_state
+                    .query_row("SELECT count(*) FROM pragma_table_info('fresh_released_handoff') WHERE name='bash_handle'", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(
+                    bash_column_count, 0,
+                    "root State must not carry a Bash placeholder"
+                );
                 let bound: i64 = fresh_state.query_row(
                     "SELECT count(*) FROM fresh_released_handoff WHERE handoff_id=?1 AND d_key=?2",
                     rusqlite::params![receipt.handoff_id, receipt.d_key],
                     |row| row.get(0),
                 ).unwrap();
                 assert_eq!(bound, 1);
+                let intent_kind: String = fresh_state
+                    .query_row(
+                        "SELECT root_intent_kind FROM fresh_released_handoff WHERE handoff_id=?1",
+                        [&receipt.handoff_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(intent_kind, "private_probe");
                 assert_eq!(
                     fs::metadata(&out).unwrap().len(),
                     0,
@@ -571,9 +620,17 @@ fn inner() {
                         .is_err()
                 );
                 let mut wrong_handle = receipt.clone();
-                wrong_handle.bash_handle = format!("ab30_{}", uuid::Uuid::new_v4().simple());
+                wrong_handle.root_work_intent =
+                    oulipoly_state::mailbox::FreshRootWorkIntent::CliHelp(vec!["--help".into()]);
                 assert!(
                     lane.require_released_handoff(&receipt.d_key, &wrong_handle, &actor)
+                        .is_err()
+                );
+                let mut malformed_intent = receipt.clone();
+                malformed_intent.root_work_intent =
+                    oulipoly_state::mailbox::FreshRootWorkIntent::CliHelp(vec!["--new".into()]);
+                assert!(
+                    lane.require_released_handoff(&receipt.d_key, &malformed_intent, &actor)
                         .is_err()
                 );
                 let mut wrong_invocation = receipt.clone();
@@ -2230,16 +2287,24 @@ fn inner() {
         stop(&mut restarted);
         return;
     }
-    let unsupported = Command::new(&runner)
-        .args(["--model", "age319-missing-model", "hello"])
-        .env("OULIPOLY_DATA_DIR", &data)
-        .env("OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1", "1")
-        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
-        .env_remove("LD_LIBRARY_PATH")
-        .output()
-        .unwrap();
-    assert!(!unsupported.status.success());
-    assert!(String::from_utf8_lossy(&unsupported.stderr).contains("unsupported kernel CLI mode"));
+    for args in [
+        vec!["--model", "age319-missing-model", "hello"],
+        vec!["--new", "local provider fixture"],
+        vec!["resume", "local-fixture-session"],
+    ] {
+        let unsupported = Command::new(&runner)
+            .args(args)
+            .env("OULIPOLY_DATA_DIR", &data)
+            .env("OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1", "1")
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+            .env_remove("LD_LIBRARY_PATH")
+            .output()
+            .unwrap();
+        assert!(!unsupported.status.success());
+        assert!(
+            String::from_utf8_lossy(&unsupported.stderr).contains("unsupported kernel CLI mode")
+        );
+    }
     assert_eq!(
         fs::read_dir(broker_state.join("entries")).unwrap().count(),
         0
