@@ -299,6 +299,18 @@ pub fn read_bounded_source_selection_at(
     serde_json::from_slice(&send_state_frame_at(path, b'R', spec)?).map_err(io::Error::other)
 }
 
+/// Read one pending recipient chosen from the broker-retained sidecar. This
+/// readback is neither a session authentication nor a one-use work grant.
+pub fn read_bounded_recipient_selection_at(
+    path: &Path,
+    spec: &StateReadSpec,
+) -> io::Result<oulipoly_state::mailbox::BrokerRecipientSelection> {
+    if spec.protocol != "broker-recipient-selection-v30" || spec.attempt_id.is_some() {
+        return Err(io::Error::other("invalid bounded recipient selection read"));
+    }
+    serde_json::from_slice(&send_state_frame_at(path, b'R', spec)?).map_err(io::Error::other)
+}
+
 pub fn write_bounded_repair_at(
     path: &Path,
     spec: &StateWriteSpec,

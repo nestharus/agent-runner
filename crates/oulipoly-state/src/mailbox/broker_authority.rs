@@ -143,6 +143,28 @@ pub struct BrokerSourceCandidate {
     pub listener: crate::completion_continuation::ListenerIdentity,
 }
 
+/// A pending recipient selected on the retained broker connection. This is
+/// metadata for planning only: the row can change, and neither the session ID
+/// nor the payload digest is a recipient authentication or work grant.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct BrokerRecipientSelection {
+    pub source_generation: String,
+    pub root_id: String,
+    pub owner_generation: String,
+    pub authority_ordinal: i64,
+    pub candidate: Option<BrokerRecipientCandidate>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct BrokerRecipientCandidate {
+    pub session_id: String,
+    pub seq: i64,
+    pub kind: String,
+    pub handle: String,
+    pub payload_sha256: String,
+    pub payload_byte_len: i64,
+}
+
 /// Installer-owned proof that the old service images and every sidecar writer
 /// were stopped, joined and fenced. No production constructor exists yet:
 /// the installed service/launcher census and new-entry fence must be added
@@ -364,6 +386,72 @@ impl BrokerSidecar {
         }
         self.check_mailbox_read(source_generation)?;
         Ok(BrokerSourceSelection {
+            source_generation: self.source_generation.clone(),
+            root_id: root_id.into(),
+            owner_generation: owner.owner_generation.clone(),
+            authority_ordinal: head.map_or(0, |head| head.authority_ordinal),
+            candidate,
+        })
+    }
+
+    /// Read one pending recipient from at most 32 sessions. The broker must
+    /// first prove the exact live root, owner and driver. This does not claim
+    /// the session, read payload bytes onto the wire, or authorize delivery.
+    pub fn read_bounded_recipient_selection(
+        &mut self,
+        source_generation: &str,
+        root_id: &str,
+        owner: &CompletionDomainOwner,
+    ) -> Result<BrokerRecipientSelection, String> {
+        self.check_mailbox_read(source_generation)?;
+        let state = self.bound_state()?;
+        let head = self.mailbox.completion_continuity_head()?;
+        if state.completion_repair_has_suffix(head.as_ref())? {
+            return Err("broker recipient selection requires complete State projection".into());
+        }
+        let sessions = self
+            .mailbox
+            .wake_sessions()
+            .pending_delivery_session_ids(32)?;
+        let mut candidate = None;
+        for session_id in sessions {
+            if self.mailbox.notifications_paused(&session_id)? {
+                continue;
+            }
+            let Some(row) = self
+                .mailbox
+                .list_pending_for_delivery_after(&session_id, None, 0, 1)?
+                .into_iter()
+                .next()
+            else {
+                continue;
+            };
+            // Verification uses the retained root-owned payload repository.
+            // The response carries only its exact digest and length.
+            self.mailbox.payloads().verify_mailbox_row_payload(&row)?;
+            let (Some(payload_sha256), Some(payload_byte_len)) =
+                (row.payload_sha256, row.payload_byte_len)
+            else {
+                return Err("broker pending recipient has no retained payload identity".into());
+            };
+            if payload_byte_len < 0 || row.session_id != session_id {
+                return Err("broker pending recipient identity changed".into());
+            }
+            candidate = Some(BrokerRecipientCandidate {
+                session_id,
+                seq: row.seq,
+                kind: row.kind,
+                handle: row.handle,
+                payload_sha256,
+                payload_byte_len,
+            });
+            break;
+        }
+        if state.completion_repair_has_suffix(head.as_ref())? {
+            return Err("broker State source changed during recipient selection".into());
+        }
+        self.check_mailbox_read(source_generation)?;
+        Ok(BrokerRecipientSelection {
             source_generation: self.source_generation.clone(),
             root_id: root_id.into(),
             owner_generation: owner.owner_generation.clone(),
@@ -817,6 +905,29 @@ impl BrokerSidecar {
     ) -> Result<String, String> {
         require_host_root()?;
         activate_with_owner(path, 0, broker_state_root)
+    }
+
+    /// Private namespace fixture for a quiesced copy containing retained
+    /// payload files. Production still requires the installed writer census.
+    #[cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
+    pub fn stage_private_fixture_copy(
+        source: &Path,
+        broker_state_root: &Path,
+        _proof: &QuiescedCutoverProof,
+    ) -> Result<std::path::PathBuf, String> {
+        require_host_root()?;
+        stage_with_owner(source, 0, broker_state_root, 0)
+    }
+
+    #[cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
+    pub fn publish_private_fixture_copy(
+        source: &Path,
+        stage: &Path,
+        broker_state_root: &Path,
+        _proof: &QuiescedCutoverProof,
+    ) -> Result<String, String> {
+        require_host_root()?;
+        publish_with_owner(source, 0, stage, broker_state_root, 0)
     }
 
     #[cfg(all(unix, feature = "age319-private-broker-fixture"))]
@@ -2341,6 +2452,94 @@ mod tests {
         );
         drop(broker);
         assert!(open_with_owner(&target, uid, &broker_root).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recipient_selection_uses_retained_pending_payload_without_ack() {
+        let (_root, source, broker_root, mail, _input) = payload_cutover_fixture();
+        let uid = unsafe { libc::geteuid() };
+        let stage = stage_with_owner(&source, uid, &broker_root, uid).unwrap();
+        let generation = publish_with_owner(&source, uid, &stage, &broker_root, uid).unwrap();
+        let target = broker_root.join("sidecar/pid-identity.db");
+        let state_path = source.with_file_name("state.db");
+        drop(StateDb::open(&state_path).unwrap());
+        write_state_source_binding(&broker_root.join("sidecar"), &state_path, uid, uid).unwrap();
+        let mut broker = open_with_owner(&target, uid, &broker_root).unwrap();
+        let owner = CompletionDomainOwner {
+            protocol: PROTOCOL.into(),
+            domain_id: broker.domain_id().unwrap(),
+            supervisor_authority_id: uuid::Uuid::new_v4().to_string(),
+            owner_generation: uuid::Uuid::new_v4().to_string(),
+            guardian_identity: SourceProcessIdentity {
+                pid: 1,
+                boot_id: uuid::Uuid::new_v4().to_string(),
+                starttime_ticks: 1,
+            },
+            driver_identity: SourceProcessIdentity {
+                pid: 2,
+                boot_id: uuid::Uuid::new_v4().to_string(),
+                starttime_ticks: 2,
+            },
+            endpoint: "fixture".into(),
+        };
+        let root_id = uuid::Uuid::new_v4().to_string();
+        assert!(
+            broker
+                .read_bounded_recipient_selection("wrong", &root_id, &owner)
+                .is_err()
+        );
+        let first = broker
+            .read_bounded_recipient_selection(&generation, &root_id, &owner)
+            .unwrap();
+        let candidate = first.candidate.unwrap();
+        assert_eq!(candidate.session_id, "recipient");
+        assert_eq!(candidate.seq, mail.seq);
+        assert_eq!(candidate.payload_sha256, mail.payload_sha256.unwrap());
+        assert_eq!(candidate.payload_byte_len, mail.payload_byte_len.unwrap());
+        assert_eq!(
+            broker
+                .read_exact_mailbox_row(&generation, "recipient", mail.seq)
+                .unwrap()
+                .unwrap()
+                .row
+                .delivered_at,
+            None
+        );
+        drop(broker);
+        // The retired user-owned copy cannot change this broker selection.
+        let mut retired = MailboxDb::open(&source).unwrap();
+        retired
+            .acknowledge_range("recipient", mail.seq, mail.seq, "retired")
+            .unwrap();
+        drop(retired);
+        let mut broker = open_with_owner(&target, uid, &broker_root).unwrap();
+        assert_eq!(
+            broker
+                .read_bounded_recipient_selection(&generation, &root_id, &owner)
+                .unwrap()
+                .candidate
+                .unwrap()
+                .seq,
+            mail.seq
+        );
+        let retained_path = broker
+            .read_exact_mailbox_row(&generation, "recipient", mail.seq)
+            .unwrap()
+            .unwrap()
+            .row
+            .payload_file_path
+            .unwrap();
+        let corrupted = vec![b'x'; fs::metadata(&retained_path).unwrap().len() as usize];
+        fs::set_permissions(&retained_path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&retained_path, corrupted).unwrap();
+        fs::set_permissions(&retained_path, fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(
+            broker
+                .read_bounded_recipient_selection(&generation, &root_id, &owner)
+                .unwrap_err()
+                .contains("integrity mismatch")
+        );
     }
 
     #[cfg(unix)]

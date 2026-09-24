@@ -889,6 +889,61 @@ fn encode_source_selection(
 
 #[expect(
     clippy::too_many_arguments,
+    reason = "broker actor and retained recipient authorities are independent"
+)]
+fn read_bounded_recipient_selection(
+    spec: StateReadSpec,
+    peer: &PeerIdentity,
+    host_namespace: &File,
+    runner_image: &File,
+    roots: &RootRegistry,
+    works: &WorkRegistry,
+    entries: &EntryRegistry,
+    sidecar: &mut BrokerSidecar,
+) -> io::Result<oulipoly_state::mailbox::BrokerRecipientSelection> {
+    if spec.protocol != "broker-recipient-selection-v30" || spec.attempt_id.is_some() {
+        return Err(io::Error::other(
+            "broker recipient selection version conflict",
+        ));
+    }
+    let exact = read_broker_state(
+        StateReadSpec {
+            protocol: "broker-state-read-v1".into(),
+            ..spec
+        },
+        peer,
+        host_namespace,
+        runner_image,
+        roots,
+        works,
+        entries,
+        sidecar,
+    )?;
+    if !exact.broker_owned || exact.owner.driver_identity.pid != i64::from(peer.process.host_pid) {
+        return Err(io::Error::other(
+            "broker recipient selection requires exact driver",
+        ));
+    }
+    sidecar
+        .read_bounded_recipient_selection(&exact.source_generation, &exact.root_id, &exact.owner)
+        .map_err(io::Error::other)
+}
+
+fn encode_recipient_selection(
+    selection: &oulipoly_state::mailbox::BrokerRecipientSelection,
+) -> io::Result<String> {
+    let mut response = serde_json::to_string(selection)?;
+    response.push('\n');
+    if response.len() > 4096 {
+        return Err(io::Error::other(
+            "broker recipient selection readback too large",
+        ));
+    }
+    Ok(response)
+}
+
+#[expect(
+    clippy::too_many_arguments,
     reason = "broker actor and retained State authorities are independent"
 )]
 fn write_bounded_repair(
@@ -2550,6 +2605,21 @@ fn serve() -> io::Result<()> {
                         sidecar,
                     )?;
                     encode_source_selection(&selection)
+                } else if spec.protocol == "broker-recipient-selection-v30" {
+                    let sidecar = broker_sidecar
+                        .as_mut()
+                        .ok_or_else(|| io::Error::other("broker State cutover absent"))?;
+                    let selection = read_bounded_recipient_selection(
+                        spec,
+                        &peer,
+                        &host_namespace,
+                        &runner_image,
+                        &registry,
+                        &works,
+                        &entries,
+                        sidecar,
+                    )?;
+                    encode_recipient_selection(&selection)
                 } else {
                     let readback = read_broker_state(
                         spec,
