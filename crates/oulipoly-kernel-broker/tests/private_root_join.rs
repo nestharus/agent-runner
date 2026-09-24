@@ -77,6 +77,9 @@ fn inner() {
             | "normal_model_provider_unsupported"
             | "normal_model_provider_quota"
             | "normal_model_provider_auth"
+            | "normal_model_provider_auth_success"
+            | "normal_model_provider_auth_reply_loss"
+            | "normal_model_provider_auth_restart"
             | "normal_model_provider_quota_available"
             | "normal_model_provider_quota_reply_loss"
             | "normal_model_provider_quota_restart"
@@ -135,6 +138,21 @@ fn inner() {
         } else if mode == "normal_model_provider_auth" {
             "quota_script = \"quota-must-not-run\"\nauth_refresh_command = \"auth-must-not-run\"\n"
                 .into()
+        } else if matches!(
+            mode.as_str(),
+            "normal_model_provider_auth_success"
+                | "normal_model_provider_auth_reply_loss"
+                | "normal_model_provider_auth_restart"
+        ) {
+            fs::write(
+                gate.join("quota.json"),
+                br#"{"used_percent":20,"resets_at":"2099-01-01T00:00:00Z"}"#,
+            )
+            .unwrap();
+            format!(
+                "quota_script = 'if test -e {0}/auth-ok; then cat {0}/quota.json; else exit 7; fi'\nauth_refresh_command = 'printf x >> {0}/auth-ok'\n",
+                gate.display()
+            )
         } else {
             String::new()
         };
@@ -337,7 +355,11 @@ fn inner() {
             "1",
         )))
         .envs(
-            (mode == "normal_model_provider_quota_reply_loss").then_some((
+            matches!(
+                mode.as_str(),
+                "normal_model_provider_quota_reply_loss" | "normal_model_provider_auth_reply_loss"
+            )
+            .then_some((
                 "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_ACCOUNT_EFFECT_REPLY_V1",
                 "1",
             )),
@@ -642,6 +664,9 @@ fn inner() {
                     | "normal_model_provider_unsupported"
                     | "normal_model_provider_quota"
                     | "normal_model_provider_auth"
+                    | "normal_model_provider_auth_success"
+                    | "normal_model_provider_auth_reply_loss"
+                    | "normal_model_provider_auth_restart"
                     | "normal_model_provider_quota_available"
                     | "normal_model_provider_quota_reply_loss"
                     | "normal_model_provider_quota_restart"
@@ -1084,6 +1109,42 @@ fn inner() {
                             "quota reply loss caused a second effect K"
                         );
                     }
+                    if matches!(
+                        mode.as_str(),
+                        "normal_model_provider_auth_success"
+                            | "normal_model_provider_auth_reply_loss"
+                            | "normal_model_provider_auth_restart"
+                    ) {
+                        let effects = provider_dir.join("account-effects");
+                        for (kind, expected) in [
+                            ("quota-first", "failed"),
+                            ("auth-refresh", "refreshed"),
+                            ("quota-retry", "valid_windows"),
+                        ] {
+                            let effect_dir =
+                                effects.join(format!("{}-1-{kind}", receipt.handoff_id));
+                            let effect: serde_json::Value = serde_json::from_slice(
+                                &fs::read(effect_dir.join("result.json")).unwrap(),
+                            )
+                            .unwrap();
+                            assert_eq!(effect["state"], "drained");
+                            assert_eq!(effect["outcome"], expected);
+                            assert_eq!(
+                                fs::read_dir(&effect_dir)
+                                    .unwrap()
+                                    .filter_map(Result::ok)
+                                    .filter(|entry| entry
+                                        .file_name()
+                                        .to_string_lossy()
+                                        .ends_with(".consumed.json"))
+                                    .count(),
+                                1,
+                                "auth reply loss caused a duplicate {kind} K"
+                            );
+                        }
+                        assert_eq!(fs::read(gate.join("auth-ok")).unwrap(), b"x");
+                        assert_eq!(route["selection"]["quota_remaining_basis_points"], 8000);
+                    }
                     let grant_id = grant["id"].as_str().unwrap();
                     eventually(|| provider_dir.join(format!("{grant_id}.exit.json")).exists());
                     assert!(
@@ -1144,7 +1205,9 @@ fn inner() {
                     );
                     if matches!(
                         mode.as_str(),
-                        "normal_model_provider_restart" | "normal_model_provider_quota_restart"
+                        "normal_model_provider_restart"
+                            | "normal_model_provider_quota_restart"
+                            | "normal_model_provider_auth_restart"
                     ) {
                         let fresh_socket = socket.with_file_name("v30.sock");
                         stop(&mut broker);
@@ -1212,7 +1275,11 @@ fn inner() {
                     )
                     .unwrap();
                     assert_eq!(mapped["mapped_after_q"], true);
-                    if mode == "normal_model_provider_quota_restart" {
+                    if matches!(
+                        mode.as_str(),
+                        "normal_model_provider_quota_restart"
+                            | "normal_model_provider_auth_restart"
+                    ) {
                         assert_eq!(
                             mapped["quota_restart_readback"], true,
                             "quota result was not read back through restarted broker"
@@ -3312,6 +3379,9 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_model_provider_unsupported",
         "normal_model_provider_quota",
         "normal_model_provider_auth",
+        "normal_model_provider_auth_success",
+        "normal_model_provider_auth_reply_loss",
+        "normal_model_provider_auth_restart",
         "normal_model_provider_quota_available",
         "normal_model_provider_quota_reply_loss",
         "normal_model_provider_quota_restart",

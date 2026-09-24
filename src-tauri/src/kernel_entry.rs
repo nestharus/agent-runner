@@ -900,6 +900,7 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
         .map_err(|e| format!("fresh route candidate refused before K: {e}"))?;
     }
     let mut quota_receipts = Vec::new();
+    let mut auth_receipts = Vec::new();
     for (index, (quota_script, auth_command)) in pool.account_effects.iter().enumerate() {
         if quota_script.is_none() {
             continue;
@@ -932,12 +933,20 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
             environment,
         };
         let first = private_run_account_effect(&socket, &effect)?;
-        quota_receipts.push((effect.clone(), first.effect_id.clone()));
+        quota_receipts.push((
+            effect.clone(),
+            first.effect_id.clone(),
+            first.outcome.clone(),
+        ));
         if first.outcome.as_deref() != Some("valid_windows") && auth_command.is_some() {
             effect.kind = FreshAccountEffectKind::AuthRefresh;
-            private_run_account_effect(&socket, &effect)?;
-            effect.kind = FreshAccountEffectKind::QuotaRetry;
-            private_run_account_effect(&socket, &effect)?;
+            let auth = private_run_account_effect(&socket, &effect)?;
+            auth_receipts.push((effect.clone(), auth.effect_id.clone(), auth.outcome.clone()));
+            if auth.outcome.as_deref() == Some("refreshed") {
+                effect.kind = FreshAccountEffectKind::QuotaRetry;
+                let retry = private_run_account_effect(&socket, &effect)?;
+                auth_receipts.push((effect.clone(), retry.effect_id, retry.outcome));
+            }
         }
     }
     let request = FreshRouteRequest {
@@ -980,21 +989,22 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
     let mut backend = PrivateFreshBroker { authority };
     let result = run_prepared_fresh_headless(selected_plan, &mut backend)?;
     let mut quota_restart_readback = false;
-    if std::env::var("AGE319_PRIVATE_JOIN_MODE").ok().as_deref()
-        == Some("normal_model_provider_quota_restart")
-    {
+    if matches!(
+        std::env::var("AGE319_PRIVATE_JOIN_MODE").ok().as_deref(),
+        Some("normal_model_provider_quota_restart" | "normal_model_provider_auth_restart")
+    ) {
         if quota_receipts.is_empty() {
             return Err("fresh quota restart fixture has no effect receipt".into());
         }
-        for (effect_request, expected_id) in quota_receipts {
+        for (effect_request, expected_id, expected_outcome) in
+            quota_receipts.into_iter().chain(auth_receipts)
+        {
             let after_restart =
                 protocol::private_fresh_account_effect_at(&socket, &effect_request, false)
                     .map_err(|e| {
                         format!("fresh quota readback after broker restart failed: {e}")
                     })?;
-            if after_restart.effect_id != expected_id
-                || after_restart.outcome.as_deref() != Some("valid_windows")
-            {
+            if after_restart.effect_id != expected_id || after_restart.outcome != expected_outcome {
                 return Err("fresh quota readback after broker restart changed".into());
             }
         }
@@ -1050,15 +1060,20 @@ fn private_run_account_effect(
         effect =
             protocol::private_fresh_account_effect_at(socket, request, false).map_err(|e| {
                 format!(
-                    "fresh account effect unknown: D={}, effect={}, artifact={}, readback={e}",
-                    request.d_key, effect.effect_id, effect.artifact
+                    "fresh account effect unknown: D={}, effect={}, artifact={}, peer_effect={:?}, peer_artifact={:?}, readback={e}",
+                    request.d_key, effect.effect_id, effect.artifact,
+                    effect.peer_effect_id, effect.peer_artifact
                 )
             })?;
     }
     if effect.state != "drained" {
         return Err(format!(
-            "fresh account effect unknown: D={}, effect={}, artifact={}",
-            request.d_key, effect.effect_id, effect.artifact
+            "fresh account effect unknown: D={}, effect={}, artifact={}, peer_effect={:?}, peer_artifact={:?}",
+            request.d_key,
+            effect.effect_id,
+            effect.artifact,
+            effect.peer_effect_id,
+            effect.peer_artifact
         ));
     }
     Ok(effect)

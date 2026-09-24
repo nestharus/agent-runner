@@ -576,11 +576,20 @@ struct AccountEffectIntent {
     request: FreshAccountEffectRequest,
     environment_sha256: String,
     plan_sha256: String,
+    #[serde(default)]
+    auth_source: Option<AuthReuse>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct QuotaReuse {
+    source_directory: String,
+    source_effect_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct AuthReuse {
     source_directory: String,
     source_effect_id: String,
 }
@@ -729,41 +738,58 @@ fn auth_admission_lock(directory: &Path, account: &str) -> io::Result<File> {
     }
 }
 
-fn refuse_concurrent_auth(directory: &Path, binding: &Binding, account: &str) -> io::Result<()> {
+fn coalescible_auth_source(
+    directory: &Path,
+    binding: &Binding,
+    request: &FreshAccountEffectRequest,
+) -> io::Result<Option<(String, AccountEffectIntent)>> {
     let parent = directory.join("account-effects");
-    let entries = match std::fs::read_dir(parent) {
+    let entries = match std::fs::read_dir(&parent) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    for entry in entries {
-        let entry = entry?;
-        if !entry
-            .file_name()
-            .to_string_lossy()
-            .ends_with("auth-refresh")
-        {
+    let mut names = entries
+        .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+        .collect::<io::Result<Vec<_>>>()?;
+    names.sort();
+    for name in names {
+        if !name.ends_with("-auth-refresh") {
             continue;
         }
-        let Some(intent) = effect_intent(&entry.path())? else {
+        let source_dir = parent.join(&name);
+        let Some(intent) = effect_intent(&source_dir)? else {
             continue;
         };
-        if intent.binding == *binding || intent.request.account != account {
+        // A follower is a reference to the original K, never another source.
+        if intent.auth_source.is_some() {
             continue;
         }
-        let prior = effect_readback_from_dir(&entry.path(), &intent)?;
+        if intent.binding == *binding || intent.request.account != request.account {
+            continue;
+        }
+        let prior = effect_readback_from_dir(&source_dir, &intent)?;
         if prior.state != "drained"
             || prior
                 .completed_unix_seconds
                 .is_some_and(|completed| Utc::now().timestamp() - completed < 30)
         {
-            return Err(io::Error::other(format!(
-                "fresh auth refresh already active or recently completed: effect={}, state={}, artifact={}",
-                prior.effect_id, prior.state, prior.artifact
-            )));
+            if intent.version != 1
+                || intent.request.kind != FreshAccountEffectKind::AuthRefresh
+                || intent.request.model != request.model
+                || intent.request.config_sha256 != request.config_sha256
+                || intent.request.index != request.index
+                || intent.environment_sha256 != environment_digest(request)?
+            {
+                return Err(io::Error::other(format!(
+                    "fresh auth peer provenance differs: effect={}, state={}, artifact={}",
+                    prior.effect_id, prior.state, prior.artifact
+                )));
+            }
+            return Ok(Some((name, intent)));
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 fn effect_readback_from_dir(
@@ -771,6 +797,44 @@ fn effect_readback_from_dir(
     intent: &AccountEffectIntent,
 ) -> io::Result<FreshAccountEffectReadback> {
     let artifact = dir.display().to_string();
+    if let Some(reuse) = &intent.auth_source {
+        if intent.request.kind != FreshAccountEffectKind::AuthRefresh
+            || reuse.source_directory.contains('/')
+            || reuse.source_directory.contains("..")
+            || !reuse.source_directory.ends_with("-auth-refresh")
+        {
+            return Err(io::Error::other("fresh auth reuse source invalid"));
+        }
+        let source_dir = dir
+            .parent()
+            .ok_or_else(|| io::Error::other("fresh auth reuse parent absent"))?
+            .join(&reuse.source_directory);
+        if source_dir == dir {
+            return Err(io::Error::other("fresh auth reuse chain refused"));
+        }
+        let source = effect_intent(&source_dir)?
+            .ok_or_else(|| io::Error::other("fresh auth reuse intent absent"))?;
+        if source.version != 1
+            || source.auth_source.is_some()
+            || source.id != reuse.source_effect_id
+            || intent.plan_sha256 != format!("coalesced:{}", source.id)
+            || source.binding == intent.binding
+            || source.request.kind != FreshAccountEffectKind::AuthRefresh
+            || source.request.model != intent.request.model
+            || source.request.config_sha256 != intent.request.config_sha256
+            || source.request.account != intent.request.account
+            || source.request.index != intent.request.index
+            || source.environment_sha256 != intent.environment_sha256
+        {
+            return Err(io::Error::other("fresh auth reuse provenance changed"));
+        }
+        let mut peer = effect_readback_from_dir(&source_dir, &source)?;
+        peer.peer_effect_id = Some(peer.effect_id.clone());
+        peer.peer_artifact = Some(peer.artifact.clone());
+        peer.effect_id = intent.id.clone();
+        peer.artifact = artifact;
+        return Ok(peer);
+    }
     if let Some(reuse) = exact_file::<QuotaReuse>(dir, "reuse.json")? {
         if reuse.source_directory.contains('/')
             || reuse.source_directory.contains("..")
@@ -810,6 +874,8 @@ fn effect_readback_from_dir(
         windows: Vec::new(),
         completed_unix_seconds: None,
         artifact: artifact.clone(),
+        peer_effect_id: None,
+        peer_artifact: None,
     };
     let grant = grant_for_binding(dir, &intent.binding)?;
     let Some(grant) = grant else {
@@ -846,6 +912,8 @@ fn effect_readback_from_dir(
                 windows,
                 completed_unix_seconds: Some(completed),
                 artifact,
+                peer_effect_id: None,
+                peer_artifact: None,
             };
             if let Some(existing) = exact_file::<FreshAccountEffectReadback>(dir, "result.json")? {
                 if serde_json::to_value(&existing)? != serde_json::to_value(&receipt)? {
@@ -953,9 +1021,6 @@ pub(super) fn begin_account_effect(
             "fresh account effect already begun; observe exact effect",
         ));
     }
-    if request.kind == FreshAccountEffectKind::AuthRefresh {
-        refuse_concurrent_auth(directory, binding, &request.account)?;
-    }
     let first_request = FreshAccountEffectRequest {
         kind: FreshAccountEffectKind::QuotaFirst,
         ..request.clone()
@@ -981,11 +1046,40 @@ pub(super) fn begin_account_effect(
                     ..request.clone()
                 },
             )?;
-            if auth.state != "drained" {
-                return Err(io::Error::other(
-                    "quota retry has no drained auth prerequisite",
-                ));
+            if auth.state != "drained" || auth.outcome.as_deref() != Some("refreshed") {
+                return Err(io::Error::other(format!(
+                    "quota retry has no verified successful auth Q: effect={}, state={}, outcome={:?}, artifact={}, peer_effect={:?}, peer_artifact={:?}",
+                    auth.effect_id,
+                    auth.state,
+                    auth.outcome,
+                    auth.artifact,
+                    auth.peer_effect_id,
+                    auth.peer_artifact
+                )));
             }
+        }
+    }
+    if request.kind == FreshAccountEffectKind::AuthRefresh {
+        if let Some((source_directory, source)) =
+            coalescible_auth_source(directory, binding, request)?
+        {
+            let parent = directory.join("account-effects");
+            std::fs::create_dir(&dir)?;
+            File::open(&parent)?.sync_all()?;
+            let intent = AccountEffectIntent {
+                version: 1,
+                id: uuid::Uuid::new_v4().to_string(),
+                binding: binding.clone(),
+                request: redacted_effect_request(request),
+                environment_sha256: environment_digest(request)?,
+                plan_sha256: format!("coalesced:{}", source.id),
+                auth_source: Some(AuthReuse {
+                    source_directory,
+                    source_effect_id: source.id,
+                }),
+            };
+            durable_new(&dir, "intent.json", &intent)?;
+            return effect_readback_from_dir(&dir, &intent);
         }
     }
     if request.kind == FreshAccountEffectKind::QuotaFirst {
@@ -1002,6 +1096,7 @@ pub(super) fn begin_account_effect(
                 request: redacted_effect_request(request),
                 environment_sha256: environment_digest(request)?,
                 plan_sha256: format!("reused:{}", source.id),
+                auth_source: None,
             };
             durable_new(&dir, "intent.json", &intent)?;
             durable_new(
@@ -1042,6 +1137,7 @@ pub(super) fn begin_account_effect(
         request: redacted_effect_request(request),
         environment_sha256: environment_digest(request)?,
         plan_sha256: plan.digest.clone(),
+        auth_source: None,
     };
     durable_new(&dir, "intent.json", &intent)?;
     let prepared = prepare(&dir, binding.clone(), plan)?;
@@ -1243,6 +1339,40 @@ fn candidate_quota(
     if result.outcome.as_deref() != Some("valid_windows")
         && candidate.auth_refresh_command.is_some()
     {
+        let auth_dir = effect_directory(
+            directory,
+            binding,
+            &FreshAccountEffectRequest {
+                kind: FreshAccountEffectKind::AuthRefresh,
+                ..request.clone()
+            },
+        );
+        let auth_intent = effect_intent(&auth_dir)?.ok_or_else(|| {
+            io::Error::other(format!(
+                "fresh auth evidence absent: {}",
+                auth_dir.display()
+            ))
+        })?;
+        if auth_intent.version != 1
+            || auth_intent.binding != *binding
+            || auth_intent.request.model != candidate.model
+            || auth_intent.request.config_sha256 != candidate.config_sha256
+            || auth_intent.request.account != candidate.account
+            || auth_intent.request.index != candidate.index
+            || auth_intent.request.kind != FreshAccountEffectKind::AuthRefresh
+        {
+            return Err(io::Error::other("fresh auth effect provenance changed"));
+        }
+        let auth = effect_readback_from_dir(&auth_dir, &auth_intent)?;
+        if auth.state != "drained" {
+            return Err(io::Error::other(format!(
+                "fresh auth effect unknown: effect={}, artifact={}, peer_effect={:?}, peer_artifact={:?}",
+                auth.effect_id, auth.artifact, auth.peer_effect_id, auth.peer_artifact
+            )));
+        }
+        if auth.outcome.as_deref() != Some("refreshed") {
+            return Ok(None);
+        }
         let retry_dir = effect_directory(
             directory,
             binding,
@@ -2221,6 +2351,103 @@ mod tests {
     }
 
     #[test]
+    fn auth_reference_retains_unknown_and_rejects_changed_provenance() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("account-effects");
+        std::fs::create_dir(&parent).unwrap();
+        let process = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+        let source_binding = fixture_binding(&process, &process);
+        let mut follower_binding = fixture_binding(&process, &process);
+        follower_binding.handoff_id = uuid::Uuid::new_v4().to_string();
+        let request = FreshAccountEffectRequest {
+            d_key: uuid::Uuid::new_v4().to_string(),
+            model: "model".into(),
+            config_sha256: "a".repeat(64),
+            account: "shared-account".into(),
+            index: 0,
+            kind: FreshAccountEffectKind::AuthRefresh,
+            environment: vec![("PATH".into(), "/usr/bin:/bin".into())],
+        };
+        let source_dir = effect_directory(temp.path(), &source_binding, &request);
+        std::fs::create_dir(&source_dir).unwrap();
+        let source = AccountEffectIntent {
+            version: 1,
+            id: uuid::Uuid::new_v4().to_string(),
+            binding: source_binding.clone(),
+            request: redacted_effect_request(&request),
+            environment_sha256: environment_digest(&request).unwrap(),
+            plan_sha256: "source-plan".into(),
+            auth_source: None,
+        };
+        durable_new(&source_dir, "intent.json", &source).unwrap();
+        let (source_name, found) =
+            coalescible_auth_source(temp.path(), &follower_binding, &request)
+                .unwrap()
+                .unwrap();
+        assert_eq!(found.id, source.id);
+        let mut different = request.clone();
+        different.config_sha256 = "b".repeat(64);
+        assert!(
+            coalescible_auth_source(temp.path(), &follower_binding, &different)
+                .unwrap_err()
+                .to_string()
+                .contains(&source.id)
+        );
+        different = request.clone();
+        different.environment.push(("CHANGED".into(), "1".into()));
+        assert!(coalescible_auth_source(temp.path(), &follower_binding, &different).is_err());
+        different = request.clone();
+        different.account = "other-account".into();
+        assert!(
+            coalescible_auth_source(temp.path(), &follower_binding, &different)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            coalescible_auth_source(temp.path(), &source_binding, &request)
+                .unwrap()
+                .is_none()
+        );
+
+        let follower_dir = effect_directory(temp.path(), &follower_binding, &request);
+        std::fs::create_dir(&follower_dir).unwrap();
+        let follower = AccountEffectIntent {
+            version: 1,
+            id: uuid::Uuid::new_v4().to_string(),
+            binding: follower_binding,
+            request: redacted_effect_request(&request),
+            environment_sha256: environment_digest(&request).unwrap(),
+            plan_sha256: format!("coalesced:{}", source.id),
+            auth_source: Some(AuthReuse {
+                source_directory: source_name,
+                source_effect_id: source.id.clone(),
+            }),
+        };
+        durable_new(&follower_dir, "intent.json", &follower).unwrap();
+        // Simulates a lost original K reply and a broker process restart: only
+        // the durable intents are available, so neither root may assume Q.
+        let readback = effect_readback_from_dir(&follower_dir, &follower).unwrap();
+        assert_eq!(readback.state, "unknown");
+        assert_eq!(readback.effect_id, follower.id);
+        assert_eq!(readback.peer_effect_id.as_deref(), Some(source.id.as_str()));
+        assert_eq!(readback.artifact, follower_dir.display().to_string());
+        assert_eq!(
+            readback.peer_artifact.as_deref(),
+            Some(source_dir.display().to_string().as_str())
+        );
+        let mut forged = follower.clone();
+        forged.auth_source.as_mut().unwrap().source_effect_id = uuid::Uuid::new_v4().to_string();
+        assert!(effect_readback_from_dir(&follower_dir, &forged).is_err());
+        assert!(
+            coalescible_auth_source(temp.path(), &follower.binding, &request)
+                .unwrap()
+                .is_some(),
+            "a follower must not become a new authoritative auth K"
+        );
+        assert!(follower.auth_source.is_some());
+    }
+
+    #[test]
     fn broker_source_rejects_roster_effect_and_digest_forgery_or_edit() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir(temp.path().join("models")).unwrap();
@@ -2439,6 +2666,8 @@ mod tests {
             }],
             completed_unix_seconds: Some(now),
             artifact: "/fresh/effect".into(),
+            peer_effect_id: None,
+            peer_artifact: None,
         };
         assert_eq!(quota_remaining(&result, now).unwrap(), Some(7500));
         assert!(
@@ -2824,6 +3053,8 @@ mod tests {
         }
         let temporary = tempfile::tempdir().unwrap();
         let marker = temporary.path().join("auth-marker");
+        let auth_ready = temporary.path().join("auth-ready");
+        let auth_release = temporary.path().join("auth-release");
         let input = temporary.path().join("empty-input");
         std::fs::write(&input, b"").unwrap();
         let mut actor_child = Command::new("sleep").arg("60").spawn().unwrap();
@@ -2834,7 +3065,12 @@ mod tests {
             "if test -e '{}'; then printf '{{\"used_percent\":20,\"resets_at\":\"2099-01-01T00:00:00Z\"}}'; else exit 7; fi",
             marker.display()
         );
-        let auth_script = format!("printf x >> '{}'", marker.display());
+        let auth_script = format!(
+            "printf ready > '{}'; while test ! -e '{}'; do sleep 0.02; done; printf x >> '{}'",
+            auth_ready.display(),
+            auth_release.display(),
+            marker.display()
+        );
         let request =
             |index: usize, account: &str, quota: &str, auth: Option<&str>| FreshRouteRequest {
                 d_key: uuid::Uuid::new_v4().to_string(),
@@ -2932,16 +3168,245 @@ mod tests {
         assert_eq!(failed.effect_id, begun.effect_id);
         assert_eq!(failed.outcome.as_deref(), Some("failed"));
         assert!(!marker.exists());
+        let mut follower_binding = fixture_binding(&root, &actor);
+        follower_binding.handoff_id = uuid::Uuid::new_v4().to_string();
+        register_route_candidate(
+            temporary.path(),
+            &follower_binding,
+            &request(0, "recovering", &shell_script, Some(&auth_script)),
+            plan(
+                &image,
+                temporary.path(),
+                &File::open(&input).unwrap(),
+                vec!["--recovering".into()],
+                vec![],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let follower_first = effect(0, "recovering", FreshAccountEffectKind::QuotaFirst);
+        begin_account_effect(
+            temporary.path(),
+            &follower_binding,
+            &follower_first,
+            &root,
+            &actor,
+            0,
+            0,
+        )
+        .unwrap();
+        let wait_follower = |request: &FreshAccountEffectRequest| {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                let readback =
+                    observe_account_effect(temporary.path(), &follower_binding, request).unwrap();
+                if readback.state == "drained" {
+                    return readback;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "follower effect did not drain: {readback:?}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        assert_eq!(
+            wait_follower(&follower_first).outcome.as_deref(),
+            Some("failed")
+        );
         let auth = effect(0, "recovering", FreshAccountEffectKind::AuthRefresh);
-        begin_account_effect(temporary.path(), &binding, &auth, &root, &actor, 0, 0).unwrap();
+        let original_auth =
+            begin_account_effect(temporary.path(), &binding, &auth, &root, &actor, 0, 0).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !auth_ready.exists() {
+            assert!(Instant::now() < deadline, "auth effect never entered");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let follower_auth = begin_account_effect(
+            temporary.path(),
+            &follower_binding,
+            &auth,
+            &root,
+            &actor,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            follower_auth.peer_effect_id.as_deref(),
+            Some(original_auth.effect_id.as_str())
+        );
+        assert_eq!(
+            follower_auth.peer_artifact.as_deref(),
+            Some(original_auth.artifact.as_str())
+        );
+        assert_eq!(follower_auth.state, "pending");
+        assert!(
+            begin_account_effect(
+                temporary.path(),
+                &follower_binding,
+                &auth,
+                &root,
+                &actor,
+                0,
+                0,
+            )
+            .is_err(),
+            "follower auth intent was spent twice"
+        );
+        let retry = effect(0, "recovering", FreshAccountEffectKind::QuotaRetry);
+        assert!(
+            begin_account_effect(
+                temporary.path(),
+                &follower_binding,
+                &retry,
+                &root,
+                &actor,
+                0,
+                0,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("no verified successful auth Q")
+        );
+        assert!(
+            grant_for_binding(
+                &effect_directory(temporary.path(), &follower_binding, &auth),
+                &follower_binding
+            )
+            .unwrap()
+            .is_none()
+        );
+        std::fs::write(&auth_release, b"go").unwrap();
         assert_eq!(wait(&auth).outcome.as_deref(), Some("refreshed"));
+        let follower_auth = wait_follower(&auth);
+        assert_eq!(follower_auth.outcome.as_deref(), Some("refreshed"));
+        assert_eq!(
+            follower_auth.peer_effect_id.as_deref(),
+            Some(original_auth.effect_id.as_str())
+        );
         assert_eq!(std::fs::read(&marker).unwrap(), b"x");
         assert!(
             begin_account_effect(temporary.path(), &binding, &auth, &root, &actor, 0, 0).is_err()
         );
-        let retry = effect(0, "recovering", FreshAccountEffectKind::QuotaRetry);
+        begin_account_effect(
+            temporary.path(),
+            &follower_binding,
+            &retry,
+            &root,
+            &actor,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            wait_follower(&retry).outcome.as_deref(),
+            Some("valid_windows")
+        );
         begin_account_effect(temporary.path(), &binding, &retry, &root, &actor, 0, 0).unwrap();
         assert_eq!(wait(&retry).outcome.as_deref(), Some("valid_windows"));
+        // A peer's completed nonzero Q is observed as failure, never as
+        // permission for a follower quota retry or another auth shellout.
+        let mut failing_binding = fixture_binding(&root, &actor);
+        failing_binding.handoff_id = uuid::Uuid::new_v4().to_string();
+        let mut failing_follower = fixture_binding(&root, &actor);
+        failing_follower.handoff_id = uuid::Uuid::new_v4().to_string();
+        for bound in [&failing_binding, &failing_follower] {
+            register_route_candidate(
+                temporary.path(),
+                bound,
+                &request(0, "failed-auth", "exit 7", Some("exit 19")),
+                plan(
+                    &image,
+                    temporary.path(),
+                    &File::open(&input).unwrap(),
+                    vec!["--failed-auth".into()],
+                    vec![],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        let mut failure_effect = effect(0, "failed-auth", FreshAccountEffectKind::QuotaFirst);
+        for bound in [&failing_binding, &failing_follower] {
+            begin_account_effect(
+                temporary.path(),
+                bound,
+                &failure_effect,
+                &root,
+                &actor,
+                0,
+                0,
+            )
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                let result =
+                    observe_account_effect(temporary.path(), bound, &failure_effect).unwrap();
+                if result.state == "drained" {
+                    assert_eq!(result.outcome.as_deref(), Some("failed"));
+                    break;
+                }
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        failure_effect.kind = FreshAccountEffectKind::AuthRefresh;
+        let failed_source = begin_account_effect(
+            temporary.path(),
+            &failing_binding,
+            &failure_effect,
+            &root,
+            &actor,
+            0,
+            0,
+        )
+        .unwrap();
+        let failed_peer = begin_account_effect(
+            temporary.path(),
+            &failing_follower,
+            &failure_effect,
+            &root,
+            &actor,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            failed_peer.peer_effect_id.as_deref(),
+            Some(failed_source.effect_id.as_str())
+        );
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let result =
+                observe_account_effect(temporary.path(), &failing_follower, &failure_effect)
+                    .unwrap();
+            if result.state == "drained" {
+                assert_eq!(result.outcome.as_deref(), Some("failed"));
+                assert_eq!(
+                    result.peer_effect_id.as_deref(),
+                    Some(failed_source.effect_id.as_str())
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        failure_effect.kind = FreshAccountEffectKind::QuotaRetry;
+        assert!(
+            begin_account_effect(
+                temporary.path(),
+                &failing_follower,
+                &failure_effect,
+                &root,
+                &actor,
+                0,
+                0,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("no verified successful auth Q")
+        );
         let mut sibling_binding = binding.clone();
         sibling_binding.handoff_id = uuid::Uuid::new_v4().to_string();
         register_route_candidate(
@@ -2995,6 +3460,7 @@ mod tests {
             request: redacted_effect_request(&first),
             environment_sha256: environment_digest(&first).unwrap(),
             plan_sha256: "pending-plan".into(),
+            auth_source: None,
         };
         durable_new(&pending_dir, "intent.json", &pending_intent).unwrap();
         assert_eq!(
