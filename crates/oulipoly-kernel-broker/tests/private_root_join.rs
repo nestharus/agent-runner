@@ -948,6 +948,11 @@ fn inner() {
                 b"retired copied owner"
             );
         }
+        if matches!(mode.as_str(), "normal_release" | "normal_recipient") {
+            // Restart the actual old sidecar/source or pending recipient
+            // authority after an independent empty fresh publication.
+            FreshV30Lane::initialize_at(&broker_state).unwrap();
+        }
         if mode != "normal_broker_death" {
             stop(&mut broker);
         }

@@ -132,7 +132,7 @@ fn private_fresh_recipient_delivery_ack_collision_and_restart() {
     );
     drop(lane);
 
-    let socket = broker_root.join("fresh.sock");
+    let socket = private.path().join("v30.sock");
     let runner = std::env::current_exe().unwrap();
     let mut broker = start_broker(&broker_root, &socket, &runner);
     let first_request = uuid::Uuid::new_v4().to_string();
@@ -743,9 +743,11 @@ fn insert_fresh_payload(
 
 fn start_broker(root: &Path, socket: &Path, runner: &Path) -> Child {
     let mut child = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
-        .arg("--serve-fresh-v30")
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", root)
-        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", socket)
+        .env(
+            "OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1",
+            root.parent().unwrap().join("control.sock"),
+        )
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", runner)
         .spawn()
         .unwrap();

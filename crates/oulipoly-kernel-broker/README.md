@@ -193,18 +193,29 @@ connection provenance before a future K may have effects.
 Older prepared v4 records without the new sidecar pin can still replay the
 same N grant ID, but native k refuses them as retained debt.
 
-## Fresh v30 session request
+## Fresh v30 domain in the broker process
 
-The separate fresh v30 socket accepts challenged `I` route readback and
-`D`/`d` session allocation/readback only. `D` carries a caller-created,
-persisted 16-byte request UUID after the challenge. The broker records that
-request with the minted session in its root-owned v30 sidecar; repeating `D`
-with the same UUID returns the exact row, including after a lost reply or
-restart. `d` uses the same frame and returns that row or `fresh-session absent`
-without allocating. A caller must retain the UUID before its first `D` send;
-using a new UUID requests a new session. Neither operation grants work,
-notification, recipient delivery, or ACK. The legacy socket and v29 debt stay
-separate.
+The default host-root service owns both `control.sock` and, when the separate
+empty `v30/` publication already exists at startup, `v30.sock`. The old loop
+alone owns the held release gate and mutable root, guardian, driver, work and
+physical registries. The fresh listener runs in a separate thread with its
+own `FreshV30Lane` and fixed `v30/state.db` and sidecar. Its handler cannot
+select old State; the old handler cannot select fresh State. A failed fresh
+open closes only the fresh endpoint and logs the failure. The old service may
+run without `v30/`. After administrator initialization publishes `v30/`, the
+default service must restart to bind the fresh socket. An abandoned exact
+`.v30-fresh-<v4 UUID>` directory is recognized during old registry recovery;
+arbitrary root entries still refuse restart.
+
+Production fresh U, new D, F and all work effects remain closed until a
+durable released-child handoff, real fresh invocation, Bash handle and
+registration, one-use W, result and ACK are implemented. Challenged I and
+exact d readback remain available. Private fixtures exercise U/D and
+recipient protocol mechanics, but cannot authorize production effects. The
+retired `--serve-fresh-v30` mode refuses in production; its private fixture
+form remains only for an older paired test. The service unit still starts
+the default mode. Old v29 rows and pending source, WAL, physical and ACK debt
+remain in the independent old stores, with no row import.
 
 ## Remaining interfaces
 

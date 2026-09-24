@@ -367,6 +367,15 @@ fn private_broker_has_distinct_fresh_route_while_old_wal_writer_survives() {
     );
     broker.kill().unwrap();
     broker.wait().unwrap();
+    // A broken fresh publication closes only its endpoint. The old registry
+    // and control route remain readable after the same process restarts.
+    fs::remove_file(broker_root.join("v30/sidecar/state-source.json")).unwrap();
+    let mut old_after_fresh_failure = start_broker(&broker_root, &old_socket, &runner);
+    assert_eq!(socket_peer_pid(&old_socket), old_after_fresh_failure.id());
+    assert_eq!(request(&old_socket, b'i'), "entry-gate-v1 legacy-open\n");
+    assert!(UnixStream::connect(&socket).is_err());
+    old_after_fresh_failure.kill().unwrap();
+    old_after_fresh_failure.wait().unwrap();
 }
 
 fn start_broker(
