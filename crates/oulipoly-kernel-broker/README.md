@@ -219,6 +219,17 @@ remain in the independent old stores, with no row import.
 
 ## Remaining interfaces
 
+The feature-gated fresh-provider fixture executes the broker-opened host inode
+with `execveat(AT_EMPTY_PATH)` after one-use K. Its v2 grant binds the broker
+resolved path, descriptor device/inode/mount, cwd, sealed input and recipe.
+`preflight_image` records optional hash, shebang and xattr observations plus
+metadata from before K; these fields do **not** attest bytes or permissions at
+exec. A mutable inode can change before or during exec. Linux applies the
+inode's then-current permissions, mount and LSM rules; an exec failure after K
+is recorded as a provider exit and physical Q when the namespace drains.
+Uncertain K/Q remains unknown and cannot be replayed automatically. This
+source-only fixture does not prove installed host sudo or open the selector.
+
 - The merged State/runtime/Runner PID readers translate namespace-local PIDs
   into the caller's procfs observer and fail closed on changed or ambiguous
   identity. The observer tag in the child environment is a drift check, not

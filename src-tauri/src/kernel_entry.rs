@@ -661,12 +661,12 @@ impl oulipoly_runtime::executor::cli::fresh_remote::FreshProviderBackend
         use oulipoly_kernel_broker::protocol;
         use std::os::unix::fs::OpenOptionsExt;
         let socket = broker_socket().with_file_name("v30.sock");
-        // Descriptor identity and byte content are rechecked and sealed by
-        // the host broker before one-use K; neither configured path nor text
-        // recipe is trusted after this point.
+        // The broker binds this descriptor's inode and mount to the sealed
+        // recipe before one-use K. Executable content remains host mutable;
+        // a preflight hash does not attest bytes at the later execveat.
         let image = std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_PATH)
             .open(&plan.executable)
             .map_err(|e| format!("fresh provider image: {e}"))?;
         let cwd = std::fs::OpenOptions::new()

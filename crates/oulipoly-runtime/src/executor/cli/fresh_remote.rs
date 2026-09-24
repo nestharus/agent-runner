@@ -64,8 +64,8 @@ pub fn execute_fresh_headless(
         return Err("fresh broker provider shape unsupported before K".into());
     }
     let parts = super::shell_split(&provider.command);
-    if parts.len() != 1 || !Path::new(&parts[0]).is_absolute() {
-        return Err("fresh broker requires one absolute executable before K".into());
+    if parts.is_empty() || !Path::new(&parts[0]).is_absolute() {
+        return Err("fresh broker requires an absolute first executable before K".into());
     }
     let input_args = resolve_input_flags(model, &HashMap::new())?;
     if provider
@@ -252,19 +252,52 @@ mod tests {
     }
 
     #[test]
-    fn prefixed_and_resume_shapes_refuse_before_backend() {
+    fn resume_shape_refuses_before_backend() {
         let mut backend = ObserveBackend {
             calls: 0,
             wait_status: 0,
         };
         let cwd = std::env::current_dir().unwrap();
-        assert!(
-            execute_fresh_headless(&model("env /bin/true"), 0, "x", &cwd, &mut backend).is_err()
-        );
         let mut resume = model("/bin/true");
         resume.prompt_mode = PromptMode::Arg;
         assert!(execute_fresh_headless(&resume, 0, "x", &cwd, &mut backend).is_err());
         assert_eq!(backend.calls, 0);
+    }
+
+    #[test]
+    fn absolute_prefix_is_part_of_the_exact_broker_recipe() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let old_data = std::env::var_os(oulipoly_state::paths::DATA_DIR_ENV);
+        unsafe { std::env::set_var(oulipoly_state::paths::DATA_DIR_ENV, data.path()) };
+        struct PrefixBackend;
+        impl FreshProviderBackend for PrefixBackend {
+            fn run_to_physical_q(
+                &mut self,
+                plan: FreshProviderPlan,
+            ) -> Result<FreshProviderCompletion, String> {
+                assert_eq!(plan.executable, Path::new("/usr/bin/env"));
+                assert_eq!(plan.argv, ["-u", "CLAUDECODE", "/bin/true", "--fixture"]);
+                Ok(FreshProviderCompletion {
+                    wait_status: 0,
+                    stdout: b"prefix output".to_vec(),
+                    stderr: vec![],
+                })
+            }
+        }
+        let result = execute_fresh_headless(
+            &model("/usr/bin/env -u CLAUDECODE /bin/true"),
+            0,
+            "raw prompt",
+            &std::env::current_dir().unwrap(),
+            &mut PrefixBackend,
+        )
+        .unwrap();
+        assert_eq!(result.stdout, b"prefix output");
+        match old_data {
+            Some(value) => unsafe { std::env::set_var(oulipoly_state::paths::DATA_DIR_ENV, value) },
+            None => unsafe { std::env::remove_var(oulipoly_state::paths::DATA_DIR_ENV) },
+        }
     }
 
     #[test]
