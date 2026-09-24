@@ -315,8 +315,10 @@ fn classify_completion_summary(summary: CompletionProtocolSummary) -> Option<&'s
     }
 }
 
-pub(super) const CURRENT_VERSION: i64 = 29;
-pub(super) const BROKER_OWNED_VERSION: i64 = 30;
+// v30 was assigned to the broker-owned sidecar. Keep that ordinal reserved so
+// an ordinary opener can never mistake an old broker cutover for an upgrade.
+pub(super) const CURRENT_VERSION: i64 = 31;
+pub(super) const BROKER_OWNED_VERSION: i64 = 32;
 const MAX_SUPPORTED_VERSION: i64 = CURRENT_VERSION;
 const SCHEMA_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -503,7 +505,26 @@ const SCHEMA_STEPS: &[MigrationStep] = &[
         owner: SidecarEntity::CompletionAuthority,
         apply: migrate_native_worker_kernel_q,
     },
+    MigrationStep {
+        target_version: 30,
+        owner: SidecarEntity::CompletionAuthority,
+        apply: reserved_broker_version,
+    },
+    MigrationStep {
+        target_version: 31,
+        owner: SidecarEntity::CompletionAuthority,
+        apply: migrate_uncertain_activation,
+    },
 ];
+
+fn reserved_broker_version(_conn: &Connection) -> Result<(), String> {
+    Ok(())
+}
+
+fn migrate_uncertain_activation(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(include_str!("migrations/0031_uncertain_activation.sql"))
+        .map_err(|error| error.to_string())
+}
 
 fn migrate_native_worker_kernel_q(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(include_str!("migrations/0029_native_worker_kernel_q.sql"))
@@ -670,6 +691,12 @@ fn after_stale_observation() {
 }
 
 fn validate_supported_version(version: i64) -> Result<(), String> {
+    if version == 30 {
+        return Err(
+            "Unsupported PID mailbox sidecar schema version 30; reserved broker-owned ordinal"
+                .into(),
+        );
+    }
     if (0..=MAX_SUPPORTED_VERSION).contains(&version) {
         return Ok(());
     }
@@ -697,7 +724,9 @@ pub(super) fn validate_broker_owned(conn: &Connection) -> Result<String, String>
         .unchecked_transaction()
         .map_err(|error| format!("Failed to observe broker sidecar: {error}"))?;
     if sidecar_version(&tx)? != BROKER_OWNED_VERSION {
-        return Err("broker sidecar requires schema version 30".into());
+        return Err(format!(
+            "broker sidecar requires schema version {BROKER_OWNED_VERSION}"
+        ));
     }
     super::completion_continuation::validate_broker_schema_on(&tx)?;
     let definition: String = tx
@@ -1467,6 +1496,8 @@ pub(crate) fn remove_completion_recovery_working_set_for_legacy_fixture(conn: &C
          DROP INDEX IF EXISTS idx_mailbox_deliverable_target_live;
          DROP INDEX IF EXISTS idx_mailbox_deliverable_global;
          DROP INDEX IF EXISTS idx_mailbox_delivery_attempt_unresolved;
+         DROP TRIGGER IF EXISTS completion_uncertain_input_preserve;
+         DROP TABLE IF EXISTS completion_uncertain_input;
          DROP INDEX IF EXISTS idx_completion_event_listener_session_live;
          DROP INDEX IF EXISTS idx_completion_event_listener_unacknowledged;
          DROP INDEX IF EXISTS idx_completion_event_listener_retirement_pending;
@@ -1574,6 +1605,62 @@ mod contention_tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
+
+    #[test]
+    fn v29_upgrade_retains_submitted_input_and_reserves_old_broker_ordinal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        let mut db = super::super::MailboxDb::open(&path).unwrap();
+        let result = db
+            .enqueue_submitted_input(&super::super::SubmittedInputEnqueue {
+                submission_token: "upgrade-pending",
+                target: super::super::InboxTarget {
+                    kind: super::super::InboxTargetKind::Session,
+                    id: "session",
+                },
+                input: b"exact-pending-input",
+            })
+            .unwrap();
+        let super::super::EnqueueResult::Inserted(row) = result else {
+            panic!("fixture input was not inserted");
+        };
+        drop(db);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP TRIGGER completion_uncertain_input_preserve;
+             DROP TABLE completion_uncertain_input;
+             DROP INDEX idx_mailbox_deliverable_session_live;
+             DROP INDEX idx_mailbox_deliverable_target_live;
+             DROP INDEX idx_mailbox_deliverable_global;
+             PRAGMA user_version=29;",
+        )
+        .unwrap();
+        conn.execute_batch(include_str!("migrations/0022_live_history_barrier.sql"))
+            .unwrap();
+        drop(conn);
+        db = super::super::MailboxDb::open(&path).unwrap();
+        assert_eq!(sidecar_version(db.connection()).unwrap(), CURRENT_VERSION);
+        assert_eq!(db.pending_delivery_count("session", None).unwrap(), 1);
+        assert_eq!(db.uncertain_activation_input_count("session").unwrap(), 0);
+        assert_eq!(
+            super::super::MailboxDb::open_historical_read_only(&path)
+                .unwrap()
+                .list_mailbox("session", true)
+                .unwrap()[0]
+                .seq,
+            row.seq
+        );
+        drop(db);
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "user_version", 30).unwrap();
+        drop(conn);
+        assert!(
+            super::super::MailboxDb::open(&path)
+                .err()
+                .unwrap()
+                .contains("Unsupported PID mailbox sidecar schema version 30")
+        );
+    }
 
     #[test]
     fn published_v24_to_v28_upgrade_to_native_worker_ledger_preserves_attempts() {

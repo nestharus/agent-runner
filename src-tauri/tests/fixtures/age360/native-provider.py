@@ -76,6 +76,10 @@ def launch(request):
             runner = os.environ["AGENT_BASH_AGENT_RUNNER_BIN"]
             listed = subprocess.run([runner,"mailbox","list","--session-id",known,"--all","--json"],capture_output=True,check=True,timeout=10)
             rows = json.loads(listed.stdout)["rows"]
+            if case == "owner_only" and "unrelated-followup" in prompt:
+                # The negative control sees retained history but may ACK only
+                # the newly admitted, deliverable input.
+                rows = [row for row in rows if row["delivery_error"] != "completion_effect_uncertain"]
             if case == "two_source":
                 assert len(rows) == 2, rows
                 second = rows[1]
@@ -99,7 +103,7 @@ def launch(request):
                 assert rows[0]["handle"] in prompt
                 assert json.loads(rows[0]["payload_json"])["fixture"] == "legacy-materialized"
             elif os.environ.get("AGE360_CASE") == "owner_only":
-                assert "native-custody-input" in prompt
+                assert "native-custody-input" in prompt or "unrelated-followup" in prompt
             else:
                 assert rows[0]["handle"] in prompt
                 if case in ("native_missing", "missing_selection", "missing_pin", "missing_short"):

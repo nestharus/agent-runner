@@ -49,7 +49,108 @@ use crate::sqlite_observability::{
     process_query_plans_enabled,
 };
 
+/// Physical drain proves that this activation ended, not that its selected
+/// input caused no provider effect. Fence every still-pending row from the
+/// exact claim before deleting that claim. Rows enqueued after the claim are
+/// outside its immutable sequence bounds and remain independently startable.
+fn retain_uncertain_activation_input_on(
+    tx: &Transaction<'_>,
+    attempt: &ContinuationAttempt,
+) -> Result<(), String> {
+    let session = attempt
+        .session_id
+        .as_deref()
+        .ok_or("activation session absent")?;
+    let token = attempt
+        .claim_token
+        .as_deref()
+        .ok_or("activation claim absent")?;
+    let bounds: Option<(Option<i64>, Option<i64>)> = tx
+        .query_row(
+            "SELECT min_pending_seq_at_claim,max_pending_seq_at_claim
+             FROM session_wake_claim WHERE session_id=?1 AND claim_token=?2",
+            params![session, token],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let bounds = bounds.ok_or("exact activation claim absent at drain")?;
+    let (Some(min_seq), Some(max_seq)) = bounds else {
+        let pending: bool = tx
+            .query_row(
+                &format!(
+                    "SELECT EXISTS(SELECT 1 FROM mailbox WHERE delivered_at IS NULL
+                     AND ((target_kind IS NULL AND session_id=?1)
+                          OR (target_kind='session' AND target_id=?1)) AND {})",
+                    super::super::DELIVERABLE_MAILBOX_ERROR_PREDICATE
+                ),
+                [session],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        return if pending {
+            Err("activation claim lacks selected input bounds".into())
+        } else {
+            Ok(())
+        };
+    };
+    if min_seq <= 0 || max_seq < min_seq {
+        return Err("activation claim has invalid selected input bounds".into());
+    }
+    let select = format!(
+        "INSERT INTO completion_uncertain_input(mailbox_seq,attempt_id,recorded_at,disposition)
+         SELECT seq,?1,?5,'effect_uncertain' FROM mailbox
+         WHERE seq BETWEEN ?3 AND ?4 AND delivered_at IS NULL
+           AND ((target_kind IS NULL AND session_id=?2)
+                OR (target_kind='session' AND target_id=?2))
+           AND {}",
+        super::super::DELIVERABLE_MAILBOX_ERROR_PREDICATE
+    );
+    tx.execute(
+        &select,
+        params![attempt.attempt_id, session, min_seq, max_seq, now_rfc3339()],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.execute(
+        "UPDATE mailbox SET delivery_error=?2
+         WHERE seq IN (SELECT mailbox_seq FROM completion_uncertain_input WHERE attempt_id=?1)
+           AND delivered_at IS NULL",
+        params![
+            attempt.attempt_id,
+            super::super::COMPLETION_EFFECT_UNCERTAIN_ERROR
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 impl MailboxDb {
+    /// Read-only operator visibility. The delivery count intentionally omits
+    /// these rows, so status must report the separate retained obligation.
+    pub fn uncertain_activation_input_count(&self, session_id: &str) -> Result<usize, String> {
+        let version: i64 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        if version < 31 {
+            return Ok(0);
+        }
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM completion_uncertain_input uncertain
+                 JOIN mailbox message ON message.seq=uncertain.mailbox_seq
+                 WHERE message.delivered_at IS NULL
+                   AND message.delivery_error='completion_effect_uncertain'
+                   AND ((message.target_kind IS NULL AND message.session_id=?1)
+                        OR (message.target_kind='session' AND message.target_id=?1))",
+                [session_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        usize::try_from(count).map_err(|error| error.to_string())
+    }
+
     pub fn reserve_continuation_attempt(
         &mut self,
         request: &ContinuationAttempt,
@@ -251,6 +352,9 @@ impl MailboxDb {
             }
         }
         if attempt.operation == "activation" {
+            if changed == 1 {
+                retain_uncertain_activation_input_on(&tx, attempt)?;
+            }
             tx.execute(
                 "DELETE FROM session_wake_claim WHERE session_id=?1 AND claim_token=?2",
                 params![attempt.session_id, attempt.claim_token],
@@ -1987,6 +2091,9 @@ impl MailboxDb {
             }
         }
         if attempt.operation == "activation" {
+            if changed == 1 {
+                retain_uncertain_activation_input_on(&tx, attempt)?;
+            }
             tx.execute(
                 "DELETE FROM session_wake_claim WHERE session_id=?1 AND claim_token=?2",
                 params![attempt.session_id, attempt.claim_token],

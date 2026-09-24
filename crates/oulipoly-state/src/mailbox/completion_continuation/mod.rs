@@ -641,6 +641,7 @@ fn validate_schema_version_on(conn: &Connection, required_version: i64) -> Resul
                 "SELECT type,name,sql FROM sqlite_master
                  WHERE sql IS NOT NULL AND (
                     name LIKE 'completion_continuation_%'
+                    OR name LIKE 'completion_uncertain_input%'
                     OR name LIKE 'completion_native_grant_%'
                     OR name LIKE 'completion_native_worker_%'
                     OR name LIKE 'completion_native_kernel_%'
@@ -734,7 +735,12 @@ fn validate_schema_version_on(conn: &Connection, required_version: i64) -> Resul
                 ))
                 .map_err(|e| e.to_string())?;
             expected.execute_batch(
-                "CREATE TABLE mailbox(completion_provenance TEXT NOT NULL DEFAULT 'unclassified');",
+                "CREATE TABLE mailbox(seq INTEGER PRIMARY KEY,session_id TEXT,target_kind TEXT,
+                 target_id TEXT,delivered_at TEXT,delivery_error TEXT,
+                 completion_provenance TEXT NOT NULL DEFAULT 'unclassified');
+                 CREATE INDEX idx_mailbox_deliverable_session_live ON mailbox(seq);
+                 CREATE INDEX idx_mailbox_deliverable_target_live ON mailbox(seq);
+                 CREATE INDEX idx_mailbox_deliverable_global ON mailbox(seq);",
             ).map_err(|e| e.to_string())?;
             expected.execute_batch(super::schema::COMPLETION_PROVENANCE_TRIGGER_SQL)
                 .map_err(|e| e.to_string())?;
@@ -752,6 +758,8 @@ fn validate_schema_version_on(conn: &Connection, required_version: i64) -> Resul
             expected.execute_batch(include_str!("../migrations/0028_native_grant_binding.sql"))
                 .map_err(|e| e.to_string())?;
             expected.execute_batch(include_str!("../migrations/0029_native_worker_kernel_q.sql"))
+                .map_err(|e| e.to_string())?;
+            expected.execute_batch(include_str!("../migrations/0031_uncertain_activation.sql"))
                 .map_err(|e| e.to_string())?;
             definitions(&expected)
         })
@@ -2459,6 +2467,44 @@ mod tests {
             db.record_continuation_never_forked(&attempt, "different_reason")
                 .is_err()
         );
+        assert!(
+            db.wake_session_reader()
+                .wake_claim("session")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn never_forked_activation_keeps_submitted_input_retryable() {
+        let (_dir, mut db, owner) = fixture();
+        let result = db
+            .enqueue_submitted_input(&crate::mailbox::SubmittedInputEnqueue {
+                submission_token: "pre-effect",
+                target: crate::mailbox::InboxTarget {
+                    kind: crate::mailbox::InboxTargetKind::Session,
+                    id: "session",
+                },
+                input: b"safe-retry",
+            })
+            .unwrap();
+        let crate::mailbox::EnqueueResult::Inserted(row) = result else {
+            panic!("fixture input was not inserted");
+        };
+        let attempt = reservation(&mut db, &owner);
+        db.conn
+            .execute(
+                "UPDATE session_wake_claim
+                 SET min_pending_seq_at_claim=?1,max_pending_seq_at_claim=?1
+                 WHERE session_id='session'",
+                [row.seq],
+            )
+            .unwrap();
+        db.accept_continuation_attempt(&attempt).unwrap();
+        db.record_continuation_never_forked(&attempt, "worker_not_forked")
+            .unwrap();
+        assert_eq!(db.uncertain_activation_input_count("session").unwrap(), 0);
+        assert_eq!(db.pending_delivery_count("session", None).unwrap(), 1);
         assert!(
             db.wake_session_reader()
                 .wake_claim("session")
