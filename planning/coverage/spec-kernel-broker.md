@@ -25,6 +25,7 @@
 - `crates/oulipoly-kernel-broker/tests/private_source_physical.rs`
 - `crates/oulipoly-kernel-broker/tests/private_accepted_h_frame.rs`
 - `crates/oulipoly-kernel-broker/tests/private_installed_exec.rs`
+- `crates/oulipoly-kernel-broker/tests/age319_fresh_recipient_socket.rs`
 - `src-tauri/src/kernel_entry.rs`
 - `src-tauri/src/completion_owner/linux.rs`
 - `src-tauri/src/completion_owner/driver.rs`
@@ -105,7 +106,7 @@
 ## Boundaries
 
 - Classification is never positive work authority.
-- Fresh v30 session allocation is broker-owned; production source effects, source acceptance/release, recipient delivery/ACK, and native K/Q remain closed. Private fixtures exercise the source launch and native physical paths separately. The installed launcher and normal v30 entry remain gated pending combined lineage and host-root proof.
+- Fresh v30 session allocation and recipient submit/readback/token-ACK/delegated-ACK socket mechanics are broker-owned. Production source acceptance, recipient runtime attachment, provider transport, and native K/Q remain closed. The recipient fixture supplies a synthetic private accepted source/attempt and exact process binding; it is no proof of ordinary Runner delivery. The installed launcher and normal v30 entry remain gated pending combined lineage and host-root proof.
 - The unprivileged user-namespace fixture cannot establish host-root sudo/setuid behavior.
 - Ordinary Runner/Bash entry and allocated-attempt NNP/seccomp remain. The opt-in entry keeps the host guardian outside the root PID namespace and releases only the fixed Runner for help/offline diagnostics.
 
@@ -115,6 +116,7 @@
 - `crates/oulipoly-kernel-broker/tests/private_work_pidns.rs` exercises root/work binding, sibling separation, adopted peer classification, persistence poisoning, and restart uncertainty.
 - `crates/oulipoly-kernel-broker/tests/private_root_join.rs` runs the actual opt-in Runner and broker binaries in a private user namespace, holds the child at the pre-exec gate, and checks exact root/guardian placement, persisted child stamp, V acceptance and changed-incarnation/socket refusal, replay denial and broker restart debt. Its normal v30 modes use an independently admitted StateDb suffix, a corrupted retired sidecar, and the retained broker connection. The execed driver projects the bounded suffix, rejects wrong root/source/owner and stale/duplicate repair requests, reconciles a lost reply by exact cursor readback, and stops at the missing source grant. Restart retains the repaired cursor without admitting another root.
 - `crates/oulipoly-kernel-broker/tests/private_source_physical.rs` runs a Rust nested PID1 reaper with a held Python worker and an adopted descendant longer than five seconds. It exercises post-owner readback, complete bounded output, duplicate and orphan debt, in-place output change, missing receipt, and cancellation intent replay after registry reopen. Its consumed grant is a private fixture surrogate, not a Bash-created source or production consume.
+- `crates/oulipoly-kernel-broker/tests/age319_fresh_recipient_socket.rs` uses a synthetic private accepted source/attempt and real fresh broker socket for exact payload, lost reply, wrong/offline recipient, restart, duplicate ACK, lane collision and explicitly delegated noncontiguous batch ACK. It does not establish a production source writer or provider transport.
 - `crates/oulipoly-kernel-broker/src/linux_main.rs` unit tests exercise challenged credentials, a `CAP_SYS_ADMIN` child namespace socket handoff, exact host namespace policy, descriptor rejection, and production dispatch E/P/G ordering.
 - `crates/oulipoly-kernel-broker/src/entry_registry.rs` exercises persisted exact prepare/bind and sibling/replay denial.
 - `crates/oulipoly-kernel-broker/src/installed_launch.rs` and `protocol.rs` unit fixtures capture CLI/GUI argument bytes, environment, cwd, absent stdio, PTY FDs/window size, second entrant, missing socket and a lost reply without an automatic retry. The fixture has no workload execution.

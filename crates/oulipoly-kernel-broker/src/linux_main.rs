@@ -10,6 +10,7 @@ mod root_join;
 mod source_launch;
 #[path = "work_launch.rs"]
 mod work_launch;
+use base64::Engine as _;
 use oulipoly_kernel_broker::accepted_grant::GrantRegistry;
 use oulipoly_kernel_broker::cutover_gate::EntryGate;
 use oulipoly_kernel_broker::entry_registry::{EntryRegistry, ProcessStamp};
@@ -22,8 +23,8 @@ use oulipoly_kernel_broker::native_receipt::{
     BoundNativeAuthority, verify as verify_native_receipt,
 };
 use oulipoly_kernel_broker::protocol::{
-    AcceptedWorkSpec, JoinSpec, JoinedChildWitness, LaunchAcceptedWorkSpec, NativeKSpec,
-    NativePrepareSpec, OwnerWitness, ProcessWitness, SourceControlUse, SourceScope,
+    AcceptedWorkSpec, FreshRecipientRequest, JoinSpec, JoinedChildWitness, LaunchAcceptedWorkSpec,
+    NativeKSpec, NativePrepareSpec, OwnerWitness, ProcessWitness, SourceControlUse, SourceScope,
     SourceSocketWitness, SourceTicketUse, StateGenerationSpec, StateReadSpec, StateWriteAction,
     StateWriteSpec,
 };
@@ -32,7 +33,8 @@ use oulipoly_kernel_broker::source_acceptance::capture_and_stage_v2_evidence;
 use oulipoly_kernel_broker::source_physical::{SourceObservation, SourcePhysicalRegistry};
 use oulipoly_kernel_broker::work_registry::{Scope, WorkRegistry, classify_scope};
 use oulipoly_state::mailbox::{
-    BrokerReleaseEvidence, BrokerSidecar, FreshV30Lane, PreparedBrokerOwner, PreparedProcessStamp,
+    BrokerReleaseEvidence, BrokerSidecar, FreshDeliverySubmission, FreshRecipientIdentity,
+    FreshV30Lane, PreparedBrokerOwner, PreparedProcessStamp,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
@@ -149,6 +151,9 @@ enum RequestPayload {
     None,
     FreshSessionRequest {
         request_id: String,
+    },
+    FreshRecipientRequest {
+        request: FreshRecipientRequest,
     },
     Prepare {
         root_id: String,
@@ -332,6 +337,7 @@ fn recv_request(
         b'L' => (18..=48 * 1024 + 17).contains(&read),
         b'V' | b'S' | b's' | b'T' | b'H' | b'K' | b'B' | b'N' | b'k' | b't' | b'R' | b'W'
         | b'Y' => (18..=2048 + 17).contains(&read),
+        b'F' => (18..=8192 + 17).contains(&read),
         _ => read == 17,
     };
     if !valid_length
@@ -368,6 +374,9 @@ fn recv_request(
     }
     process.verify()?;
     let payload = match request[0] {
+        b'F' => RequestPayload::FreshRecipientRequest {
+            request: serde_json::from_slice(&request[17..read as usize])?,
+        },
         b'D' | b'd' => RequestPayload::FreshSessionRequest {
             request_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
         },
@@ -3383,6 +3392,16 @@ fn serve() -> io::Result<()> {
     }
 }
 
+fn fresh_payload_reply(
+    kind: &str,
+    submission: FreshDeliverySubmission,
+) -> io::Result<serde_json::Value> {
+    let mut grant = serde_json::to_value(submission.readback)?;
+    grant["delivery_token"] = serde_json::Value::String(submission.delivery_token);
+    Ok(serde_json::json!({ "kind": kind, "grant": grant,
+        "payload_base64": base64::engine::general_purpose::STANDARD.encode(submission.payload) }))
+}
+
 fn serve_fresh_v30() -> io::Result<()> {
     if unsafe { libc::geteuid() } != 0 {
         return Err(io::Error::other("host root required"));
@@ -3449,7 +3468,8 @@ fn serve_fresh_v30() -> io::Result<()> {
     for incoming in listener.incoming() {
         let Ok(mut stream) = incoming else { continue };
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+        let mut submitted_grant = None;
         let answer = (|| -> io::Result<String> {
             let (operation, payload, peer) = peer_from_request(&mut stream)?;
             peer.process.verify()?;
@@ -3464,11 +3484,24 @@ fn serve_fresh_v30() -> io::Result<()> {
                 }
                 .into());
             }
-            if !peer.process.same_executable_as(&runner_image)? {
+            let local_lookup = matches!(
+                &payload,
+                RequestPayload::FreshRecipientRequest {
+                    request: FreshRecipientRequest::Lookup { .. }
+                }
+            );
+            if !local_lookup && !peer.process.same_executable_as(&runner_image)? {
                 return Err(io::Error::other(
                     "fresh lane requires installed Runner image",
                 ));
             }
+            let recipient = FreshRecipientIdentity {
+                host_pid: peer.process.host_pid,
+                boot_id: peer.process.boot_id.clone(),
+                starttime_ticks: peer.process.starttime_ticks,
+                pidns_dev: peer.process.pidns_dev,
+                pidns_ino: peer.process.pidns_ino,
+            };
             match operation {
                 b'I' if matches!(payload, RequestPayload::None) => Ok(format!(
                     "fresh-v30-route {} {} {}\n",
@@ -3502,13 +3535,124 @@ fn serve_fresh_v30() -> io::Result<()> {
                         serde_json::to_string(&session)?
                     ))
                 }
+                b'F' => {
+                    let RequestPayload::FreshRecipientRequest { request } = payload else {
+                        return Err(io::Error::other("fresh recipient request absent"));
+                    };
+                    let reply = match request {
+                        FreshRecipientRequest::Submit {
+                            allocation_request_id,
+                            delivery_request_id,
+                        } => {
+                            if instance.is_closed() {
+                                return Err(io::Error::other("fresh recipient entry gate closed"));
+                            }
+                            let session = lane
+                                .read_session(&allocation_request_id)
+                                .map_err(io::Error::other)?
+                                .ok_or_else(|| {
+                                    io::Error::other("fresh session allocation absent")
+                                })?;
+                            let submitted = lane
+                                .submit_recipient_delivery(
+                                    &delivery_request_id,
+                                    &session,
+                                    &recipient,
+                                )
+                                .map_err(io::Error::other)?;
+                            submitted_grant = Some(submitted.readback.grant_id.clone());
+                            fresh_payload_reply("delivery", submitted)?
+                        }
+                        FreshRecipientRequest::Read {
+                            delivery_request_id,
+                        } => {
+                            let grant = lane
+                                .read_recipient_delivery_by_request(
+                                    &delivery_request_id,
+                                    &recipient,
+                                )
+                                .map_err(io::Error::other)?;
+                            serde_json::json!({ "kind": "readback", "grant": grant })
+                        }
+                        FreshRecipientRequest::Recover {
+                            delivery_request_id,
+                        } => {
+                            let recovered = lane
+                                .recover_recipient_delivery_by_request(
+                                    &delivery_request_id,
+                                    &recipient,
+                                )
+                                .map_err(io::Error::other)?;
+                            submitted_grant = Some(recovered.readback.grant_id.clone());
+                            fresh_payload_reply("recovered_delivery", recovered)?
+                        }
+                        FreshRecipientRequest::Acknowledge {
+                            grant_id,
+                            delivery_token,
+                        } => {
+                            let grant = lane
+                                .acknowledge_recipient_delivery(
+                                    &grant_id,
+                                    &delivery_token,
+                                    &recipient,
+                                )
+                                .map_err(io::Error::other)?;
+                            serde_json::json!({ "kind": "ack", "grant": grant })
+                        }
+                        FreshRecipientRequest::Delegate {
+                            grant_ids,
+                            delegate,
+                        } => {
+                            let pinned = PinnedProcess::open(delegate.host_pid)?;
+                            pinned.verify()?;
+                            let observed = FreshRecipientIdentity {
+                                host_pid: pinned.host_pid,
+                                boot_id: pinned.boot_id.clone(),
+                                starttime_ticks: pinned.starttime_ticks,
+                                pidns_dev: pinned.pidns_dev,
+                                pidns_ino: pinned.pidns_ino,
+                            };
+                            if observed != delegate || !pinned.same_executable_as(&runner_image)? {
+                                return Err(io::Error::other(
+                                    "delegate is not a live exact Runner process",
+                                ));
+                            }
+                            let batch = lane
+                                .delegate_ack_batch(&grant_ids, &recipient, &delegate)
+                                .map_err(io::Error::other)?;
+                            serde_json::json!({ "kind": "delegation", "batch": batch })
+                        }
+                        FreshRecipientRequest::AcknowledgeDelegated { delegation_id } => {
+                            let batch = lane
+                                .acknowledge_delegated_batch(&delegation_id, &recipient)
+                                .map_err(io::Error::other)?;
+                            serde_json::json!({ "kind": "delegated_ack", "batch": batch })
+                        }
+                        FreshRecipientRequest::Lookup {
+                            lane_id,
+                            session_id,
+                            seq,
+                        } => {
+                            let bytes = lane
+                                .lookup_payload(&lane_id, &session_id, seq)
+                                .map_err(io::Error::other)?;
+                            serde_json::json!({ "kind": "payload", "byte_len": bytes.len(),
+                                "payload_base64": base64::engine::general_purpose::STANDARD.encode(bytes) })
+                        }
+                    };
+                    serde_json::to_string(&reply).map_err(io::Error::other)
+                }
                 _ => Err(io::Error::other(
                     "fresh v30 effects closed pending source/recipient/K/Q/ACK lineage",
                 )),
             }
         })();
         let response = answer.unwrap_or_else(|error| format!("error {error}\n"));
-        let _ = stream.write_all(response.as_bytes());
+        if stream.write_all(response.as_bytes()).is_ok() {
+            if let Some(grant_id) = submitted_grant {
+                let _ = lane.mark_recipient_submitted(&grant_id);
+            }
+        }
     }
     Ok(())
 }

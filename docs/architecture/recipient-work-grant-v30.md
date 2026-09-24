@@ -2,9 +2,9 @@
 
 The broker-retained root-only sidecar is the sole notification authority after
 v30 cutover. `read_bounded_recipient_selection` is a planning read. Its session,
-row and digest fields are data, not a bearer grant. The current implementation
-stops before recipient work. This document defines the missing route and the
-conditions for opening that stop.
+row and digest fields are data, not a bearer grant. The requirements below
+describe the full production route. The current source implementation and its
+remaining admission gap are recorded at the end.
 
 ## Identity and requester
 
@@ -74,15 +74,39 @@ the actual recipient/session or an explicit delegated exact batch grant;
 `--delivered-by` remains an audit label. Read-only human lookup may remain
 available without new recipient authentication.
 
-## Current missing capability
+## Current source implementation and missing capability
 
-The broker's native K handler returns `native K fixed Runner attach/release
-closed`; v30 has no pinned provider K and no broker-owned PTY or headless
-transport route. Legacy `mailbox_delivery` and `wake_coordinator` act on the
-user sidecar and cannot consume this protocol. Until those boundaries exist,
-the broker must mint no executable recipient grant and the v30 driver must
-return the exact missing-capability error. The legacy CLI ACK, pause, PTY and
-wake entry points check the live broker entry route before touching their
-user-side sidecar; on a broker-owned route they refuse effects. Supported
-installed Runner entry also refuses a missing or v30-closed broker before CLI
-dispatch. Unrestricted host sudo is unchanged.
+The fresh socket now implements `F` requests for a recipient-bound submit,
+exact request-ID readback, token ACK, explicit exact-ID batch delegation and
+delegated ACK, plus lane-qualified local payload lookup. The broker derives
+the recipient's process stamp from the challenged socket peer. It selects an
+ungranted pending row, verifies the retained payload bytes, and requires a
+sidecar source/attempt/row mapping equal to an accepted source in fresh State,
+plus an exact recipient process attachment in both State and sidecar.
+One grant per row is committed as `unknown` before the socket write. A full
+write records `submitted`; both states remain unacknowledged until a valid
+owner token or one-use delegated batch ACK commits. A lost reply is read back
+by its persisted delivery request UUID without exposing the ACK token. An
+explicit recovery request for that UUID returns the same verified bytes and
+token to the exact recipient without minting another grant. Local lookup uses
+exact lane, session and row identity, does not expose an ACK token, and does
+not change ACK state. No 30-day timer resolves pending rows.
+
+There is **no production writer** for `fresh_lane_accepted_source`,
+`fresh_lane_recipient_attachment`, `fresh_recipient_source`,
+`fresh_recipient_row_source`, or the recipient process binding. The private
+executable fixture inserts synthetic accepted rows and tests the real broker
+socket and storage transitions. Consequently
+ordinary v30 entry cannot submit a positive recipient delivery on this
+branch. The binding record also does not yet prove that a live PTY/provider or
+headless wake successor belongs to the pinned root tree. The broker's native
+K handler remains closed; v30 has no pinned provider K or broker-owned PTY or
+headless wake transport route. A socket write proves submission to that
+connected process only, never provider consumption or ACK. Source acceptance,
+physical K/Q, Runner result and recipient ACK remain separate facts.
+
+Legacy `mailbox_delivery` and `wake_coordinator` act on the user sidecar and
+cannot consume this protocol. Existing v29 recipient/session/ACK continue on
+their old route; an unqualified fresh-shaped session is refused there. The
+installed Runner entry remains closed pending source, runtime binding and
+provider transport integration. Unrestricted host sudo is unchanged.

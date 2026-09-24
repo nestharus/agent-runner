@@ -58,7 +58,10 @@ pub use broker_authority::{
     BrokerSourceSelection, PreparedBrokerOwner, PreparedProcessStamp, QuiescedCutoverProof,
 };
 #[cfg(target_os = "linux")]
-pub use fresh_lane::{FreshV30Lane, FreshV30LaneIdentity, FreshV30Session};
+pub use fresh_lane::{
+    FreshAckDelegation, FreshDeliveryReadback, FreshDeliverySubmission, FreshRecipientIdentity,
+    FreshV30Lane, FreshV30LaneIdentity, FreshV30Session,
+};
 pub use native_publication::NativePublication;
 #[path = "mailbox/schema.rs"]
 mod schema;
