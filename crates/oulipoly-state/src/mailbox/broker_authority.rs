@@ -160,6 +160,133 @@ pub struct BrokerSourceEffectGrant {
     pub revision: i64,
 }
 
+/// Exact reserved row and its State-admitted original registration bytes.
+/// Only the retained broker sidecar can construct this material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrokerSourceMaterial {
+    pub grant: BrokerSourceEffectGrant,
+    pub registration_bytes: Vec<u8>,
+}
+
+fn consume_source_grant_row(
+    conn: &Connection,
+    material: &BrokerSourceMaterial,
+) -> Result<(), String> {
+    let changed = conn
+        .execute(
+            "UPDATE broker_source_effect_grant SET phase='consumed',revision=2
+         WHERE grant_id=?1 AND source_generation=?2 AND root_id=?3
+           AND owner_generation=?4 AND driver_identity=?5 AND authority_ordinal=?6
+           AND registration_id=?7 AND registration_digest=?8 AND registration_bytes=?9
+           AND listener_revision=?10 AND listener_json=?11
+           AND phase='reserved' AND revision=1",
+            params![
+                material.grant.grant_id,
+                material.grant.source_generation,
+                material.grant.root_id,
+                material.grant.owner_generation,
+                serde_json::to_string(&material.grant.driver_identity).map_err(|e| e.to_string())?,
+                material.grant.authority_ordinal,
+                material.grant.candidate.registration_id,
+                material.grant.candidate.registration_digest,
+                material.registration_bytes,
+                i64::try_from(material.grant.candidate.listener_revision)
+                    .map_err(|_| "listener revision overflow")?,
+                serde_json::to_string(&material.grant.candidate.listener)
+                    .map_err(|e| e.to_string())?,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    if changed != 1 {
+        return Err("source grant already consumed or changed".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod source_grant_cas_tests {
+    use super::*;
+
+    #[test]
+    fn exact_source_row_consumes_once_and_refuses_wrong_sibling_or_stale_material() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE broker_source_effect_grant (
+            grant_id TEXT PRIMARY KEY, source_generation TEXT, root_id TEXT,
+            owner_generation TEXT, driver_identity TEXT, authority_ordinal INTEGER,
+            registration_id TEXT, registration_digest TEXT, registration_bytes BLOB,
+            listener_revision INTEGER, listener_json TEXT, phase TEXT, revision INTEGER);",
+        )
+        .unwrap();
+        let bytes = b"exact registration".to_vec();
+        let material = BrokerSourceMaterial {
+            grant: BrokerSourceEffectGrant {
+                grant_id: uuid::Uuid::new_v4().to_string(),
+                source_generation: uuid::Uuid::new_v4().to_string(),
+                root_id: uuid::Uuid::new_v4().to_string(),
+                owner_generation: uuid::Uuid::new_v4().to_string(),
+                driver_identity: crate::completion_continuation::SourceProcessIdentity {
+                    pid: 10,
+                    boot_id: uuid::Uuid::new_v4().to_string(),
+                    starttime_ticks: 20,
+                },
+                authority_ordinal: 7,
+                candidate: BrokerSourceCandidate {
+                    registration_id: uuid::Uuid::new_v4().to_string(),
+                    registration_digest: crate::completion_continuation::sha256(&bytes),
+                    listener_revision: 2,
+                    listener: crate::completion_continuation::ListenerIdentity {
+                        listener_id: uuid::Uuid::new_v4().to_string(),
+                        session_id: "exact".into(),
+                        owner_invocation_uuid: uuid::Uuid::new_v4().to_string(),
+                    },
+                },
+                phase: "reserved".into(),
+                revision: 1,
+            },
+            registration_bytes: bytes,
+        };
+        conn.execute("INSERT INTO broker_source_effect_grant VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'reserved',1)", params![
+            material.grant.grant_id,
+            material.grant.source_generation,
+            material.grant.root_id,
+            material.grant.owner_generation,
+            serde_json::to_string(&material.grant.driver_identity).unwrap(),
+            material.grant.authority_ordinal,
+            material.grant.candidate.registration_id,
+            material.grant.candidate.registration_digest,
+            material.registration_bytes,
+            material.grant.candidate.listener_revision as i64,
+            serde_json::to_string(&material.grant.candidate.listener).unwrap(),
+        ]).unwrap();
+        let mut wrong = material.clone();
+        wrong.grant.grant_id = uuid::Uuid::new_v4().to_string();
+        assert!(consume_source_grant_row(&conn, &wrong).is_err());
+        wrong = material.clone();
+        wrong.grant.root_id = uuid::Uuid::new_v4().to_string();
+        assert!(consume_source_grant_row(&conn, &wrong).is_err());
+        wrong = material.clone();
+        wrong.grant.candidate.registration_id = uuid::Uuid::new_v4().to_string();
+        assert!(consume_source_grant_row(&conn, &wrong).is_err());
+        wrong = material.clone();
+        wrong.grant.candidate.listener.session_id = "sibling".into();
+        assert!(consume_source_grant_row(&conn, &wrong).is_err());
+        wrong = material.clone();
+        wrong.grant.authority_ordinal -= 1;
+        assert!(consume_source_grant_row(&conn, &wrong).is_err());
+        consume_source_grant_row(&conn, &material).unwrap();
+        assert!(consume_source_grant_row(&conn, &material).is_err());
+        let row: (String, i64) = conn
+            .query_row(
+                "SELECT phase,revision FROM broker_source_effect_grant",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("consumed".into(), 2));
+    }
+}
+
 /// Installer-owned proof that the old service images and every sidecar writer
 /// were stopped, joined and fenced. No production constructor exists yet:
 /// the installed service/launcher census and new-entry fence must be added
@@ -576,6 +703,93 @@ impl BrokerSidecar {
             phase,
             revision,
         }))
+    }
+
+    /// Read the exact original registration stored with the reserved grant.
+    /// The caller must check the original pathname and recovery image before
+    /// consuming this one-use authority.
+    pub fn read_reserved_source_material(
+        &self,
+        source_generation: &str,
+        root_id: &str,
+        owner: &CompletionDomainOwner,
+    ) -> Result<BrokerSourceMaterial, String> {
+        let grant = self
+            .read_source_effect_grant(source_generation, root_id, owner)?
+            .ok_or("reserved source grant absent")?;
+        if grant.phase != "reserved" || grant.revision != 1 {
+            return Err("source grant is not reserved".into());
+        }
+        let bytes: Vec<u8> = self
+            .mailbox
+            .conn
+            .query_row(
+                "SELECT registration_bytes FROM broker_source_effect_grant
+             WHERE grant_id=?1 AND registration_id=?2 AND phase='reserved' AND revision=1",
+                params![grant.grant_id, grant.candidate.registration_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        let registration: crate::completion_continuation::SourceRegistration =
+            serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        registration.validate()?;
+        if bytes.len() > crate::completion_continuation::MAX_REGISTRATION_BYTES
+            || crate::completion_continuation::sha256(&bytes) != grant.candidate.registration_digest
+            || registration.registration_id != grant.candidate.registration_id
+            || registration.listener_revision != grant.candidate.listener_revision
+        {
+            return Err("reserved source registration changed".into());
+        }
+        Ok(BrokerSourceMaterial {
+            grant,
+            registration_bytes: bytes,
+        })
+    }
+
+    /// One conditional irreversible transition. A lost reply cannot consume
+    /// again; the caller must retain the consumed row as unknown debt until
+    /// an exact held-child physical record is fsynced.
+    pub fn consume_reserved_source_effect_grant(
+        &mut self,
+        material: &BrokerSourceMaterial,
+        owner: &CompletionDomainOwner,
+    ) -> Result<BrokerSourceEffectGrant, String> {
+        let exact = self.read_reserved_source_material(
+            &material.grant.source_generation,
+            &material.grant.root_id,
+            owner,
+        )?;
+        if exact != *material {
+            return Err("source material changed before consume".into());
+        }
+        let synchronous: i64 = self
+            .mailbox
+            .conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .map_err(|e| e.to_string())?;
+        let journal: String = self
+            .mailbox
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .map_err(|e| e.to_string())?;
+        if synchronous != 2 || !journal.eq_ignore_ascii_case("wal") {
+            return Err("source consume requires durable FULL WAL sidecar".into());
+        }
+        consume_source_grant_row(&self.mailbox.conn, material)?;
+        let consumed = self
+            .read_source_effect_grant(
+                &material.grant.source_generation,
+                &material.grant.root_id,
+                owner,
+            )?
+            .ok_or("consumed source grant disappeared")?;
+        if consumed.phase != "consumed"
+            || consumed.revision != 2
+            || consumed.grant_id != material.grant.grant_id
+        {
+            return Err("consumed source grant readback conflict".into());
+        }
+        Ok(consumed)
     }
 
     /// On broker restart the old in-memory gate and child custody cannot be

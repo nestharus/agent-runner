@@ -12,6 +12,8 @@
 - `crates/oulipoly-kernel-broker/src/protocol.rs`
 - `crates/oulipoly-kernel-broker/src/registry.rs`
 - `crates/oulipoly-kernel-broker/src/root_join.rs`
+- `crates/oulipoly-kernel-broker/src/source_candidate.rs`
+- `crates/oulipoly-kernel-broker/src/source_launch.rs`
 - `crates/oulipoly-kernel-broker/src/source_physical.rs`
 - `crates/oulipoly-kernel-broker/src/work_registry.rs`
 - `crates/oulipoly-kernel-broker/src/writer_census.rs`
@@ -47,8 +49,9 @@
 | H succeeds, fails, or loses its response at the pinned guardian. | The accepted request remains no-replay and never forks through the legacy `Command::spawn` path; no execution grant or physical drain is inferred from H. |
 | Prepared grant consumed before a future namespace fork, then broker restart. | Fsynced consumed record remains and replay is refused. |
 | Root or work PID1 missing/changed on restart. | Durable unknown debt, never a drain receipt. |
-| Broker-owned consumed source grant, pinned root/entry/driver/guardian/held worker, and empty root-only capture files. | One fsynced source physical record binds exact process incarnations, nested PID1 lineage, worker local PID and output inodes before the worker gate opens. A duplicate grant or orphan output blocks another physical binding. Production consumption and launch are still closed. |
-| Source worker exits while an adopted descendant remains live. | Source PID1 retains the worker wait, reaps to ECHILD without a lifetime cap, syncs bounded stdout/stderr, and writes one terminal receipt; post-owner readback remains live/pending until the exact PID1 incarnation ends. Missing, changed or incomplete evidence remains unknown debt. |
+| Exact live v30 driver requests the broker-selected reserved source. | The retained sidecar supplies admitted registration/listener bytes. The broker checks original registration, environment and image inodes/hashes, holds one nested PID1 worker before exec, consumes the exact grant once in FULL WAL, fsyncs the physical record and confirmation, rechecks the original names, then opens the worker gate. A lost response never permits a second launch. The Runner driver does not call this route yet. |
+| Broker-owned consumed source grant, pinned root/entry/driver/guardian/held worker, and empty root-only capture files. | One fsynced source physical record binds exact process incarnations, nested PID1 lineage, worker local PID and output inodes before the worker gate opens. A duplicate grant or orphan output blocks another physical binding. The joined child's prior broker stamp remains valid after that child exits. |
+| Source worker exits while an adopted descendant remains live. | Source PID1 retains the worker wait, pumps each pipe to root-only disk with bounded memory and backpressure, reaps to ECHILD without a lifetime cap, syncs and hashes complete stdout/stderr, and writes one terminal receipt. Post-owner readback remains live/pending until the exact PID1 incarnation ends. Read/write/sync failure records incomplete diagnostic debt when storage permits. |
 | Broker restarts after a durable source cancellation intent but before a signal reply. | The fixed root-only registry reopens, reissues the request through the exact PID1 pidfd, and observes the same terminal/drain receipt. A changed PID never receives the signal. |
 | Unsolicited descriptor in a challenged socket request. | Descriptor closed and request refused. |
 | Entry reservation from an unrelated child PID namespace classified `outside`. | Denied because the connector is not in the broker's host PID namespace. |
@@ -82,7 +85,7 @@
 - Registry read order does not matter for nested parent reattachment.
 - A write or fsync failure poisons the running registry until restart/reconciliation.
 - A grant ID may bind only one work namespace record; old classifier records have no grant authority.
-- Source capture is complete only up to 64 MiB per stream. Larger output yields unknown debt rather than truncated success.
+- Source capture has no arbitrary output cutoff. A positive terminal requires exact full-file length and SHA-256 readback; I/O failure, changed bytes or incomplete storage remains unknown debt.
 
 ## Error conditions
 
@@ -94,7 +97,7 @@
 ## Boundaries
 
 - Classification is never positive work authority.
-- The source has no service-requiring CLI, TTY/GUI handoff, accepted-work launch, clean physical drain receipt, or retirement operation. H prepares a guardian grant without consumption or launch. Help/offline diagnostics have an authenticated one-use root child join and host-side owner-socket verification. Maintenance and provider PID transport remain incomplete.
+- The source launch opcode is broker-owned and requires the exact live v30 driver, but the Runner driver does not call it. A physical terminal receipt is observation only; broker-owned v2 acceptance, source release, notification, recipient ACK and K/Q are closed. Service-requiring CLI, TTY/GUI handoff, retirement and wider provider PID transport remain incomplete.
 - The unprivileged user-namespace fixture cannot establish host-root sudo/setuid behavior.
 - Ordinary Runner/Bash entry and allocated-attempt NNP/seccomp remain. The opt-in entry keeps the host guardian outside the root PID namespace and releases only the fixed Runner for help/offline diagnostics.
 

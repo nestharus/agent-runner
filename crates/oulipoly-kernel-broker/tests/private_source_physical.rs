@@ -6,17 +6,18 @@ use oulipoly_kernel_broker::entry_registry::{EntryRecord, ProcessStamp};
 use oulipoly_kernel_broker::identity::{PinnedProcess, observed_incarnation_gone};
 use oulipoly_kernel_broker::source_physical::{
     SourceObservation, SourcePhysicalRegistry, install_source_pid1_cancel_handler,
-    reap_source_pid1_and_write_terminal,
+    reap_source_pid1_with_pipes,
 };
 use oulipoly_state::completion_continuation::{ListenerIdentity, SourceProcessIdentity};
 use oulipoly_state::mailbox::{BrokerSourceCandidate, BrokerSourceEffectGrant};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const JOINED: &str = r#"
@@ -31,13 +32,14 @@ socket_path,directory,grant=sys.argv[1:]
 w=socket.socket(socket.AF_UNIX); w.connect(socket_path)
 w.sendall(b'W'+os.getpid().to_bytes(4,'little'))
 assert w.recv(1)==b'R'
-out=os.open(os.path.join(directory,grant+'.stdout'),os.O_WRONLY|os.O_APPEND)
-err=os.open(os.path.join(directory,grant+'.stderr'),os.O_WRONLY|os.O_APPEND)
-os.write(out,b'worker-start\n'); os.write(err,b'worker-stderr\n')
+os.write(1,b'worker-start\n'); os.write(2,b'worker-stderr\n')
+if os.getenv('AGE319_PRIVATE_SOURCE_LARGE'):
+    block=b'x'*65536
+    for _ in range(1040): os.write(1,block)
 if os.fork()==0:
     os.setsid(); time.sleep(6.5)
-    os.write(out,b'adopted-after-five-seconds\n')
-    os.fsync(out); os._exit(0)
+    os.write(1,b'adopted-after-five-seconds\n')
+    os._exit(0)
 os._exit(7)
 "#;
 
@@ -131,8 +133,10 @@ fn source_pid1() {
     let mut control = UnixStream::connect(&socket).unwrap();
     control.write_all(b"P").unwrap();
     install_source_pid1_cancel_handler().unwrap();
-    let _worker = Command::new("python3")
+    let mut worker = Command::new("python3")
         .args(["-c", WORKER, &socket, directory.to_str().unwrap(), &grant])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     let until = Instant::now() + Duration::from_secs(20);
@@ -149,11 +153,28 @@ fn source_pid1() {
         assert!(Instant::now() < until, "held source record absent");
         std::thread::sleep(Duration::from_millis(10));
     };
-    reap_source_pid1_and_write_terminal(&directory, &record).unwrap();
+    let stdout_file = fs::OpenOptions::new()
+        .write(true)
+        .open(directory.join(format!("{grant}.stdout")))
+        .unwrap();
+    let stderr_file = fs::OpenOptions::new()
+        .write(true)
+        .open(directory.join(format!("{grant}.stderr")))
+        .unwrap();
+    reap_source_pid1_with_pipes(
+        &directory,
+        &record,
+        worker.stdout.take().unwrap(),
+        worker.stderr.take().unwrap(),
+        stdout_file,
+        stderr_file,
+    )
+    .unwrap();
 }
 
 fn inner() {
     let cancel_mode = std::env::var_os("AGE319_PRIVATE_SOURCE_CANCEL").is_some();
+    let large_mode = std::env::var_os("AGE319_PRIVATE_SOURCE_LARGE").is_some();
     let temp = tempfile::tempdir().unwrap();
     let directory = temp.path().join("source-physical");
     fs::create_dir(&directory).unwrap();
@@ -267,7 +288,6 @@ fn inner() {
             root,
             guardian,
             driver,
-            joined,
             pid1,
             worker,
             actors[&b'W'].2.unwrap(),
@@ -287,7 +307,6 @@ fn inner() {
                 root,
                 guardian,
                 driver,
-                joined,
                 pid1,
                 worker,
                 record.worker_local_pid
@@ -405,25 +424,70 @@ fn inner() {
         std::thread::sleep(Duration::from_millis(20));
     };
     assert_eq!(drained.0, 7 << 8);
-    if cancel_mode {
-        assert_eq!(drained.1, b"worker-start\n");
-    } else {
-        assert_eq!(drained.1, b"worker-start\nadopted-after-five-seconds\n");
+    let mut expected = Sha256::new();
+    expected.update(b"worker-start\n");
+    let mut expected_len = b"worker-start\n".len() as u64;
+    if large_mode {
+        let block = [b'x'; 65536];
+        for _ in 0..1040 {
+            expected.update(block);
+            expected_len += block.len() as u64;
+        }
     }
-    assert_eq!(drained.2, b"worker-stderr\n");
-    assert_eq!(drained.3, cancel_mode);
+    if !cancel_mode {
+        expected.update(b"adopted-after-five-seconds\n");
+        expected_len += b"adopted-after-five-seconds\n".len() as u64;
+    }
+    assert_eq!(drained.1.byte_len, expected_len);
+    assert_eq!(drained.1.sha256, format!("{:x}", expected.finalize()));
+    assert_eq!(drained.2.byte_len, b"worker-stderr\n".len() as u64);
     assert_eq!(
-        drained
-            .1
-            .windows(b"worker-start".len())
-            .filter(|w| *w == b"worker-start")
-            .count(),
-        1
+        drained.2.sha256,
+        format!("{:x}", Sha256::digest(b"worker-stderr\n"))
     );
+    assert_eq!(drained.3, cancel_mode);
+    let stdout_path = directory.join(format!("{grant_id}.stdout"));
+    let mut start = [0; 13];
+    fs::File::open(&stdout_path)
+        .unwrap()
+        .read_exact(&mut start)
+        .unwrap();
+    assert_eq!(&start, b"worker-start\n");
     assert!(dead(pid1));
+    // A producer-reported disk failure cannot be mistaken for a successful
+    // terminal even when otherwise valid output and receipt files exist.
+    let incomplete_path = directory.join(format!("{grant_id}.incomplete.json"));
+    let mut incomplete = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&incomplete_path)
+        .unwrap();
+    serde_json::to_writer(
+        &mut incomplete,
+        &oulipoly_kernel_broker::source_physical::SourceIncompleteReceipt {
+            version: 1,
+            grant_id: grant_id.clone(),
+            stage: "stdout-pump".into(),
+            stdout_bytes: Some(drained.1.byte_len),
+            stderr_bytes: Some(drained.2.byte_len),
+            io_error: "ENOSPC after captured bytes".into(),
+        },
+    )
+    .unwrap();
+    incomplete.write_all(b"\n").unwrap();
+    incomplete.sync_all().unwrap();
+    assert!(matches!(
+        registry.observe(&grant_id).unwrap(),
+        SourceObservation::Unknown {
+            reason: "incomplete-capture",
+            diagnostic: Some(_),
+            ..
+        }
+    ));
+    fs::remove_file(&incomplete_path).unwrap();
     // Post-terminal tampering with either output or the receipt loses the
     // positive observation, even if the same inode is changed in place.
-    let stdout_path = directory.join(format!("{grant_id}.stdout"));
     fs::OpenOptions::new()
         .append(true)
         .open(&stdout_path)
@@ -503,4 +567,29 @@ fn post_owner_source_cancellation_drains_adopted_descendant() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+}
+
+#[test]
+fn post_owner_source_capture_exceeds_old_cutoff() {
+    if std::env::var_os("AGE319_PRIVATE_SOURCE_INNER").is_some() {
+        inner();
+        return;
+    }
+    let output = Command::new("unshare")
+        .args(["-Urpfm", "--mount-proc"])
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "post_owner_source_capture_exceeds_old_cutoff",
+            "--nocapture",
+        ])
+        .env("AGE319_PRIVATE_SOURCE_INNER", "1")
+        .env("AGE319_PRIVATE_SOURCE_LARGE", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

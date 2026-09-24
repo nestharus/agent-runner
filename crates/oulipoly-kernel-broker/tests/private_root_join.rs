@@ -349,6 +349,19 @@ fn inner() {
                     "source grant boundary: {}",
                     fs::read_to_string(&err).unwrap_or_default()
                 );
+                // A sibling caller cannot turn the driver's reserved grant
+                // into a physical source effect by naming its root/owner.
+                let launch = protocol::StateWriteSpec {
+                    protocol: "broker-source-effect-launch-v30".into(),
+                    source_generation: generation.clone(),
+                    root_id: prepared.root_id.clone(),
+                    owner_generation: prepared.owner_generation.clone(),
+                    action: protocol::StateWriteAction::LaunchSourceGrant,
+                };
+                assert!(protocol::launch_source_effect_grant_at(&socket, &launch).is_err());
+                let mut stale = launch;
+                stale.owner_generation = uuid::Uuid::new_v4().to_string();
+                assert!(protocol::launch_source_effect_grant_at(&socket, &stale).is_err());
             }
             fs::write(gate.join("child-effect"), b"yes").unwrap();
             eventually(|| entry.try_wait().unwrap().is_some());

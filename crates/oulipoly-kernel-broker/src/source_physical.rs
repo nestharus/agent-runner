@@ -1,7 +1,5 @@
 //! Broker-owned post-owner source custody. A consumed source grant may be
 //! bound here only while its PID1 and worker are held behind the launch gate.
-//! This module does not consume grants or launch recovery: those effects stay
-//! closed until the State transition and PID1 producer use this same record.
 use crate::entry_registry::{EntryRecord, ProcessStamp};
 use crate::identity::{PinnedProcess, observed_incarnation_gone};
 use crate::registry::RootRecord;
@@ -15,6 +13,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 static SOURCE_CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -106,6 +105,26 @@ pub struct SourceTerminalReceipt {
     pub stderr_sha256: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CapturedOutput {
+    pub byte_len: u64,
+    pub sha256: String,
+}
+
+/// Best-effort diagnostic for a failed producer. This never authorizes a
+/// terminal result; its absence also leaves the source unknown.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SourceIncompleteReceipt {
+    pub version: u32,
+    pub grant_id: String,
+    pub stage: String,
+    pub stdout_bytes: Option<u64>,
+    pub stderr_bytes: Option<u64>,
+    pub io_error: String,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum SourceObservation {
     Live {
@@ -117,11 +136,12 @@ pub enum SourceObservation {
     Unknown {
         reason: &'static str,
         cancel_requested: bool,
+        diagnostic: Option<SourceIncompleteReceipt>,
     },
     Drained {
         worker_wait_status: i32,
-        stdout: Vec<u8>,
-        stderr: Vec<u8>,
+        stdout: CapturedOutput,
+        stderr: CapturedOutput,
         cancel_requested: bool,
     },
 }
@@ -130,6 +150,7 @@ pub struct SourcePhysicalRegistry {
     directory: PathBuf,
     records: Vec<SourcePhysicalRecord>,
     orphaned: Vec<String>,
+    pending_grant: Option<String>,
     poisoned: bool,
 }
 
@@ -140,8 +161,89 @@ fn valid_digest(value: &str) -> bool {
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
-fn digest(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+const CAPTURE_BUFFER_BYTES: usize = 64 * 1024;
+
+/// Hash a stream with fixed memory. The length in an I/O error identifies
+/// how many bytes were actually read before the incomplete result.
+fn hash_stream(reader: &mut impl Read) -> io::Result<CapturedOutput> {
+    let mut digest = Sha256::new();
+    let mut byte_len = 0u64;
+    let mut buffer = [0u8; CAPTURE_BUFFER_BYTES];
+    loop {
+        let n = reader.read(&mut buffer).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("read after {byte_len} bytes: {error}"),
+            )
+        })?;
+        if n == 0 {
+            break;
+        }
+        byte_len = byte_len
+            .checked_add(n as u64)
+            .ok_or_else(|| io::Error::other("source output byte count overflow"))?;
+        digest.update(&buffer[..n]);
+    }
+    Ok(CapturedOutput {
+        byte_len,
+        sha256: format!("{:x}", digest.finalize()),
+    })
+}
+
+/// Pipe-to-disk capture for a future source worker. A finite buffer and
+/// synchronous writes provide backpressure; errors report the accepted byte
+/// count and cannot be treated as a complete stream.
+pub fn capture_stream_to_disk(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+) -> io::Result<CapturedOutput> {
+    let mut digest = Sha256::new();
+    let mut byte_len = 0u64;
+    let mut buffer = [0u8; CAPTURE_BUFFER_BYTES];
+    loop {
+        let n = reader.read(&mut buffer).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("capture read after {byte_len} bytes: {error}"),
+            )
+        })?;
+        if n == 0 {
+            break;
+        }
+        let mut written = 0;
+        while written < n {
+            let count = writer.write(&buffer[written..n]).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "capture write after {} bytes: {error}",
+                        byte_len + written as u64
+                    ),
+                )
+            })?;
+            if count == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    format!("capture write after {} bytes", byte_len + written as u64),
+                ));
+            }
+            written += count;
+        }
+        byte_len = byte_len
+            .checked_add(n as u64)
+            .ok_or_else(|| io::Error::other("source output byte count overflow"))?;
+        digest.update(&buffer[..n]);
+    }
+    writer.flush().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("capture flush after {byte_len} bytes: {error}"),
+        )
+    })?;
+    Ok(CapturedOutput {
+        byte_len,
+        sha256: format!("{:x}", digest.finalize()),
+    })
 }
 
 fn name(id: &str, suffix: &str) -> io::Result<String> {
@@ -200,6 +302,9 @@ fn valid_record(record: &SourcePhysicalRecord) -> bool {
         && u64::try_from(record.grant.driver_identity.starttime_ticks).ok()
             == Some(record.driver.starttime_ticks)
         && record.root_init.boot_id == record.pid1.boot_id
+        && record.joined_child.boot_id == record.root_init.boot_id
+        && (record.joined_child.pidns_dev, record.joined_child.pidns_ino)
+            == (record.root_init.pidns_dev, record.root_init.pidns_ino)
         && record.pid1.boot_id == record.worker.boot_id
         && record.worker_local_pid > 1
         && record.stdout.inode != 0
@@ -238,9 +343,15 @@ impl SourcePhysicalRegistry {
             if !entry.file_type()?.is_file() {
                 return Err(io::Error::other("unrecognized source witness entry"));
             }
-            if let Some(id) = [".terminal.json", ".cancel.json", ".stdout", ".stderr"]
-                .into_iter()
-                .find_map(|suffix| filename.strip_suffix(suffix))
+            if let Some(id) = [
+                ".terminal.json",
+                ".incomplete.json",
+                ".cancel.json",
+                ".stdout",
+                ".stderr",
+            ]
+            .into_iter()
+            .find_map(|suffix| filename.strip_suffix(suffix))
             {
                 name(id, "json")?;
                 auxiliary.push(id.to_owned());
@@ -275,6 +386,7 @@ impl SourcePhysicalRegistry {
             directory,
             records,
             orphaned,
+            pending_grant: None,
             poisoned: false,
         })
     }
@@ -294,7 +406,10 @@ impl SourcePhysicalRegistry {
     /// Creates the two root-only capture files while the child is still held.
     /// Their inodes are later included in the durable physical record.
     pub fn prepare_outputs(&mut self, grant_id: &str) -> io::Result<(File, File)> {
-        if self.has_debt() || self.records.iter().any(|r| r.grant.grant_id == grant_id) {
+        if self.has_debt()
+            || self.pending_grant.is_some()
+            || self.records.iter().any(|r| r.grant.grant_id == grant_id)
+        {
             return Err(io::Error::other(
                 "source grant already has physical custody",
             ));
@@ -316,6 +431,8 @@ impl SourcePhysicalRegistry {
         })();
         if result.is_err() {
             self.poisoned = true;
+        } else {
+            self.pending_grant = Some(grant_id.to_owned());
         }
         result
     }
@@ -335,12 +452,12 @@ impl SourcePhysicalRegistry {
         root_init: &PinnedProcess,
         guardian: &PinnedProcess,
         driver: &PinnedProcess,
-        joined_child: &PinnedProcess,
         pid1: &PinnedProcess,
         worker: &PinnedProcess,
         worker_local_pid: i32,
     ) -> io::Result<SourcePhysicalRecord> {
         if self.has_debt()
+            || self.pending_grant.as_deref() != Some(grant.grant_id.as_str())
             || self.records.iter().any(|r| {
                 r.grant.grant_id == grant.grant_id
                     || (r.grant.source_generation == grant.source_generation
@@ -351,7 +468,7 @@ impl SourcePhysicalRegistry {
                 "duplicate or poisoned source physical grant",
             ));
         }
-        for process in [root_init, guardian, driver, joined_child, pid1, worker] {
+        for process in [root_init, guardian, driver, pid1, worker] {
             process.verify()?;
         }
         if root.root_id != grant.root_id
@@ -361,7 +478,7 @@ impl SourcePhysicalRegistry {
             || entry.root_id != grant.root_id
             || entry.guardian.as_ref() != Some(&ProcessStamp::from(guardian))
             || entry.prepared_driver.as_ref() != Some(&ProcessStamp::from(driver))
-            || entry.joined_child.as_ref() != Some(&ProcessStamp::from(joined_child))
+            || entry.joined_child.is_none()
             || !entry.join_consumed
             || !pid1.is_namespace_init()?
             || !direct_child_namespace(pid1, root_init)?
@@ -369,7 +486,6 @@ impl SourcePhysicalRegistry {
             || !worker.in_namespace(pid1.namespace())?
             || worker.namespace_pid()? != worker_local_pid
             || !driver.direct_child_of(guardian)?
-            || !joined_child.in_namespace(root_init.namespace())?
         {
             return Err(io::Error::other("source physical actor lineage changed"));
         }
@@ -388,7 +504,7 @@ impl SourcePhysicalRegistry {
             root_init: ProcessStamp::from(root_init),
             guardian: ProcessStamp::from(guardian),
             driver: ProcessStamp::from(driver),
-            joined_child: ProcessStamp::from(joined_child),
+            joined_child: entry.joined_child.clone().unwrap(),
             pid1: ProcessStamp::from(pid1),
             worker: ProcessStamp::from(worker),
             worker_local_pid,
@@ -416,6 +532,7 @@ impl SourcePhysicalRegistry {
             return Err(error);
         }
         self.records.push(record.clone());
+        self.pending_grant = None;
         Ok(record)
     }
 
@@ -428,6 +545,26 @@ impl SourcePhysicalRegistry {
             .iter()
             .find(|r| r.grant.grant_id == grant_id)
             .ok_or_else(|| io::Error::other("source physical grant absent"))?;
+        let diagnostic = match exact_bytes(&self.directory, grant_id, "incomplete.json", 4096) {
+            Ok(bytes) => match serde_json::from_slice::<SourceIncompleteReceipt>(&bytes) {
+                Ok(value) if value.version == 1 && value.grant_id == grant_id => Some(value),
+                _ => {
+                    return Ok(SourceObservation::Unknown {
+                        reason: "invalid-incomplete-diagnostic",
+                        cancel_requested: false,
+                        diagnostic: None,
+                    });
+                }
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(_) => {
+                return Ok(SourceObservation::Unknown {
+                    reason: "unreadable-incomplete-diagnostic",
+                    cancel_requested: false,
+                    diagnostic: None,
+                });
+            }
+        };
         let cancel_requested = match exact_bytes(&self.directory, grant_id, "cancel.json", 4096) {
             Ok(bytes) => match serde_json::from_slice::<ProcessStamp>(&bytes) {
                 Ok(stamp) if stamp == record.pid1 => true,
@@ -435,6 +572,7 @@ impl SourcePhysicalRegistry {
                     return Ok(SourceObservation::Unknown {
                         reason: "invalid-cancel-intent",
                         cancel_requested: false,
+                        diagnostic,
                     });
                 }
             },
@@ -443,6 +581,7 @@ impl SourcePhysicalRegistry {
                 return Ok(SourceObservation::Unknown {
                     reason: "unreadable-cancel-intent",
                     cancel_requested: false,
+                    diagnostic,
                 });
             }
         };
@@ -459,6 +598,7 @@ impl SourcePhysicalRegistry {
                     SourceObservation::Unknown {
                         reason: "missing-terminal-receipt",
                         cancel_requested,
+                        diagnostic,
                     }
                 } else {
                     SourceObservation::Live { cancel_requested }
@@ -468,6 +608,7 @@ impl SourcePhysicalRegistry {
                 return Ok(SourceObservation::Unknown {
                     reason: "unreadable-terminal-receipt",
                     cancel_requested,
+                    diagnostic,
                 });
             }
         };
@@ -475,6 +616,7 @@ impl SourcePhysicalRegistry {
             return Ok(SourceObservation::Unknown {
                 reason: "invalid-terminal-receipt",
                 cancel_requested,
+                diagnostic,
             });
         };
         if receipt.version != 1
@@ -489,32 +631,36 @@ impl SourcePhysicalRegistry {
             return Ok(SourceObservation::Unknown {
                 reason: "conflicting-terminal-receipt",
                 cancel_requested,
+                diagnostic,
             });
         }
         if !gone {
             return Ok(SourceObservation::DrainPending { cancel_requested });
         }
-        let output = |suffix, stamp: &OutputStamp, len, hash: &str| -> io::Result<Vec<u8>> {
+        if diagnostic.is_some() {
+            return Ok(SourceObservation::Unknown {
+                reason: "incomplete-capture",
+                cancel_requested,
+                diagnostic,
+            });
+        }
+        let output = |suffix, stamp: &OutputStamp, len, hash: &str| -> io::Result<CapturedOutput> {
             let mut file = open_exact(&self.directory, grant_id, suffix)?;
             if OutputStamp::of(&file)? != *stamp {
                 return Err(io::Error::other("source output inode changed"));
             }
-            if file.metadata()?.len() > 64 * 1024 * 1024 {
-                return Err(io::Error::other("source output exceeds completeness limit"));
-            }
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes)?;
+            let captured = hash_stream(&mut file)?;
             let named = fs::symlink_metadata(self.directory.join(name(grant_id, suffix)?))?;
             if OutputStamp::of(&file)? != *stamp
                 || named.dev() != stamp.device
                 || named.ino() != stamp.inode
-                || file.metadata()?.len() != bytes.len() as u64
-                || bytes.len() as u64 != len
-                || digest(&bytes) != hash
+                || file.metadata()?.len() != captured.byte_len
+                || captured.byte_len != len
+                || captured.sha256 != hash
             {
                 return Err(io::Error::other("source output completeness mismatch"));
             }
-            Ok(bytes)
+            Ok(captured)
         };
         let (Ok(stdout), Ok(stderr)) = (
             output(
@@ -533,6 +679,7 @@ impl SourcePhysicalRegistry {
             return Ok(SourceObservation::Unknown {
                 reason: "incomplete-or-changed-output",
                 cancel_requested,
+                diagnostic: None,
             });
         };
         Ok(SourceObservation::Drained {
@@ -609,9 +756,89 @@ impl SourcePhysicalRegistry {
 /// Source PID1's terminal producer. The exact worker wait is distinct from
 /// the ECHILD drain of its adopted descendants. An I/O, wait, or capture
 /// failure leaves no positive terminal receipt and remains unknown debt.
+fn write_incomplete(directory: &Path, receipt: &SourceIncompleteReceipt) -> io::Result<()> {
+    let path = directory.join(name(&receipt.grant_id, "incomplete.json")?);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    serde_json::to_writer(&mut file, receipt)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    File::open(directory)?.sync_all()
+}
+
+fn record_capture_failure(
+    directory: &Path,
+    record: &SourcePhysicalRecord,
+    stage: &str,
+    error: &io::Error,
+) {
+    let length = |suffix| -> Option<u64> {
+        open_exact(directory, &record.grant.grant_id, suffix)
+            .and_then(|file| file.metadata())
+            .ok()
+            .map(|meta| meta.len())
+    };
+    let diagnostic = SourceIncompleteReceipt {
+        version: 1,
+        grant_id: record.grant.grant_id.clone(),
+        stage: stage.into(),
+        stdout_bytes: length("stdout"),
+        stderr_bytes: length("stderr"),
+        io_error: error.to_string().chars().take(512).collect(),
+    };
+    if let Err(diagnostic_error) = write_incomplete(directory, &diagnostic) {
+        eprintln!(
+            "source {} incomplete at {stage}: {error}; diagnostic write: {diagnostic_error}",
+            record.grant.grant_id
+        );
+    }
+}
+
 pub fn reap_source_pid1_and_write_terminal(
     directory: &Path,
     record: &SourcePhysicalRecord,
+) -> io::Result<()> {
+    reap_source_pid1(directory, record, None)
+}
+
+/// A production worker writes to pipes. Two bounded-memory pumps persist the
+/// bytes with kernel backpressure while PID1 reaps; neither a short disk write
+/// nor a reader error can become a terminal receipt.
+pub fn reap_source_pid1_with_pipes(
+    directory: &Path,
+    record: &SourcePhysicalRecord,
+    stdout: impl Read + Send + 'static,
+    stderr: impl Read + Send + 'static,
+    stdout_file: File,
+    stderr_file: File,
+) -> io::Result<()> {
+    let stdout_thread = std::thread::spawn(move || pump(stdout, stdout_file));
+    let stderr_thread = std::thread::spawn(move || pump(stderr, stderr_file));
+    reap_source_pid1(directory, record, Some((stdout_thread, stderr_thread)))
+}
+
+fn pump(mut reader: impl Read, mut file: File) -> io::Result<CapturedOutput> {
+    let result = capture_stream_to_disk(&mut reader, &mut file)?;
+    file.sync_all().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("capture sync after {} bytes: {error}", result.byte_len),
+        )
+    })?;
+    Ok(result)
+}
+
+fn reap_source_pid1(
+    directory: &Path,
+    record: &SourcePhysicalRecord,
+    pumps: Option<(
+        JoinHandle<io::Result<CapturedOutput>>,
+        JoinHandle<io::Result<CapturedOutput>>,
+    )>,
 ) -> io::Result<()> {
     if unsafe { libc::getpid() } != 1 || !valid_record(record) {
         return Err(io::Error::other("invalid source PID1 terminal producer"));
@@ -661,25 +888,59 @@ pub fn reap_source_pid1_and_write_terminal(
     }
     let worker_wait_status =
         worker_wait.ok_or_else(|| io::Error::other("exact source worker wait absent"))?;
-    let capture = |suffix: &str, stamp: &OutputStamp| -> io::Result<(u64, String)> {
+    let pumped = if let Some((stdout_thread, stderr_thread)) = pumps {
+        let stdout = stdout_thread
+            .join()
+            .map_err(|_| io::Error::other("stdout pump panicked"))?;
+        let stderr = stderr_thread
+            .join()
+            .map_err(|_| io::Error::other("stderr pump panicked"))?;
+        match (stdout, stderr) {
+            (Ok(stdout), Ok(stderr)) => Some((stdout, stderr)),
+            (Err(error), _) => {
+                record_capture_failure(directory, record, "stdout-pump", &error);
+                return Err(error);
+            }
+            (_, Err(error)) => {
+                record_capture_failure(directory, record, "stderr-pump", &error);
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+    let capture = |suffix: &str, stamp: &OutputStamp| -> io::Result<CapturedOutput> {
         let mut file = open_exact(directory, &record.grant.grant_id, suffix)?;
-        if OutputStamp::of(&file)? != *stamp || file.metadata()?.len() > 64 * 1024 * 1024 {
-            return Err(io::Error::other(
-                "source output stamp or completeness limit changed",
-            ));
+        if OutputStamp::of(&file)? != *stamp {
+            return Err(io::Error::other("source output stamp changed"));
         }
         file.sync_all()?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        if file.metadata()?.len() != bytes.len() as u64 {
+        let captured = hash_stream(&mut file)?;
+        let named = fs::symlink_metadata(directory.join(name(&record.grant.grant_id, suffix)?))?;
+        if OutputStamp::of(&file)? != *stamp
+            || named.dev() != stamp.device
+            || named.ino() != stamp.inode
+            || file.metadata()?.len() != captured.byte_len
+        {
             return Err(io::Error::other(
                 "source output changed after physical drain",
             ));
         }
-        Ok((bytes.len() as u64, digest(&bytes)))
+        Ok(captured)
     };
-    let (stdout_len, stdout_sha256) = capture("stdout", &record.stdout)?;
-    let (stderr_len, stderr_sha256) = capture("stderr", &record.stderr)?;
+    let stdout = capture("stdout", &record.stdout).inspect_err(|error| {
+        record_capture_failure(directory, record, "stdout", error);
+    })?;
+    let stderr = capture("stderr", &record.stderr).inspect_err(|error| {
+        record_capture_failure(directory, record, "stderr", error);
+    })?;
+    if let Some((pumped_stdout, pumped_stderr)) = pumped {
+        if pumped_stdout != stdout || pumped_stderr != stderr {
+            let error = io::Error::other("pumped source bytes changed before terminal hash");
+            record_capture_failure(directory, record, "pump-verify", &error);
+            return Err(error);
+        }
+    }
     let receipt = SourceTerminalReceipt {
         version: 1,
         grant_id: record.grant.grant_id.clone(),
@@ -688,10 +949,10 @@ pub fn reap_source_pid1_and_write_terminal(
         worker_local_pid: record.worker_local_pid,
         worker_wait_status,
         adopted_tree_drained: true,
-        stdout_len,
-        stdout_sha256,
-        stderr_len,
-        stderr_sha256,
+        stdout_len: stdout.byte_len,
+        stdout_sha256: stdout.sha256,
+        stderr_len: stderr.byte_len,
+        stderr_sha256: stderr.sha256,
     };
     let path = directory.join(name(&record.grant.grant_id, "terminal.json")?);
     let mut file = OpenOptions::new()
@@ -704,4 +965,42 @@ pub fn reap_source_pid1_and_write_terminal(
     file.write_all(b"\n")?;
     file.sync_all()?;
     File::open(directory)?.sync_all()
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+
+    struct ExhaustedDisk {
+        remaining: usize,
+    }
+
+    impl Write for ExhaustedDisk {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(io::Error::from_raw_os_error(libc::ENOSPC));
+            }
+            let count = bytes.len().min(self.remaining);
+            self.remaining -= count;
+            Ok(count)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn streaming_capture_reports_disk_exhaustion_without_a_complete_hash() {
+        let mut input = io::repeat(b'x').take(128 * 1024);
+        let mut disk = ExhaustedDisk { remaining: 70000 };
+        let error = capture_stream_to_disk(&mut input, &mut disk).unwrap_err();
+        assert_eq!(error.raw_os_error(), None);
+        assert!(
+            error
+                .to_string()
+                .contains("capture write after 70000 bytes")
+        );
+        assert!(error.to_string().contains("No space left on device"));
+    }
 }

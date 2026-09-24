@@ -50,8 +50,8 @@ mod native_publication;
 mod retention;
 pub use broker_authority::{
     BrokerContinuationReadback, BrokerMailboxReadback, BrokerReleaseEvidence, BrokerRepairReadback,
-    BrokerSidecar, BrokerSourceCandidate, BrokerSourceEffectGrant, BrokerSourceSelection,
-    PreparedBrokerOwner, PreparedProcessStamp, QuiescedCutoverProof,
+    BrokerSidecar, BrokerSourceCandidate, BrokerSourceEffectGrant, BrokerSourceMaterial,
+    BrokerSourceSelection, PreparedBrokerOwner, PreparedProcessStamp, QuiescedCutoverProof,
 };
 pub use native_publication::NativePublication;
 #[path = "mailbox/schema.rs"]

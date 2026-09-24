@@ -1,6 +1,8 @@
 //! Opt-in host-root broker for the pinned guardian and one-use root child join.
 #[path = "root_join.rs"]
 mod root_join;
+#[path = "source_launch.rs"]
+mod source_launch;
 #[path = "work_launch.rs"]
 mod work_launch;
 use oulipoly_kernel_broker::accepted_grant::GrantRegistry;
@@ -790,7 +792,7 @@ fn write_broker_state(
                 .map_err(io::Error::other)?;
             Ok(readback)
         }
-        StateWriteAction::Repair { .. } => {
+        StateWriteAction::Repair { .. } | StateWriteAction::LaunchSourceGrant => {
             Err(io::Error::other("bounded repair requires v30 protocol"))
         }
     }
@@ -2294,8 +2296,13 @@ fn serve() -> io::Result<()> {
     }
     for record in source_physical.records() {
         match source_physical.observe(&record.grant.grant_id) {
-            Ok(SourceObservation::Unknown { reason, .. }) => {
-                eprintln!("source physical debt {}: {reason}", record.grant.grant_id);
+            Ok(SourceObservation::Unknown {
+                reason, diagnostic, ..
+            }) => {
+                eprintln!(
+                    "source physical debt {}: {reason}; diagnostic={diagnostic:?}",
+                    record.grant.grant_id
+                );
             }
             Err(error) => {
                 eprintln!("source physical debt {}: {error}", record.grant.grant_id);
@@ -2772,6 +2779,40 @@ fn serve() -> io::Result<()> {
                         sidecar,
                     )?;
                     encode_source_effect_grant(&Some(grant))
+                } else if spec.protocol == "broker-source-effect-launch-v30"
+                    && matches!(spec.action, StateWriteAction::LaunchSourceGrant)
+                {
+                    let exact = read_broker_state(
+                        StateReadSpec {
+                            protocol: "broker-state-read-v1".into(),
+                            source_generation: spec.source_generation,
+                            root_id: spec.root_id,
+                            owner_generation: spec.owner_generation,
+                            attempt_id: None,
+                        },
+                        &peer,
+                        &host_namespace,
+                        &runner_image,
+                        &registry,
+                        &works,
+                        &entries,
+                        sidecar,
+                    )?;
+                    if !exact.broker_owned
+                        || exact.owner.driver_identity.pid != i64::from(peer.process.host_pid)
+                    {
+                        return Err(io::Error::other("source launch requires exact live driver"));
+                    }
+                    source_launch::launch(
+                        &exact.root_id,
+                        &exact.owner,
+                        &peer,
+                        &registry,
+                        &entries,
+                        sidecar,
+                        &mut source_physical,
+                        &source_physical_path,
+                    )
                 } else {
                     let readback = write_broker_state(
                         spec,
