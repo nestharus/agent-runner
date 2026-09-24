@@ -1814,9 +1814,22 @@ mod tests {
     }
     fn remove_continuation_schema_for_legacy_fixture(connection: &rusqlite::Connection) {
         remove_record_timestamp_contract_for_legacy_fixture(connection);
+        // Remove v26 search and v28/v29 native ledgers before their v18 parent
+        // tables; SQLite reparses retained triggers during later ALTER TABLEs.
         connection
             .execute_batch(
-                "DROP TRIGGER completion_owner_supervisor_authority_insert;
+                "DROP TRIGGER completion_continuation_attempt_search_insert;
+        DROP TRIGGER completion_continuation_attempt_search_update;
+        DROP TRIGGER completion_continuation_attempt_search_delete;
+        DROP TRIGGER completion_continuation_attempt_source_search_insert;
+        DROP TRIGGER completion_continuation_attempt_source_search_update;
+        DROP TRIGGER completion_continuation_attempt_source_search_delete;
+        DROP TABLE completion_continuation_attempt_search_generation;
+        DROP TABLE completion_native_kernel_q;
+        DROP TABLE completion_native_worker_attach;
+        DROP TRIGGER completion_native_grant_no_legacy_terminal;
+        DROP TABLE completion_native_grant_binding;
+        DROP TRIGGER completion_owner_supervisor_authority_insert;
         DROP TRIGGER completion_owner_supervisor_authority_immutable;
         DROP TRIGGER completion_source_supervisor_authority_insert;
         DROP TRIGGER completion_source_supervisor_authority_immutable;
