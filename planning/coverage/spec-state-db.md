@@ -33,12 +33,14 @@
 - `crates/oulipoly-state/src/mailbox/fresh_bash_child.rs`
 - `crates/oulipoly-state/src/mailbox/fresh_bash_source.rs`
 - `crates/oulipoly-state/src/mailbox/fresh_bash_notify.rs`
+- `crates/oulipoly-state/src/mailbox/fresh_root_terminal.rs`
 - `crates/oulipoly-state/src/mailbox/migrations/0031_fresh_released_handoff.sql`
 - `crates/oulipoly-state/src/mailbox/migrations/0032_fresh_root_effect.sql`
 - `crates/oulipoly-state/src/mailbox/migrations/0033_fresh_bash_child.sql`
 - `crates/oulipoly-state/src/mailbox/migrations/0034_fresh_normal_work.sql`
 - `crates/oulipoly-state/src/mailbox/migrations/0035_fresh_bash_source.sql`
 - `crates/oulipoly-state/src/mailbox/migrations/0036_fresh_bash_notify.sql`
+- `crates/oulipoly-state/src/mailbox/migrations/0038_fresh_root_terminal.sql`
 - `crates/oulipoly-state/src/mailbox/migrations/0030_fresh_state_identity.sql`
 - `crates/oulipoly-state/tests/age319_fresh_dual_lane.rs`
 - `crates/oulipoly-state/src/mailbox/fresh_recipient.rs`
@@ -120,6 +122,7 @@
 | A broker-pinned Bash process in an already released root asks for a private v30 child reservation. | One immutable request row binds the exact actor and root, then a separate D/session, child invocation with the root as parent, `ab30_` handle and registration digest are committed and reread. A duplicate request returns the same identity; a changed actor or parent refuses. The private one-use effect/result rows grant no production work or physical drain. |
 | The private broker freezes a Bash child source event after its exact consumed child K and physical Q. | Fresh State checks immutable C registration, D/session, root/owner/generation, parent consumed K/work, child K/exit/drain/PID1 wait and original output bytes against the broker's captured receipt. The selected event and accepted-source fact commit in one State transaction. Repeated W reads the same receipt; a captured sidecar receipt without State acceptance remains explicit repair debt. Bash O cannot substitute for physical output. W alone mints no F or ACK. |
 | The pinned original root listener explicitly requests notification for one accepted private Bash W. | State retains the exact request and recipient attachment before sidecar source, binding and payload row materialization. The F row contains broker-verified raw stdout/stderr bytes and exact W/attempt/root session/invocation. Restart repairs partial cross-file materialization from the same W; original response-only C has no F. F submission and manual token ACK remain separate. Offline pending rows and old v29 debt are not settled by repair. |
+| A private released root reaches complete physical provider Q, with an optional accepted Bash W. | An immutable terminal row binds D/handoff, J/session, original actor/owner generation, independently checked parent K/Q/hashed output and exact child C/D/K/Q/W when present. Readback derives listener F/ACK and caller publication separately; unknown or submitted F is pending, manual ACK is labeled, and publication unknown cannot turn work into failure or replay. Missing physical evidence stays explicit unknown. |
 | A released root with typed normal CLI intent reaches fresh preparation. | One immutable `held` row binds the exact U/D handoff, invocation, session, actor and intent. Retry reads that row; there is no provider fork, native K/Q, result or physical-drain transition. |
 | Existing DB at a known-incompatible past version (no migration path). | Open fails with `MigrationUnsupported`; advise the operator to reset or restore. |
 | Concurrent reader during writer migration. | SQLite WAL + retry handles short waits; long contention surfaces as `DbBusy`. |

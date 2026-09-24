@@ -283,6 +283,33 @@ impl FreshV30Lane {
         Ok(())
     }
 
+    /// Exact repair for one root's already admitted C key. This does not scan
+    /// unrelated registrations, launch K or submit F.
+    pub fn repair_captured_private_bash_source(&self, request_id: &str) -> Result<(), String> {
+        validate_request_id(request_id)?;
+        let child = self.read_bash_child(request_id)?.ok_or("captured Bash C absent")?;
+        let directory = self.state_path.parent().ok_or("fresh State parent absent")?.join(FRESH_PROVIDER_DIRECTORY);
+        let physical: Option<String> = self.state_connection(OpenFlags::SQLITE_OPEN_READ_ONLY)?
+            .query_row("SELECT physical_grant_id FROM fresh_bash_selected_event WHERE request_id=?1",
+                [request_id], |r| r.get(0)).optional().map_err(|e| e.to_string())?;
+        let selected_in_state = physical.is_some();
+        let grant = if let Some(grant) = physical { grant } else {
+            let name = format!("{}.fresh-grant.json", child.request_id);
+            if !physical_entry_exists(&directory, &name)? { return Ok(()); }
+            let value = physical_json(&directory, &name)?;
+            value.get("id").and_then(|v| v.as_str()).ok_or("captured grant id absent")?.to_owned()
+        };
+        validate_request_id(&grant)?;
+        let name = format!("{grant}.source-event.json");
+        if !physical_entry_exists(&directory, &name)? {
+            if selected_in_state { return Err(format!("selected source event lost: {name}")); }
+            return Ok(());
+        }
+        let event: FreshBashSourceEvent = serde_json::from_value(physical_json(&directory, &name)?)
+            .map_err(|e| e.to_string())?;
+        self.accept_private_bash_source(&event)
+    }
+
     /// Exact repair after broker restart. Only already captured receipts are
     /// reconsidered; absent physical receipts remain unknown and no K is run.
     pub fn repair_captured_private_bash_sources(&self) -> Result<(), String> {

@@ -855,6 +855,41 @@ fn private_fresh_provider(
         let state = protocol::private_fresh_provider_at(&socket, &receipt.d_key, b'6', None)
             .map_err(|e| format!("private provider Q readback failed: {e}"))?;
         if state.starts_with(&format!("fresh-provider-drained {grant} ")) {
+            if std::env::var_os("AGE319_PRIVATE_ROOT_TERMINAL_V1").is_some() {
+                use protocol::FreshRecipientRequest;
+                let recorded = protocol::fresh_root_terminal_request_at(
+                    &socket,
+                    &FreshRecipientRequest::SettleRootTerminal {
+                        d_key: receipt.d_key.clone(),
+                    },
+                )
+                .map_err(|e| format!("private root terminal settle failed: {e}"))?;
+                let read = protocol::fresh_root_terminal_request_at(
+                    &socket,
+                    &FreshRecipientRequest::ReadRootTerminal {
+                        d_key: receipt.d_key.clone(),
+                    },
+                )
+                .map_err(|e| format!("private root terminal readback failed: {e}"))?;
+                if recorded != read {
+                    return Err("private root terminal lost reply readback changed".into());
+                }
+                let repaired = protocol::fresh_root_terminal_request_at(
+                    &socket,
+                    &FreshRecipientRequest::RepairRootTerminal {
+                        d_key: receipt.d_key.clone(),
+                    },
+                )
+                .map_err(|e| format!("private root terminal repair readback failed: {e}"))?;
+                if repaired != read {
+                    return Err("private root terminal exact repair changed record".into());
+                }
+                std::fs::write(
+                    std::path::Path::new(&gate).join("root-terminal-readback.json"),
+                    serde_json::to_vec(&read).map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| e.to_string())?;
+            }
             // The broker verified the complete output and physical Q. The
             // ordinary runtime has no remote result backend yet; this private
             // fixture must not turn the readback into CLI terminal success.
