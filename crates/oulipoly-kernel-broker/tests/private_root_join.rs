@@ -48,6 +48,10 @@ impl Drop for SnapshotRestore {
 fn inner() {
     let mode = std::env::var("AGE319_PRIVATE_JOIN_MODE").unwrap_or_else(|_| "help".into());
     let provider_mode = mode.starts_with("normal_model_provider");
+    let path_mode = matches!(
+        mode.as_str(),
+        "normal_model_provider_path" | "normal_model_provider_prefix"
+    );
     let provider_negative = matches!(
         mode.as_str(),
         "normal_model_provider_bad_config"
@@ -84,6 +88,8 @@ fn inner() {
             | "normal_model_provider_quota_reply_loss"
             | "normal_model_provider_quota_restart"
             | "normal_model_provider_no_pin"
+            | "normal_model_provider_path"
+            | "normal_model_provider_prefix"
     );
     let recipient_mode = mode.starts_with("normal_recipient");
     let real_source = mode.starts_with("normal_bash_source");
@@ -112,7 +118,30 @@ fn inner() {
     if provider_mode {
         let config_dir = config_home.join("oulipoly-agent-runner");
         fs::create_dir_all(config_dir.join("models")).unwrap();
-        let provider_command = serde_json::to_string(&provider_image).unwrap();
+        let (provider_command, provider_environment) = if path_mode {
+            let bin = temp.path().join("provider-bin");
+            fs::create_dir(&bin).unwrap();
+            let image = bin.join("age319-provider");
+            fs::copy(&provider_image, &image).unwrap();
+            fs::set_permissions(&image, fs::Permissions::from_mode(0o755)).unwrap();
+            let command = if mode == "normal_model_provider_prefix" {
+                "env -u AGE319_PREFIX_REMOVED age319-provider"
+            } else {
+                "age319-provider"
+            };
+            (
+                serde_json::to_string(command).unwrap(),
+                format!(
+                    "environment = {{ PATH = {} }}\n",
+                    serde_json::to_string(&format!("{}:/usr/bin:/bin", bin.display())).unwrap()
+                ),
+            )
+        } else {
+            (
+                serde_json::to_string(&provider_image).unwrap(),
+                String::new(),
+            )
+        };
         let marker = serde_json::to_string(gate.join("provider-effect").to_str().unwrap()).unwrap();
         let unused_marker =
             serde_json::to_string(gate.join("provider-effect-unused").to_str().unwrap()).unwrap();
@@ -164,7 +193,7 @@ fn inner() {
         fs::write(
             config_dir.join("providers.toml"),
             format!(
-                "[unused]\ncommand = {provider_command}\nargs = [{unused_marker}]\n[{provider_name}]\ncommand = {provider_command}\nargs = [{marker}]\n{prompt_mode}{quota}"
+                "[unused]\ncommand = {provider_command}\nargs = [{unused_marker}]\n{provider_environment}[{provider_name}]\ncommand = {provider_command}\nargs = [{marker}]\n{provider_environment}{prompt_mode}{quota}"
             ),
         )
         .unwrap();
@@ -939,6 +968,8 @@ fn inner() {
                     | "normal_model_provider_quota_reply_loss"
                     | "normal_model_provider_quota_restart"
                     | "normal_model_provider_no_pin"
+                    | "normal_model_provider_path"
+                    | "normal_model_provider_prefix"
             ) {
                 let marker: serde_json::Value =
                     serde_json::from_slice(&fs::read(gate.join("child-handoff")).unwrap()).unwrap();
@@ -1340,6 +1371,29 @@ fn inner() {
                     eventually(|| grant_file.exists());
                     let grant: serde_json::Value =
                         serde_json::from_slice(&fs::read(&grant_file).unwrap()).unwrap();
+                    if path_mode {
+                        assert_eq!(
+                            grant["configured_program"],
+                            if mode == "normal_model_provider_prefix" {
+                                "env"
+                            } else {
+                                "age319-provider"
+                            }
+                        );
+                        assert!(grant["broker_resolved_path"].as_str().unwrap().contains(
+                            if mode == "normal_model_provider_prefix" {
+                                "/env"
+                            } else {
+                                "/age319-provider"
+                            }
+                        ));
+                        assert!(
+                            grant["preflight_image"]["metadata"]["inode"]
+                                .as_u64()
+                                .unwrap()
+                                > 0
+                        );
+                    }
                     let route_file =
                         provider_dir.join(format!("{}.route-selection.json", receipt.handoff_id));
                     let route: serde_json::Value =
@@ -3824,6 +3878,8 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_model_provider_quota_reply_loss",
         "normal_model_provider_quota_restart",
         "normal_model_provider_no_pin",
+        "normal_model_provider_path",
+        "normal_model_provider_prefix",
         "normal_guardian_death",
         "normal_driver_death",
         "normal_broker_death",

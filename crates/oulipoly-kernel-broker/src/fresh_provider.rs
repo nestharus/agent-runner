@@ -15,6 +15,7 @@ use oulipoly_state::mailbox::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -103,17 +104,21 @@ pub(super) fn binding_from_held(
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Recipe {
+    configured_program: String,
     argv: Vec<String>,
     env: Vec<(String, String)>,
 }
 
 pub(super) struct Plan {
     image: File,
+    configured_program: String,
+    broker_resolved_path: PathBuf,
+    image_descriptor: ImageDescriptor,
+    preflight_image: ImagePreflight,
     cwd: File,
     input: File,
     recipe: File,
     digest: String,
-    image_hash: String,
     cwd_device: u64,
     cwd_inode: u64,
 }
@@ -121,22 +126,207 @@ pub(super) struct Plan {
 impl Plan {
     fn verify(&self) -> io::Result<()> {
         let cwd = self.cwd.metadata()?;
-        if sha_file(&self.image)?.0 != self.image_hash
+        if ImageDescriptor::of(&self.image)? != self.image_descriptor
             || cwd.dev() != self.cwd_device
             || cwd.ino() != self.cwd_inode
-            || unsafe { libc::fcntl(self.image.as_raw_fd(), libc::F_GET_SEALS) }
-                & libc::F_SEAL_WRITE
-                == 0
-            || unsafe { libc::fcntl(self.input.as_raw_fd(), libc::F_GET_SEALS) }
-                & libc::F_SEAL_WRITE
-                == 0
-            || unsafe { libc::fcntl(self.recipe.as_raw_fd(), libc::F_GET_SEALS) }
-                & libc::F_SEAL_WRITE
-                == 0
+            || !fully_sealed(&self.input)
+            || !fully_sealed(&self.recipe)
         {
             return Err(io::Error::other("fresh provider pinned plan changed"));
         }
         Ok(())
+    }
+}
+
+fn fully_sealed(file: &File) -> bool {
+    let seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
+    let required = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+    seals >= 0 && seals & required == required
+}
+
+/// Only async-signal-safe writes are used from the post-fork child.
+unsafe fn write_exec_errno(error: i32) {
+    let prefix = b"fresh provider execveat failed errno=";
+    unsafe { libc::write(2, prefix.as_ptr().cast(), prefix.len()) };
+    let mut digits = [0u8; 11];
+    let mut at = digits.len();
+    let mut value = error.unsigned_abs();
+    loop {
+        at -= 1;
+        digits[at] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    unsafe { libc::write(2, digits[at..].as_ptr().cast(), digits.len() - at) };
+    unsafe { libc::write(2, b"\n".as_ptr().cast(), 1) };
+}
+
+/// The fd's mount matters as well as its inode: a bind mount may have a
+/// different noexec/nosuid policy. This identity is stable across an in-place
+/// update; the host kernel decides what the inode contains and permits at exec.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct ImageDescriptor {
+    device: u64,
+    inode: u64,
+    mount_id: u64,
+}
+
+/// Diagnostic observations made before K. These are never an attestation of
+/// the bytes or metadata later consumed by execveat on a mutable inode.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct ImagePreflight {
+    metadata: ImageIdentity,
+    observed_sha256: Option<String>,
+    observed_shebang: Option<bool>,
+    observed_xattrs_sha256: Option<String>,
+}
+
+/// Metadata observed at preflight, not an executable-content admission rule.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct ImageIdentity {
+    device: u64,
+    inode: u64,
+    mount_id: u64,
+    filesystem_magic: i64,
+    size: u64,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    ctime: i64,
+    ctime_nsec: i64,
+    mtime: i64,
+    mtime_nsec: i64,
+}
+
+fn image_xattrs_sha256(file: &File) -> io::Result<String> {
+    let fd = file.as_raw_fd();
+    let names_len = unsafe { libc::flistxattr(fd, std::ptr::null_mut(), 0) };
+    if names_len < 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EOPNOTSUPP) {
+            return Ok(format!("{:x}", Sha256::digest(b"xattrs-unsupported")));
+        }
+        return Err(error);
+    }
+    let mut names = vec![0u8; names_len as usize];
+    let listed = unsafe { libc::flistxattr(fd, names.as_mut_ptr().cast(), names.len()) };
+    if listed < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if listed != names_len || names.last().is_some_and(|last| *last != 0) {
+        return Err(io::Error::other(
+            "fresh provider image xattrs changed while listing",
+        ));
+    }
+    let mut entries = Vec::new();
+    for name in names
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+    {
+        let name = CString::new(name)?;
+        let value_len = unsafe { libc::fgetxattr(fd, name.as_ptr(), std::ptr::null_mut(), 0) };
+        if value_len < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut value = vec![0u8; value_len as usize];
+        let read =
+            unsafe { libc::fgetxattr(fd, name.as_ptr(), value.as_mut_ptr().cast(), value.len()) };
+        if read != value_len {
+            return Err(io::Error::other(
+                "fresh provider image xattr changed while reading",
+            ));
+        }
+        entries.push((name.into_bytes(), value));
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&entries)?)
+    ))
+}
+
+impl ImageIdentity {
+    fn of(file: &File) -> io::Result<Self> {
+        let meta = file.metadata()?;
+        let mut statfs: libc::statfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstatfs(file.as_raw_fd(), &mut statfs) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let fdinfo = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))?;
+        let mount_id = fdinfo
+            .lines()
+            .find_map(|line| line.strip_prefix("mnt_id:\t"))
+            .ok_or_else(|| io::Error::other("fresh provider image mount ID unavailable"))?
+            .parse()
+            .map_err(|_| io::Error::other("fresh provider image mount ID invalid"))?;
+        Ok(Self {
+            device: meta.dev(),
+            inode: meta.ino(),
+            mount_id,
+            filesystem_magic: statfs.f_type as i64,
+            size: meta.len(),
+            uid: meta.uid(),
+            gid: meta.gid(),
+            mode: meta.mode(),
+            ctime: meta.ctime(),
+            ctime_nsec: meta.ctime_nsec(),
+            mtime: meta.mtime(),
+            mtime_nsec: meta.mtime_nsec(),
+        })
+    }
+}
+
+impl ImageDescriptor {
+    fn of(file: &File) -> io::Result<Self> {
+        let meta = file.metadata()?;
+        if !meta.is_file() {
+            return Err(io::Error::other(
+                "fresh provider image is not a regular file",
+            ));
+        }
+        let fdinfo = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))?;
+        let mount_id = fdinfo
+            .lines()
+            .find_map(|line| line.strip_prefix("mnt_id:\t"))
+            .ok_or_else(|| io::Error::other("fresh provider image mount ID unavailable"))?
+            .parse()
+            .map_err(|_| io::Error::other("fresh provider image mount ID invalid"))?;
+        Ok(Self {
+            device: meta.dev(),
+            inode: meta.ino(),
+            mount_id,
+        })
+    }
+}
+
+fn image_is_shebang(image: &File) -> io::Result<bool> {
+    let mut magic = [0u8; 2];
+    let n = image.read_at(&mut magic, 0)?;
+    Ok(n == 2 && magic == *b"#!")
+}
+
+impl ImagePreflight {
+    fn observe(image: &File, path: &Path) -> io::Result<Self> {
+        let descriptor = ImageDescriptor::of(image)?;
+        let readable = OpenOptions::new()
+            .read(true)
+            .open(path)
+            .ok()
+            .and_then(|file| (ImageDescriptor::of(&file).ok()? == descriptor).then_some(file));
+        Ok(Self {
+            metadata: ImageIdentity::of(image)?,
+            observed_sha256: readable
+                .as_ref()
+                .and_then(|file| sha_file(file).ok().map(|v| v.0)),
+            observed_shebang: readable
+                .as_ref()
+                .and_then(|file| image_is_shebang(file).ok()),
+            observed_xattrs_sha256: readable
+                .as_ref()
+                .and_then(|file| image_xattrs_sha256(file).ok()),
+        })
     }
 }
 
@@ -205,10 +395,8 @@ fn sealed_copy(source: &File, name: &'static std::ffi::CStr) -> io::Result<File>
     Ok(target)
 }
 
-/// One deterministic ELF executable, absolute path, exact argv/env, directory
-/// descriptor and sealed stdin. Unsupported shapes are rejected before spend.
-/// The setuid/setgid image refusal below scopes only this private proof; it is
-/// not an accepted restriction for the eventual unrestricted host-sudo route.
+/// One configured host executable, absolute path, exact argv/env, directory
+/// descriptor and sealed stdin. The host decides executable format and policy.
 pub(super) fn plan(
     image_path: &Path,
     cwd: &Path,
@@ -235,18 +423,10 @@ pub(super) fn plan(
     }
     let image = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_PATH)
         .open(image_path)?;
-    let meta = image.metadata()?;
-    let mut magic = [0u8; 4];
-    if !meta.is_file()
-        || meta.mode() & 0o111 == 0
-        || meta.mode() & 0o6000 != 0
-        || image.read_at(&mut magic, 0)? != 4
-        || magic != *b"\x7fELF"
-    {
-        return Err(io::Error::other("fresh provider requires pinned local ELF"));
-    }
+    let image_descriptor = ImageDescriptor::of(&image)?;
+    let preflight_image = ImagePreflight::observe(&image, image_path)?;
     let cwd = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
@@ -262,27 +442,27 @@ pub(super) fn plan(
         return Err(io::Error::last_os_error());
     }
     let mut recipe = unsafe { File::from_raw_fd(recipe_fd) };
-    serde_json::to_writer(&mut recipe, &Recipe { argv, env })?;
+    serde_json::to_writer(
+        &mut recipe,
+        &Recipe {
+            configured_program: image_path.to_string_lossy().into_owned(),
+            argv,
+            env,
+        },
+    )?;
     let seals = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
     if unsafe { libc::fcntl(recipe_fd, libc::F_ADD_SEALS, seals) } < 0 {
         return Err(io::Error::last_os_error());
     }
     recipe.seek(SeekFrom::Start(0))?;
-    let original_hash = sha_file(&image)?.0;
-    let sealed_image = sealed_copy(&image, c"fresh-provider-image")?;
-    let (image_hash, _) = sha_file(&sealed_image)?;
-    if image_hash != original_hash || sha_file(&image)?.0 != original_hash {
-        return Err(io::Error::other("provider image changed while sealing"));
-    }
     let (input_hash, input_len) = sha_file(&input)?;
     let (recipe_hash, recipe_len) = sha_file(&recipe)?;
     let cwd_meta = cwd.metadata()?;
     let digest = format!(
         "{:x}",
         Sha256::digest(serde_json::to_vec(&(
-            &image_hash,
-            meta.dev(),
-            meta.ino(),
+            image_path,
+            &image_descriptor,
             cwd_meta.dev(),
             cwd_meta.ino(),
             input_hash,
@@ -292,12 +472,15 @@ pub(super) fn plan(
         ))?)
     );
     Ok(Plan {
-        image: sealed_image,
+        image,
+        configured_program: image_path.to_string_lossy().into_owned(),
+        broker_resolved_path: image_path.to_owned(),
+        image_descriptor,
+        preflight_image,
         cwd,
         input,
         recipe,
         digest,
-        image_hash,
         cwd_device: cwd_meta.dev(),
         cwd_inode: cwd_meta.ino(),
     })
@@ -305,47 +488,43 @@ pub(super) fn plan(
 
 /// The eventual runtime bridge can pass variable recipe and prompt bytes by
 /// descriptor. The private socket uses this form so its control frame remains
-/// fixed size. The broker resolves the absolute image path, pins its original
-/// inode, then executes a sealed byte-identical copy under K.
-/// This private proof refuses a setuid/setgid image before K. Production must
-/// resolve that launch shape without narrowing normal host privileges.
+/// fixed size. The resolved path must name the caller's passed inode/mount;
+/// the sealed recipe separately records the configured first command token.
 pub(super) fn plan_from_descriptors(
-    configured_image: &Path,
+    resolved_image: &Path,
     image: File,
     cwd: File,
     input: File,
     recipe: File,
 ) -> io::Result<Plan> {
-    if !configured_image.is_absolute() {
+    if !resolved_image.is_absolute() {
         return Err(io::Error::other(
-            "fresh provider image path is not absolute",
+            "fresh provider resolved image path is not absolute",
         ));
     }
-    let configured = OpenOptions::new()
+    let resolved = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(configured_image)?;
-    let image_meta = image.metadata()?;
-    let configured_meta = configured.metadata()?;
+        .custom_flags(libc::O_PATH)
+        .open(resolved_image)?;
+    let image_descriptor = ImageDescriptor::of(&image)?;
+    let resolved_descriptor = ImageDescriptor::of(&resolved)?;
     let cwd_meta = cwd.metadata()?;
-    let mut magic = [0u8; 4];
-    if !image_meta.is_file()
-        || image_meta.mode() & 0o111 == 0
-        || image_meta.mode() & 0o6000 != 0
-        || !cwd_meta.is_dir()
-        || (image_meta.dev(), image_meta.ino()) != (configured_meta.dev(), configured_meta.ino())
-        || image.read_at(&mut magic, 0)? != 4
-        || magic != *b"\x7fELF"
-    {
+    if !cwd_meta.is_dir() {
+        return Err(io::Error::other("fresh provider cwd is not a directory"));
+    }
+    if image_descriptor != resolved_descriptor {
         return Err(io::Error::other(
-            "fresh provider pinned image or cwd mismatch",
+            "fresh provider caller image and broker path differ in inode or mount",
         ));
     }
+    let preflight_image = ImagePreflight::observe(&resolved, resolved_image)?;
     let mut reader = recipe.try_clone()?;
     reader.seek(SeekFrom::Start(0))?;
     let parsed: Recipe = serde_json::from_reader(reader)?;
     let mut keys = HashSet::new();
-    if parsed.argv.iter().any(|arg| arg.contains('\0'))
+    if parsed.configured_program.is_empty()
+        || parsed.configured_program.contains('\0')
+        || parsed.argv.iter().any(|arg| arg.contains('\0'))
         || parsed.env.iter().any(|(key, value)| {
             key.is_empty()
                 || key.contains(['=', '\0'])
@@ -359,19 +538,6 @@ pub(super) fn plan_from_descriptors(
     {
         return Err(io::Error::other("unsupported fresh provider recipe"));
     }
-    let original_hash = sha_file(&image)?.0;
-    if sha_file(&configured)?.0 != original_hash {
-        return Err(io::Error::other(
-            "fresh provider image path content changed",
-        ));
-    }
-    let sealed_image = sealed_copy(&image, c"fresh-provider-image")?;
-    let (image_hash, _) = sha_file(&sealed_image)?;
-    if image_hash != original_hash || sha_file(&image)?.0 != original_hash {
-        return Err(io::Error::other(
-            "fresh provider image changed while sealing",
-        ));
-    }
     let input = sealed_copy(&input, c"fresh-provider-stdin")?;
     let recipe = sealed_copy(&recipe, c"fresh-provider-recipe")?;
     let (input_hash, input_len) = sha_file(&input)?;
@@ -379,9 +545,8 @@ pub(super) fn plan_from_descriptors(
     let digest = format!(
         "{:x}",
         Sha256::digest(serde_json::to_vec(&(
-            &image_hash,
-            image_meta.dev(),
-            image_meta.ino(),
+            resolved_image,
+            &resolved_descriptor,
             cwd_meta.dev(),
             cwd_meta.ino(),
             input_hash,
@@ -391,12 +556,15 @@ pub(super) fn plan_from_descriptors(
         ))?)
     );
     Ok(Plan {
-        image: sealed_image,
+        image: resolved,
+        configured_program: parsed.configured_program,
+        broker_resolved_path: resolved_image.to_owned(),
+        image_descriptor: resolved_descriptor,
+        preflight_image,
         cwd,
         input,
         recipe,
         digest,
-        image_hash,
         cwd_device: cwd_meta.dev(),
         cwd_inode: cwd_meta.ino(),
     })
@@ -409,6 +577,11 @@ struct Grant {
     id: String,
     binding: Binding,
     plan_sha256: String,
+    configured_program: String,
+    broker_resolved_path: PathBuf,
+    image_descriptor: ImageDescriptor,
+    /// Pre-K observation only. Mutable inode bytes/metadata may differ at exec.
+    preflight_image: ImagePreflight,
 }
 
 pub(super) struct Prepared {
@@ -1160,7 +1333,7 @@ fn route_evidence(directory: &Path, candidate: &RouteCandidate) -> io::Result<(u
         let consumed_path = directory.join(format!("{}.consumed.json", grant.id));
         let consumed: Option<Grant> =
             exact_file(directory, &format!("{}.consumed.json", grant.id))?;
-        if consumed.as_ref() != Some(&grant) || grant.version != 1 {
+        if consumed.as_ref() != Some(&grant) || grant.version != 3 {
             return Err(io::Error::other(format!(
                 "fresh route history K absent or changed: {}",
                 consumed_path.display()
@@ -1491,7 +1664,13 @@ pub(super) fn prepare(directory: &Path, binding: Binding, plan: Plan) -> io::Res
     let path = directory.join(&name);
     let grant = if path.exists() {
         let old: Grant = serde_json::from_reader(File::open(&path)?)?;
-        if old.version != 1 || old.binding != binding || old.plan_sha256 != plan.digest {
+        if old.version != 3
+            || old.binding != binding
+            || old.plan_sha256 != plan.digest
+            || old.configured_program != plan.configured_program
+            || old.broker_resolved_path != plan.broker_resolved_path
+            || old.image_descriptor != plan.image_descriptor
+        {
             return Err(io::Error::other(
                 "fresh provider grant binding or plan changed",
             ));
@@ -1499,10 +1678,14 @@ pub(super) fn prepare(directory: &Path, binding: Binding, plan: Plan) -> io::Res
         old
     } else {
         let grant = Grant {
-            version: 1,
+            version: 3,
             id: uuid::Uuid::new_v4().to_string(),
             binding,
             plan_sha256: plan.digest.clone(),
+            configured_program: plan.configured_program.clone(),
+            broker_resolved_path: plan.broker_resolved_path.clone(),
+            image_descriptor: plan.image_descriptor.clone(),
+            preflight_image: plan.preflight_image.clone(),
         };
         durable_new(directory, &name, &grant)?;
         grant
@@ -1527,7 +1710,7 @@ pub(super) fn grant_for_binding(directory: &Path, binding: &Binding) -> io::Resu
     let Some(grant): Option<Grant> = exact_file(directory, &name)? else {
         return Ok(None);
     };
-    if grant.version != 1 || grant.binding != *binding {
+    if grant.version != 3 || grant.binding != *binding {
         return Err(io::Error::other(
             "fresh provider grant readback binding changed",
         ));
@@ -1545,7 +1728,13 @@ pub(super) fn grant_for_matching_plan(
     let name = format!("{}.fresh-grant.json", binding.handoff_id);
     let grant: Grant = exact_file(directory, &name)?
         .ok_or_else(|| io::Error::other("fresh provider grant absent"))?;
-    if grant.version != 1 || grant.binding != *binding || grant.plan_sha256 != plan.digest {
+    if grant.version != 3
+        || grant.binding != *binding
+        || grant.plan_sha256 != plan.digest
+        || grant.configured_program != plan.configured_program
+        || grant.broker_resolved_path != plan.broker_resolved_path
+        || grant.image_descriptor != plan.image_descriptor
+    {
         return Err(io::Error::other("fresh provider K readback plan mismatch"));
     }
     Ok(grant.id)
@@ -1668,13 +1857,32 @@ fn run_init(mut init: Init) -> io::Result<()> {
             "fresh provider PID1 persistence gate refused",
         ));
     }
+    init.plan.verify()?;
     let recipe: Recipe = serde_json::from_reader(&init.plan.recipe)?;
     let image = format!("/proc/self/fd/{}", init.plan.image.as_raw_fd());
+    let argv = std::iter::once(recipe.configured_program.as_str())
+        .chain(recipe.argv.iter().map(String::as_str))
+        .map(CString::new)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| io::Error::other("fresh provider argv contains NUL"))?;
+    let argv_ptrs = argv
+        .iter()
+        .map(|value| value.as_ptr() as usize)
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let env = recipe
+        .env
+        .iter()
+        .map(|(key, value)| CString::new(format!("{key}={value}")))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| io::Error::other("fresh provider environment contains NUL"))?;
+    let env_ptrs = env
+        .iter()
+        .map(|value| value.as_ptr() as usize)
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
     let mut command = Command::new(image);
-    command.args(&recipe.argv).env_clear();
-    for (k, v) in recipe.env {
-        command.env(k, v);
-    }
+    command.env_clear();
     init.plan.input.seek(SeekFrom::Start(0))?;
     command
         .stdin(Stdio::from(init.plan.input.try_clone()?))
@@ -1686,6 +1894,9 @@ fn run_init(mut init: Init) -> io::Result<()> {
     let uid = init.uid;
     let gid = init.gid;
     let groups = init.groups;
+    let image_fd = init.plan.image.as_raw_fd();
+    let image_probe = CString::new(format!("/proc/self/fd/{image_fd}"))?;
+    let preflight_shebang = init.plan.preflight_image.observed_shebang;
     let fixture = super::private_fixture();
     unsafe {
         command.pre_exec(move || {
@@ -1709,7 +1920,44 @@ fn run_init(mut init: Init) -> io::Result<()> {
             if libc::read(gate_fd, (&mut byte as *mut u8).cast(), 1) != 1 || byte != b'R' {
                 return Err(io::Error::other("fresh provider pre-exec gate refused"));
             }
-            Ok(())
+            // A shebang interpreter opens /dev/fd/N after execveat. Probe the
+            // pinned inode after the gate, then keep its fd only for scripts.
+            // A last concurrent write can still change the result or cause an
+            // OS exec error; this probe does not attest executed bytes.
+            let probe = libc::open(image_probe.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+            let script = if probe >= 0 {
+                let mut magic = [0u8; 2];
+                let read = libc::pread(probe, magic.as_mut_ptr().cast(), magic.len(), 0);
+                libc::close(probe);
+                read != 2 || magic == *b"#!"
+            } else {
+                preflight_shebang.unwrap_or(true)
+            };
+            let flags = libc::fcntl(image_fd, libc::F_GETFD);
+            let target_flags = if script {
+                flags & !libc::FD_CLOEXEC
+            } else {
+                flags | libc::FD_CLOEXEC
+            };
+            if flags < 0 || libc::fcntl(image_fd, libc::F_SETFD, target_flags) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // The kernel executes the original inode and mount, including
+            // the host's set-ID, file-capability and LSM decisions.
+            let _keep_strings_alive = (&argv, &env);
+            libc::syscall(
+                libc::SYS_execveat,
+                image_fd,
+                c"".as_ptr(),
+                argv_ptrs.as_ptr().cast::<*const libc::c_char>(),
+                env_ptrs.as_ptr().cast::<*const libc::c_char>(),
+                libc::AT_EMPTY_PATH,
+            );
+            // This is an OS exec refusal after one-use K. Exit as a real
+            // provider failure so PID1 can record exit and physical Q.
+            let error = *libc::__errno_location();
+            write_exec_errno(error);
+            libc::_exit(if error == libc::ENOENT { 127 } else { 126 });
         });
     }
     let provider = command.spawn()?;
@@ -1897,7 +2145,11 @@ pub(super) fn launch(
         return Err(io::Error::other("fresh provider K inherited NNP/seccomp"));
     }
     prepared.plan.verify()?;
-    if prepared.plan.digest != prepared.grant.plan_sha256 {
+    if prepared.plan.digest != prepared.grant.plan_sha256
+        || prepared.plan.configured_program != prepared.grant.configured_program
+        || prepared.plan.broker_resolved_path != prepared.grant.broker_resolved_path
+        || prepared.plan.image_descriptor != prepared.grant.image_descriptor
+    {
         return Err(io::Error::other("fresh provider plan changed before K"));
     }
     durable_new(
@@ -2197,7 +2449,259 @@ pub(super) fn cancel(dir: &Path, grant_id: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
+
+    fn wait_for_q(directory: &Path, grant: &str) -> (i32, Vec<u8>, Vec<u8>) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Ok(Observation::Drained {
+                status,
+                mut stdout,
+                mut stderr,
+                ..
+            }) = observe(directory, grant)
+            {
+                let mut out = Vec::new();
+                let mut err = Vec::new();
+                stdout.read_to_end(&mut out).unwrap();
+                stderr.read_to_end(&mut err).unwrap();
+                return (status, out, err);
+            }
+            assert!(Instant::now() < deadline, "physical Q absent for {grant}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn user_owned_mutable_and_execute_only_images_are_plan_eligible() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let image = temporary.path().join("user-image");
+        std::fs::copy(std::env::current_exe().unwrap(), &image).unwrap();
+        std::fs::set_permissions(&image, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let input = temporary.path().join("input");
+        std::fs::write(&input, b"").unwrap();
+        let candidate = plan(
+            &image,
+            temporary.path(),
+            &File::open(&input).unwrap(),
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(candidate.preflight_image.metadata.uid, unsafe {
+            libc::geteuid()
+        });
+        assert_eq!(
+            candidate.image_descriptor,
+            ImageDescriptor::of(&candidate.image).unwrap()
+        );
+        candidate.verify().unwrap();
+        std::fs::set_permissions(&image, std::fs::Permissions::from_mode(0o111)).unwrap();
+        assert!(File::open(&image).is_err());
+        let execute_only = plan(
+            &image,
+            temporary.path(),
+            &File::open(&input).unwrap(),
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        assert!(execute_only.preflight_image.observed_sha256.is_none());
+        execute_only.verify().unwrap();
+    }
+
+    #[test]
+    fn host_inode_shebang_mutation_prefix_and_failed_exec_reach_physical_q() {
+        if std::env::var_os("AGE319_HOST_IMAGE_INNER").is_none() {
+            if std::env::var_os("OULIPOLY_AGE319_PROVIDER_IMAGE").is_none() {
+                return;
+            }
+            let output = Command::new("unshare")
+                .args(["-Urpfm", "--mount-proc"])
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", "linux_main::fresh_provider::tests::host_inode_shebang_mutation_prefix_and_failed_exec_reach_physical_q", "--nocapture"])
+                .env("AGE319_HOST_IMAGE_INNER", "1")
+                .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", "/tmp/host-image-fixture-socket")
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let input = temporary.path().join("input");
+        std::fs::write(&input, b"").unwrap();
+        let mut actor_child = Command::new("sleep").arg("60").spawn().unwrap();
+        let root = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+        let actor = PinnedProcess::open(actor_child.id() as i32).unwrap();
+        let image = temporary.path().join("script");
+        std::fs::write(&image, b"#!/bin/sh\nprintf before\n").unwrap();
+        std::fs::set_permissions(&image, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let make = |path: &Path, args: Vec<String>, env: Vec<(String, String)>| {
+            plan(
+                path,
+                temporary.path(),
+                &File::open(&input).unwrap(),
+                args,
+                env,
+            )
+            .unwrap()
+        };
+        let binding = fixture_binding(&root, &actor);
+        let prepared = prepare(
+            temporary.path(),
+            binding.clone(),
+            make(&image, vec![], vec![]),
+        )
+        .unwrap();
+        let observed = prepared.grant.preflight_image.observed_sha256.clone();
+        std::fs::write(&image, b"#!/bin/sh\nprintf after\n").unwrap();
+        assert_ne!(
+            observed,
+            Some(sha_file(&File::open(&image).unwrap()).unwrap().0)
+        );
+        prepared.plan.verify().unwrap();
+        assert_eq!(
+            grant_for_matching_plan(temporary.path(), &binding, &make(&image, vec![], vec![]))
+                .unwrap(),
+            prepared.grant.id
+        );
+        let grant = launch(prepared, &root, &actor, 0, 0).unwrap();
+        let (status, stdout, _) = wait_for_q(temporary.path(), &grant);
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+        assert_eq!(stdout, b"after");
+        assert!(prepare(temporary.path(), binding, make(&image, vec![], vec![])).is_err());
+
+        let replacement = temporary.path().join("replacement");
+        std::fs::write(&replacement, b"#!/bin/sh\nprintf original\n").unwrap();
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let held = prepare(
+            temporary.path(),
+            fixture_binding(&root, &actor),
+            make(&replacement, vec![], vec![]),
+        )
+        .unwrap();
+        std::fs::rename(&replacement, temporary.path().join("old-replacement")).unwrap();
+        std::fs::write(&replacement, b"#!/bin/sh\nprintf substituted\n").unwrap();
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o755)).unwrap();
+        held.plan.verify().unwrap();
+        assert!(
+            plan_from_descriptors(
+                &replacement,
+                held.plan.image.try_clone().unwrap(),
+                held.plan.cwd.try_clone().unwrap(),
+                held.plan.input.try_clone().unwrap(),
+                held.plan.recipe.try_clone().unwrap()
+            )
+            .is_err()
+        );
+        let held_grant = launch(held, &root, &actor, 0, 0).unwrap();
+        assert_eq!(wait_for_q(temporary.path(), &held_grant).1, b"original");
+
+        let prefix = temporary.path().join("prefix-target");
+        std::fs::write(
+            &prefix,
+            b"#!/bin/sh\n[ -z \"${AGE319_PREFIX_REMOVED+x}\" ] || exit 33\nprintf prefix-output\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&prefix, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let prefix_plan = make(
+            Path::new("/usr/bin/env"),
+            vec![
+                "-u".into(),
+                "AGE319_PREFIX_REMOVED".into(),
+                prefix.display().to_string(),
+            ],
+            vec![
+                ("AGE319_PREFIX_REMOVED".into(), "present".into()),
+                ("PATH".into(), "/usr/bin:/bin".into()),
+            ],
+        );
+        let prefix_grant = launch(
+            prepare(
+                temporary.path(),
+                fixture_binding(&root, &actor),
+                prefix_plan,
+            )
+            .unwrap(),
+            &root,
+            &actor,
+            0,
+            0,
+        )
+        .unwrap();
+        let (status, stdout, _) = wait_for_q(temporary.path(), &prefix_grant);
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+        assert_eq!(stdout, b"prefix-output");
+
+        let setid = temporary.path().join("setid-true");
+        std::fs::copy("/bin/true", &setid).unwrap();
+        std::fs::set_permissions(&setid, std::fs::Permissions::from_mode(0o6755)).unwrap();
+        let setid_plan = make(&setid, vec![], vec![]);
+        assert_eq!(setid_plan.preflight_image.metadata.mode & 0o6000, 0o6000);
+        let setid_grant = launch(
+            prepare(temporary.path(), fixture_binding(&root, &actor), setid_plan).unwrap(),
+            &root,
+            &actor,
+            0,
+            0,
+        )
+        .unwrap();
+        let (status, _, _) = wait_for_q(temporary.path(), &setid_grant);
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+
+        let filecap = temporary.path().join("filecap-true");
+        std::fs::copy("/bin/true", &filecap).unwrap();
+        std::fs::set_permissions(&filecap, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let setcap = Command::new("setcap")
+            .arg("cap_net_bind_service=ep")
+            .arg(&filecap)
+            .output()
+            .unwrap();
+        assert!(
+            setcap.status.success(),
+            "setcap: {}",
+            String::from_utf8_lossy(&setcap.stderr)
+        );
+        let cap_plan = make(&filecap, vec![], vec![]);
+        assert!(cap_plan.preflight_image.observed_xattrs_sha256.is_some());
+        let cap_grant = launch(
+            prepare(temporary.path(), fixture_binding(&root, &actor), cap_plan).unwrap(),
+            &root,
+            &actor,
+            0,
+            0,
+        )
+        .unwrap();
+        let (status, _, _) = wait_for_q(temporary.path(), &cap_grant);
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+
+        let refused = temporary.path().join("refused");
+        std::fs::write(&refused, b"#!/bin/sh\nprintf should-not-run\n").unwrap();
+        std::fs::set_permissions(&refused, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let prepared = prepare(
+            temporary.path(),
+            fixture_binding(&root, &actor),
+            make(&refused, vec![], vec![]),
+        )
+        .unwrap();
+        std::fs::set_permissions(&refused, std::fs::Permissions::from_mode(0o000)).unwrap();
+        prepared.plan.verify().unwrap();
+        let refused_grant = launch(prepared, &root, &actor, 0, 0).unwrap();
+        let (status, stdout, stderr) = wait_for_q(temporary.path(), &refused_grant);
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 126);
+        assert!(stdout.is_empty());
+        assert!(stderr.starts_with(b"fresh provider execveat failed errno=13\n"));
+        actor_child.kill().unwrap();
+        actor_child.wait().unwrap();
+    }
 
     #[test]
     fn recent_failure_window_threshold_fallback_and_pin() {
@@ -2334,11 +2838,21 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let process = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
         let previous = fixture_binding(&process, &process);
+        let image_path = Path::new("/bin/true");
+        let image = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH)
+            .open(image_path)
+            .unwrap();
         let grant = Grant {
-            version: 1,
+            version: 3,
             id: uuid::Uuid::new_v4().to_string(),
             binding: previous.clone(),
             plan_sha256: "b".repeat(64),
+            configured_program: image_path.display().to_string(),
+            broker_resolved_path: image_path.to_path_buf(),
+            image_descriptor: ImageDescriptor::of(&image).unwrap(),
+            preflight_image: ImagePreflight::observe(&image, image_path).unwrap(),
         };
         durable_new(
             temp.path(),

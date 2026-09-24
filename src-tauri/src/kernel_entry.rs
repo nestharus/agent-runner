@@ -738,7 +738,7 @@ fn private_pin_plan(
     use std::os::unix::fs::OpenOptionsExt;
     let image = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_PATH)
         .open(&plan.executable)
         .map_err(|e| format!("fresh provider image: {e}"))?;
     let cwd = std::fs::OpenOptions::new()
@@ -748,6 +748,7 @@ fn private_pin_plan(
         .map_err(|e| format!("fresh provider cwd: {e}"))?;
     let input = private_sealed_bytes(b"fresh-provider-input", &plan.stdin)?;
     let recipe_bytes = serde_json::to_vec(&serde_json::json!({
+        "configured_program": plan.configured_program,
         "argv": plan.argv, "env": plan.environment,
     }))
     .map_err(|e| e.to_string())?;
@@ -771,9 +772,8 @@ impl oulipoly_runtime::executor::cli::fresh_remote::FreshProviderBackend
     {
         use oulipoly_kernel_broker::protocol;
         let socket = broker_socket().with_file_name("v30.sock");
-        // Descriptor identity and byte content are rechecked and sealed by
-        // the host broker before one-use K; neither configured path nor text
-        // recipe is trusted after this point.
+        // The broker binds the original descriptor's inode and mount before
+        // one-use K. Preflight content observations cannot attest later bytes.
         let pinned = private_pin_plan(&plan)?;
         let submitted = protocol::private_fresh_provider_at(
             &socket,

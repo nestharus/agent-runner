@@ -11,6 +11,25 @@ physical-drain boundary is incomplete.
 Ordinary Runner and Bash admission and allocated-attempt custody remain active.
 This source is not a deployable AGE-319 restoration.
 
+## Private fresh provider execution
+
+The closed private route assembles the configured first command, arguments,
+environment, cwd and stdin through the normal runtime launch path. A bare
+first command is resolved against that child's effective `PATH` for each
+attempt. The broker compares the passed descriptor with its own open of the
+resolved path, binds that mount and inode and the sealed recipe to one-use K,
+and invokes `execveat` on the original descriptor. The host kernel applies its
+normal shebang, set-ID, file-capability and mount policy. User-owned and
+mutable executable images are eligible. A recorded preflight hash, metadata
+and xattr digest are observations; they do not certify bytes or metadata at
+the later syscall. Path replacement leaves a prepared descriptor on its
+original inode; an in-place update may change the outcome or cause an OS exec
+error, which is recorded as provider exit and physical Q. An uncertain K or Q
+remains explicit debt for caller-owned recovery, with no automatic replay.
+
+This is source and private user-namespace evidence only. The selector stays
+closed, and installed host sudo behavior is unproved.
+
 ## Installed trust roots and protocol
 
 The source-only unit is `packaging/linux/oulipoly-kernel-broker.service`. The
