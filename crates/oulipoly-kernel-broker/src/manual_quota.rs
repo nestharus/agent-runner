@@ -516,6 +516,217 @@ pub(super) struct IntentSummary {
     pub effect_id: Option<String>,
 }
 
+/// Read-only import of retained manual intents. Followers remain explicit
+/// unresolved references; only their source owns a physical K/Q.
+pub(super) fn offline_collect(
+    directory: &Path,
+    source: &Path,
+    snapshot: &mut super::fresh_index::OfflineSnapshot,
+) -> io::Result<()> {
+    use super::fresh_index::{
+        Account, Artifact, EffectIntent, EffectKind, MarkerTimes, PhysicalQ as IndexPhysicalQ,
+        SourceKey,
+    };
+    use std::collections::BTreeMap;
+    let parent = directory.join("manual-quota");
+    let entries = match fs::read_dir(&parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let meta = source.metadata()?;
+    if !meta.is_dir() {
+        return Err(io::Error::other("offline manual source not directory"));
+    }
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let dir = entry.path();
+        let id = entry.file_name().to_string_lossy().into_owned();
+        if !valid_id(&id) {
+            return Err(io::Error::other("offline manual operation ID invalid"));
+        }
+        let intent: Intent = read_exact(&dir, "intent.json")?
+            .ok_or_else(|| io::Error::other("offline manual intent absent"))?;
+        let pool = oulipoly_runtime::executor::cli::fresh_remote::load_fresh_headless_pool(
+            source,
+            &intent.request.model,
+        )
+        .map_err(io::Error::other)?;
+        let index = pool
+            .model
+            .providers
+            .iter()
+            .position(|p| p.name == intent.request.account)
+            .ok_or_else(|| io::Error::other("offline manual source account absent"))?;
+        if intent.version != 1
+            || intent.request.operation_id != id
+            || intent.request.config_sha256 != pool.config_sha256
+            || intent.physical_account_id != pool.account_identities[index].as_deref().unwrap_or("")
+            || (
+                intent.quota_script.clone(),
+                intent.auth_refresh_command.clone(),
+            ) != pool.account_effects[index]
+            || intent.source_device != meta.dev()
+            || intent.source_inode != meta.ino()
+            || intent.environment_sha256.len() != 64
+            || !intent
+                .environment_sha256
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(io::Error::other(
+                "offline manual config/source/environment changed",
+            ));
+        }
+        if snapshot
+            .source_models
+            .insert(
+                intent.request.model.clone(),
+                intent.request.config_sha256.clone(),
+            )
+            .is_some_and(|prior| prior != intent.request.config_sha256)
+        {
+            return Err(io::Error::other(
+                "offline manual model has multiple config digests",
+            ));
+        }
+        let k: Option<serde_json::Value> = read_exact(&dir, "k.json")?;
+        if intent.source_operation_id.is_some() && k.is_some() {
+            return Err(io::Error::other("offline manual reuse has physical K"));
+        }
+        if intent.quota_script.is_none() && k.is_some() {
+            return Err(io::Error::other("offline unmetered manual operation has K"));
+        }
+        if let Some(k) = &k {
+            if k.get("version").and_then(|v| v.as_u64()) != Some(1)
+                || k.get("effect_id").and_then(|v| v.as_str()) != intent.effect_id.as_deref()
+                || k.get("operation_id").and_then(|v| v.as_str()) != Some(id.as_str())
+            {
+                return Err(io::Error::other("offline manual K identity changed"));
+            }
+        }
+        let result = readback_intent(directory, &intent)?;
+        if dir.join("q.json").exists() && (k.is_none() || result.state != "drained") {
+            return Err(io::Error::other(
+                "offline manual Q lacks certified K/readback",
+            ));
+        }
+        let source_key = SourceKey {
+            commands_sha256: sha(&serde_json::to_vec(&(
+                &intent.quota_script,
+                &intent.auth_refresh_command,
+            ))?),
+            environment_sha256: intent.environment_sha256.clone(),
+        };
+        let relative = Path::new("manual-quota").join(&id);
+        let effect = EffectIntent {
+            kind: EffectKind::ManualQuota,
+            source: source_key,
+            intent: Artifact::from_existing(directory, &relative.join("intent.json"))
+                .map_err(io::Error::other)?,
+            reuse: None,
+            consumed_k: if k.is_some() {
+                Some(
+                    Artifact::from_existing(directory, &relative.join("k.json"))
+                        .map_err(io::Error::other)?,
+                )
+            } else {
+                None
+            },
+            certified_q: if result.state == "drained" && k.is_some() {
+                let k = Artifact::from_existing(directory, &relative.join("k.json"))
+                    .map_err(io::Error::other)?;
+                let q = Artifact::from_existing(directory, &relative.join("q.json"))
+                    .map_err(io::Error::other)?;
+                Some(IndexPhysicalQ {
+                    physical_k: k,
+                    q,
+                    terminal: None,
+                    completed_unix_nanos: i64::try_from(physical_q_nanos(directory, &id)?)
+                        .map_err(io::Error::other)?,
+                })
+            } else {
+                None
+            },
+        };
+        let account = snapshot
+            .accounts
+            .entry(intent.physical_account_id.clone())
+            .or_insert_with(|| Account {
+                generation: String::new(),
+                physical_key: intent.physical_account_id.clone(),
+                revision: 0,
+                grants: BTreeMap::new(),
+                effects: BTreeMap::new(),
+                observed_invocations: 0,
+                markers: MarkerTimes::default(),
+                source_q: BTreeMap::new(),
+                recent_failure_nanos: Vec::new(),
+            });
+        if account.effects.insert(id, effect).is_some() {
+            return Err(io::Error::other("offline manual operation duplicated"));
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn offline_certified_q(
+    directory: &Path,
+    operation_id: &str,
+    source: &Path,
+) -> io::Result<Option<(u128, bool)>> {
+    let dir = operation_dir(directory, operation_id);
+    let intent: Intent = read_exact(&dir, "intent.json")?
+        .ok_or_else(|| io::Error::other("manual reconcile intent absent"))?;
+    let meta = source.metadata()?;
+    let pool = oulipoly_runtime::executor::cli::fresh_remote::load_fresh_headless_pool(
+        source,
+        &intent.request.model,
+    )
+    .map_err(io::Error::other)?;
+    let index = pool
+        .model
+        .providers
+        .iter()
+        .position(|p| p.name == intent.request.account)
+        .ok_or_else(|| io::Error::other("manual reconcile account absent"))?;
+    if intent.version != 1
+        || intent.request.operation_id != operation_id
+        || intent.source_operation_id.is_some()
+        || intent.source_device != meta.dev()
+        || intent.source_inode != meta.ino()
+        || intent.request.config_sha256 != pool.config_sha256
+        || intent.physical_account_id != pool.account_identities[index].as_deref().unwrap_or("")
+        || (
+            intent.quota_script.clone(),
+            intent.auth_refresh_command.clone(),
+        ) != pool.account_effects[index]
+    {
+        return Err(io::Error::other("manual reconcile source changed"));
+    }
+    if !dir.join("q.json").exists() {
+        return Ok(None);
+    }
+    let k: serde_json::Value =
+        read_exact(&dir, "k.json")?.ok_or_else(|| io::Error::other("manual Q precedes K"))?;
+    if k.get("effect_id").and_then(|v| v.as_str()) != intent.effect_id.as_deref()
+        || k.get("operation_id").and_then(|v| v.as_str()) != Some(operation_id)
+    {
+        return Err(io::Error::other("manual reconcile K changed"));
+    }
+    let result = readback_intent(directory, &intent)?;
+    if result.state != "drained" {
+        return Err(io::Error::other("manual Q not certified"));
+    }
+    Ok(Some((
+        physical_q_nanos(directory, operation_id)?,
+        result.outcome.as_deref() == Some("valid_windows"),
+    )))
+}
+
 pub(super) fn unresolved_for_physical(
     directory: &Path,
     physical_id: &str,

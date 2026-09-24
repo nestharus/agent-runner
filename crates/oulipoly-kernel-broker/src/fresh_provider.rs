@@ -28,6 +28,10 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+#[path = "fresh_rebuild.rs"]
+mod fresh_rebuild;
+pub(super) use fresh_rebuild::{offline_snapshot, reconcile_offline_account};
+
 static CANCEL: AtomicBool = AtomicBool::new(false);
 extern "C" fn request_cancel(_: libc::c_int) {
     CANCEL.store(true, Ordering::Relaxed);
@@ -961,6 +965,14 @@ fn effect_readback_from_dir(
     dir: &Path,
     intent: &AccountEffectIntent,
 ) -> io::Result<FreshAccountEffectReadback> {
+    effect_readback_from_dir_mode(dir, intent, true)
+}
+
+fn effect_readback_from_dir_mode(
+    dir: &Path,
+    intent: &AccountEffectIntent,
+    materialize: bool,
+) -> io::Result<FreshAccountEffectReadback> {
     let artifact = dir.display().to_string();
     let broker_directory = dir
         .parent()
@@ -1025,7 +1037,7 @@ fn effect_readback_from_dir(
         {
             return Err(io::Error::other("fresh auth reuse provenance changed"));
         }
-        let mut peer = effect_readback_from_dir(&source_dir, &source)?;
+        let mut peer = effect_readback_from_dir_mode(&source_dir, &source, materialize)?;
         peer.peer_effect_id = Some(peer.effect_id.clone());
         peer.peer_artifact = Some(peer.artifact.clone());
         peer.effect_id = intent.id.clone();
@@ -1056,7 +1068,7 @@ fn effect_readback_from_dir(
         {
             return Err(io::Error::other("fresh quota reuse provenance changed"));
         }
-        let mut readback = effect_readback_from_dir(&source_dir, &source)?;
+        let mut readback = effect_readback_from_dir_mode(&source_dir, &source, materialize)?;
         readback.effect_id = intent.id.clone();
         readback.artifact = format!("{artifact} -> {}", readback.artifact);
         return Ok(readback);
@@ -1113,7 +1125,7 @@ fn effect_readback_from_dir(
                 if serde_json::to_value(&existing)? != serde_json::to_value(&receipt)? {
                     return Err(io::Error::other("fresh account effect result changed"));
                 }
-            } else {
+            } else if materialize {
                 durable_result(dir, &receipt)?;
             }
             Ok(receipt)

@@ -2,7 +2,8 @@
 #[cfg(feature = "age319-private-broker-fixture")]
 #[path = "fresh_provider.rs"]
 mod fresh_provider;
-// Inert AGE-319 substrate. No live selector, admission, or effect path calls it.
+// Offline AGE-319 substrate; only the broker-lifetime admission freeze lease
+// touches the live lane. Selectors and effect writers do not consume the index.
 #[cfg(feature = "age319-private-broker-fixture")]
 #[path = "fresh_index.rs"]
 #[allow(dead_code)]
@@ -3837,6 +3838,12 @@ fn serve_fresh_v30_at(
 ) -> io::Result<()> {
     // A missing or incomplete publication cannot bind the new endpoint.
     let mut lane = FreshV30Lane::open_at(state_root).map_err(io::Error::other)?;
+    // The lease spans all broker requests, including route, grant, provider K,
+    // quota/auth/manual intent and K, and their readback paths. Offline index
+    // rebuild takes the exclusive side before reading any retained evidence.
+    #[cfg(feature = "age319-private-broker-fixture")]
+    let _admission = fresh_index::broker_admission_lease(&state_root.join("v30/fresh-provider"))
+        .map_err(io::Error::other)?;
     let instance = EntryGate::open(&state_root.join("v30"))?;
     // An installed Bash child must match the package's pinned digest. Private
     // fixtures supply their built source binary only at broker startup.
@@ -4774,6 +4781,65 @@ pub fn run() {
                     println!("{}", serde_json::to_string(&identity).unwrap());
                 })
                 .map_err(io::Error::other)
+        }
+        #[cfg(feature = "age319-private-broker-fixture")]
+        [_, mode, source] if mode == "--offline-rebuild-fresh-index" => {
+            let state = if private_fixture() {
+                std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1")
+                    .ok_or_else(|| io::Error::other("offline fixture state absent"))
+                    .map(PathBuf::from)
+            } else {
+                Ok(PathBuf::from(STATE))
+            };
+            let socket = if private_fixture() {
+                std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1")
+                    .ok_or_else(|| io::Error::other("offline fixture socket absent"))
+                    .map(PathBuf::from)
+            } else {
+                Ok(PathBuf::from(FRESH_SOCKET))
+            };
+            state.and_then(|state| {
+                socket.and_then(|socket| {
+                    fresh_index::Index::rebuild_offline(
+                        &state.join("v30/fresh-provider"),
+                        &socket,
+                        Path::new(source),
+                    )
+                    .map(|_| ())
+                    .map_err(io::Error::other)
+                })
+            })
+        }
+        #[cfg(feature = "age319-private-broker-fixture")]
+        [_, mode, source, account] if mode == "--offline-reconcile-fresh-index" => {
+            let state = if private_fixture() {
+                std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1")
+                    .ok_or_else(|| io::Error::other("offline fixture state absent"))
+                    .map(PathBuf::from)
+            } else {
+                Ok(PathBuf::from(STATE))
+            };
+            let socket = if private_fixture() {
+                std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1")
+                    .ok_or_else(|| io::Error::other("offline fixture socket absent"))
+                    .map(PathBuf::from)
+            } else {
+                Ok(PathBuf::from(FRESH_SOCKET))
+            };
+            state.and_then(|state| {
+                socket.and_then(|socket| {
+                    let index = fresh_index::Index::open(&state.join("v30/fresh-provider"))
+                        .map_err(io::Error::other)?;
+                    index
+                        .reconcile_offline_account_frozen(
+                            &socket,
+                            &account.to_string_lossy(),
+                            Path::new(source),
+                        )
+                        .map(|_| ())
+                        .map_err(io::Error::other)
+                })
+            })
         }
         [_, mode] if mode == "--serve-fresh-v30" => {
             #[cfg(feature = "age319-private-broker-fixture")]

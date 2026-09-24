@@ -11,6 +11,8 @@
 - `crates/oulipoly-kernel-broker/src/entry_registry.rs`
 - `crates/oulipoly-kernel-broker/src/fresh_provider.rs`
 - `crates/oulipoly-kernel-broker/src/fresh_index.rs`
+- `crates/oulipoly-kernel-broker/src/fresh_rebuild.rs`
+- `crates/oulipoly-kernel-broker/src/manual_quota.rs`
 - `crates/oulipoly-kernel-broker/src/fresh_provider_fixture.rs`
 - `crates/oulipoly-kernel-broker/src/lib.rs`
 - `crates/oulipoly-kernel-broker/src/linux_main.rs`
@@ -123,6 +125,7 @@
 ## Declared test patterns
 
 - `fresh_index.rs` unit tests cover explicit empty genesis and pre-index refusal, keyed record collision/corruption, missing committed records, generation mismatch, serialized decision CAS and pending/decision/cursor crash windows, pin sequence, durable account reopen, prepared grant/effect and manual K without Q, exact artifact readback, marker times and bounded failures. This substrate is not wired into live selection or effect writers.
+- `fresh_rebuild.rs` tests exercise a stopped broker admission lease, nonempty v3/v4 evidence, exact source/candidate/grant/K and typed physical Q, manual K and reuse, pin and duplicate RR sequence, changed or missing evidence, Q arrival after the scan, staged and published generation failures, and old State WAL isolation. The importer requires the same retained source directory inode and refuses unsupported pre-index formats; the selector remains closed.
 
 - `crates/oulipoly-kernel-broker/tests/private_pidns.rs` exercises root sibling/nested classification and root debt.
 - `crates/oulipoly-kernel-broker/tests/private_work_pidns.rs` exercises root/work binding, sibling separation, adopted peer classification, persistence poisoning, and restart uncertainty.

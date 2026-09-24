@@ -1,6 +1,7 @@
-//! Inert broker-owned evidence index substrate. The live fresh route and all
-//! provider/effect writers still use their existing files; this module is not
-//! called by them. Its records cannot certify provider Q by themselves.
+//! Broker-owned evidence index and detached frozen rebuild. The private broker
+//! holds the admission lease, but live route/effect writers and readers remain
+//! on retained files. Index Q pointers are published only after source-level
+//! certification; their hashes alone do not certify physical completion.
 //!
 //! Lock order for a future same-broker cutover: route lock, then account locks
 //! in sorted physical-key order. Grant/effect admission takes only its account
@@ -12,12 +13,14 @@
 //! either can admit a decision.
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::net::UnixStream;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 const VERSION: u32 = 1;
 const MAX_RECORD: u64 = 4 * 1024 * 1024;
@@ -46,7 +49,7 @@ impl std::fmt::Display for IndexError {
     }
 }
 impl std::error::Error for IndexError {}
-type Result<T> = std::result::Result<T, IndexError>;
+pub(super) type Result<T> = std::result::Result<T, IndexError>;
 fn corrupt(s: impl Into<String>) -> IndexError {
     IndexError::Corrupt(s.into())
 }
@@ -123,6 +126,9 @@ fn write_new<T: Serialize>(path: &Path, data: &T) -> Result<()> {
         sha256: keyed(data)?,
     })
     .map_err(|e| corrupt(e.to_string()))?;
+    if bytes.len() as u64 > MAX_RECORD {
+        return Err(IndexError::Conflict("record exceeds bound"));
+    }
     let parent = path
         .parent()
         .ok_or_else(|| corrupt("record parent absent"))?;
@@ -166,16 +172,131 @@ fn locked(path: &Path) -> Result<File> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AdmissionMode {
+    Broker,
+    Frozen,
+}
+static ADMISSION_IN_PROCESS: OnceLock<Mutex<HashMap<PathBuf, AdmissionMode>>> = OnceLock::new();
+fn admission_table() -> &'static Mutex<HashMap<PathBuf, AdmissionMode>> {
+    ADMISSION_IN_PROCESS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+pub(super) struct AdmissionLease {
+    file: Option<File>,
+    path: PathBuf,
+}
+impl Drop for AdmissionLease {
+    fn drop(&mut self) {
+        if let Ok(mut table) = admission_table().lock() {
+            // POSIX record locks are process-owned. Close before making this
+            // path available to another thread in the same process.
+            drop(self.file.take());
+            table.remove(&self.path);
+        }
+    }
+}
+fn admission_lock(file: &File, mode: AdmissionMode) -> Result<()> {
+    let lock = libc::flock {
+        l_type: if mode == AdmissionMode::Broker {
+            libc::F_RDLCK
+        } else {
+            libc::F_WRLCK
+        } as _,
+        l_whence: libc::SEEK_SET as _,
+        l_start: 0,
+        l_len: 0,
+        l_pid: 0,
+    };
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &lock) } != 0 {
+        return Err(IndexError::Conflict("broker admission lock held"));
+    }
+    Ok(())
+}
+fn take_admission(path: &Path, create: bool, mode: AdmissionMode) -> Result<AdmissionLease> {
+    let canonical_parent = path
+        .parent()
+        .ok_or_else(|| corrupt("admission path has no parent"))?
+        .canonicalize()?;
+    let canonical_path = canonical_parent.join("admission.lock");
+    let mut table = admission_table()
+        .lock()
+        .map_err(|_| corrupt("admission lock poisoned"))?;
+    // Check before opening: closing any descriptor for a POSIX-locked inode
+    // releases this process's lock, even if another descriptor still exists.
+    if table.contains_key(&canonical_path) {
+        return Err(IndexError::Conflict("broker admission active in process"));
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(create)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&canonical_path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(corrupt("admission lock inode is not private regular file"));
+    }
+    admission_lock(&file, mode)?;
+    table.insert(canonical_path.clone(), mode);
+    Ok(AdmissionLease {
+        file: Some(file),
+        path: canonical_path,
+    })
+}
+
+/// Held for the whole lifetime of a fresh broker, including every accepted
+/// request. A rebuild needs the exclusive side and fails immediately if any
+/// compatible broker is still admitting requests. POSIX locks are not
+/// inherited across fork, so PID1 may finish Q while the broker is stopped.
+pub(super) fn broker_admission_lease(root: &Path) -> Result<AdmissionLease> {
+    let base = root.join("index-v1");
+    fs::create_dir_all(&base)?;
+    let lease = take_admission(&base.join("admission.lock"), true, AdmissionMode::Broker)?;
+    // This marker means a version with the lifetime lease has actually run.
+    // Old pre-index binaries never wrote it and cannot be frozen by this lock.
+    let marker = base.join("admission-protocol.json");
+    if marker.exists() {
+        let version: u32 = read(&marker)?.ok_or_else(|| corrupt("admission marker absent"))?;
+        if version != VERSION {
+            return Err(IndexError::RebuildRequired("admission protocol changed"));
+        }
+    } else {
+        write_new(&marker, &VERSION)?;
+    }
+    sync_dir(root)?;
+    Ok(lease)
+}
+
+fn frozen_admission(root: &Path, socket: &Path) -> Result<AdmissionLease> {
+    let base = root.join("index-v1");
+    if read::<u32>(&base.join("admission-protocol.json"))? != Some(VERSION) {
+        return Err(IndexError::RebuildRequired(
+            "no compatible broker admission freeze proof",
+        ));
+    }
+    let lease = take_admission(&base.join("admission.lock"), false, AdmissionMode::Frozen)?;
+    match UnixStream::connect(socket) {
+        Ok(_) => return Err(IndexError::Conflict("broker socket still accepts requests")),
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ECONNREFUSED)) => {}
+        Err(e) => return Err(IndexError::Io(e)),
+    }
+    Ok(lease)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Manifest {
     version: u32,
     generation: String,
+    #[serde(default)]
+    generation_dir: bool,
 }
 #[derive(Clone, Debug)]
 pub(super) struct Index {
     root: PathBuf,
     generation: String,
+    storage: PathBuf,
 }
 /// The caller must hold an admission freeze for this previously unused broker
 /// directory. The empty-directory check below is a second, local guard.
@@ -183,6 +304,12 @@ pub(super) enum GenesisAuthority {
     ConfirmedFreshEmptyDirectory,
 }
 impl Index {
+    pub(super) fn evidence_root(&self) -> &Path {
+        &self.root
+    }
+    pub(super) fn generation(&self) -> &str {
+        &self.generation
+    }
     /// Explicit authority for a genuinely empty broker evidence directory.
     /// A missing manifest on an old nonempty directory always needs an offline
     /// rebuild, which this substrate deliberately does not implement.
@@ -220,12 +347,14 @@ impl Index {
         let manifest = Manifest {
             version: VERSION,
             generation: uuid::Uuid::new_v4().to_string(),
+            generation_dir: false,
         };
         write_new(&base.join("manifest.json"), &manifest)?;
         sync_dir(root)?;
         Ok(Self {
             root: root.to_owned(),
             generation: manifest.generation,
+            storage: base,
         })
     }
     pub(super) fn open(root: &Path) -> Result<Self> {
@@ -241,18 +370,24 @@ impl Index {
                 "unsupported or invalid index generation",
             ));
         }
+        let storage = if manifest.generation_dir {
+            root.join("index-v1/generations").join(&manifest.generation)
+        } else {
+            root.join("index-v1")
+        };
         for name in ["cursors", "accounts", "decisions"] {
-            if !root.join("index-v1").join(name).is_dir() {
+            if !storage.join(name).is_dir() {
                 return Err(IndexError::RebuildRequired("index storage missing"));
             }
         }
         Ok(Self {
             root: root.to_owned(),
             generation: manifest.generation,
+            storage,
         })
     }
     fn base(&self) -> PathBuf {
-        self.root.join("index-v1")
+        self.storage.clone()
     }
     fn check_generation(&self) -> Result<()> {
         let current = Self::open(&self.root)?;
@@ -320,7 +455,7 @@ pub(super) struct CursorKey {
 pub(super) struct Cursor {
     generation: String,
     key: CursorKey,
-    sequence: u64,
+    pub sequence: u64,
     index: Option<usize>,
     last_handoff: Option<String>,
 }
@@ -335,6 +470,23 @@ pub(super) struct Decision {
     pin: bool,
     sequence: u64,
 }
+
+#[derive(Clone, Debug)]
+pub(super) struct OfflineDecision {
+    pub handoff: String,
+    pub key: CursorKey,
+    pub candidate_identity: String,
+    pub candidate_index: usize,
+    pub pin: bool,
+    pub sequence: u64,
+}
+
+#[derive(Default)]
+pub(super) struct OfflineSnapshot {
+    pub decisions: Vec<OfflineDecision>,
+    pub accounts: BTreeMap<String, Account>,
+    pub source_models: BTreeMap<String, String>,
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Pending {
@@ -345,6 +497,188 @@ struct Pending {
 }
 
 impl Index {
+    /// Detached maintenance only. The caller gives the actual broker socket
+    /// and the retained source directory; a changed source is unsupported.
+    /// The generation is built off to the side and the manifest is the only
+    /// publication point. Every consumed K remains unresolved at publication.
+    pub(super) fn rebuild_offline(root: &Path, socket: &Path, source: &Path) -> Result<Self> {
+        Self::rebuild_offline_inner(root, socket, source, || {})
+    }
+
+    fn rebuild_offline_inner(
+        root: &Path,
+        socket: &Path,
+        source: &Path,
+        after_scan: impl FnOnce(),
+    ) -> Result<Self> {
+        let _freeze = frozen_admission(root, socket)?;
+        let source_before = source.metadata()?;
+        if !source_before.is_dir() {
+            return Err(corrupt("offline config source is not a directory"));
+        }
+        let snapshot = super::fresh_provider::offline_snapshot(root, source)
+            .map_err(|e| corrupt(format!("retained evidence: {e}")))?;
+        after_scan();
+        let source_after = source.metadata()?;
+        if (source_before.dev(), source_before.ino()) != (source_after.dev(), source_after.ino()) {
+            return Err(corrupt(
+                "offline config source directory changed during scan",
+            ));
+        }
+        for (model, digest) in &snapshot.source_models {
+            let pool = oulipoly_runtime::executor::cli::fresh_remote::load_fresh_headless_pool(
+                source, model,
+            )
+            .map_err(|e| corrupt(format!("offline source readback: {e}")))?;
+            if &pool.config_sha256 != digest {
+                return Err(corrupt("offline config source changed before publication"));
+            }
+        }
+        Self::publish_offline(root, snapshot)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rebuild_offline_test_hook(
+        root: &Path,
+        socket: &Path,
+        source: &Path,
+        after_scan: impl FnOnce(),
+    ) -> Result<Self> {
+        Self::rebuild_offline_inner(root, socket, source, after_scan)
+    }
+
+    /// Detached exact Q reconciliation after the generation is visible.
+    /// It visits only this physical account's unresolved references.
+    pub(super) fn reconcile_offline_account(&self, key: &str, source: &Path) -> Result<Account> {
+        super::fresh_provider::reconcile_offline_account(self, key, source)
+            .map_err(|e| corrupt(format!("exact Q reconciliation: {e}")))
+    }
+
+    pub(super) fn reconcile_offline_account_frozen(
+        &self,
+        socket: &Path,
+        key: &str,
+        source: &Path,
+    ) -> Result<Account> {
+        let _freeze = frozen_admission(&self.root, socket)?;
+        self.reconcile_offline_account(key, source)
+    }
+
+    fn publish_offline(root: &Path, mut snapshot: OfflineSnapshot) -> Result<Self> {
+        let base = root.join("index-v1");
+        let generations = base.join("generations");
+        fs::create_dir_all(&generations)?;
+        let generation = uuid::Uuid::new_v4().to_string();
+        let storage = generations.join(&generation);
+        fs::create_dir(&storage)?;
+        for class in ["cursors", "accounts", "decisions"] {
+            fs::create_dir(storage.join(class))?;
+        }
+        sync_dir(&generations)?;
+        let staged = Self {
+            root: root.to_owned(),
+            generation: generation.clone(),
+            storage,
+        };
+        let mut cursors: BTreeMap<String, Cursor> = BTreeMap::new();
+        let mut seen_handoffs = std::collections::HashSet::new();
+        snapshot.decisions.sort_by_key(|d| d.sequence);
+        for seed in snapshot.decisions {
+            if !seen_handoffs.insert(seed.handoff.clone())
+                || seed.handoff.is_empty()
+                || seed.key.model.is_empty()
+                || seed.key.config_sha256.is_empty()
+                || seed.candidate_identity.is_empty()
+            {
+                return Err(corrupt("duplicate or empty offline decision identity"));
+            }
+            let digest = keyed(&seed.key)?;
+            let cursor = cursors.entry(digest).or_insert_with(|| Cursor {
+                generation: generation.clone(),
+                key: seed.key.clone(),
+                sequence: 0,
+                index: None,
+                last_handoff: None,
+            });
+            if cursor.key != seed.key {
+                return Err(corrupt("offline cursor key collision"));
+            }
+            let decision = Decision {
+                generation: generation.clone(),
+                handoff: seed.handoff,
+                key: seed.key,
+                candidate_identity: seed.candidate_identity,
+                candidate_index: seed.candidate_index,
+                pin: seed.pin,
+                sequence: seed.sequence,
+            };
+            let next = staged.advanced(cursor, &decision)?;
+            write_new(&staged.decision_path(&decision.handoff)?, &decision)?;
+            staged.mark_known("decisions", &decision.handoff)?;
+            *cursor = next;
+        }
+        for cursor in cursors.into_values() {
+            if cursor.sequence != 0 {
+                staged.mark_known("cursors", &cursor.key)?;
+                write_new(&staged.key_path("cursors", &cursor.key)?, &cursor)?;
+            }
+        }
+        for (key, mut account) in snapshot.accounts {
+            if key.is_empty() || account.physical_key != key {
+                return Err(corrupt("offline account identity mismatch"));
+            }
+            account.generation = generation.clone();
+            staged.mark_known("accounts", &key)?;
+            write_new(&staged.key_path("accounts", &key)?, &account)?;
+        }
+        for class in ["cursors", "accounts", "decisions"] {
+            sync_dir(&staged.base().join(class))?;
+        }
+        sync_dir(&staged.base())?;
+        // Validate every staged record before the only publication rename.
+        for entry in fs::read_dir(staged.base().join("decisions"))? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|x| x == "json")
+                && !path.to_string_lossy().contains(".known.")
+            {
+                let record: Decision =
+                    read(&path)?.ok_or_else(|| corrupt("staged decision absent"))?;
+                if record.generation != generation || !staged.known("decisions", &record.handoff)? {
+                    return Err(corrupt("staged decision invalid"));
+                }
+            }
+        }
+        for entry in fs::read_dir(staged.base().join("cursors"))? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|x| x == "json")
+                && !path.to_string_lossy().contains(".known.")
+            {
+                let record: Cursor = read(&path)?.ok_or_else(|| corrupt("staged cursor absent"))?;
+                if record.generation != generation || record.sequence == 0 {
+                    return Err(corrupt("staged cursor invalid"));
+                }
+            }
+        }
+        for entry in fs::read_dir(staged.base().join("accounts"))? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|x| x == "json")
+                && !path.to_string_lossy().contains(".known.")
+            {
+                let record: Account =
+                    read(&path)?.ok_or_else(|| corrupt("staged account absent"))?;
+                if record.generation != generation {
+                    return Err(corrupt("staged account invalid"));
+                }
+            }
+        }
+        let manifest = Manifest {
+            version: VERSION,
+            generation,
+            generation_dir: true,
+        };
+        write_atomic(&base.join("manifest.json"), &manifest)?;
+        Self::open(root)
+    }
     fn cursor_unlocked(&self, key: &CursorKey) -> Result<Cursor> {
         let path = self.key_path("cursors", key)?;
         let record: Option<Cursor> = read(&path)?;
@@ -378,6 +712,9 @@ impl Index {
     }
     fn read_decision(&self, handoff: &str) -> Result<Option<Decision>> {
         let d: Option<Decision> = read(&self.decision_path(handoff)?)?;
+        if d.is_none() && self.known("decisions", &handoff.to_owned())? {
+            return Err(corrupt("known decision record absent"));
+        }
         if d.as_ref()
             .is_some_and(|d| d.handoff != handoff || d.generation != self.generation)
         {
@@ -422,8 +759,12 @@ impl Index {
             return Err(corrupt("pending cursor prior/next mismatch"));
         }
         if decision.is_some() && current == pending.expected && next != current {
+            self.mark_known("decisions", &pending.decision.handoff)?;
             self.mark_known("cursors", &current.key)?;
             write_atomic(&self.key_path("cursors", &current.key)?, &next)?;
+        }
+        if decision.is_some() {
+            self.mark_known("decisions", &pending.decision.handoff)?;
         }
         // A missing decision means no sequence advance. A pin leaves the cursor
         // byte-for-byte unchanged even when its decision exists.
@@ -475,6 +816,9 @@ impl Index {
         self.check_generation()?;
         self.reconcile_pending()?;
         if let Some(existing) = self.read_decision(&handoff)? {
+            if !self.known("decisions", &handoff)? {
+                return Err(corrupt("decision known-key marker absent"));
+            }
             if existing.key != key
                 || existing.candidate_identity != candidate_identity
                 || existing.candidate_index != candidate_index
@@ -525,7 +869,11 @@ impl Index {
         let _lock = locked(&self.base().join("route.lock"))?;
         self.check_generation()?;
         self.reconcile_pending()?;
-        self.read_decision(handoff)
+        let decision = self.read_decision(handoff)?;
+        if decision.is_some() && !self.known("decisions", &handoff.to_owned())? {
+            return Err(corrupt("decision known-key marker absent"));
+        }
+        Ok(decision)
     }
 }
 
@@ -536,6 +884,27 @@ pub(super) struct Artifact {
     pub sha256: String,
 }
 impl Artifact {
+    pub(super) fn from_existing(root: &Path, relative: &Path) -> Result<Self> {
+        let path = relative
+            .to_str()
+            .ok_or_else(|| corrupt("non-UTF8 offline artifact path"))?
+            .to_owned();
+        let mut f = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(root.join(relative))?;
+        if !f.metadata()?.is_file() {
+            return Err(corrupt("offline artifact not regular"));
+        }
+        let mut hasher = Sha256::new();
+        io::copy(&mut f, &mut hasher)?;
+        let artifact = Self {
+            path,
+            sha256: format!("{:x}", hasher.finalize()),
+        };
+        artifact.require_present(root)?;
+        Ok(artifact)
+    }
     fn verify(&self, root: &Path) -> Result<bool> {
         let path = Path::new(&self.path);
         if path
@@ -579,6 +948,8 @@ pub(super) struct ProviderGrant {
     pub decision_handoff: String,
     pub grant: Artifact,
     pub consumed_k: Option<Artifact>,
+    #[serde(default)]
+    pub certified_q: Option<PhysicalQ>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -604,7 +975,11 @@ pub(super) struct EffectIntent {
     pub kind: EffectKind,
     pub source: SourceKey,
     pub intent: Artifact,
+    #[serde(default)]
+    pub reuse: Option<Artifact>,
     pub consumed_k: Option<Artifact>,
+    #[serde(default)]
+    pub certified_q: Option<PhysicalQ>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -685,14 +1060,29 @@ impl Index {
             } else {
                 grant.grant.verify(&self.root)?;
             }
+            if let Some(q) = &grant.certified_q {
+                if grant.consumed_k.as_ref() != Some(&q.physical_k) || q.terminal.is_none() {
+                    return Err(corrupt("certified provider Q/K or terminal mismatch"));
+                }
+                q.verify(&self.root)?;
+            }
         }
         for effect in account.effects.values() {
             effect.intent.validate()?;
+            if let Some(reference) = &effect.reuse {
+                reference.require_present(&self.root)?;
+            }
             if let Some(k) = &effect.consumed_k {
                 effect.intent.require_present(&self.root)?;
                 k.require_present(&self.root)?;
             } else {
                 effect.intent.verify(&self.root)?;
+            }
+            if let Some(q) = &effect.certified_q {
+                if effect.consumed_k.as_ref() != Some(&q.physical_k) || q.terminal.is_some() {
+                    return Err(corrupt("certified effect Q/K mismatch"));
+                }
+                q.verify(&self.root)?;
             }
         }
         for source in account.source_q.values() {
@@ -731,7 +1121,7 @@ impl Index {
                         "grant identity already announced or empty",
                     ));
                 }
-                if grant.consumed_k.is_some() {
+                if grant.consumed_k.is_some() || grant.certified_q.is_some() {
                     return Err(IndexError::Conflict("announcement includes K"));
                 }
                 grant.grant.validate()?;
@@ -772,12 +1162,19 @@ impl Index {
                 }
             }
             AccountUpdate::AnnounceEffect { id, effect } => {
-                if id.is_empty() || a.effects.contains_key(&id) || effect.consumed_k.is_some() {
+                if id.is_empty()
+                    || a.effects.contains_key(&id)
+                    || effect.consumed_k.is_some()
+                    || effect.certified_q.is_some()
+                {
                     return Err(IndexError::Conflict(
                         "effect identity already announced or includes K",
                     ));
                 }
                 effect.intent.validate()?;
+                if let Some(reference) = &effect.reuse {
+                    reference.validate()?;
+                }
                 if !effect.source.valid() {
                     return Err(IndexError::Conflict("effect source identity absent"));
                 }
@@ -1130,6 +1527,7 @@ mod tests {
         let manifest = Manifest {
             version: VERSION,
             generation: uuid::Uuid::new_v4().to_string(),
+            generation_dir: false,
         };
         write_atomic(&index.base().join("manifest.json"), &manifest).unwrap();
         assert!(matches!(
@@ -1151,6 +1549,7 @@ mod tests {
                         decision_handoff: "d".into(),
                         grant: grant.clone(),
                         consumed_k: None,
+                        certified_q: None,
                     },
                 },
             )
@@ -1192,7 +1591,9 @@ mod tests {
                             environment_sha256: "environment".into(),
                         },
                         intent: intent.clone(),
+                        reuse: None,
                         consumed_k: None,
+                        certified_q: None,
                     },
                 },
             )
@@ -1310,6 +1711,7 @@ mod tests {
                         decision_handoff: "d".into(),
                         grant: future_artifact("grant", b"x"),
                         consumed_k: None,
+                        certified_q: None,
                     },
                 },
             )
@@ -1354,7 +1756,9 @@ mod tests {
                                 environment_sha256: "env".into(),
                             },
                             intent: future_artifact(&format!("{id}-intent"), b"I"),
+                            reuse: None,
                             consumed_k: None,
+                            certified_q: None,
                         },
                     },
                 )
