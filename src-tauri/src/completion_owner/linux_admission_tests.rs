@@ -439,6 +439,12 @@ fn identity_refusal_codes_keep_fresh_root_and_image_guards_closed() {
     foreign_image.wait().unwrap();
 
     authorities.fresh(&owner, self_identity.clone()).unwrap();
+    assert!(
+        authorities
+            .fresh_from_accepted_native(&owner, self_identity.clone(), &supervisor)
+            .is_err(),
+        "a copied fresh actor has no accepted native activation"
+    );
     let inside_root = refusal(
         &path,
         &owner,

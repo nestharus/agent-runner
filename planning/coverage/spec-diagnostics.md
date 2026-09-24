@@ -56,6 +56,7 @@
 - `src-tauri/src/completion_owner/original_work.rs`
 - `src-tauri/src/completion_owner/control.rs`
 - `src-tauri/src/completion_owner/linux.rs`
+- `src-tauri/src/completion_owner/j01_private_trace.rs`
 - `src-tauri/src/completion_owner/driver.rs`
 - `src-tauri/src/wake_coordinator/constants.rs`
 - `runtime-caps.json`

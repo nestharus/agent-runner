@@ -3145,6 +3145,310 @@ fn native_join_identity_refusal_retains_failure_and_releases_claim() {
         0
     );
 }
+
+#[cfg(feature = "age360-fault-fixtures")]
+#[test]
+fn private_j01_discriminates_founder_overlap_from_native_activation() {
+    if private_case(false) {
+        return;
+    }
+    use std::collections::HashSet;
+    const SECOND_SESSION: &str = "ses_age360_j01_second";
+    let f = Fixture::new("owner_only");
+    f.gate("j01-trace-enabled");
+    f.gate("j01-negative-enabled");
+    f.gate("release-resume");
+    f.gate("root-result-retained.hold");
+    let mut founder = f
+        .command()
+        .env("AGE360_MCP_E2E", "1")
+        .args(["-m", MODEL, "--models-dir"])
+        .arg(&f.models)
+        .arg("synthetic independent owner founder")
+        .stdout(fs::File::create(f.root.path().join("founder.stdout")).unwrap())
+        .stderr(fs::File::create(f.root.path().join("founder.stderr")).unwrap())
+        .stdin(Stdio::null())
+        .spawn()
+        .unwrap();
+    let owner = f.owner();
+    fs::write(f.root.path().join("j01-negative-endpoint"), &owner.endpoint).unwrap();
+    let mut seen = HashSet::new();
+    let next = |seen: &mut HashSet<PathBuf>, native: bool| -> serde_json::Value {
+        wait(|| {
+            if !native && let Ok(bytes) = fs::read(f.root.path().join("j01-negative-result.json")) {
+                panic!(
+                    "negative child returned before J01 trace: {}",
+                    String::from_utf8_lossy(&bytes)
+                );
+            }
+            for item in fs::read_dir(f.root.path()).ok()?.flatten() {
+                let path = item.path();
+                if !path
+                    .file_name()?
+                    .to_string_lossy()
+                    .starts_with("j01-trace-")
+                    || seen.contains(&path)
+                {
+                    continue;
+                }
+                let Ok(trace) = fs::read(&path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                    .ok_or(())
+                else {
+                    continue;
+                };
+                let direct_native = trace["native"]
+                    .as_array()?
+                    .iter()
+                    .any(|entry| entry["granted"] == true && entry["direct_peer"] == true);
+                seen.insert(path);
+                // A concurrent ordinary helper join is released but cannot
+                // stand in for an exact accepted native actor.
+                let pid = trace["peer"]["pid"].as_i64()?;
+                if direct_native == native {
+                    if !direct_native {
+                        f.gate(&format!("j01-release-{pid}"));
+                    }
+                    return Some(trace);
+                }
+                f.gate(&format!("j01-release-{pid}"));
+            }
+            None
+        })
+    };
+    let negative = next(&mut seen, false);
+    assert_eq!(negative["snapshot"], "stable", "{negative}");
+    assert_eq!(negative["peer"]["pid"].as_i64().is_some(), true);
+    assert!(
+        negative["matched"].as_array().unwrap().iter().any(|scope| {
+            scope["context"]["pid"] == i64::from(founder.id())
+                && scope["lease"] == true
+                && scope["local_sockets"].as_u64().unwrap_or(0) > 0
+        }),
+        "{negative}"
+    );
+    assert!(
+        negative["native"].as_array().unwrap().is_empty(),
+        "{negative}"
+    );
+    let rejected: serde_json::Value = wait(|| {
+        serde_json::from_slice(&fs::read(f.root.path().join("j01-negative-result.json")).ok()?).ok()
+    });
+    assert_ne!(rejected["rc"], 0);
+    assert!(
+        rejected["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("J01_FRESH_INSIDE_ROOT"),
+        "{rejected}"
+    );
+    fs::remove_file(f.root.path().join("j01-negative-enabled")).unwrap();
+    wait(|| {
+        f.root
+            .path()
+            .join("provider-initial-ready")
+            .exists()
+            .then_some(())
+    });
+    assert!(founder.try_wait().unwrap().is_none());
+
+    // A separate Runner establishes the target session in this same domain
+    // while the founding context remains live.
+    fs::remove_file(f.root.path().join("j01-trace-enabled")).unwrap();
+    let mut session_creator = f.start();
+    f.wait_initial(&mut session_creator);
+    let ready: String = f
+        .sidecar_connection()
+        .query_row(
+            "SELECT run_state FROM session_runtime WHERE session_id=?1",
+            [SESSION],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(ready, "idle");
+    let mut second_creator = f
+        .command()
+        .env("AGE360_HOLD_INITIAL", "1")
+        .args(["-m", MODEL, "--models-dir"])
+        .arg(&f.models)
+        .arg("j01 independent target two")
+        .stdout(fs::File::create(f.root.path().join("second.stdout")).unwrap())
+        .stderr(fs::File::create(f.root.path().join("second.stderr")).unwrap())
+        .stdin(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait(|| {
+        f.root
+            .path()
+            .join("second-provider-ready")
+            .exists()
+            .then_some(())
+    });
+    assert!(second_creator.try_wait().unwrap().is_none());
+    assert!(founder.try_wait().unwrap().is_none());
+    f.gate("j01-trace-enabled");
+    MailboxDb::open(&f.data.join("pid-identity.db"))
+        .unwrap()
+        .enqueue_submitted_input(&oulipoly_state::mailbox::SubmittedInputEnqueue {
+            submission_token: "j01-founder-alive",
+            target: oulipoly_state::mailbox::InboxTarget {
+                kind: oulipoly_state::mailbox::InboxTargetKind::Session,
+                id: SESSION,
+            },
+            input: b"j01-founder-alive",
+        })
+        .unwrap();
+    let alive = next(&mut seen, true);
+    assert_eq!(alive["snapshot"], "stable", "{alive}");
+    assert!(
+        alive["matched"].as_array().unwrap().iter().any(|scope| {
+            scope["context"]["pid"] == i64::from(founder.id())
+                && scope["lease"] == true
+                && scope["local_sockets"].as_u64().unwrap_or(0) > 0
+        }),
+        "{alive}"
+    );
+    let accepted_id = alive["native"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["direct_peer"] == true && entry["granted"] == true)
+        .unwrap()["attempt_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let first_attempt = wait(|| {
+        let claim = f
+            .mailbox_for_poll()?
+            .wake_session_reader()
+            .wake_claim(SESSION)
+            .ok()??;
+        let attempt = f
+            .mailbox_for_poll()?
+            .continuation_activation(SESSION, &claim.claim_token)
+            .ok()??;
+        (attempt.attempt_id == accepted_id).then_some(attempt)
+    });
+    f.gate(&format!(
+        "j01-release-{}",
+        alive["peer"]["pid"].as_i64().unwrap()
+    ));
+    wait(|| {
+        f.root
+            .path()
+            .join("root-result-retained.reached")
+            .exists()
+            .then_some(())
+    });
+    let stderr = fs::read_to_string(
+        PathBuf::from(&first_attempt.result_path)
+            .parent()
+            .unwrap()
+            .join("launcher.stderr"),
+    )
+    .unwrap();
+    assert!(!stderr.contains("J01_FRESH_INSIDE_ROOT"), "{stderr}");
+    let first_result: serde_json::Value =
+        serde_json::from_slice(&fs::read(&first_attempt.result_path).unwrap()).unwrap();
+    assert_eq!(first_result["root_exit_code"], 0, "{first_result}");
+    assert_eq!(first_result["spawn_failed"], false);
+    let first_prompts = fs::read_to_string(f.root.path().join("resume-prompts.jsonl")).unwrap();
+    assert!(
+        first_prompts.contains("j01-founder-alive"),
+        "{first_prompts}"
+    );
+
+    f.gate("release-founder");
+    f.wait_initial(&mut founder);
+    f.gate("j01-hold-after-release");
+    // The retained-result fixture pauses the guardian inside tick(), before
+    // its context-release pass. Release that pause after founder exit.
+    fs::remove_file(f.root.path().join("root-result-retained.hold")).unwrap();
+    wait(|| {
+        f.root
+            .path()
+            .join("j01-after-release.reached")
+            .exists()
+            .then_some(())
+    });
+    wait(|| {
+        (!f.mailbox_for_poll()?
+            .completion_contexts()
+            .ok()?
+            .iter()
+            .any(|id| id.pid == i64::from(founder.id())))
+        .then_some(())
+    });
+    assert_eq!(f.owner().guardian_identity, owner.guardian_identity);
+    MailboxDb::open(&f.data.join("pid-identity.db"))
+        .unwrap()
+        .enqueue_submitted_input(&oulipoly_state::mailbox::SubmittedInputEnqueue {
+            submission_token: "j01-founder-gone",
+            target: oulipoly_state::mailbox::InboxTarget {
+                kind: oulipoly_state::mailbox::InboxTargetKind::Session,
+                id: SECOND_SESSION,
+            },
+            input: b"j01-founder-gone",
+        })
+        .unwrap();
+    // Completion of this separate real session supplies the coordinator's
+    // idle transition only after founder exit and context release.
+    f.gate("release-initial-provider");
+    let second_status = wait(|| second_creator.try_wait().unwrap());
+    assert!(
+        second_status.success(),
+        "{}",
+        fs::read_to_string(f.root.path().join("second.stderr")).unwrap()
+    );
+    let second_ready: String = f
+        .sidecar_connection()
+        .query_row(
+            "SELECT run_state FROM session_runtime WHERE session_id=?1",
+            [SECOND_SESSION],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(second_ready, "idle");
+    fs::remove_file(f.root.path().join("j01-hold-after-release")).unwrap();
+    let gone = next(&mut seen, true);
+    assert_eq!(gone["snapshot"], "stable", "{gone}");
+    assert!(gone["matched"].as_array().unwrap().is_empty(), "{gone}");
+    assert_ne!(
+        gone["native"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["direct_peer"] == true)
+            .unwrap()["attempt_id"],
+        accepted_id
+    );
+    let second_claim = f
+        .mailbox()
+        .wake_session_reader()
+        .wake_claim(SECOND_SESSION)
+        .unwrap()
+        .unwrap();
+    let second_attempt = f
+        .mailbox()
+        .continuation_activation(SECOND_SESSION, &second_claim.claim_token)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        gone["native"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["direct_peer"] == true && entry["granted"] == true)
+            .unwrap()["attempt_id"],
+        second_attempt.attempt_id,
+    );
+    f.gate(&format!(
+        "j01-release-{}",
+        gone["peer"]["pid"].as_i64().unwrap()
+    ));
+    println!("J01 private phases: negative={negative} founder_alive={alive} founder_gone={gone}");
+}
 #[test]
 fn native_root_state_token_cancellation_retains_result_across_driver_replacement() {
     if !private_case(false) {
