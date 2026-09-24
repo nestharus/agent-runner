@@ -9,6 +9,7 @@ pub mod entry_registry;
 pub mod identity;
 pub mod installed_launch;
 pub mod installed_pair;
+pub mod json_artifact;
 pub mod native_receipt;
 pub mod protocol;
 pub mod registry;

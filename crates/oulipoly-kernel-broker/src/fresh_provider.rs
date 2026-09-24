@@ -18,6 +18,7 @@ const RATE_LIMITED_RELEASE_WAIT: std::time::Duration = std::time::Duration::from
 use super::work_launch;
 use chrono::{DateTime, Utc};
 use oulipoly_kernel_broker::identity::{PinnedProcess, host_proc_file, observed_incarnation_gone};
+use oulipoly_kernel_broker::json_artifact;
 use oulipoly_kernel_broker::protocol::{
     FreshAccountEffectKind, FreshAccountEffectReadback, FreshAccountEffectRequest,
     FreshQuotaWindow, FreshRouteRequest, FreshRouteSelection,
@@ -726,22 +727,11 @@ pub(super) struct Prepared {
 }
 
 fn durable_new<T: Serialize>(directory: &Path, name: &str, value: &T) -> io::Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(directory.join(name))?;
-    serde_json::to_writer(&mut file, value)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    File::open(directory)?.sync_all()
+    json_artifact::create_new(directory, name, value)
 }
 
 fn durable_result<T: Serialize>(directory: &Path, value: &T) -> io::Result<()> {
-    let temporary = format!("{}.result-pending.json", uuid::Uuid::new_v4());
-    durable_new(directory, &temporary, value)?;
-    std::fs::rename(directory.join(&temporary), directory.join("result.json"))?;
-    File::open(directory)?.sync_all()
+    durable_new(directory, "result.json", value)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1172,7 +1162,8 @@ fn latest_terminal_marker_time(
         {
             continue;
         }
-        let record: TerminalRecord = serde_json::from_reader(File::open(entry.path())?)?;
+        let record: TerminalRecord =
+            json_artifact::read(&entry.path(), "terminal_marker_readback")?;
         if record.version != 1 {
             return Err(io::Error::other("fresh terminal ledger version changed"));
         }
@@ -1974,7 +1965,8 @@ fn route_evidence_excluding(
         if !name.ends_with(".route-selection.json") {
             continue;
         }
-        let previous: RouteDecision = serde_json::from_reader(File::open(entry.path())?)?;
+        let previous: RouteDecision =
+            json_artifact::read(&entry.path(), "route_selection_readback")?;
         if previous.version != 1
             || previous.selection.model != candidate.model
             || previous.selection.config_sha256 != candidate.config_sha256
@@ -2630,7 +2622,7 @@ pub(super) fn prepare(directory: &Path, binding: Binding, plan: Plan) -> io::Res
     let name = format!("{}.fresh-grant.json", binding.grant_key());
     let path = directory.join(&name);
     let grant = if path.exists() {
-        let old: Grant = serde_json::from_reader(File::open(&path)?)?;
+        let old: Grant = json_artifact::read(&path, "fresh_grant_readback")?;
         if old.version != 3
             || old.binding != binding
             || old.plan_sha256 != plan.digest
@@ -3427,10 +3419,20 @@ fn exact_file<T: for<'de> Deserialize<'de>>(dir: &Path, name: &str) -> io::Resul
         .custom_flags(libc::O_NOFOLLOW)
         .open(dir.join(name))
     {
-        Ok(file) if file.metadata()?.is_file() => Ok(Some(serde_json::from_reader(file)?)),
+        Ok(file) if file.metadata()?.is_file() => Ok(Some(json_artifact::read_open(
+            file,
+            &dir.join(name),
+            "fresh_provider_readback",
+        )?)),
         Ok(_) => Err(io::Error::other("fresh provider receipt is not regular")),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
+        Err(e) => {
+            eprintln!(
+                "oulipoly JSON artifact: stage=fresh_provider_open path={} bytes=unavailable sha256=unavailable cause={e}",
+                dir.join(name).display()
+            );
+            Err(e)
+        }
     }
 }
 
@@ -3688,7 +3690,8 @@ pub(super) fn cancel(dir: &Path, grant_id: &str) -> io::Result<()> {
     let intent = serde_json::json!({ "grant_id": grant_id, "work_id": attach.work_id });
     let name = format!("{grant_id}.cancel.json");
     if dir.join(&name).exists() {
-        let old: serde_json::Value = serde_json::from_reader(File::open(dir.join(&name))?)?;
+        let old: serde_json::Value =
+            json_artifact::read(&dir.join(&name), "cancel_intent_readback")?;
         if old != intent {
             return Err(io::Error::other(
                 "fresh provider cancellation intent changed",
