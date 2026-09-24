@@ -142,6 +142,81 @@ fn private_fresh_dual_lane_live_old_wal_collision_and_restart() {
         "new child schema has no imported v29 or root work"
     );
 
+    // The provider ledger is a separate root-only directory. Reopening must
+    // refuse a missing or replaced ledger without replacing the fresh State,
+    // Bash child, or held normal-work schema (or disturbing the old WAL).
+    let provider_ledger = broker_root.join("v30/fresh-provider");
+    let state_inode = fs::metadata(&fresh_state).unwrap().ino();
+    let mailbox_inode = fs::metadata(&fresh_mailbox).unwrap().ino();
+    let schemas = [
+        "fresh_released_handoff",
+        "fresh_root_effect",
+        "fresh_bash_child",
+        "fresh_normal_work_preparation",
+    ];
+    let original_sql: Vec<String> = schemas
+        .iter()
+        .map(|table| {
+            state
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        })
+        .collect();
+    for table in schemas {
+        assert_eq!(
+            state
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1,
+            "fresh {table} table absent before provider ledger check"
+        );
+    }
+    fs::remove_dir(&provider_ledger).unwrap();
+    assert!(FreshV30Lane::open_at(&broker_root).is_err());
+    assert!(FreshV30Lane::initialize_at(&broker_root).is_err());
+    std::os::unix::fs::symlink(&fresh_state, &provider_ledger).unwrap();
+    assert!(FreshV30Lane::open_at(&broker_root).is_err());
+    fs::remove_file(&provider_ledger).unwrap();
+    fs::create_dir(&provider_ledger).unwrap();
+    fs::set_permissions(&provider_ledger, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(FreshV30Lane::open_at(&broker_root).is_err());
+    fs::set_permissions(&provider_ledger, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        FreshV30Lane::open_at(&broker_root).unwrap().identity(),
+        &first
+    );
+    assert_eq!(fs::metadata(&fresh_state).unwrap().ino(), state_inode);
+    assert_eq!(fs::metadata(&fresh_mailbox).unwrap().ino(), mailbox_inode);
+    for (table, expected_sql) in schemas.into_iter().zip(original_sql) {
+        assert_eq!(
+            state
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1,
+            "fresh {table} table replaced during provider ledger check"
+        );
+        let actual_sql: String = state
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                [table],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(actual_sql, expected_sql);
+    }
+
     // Simulate a lost initialization reply and broker restart. Identity is
     // read back from the published files; a second generation is never made.
     assert_eq!(FreshV30Lane::initialize_at(&broker_root).unwrap(), first);

@@ -9,6 +9,8 @@
 - `crates/oulipoly-kernel-broker/src/accepted_grant.rs`
 - `crates/oulipoly-kernel-broker/src/cutover_gate.rs`
 - `crates/oulipoly-kernel-broker/src/entry_registry.rs`
+- `crates/oulipoly-kernel-broker/src/fresh_provider.rs`
+- `crates/oulipoly-kernel-broker/src/fresh_provider_fixture.rs`
 - `crates/oulipoly-kernel-broker/src/lib.rs`
 - `crates/oulipoly-kernel-broker/src/linux_main.rs`
 - `crates/oulipoly-kernel-broker/src/main.rs`
@@ -58,6 +60,7 @@
 | Root or work PID1 missing/changed on restart. | Durable unknown debt, never a drain receipt. |
 | Exact live v30 driver requests the broker-selected reserved source. | The retained sidecar supplies admitted registration/listener bytes. The broker checks original registration, environment and image inodes/hashes, holds one nested PID1 worker before exec, consumes the exact grant once in FULL WAL, fsyncs the physical record and confirmation, rechecks the original names, then opens the worker gate. A lost response never permits a second launch. The Runner driver does not call this route yet. |
 | Fresh D request UUID is sent to the versioned broker socket. | Broker commits an exact new-lane State session admission before the mailbox allocation. It returns only when both rows match the request, lane, source generation, session and allocation UUIDs. A lost reply returns the same pair; a State-first interruption is reconciled only by the same D key. d refuses the incomplete pair and never repairs it. Neither pair grants an invocation, owner, effect, result or ACK. |
+| Private held normal J has released U/D and the exact joined Runner submits descriptor-backed provider K. | Broker reattests the old release, actor/root and held row, seals the selected ELF, recipe and stdin, fsyncs a distinct one-use fresh grant before fork, then opens a nested PID1/provider gate only after exact attach. Provider exit, complete hashed output and PID1/parent wait Q are separate readbacks. A lost K reply observes the same grant; duplicate K refuses. The ordinary runtime result backend remains closed. |
 | Broker-owned consumed source grant, pinned root/entry/driver/guardian/held worker, and empty root-only capture files. | One fsynced source physical record binds exact process incarnations, nested PID1 lineage, worker local PID and output inodes before the worker gate opens. A duplicate grant or orphan output blocks another physical binding. The joined child's prior broker stamp remains valid after that child exits. |
 | Source worker exits while an adopted descendant remains live. | Source PID1 retains the worker wait, pumps each pipe to root-only disk with bounded memory and backpressure, reaps to ECHILD without a lifetime cap, syncs and hashes complete stdout/stderr, and writes one terminal receipt. Post-owner readback remains live/pending until the exact PID1 incarnation ends. Read/write/sync failure records incomplete diagnostic debt when storage permits. |
 | Broker restarts after a durable source cancellation intent but before a signal reply. | The fixed root-only registry reopens, reissues the request through the exact PID1 pidfd, and observes the same terminal/drain receipt. A changed PID never receives the signal. |
@@ -97,6 +100,7 @@
 - A write or fsync failure poisons the running registry until restart/reconciliation.
 - A grant ID may bind only one work namespace record; old classifier records have no grant authority.
 - Source capture has no arbitrary output cutoff. A positive terminal requires exact full-file length and SHA-256 readback; I/O failure, changed bytes or incomplete storage remains unknown debt.
+- The private fresh provider fixture accepts no return channel or session capture. Its output is streamed to root-only files and verified without a product byte cap; the test's polling deadline is not a provider lifetime cutoff.
 
 ## Error conditions
 
@@ -109,6 +113,7 @@
 
 - Classification is never positive work authority.
 - Fresh v30 session allocation and recipient submit/readback/token-ACK/delegated-ACK socket mechanics are broker-owned. Production source acceptance, recipient runtime attachment, provider transport, and native K/Q remain closed. The recipient fixture supplies a synthetic private accepted source/attempt and exact process binding; it is no proof of ordinary Runner delivery. The installed launcher and normal v30 entry remain gated pending combined lineage and host-root proof.
+- The fresh provider K/Q opcode is feature and private-fixture gated. It does not activate the normal production selector, publish source W or recipient ACK, or route ordinary runtime provider results. The private root CLI deliberately returns failure after verified Q until that backend exists.
 - The unprivileged user-namespace fixture cannot establish host-root sudo/setuid behavior.
 - Ordinary Runner/Bash entry and allocated-attempt NNP/seccomp remain. The opt-in entry keeps the host guardian outside the root PID namespace and releases only the fixed Runner for help/offline diagnostics.
 
@@ -117,6 +122,7 @@
 - `crates/oulipoly-kernel-broker/tests/private_pidns.rs` exercises root sibling/nested classification and root debt.
 - `crates/oulipoly-kernel-broker/tests/private_work_pidns.rs` exercises root/work binding, sibling separation, adopted peer classification, persistence poisoning, and restart uncertainty.
 - `crates/oulipoly-kernel-broker/tests/private_root_join.rs` runs the actual opt-in Runner and broker binaries in a private user namespace, holds the child at the pre-exec gate, and checks exact root/guardian placement, persisted child stamp, V acceptance and changed-incarnation/socket refusal, replay denial and broker restart debt. Its normal v30 modes use an independently admitted StateDb suffix, a corrupted retired sidecar, and the retained broker connection. The execed driver projects the bounded suffix, rejects wrong root/source/owner and stale/duplicate repair requests, reconciles a lost reply by exact cursor readback, and stops at the missing source grant. Restart retains the repaired cursor without admitting another root.
+- `crates/oulipoly-kernel-broker/src/fresh_provider.rs` unit fixture and `private_root_join.rs` provider modes execute the real ELF under broker K and nested PID1, retain provider exit while a detached adopted child lives, cancel and verify exact output/Q, refuse changed root/actor/image/argv, missing output and duplicate K, and observe the same grant after lost K reply and broker restart.
 - `crates/oulipoly-kernel-broker/tests/private_source_physical.rs` runs a Rust nested PID1 reaper with a held Python worker and an adopted descendant longer than five seconds. It exercises post-owner readback, complete bounded output, duplicate and orphan debt, in-place output change, missing receipt, and cancellation intent replay after registry reopen. Its consumed grant is a private fixture surrogate, not a Bash-created source or production consume.
 - `crates/oulipoly-kernel-broker/tests/age319_fresh_recipient_socket.rs` uses a synthetic private accepted source/attempt and real fresh broker socket for exact payload, lost reply, wrong/offline recipient, restart, duplicate ACK, lane collision and explicitly delegated noncontiguous batch ACK. It does not establish a production source writer or provider transport.
 - `crates/oulipoly-kernel-broker/src/linux_main.rs` unit tests exercise challenged credentials, a `CAP_SYS_ADMIN` child namespace socket handoff, exact host namespace policy, descriptor rejection, and production dispatch E/P/G ordering.

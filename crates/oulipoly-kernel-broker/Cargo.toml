@@ -19,6 +19,11 @@ path = "src/installed_launcher.rs"
 name = "oulipoly-shared-front-door"
 path = "src/shared_front_door.rs"
 
+[[bin]]
+name = "age319-fresh-provider-fixture"
+path = "src/fresh_provider_fixture.rs"
+required-features = ["age319-private-broker-fixture"]
+
 [dependencies]
 base64 = "0.22"
 libc.workspace = true

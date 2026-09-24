@@ -14,6 +14,7 @@ include!("fresh_recipient.rs");
 include!("fresh_bash_child.rs");
 
 const LANE_DIRECTORY: &str = "v30";
+const FRESH_PROVIDER_DIRECTORY: &str = "fresh-provider";
 const LANE_PROTOCOL: &str = "fresh-v30-lane-v1";
 const FRESH_SCHEMA: &str = include_str!("migrations/0030_fresh_lane.sql");
 const FRESH_STATE_SCHEMA: &str = include_str!("migrations/0030_fresh_state_identity.sql");
@@ -241,6 +242,10 @@ impl FreshV30Lane {
         fs::create_dir(&sidecar_root).map_err(|e| e.to_string())?;
         fs::set_permissions(&sidecar_root, fs::Permissions::from_mode(0o700))
             .map_err(|e| e.to_string())?;
+        let provider_root = stage_root.join(FRESH_PROVIDER_DIRECTORY);
+        fs::create_dir(&provider_root).map_err(|e| e.to_string())?;
+        fs::set_permissions(&provider_root, fs::Permissions::from_mode(0o700))
+            .map_err(|e| e.to_string())?;
         let state_path = stage_root.join("state.db");
         let mailbox_path = sidecar_root.join("pid-identity.db");
         // Both constructors start from absent files. No old writer or WAL is
@@ -341,6 +346,15 @@ impl FreshV30Lane {
         unsafe { libc::umask(0o077) };
         require_broker_root(broker_root)?;
         let lane_root = broker_root.join(LANE_DIRECTORY);
+        let provider_meta = fs::symlink_metadata(lane_root.join(FRESH_PROVIDER_DIRECTORY))
+            .map_err(|e| format!("fresh provider ledger directory absent: {e}"))?;
+        if !provider_meta.is_dir()
+            || provider_meta.file_type().is_symlink()
+            || provider_meta.uid() != 0
+            || provider_meta.mode() & 0o777 != 0o700
+        {
+            return Err("fresh provider ledger directory changed".into());
+        }
         let sidecar =
             BrokerSidecar::open_existing(&lane_root.join("sidecar/pid-identity.db"), &lane_root)?;
         let state = sidecar.bound_state()?;

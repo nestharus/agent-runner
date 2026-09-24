@@ -1,4 +1,7 @@
 //! Opt-in host-root broker for the pinned guardian and one-use root child join.
+#[cfg(feature = "age319-private-broker-fixture")]
+#[path = "fresh_provider.rs"]
+mod fresh_provider;
 #[path = "native_work.rs"]
 mod native_work;
 #[cfg(feature = "age319-private-broker-fixture")]
@@ -167,6 +170,11 @@ enum RequestPayload {
     },
     FreshBashPrivateResult {
         result: oulipoly_state::mailbox::FreshBashPrivateResult,
+    },
+    #[cfg(feature = "age319-private-broker-fixture")]
+    FreshProviderRequest {
+        request: FreshRootEffectRequest,
+        descriptors: Vec<File>,
     },
     FreshRecipientRequest {
         request: FreshRecipientRequest,
@@ -353,6 +361,8 @@ fn recv_request(
         b'L' => (18..=48 * 1024 + 17).contains(&read),
         b'V' | b'S' | b's' | b'T' | b'H' | b'K' | b'B' | b'N' | b'k' | b't' | b'R' | b'W'
         | b'Y' | b'0' | b'1' | b'2' | b'3' | b'4' => (18..=2048 + 17).contains(&read),
+        #[cfg(feature = "age319-private-broker-fixture")]
+        b'5' | b'6' | b'7' => (18..=2048 + 17).contains(&read),
         b'F' => (18..=8192 + 17).contains(&read),
         b'O' => (18..=1024 + 17).contains(&read),
         b'U' => (18..=512 + 17).contains(&read),
@@ -370,6 +380,8 @@ fn recv_request(
             b'N' | b't' => descriptors.len() != 3,
             b'k' => descriptors.len() != 4,
             b'K' => descriptors.len() != 7,
+            #[cfg(feature = "age319-private-broker-fixture")]
+            b'5' => descriptors.len() != 4,
             b'L' => !(1..=4).contains(&descriptors.len()),
             b'V' | b'S' | b's' | b'T' => descriptors.len() != 1,
             _ => !descriptors.is_empty(),
@@ -400,6 +412,11 @@ fn recv_request(
         },
         b'0' | b'1' | b'2' | b'3' | b'4' => RequestPayload::FreshRootEffectRequest {
             request: serde_json::from_slice(&request[17..read as usize])?,
+        },
+        #[cfg(feature = "age319-private-broker-fixture")]
+        b'5' | b'6' | b'7' => RequestPayload::FreshProviderRequest {
+            request: serde_json::from_slice(&request[17..read as usize])?,
+            descriptors,
         },
         b'D' | b'd' => RequestPayload::FreshSessionRequest {
             request_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
@@ -3793,6 +3810,8 @@ fn serve_fresh_v30_at(
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
         stream.set_write_timeout(Some(Duration::from_secs(30)))?;
         let mut submitted_grant = None;
+        #[cfg(feature = "age319-private-broker-fixture")]
+        let mut drop_provider_k_reply = false;
         let answer = (|| -> io::Result<String> {
             let (operation, payload, peer) = peer_from_request(&mut stream)?;
             peer.process.verify()?;
@@ -4183,6 +4202,130 @@ fn serve_fresh_v30_at(
                         None => Ok("fresh-normal-work absent\n".into()),
                     }
                 }
+                #[cfg(feature = "age319-private-broker-fixture")]
+                b'5' | b'6' | b'7' => {
+                    if !private_fixture() {
+                        return Err(io::Error::other("fresh provider fixture route closed"));
+                    }
+                    let RequestPayload::FreshProviderRequest {
+                        request,
+                        descriptors,
+                    } = payload
+                    else {
+                        return Err(io::Error::other("fresh provider request absent"));
+                    };
+                    if request.success.is_some() {
+                        return Err(io::Error::other("fresh provider request has CLI result"));
+                    }
+                    let receipt = lane
+                        .released_handoff_for_child(&request.d_key, &recipient)
+                        .map_err(io::Error::other)?;
+                    let actor_pid = peer.process.host_pid;
+                    let actor_uid = peer.uid;
+                    let actor_gid = peer.gid;
+                    let spec = StateReadSpec {
+                        protocol: "broker-release-attest-v30".into(),
+                        source_generation: receipt.old_release.prepared.source_generation.clone(),
+                        root_id: receipt.old_release.prepared.root_id.clone(),
+                        owner_generation: receipt.old_release.prepared.owner_generation.clone(),
+                        attempt_id: None,
+                    };
+                    let bridge = handoff_tx.as_ref().ok_or_else(|| {
+                        io::Error::other("in-process release authority unavailable")
+                    })?;
+                    if bridge_released_handoff(
+                        bridge,
+                        spec,
+                        peer,
+                        lane.identity(),
+                        true,
+                        &runner_image,
+                    )? != receipt
+                    {
+                        return Err(io::Error::other(
+                            "fresh provider old release readback changed",
+                        ));
+                    }
+                    let session = lane
+                        .read_session(&request.d_key)
+                        .map_err(io::Error::other)?
+                        .ok_or_else(|| io::Error::other("fresh provider D absent"))?;
+                    lane.require_released_invocation(&receipt, &recipient, &session)
+                        .map_err(io::Error::other)?;
+                    let held = lane
+                        .read_normal_work(&receipt, &recipient, &session)
+                        .map_err(io::Error::other)?
+                        .ok_or_else(|| io::Error::other("fresh provider held J absent"))?;
+                    let root =
+                        PinnedProcess::open(receipt.old_release.prepared.root_init.host_pid)?;
+                    let actor = PinnedProcess::open(actor_pid)?;
+                    if actor.boot_id != recipient.boot_id
+                        || actor.starttime_ticks != recipient.starttime_ticks
+                        || (actor.pidns_dev, actor.pidns_ino)
+                            != (recipient.pidns_dev, recipient.pidns_ino)
+                    {
+                        return Err(io::Error::other("fresh provider peer incarnation changed"));
+                    }
+                    let binding =
+                        fresh_provider::binding_from_held(&receipt, &held, &actor, &root)?;
+                    let directory = state_root.join("v30/fresh-provider");
+                    if operation == b'5' {
+                        if instance.is_closed() {
+                            return Err(io::Error::other("fresh provider K entry gate closed"));
+                        }
+                        let [image_fd, cwd, input, recipe]: [File; 4] = descriptors
+                            .try_into()
+                            .map_err(|_| io::Error::other("fresh provider descriptors absent"))?;
+                        let image =
+                            fs::read_link(format!("/proc/self/fd/{}", image_fd.as_raw_fd()))?;
+                        let plan = fresh_provider::plan_from_descriptors(
+                            &image, image_fd, cwd, input, recipe,
+                        )?;
+                        let prepared = fresh_provider::prepare(&directory, binding, plan)?;
+                        let grant =
+                            fresh_provider::launch(prepared, &root, &actor, actor_uid, actor_gid)?;
+                        if std::env::var_os(
+                            "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_PROVIDER_K_REPLY_V1",
+                        )
+                        .is_some()
+                        {
+                            drop_provider_k_reply = true;
+                        }
+                        return Ok(format!("fresh-provider-k {grant}\n"));
+                    }
+                    let grant = fresh_provider::grant_for_binding(&directory, &binding)?
+                        .ok_or_else(|| io::Error::other("fresh provider grant absent"))?;
+                    if operation == b'7' {
+                        fresh_provider::cancel(&directory, &grant)?;
+                        return Ok(format!("fresh-provider-cancel {grant}\n"));
+                    }
+                    let result = match fresh_provider::observe(&directory, &grant)? {
+                        fresh_provider::Observation::Unknown => {
+                            format!("fresh-provider-unknown {grant}\n")
+                        }
+                        fresh_provider::Observation::Pending => {
+                            format!("fresh-provider-pending {grant}\n")
+                        }
+                        fresh_provider::Observation::ProviderExited(status) => {
+                            format!("fresh-provider-exited {grant} {status}\n")
+                        }
+                        fresh_provider::Observation::Drained {
+                            status,
+                            stdout,
+                            stderr,
+                            stdout_len,
+                            stderr_len,
+                            cancelled,
+                        } => {
+                            drop(stdout);
+                            drop(stderr);
+                            format!(
+                                "fresh-provider-drained {grant} {status} {stdout_len} {stderr_len} {cancelled}\n"
+                            )
+                        }
+                    };
+                    Ok(result)
+                }
                 b'F' => {
                     // No production delivery can be authorized by a private
                     // prefix D/session or by a copied old mailbox row.
@@ -4302,6 +4445,10 @@ fn serve_fresh_v30_at(
                 )),
             }
         })();
+        #[cfg(feature = "age319-private-broker-fixture")]
+        if drop_provider_k_reply {
+            continue;
+        }
         let response = answer.unwrap_or_else(|error| format!("error {error}\n"));
         if stream.write_all(response.as_bytes()).is_ok() {
             if let Some(grant_id) = submitted_grant {

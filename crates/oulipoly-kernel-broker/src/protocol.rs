@@ -138,6 +138,78 @@ pub fn observe_fresh_normal_work_at(
     normal_work_request_at(path, b'4', d_key)
 }
 
+/// Private first provider proof. Variable recipe and stdin bytes are carried
+/// by pinned descriptors; the challenged frame contains only the D key.
+#[cfg(feature = "age319-private-broker-fixture")]
+pub fn private_fresh_provider_at(
+    path: &Path,
+    d_key: &str,
+    operation: u8,
+    descriptors: Option<[RawFd; 4]>,
+) -> io::Result<String> {
+    if !matches!(operation, b'5' | b'6' | b'7') || (operation == b'5') != descriptors.is_some() {
+        return Err(io::Error::other("invalid private fresh provider operation"));
+    }
+    let id = uuid::Uuid::parse_str(d_key)
+        .map_err(|_| io::Error::other("invalid fresh provider D key"))?;
+    if id.is_nil() || id.to_string() != d_key {
+        return Err(io::Error::other("noncanonical fresh provider D key"));
+    }
+    let body = serde_json::to_vec(&FreshRootEffectRequest {
+        d_key: d_key.into(),
+        success: None,
+    })?;
+    let mut stream = checked_connection(path)?;
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let mut frame = Vec::with_capacity(17 + body.len());
+    frame.push(operation);
+    frame.extend_from_slice(&challenge);
+    frame.extend_from_slice(&body);
+    if let Some(descriptors) = descriptors {
+        let mut iov = libc::iovec {
+            iov_base: frame.as_mut_ptr().cast(),
+            iov_len: frame.len(),
+        };
+        let mut control = [0u8; 64];
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr().cast();
+        msg.msg_controllen =
+            unsafe { libc::CMSG_SPACE(std::mem::size_of_val(&descriptors) as _) } as usize;
+        unsafe {
+            let header = libc::CMSG_FIRSTHDR(&msg);
+            (*header).cmsg_level = libc::SOL_SOCKET;
+            (*header).cmsg_type = libc::SCM_RIGHTS;
+            (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(&descriptors) as _) as usize;
+            std::ptr::copy_nonoverlapping(descriptors.as_ptr(), libc::CMSG_DATA(header).cast(), 4);
+        }
+        if unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) }
+            != frame.len() as isize
+        {
+            return Err(io::Error::other("fresh provider K request uncertain"));
+        }
+    } else if unsafe {
+        libc::send(
+            stream.as_raw_fd(),
+            frame.as_ptr().cast(),
+            frame.len(),
+            libc::MSG_NOSIGNAL,
+        )
+    } != frame.len() as isize
+    {
+        return Err(io::Error::other(
+            "fresh provider observe/cancel request uncertain",
+        ));
+    }
+    let answer = read_response(stream)?;
+    if let Some(error) = answer.strip_prefix("error ") {
+        return Err(io::Error::other(error.trim_end().to_owned()));
+    }
+    Ok(answer)
+}
+
 fn normal_work_request_at(
     path: &Path,
     operation: u8,
