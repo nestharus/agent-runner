@@ -295,9 +295,9 @@ pub fn private_fresh_route_at(
     path: &Path,
     request: &FreshRouteRequest,
     operation: u8,
-    descriptors: Option<[RawFd; 4]>,
+    descriptors: &[RawFd],
 ) -> io::Result<Option<FreshRouteSelection>> {
-    if !matches!(operation, b'c' | b'f') || (operation == b'c') != descriptors.is_some() {
+    if !matches!((operation, descriptors.len()), (b'c', 5) | (b'f', 1)) {
         return Err(io::Error::other("invalid fresh route operation"));
     }
     let id = uuid::Uuid::parse_str(&request.d_key)
@@ -313,7 +313,7 @@ pub fn private_fresh_route_at(
     frame.push(operation);
     frame.extend_from_slice(&challenge);
     frame.extend_from_slice(&body);
-    if let Some(descriptors) = descriptors {
+    if !descriptors.is_empty() {
         let mut iov = libc::iovec {
             iov_base: frame.as_mut_ptr().cast(),
             iov_len: frame.len(),
@@ -324,13 +324,19 @@ pub fn private_fresh_route_at(
         msg.msg_iovlen = 1;
         msg.msg_control = control.as_mut_ptr().cast();
         msg.msg_controllen =
-            unsafe { libc::CMSG_SPACE(std::mem::size_of_val(&descriptors) as _) } as usize;
+            unsafe { libc::CMSG_SPACE((descriptors.len() * std::mem::size_of::<RawFd>()) as _) }
+                as usize;
         unsafe {
             let header = libc::CMSG_FIRSTHDR(&msg);
             (*header).cmsg_level = libc::SOL_SOCKET;
             (*header).cmsg_type = libc::SCM_RIGHTS;
-            (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(&descriptors) as _) as usize;
-            std::ptr::copy_nonoverlapping(descriptors.as_ptr(), libc::CMSG_DATA(header).cast(), 4);
+            (*header).cmsg_len =
+                libc::CMSG_LEN((descriptors.len() * std::mem::size_of::<RawFd>()) as _) as usize;
+            std::ptr::copy_nonoverlapping(
+                descriptors.as_ptr(),
+                libc::CMSG_DATA(header).cast(),
+                descriptors.len(),
+            );
         }
         if unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) }
             != frame.len() as isize

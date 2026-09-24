@@ -387,7 +387,9 @@ fn recv_request(
             #[cfg(feature = "age319-private-broker-fixture")]
             b'5' | b'9' => descriptors.len() != 4,
             #[cfg(feature = "age319-private-broker-fixture")]
-            b'c' => descriptors.len() != 4,
+            b'c' => descriptors.len() != 5,
+            #[cfg(feature = "age319-private-broker-fixture")]
+            b'f' => descriptors.len() != 1,
             b'L' => !(1..=4).contains(&descriptors.len()),
             b'V' | b'S' | b's' | b'T' => descriptors.len() != 1,
             _ => !descriptors.is_empty(),
@@ -4187,9 +4189,17 @@ fn serve_fresh_v30_at(
                             if instance.is_closed() {
                                 return Err(io::Error::other("fresh route entry gate closed"));
                             }
-                            let [image_fd, cwd, input, recipe]: [File; 4] = descriptors
+                            let [image_fd, cwd, input, recipe, config_dir]: [File; 5] = descriptors
                                 .try_into()
                                 .map_err(|_| io::Error::other("fresh route descriptors absent"))?;
+                            fresh_provider::validate_route_source(&config_dir, &route_request)?;
+                            fresh_provider::bind_route_source(
+                                &directory,
+                                &binding,
+                                &route_request,
+                                &config_dir,
+                                true,
+                            )?;
                             let image =
                                 fs::read_link(format!("/proc/self/fd/{}", image_fd.as_raw_fd()))?;
                             let plan = fresh_provider::plan_from_descriptors(
@@ -4203,6 +4213,17 @@ fn serve_fresh_v30_at(
                             )?;
                             return Ok("fresh-route-registered\n".into());
                         }
+                        let [config_dir]: [File; 1] = descriptors
+                            .try_into()
+                            .map_err(|_| io::Error::other("fresh route source absent"))?;
+                        fresh_provider::validate_route_source(&config_dir, &route_request)?;
+                        fresh_provider::bind_route_source(
+                            &directory,
+                            &binding,
+                            &route_request,
+                            &config_dir,
+                            false,
+                        )?;
                         let selection =
                             fresh_provider::select_route(&directory, &binding, &route_request)?;
                         return Ok(format!(

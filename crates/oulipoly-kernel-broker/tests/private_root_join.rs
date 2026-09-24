@@ -1119,7 +1119,7 @@ fn inner() {
                                 auth_refresh_command: None,
                             },
                             b'f',
-                            None,
+                            &[std::fs::File::open("/").unwrap().as_raw_fd()],
                         )
                         .is_err(),
                         "sibling read back fresh route"
