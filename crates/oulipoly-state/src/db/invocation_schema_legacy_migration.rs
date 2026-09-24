@@ -443,6 +443,42 @@ impl StateDb {
     pub(super) fn replace_invocations_with_migrated_table(
         conn: &sqlite::Connection,
     ) -> Result<(), String> {
+        // A pre-UUID rebuild cannot safely relink completed-turn custody.
+        // The v28 target triggers also reference invocations while SQLite
+        // renames the replacement table, so preserve their exact definitions
+        // and reinstall them inside the same migration transaction.
+        let completed_turns_present: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='completed_turns')",
+            [], |row| row.get(0),
+        ).map_err(Self::format_invocations_table_replace_error)?;
+        if completed_turns_present {
+            let linked: i64 = conn
+                .query_row("SELECT count(*) FROM completed_turns", [], |row| row.get(0))
+                .map_err(Self::format_invocations_table_replace_error)?;
+            if linked != 0 {
+                return Err("Cannot rebuild invocations with completed-turn custody".into());
+            }
+        }
+        let recovery_triggers = conn
+            .prepare(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name IN (
+                'completed_turn_recovery_target_insert',
+                'completed_turn_recovery_target_payload_update',
+                'completed_turn_recovery_target_invocation_update') ORDER BY name",
+            )
+            .map_err(Self::format_invocations_table_replace_error)?
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(Self::format_invocations_table_replace_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Self::format_invocations_table_replace_error)?;
+        if !recovery_triggers.is_empty() {
+            conn.execute_batch(
+                "DROP TRIGGER IF EXISTS completed_turn_recovery_target_insert;
+                 DROP TRIGGER IF EXISTS completed_turn_recovery_target_payload_update;
+                 DROP TRIGGER IF EXISTS completed_turn_recovery_target_invocation_update;",
+            )
+            .map_err(Self::format_invocations_table_replace_error)?;
+        }
         // The numbered lifecycle migration may precede the legacy invocation rebuild.
         // Preserve its exact trigger inside this transaction; linked rows cannot be rebuilt.
         let launch_join: Option<String> = conn.query_row(
@@ -466,6 +502,10 @@ impl StateDb {
         )
         .map_err(Self::format_invocations_table_replace_error)?;
         if let Some(sql) = launch_join {
+            conn.execute_batch(&sql)
+                .map_err(Self::format_invocations_table_replace_error)?;
+        }
+        for sql in recovery_triggers {
             conn.execute_batch(&sql)
                 .map_err(Self::format_invocations_table_replace_error)?;
         }

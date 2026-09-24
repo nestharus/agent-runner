@@ -788,7 +788,8 @@ mod tests {
             "INSERT INTO completed_turns(invocation_id,invocation_uuid,settlement_id,
              effects_json,context_json,content_sha256,committed_at,tails_json,
              recovery_pending,created_at,updated_at,retention_status)
-             VALUES(?1,?2,'pending-settlement','{}','{}',?3,NULL,'{}',1,NULL,NULL,'legacy_unknown')",
+             VALUES(?1,?2,'pending-settlement','{}',
+                    '{\"provider_session\":\"retention-recovery\"}',?3,NULL,'{}',1,NULL,NULL,'legacy_unknown')",
             params![recovery_row,recovery_uuid,"0".repeat(64)],
         ).unwrap();
         let outcome = state

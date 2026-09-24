@@ -1158,7 +1158,7 @@ impl FlightRecorder {
         })
     }
 
-    fn disabled() -> Self {
+    pub(crate) fn disabled() -> Self {
         let instance = ProducerInstanceId::new();
         Self {
             inner: Arc::new(RecorderInner {

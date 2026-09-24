@@ -173,11 +173,19 @@ pub(crate) fn run(cli: Cli) -> Result<i32, String> {
     // Must precede ALL startup recovery, wake sweeps and provider registries.
     if let Some(Subcommands::CompletedTurn {
         invocation,
+        after_id,
+        epoch,
         settle,
         output,
     }) = &cli.command
     {
-        return crate::run::resume::retention::command(invocation.as_deref(), *settle, *output);
+        return crate::run::resume::retention::command(
+            invocation.as_deref(),
+            *after_id,
+            *epoch,
+            *settle,
+            *output,
+        );
     }
     // Keep read-only session inspection ahead of startup recovery and provider dispatch.
     if let Some(Subcommands::Session { command }) = &cli.command
@@ -471,9 +479,17 @@ fn dispatch_subcommand(
         Subcommands::ResumeList { uuid } => crate::commands::resume_list::run_resume_list(&uuid),
         Subcommands::CompletedTurn {
             invocation,
+            after_id,
+            epoch,
             settle,
             output,
-        } => crate::run::resume::retention::command(invocation.as_deref(), settle, output),
+        } => crate::run::resume::retention::command(
+            invocation.as_deref(),
+            after_id,
+            epoch,
+            settle,
+            output,
+        ),
         Subcommands::MigrateDb => commands::migrate::run_migrate_db(),
         Subcommands::MigrateSessionOwnership {
             dry_run,

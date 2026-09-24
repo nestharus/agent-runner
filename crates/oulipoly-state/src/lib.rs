@@ -105,6 +105,7 @@ pub use db::{CompactSummaryEvidence, OwnedTurnEvent, OwnedTurnEventRow};
 pub use db::{
     CompletedTurnEffects, CompletedTurnMigrationFence, CompletedTurnMigrationScope,
     CompletedTurnMigrationStage, CompletedTurnRecord, CompletedTurnRecoveryIdentity,
+    CompletedTurnRecoveryPage,
 };
 pub use db::{
     CompletionContinuityRecoveryState, CompletionObligationAdmission,

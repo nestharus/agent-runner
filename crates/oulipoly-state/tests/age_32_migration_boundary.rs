@@ -238,6 +238,88 @@ fn ti_03_current_version_open_is_noop_for_rows_and_duplicates() {
 }
 
 #[test]
+fn v27_pending_completed_turns_gain_exact_recovery_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("state.db");
+    let mut conn = Connection::open(&db_path).unwrap();
+    fixtures::create_full_state_schema(&conn, 27);
+    for (uuid, provider_session, fallback) in [
+        ("old-bound", Some("native"), "fallback"),
+        ("old-fallback", None, "fallback"),
+    ] {
+        conn.execute(
+            "INSERT INTO invocations
+             (invocation_uuid,model_name,provider_name,provider_index,status,
+              provider_session_id,created_at)
+             VALUES (?1,'model','fixture',0,'running',?2,'2026-01-01T00:00:00Z')",
+            rusqlite::params![uuid, provider_session],
+        )
+        .unwrap();
+        let id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO completed_turns
+             (invocation_id,invocation_uuid,settlement_id,effects_json,context_json,content_sha256)
+             VALUES (?1,?2,?3,'{}',?4,'fixture-digest')",
+            rusqlite::params![
+                id,
+                uuid,
+                format!("settlement-{uuid}"),
+                format!(r#"{{"provider_session":"{fallback}"}}"#)
+            ],
+        )
+        .unwrap();
+    }
+    let plan = migrations::current_plan_from(27).unwrap();
+    migrations::run_with_db_path(&mut conn, &plan, db_path).unwrap();
+    assert_eq!(user_version(&conn), CURRENT_SCHEMA_VERSION);
+    let targets = conn
+        .prepare(
+            "SELECT recovery_provider_name,recovery_provider_session FROM completed_turns
+         ORDER BY invocation_id",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        targets,
+        vec![
+            ("fixture".into(), "native".into()),
+            ("fixture".into(), "fallback".into())
+        ]
+    );
+}
+
+#[test]
+fn v27_pending_without_target_fails_upgrade_without_erasing_duty() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("state.db");
+    let mut conn = Connection::open(&db_path).unwrap();
+    fixtures::create_full_state_schema(&conn, 27);
+    conn.execute(
+        "INSERT INTO invocations
+         (invocation_uuid,model_name,provider_index,status,created_at)
+         VALUES ('unscoped','model',0,'running','2026-01-01T00:00:00Z')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO completed_turns
+         (invocation_id,invocation_uuid,settlement_id,effects_json,context_json,content_sha256)
+         VALUES (?1,'unscoped','settlement','{}','{}','fixture-digest')",
+        [conn.last_insert_rowid()],
+    )
+    .unwrap();
+    let plan = migrations::current_plan_from(27).unwrap();
+    assert!(migrations::run_with_db_path(&mut conn, &plan, db_path).is_err());
+    assert_eq!(user_version(&conn), 27);
+    assert_eq!(fixtures::count_rows(&conn, "completed_turns"), 1);
+}
+
+#[test]
 fn ti_06_probe_and_classifier_report_migratable_without_mutation() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("state.db");
@@ -385,6 +467,7 @@ fn ti_10_age_54_schema4_plan_contains_only_schema5_step() {
             24,
             25,
             26,
+            27,
             CURRENT_SCHEMA_VERSION,
         ],
         "schema-4 DBs must take every ordered migration through the current schema"
@@ -415,6 +498,7 @@ fn ti_10_age_54_schema4_plan_contains_only_schema5_step() {
             "0025_completed_turns",
             "0026_live_history_barrier",
             "0027_record_timestamp_contract",
+            "0028_completed_turn_recovery_targets",
         ]
     );
 }

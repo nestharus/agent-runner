@@ -2032,12 +2032,25 @@ impl MailboxDb {
         &mut self,
         session: &str,
         retained_claims: &[RetainedWakeClaim],
+        expected_claim: &Option<ManualWakeClaimIdentity>,
+        span: &DiagnosticSpan,
     ) -> Result<ManualWakeCoordination, String> {
         self.conn
             .busy_timeout(StdDuration::ZERO)
             .map_err(|e| e.to_string())?;
-        self.wake_sessions()
-            .coordinate_manual_resume(session, retained_claims)
+        self.wake_sessions().coordinate_manual_resume(
+            session,
+            retained_claims,
+            expected_claim,
+            span,
+        )
+    }
+
+    pub(crate) fn manual_wake_claim_identity(
+        &self,
+        session: &str,
+    ) -> Result<Option<ManualWakeClaimIdentity>, String> {
+        wake_claim(&self.conn, session).map(|claim| claim.map(ManualWakeClaimIdentity::from))
     }
 
     pub(crate) fn begin_completion_authority_fence(
@@ -6446,6 +6459,33 @@ pub(crate) struct RetainedWakeClaim {
     pub(crate) phase: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManualWakeClaimIdentity {
+    pub(crate) claim_token: String,
+    pub(crate) wake_invocation_uuid: Option<String>,
+    claimed_at: String,
+    wake_pid: Option<i64>,
+    reason: String,
+    auto_wake_count: i64,
+    min_pending_seq_at_claim: Option<i64>,
+    max_pending_seq_at_claim: Option<i64>,
+}
+
+impl From<WakeClaimRow> for ManualWakeClaimIdentity {
+    fn from(claim: WakeClaimRow) -> Self {
+        Self {
+            claim_token: claim.claim_token,
+            wake_invocation_uuid: claim.wake_invocation_uuid,
+            claimed_at: claim.claimed_at,
+            wake_pid: claim.wake_pid,
+            reason: claim.reason,
+            auto_wake_count: claim.auto_wake_count,
+            min_pending_seq_at_claim: claim.min_pending_seq_at_claim,
+            max_pending_seq_at_claim: claim.max_pending_seq_at_claim,
+        }
+    }
+}
+
 impl WakeSessionRepository<'_> {
     pub fn upsert_session_metadata(
         &mut self,
@@ -7124,23 +7164,61 @@ impl WakeSessionRepository<'_> {
         &mut self,
         session: &str,
         retained_claims: &[RetainedWakeClaim],
+        expected_claim: &Option<ManualWakeClaimIdentity>,
+        parent_span: &DiagnosticSpan,
     ) -> Result<ManualWakeCoordination, String> {
         // A live coherent read is only a wait/release hint, not launch authority.
         // Drop it before acquiring a writer: never upgrade a read transaction.
         let read = self.conn.transaction().map_err(|e| e.to_string())?;
+        if wake_claim_tx(&read, session)?.map(ManualWakeClaimIdentity::from) != *expected_claim {
+            return Err(
+                "manual_resume_claim_changed_retry: claim changed after exact State lookup".into(),
+            );
+        }
         let observation = manual_resume_observation_on(&read, session)?;
         drop(read);
         if let Some(observation) = observation {
             return Ok(observation);
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| e.to_string())?;
+        let start = SpanStart::new(
+            "completed_turn_manual_resume_sidecar_write",
+            "pid_mailbox_sqlite",
+        )
+        .with_sqlite_identity(
+            SqliteEventIdentity::new(
+                SqliteDatabaseRole::PidMailbox,
+                SqlitePathClass::ManagedFile,
+                "completed_turn.manual_resume.sidecar_write",
+            )
+            .with_transaction_mode(SqliteTransactionMode::Immediate),
+        )
+        .with_busy_timeout(StdDuration::ZERO)
+        .with_diagnostic_id(parent_span.diagnostic_id().clone())
+        .with_parent_span_id(parent_span.span_id().clone())
+        .with_hashed_correlation("session_id", session);
+        parent_span.with_deferred_requested_span(start, |span| {
+        let attempt = TransactionAttempt::start();
+        let tx = match self.conn.transaction_with_behavior(TransactionBehavior::Immediate) {
+            Ok(tx) => tx,
+            Err(error) => {
+                record_sqlite_failure(span, &error, attempt);
+                record_unacquired_release(span);
+                return Err(error.to_string());
+            }
+        };
+        let mut phases = TransactionPhaseGuard::acquired(span, attempt);
+        let mut commit_attempted = false;
+        let result = (|| {
         if let Some(observation) = manual_native_custody_on(&tx, session)? {
             return Ok(observation);
         }
-        let Some(claim) = wake_claim_tx(&tx, session)? else {
+        let claim = wake_claim_tx(&tx, session)?;
+        if claim.clone().map(ManualWakeClaimIdentity::from) != *expected_claim {
+            return Err(
+                "manual_resume_claim_changed_retry: claim changed after exact State lookup".into(),
+            );
+        }
+        let Some(claim) = claim else {
             return Ok(ManualWakeCoordination::Absent);
         };
         if wake_claim_is_releasable_for_manual_resume(&tx, &claim)? {
@@ -7181,13 +7259,33 @@ impl WakeSessionRepository<'_> {
             if changed != 1 {
                 return Err("manual legacy release changed under writer".into());
             }
-            tx.commit().map_err(|e| e.to_string())?;
+            phases.commit_started();
+            commit_attempted = true;
+            match tx.commit() {
+                Ok(()) => phases.committed(),
+                Err(error) => {
+                    phases.sqlite_failure(&error);
+                    return Err(error.to_string());
+                }
+            }
             return Ok(ManualWakeCoordination::Released);
         }
         Ok(if wake_claim_has_persisted_process_identity(&tx, &claim)? {
             ManualWakeCoordination::LegacyLiveBusy
         } else {
             ManualWakeCoordination::UnknownCustody
+        })
+        })();
+        if result.is_err() {
+            phases.failed("manual_resume_sidecar_write_failed");
+        }
+        // The closure has dropped the transaction on every non-commit path.
+        if commit_attempted {
+            phases.release_after_owner();
+        } else {
+            phases.release_after_rollback();
+        }
+        result
         })
     }
 

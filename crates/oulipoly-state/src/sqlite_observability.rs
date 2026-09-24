@@ -259,6 +259,33 @@ impl SqliteOperationObserver {
         }
     }
 
+    /// Records a repository-level failure after database authority has been
+    /// released. The cause must be a fixed label, never an error string or SQL.
+    pub fn record_failure_cause(
+        self,
+        span: impl FnOnce() -> SpanStart,
+        cause: &'static str,
+        certainty: OutcomeCertainty,
+        evidence: impl FnOnce(Duration) -> SqlitePhaseEvidence,
+    ) -> SqliteRecordDecision {
+        let Some(elapsed) = self.elapsed() else {
+            return SqliteRecordDecision::Disabled;
+        };
+        let observation = PhaseObservation {
+            certainty,
+            ..PhaseObservation::default()
+        }
+        .with_cause(cause)
+        .with_sqlite_evidence(evidence(elapsed).with_total_elapsed(elapsed));
+        let _ = process_recorder().record_completed_observation(
+            span(),
+            elapsed,
+            DiagnosticPhase::Failed,
+            observation,
+        );
+        SqliteRecordDecision::RecordedFailure
+    }
+
     pub(crate) fn record_failure_deferred(
         self,
         target: DeferredObservationTarget<'_>,
