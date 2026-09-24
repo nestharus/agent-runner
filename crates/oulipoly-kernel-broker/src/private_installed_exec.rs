@@ -10,7 +10,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -185,6 +185,93 @@ struct InitContext {
     gid: u32,
 }
 
+fn environment<'a>(spec: &'a InstalledLaunchSpec, name: &[u8]) -> Option<&'a OsStr> {
+    spec.environment
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| OsStr::from_bytes(value))
+}
+
+fn private_gui_session(spec: &InstalledLaunchSpec, uid: u32) -> io::Result<()> {
+    if !spec.args.is_empty() {
+        return Err(io::Error::other("private GUI argv refused"));
+    }
+    let runtime = environment(spec, b"XDG_RUNTIME_DIR")
+        .ok_or_else(|| io::Error::other("private GUI runtime directory missing"))?;
+    let runtime = Path::new(runtime);
+    let metadata = fs::symlink_metadata(runtime)?;
+    if !runtime.is_absolute()
+        || !metadata.file_type().is_dir()
+        || metadata.uid() != uid
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(io::Error::other(
+            "private GUI runtime directory owner/mode mismatch",
+        ));
+    }
+    let mut display = false;
+    if let Some(wayland) = environment(spec, b"WAYLAND_DISPLAY") {
+        let name = wayland.as_bytes();
+        if name.is_empty() || name.contains(&b'/') || name == b"." || name == b".." {
+            return Err(io::Error::other("private GUI Wayland display name refused"));
+        }
+        private_gui_socket(&runtime.join(wayland), uid, false)?;
+        display = true;
+    }
+    if let Some(x11) = environment(spec, b"DISPLAY") {
+        let bytes = x11.as_bytes();
+        let number = bytes
+            .strip_prefix(b":")
+            .and_then(|rest| rest.split(|b| *b == b'.').next());
+        let Some(number) = number.filter(|n| !n.is_empty() && n.iter().all(u8::is_ascii_digit))
+        else {
+            return Err(io::Error::other("private GUI X11 display form refused"));
+        };
+        let socket = PathBuf::from("/tmp/.X11-unix")
+            .join(OsStr::from_bytes(&[b"X".as_slice(), number].concat()));
+        private_gui_socket(&socket, uid, true)?;
+        display = true;
+    }
+    if !display {
+        return Err(io::Error::other("private GUI display missing"));
+    }
+    if let Some(address) = environment(spec, b"DBUS_SESSION_BUS_ADDRESS") {
+        let path = address
+            .as_bytes()
+            .strip_prefix(b"unix:path=")
+            .ok_or_else(|| io::Error::other("private GUI DBus address refused"))?;
+        let path = Path::new(OsStr::from_bytes(path));
+        if path.parent() != Some(runtime) {
+            return Err(io::Error::other(
+                "private GUI DBus path outside runtime directory",
+            ));
+        }
+        private_gui_socket(path, uid, false)?;
+    }
+    if let Some(authority) = environment(spec, b"XAUTHORITY") {
+        let path = Path::new(authority);
+        let metadata = fs::symlink_metadata(path)?;
+        if !path.is_absolute() || !metadata.file_type().is_file() || metadata.uid() != uid {
+            return Err(io::Error::other(
+                "private GUI Xauthority owner/type mismatch",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn private_gui_socket(path: &Path, uid: u32, allow_root: bool) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_socket()
+        || metadata.uid() != uid && !(allow_root && metadata.uid() == 0)
+    {
+        return Err(io::Error::other(
+            "private GUI display/session socket owner/type mismatch",
+        ));
+    }
+    Ok(())
+}
+
 extern "C" fn init_start(pointer: *mut libc::c_void) -> libc::c_int {
     let context = unsafe { Box::from_raw(pointer.cast::<InitContext>()) };
     if run_init(*context).is_ok() { 0 } else { 70 }
@@ -236,13 +323,26 @@ fn run_init(context: InitContext) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     let mut command = Command::new(format!("/proc/self/fd/{}", image.as_raw_fd()));
-    command.args(spec.args.iter().cloned().map(OsString::from_vec));
+    if spec.kind == EntryKind::Gui {
+        command.args(["__age319-private-installed-probe-v1", "gui"]);
+    } else {
+        command.args(spec.args.iter().cloned().map(OsString::from_vec));
+    }
     command.env_clear();
     command.envs(
         spec.environment
             .iter()
             .map(|(key, value)| (OsStr::from_bytes(key), OsStr::from_bytes(value))),
     );
+    if spec.kind == EntryKind::Gui {
+        command.env(
+            "OULIPOLY_AGE319_PRIVATE_GUI_STDIO_V1",
+            spec.stdio_present
+                .iter()
+                .map(|present| if *present { '1' } else { '0' })
+                .collect::<String>(),
+        );
+    }
     let mut cursor = 0;
     for (index, present) in spec.stdio_present.into_iter().enumerate() {
         if present {
@@ -274,10 +374,14 @@ fn run_init(context: InitContext) -> io::Result<()> {
         }
     }
     let present = spec.stdio_present;
+    let gui = spec.kind == EntryKind::Gui;
     let control_fd = child_control.as_raw_fd();
     let child_gate_fd = child_gate.as_raw_fd();
     unsafe {
         command.pre_exec(move || {
+            if gui && libc::setgroups(0, std::ptr::null()) != 0 {
+                return Err(io::Error::last_os_error());
+            }
             if libc::setsid() < 0
                 || libc::setresgid(gid, gid, gid) != 0
                 || libc::setresuid(uid, uid, uid) != 0
@@ -287,6 +391,10 @@ fn run_init(context: InitContext) -> io::Result<()> {
             for (index, exists) in present.into_iter().enumerate() {
                 if !exists {
                     libc::close(index as i32);
+                }
+                let observed = libc::fcntl(index as i32, libc::F_GETFD) >= 0;
+                if observed != exists {
+                    return Err(io::Error::other("private Runner stdio presence mismatch"));
                 }
             }
             let tty = (0..=2).find(|fd| libc::isatty(*fd) == 1);
@@ -450,19 +558,26 @@ pub(super) fn launch(
     client: UnixStream,
 ) -> io::Result<()> {
     installed_launch::validate(&spec, &installed_launch::files_as_raw(&descriptors))?;
-    if spec.kind != EntryKind::Cli {
-        return Err(io::Error::other(
-            "private GUI needs installed display/session lifecycle",
-        ));
+    if !peer.process.in_namespace(host_namespace)? {
+        return Err(io::Error::other("private host entry refused"));
     }
-    let args = spec
-        .args
-        .iter()
-        .map(|arg| String::from_utf8(arg.clone()))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| io::Error::other("private CLI mode requires UTF-8 args"))?;
-    if !supported_entry_args(&args) || !peer.process.in_namespace(host_namespace)? {
-        return Err(io::Error::other("private CLI mode or host entry refused"));
+    if spec.kind == EntryKind::Gui {
+        if peer.uid != 0 && image.metadata()?.permissions().mode() & 0o6000 != 0 {
+            return Err(io::Error::other(
+                "private GUI fixed image privilege bits refused",
+            ));
+        }
+        private_gui_session(&spec, peer.uid)?;
+    } else {
+        let args = spec
+            .args
+            .iter()
+            .map(|arg| String::from_utf8(arg.clone()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| io::Error::other("private CLI mode requires UTF-8 args"))?;
+        if !supported_entry_args(&args) {
+            return Err(io::Error::other("private CLI mode refused"));
+        }
     }
     if unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) } != 0 {
         return Err(io::Error::other("private broker lost sudo semantics"));

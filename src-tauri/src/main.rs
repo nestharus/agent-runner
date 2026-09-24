@@ -127,14 +127,21 @@ fn private_installed_probe() -> Option<ExitCode> {
     if args.first().and_then(|arg| arg.to_str()) != Some("__age319-private-installed-probe-v1") {
         return None;
     }
-    if (unsafe { libc::geteuid() }) != 0
-        || !std::fs::read_to_string("/proc/self/uid_map")
-            .ok()
-            .is_some_and(|map| map.split_ascii_whitespace().nth(2) == Some("1"))
-    {
+    let private_namespace = std::fs::read_to_string("/proc/self/uid_map")
+        .ok()
+        .is_some_and(|map| map.split_ascii_whitespace().nth(2) == Some("1"));
+    let gui_mode = args.get(1).and_then(|arg| arg.to_str()) == Some("gui") && args.len() == 2;
+    if !private_namespace || !gui_mode && (unsafe { libc::geteuid() }) != 0 {
         return Some(ExitCode::FAILURE);
     }
     match args.get(1).and_then(|arg| arg.to_str()) {
+        Some("gui") if args.len() == 2 => Some(match private_gui_probe() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("PRIVATE_GUI_PROBE_GAP={error}");
+                ExitCode::FAILURE
+            }
+        }),
         Some("tty") if args.len() == 2 => {
             unsafe {
                 libc::signal(libc::SIGWINCH, winch as libc::sighandler_t);
@@ -278,6 +285,113 @@ fn private_installed_probe() -> Option<ExitCode> {
         }
         _ => Some(ExitCode::FAILURE),
     }
+}
+
+#[cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
+fn private_gui_probe() -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::net::UnixStream;
+    use std::path::{Path, PathBuf};
+
+    if unsafe { libc::getuid() } != unsafe { libc::geteuid() }
+        || unsafe { libc::getgid() } != unsafe { libc::getegid() }
+    {
+        return Err(std::io::Error::other("GUI credentials changed at exec"));
+    }
+    let groups = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if groups != 0 {
+        return Err(std::io::Error::other("GUI inherited supplementary groups"));
+    }
+
+    let stdio_entry = std::env::var("OULIPOLY_AGE319_PRIVATE_GUI_STDIO_V1")
+        .map_err(|_| std::io::Error::other("broker stdio witness missing"))?;
+    if !matches!(
+        stdio_entry.as_str(),
+        "000" | "001" | "010" | "011" | "100" | "101" | "110" | "111"
+    ) {
+        return Err(std::io::Error::other("broker stdio witness invalid"));
+    }
+
+    let runtime = PathBuf::from(
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .ok_or_else(|| std::io::Error::other("runtime directory missing"))?,
+    );
+    if let Some(name) = std::env::var_os("WAYLAND_DISPLAY") {
+        UnixStream::connect(runtime.join(name))?;
+    }
+    if let Some(display) = std::env::var_os("DISPLAY") {
+        let bytes = display.as_bytes();
+        let number = bytes
+            .strip_prefix(b":")
+            .and_then(|rest| rest.split(|b| *b == b'.').next())
+            .ok_or_else(|| std::io::Error::other("X11 display invalid"))?;
+        UnixStream::connect(
+            Path::new("/tmp/.X11-unix").join(std::ffi::OsStr::from_bytes(
+                &[b"X".as_slice(), number].concat(),
+            )),
+        )?;
+    }
+    if let Some(address) = std::env::var_os("DBUS_SESSION_BUS_ADDRESS") {
+        let path = address
+            .as_bytes()
+            .strip_prefix(b"unix:path=")
+            .ok_or_else(|| std::io::Error::other("DBus address invalid"))?;
+        UnixStream::connect(Path::new(std::ffi::OsStr::from_bytes(path)))?;
+    }
+    if let Some(authority) = std::env::var_os("XAUTHORITY") {
+        std::fs::File::open(authority)?;
+    }
+    let hold = std::env::var_os("OULIPOLY_AGE319_PRIVATE_GUI_HOLD_V1").as_deref()
+        == Some(std::ffi::OsStr::new("1"));
+    let grandchild = if hold {
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if pid == 0 {
+            unsafe {
+                libc::setsid();
+                libc::clearenv();
+                for fd in 0..1024 {
+                    libc::close(fd);
+                }
+            }
+            loop {
+                unsafe { libc::pause() };
+            }
+        }
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status"))?;
+        status
+            .lines()
+            .find(|line| line.starts_with("NSpid:"))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|value| value.parse::<i32>().ok())
+            .unwrap_or(-1)
+    } else {
+        -1
+    };
+    let report = format!(
+        "PRIVATE_GUI_CONNECTED uid={} euid={} gid={} egid={} groups={groups} cwd={} stdio_entry={} nnp={} grandchild_host_pid={}\n",
+        unsafe { libc::getuid() },
+        unsafe { libc::geteuid() },
+        unsafe { libc::getgid() },
+        unsafe { libc::getegid() },
+        std::env::current_dir()?.display(),
+        stdio_entry,
+        unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) },
+        grandchild
+    );
+    let path = runtime.join("age319-private-gui-report");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    use std::io::Write;
+    file.write_all(report.as_bytes())?;
+    file.sync_all()?;
+    // The report is the fixed private probe's observable witness; the broker
+    // still owns terminal settlement and waits for PID1 to reap descendants.
+    Ok(())
 }
 
 fn run_with_event_sink_shutdown(
