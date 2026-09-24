@@ -80,7 +80,15 @@ mode, and verifies the current completion-schema fingerprint. It computes a
 full `sqlite_master` plus typed-row fingerprint for every table, checks SQLite
 integrity and foreign keys, uses `VACUUM INTO` to include committed WAL rows,
 then compares source and copy. It checks the source pathname/inode and artifact
-identity again, makes the stage root-only, and fsyncs the copy and directories.
+identity again. For every retained mailbox or completion-event payload, it
+requires the old content address, single-link read-only file, unchanged inode
+identity, exact length and SHA-256, and matching row metadata and protocol.
+It copies each distinct digest once through no-follow descriptors into the
+root-only stage, records source and staged file identities in a root-only
+manifest, and rewrites only the payload paths, JSON references, and input
+compatibility carriers to the fixed broker-owned address. A projected
+full-table fingerprint compares all schema and rows after those explicit
+transformations. Files and directories are fsynced before publication.
 The returned `sidecar-stage-<uuid>/` is never loaded by broker startup. A
 failure leaves at most an inert root-only stage for installer inspection; no
 live name is changed. The API is intentionally not a CLI or activation path.
@@ -104,8 +112,13 @@ cooperative `MailboxAuthorityFence` alone cannot establish this against an
 old binary. The coordinator must select the exact v29 source, hold the fence,
 stage once, revalidate the source and State continuity head under quiescence,
 then call the publication method. It rechecks the exact source and complete
-copy, atomically renames the stage directory to the fixed `sidecar/` name
+copy including payload identities, atomically renames the stage directory to
+the fixed `sidecar/` name
 without replacement, fsyncs the parent, and invokes v29-to-v30 activation.
+Activation refuses a DB-only copy that still has payload references without
+broker-owned files and the custody manifest. New notification bytes have a
+root-side repository precursor, but no external FD/bytes wire ingress or
+recipient delivery/ACK authorization route is opened by this change.
 Normal broker startup never calls either migration method.
 
 Crash handling is deliberately closed: an un-published stage is ignored; a

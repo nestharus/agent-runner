@@ -1,9 +1,7 @@
 //! Root-owned sidecar cutover boundary. This opens the same State database;
-//! there is no second acceptance ledger. Migration of the quiesced v29 bytes
-//! into this directory is a separate prerequisite to activation.
+//! there is no second acceptance ledger. Offline publication carries the
+//! quiesced v29 database and its retained payloads in one directory.
 use super::*;
-#[cfg(unix)]
-use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Component;
@@ -52,7 +50,7 @@ pub struct BrokerContinuationReadback {
 
 /// Metadata read from the retained v30 connection. This does not grant
 /// delivery or acknowledgement: a wire caller still needs an independently
-/// proved recipient/session relationship and broker-owned payload custody.
+/// proved recipient/session relationship and exact payload verification.
 /// The full row can exceed the current broker response frame; this type is
 /// internal readback, not a wire response.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -158,10 +156,59 @@ pub struct BrokerReleaseEvidence {
 }
 
 impl BrokerSidecar {
+    /// Root-side precursor for new completion mail. The caller must already
+    /// have broker-proven source and recipient facts; this does not create a
+    /// wire ingress grant. Payload bytes are copied into the repository
+    /// addressed from this retained root-owned sidecar, never a caller path.
+    /// No delivery or ACK state changes here.
+    pub fn enqueue_notification_bytes<'a>(
+        &mut self,
+        source_generation: &str,
+        mut input: AgentBashCompleteEnqueue<'a>,
+        bytes: &'a [u8],
+    ) -> Result<EnqueueResult, String> {
+        self.check_mailbox_read(source_generation)?;
+        if bytes.len() > 32 * 1024 * 1024 {
+            return Err("broker notification payload exceeds ingress bound".into());
+        }
+        let payload =
+            std::str::from_utf8(bytes).map_err(|_| "broker notification payload is not UTF-8")?;
+        let value: serde_json::Value =
+            serde_json::from_str(payload).map_err(|_| "broker notification payload is not JSON")?;
+        if !value.is_object()
+            || value
+                .get("handle")
+                .and_then(|v| v.as_str())
+                .is_some_and(|handle| handle != input.handle)
+            || value.get("completion_protocol").is_some_and(|protocol| {
+                protocol.as_str() != Some(crate::completion_continuation::PROTOCOL)
+            })
+            || value
+                .get("protocol")
+                .is_some_and(|protocol| protocol.as_str().is_none_or(str::is_empty))
+            || (value.get("completion_protocol").is_none()
+                && value
+                    .get("protocol")
+                    .and_then(|v| v.as_str())
+                    .is_none_or(str::is_empty))
+        {
+            return Err("broker notification payload protocol or handle differs".into());
+        }
+        input.payload_json = payload;
+        let result = self.mailbox.enqueue_agent_bash_complete(&input)?;
+        let row = match &result {
+            EnqueueResult::Inserted(row) | EnqueueResult::AlreadyEnqueued(row) => row,
+            EnqueueResult::Conflict { existing } => existing,
+        };
+        self.mailbox.payloads().verify_mailbox_row_payload(row)?;
+        self.check_mailbox_read(source_generation)?;
+        Ok(result)
+    }
+
     /// Exact PK lookup for a session. The broker must supply the session from
     /// its own authority, not accept it as mutation authority from a caller.
-    /// This only reads row metadata; paths inside copied v29 rows are not
-    /// opened and are not evidence that payload bytes are broker-owned.
+    /// This only reads row metadata; byte consumption still verifies the
+    /// immutable broker-owned file against the exact row.
     pub fn read_exact_mailbox_row(
         &self,
         source_generation: &str,
@@ -519,7 +566,8 @@ impl BrokerSidecar {
         activate_with_owner(path, 0, broker_state_root)
     }
 
-    /// Prepare an inert, root-only SQLite snapshot of an exact v29 source.
+    /// Prepare an inert, root-only SQLite snapshot and retained payload copy
+    /// of an exact v29 source.
     /// The returned directory is never consulted by the broker. Installation
     /// must separately stop and join all old writers, fence new entries,
     /// verify source handles, and then publish/activate under that proof.
@@ -536,10 +584,10 @@ impl BrokerSidecar {
         stage_with_owner(source, source_owner, broker_state_root, 0)
     }
 
-    /// Publish only a previously validated snapshot under an installed
-    /// quiescence proof. The directory rename never replaces an existing
-    /// sidecar. A crash after rename leaves v29 at the fixed name and broker
-    /// startup refuses until the installer resumes activation explicitly.
+    /// Publish only a previously validated database and payload snapshot under
+    /// an installed quiescence proof. The directory rename never replaces an
+    /// existing sidecar. A crash after rename leaves v29 at the fixed name
+    /// and broker startup refuses until activation resumes explicitly.
     #[cfg(target_os = "linux")]
     pub fn publish_and_activate_quiesced_copy(
         source: &Path,
@@ -1046,69 +1094,7 @@ fn complete_v29_fingerprint(conn: &Connection) -> Result<[u8; 32], String> {
     if foreign_key_failure {
         return Err("cutover source has foreign-key violations".into());
     }
-    let mut digest = Sha256::new();
-    let mut schema_rows = conn
-        .prepare("SELECT type,name,tbl_name,COALESCE(sql,'') FROM sqlite_master ORDER BY type,name")
-        .map_err(|error| error.to_string())?;
-    let rows = schema_rows
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })
-        .map_err(|error| error.to_string())?;
-    let mut tables = Vec::new();
-    for row in rows {
-        let (kind, name, parent, sql) = row.map_err(|error| error.to_string())?;
-        for field in [&kind, &name, &parent, &sql] {
-            digest.update((field.len() as u64).to_le_bytes());
-            digest.update(field.as_bytes());
-        }
-        if kind == "table" {
-            tables.push(name);
-        }
-    }
-    tables.sort();
-    for table in tables {
-        // SQLite's own identifier came from sqlite_master; quote it as an
-        // identifier rather than interpolating it as SQL syntax.
-        let quoted = format!("\"{}\"", table.replace('"', "\"\""));
-        let statement = conn
-            .prepare(&format!("SELECT * FROM {quoted}"))
-            .map_err(|error| error.to_string())?;
-        let columns = statement.column_count();
-        let order = (1..=columns)
-            .map(|n| n.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        let mut statement = conn
-            .prepare(&format!("SELECT * FROM {quoted} ORDER BY {order}"))
-            .map_err(|error| error.to_string())?;
-        digest.update((table.len() as u64).to_le_bytes());
-        digest.update(table.as_bytes());
-        let mut rows = statement.query([]).map_err(|error| error.to_string())?;
-        while let Some(row) = rows.next().map_err(|error| error.to_string())? {
-            digest.update([0xff]);
-            for index in 0..columns {
-                use rusqlite::types::ValueRef;
-                let (tag, bytes): (u8, Vec<u8>) =
-                    match row.get_ref(index).map_err(|error| error.to_string())? {
-                        ValueRef::Null => (0, Vec::new()),
-                        ValueRef::Integer(value) => (1, value.to_le_bytes().to_vec()),
-                        ValueRef::Real(value) => (2, value.to_bits().to_le_bytes().to_vec()),
-                        ValueRef::Text(value) => (3, value.to_vec()),
-                        ValueRef::Blob(value) => (4, value.to_vec()),
-                    };
-                digest.update([tag]);
-                digest.update((bytes.len() as u64).to_le_bytes());
-                digest.update(bytes);
-            }
-        }
-    }
-    Ok(digest.finalize().into())
+    super::broker_payload_custody::projected_fingerprint(conn, None)
 }
 
 #[cfg(unix)]
@@ -1147,6 +1133,8 @@ fn stage_with_owner(
         return Err("cutover source must use SQLite WAL mode".into());
     }
     let expected = complete_v29_fingerprint(&conn)?;
+    let payload_identities =
+        super::broker_payload_custody::capture_source_identities(&conn, source, source_owner)?;
     let stage = anchor.join(format!("sidecar-stage-{}", uuid::Uuid::new_v4()));
     use std::os::unix::fs::DirBuilderExt;
     fs::DirBuilder::new()
@@ -1173,10 +1161,32 @@ fn stage_with_owner(
             .map_err(|error| error.to_string())?;
         let copied = Connection::open_with_flags(&copy, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|error| error.to_string())?;
-        if complete_v29_fingerprint(&copied)? != expected {
-            return Err("cutover copy schema or rows differ from v29 source".into());
+        drop(copied);
+        super::broker_payload_custody::stage(
+            &conn,
+            &copy,
+            source,
+            &stage,
+            &anchor.join("sidecar"),
+            source_owner,
+            storage_owner,
+            &payload_identities,
+        )?;
+        let copied = Connection::open_with_flags(&copy, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| error.to_string())?;
+        let projected = super::broker_payload_custody::projected_fingerprint(
+            &conn,
+            Some(&anchor.join("sidecar")),
+        )?;
+        if complete_v29_fingerprint(&copied)? != projected {
+            return Err("cutover copy differs beyond explicit payload transformations".into());
         }
         drop(copied);
+        if !source_artifacts_unchanged(&before, &source_artifacts(source, source_owner)?)
+            || complete_v29_fingerprint(&conn)? != expected
+        {
+            return Err("cutover source changed during payload custody".into());
+        }
         File::open(&copy)
             .and_then(|file| file.sync_all())
             .map_err(|error| error.to_string())?;
@@ -1234,9 +1244,17 @@ fn publish_with_owner(
     // A stale WAL or another entry could change the read after validation.
     let entries = fs::read_dir(stage).map_err(|error| error.to_string())?;
     for entry in entries {
-        if entry.map_err(|error| error.to_string())?.file_name()
-            != std::ffi::OsStr::new("pid-identity.db")
-        {
+        if ![
+            std::ffi::OsStr::new("pid-identity.db"),
+            std::ffi::OsStr::new(MAILBOX_PAYLOAD_DIRECTORY),
+            std::ffi::OsStr::new("payload-custody.json"),
+        ]
+        .contains(
+            &entry
+                .map_err(|error| error.to_string())?
+                .file_name()
+                .as_os_str(),
+        ) {
             return Err("cutover stage has unexpected artifacts".into());
         }
     }
@@ -1244,12 +1262,25 @@ fn publish_with_owner(
     let source_conn = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|error| error.to_string())?;
     broker_main_file_must_be_named(&source_conn)?;
-    let source_hash = complete_v29_fingerprint(&source_conn)?;
+    complete_v29_fingerprint(&source_conn)?;
+    let source_hash = super::broker_payload_custody::projected_fingerprint(
+        &source_conn,
+        Some(&anchor.join("sidecar")),
+    )?;
     let copy_conn = Connection::open_with_flags(&stage_db, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|error| error.to_string())?;
     if complete_v29_fingerprint(&copy_conn)? != source_hash {
         return Err("cutover source and staged rows/schema differ".into());
     }
+    super::broker_payload_custody::verify(
+        &source_conn,
+        &stage_db,
+        source,
+        stage,
+        &anchor.join("sidecar"),
+        source_owner,
+        storage_owner,
+    )?;
     drop(copy_conn);
     if !source_artifacts_unchanged(&before, &source_artifacts(source, source_owner)?) {
         return Err("cutover source changed before publication".into());
@@ -1320,6 +1351,7 @@ fn open_with_owner(path: &Path, owner: u32, anchor: &Path) -> Result<BrokerSidec
     authority.validate_opened_target()?;
     configure_writable_sidecar_connection(&conn)?;
     let generation = schema::validate_broker_owned(&conn)?;
+    super::broker_payload_custody::check_manifest_marker(path, owner)?;
     let mode: String = conn
         .query_row("PRAGMA journal_mode", [], |row| row.get(0))
         .map_err(|error| error.to_string())?;
@@ -1355,6 +1387,7 @@ fn activate_with_owner(path: &Path, owner: u32, anchor: &Path) -> Result<String,
     }
     let mut mailbox = MailboxDb::open_with_authority(&authority)?;
     schema::validate_exact_v29(&mailbox.conn)?;
+    super::broker_payload_custody::verify_activation(&mailbox.conn, path, owner)?;
     let generation = uuid::Uuid::new_v4().to_string();
     let tx = mailbox
         .conn
@@ -1491,10 +1524,429 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[cfg(target_os = "linux")]
+    fn payload_cutover_fixture() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        MailboxRow,
+        MailboxRow,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let old = root.path().join("old");
+        let broker_root = root.path().join("broker");
+        fs::create_dir(&old).unwrap();
+        fs::create_dir(&broker_root).unwrap();
+        fs::set_permissions(&broker_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let source = old.join("pid-identity.db");
+        let mut db = MailboxDb::open(&source).unwrap();
+        let mail = match db
+            .enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
+                session_id: "recipient",
+                handle: "completion-one",
+                payload_json: r#"{"protocol":"source-retention-release-v1","body":"held"}"#,
+                owner_invocation_uuid: Some("owner-invocation"),
+                matched_os_pid: None,
+                matched_os_boot_id: None,
+                matched_os_pid_starttime_ticks: None,
+                matched_chain_index: None,
+                state_dir: "state",
+                meta_path: "meta",
+                log_path: "log",
+                rc_path: "rc",
+                rc: 0,
+            })
+            .unwrap()
+        {
+            EnqueueResult::Inserted(row) => row,
+            other => panic!("{other:?}"),
+        };
+        let input = match db
+            .enqueue_submitted_input(&SubmittedInputEnqueue {
+                submission_token: "submission-one",
+                target: InboxTarget {
+                    kind: InboxTargetKind::Session,
+                    id: "recipient",
+                },
+                input: b"new input bytes",
+            })
+            .unwrap()
+        {
+            EnqueueResult::Inserted(row) => row,
+            other => panic!("{other:?}"),
+        };
+        db.conn
+            .execute(
+                "INSERT INTO completion_event(event_id,kind,state,delivery_mode,
+            state_dir,meta_path,log_path,rc_path,rc,payload_json,payload_file_path,
+            payload_sha256,payload_byte_len,payload_retention_policy,created_at,triggered_at)
+            VALUES('completion-one',?1,'triggered','async','state','meta','log','rc',0,
+            ?2,?3,?4,?5,?6,?7,?7)",
+                params![
+                    AGENT_BASH_COMPLETE_KIND,
+                    mail.payload_json,
+                    mail.payload_file_path,
+                    mail.payload_sha256,
+                    mail.payload_byte_len,
+                    mail.payload_retention_policy,
+                    now_rfc3339()
+                ],
+            )
+            .unwrap();
+        db.conn
+            .execute_batch(
+                "PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE custody_probe(value TEXT NOT NULL);
+            INSERT INTO custody_probe VALUES('committed WAL fact');",
+            )
+            .unwrap();
+        drop(db);
+        (root, source, broker_root, mail, input)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn offline_payload_custody_publishes_files_with_full_row_continuity() {
+        let (root, source, broker_root, mail, input) = payload_cutover_fixture();
+        let uid = unsafe { libc::geteuid() };
+        let db_only_root = root.path().join("db-only");
+        let db_only = db_only_root.join("sidecar");
+        fs::create_dir(&db_only_root).unwrap();
+        fs::create_dir(&db_only).unwrap();
+        fs::set_permissions(&db_only_root, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&db_only, fs::Permissions::from_mode(0o700)).unwrap();
+        let unsafe_db = db_only.join("pid-identity.db");
+        Connection::open(&source)
+            .unwrap()
+            .execute("VACUUM INTO ?1", [unsafe_db.to_str().unwrap()])
+            .unwrap();
+        fs::set_permissions(&unsafe_db, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            activate_with_owner(&unsafe_db, uid, &db_only_root)
+                .unwrap_err()
+                .contains("payload")
+        );
+        let stage = stage_with_owner(&source, uid, &broker_root, uid).unwrap();
+        assert!(!broker_root.join("sidecar").exists());
+        let stage_db = Connection::open_with_flags(
+            stage.join("pid-identity.db"),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let value: String = stage_db
+            .query_row("SELECT value FROM custody_probe", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(value, "committed WAL fact");
+        drop(stage_db);
+        let generation = publish_with_owner(&source, uid, &stage, &broker_root, uid).unwrap();
+        let target = broker_root.join("sidecar/pid-identity.db");
+        let mut broker = open_with_owner(&target, uid, &broker_root).unwrap();
+        let row = broker
+            .read_exact_mailbox_row(&generation, "recipient", mail.seq)
+            .unwrap()
+            .unwrap()
+            .row;
+        assert_eq!(row.handle, mail.handle);
+        assert_eq!(row.owner_invocation_uuid, mail.owner_invocation_uuid);
+        assert_eq!(row.payload_sha256, mail.payload_sha256);
+        assert_eq!(row.payload_byte_len, mail.payload_byte_len);
+        assert!(row.delivered_at.is_none());
+        assert!(
+            row.payload_file_path
+                .as_ref()
+                .unwrap()
+                .starts_with(broker_root.join("sidecar").to_str().unwrap())
+        );
+        broker
+            .mailbox
+            .payloads()
+            .verify_mailbox_row_payload(&row)
+            .unwrap();
+        let event = broker
+            .mailbox
+            .completion_event("completion-one")
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.payload_file_path, row.payload_file_path);
+        let input_row = broker
+            .read_exact_mailbox_row(&generation, "recipient", input.seq)
+            .unwrap()
+            .unwrap()
+            .row;
+        broker
+            .mailbox
+            .payloads()
+            .verify_mailbox_row_payload(&input_row)
+            .unwrap();
+        assert_eq!(input_row.handle, input.handle);
+        assert_eq!(input_row.payload_sha256, input.payload_sha256);
+        assert_eq!(
+            input_row.state_dir,
+            Path::new(input_row.payload_file_path.as_ref().unwrap())
+                .parent()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        );
+        let bytes = fs::read(row.payload_file_path.as_ref().unwrap()).unwrap();
+        let new_mail = AgentBashCompleteEnqueue {
+            session_id: "recipient",
+            handle: "new-broker-mail",
+            payload_json: "ignored",
+            owner_invocation_uuid: Some("owner-invocation"),
+            matched_os_pid: None,
+            matched_os_boot_id: None,
+            matched_os_pid_starttime_ticks: None,
+            matched_chain_index: None,
+            state_dir: "state",
+            meta_path: "meta",
+            log_path: "log",
+            rc_path: "rc",
+            rc: 0,
+        };
+        assert!(
+            broker
+                .enqueue_notification_bytes("wrong", new_mail, b"{}")
+                .is_err()
+        );
+        assert!(
+            broker
+                .enqueue_notification_bytes(&generation, new_mail, b"{}")
+                .is_err()
+        );
+        let new_bytes = br#"{"protocol":"source-retention-release-v1","handle":"new-broker-mail"}"#;
+        let new_row = match broker
+            .enqueue_notification_bytes(&generation, new_mail, new_bytes)
+            .unwrap()
+        {
+            EnqueueResult::Inserted(row) => row,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            fs::read(new_row.payload_file_path.as_ref().unwrap()).unwrap(),
+            new_bytes
+        );
+        assert!(
+            new_row
+                .payload_file_path
+                .as_ref()
+                .unwrap()
+                .starts_with(broker_root.join("sidecar").to_str().unwrap())
+        );
+        assert!(matches!(
+            broker
+                .enqueue_notification_bytes(&generation, new_mail, new_bytes)
+                .unwrap(),
+            EnqueueResult::AlreadyEnqueued(_)
+        ));
+        drop(broker);
+        let old_file = mail.payload_file_path.as_ref().unwrap();
+        fs::set_permissions(old_file, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(old_file, b"retired source mutation").unwrap();
+        let restarted = open_with_owner(&target, uid, &broker_root).unwrap();
+        let resumed = restarted
+            .read_exact_mailbox_row(&generation, "recipient", mail.seq)
+            .unwrap()
+            .unwrap()
+            .row;
+        assert_eq!(fs::read(resumed.payload_file_path.unwrap()).unwrap(), bytes);
+        assert!(stage_with_owner(&source, uid, &broker_root, uid).is_err());
+        assert_eq!(
+            fs::read_dir(broker_root.join("sidecar/inbox-payloads/v1/sha256"))
+                .unwrap()
+                .flat_map(|r| fs::read_dir(r.unwrap().path()).unwrap())
+                .filter(|r| r
+                    .as_ref()
+                    .is_ok_and(|entry| entry.file_name().to_string_lossy().len() == 64))
+                .count(),
+            3
+        );
+        drop(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn offline_payload_custody_rejects_missing_modified_symlink_hardlink_and_copy_swap() {
+        use std::os::unix::fs::symlink;
+        for attack in ["missing", "modified", "symlink", "hardlink", "copy-swap"] {
+            let (_root, source, broker_root, mail, _input) = payload_cutover_fixture();
+            let path = PathBuf::from(mail.payload_file_path.unwrap());
+            match attack {
+                "missing" => fs::remove_file(&path).unwrap(),
+                "modified" => {
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+                    fs::write(&path, b"modified payload").unwrap();
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+                }
+                "symlink" => {
+                    let old = path.with_extension("original");
+                    fs::rename(&path, &old).unwrap();
+                    symlink(&old, &path).unwrap();
+                }
+                "hardlink" => {
+                    fs::hard_link(&path, path.with_extension("second-link")).unwrap();
+                }
+                "copy-swap" => {
+                    AFTER_SNAPSHOT_HOOK.with(|slot| {
+                        *slot.borrow_mut() = Some(Box::new(move || {
+                            let old = path.with_extension("original");
+                            fs::rename(&path, &old).unwrap();
+                            fs::copy(&old, &path).unwrap();
+                            fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+                        }));
+                    });
+                }
+                _ => unreachable!(),
+            }
+            let uid = unsafe { libc::geteuid() };
+            assert!(
+                stage_with_owner(&source, uid, &broker_root, uid).is_err(),
+                "{attack}"
+            );
+            assert!(!broker_root.join("sidecar").exists(), "{attack}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn offline_payload_custody_checks_exact_digest_length_handle_and_protocol() {
+        for attack in [
+            "same-length-digest",
+            "short-length",
+            "bad-handle",
+            "bad-protocol",
+        ] {
+            let (_root, source, broker_root, mail, _input) = payload_cutover_fixture();
+            let path = PathBuf::from(mail.payload_file_path.unwrap());
+            match attack {
+                "same-length-digest" => {
+                    let mut bytes = fs::read(&path).unwrap();
+                    let last = bytes.len() - 2;
+                    bytes[last] = if bytes[last] == b'X' { b'Y' } else { b'X' };
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+                    fs::write(&path, bytes).unwrap();
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+                }
+                "short-length" => {
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+                    fs::write(&path, b"short").unwrap();
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+                }
+                "bad-handle" | "bad-protocol" => {
+                    let mut db = MailboxDb::open(&source).unwrap();
+                    let payload = if attack == "bad-handle" {
+                        r#"{"protocol":"source-retention-release-v1","handle":"someone-else"}"#
+                    } else {
+                        r#"{"handle":"bad-protocol"}"#
+                    };
+                    let handle = if attack == "bad-handle" {
+                        "bad-handle"
+                    } else {
+                        "bad-protocol"
+                    };
+                    db.enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
+                        session_id: "recipient",
+                        handle,
+                        payload_json: payload,
+                        owner_invocation_uuid: None,
+                        matched_os_pid: None,
+                        matched_os_boot_id: None,
+                        matched_os_pid_starttime_ticks: None,
+                        matched_chain_index: None,
+                        state_dir: "state",
+                        meta_path: "meta",
+                        log_path: "log",
+                        rc_path: "rc",
+                        rc: 0,
+                    })
+                    .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let uid = unsafe { libc::geteuid() };
+            assert!(
+                stage_with_owner(&source, uid, &broker_root, uid).is_err(),
+                "{attack}"
+            );
+            assert!(!broker_root.join("sidecar").exists(), "{attack}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn offline_payload_custody_detects_swap_during_copy_and_stale_stage() {
+        let (_root, source, broker_root, mail, _input) = payload_cutover_fixture();
+        let path = PathBuf::from(mail.payload_file_path.unwrap());
+        crate::mailbox::broker_payload_custody::set_after_payload_open_hook(move || {
+            let old = path.with_extension("original");
+            fs::rename(&path, &old).unwrap();
+            fs::copy(&old, &path).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+        });
+        let uid = unsafe { libc::geteuid() };
+        assert!(stage_with_owner(&source, uid, &broker_root, uid).is_err());
+        assert!(!broker_root.join("sidecar").exists());
+
+        let (_root, source, broker_root, mail, _input) = payload_cutover_fixture();
+        let stage = stage_with_owner(&source, uid, &broker_root, uid).unwrap();
+        let sha = mail.payload_sha256.as_ref().unwrap();
+        let staged = stage
+            .join("inbox-payloads/v1/sha256")
+            .join(&sha[..2])
+            .join(sha);
+        let old = staged.with_extension("original");
+        fs::rename(&staged, &old).unwrap();
+        fs::copy(&old, &staged).unwrap();
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o400)).unwrap();
+        fs::remove_file(old).unwrap();
+        assert!(publish_with_owner(&source, uid, &stage, &broker_root, uid).is_err());
+        assert!(!broker_root.join("sidecar").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn offline_payload_custody_refuses_changed_source_before_publish_and_recovers_after_rename() {
+        let (_root, source, broker_root, mail, _input) = payload_cutover_fixture();
+        let uid = unsafe { libc::geteuid() };
+        let stage = stage_with_owner(&source, uid, &broker_root, uid).unwrap();
+        let old_file = mail.payload_file_path.as_ref().unwrap();
+        fs::set_permissions(old_file, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(old_file, b"changed source").unwrap();
+        assert!(publish_with_owner(&source, uid, &stage, &broker_root, uid).is_err());
+        assert!(!broker_root.join("sidecar").exists());
+
+        let (_root, source, broker_root, mail, _input) = payload_cutover_fixture();
+        let stage = stage_with_owner(&source, uid, &broker_root, uid).unwrap();
+        let target_dir = broker_root.join("sidecar");
+        fs::rename(&stage, &target_dir).unwrap();
+        File::open(&broker_root).unwrap().sync_all().unwrap();
+        let target = target_dir.join("pid-identity.db");
+        assert!(open_with_owner(&target, uid, &broker_root).is_err());
+        fs::set_permissions(
+            mailbox_authority_path(&target),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let generation = activate_with_owner(&target, uid, &broker_root).unwrap();
+        let broker = open_with_owner(&target, uid, &broker_root).unwrap();
+        let row = broker
+            .read_exact_mailbox_row(&generation, "recipient", mail.seq)
+            .unwrap()
+            .unwrap()
+            .row;
+        broker
+            .mailbox
+            .payloads()
+            .verify_mailbox_row_payload(&row)
+            .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn mailbox_readback_is_exact_bounded_and_uses_retained_v30_connection() {
         let root = tempfile::tempdir().unwrap();
-        let source = root.path().join("source.pid-identity.db");
+        let old_dir = root.path().join("old");
+        fs::create_dir(&old_dir).unwrap();
+        let source = old_dir.join("pid-identity.db");
         let mut old = MailboxDb::open(&source).unwrap();
         let enqueue = |db: &mut MailboxDb, session_id: &str, handle: &str| {
             let input = AgentBashCompleteEnqueue {
@@ -1522,19 +1974,15 @@ mod tests {
         let second = enqueue(&mut old, "recipient", "second");
         drop(old);
 
-        let directory = root.path().join("sidecar");
-        fs::create_dir(&directory).unwrap();
-        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
-        let target = directory.join("pid-identity.db");
-        let source_conn = Connection::open(&source).unwrap();
-        source_conn
-            .execute("VACUUM INTO ?1", [target.to_str().unwrap()])
-            .unwrap();
-        drop(source_conn);
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        let broker_root = root.path().join("broker");
+        fs::create_dir(&broker_root).unwrap();
+        fs::set_permissions(&broker_root, fs::Permissions::from_mode(0o700)).unwrap();
         let uid = unsafe { libc::geteuid() };
-        let generation = activate_with_owner(&target, uid, root.path()).unwrap();
-        let broker = open_with_owner(&target, uid, root.path()).unwrap();
+        let stage = stage_with_owner(&source, uid, &broker_root, uid).unwrap();
+        let generation = publish_with_owner(&source, uid, &stage, &broker_root, uid).unwrap();
+        let directory = broker_root.join("sidecar");
+        let target = directory.join("pid-identity.db");
+        let broker = open_with_owner(&target, uid, &broker_root).unwrap();
 
         assert!(
             broker
@@ -1560,15 +2008,11 @@ mod tests {
         assert_eq!(read.row.payload_sha256, first.payload_sha256);
         assert_eq!(read.row.payload_byte_len, first.payload_byte_len);
         assert!(read.row.delivered_at.is_none());
-        // The copied row still names the old user-side payload store. A
-        // metadata read is safe; byte delivery must wait for root-owned copy.
-        assert!(
-            broker
-                .mailbox
-                .payloads()
-                .verify_mailbox_row_payload(&read.row)
-                .is_err()
-        );
+        broker
+            .mailbox
+            .payloads()
+            .verify_mailbox_row_payload(&read.row)
+            .unwrap();
         let page = broker
             .read_pending_mailbox_page(&generation, "recipient", 0, 1)
             .unwrap();
@@ -1595,7 +2039,7 @@ mod tests {
             .acknowledge_range("recipient", first.seq, first.seq, "retired")
             .unwrap();
         drop(retired);
-        let broker = open_with_owner(&target, uid, root.path()).unwrap();
+        let broker = open_with_owner(&target, uid, &broker_root).unwrap();
         assert!(
             broker
                 .read_exact_mailbox_row(&generation, "recipient", first.seq)
@@ -1612,7 +2056,7 @@ mod tests {
                 .is_err()
         );
         drop(broker);
-        assert!(open_with_owner(&target, uid, root.path()).is_err());
+        assert!(open_with_owner(&target, uid, &broker_root).is_err());
     }
 
     #[cfg(unix)]
@@ -1913,6 +2357,8 @@ mod tests {
         assert!(MailboxDb::open_existing_native_authority(&path).is_err());
         assert!(crate::pid_identity::PidIdentityDb::open(&path).is_err());
         assert!(activate_with_owner(&path, uid, root.path()).is_err());
+        fs::remove_file(directory.join("payload-custody.json")).unwrap();
+        assert!(open_with_owner(&path, uid, root.path()).is_err());
     }
 
     #[cfg(unix)]

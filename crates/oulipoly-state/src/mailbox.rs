@@ -42,6 +42,8 @@ use crate::sqlite_observability::{
 };
 
 mod broker_authority;
+#[cfg(unix)]
+mod broker_payload_custody;
 mod completion_continuation;
 mod finalization;
 mod native_publication;
