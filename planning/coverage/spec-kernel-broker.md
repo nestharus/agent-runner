@@ -18,6 +18,7 @@
 - `crates/oulipoly-kernel-broker/tests/private_accepted_h_frame.rs`
 - `src-tauri/src/kernel_entry.rs`
 - `src-tauri/src/completion_owner/linux.rs`
+- `src-tauri/src/completion_owner/broker_route.rs`
 - `src-tauri/src/completion_owner/mod.rs`
 - `src-tauri/src/completion_owner/original_work.rs`
 - `src-tauri/src/main.rs`
@@ -47,6 +48,8 @@
 | Entry reservation from an unrelated child PID namespace classified `outside`. | Denied because the connector is not in the broker's host PID namespace. |
 | Host entry reserves before guardian fork, then prepares a gated exact child and binds its domain. | Fsynced root/entry/prepared-guardian/domain binding; repeated bind refused. |
 | Exact Runner host entry asks the live broker for its State route before any user-side sidecar read or root reservation. | Legacy route retains v29 preflight. A broker-owned v30 generation refuses this incomplete production client path, even when the retired user-side copy is present or corrupt; another executable cannot select or inspect the route. |
+| Private v30 guardian prepares/releases an owner and its exact child gate; the pinned driver reads, reserves and observes acceptance. | Both actors derive the same source from broker I/Y, use challenged R/W and exact PK readback, and leave the retired user sidecar corrupt and unused. A second W cannot add another owner or attempt. Production entry remains closed while wider State repair and wake/custody readers are direct. |
+| Broker verifies a distinct live driver and writes or withdraws an activation reservation. | The retained State transaction compares the pinned driver identity, not the broker PID. Withdrawal is limited to the original unaccepted revision and clears the exact wake claim; accepted attempts cannot be withdrawn. |
 | Broker activates v30 after a legacy route observation or restarts between that observation and entry reservation. | The broker refuses legacy E/P/G/A/J independently of the client's earlier observation. |
 | Pinned guardian publishes a completion owner after broker G/A. | The owner row stores the exact root UUID, domain, supervisor UUID, and guardian incarnation; the driver remains gated until a second A and durable row comparison. |
 | P or G is refused, or the guardian dies. | No child Runner is released; debt remains and later readback/admission is denied. |

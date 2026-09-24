@@ -54,6 +54,24 @@ impl MailboxDb {
         &mut self,
         request: &ContinuationAttempt,
     ) -> Result<(), String> {
+        self.reserve_continuation_attempt_with_driver(request, None)
+    }
+
+    /// The broker supplies the driver incarnation it has just pinned. The
+    /// broker process itself is never the driver recorded in the owner row.
+    pub(in crate::mailbox) fn reserve_continuation_attempt_for_broker(
+        &mut self,
+        request: &ContinuationAttempt,
+        driver: &SourceProcessIdentity,
+    ) -> Result<(), String> {
+        self.reserve_continuation_attempt_with_driver(request, Some(driver))
+    }
+
+    fn reserve_continuation_attempt_with_driver(
+        &mut self,
+        request: &ContinuationAttempt,
+        driver: Option<&SourceProcessIdentity>,
+    ) -> Result<(), String> {
         if request.operation == "activation" {
             if let Some(session) = request.session_id.as_deref() {
                 classify_one_pending_completion(
@@ -67,7 +85,7 @@ impl MailboxDb {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
-        reserve_on(&tx, request)?;
+        reserve_on_with_driver(&tx, request, driver)?;
         tx.commit().map_err(|e| e.to_string())
     }
 
@@ -93,14 +111,25 @@ impl MailboxDb {
         &mut self,
         attempt: &ContinuationAttempt,
     ) -> Result<bool, String> {
-        require_exact_attempt(&self.conn, attempt)?;
         let live = crate::pid_identity::read_current_process_identity()?;
-        let identity = SourceProcessIdentity {
-            pid: live.os_pid,
-            boot_id: live.os_boot_id,
-            starttime_ticks: live.os_pid_starttime_ticks,
-        };
-        let encoded = serde_json::to_string(&identity).map_err(|e| e.to_string())?;
+        self.try_revoke_unaccepted_continuation_attempt_for_broker(
+            attempt,
+            &SourceProcessIdentity {
+                pid: live.os_pid,
+                boot_id: live.os_boot_id,
+                starttime_ticks: live.os_pid_starttime_ticks,
+            },
+        )
+    }
+
+    /// Only the broker's authenticated exact driver may supply this identity.
+    pub(in crate::mailbox) fn try_revoke_unaccepted_continuation_attempt_for_broker(
+        &mut self,
+        attempt: &ContinuationAttempt,
+        identity: &SourceProcessIdentity,
+    ) -> Result<bool, String> {
+        require_exact_attempt(&self.conn, attempt)?;
+        let encoded = serde_json::to_string(identity).map_err(|e| e.to_string())?;
         // Reject a known accepted/root-owned attempt without requesting a
         // SQLite writer. The exact UPDATE below rechecks every predicate after
         // acquisition, so this read is only a contention-avoiding hint.
@@ -512,6 +541,14 @@ fn continuation_write_span(
 }
 
 fn reserve_on(tx: &Transaction<'_>, request: &ContinuationAttempt) -> Result<(), String> {
+    reserve_on_with_driver(tx, request, None)
+}
+
+fn reserve_on_with_driver(
+    tx: &Transaction<'_>,
+    request: &ContinuationAttempt,
+    verified_driver: Option<&SourceProcessIdentity>,
+) -> Result<(), String> {
     let (domain, supervisor_authority_id): (String, String) = tx.query_row("SELECT domain_id,supervisor_authority_id FROM completion_continuation_owner WHERE generation=?1 AND phase='running'", [&request.owner_generation], |r| Ok((r.get(0)?,r.get(1)?))).map_err(|e| e.to_string())?;
     if !crate::completion_continuation::is_sha256(&request.request_sha256) {
         return Err("invalid continuation request digest".into());
@@ -554,14 +591,19 @@ fn reserve_on(tx: &Transaction<'_>, request: &ContinuationAttempt) -> Result<(),
                 |row| row.get(0),
             )
             .map_err(|error| error.to_string())?;
-        let live = crate::pid_identity::read_live_process_identity(i64::from(std::process::id()))?
-            .ok_or("driver identity unavailable")?;
-        let actual = serde_json::to_string(&SourceProcessIdentity {
-            pid: live.os_pid,
-            boot_id: live.os_boot_id,
-            starttime_ticks: live.os_pid_starttime_ticks,
-        })
-        .map_err(|error| error.to_string())?;
+        let actual_driver = if let Some(driver) = verified_driver {
+            driver.clone()
+        } else {
+            let live =
+                crate::pid_identity::read_live_process_identity(i64::from(std::process::id()))?
+                    .ok_or("driver identity unavailable")?;
+            SourceProcessIdentity {
+                pid: live.os_pid,
+                boot_id: live.os_boot_id,
+                starttime_ticks: live.os_pid_starttime_ticks,
+            }
+        };
+        let actual = serde_json::to_string(&actual_driver).map_err(|error| error.to_string())?;
         if driver != actual {
             return Err("completion activation must be admitted by independent driver".into());
         }

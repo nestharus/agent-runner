@@ -619,6 +619,29 @@ fn write_broker_state(
         StateWriteAction::Prepare { .. } => {
             Err(io::Error::other("prepared owner requires v30 protocol"))
         }
+        StateWriteAction::Revoke { attempt } => {
+            let before = read_broker_state(
+                read_spec(Some(attempt.attempt_id.clone())),
+                peer,
+                host_namespace,
+                runner_image,
+                roots,
+                works,
+                entries,
+                sidecar,
+            )?;
+            if !before.broker_owned
+                || before.owner.driver_identity.pid != i64::from(peer.process.host_pid)
+                || before.attempt.as_ref() != Some(&attempt)
+            {
+                return Err(io::Error::other(
+                    "broker withdrawal requires exact driver proposal",
+                ));
+            }
+            sidecar
+                .revoke_exact_unaccepted_attempt(&before.owner, &spec.root_id, &attempt)
+                .map_err(io::Error::other)
+        }
         StateWriteAction::Publish {
             driver_pid,
             endpoint,

@@ -571,7 +571,8 @@ impl BrokerSidecar {
         {
             return Err("broker reservation owner/attempt conflict".into());
         }
-        self.mailbox.reserve_continuation_attempt(attempt)?;
+        self.mailbox
+            .reserve_continuation_attempt_for_broker(attempt, &owner.driver_identity)?;
         let after = self.read_exact_continuation(
             &self.source_generation,
             root_id,
@@ -586,6 +587,59 @@ impl BrokerSidecar {
             || (attempt.operation == "activation" && !after.claim_present)
         {
             return Err("broker reservation readback conflict".into());
+        }
+        Ok(after)
+    }
+
+    /// Withdraw one exact unaccepted proposal after a failed launch response.
+    /// A lost reply is reconciled by reading this same PK; accepted work is
+    /// never revoked and the driver must not issue a replacement meanwhile.
+    pub fn revoke_exact_unaccepted_attempt(
+        &mut self,
+        owner: &super::CompletionDomainOwner,
+        root_id: &str,
+        attempt: &super::ContinuationAttempt,
+    ) -> Result<BrokerContinuationReadback, String> {
+        let before = self.read_exact_continuation(
+            &self.source_generation,
+            root_id,
+            &owner.domain_id,
+            &owner.supervisor_authority_id,
+            &owner.owner_generation,
+            Some(&attempt.attempt_id),
+        )?;
+        if !before.broker_owned
+            || before.owner != *owner
+            || before.attempt.as_ref() != Some(attempt)
+        {
+            return Err("broker withdrawal owner/attempt conflict".into());
+        }
+        if before.phase.as_deref() != Some("reserved") || before.revision != Some(1) {
+            return Err("broker withdrawal requires unaccepted reservation".into());
+        }
+        if !self
+            .mailbox
+            .try_revoke_unaccepted_continuation_attempt_for_broker(
+                attempt,
+                &owner.driver_identity,
+            )?
+        {
+            return Err("broker withdrawal lost unaccepted reservation".into());
+        }
+        let after = self.read_exact_continuation(
+            &self.source_generation,
+            root_id,
+            &owner.domain_id,
+            &owner.supervisor_authority_id,
+            &owner.owner_generation,
+            Some(&attempt.attempt_id),
+        )?;
+        if after.attempt.as_ref() != Some(attempt)
+            || after.phase.as_deref() != Some("never_started")
+            || after.revision != Some(2)
+            || after.claim_present
+        {
+            return Err("broker withdrawal readback conflict".into());
         }
         Ok(after)
     }
@@ -2131,10 +2185,34 @@ mod tests {
                 .is_err(),
             "acceptance replay must not advance twice"
         );
-        drop(broker);
+        assert!(
+            broker
+                .revoke_exact_unaccepted_attempt(&new_owner, &root_id, &new_attempt)
+                .is_err(),
+            "accepted work cannot be withdrawn"
+        );
+        let withdrawn_attempt = super::super::ContinuationAttempt {
+            attempt_id: uuid::Uuid::new_v4().to_string(),
+            result_path: "/fixture/withdrawn-result".into(),
+            ..new_attempt.clone()
+        };
+        broker
+            .reserve_exact_attempt(&new_owner, &root_id, &withdrawn_attempt)
+            .unwrap();
+        let withdrawn = broker
+            .revoke_exact_unaccepted_attempt(&new_owner, &root_id, &withdrawn_attempt)
+            .unwrap();
+        assert_eq!(withdrawn.phase.as_deref(), Some("never_started"));
+        assert_eq!(withdrawn.revision, Some(2));
+        assert!(
+            broker
+                .revoke_exact_unaccepted_attempt(&new_owner, &root_id, &withdrawn_attempt)
+                .is_err(),
+            "withdrawal replay cannot advance twice"
+        );
         assert_eq!(
             read(
-                &open_with_owner(&target, uid, root.path()).unwrap(),
+                &broker,
                 &generation,
                 &root_id,
                 &new_owner.owner_generation,
@@ -2143,6 +2221,53 @@ mod tests {
             .unwrap(),
             new_accepted
         );
+        // The retained broker is the SQLite caller. Activation must compare
+        // the owner row with the broker-verified driver incarnation, rather
+        // than with the broker process's own PID.
+        let mut remote_driver = std::process::Command::new("sleep")
+            .arg("20")
+            .spawn()
+            .unwrap();
+        let live_driver =
+            crate::pid_identity::read_live_process_identity(i64::from(remote_driver.id()))
+                .unwrap()
+                .unwrap();
+        let mut remote_owner = new_owner.clone();
+        remote_owner.owner_generation = uuid::Uuid::new_v4().to_string();
+        remote_owner.driver_identity = SourceProcessIdentity {
+            pid: live_driver.os_pid,
+            boot_id: live_driver.os_boot_id,
+            starttime_ticks: live_driver.os_pid_starttime_ticks,
+        };
+        broker.publish_exact_owner(&remote_owner, &root_id).unwrap();
+        broker.mailbox.conn.execute(
+            "INSERT INTO session_wake_claim(session_id,claim_token,claimed_at,reason,auto_wake_count)
+             VALUES('remote-session','remote-claim','2026-09-23T00:00:00Z','fixture',1)",
+            [],
+        ).unwrap();
+        let remote_attempt = super::super::ContinuationAttempt {
+            attempt_id: uuid::Uuid::new_v4().to_string(),
+            owner_generation: remote_owner.owner_generation.clone(),
+            operation: "activation".into(),
+            request_sha256: "c".repeat(64),
+            source_registration_id: None,
+            source_listener_revision: None,
+            session_id: Some("remote-session".into()),
+            claim_token: Some("remote-claim".into()),
+            result_path: "/fixture/remote-result".into(),
+        };
+        let remote_reserved = broker
+            .reserve_exact_attempt(&remote_owner, &root_id, &remote_attempt)
+            .unwrap();
+        assert!(remote_reserved.claim_present);
+        let remote_withdrawn = broker
+            .revoke_exact_unaccepted_attempt(&remote_owner, &root_id, &remote_attempt)
+            .unwrap();
+        assert!(!remote_withdrawn.claim_present);
+        assert_eq!(remote_withdrawn.phase.as_deref(), Some("never_started"));
+        let _ = remote_driver.kill();
+        let _ = remote_driver.wait();
+        drop(broker);
 
         let copied = directory.join("copied.db");
         fs::copy(&target, &copied).unwrap();

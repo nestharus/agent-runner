@@ -134,6 +134,9 @@ pub enum StateWriteAction {
     Reserve {
         attempt: oulipoly_state::mailbox::ContinuationAttempt,
     },
+    Revoke {
+        attempt: oulipoly_state::mailbox::ContinuationAttempt,
+    },
     Accept {
         attempt_id: String,
     },
@@ -196,6 +199,21 @@ pub fn release_prepared_owner_drop_reply_at(path: &Path, spec: &StateWriteSpec) 
     {
         return Err(io::Error::other("invalid held release request"));
     }
+    state_write_drop_reply_at(path, spec)
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+pub fn prepare_owner_drop_reply_at(path: &Path, spec: &StateWriteSpec) -> io::Result<()> {
+    if spec.protocol != "broker-prepared-write-v30"
+        || !matches!(spec.action, StateWriteAction::Prepare { .. })
+    {
+        return Err(io::Error::other("invalid lost-reply preparation"));
+    }
+    state_write_drop_reply_at(path, spec)
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn state_write_drop_reply_at(path: &Path, spec: &StateWriteSpec) -> io::Result<()> {
     let body = serde_json::to_vec(spec)?;
     let mut stream = checked_connection(path)?;
     let mut challenge = [0u8; 16];
@@ -213,7 +231,7 @@ pub fn release_prepared_owner_drop_reply_at(path: &Path, spec: &StateWriteSpec) 
         )
     } != request.len() as isize
     {
-        return Err(io::Error::other("short lost-reply release request"));
+        return Err(io::Error::other("short lost-reply State write request"));
     }
     Ok(())
 }

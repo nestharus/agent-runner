@@ -4,6 +4,9 @@
 //! same inherited endpoint and guardian.
 //! Declared roles: orchestration, validator, accessor, parser, mapper.
 #[cfg(target_os = "linux")]
+#[allow(dead_code, reason = "production v30 entry stays closed until every sidecar client is routed")]
+pub(crate) mod broker_route;
+#[cfg(target_os = "linux")]
 mod custody;
 #[cfg(target_os = "linux")]
 mod driver;

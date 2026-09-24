@@ -104,6 +104,14 @@ fn inner() {
             )
             .envs(release_mode.then_some(("AGE319_PRIVATE_RELEASE_V30", "1")))
             .envs(
+                (mode == "held_release_prepare_lost_reply")
+                    .then_some(("AGE319_PRIVATE_PREPARE_LOST_REPLY_V1", "1")),
+            )
+            .envs(
+                (mode == "held_release_driver_route")
+                    .then_some(("AGE319_PRIVATE_DRIVER_ROUTE_V30", "1")),
+            )
+            .envs(
                 (mode == "held_release_lost_reply")
                     .then_some(("AGE319_PRIVATE_RELEASE_LOST_REPLY_V1", "1")),
             )
@@ -324,6 +332,37 @@ fn inner() {
             .read_exact_release(&generation, &prepared.root_id, &prepared.owner_generation)
             .unwrap();
             assert_eq!(durable, evidence);
+            if mode == "held_release_driver_route" {
+                eventually(|| {
+                    gate.join("driver-routed").exists() || entry.try_wait().unwrap().is_some()
+                });
+                let attempt_id =
+                    fs::read_to_string(gate.join("driver-routed")).unwrap_or_else(|_| {
+                        panic!(
+                            "driver route: {} broker: {}",
+                            fs::read_to_string(&err).unwrap(),
+                            fs::read_to_string(&broker_log).unwrap()
+                        )
+                    });
+                let sidecar = rusqlite::Connection::open_with_flags(
+                    broker_state.join("sidecar/pid-identity.db"),
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .unwrap();
+                let (count, phase, revision): (i64, String, i64) = sidecar.query_row(
+                    "SELECT (SELECT count(*) FROM completion_continuation_attempt),phase,revision FROM completion_continuation_attempt WHERE attempt_id=?1",
+                    [&attempt_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                ).unwrap();
+                assert_eq!((count, phase.as_str(), revision), (1, "accepted", 2));
+                let read = protocol::StateReadSpec {
+                    protocol: "broker-state-read-v1".into(),
+                    source_generation: generation.clone(),
+                    root_id: prepared.root_id.clone(),
+                    owner_generation: prepared.owner_generation.clone(),
+                    attempt_id: Some(attempt_id),
+                };
+                assert!(protocol::read_state_at(&socket, &read).is_err()); // entry is not guardian/driver
+            }
             if mode == "held_release_guardian_death" {
                 unsafe {
                     libc::kill(prepared.guardian.host_pid, libc::SIGKILL);
@@ -362,7 +401,11 @@ fn inner() {
             if mode != "held_release_broker_death" {
                 fs::write(gate.join("child-effect"), b"yes").unwrap();
             }
-            if mode == "held_release" || mode == "held_release_lost_reply" {
+            if mode == "held_release"
+                || mode == "held_release_lost_reply"
+                || mode == "held_release_prepare_lost_reply"
+                || mode == "held_release_driver_route"
+            {
                 eventually(|| {
                     fs::metadata(&out).unwrap().len() > 0 || entry.try_wait().unwrap().is_some()
                 });
@@ -866,6 +909,8 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "held_release_guardian_death",
         "held_release_child_death",
         "held_release_lost_reply",
+        "held_release_prepare_lost_reply",
+        "held_release_driver_route",
         "held_release_commit_fail",
         "held_release_child_predeath",
         "held_release_gate_fail",

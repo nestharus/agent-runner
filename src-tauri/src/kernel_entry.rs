@@ -626,8 +626,11 @@ fn private_guardian_prepared(
     }
     if driver_pid == 0 {
         drop(driver_parent);
-        let mut release = [0u8];
-        let _ = driver_child.read_exact(&mut release);
+        let result = private_v30_driver_route(&mut driver_child, broker, gate_dir, root);
+        if let Err(error) = result {
+            eprintln!("OULIPOLY_KERNEL_PRIVATE_DRIVER_GAP={error}");
+            unsafe { libc::_exit(70) }
+        }
         unsafe { libc::_exit(0) }
     }
     drop(driver_child);
@@ -645,6 +648,13 @@ fn private_guardian_prepared(
     if byte != [b'J'] {
         return Err("private held join refused".into());
     }
+    let route = crate::completion_owner::broker_route::V30OwnerRoute::guardian(
+        broker,
+        root,
+        domain,
+        supervisor,
+        &owner_generation,
+    )?;
     let generation = protocol::prepared_generation_at(broker, root).map_err(|e| e.to_string())?;
     if generation != source_generation {
         return Err("broker I/Y source generation changed".into());
@@ -659,7 +669,12 @@ fn private_guardian_prepared(
             endpoint: endpoint.to_string_lossy().into_owned(),
         },
     };
-    let published = protocol::prepare_owner_at(broker, &write).map_err(|e| e.to_string())?;
+    let published = if std::env::var_os("AGE319_PRIVATE_PREPARE_LOST_REPLY_V1").is_some() {
+        protocol::prepare_owner_drop_reply_at(broker, &write).map_err(|e| e.to_string())?;
+        route.read_prepared(driver_pid, &endpoint)?
+    } else {
+        route.prepare(driver_pid, &endpoint)?
+    };
     if protocol::prepare_owner_at(broker, &write).is_ok() {
         return Err("prepared W replay published twice".into());
     }
@@ -725,7 +740,7 @@ fn private_guardian_prepared(
                 .map_err(|e| e.to_string())?;
             None
         } else {
-            Some(protocol::release_prepared_owner_at(broker, &release).map_err(|e| e.to_string())?)
+            Some(route.release(&exact)?)
         };
         if protocol::release_prepared_owner_at(broker, &release).is_ok() {
             return Err("double held release accepted".into());
@@ -756,10 +771,139 @@ fn private_guardian_prepared(
             )
             .map_err(|e| e.to_string())?;
         channel.write_all(b"\n").map_err(|e| e.to_string())?;
+        if std::env::var_os("AGE319_PRIVATE_DRIVER_ROUTE_V30").is_some() {
+            driver_parent.write_all(b"B").map_err(|e| e.to_string())?;
+            serde_json::to_writer(&mut driver_parent, &readback.owner)
+                .map_err(|e| e.to_string())?;
+            driver_parent.write_all(b"\n").map_err(|e| e.to_string())?;
+            let attempt: oulipoly_state::mailbox::ContinuationAttempt =
+                serde_json::from_str(&private_line(&mut driver_parent)?)
+                    .map_err(|e| e.to_string())?;
+            let accepted = route.accept(&readback.owner, &attempt)?;
+            if accepted.phase.as_deref() != Some("accepted") || accepted.revision != Some(2) {
+                return Err("broker driver proposal was not accepted".into());
+            }
+            if route.accept(&readback.owner, &attempt).is_ok() {
+                return Err("accepted PK replayed".into());
+            }
+            driver_parent.write_all(b"A").map_err(|e| e.to_string())?;
+            driver_parent
+                .read_exact(&mut byte)
+                .map_err(|e| e.to_string())?;
+            if byte != [b'D'] {
+                return Err("broker driver did not read accepted PK".into());
+            }
+            std::fs::write(
+                gate_dir.join("driver-routed"),
+                attempt.attempt_id.as_bytes(),
+            )
+            .map_err(|e| e.to_string())?;
+        }
     }
     let _ = channel.read_exact(&mut byte);
     let _ = driver_parent.write_all(b"X");
     unsafe { libc::waitpid(driver_pid, std::ptr::null_mut(), 0) };
+    Ok(())
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_v30_driver_route(
+    channel: &mut UnixStream,
+    broker: &std::path::Path,
+    gate_dir: &std::path::Path,
+    root: &str,
+) -> Result<(), String> {
+    let mut instruction = [0u8];
+    channel
+        .read_exact(&mut instruction)
+        .map_err(|e| e.to_string())?;
+    if instruction == [b'X'] {
+        return Ok(());
+    }
+    if instruction != [b'B'] || std::env::var_os("AGE319_PRIVATE_DRIVER_ROUTE_V30").is_none() {
+        return Err("private driver was released without v30 route".into());
+    }
+    let owner: oulipoly_state::mailbox::CompletionDomainOwner =
+        serde_json::from_str(&private_line(channel)?).map_err(|e| e.to_string())?;
+    let route = crate::completion_owner::broker_route::V30OwnerRoute::driver(broker, root, &owner)?;
+    let running = route.read_running(&owner, None)?;
+    if running.attempt.is_some() {
+        return Err("unexpected driver owner attempt".into());
+    }
+    let spec = protocol::StateReadSpec {
+        protocol: "broker-state-read-v1".into(),
+        source_generation: running.source_generation.clone(),
+        root_id: root.into(),
+        owner_generation: owner.owner_generation.clone(),
+        attempt_id: None,
+    };
+    let mut stale = protocol::StateReadSpec {
+        source_generation: uuid::Uuid::new_v4().to_string(),
+        ..spec
+    };
+    if protocol::read_state_at(broker, &stale).is_ok() {
+        return Err("stale driver source gained R".into());
+    }
+    stale.source_generation = running.source_generation.clone();
+    stale.owner_generation = uuid::Uuid::new_v4().to_string();
+    if protocol::read_state_at(broker, &stale).is_ok() {
+        return Err("sibling driver owner gained R".into());
+    }
+    let attempt = oulipoly_state::mailbox::ContinuationAttempt {
+        attempt_id: uuid::Uuid::new_v4().to_string(),
+        owner_generation: owner.owner_generation.clone(),
+        operation: "transport".into(),
+        request_sha256: "0".repeat(64),
+        source_registration_id: None,
+        source_listener_revision: None,
+        session_id: None,
+        claim_token: None,
+        result_path: gate_dir
+            .join("driver-result.json")
+            .to_string_lossy()
+            .into_owned(),
+    };
+    let reserved = route.reserve(&owner, &attempt)?;
+    if route.reserve(&owner, &attempt)? != reserved {
+        return Err("driver reservation readback changed".into());
+    }
+    let replay = protocol::StateWriteSpec {
+        protocol: "broker-state-write-v1".into(),
+        source_generation: running.source_generation.clone(),
+        root_id: root.into(),
+        owner_generation: owner.owner_generation.clone(),
+        action: protocol::StateWriteAction::Reserve {
+            attempt: attempt.clone(),
+        },
+    };
+    if protocol::write_state_at(broker, &replay).is_ok() {
+        return Err("broker W reservation replay committed".into());
+    }
+    serde_json::to_writer(&mut *channel, &attempt).map_err(|e| e.to_string())?;
+    channel.write_all(b"\n").map_err(|e| e.to_string())?;
+    channel
+        .read_exact(&mut instruction)
+        .map_err(|e| e.to_string())?;
+    if instruction != [b'A'] {
+        return Err("private driver acceptance refused".into());
+    }
+    let accepted = route.read_running(&owner, Some(&attempt.attempt_id))?;
+    if accepted.attempt.as_ref() != Some(&attempt)
+        || accepted.phase.as_deref() != Some("accepted")
+        || accepted.revision != Some(2)
+    {
+        return Err("private driver accepted PK changed".into());
+    }
+    if route.revoke(&owner, &attempt).is_ok() {
+        return Err("accepted attempt was revoked".into());
+    }
+    channel.write_all(b"D").map_err(|e| e.to_string())?;
+    channel
+        .read_exact(&mut instruction)
+        .map_err(|e| e.to_string())?;
+    if instruction != [b'X'] {
+        return Err("private driver final gate changed".into());
+    }
     Ok(())
 }
 
