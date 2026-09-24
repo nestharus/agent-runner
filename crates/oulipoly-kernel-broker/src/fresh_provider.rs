@@ -3701,11 +3701,21 @@ mod tests {
         std::fs::write(&old_wal, b"legacy WAL sentinel").unwrap();
         let process = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
         let binding = fixture_binding(&process, &process);
+        let image_path = Path::new("/bin/true");
+        let image = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH)
+            .open(image_path)
+            .unwrap();
         let grant = Grant {
-            version: 1,
+            version: 3,
             id: uuid::Uuid::new_v4().to_string(),
             binding: binding.clone(),
             plan_sha256: "p".repeat(64),
+            configured_program: image_path.display().to_string(),
+            broker_resolved_path: image_path.to_path_buf(),
+            image_descriptor: ImageDescriptor::of(&image).unwrap(),
+            preflight_image: ImagePreflight::observe(&image, image_path).unwrap(),
         };
         let selection = FreshRouteSelection {
             model: "work".into(),
