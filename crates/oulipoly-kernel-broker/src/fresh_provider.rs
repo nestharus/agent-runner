@@ -5,7 +5,7 @@
 use super::work_launch;
 use oulipoly_kernel_broker::identity::{PinnedProcess, host_proc_file, observed_incarnation_gone};
 use oulipoly_state::mailbox::{
-    FreshNormalWorkPreparation, FreshReleasedHandoff, FreshRootWorkIntent,
+    FreshBashChild, FreshNormalWorkPreparation, FreshReleasedHandoff, FreshRootWorkIntent,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -31,6 +31,7 @@ extern "C" fn request_cancel(_: libc::c_int) {
 pub(super) struct Binding {
     root_id: String,
     handoff_id: String,
+    grant_key: String,
     invocation_uuid: String,
     session_id: String,
     owner_generation: String,
@@ -43,6 +44,17 @@ pub(super) struct Binding {
     root_starttime: u64,
     root_pidns_dev: u64,
     root_pidns_ino: u64,
+    causal_parent: Option<ParentActor>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ParentActor {
+    pid: i32,
+    starttime: u64,
+    boot_id: String,
+    pidns_dev: u64,
+    pidns_ino: u64,
 }
 
 /// Caller must have just reattested the old release and fresh U/D through
@@ -80,6 +92,7 @@ pub(super) fn binding_from_held(
     Ok(Binding {
         root_id: prepared.root_id.clone(),
         handoff_id: held.handoff_id.clone(),
+        grant_key: held.handoff_id.clone(),
         invocation_uuid: held.invocation_uuid.clone(),
         session_id: held.session_id.clone(),
         owner_generation: prepared.owner_generation.clone(),
@@ -92,6 +105,81 @@ pub(super) fn binding_from_held(
         root_starttime: root.starttime_ticks,
         root_pidns_dev: root.pidns_dev,
         root_pidns_ino: root.pidns_ino,
+        causal_parent: None,
+    })
+}
+
+/// A later Bash child has its own invocation, D and work key. This private
+/// binding checks the immediate parent at K and retains it for readback. It
+/// does not establish a consumed causal parent work grant or production W.
+pub(super) fn binding_from_bash_child(
+    release: &FreshReleasedHandoff,
+    child: &FreshBashChild,
+    bash: &PinnedProcess,
+    parent: Option<&PinnedProcess>,
+    root: &PinnedProcess,
+) -> io::Result<Binding> {
+    bash.verify()?;
+    root.verify()?;
+    let prepared = &release.old_release.prepared;
+    if child.root_handoff_id != release.handoff_id
+        || child.root_id != prepared.root_id
+        || child.parent_invocation_uuid != release.invocation_uuid
+        || child.session.request_id != child.d_key
+        || child.actor.host_pid != bash.host_pid
+        || child.actor.starttime_ticks != bash.starttime_ticks
+        || child.actor.boot_id != bash.boot_id
+        || (child.actor.pidns_dev, child.actor.pidns_ino) != (bash.pidns_dev, bash.pidns_ino)
+        || prepared.root_init.host_pid != root.host_pid
+        || prepared.root_init.starttime_ticks != root.starttime_ticks
+        || prepared.root_init.boot_id != root.boot_id
+        || (prepared.root_init.pidns_dev, prepared.root_init.pidns_ino)
+            != (root.pidns_dev, root.pidns_ino)
+        || !root.is_namespace_init()?
+        || !bash.in_namespace(root.namespace())?
+    {
+        return Err(io::Error::other(
+            "fresh Bash work child/parent/root mismatch",
+        ));
+    }
+    if let Some(parent) = parent {
+        parent.verify()?;
+        if prepared.joined_child.host_pid != parent.host_pid
+            || prepared.joined_child.starttime_ticks != parent.starttime_ticks
+            || prepared.joined_child.boot_id != parent.boot_id
+            || (
+                prepared.joined_child.pidns_dev,
+                prepared.joined_child.pidns_ino,
+            ) != (parent.pidns_dev, parent.pidns_ino)
+            || !parent.direct_child_of(root)?
+            || !bash.direct_child_of(parent)?
+        {
+            return Err(io::Error::other("fresh Bash K causal parent changed"));
+        }
+    }
+    Ok(Binding {
+        root_id: prepared.root_id.clone(),
+        handoff_id: release.handoff_id.clone(),
+        grant_key: child.request_id.clone(),
+        invocation_uuid: child.invocation_uuid.clone(),
+        session_id: child.session.session_id.clone(),
+        owner_generation: prepared.owner_generation.clone(),
+        actor_pid: bash.host_pid,
+        actor_starttime: bash.starttime_ticks,
+        actor_boot_id: bash.boot_id.clone(),
+        actor_pidns_dev: bash.pidns_dev,
+        actor_pidns_ino: bash.pidns_ino,
+        root_pid: root.host_pid,
+        root_starttime: root.starttime_ticks,
+        root_pidns_dev: root.pidns_dev,
+        root_pidns_ino: root.pidns_ino,
+        causal_parent: Some(ParentActor {
+            pid: prepared.joined_child.host_pid,
+            starttime: prepared.joined_child.starttime_ticks,
+            boot_id: prepared.joined_child.boot_id.clone(),
+            pidns_dev: prepared.joined_child.pidns_dev,
+            pidns_ino: prepared.joined_child.pidns_ino,
+        }),
     })
 }
 
@@ -161,6 +249,10 @@ fn sha_file(file: &File) -> io::Result<(String, u64)> {
     Ok((format!("{:x}", hash.finalize()), count))
 }
 
+pub(super) fn verified_hash(file: &File) -> io::Result<String> {
+    sha_file(file).map(|(hash, _)| hash)
+}
+
 fn sealed_copy(source: &File, name: &'static std::ffi::CStr) -> io::Result<File> {
     let fd =
         unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_ALLOW_SEALING | libc::MFD_CLOEXEC) };
@@ -204,7 +296,7 @@ fn sealed_copy(source: &File, name: &'static std::ffi::CStr) -> io::Result<File>
 /// descriptor and sealed stdin. Unsupported shapes are rejected before spend.
 /// The setuid/setgid image refusal below scopes only this private proof; it is
 /// not an accepted restriction for the eventual unrestricted host-sudo route.
-#[cfg(test)]
+#[cfg(any(test, feature = "age319-private-broker-fixture"))]
 pub(super) fn plan(
     image_path: &Path,
     cwd: &Path,
@@ -429,6 +521,7 @@ pub(super) fn prepare(directory: &Path, binding: Binding, plan: Plan) -> io::Res
     for id in [
         &binding.root_id,
         &binding.handoff_id,
+        &binding.grant_key,
         &binding.invocation_uuid,
         &binding.owner_generation,
     ] {
@@ -443,7 +536,7 @@ pub(super) fn prepare(directory: &Path, binding: Binding, plan: Plan) -> io::Res
     {
         return Err(io::Error::other("invalid fresh grant session or actor"));
     }
-    let name = format!("{}.fresh-grant.json", binding.handoff_id);
+    let name = format!("{}.fresh-grant.json", binding.grant_key);
     let path = directory.join(&name);
     let grant = if path.exists() {
         let old: Grant = serde_json::from_reader(File::open(&path)?)?;
@@ -479,7 +572,7 @@ pub(super) fn prepare(directory: &Path, binding: Binding, plan: Plan) -> io::Res
 }
 
 pub(super) fn grant_for_binding(directory: &Path, binding: &Binding) -> io::Result<Option<String>> {
-    let name = format!("{}.fresh-grant.json", binding.handoff_id);
+    let name = format!("{}.fresh-grant.json", binding.grant_key);
     let Some(grant): Option<Grant> = exact_file(directory, &name)? else {
         return Ok(None);
     };
@@ -827,9 +920,26 @@ pub(super) fn launch(
         || actor.boot_id != b.actor_boot_id
         || (actor.pidns_dev, actor.pidns_ino) != (b.actor_pidns_dev, b.actor_pidns_ino)
         || !root.is_namespace_init()?
-        || !actor.direct_child_of(root)?
+        || !actor.in_namespace(root.namespace())?
     {
         return Err(io::Error::other("fresh provider K root or actor changed"));
+    }
+    match &b.causal_parent {
+        Some(parent) => {
+            let pinned = PinnedProcess::open(parent.pid)?;
+            if pinned.starttime_ticks != parent.starttime
+                || pinned.boot_id != parent.boot_id
+                || (pinned.pidns_dev, pinned.pidns_ino) != (parent.pidns_dev, parent.pidns_ino)
+                || !pinned.direct_child_of(root)?
+                || !actor.direct_child_of(&pinned)?
+            {
+                return Err(io::Error::other("fresh Bash K causal parent changed"));
+            }
+        }
+        None if !actor.direct_child_of(root)? => {
+            return Err(io::Error::other("fresh provider K root child changed"));
+        }
+        None => {}
     }
     if unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) } != 0
         || unsafe { libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0) } != 0
@@ -1139,6 +1249,7 @@ mod tests {
         Binding {
             root_id: uuid::Uuid::new_v4().to_string(),
             handoff_id: uuid::Uuid::new_v4().to_string(),
+            grant_key: uuid::Uuid::new_v4().to_string(),
             invocation_uuid: uuid::Uuid::new_v4().to_string(),
             session_id: format!("v30:{}:{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4()),
             owner_generation: uuid::Uuid::new_v4().to_string(),
@@ -1151,6 +1262,7 @@ mod tests {
             root_starttime: root.starttime_ticks,
             root_pidns_dev: root.pidns_dev,
             root_pidns_ino: root.pidns_ino,
+            causal_parent: None,
         }
     }
 

@@ -580,7 +580,27 @@ fn inner() {
                 let child: oulipoly_state::mailbox::FreshBashChild =
                     serde_json::from_value(report["child"].clone()).unwrap();
                 let result: oulipoly_state::mailbox::FreshBashPrivateResult =
-                    serde_json::from_value(report["result"].clone()).unwrap();
+                    serde_json::from_value(report["bash_reported_result"].clone()).unwrap();
+                assert_eq!(report["result_provenance"], "bash-self-report-only");
+                let physical = report["broker_physical_q"].as_str().unwrap();
+                let physical_fields: Vec<_> = physical.split_ascii_whitespace().collect();
+                assert_eq!(physical_fields[0], "fresh-bash-physical-drained");
+                let physical_grant = physical_fields[1];
+                assert_eq!(physical_fields[2], "0");
+                assert_eq!(physical_fields[5], "true");
+                assert_eq!(
+                    fs::read(gate.join("bash-physical-effect")).unwrap(),
+                    b"broker-ran\n"
+                );
+                let physical_dir = broker_state.join("v30/fresh-provider");
+                for suffix in ["consumed", "exit", "drain", "pid1-wait"] {
+                    assert!(
+                        physical_dir
+                            .join(format!("{physical_grant}.{suffix}.json"))
+                            .exists(),
+                        "broker physical {suffix} absent"
+                    );
+                }
                 let root: oulipoly_state::mailbox::FreshReleasedHandoff = serde_json::from_slice(
                     &fs::read(
                         broker_state
@@ -645,6 +665,15 @@ fn inner() {
                         .unwrap(),
                     1
                 );
+                for table in [
+                    "fresh_lane_accepted_source",
+                    "fresh_lane_recipient_attachment",
+                ] {
+                    let count: i64 = fresh
+                        .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+                        .unwrap();
+                    assert_eq!(count, 0, "private Bash report or Q minted {table}");
+                }
                 assert_eq!(
                     oulipoly_kernel_broker::registry::RootRegistry::open(&broker_state)
                         .unwrap()
@@ -738,6 +767,15 @@ fn inner() {
                 assert!(
                     image_probe.contains("Bash child image changed"),
                     "{image_probe}"
+                );
+                let physical_image_probe = raw_fresh_id_request(
+                    &socket.with_file_name("v30.sock"),
+                    b'8',
+                    uuid::Uuid::parse_str(&bash_request).unwrap(),
+                );
+                assert!(
+                    physical_image_probe.contains("Bash child image changed"),
+                    "{physical_image_probe}"
                 );
                 assert!(
                     !raw_fresh_id_request(&socket, b'C', uuid::Uuid::new_v4())

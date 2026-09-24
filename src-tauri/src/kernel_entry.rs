@@ -464,7 +464,7 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
             if std::env::var_os("AGE319_PRIVATE_BASH_CHILD_V1").is_some() {
                 let bash = std::env::var("AGE319_PRIVATE_BASH_IMAGE")
                     .map_err(|_| "private Bash source image absent")?;
-                let output = std::process::Command::new(bash)
+                let output = std::process::Command::new(&bash)
                     .arg("__age319-private-admit-child-v1")
                     .output()
                     .map_err(|e| e.to_string())?;
@@ -477,6 +477,35 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
                 let report: serde_json::Value =
                     serde_json::from_slice(&output.stdout).map_err(|e| e.to_string())?;
                 private_v30_marker("bash-child", &report)?;
+                // A Bash image in the same released root namespace is not
+                // enough to create another child. The shell remains alive as
+                // Bash's direct parent, so this exercises a real in-root
+                // grandchild rather than an outside process.
+                let unrelated_marker = PathBuf::from(
+                    std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                        .ok_or("private gate directory absent")?,
+                )
+                .join(format!("unrelated-bash-{}", uuid::Uuid::new_v4()));
+                let unrelated = std::process::Command::new("/bin/sh")
+                    .args(["-c", "\"$1\" __age319-private-admit-child-v1", "sh", &bash])
+                    .env(
+                        "AGE319_PRIVATE_BASH_REQUEST_KEY",
+                        uuid::Uuid::new_v4().to_string(),
+                    )
+                    .env("AGE319_PRIVATE_BASH_EFFECT_MARKER", &unrelated_marker)
+                    .output()
+                    .map_err(|e| e.to_string())?;
+                if unrelated.status.success() || unrelated_marker.exists() {
+                    return Err("in-root Bash grandchild acquired fresh child admission".into());
+                }
+                if !String::from_utf8_lossy(&unrelated.stderr)
+                    .contains("Bash child has no exact released Runner parent")
+                {
+                    return Err(format!(
+                        "in-root Bash grandchild refused for unexpected reason: {}",
+                        String::from_utf8_lossy(&unrelated.stderr)
+                    ));
+                }
             }
         }
         effect_binding = Some((receipt, session));

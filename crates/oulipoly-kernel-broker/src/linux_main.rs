@@ -355,6 +355,8 @@ fn recv_request(
         b'P' | b'p' => read == 37,
         b'Q' | b'Z' | b'q' | b'z' | b'D' | b'd' | b'C' | b'c' | b'E' => read == 33,
         #[cfg(feature = "age319-private-broker-fixture")]
+        b'8' | b'9' | b'!' => read == 33,
+        #[cfg(feature = "age319-private-broker-fixture")]
         b'l' | b'M' => read == 49,
         b'A' | b'a' => read == 33,
         b'J' | b'j' => (18..=48 * 1024 + 17).contains(&read),
@@ -425,6 +427,10 @@ fn recv_request(
             request_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
         },
         b'E' => RequestPayload::FreshBashChildRequest {
+            request_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
+        },
+        #[cfg(feature = "age319-private-broker-fixture")]
+        b'8' | b'9' | b'!' => RequestPayload::FreshBashChildRequest {
             request_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
         },
         b'O' => RequestPayload::FreshBashPrivateResult {
@@ -3731,6 +3737,7 @@ fn fresh_bash_parent(
     lane: &FreshV30Lane,
     peer: &PeerIdentity,
     bash_image: Option<&File>,
+    new_registration: bool,
 ) -> io::Result<(FreshReleasedHandoff, FreshRecipientIdentity)> {
     let image = bash_image.ok_or_else(|| io::Error::other("installed Bash image absent"))?;
     if !peer.process.same_executable_as(image)? {
@@ -3763,6 +3770,23 @@ fn fresh_bash_parent(
         || init.record.pidns_ino != expected.pidns_ino
     {
         return Err(io::Error::other("released root PID1 changed"));
+    }
+    // Root namespace membership proves scope, but does not identify the
+    // process that caused a *new* Bash invocation. At admission require the
+    // released Runner actor itself to have spawned this Bash process. Once
+    // registered, the same pinned Bash incarnation may survive adoption;
+    // c/E/O still use its durable child row and must not rely on PPID.
+    if new_registration {
+        let parent = PinnedProcess::open(actor.host_pid)?;
+        if parent.boot_id != actor.boot_id
+            || parent.starttime_ticks != actor.starttime_ticks
+            || (parent.pidns_dev, parent.pidns_ino) != (actor.pidns_dev, actor.pidns_ino)
+            || !peer.process.direct_child_of(&parent)?
+        {
+            return Err(io::Error::other(
+                "Bash child has no exact released Runner parent",
+            ));
+        }
     }
     peer.process.verify()?;
     Ok((root, actor))
@@ -3831,7 +3855,9 @@ fn serve_fresh_v30_at(
                 RequestPayload::FreshRecipientRequest {
                     request: FreshRecipientRequest::Lookup { .. }
                 }
-            ) || matches!(operation, b'C' | b'c' | b'E' | b'O');
+            ) || matches!(operation, b'C' | b'c' | b'E' | b'O')
+                || cfg!(feature = "age319-private-broker-fixture")
+                    && matches!(operation, b'8' | b'9' | b'!');
             // The shared front door has its own pinned image. It may observe
             // the live lane identity, but it cannot acquire Runner authority.
             // Every effect-bearing operation still requires the fresh Runner
@@ -3922,13 +3948,13 @@ fn serve_fresh_v30_at(
                         request.request_id, request.invocation_uuid
                     ))
                 }
-                b'C' | b'c' | b'E' | b'O' => {
+                b'C' | b'c' | b'E' | b'O' | b'8' | b'9' | b'!' => {
                     if !private_fixture() {
                         return Err(io::Error::other(
                             "fresh Bash child/work/result closed until normal root grant and physical result custody",
                         ));
                     }
-                    if operation == b'E' && instance.is_closed() {
+                    if matches!(operation, b'E' | b'8') && instance.is_closed() {
                         return Err(io::Error::other("fresh Bash private work gate closed"));
                     }
                     let request_id = match &payload {
@@ -3938,8 +3964,18 @@ fn serve_fresh_v30_at(
                         }
                         _ => return Err(io::Error::other("Bash child request absent")),
                     };
-                    let (root, root_actor) =
-                        fresh_bash_parent(state_root, &lane, &peer, bash_image.as_ref())?;
+                    let new_registration = operation == b'C'
+                        && lane
+                            .read_bash_child(&request_id)
+                            .map_err(io::Error::other)?
+                            .is_none();
+                    let (root, root_actor) = fresh_bash_parent(
+                        state_root,
+                        &lane,
+                        &peer,
+                        bash_image.as_ref(),
+                        new_registration,
+                    )?;
                     let child = if operation == b'C' && !instance.is_closed() {
                         lane.admit_bash_child(&request_id, &root, &root_actor, &recipient)
                             .map_err(io::Error::other)?
@@ -3978,6 +4014,92 @@ fn serve_fresh_v30_at(
                                 "fresh-bash-result {}\n",
                                 serde_json::to_string(&result)?
                             ))
+                        }
+                        #[cfg(feature = "age319-private-broker-fixture")]
+                        b'8' | b'9' | b'!' => {
+                            let root_pid = root.old_release.prepared.root_init.host_pid;
+                            let root_init = PinnedProcess::open(root_pid)?;
+                            let actor = PinnedProcess::open(peer.process.host_pid)?;
+                            let parent = if operation == b'8' {
+                                Some(PinnedProcess::open(root_actor.host_pid)?)
+                            } else {
+                                None
+                            };
+                            let binding = fresh_provider::binding_from_bash_child(
+                                &root,
+                                &child,
+                                &actor,
+                                parent.as_ref(),
+                                &root_init,
+                            )?;
+                            let directory = state_root.join("v30/fresh-provider");
+                            if operation == b'8' {
+                                // Fixed private recipe. Bash supplies neither the
+                                // executable nor output claim; production still
+                                // requires a causal parent work grant and W.
+                                let gate = PathBuf::from(
+                                    std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                                        .map_err(io::Error::other)?,
+                                );
+                                let marker = gate.join("bash-physical-effect");
+                                let image = fs::canonicalize("/bin/sh")?;
+                                let fd = unsafe {
+                                    libc::memfd_create(
+                                        c"fresh-bash-empty-input".as_ptr(),
+                                        libc::MFD_CLOEXEC,
+                                    )
+                                };
+                                if fd < 0 {
+                                    return Err(io::Error::last_os_error());
+                                }
+                                let input = unsafe { File::from_raw_fd(fd) };
+                                let plan = fresh_provider::plan(
+                                    &image,
+                                    &gate,
+                                    &input,
+                                    vec![
+                                        "-c".into(),
+                                        "printf 'broker-child-output\\n'; printf 'broker-ran\\n' > \"$1\"; (setsid sh -c 'trap \"\" TERM; while :; do sleep 1; done' >/dev/null 2>&1 &)".into(),
+                                        "sh".into(),
+                                        marker.display().to_string(),
+                                    ],
+                                    vec![("PATH".into(), "/usr/bin:/bin".into())],
+                                )?;
+                                let prepared = fresh_provider::prepare(&directory, binding, plan)?;
+                                let grant = fresh_provider::launch(
+                                    prepared, &root_init, &actor, peer.uid, peer.gid,
+                                )?;
+                                return Ok(format!("fresh-bash-physical-k {grant}\n"));
+                            }
+                            let grant = fresh_provider::grant_for_binding(&directory, &binding)?
+                                .ok_or_else(|| io::Error::other("fresh Bash physical K absent"))?;
+                            if operation == b'!' {
+                                fresh_provider::cancel(&directory, &grant)?;
+                                return Ok(format!("fresh-bash-physical-cancel {grant}\n"));
+                            }
+                            match fresh_provider::observe(&directory, &grant)? {
+                                fresh_provider::Observation::Unknown => {
+                                    Ok(format!("fresh-bash-physical-unknown {grant}\n"))
+                                }
+                                fresh_provider::Observation::Pending => {
+                                    Ok(format!("fresh-bash-physical-pending {grant}\n"))
+                                }
+                                fresh_provider::Observation::ProviderExited(status) => {
+                                    Ok(format!("fresh-bash-physical-exited {grant} {status}\n"))
+                                }
+                                fresh_provider::Observation::Drained {
+                                    status,
+                                    stdout,
+                                    stderr,
+                                    stdout_len,
+                                    stderr_len,
+                                    cancelled,
+                                } => Ok(format!(
+                                    "fresh-bash-physical-drained {grant} {status} {stdout_len} {stderr_len} {cancelled} {} {}\n",
+                                    fresh_provider::verified_hash(&stdout)?,
+                                    fresh_provider::verified_hash(&stderr)?,
+                                )),
+                            }
                         }
                         _ => unreachable!(),
                     }
