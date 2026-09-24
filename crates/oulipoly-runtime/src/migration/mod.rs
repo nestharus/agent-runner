@@ -7,7 +7,7 @@ use crate::sessions::locate_transcript;
 use oulipoly_config::{ModelConfig, ScriptSessionStorageType, SessionStorage, SessionsConfig};
 use oulipoly_state::{
     ChainSegmentRotationInput, CompletedTurnMigrationScope, CompletedTurnMigrationStage,
-    ResolvedResume, StateDb,
+    ResolvedResume, StateDb, StoredProviderSessionAuthority,
 };
 use std::borrow::Cow;
 use std::io::Write;
@@ -33,6 +33,10 @@ pub enum MigrationError {
     },
     TargetMissingStorage {
         provider: String,
+    },
+    TargetAuthorityUnavailable {
+        provider: String,
+        message: String,
     },
     SpawnCwdUnsupported {
         provider: String,
@@ -123,11 +127,53 @@ pub fn migrate_chain_segment(
     reason: TransitionReason,
     stderr: &mut dyn Write,
 ) -> Result<MigratedSegment, MigrationError> {
+    migrate_chain_segment_with_target_authority(
+        state,
+        sessions_cfg,
+        model,
+        resolved,
+        resume_working_dir,
+        target_provider_index,
+        reason,
+        None,
+        stderr,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn migrate_chain_segment_with_target_authority(
+    state: &StateDb,
+    sessions_cfg: &SessionsConfig,
+    model: &ModelConfig,
+    resolved: &ResolvedResume,
+    resume_working_dir: &Path,
+    target_provider_index: usize,
+    reason: TransitionReason,
+    target_authority: Option<&StoredProviderSessionAuthority>,
+    stderr: &mut dyn Write,
+) -> Result<MigratedSegment, MigrationError> {
     let source = source_provider_for_model(model, resolved)?;
     let target = target_provider_for_index(model, target_provider_index)?;
     require_provider_resume(source)?;
     require_provider_resume(target)?;
     ensure_migration_storage_supported(source, target)?;
+    if target_authority.is_none()
+        && state
+            .active_provider_session_authority(&resolved.chain_id)
+            .map_err(|message| MigrationError::Db { message })?
+            .is_some()
+    {
+        return Err(MigrationError::TargetAuthorityUnavailable {
+            provider: target.name.clone(),
+            message: "active provider session requires a selected target endpoint".into(),
+        });
+    }
+    if target_authority.is_some() && !resume_working_dir.is_absolute() {
+        return Err(MigrationError::SpawnCwdUnsupported {
+            provider: target.name.clone(),
+            cwd: resume_working_dir.display().to_string(),
+        });
+    }
     let _migration_fence = state
         .begin_completed_turn_migration(
             resolved,
@@ -164,21 +210,25 @@ pub fn migrate_chain_segment(
     write_jsonl_atomic(&target_path, slice.as_ref())?;
 
     let now = chrono::Utc::now();
-    state
-        .close_active_segment_returning(&resolved.chain_id, &now)
-        .map_err(|message| MigrationError::Db { message })?
-        .ok_or_else(|| MigrationError::ConcurrentSegmentClosed {
-            chain_id: resolved.chain_id.clone(),
-        })?;
-    state
-        .open_chain_segment(
-            &resolved.chain_id,
-            &target.name,
-            &target_session_id,
-            &now,
-            reason,
+    let rotation = ChainSegmentRotationInput {
+        chain_id: &resolved.chain_id,
+        source_provider_name: &source.name,
+        source_session_id: &resolved.active_session_id,
+        target_provider_name: &target.name,
+        target_session_id: &target_session_id,
+        changed_at: &now,
+        reason,
+    };
+    if let Some(authority) = target_authority {
+        state.rotate_chain_segment_with_provider_authority(
+            rotation,
+            authority,
+            &resume_working_dir.display().to_string(),
         )
-        .map_err(|message| MigrationError::Db { message })?;
+    } else {
+        state.rotate_chain_segment_transactionally(rotation)
+    }
+    .map_err(|message| MigrationError::Db { message })?;
     writeln!(
         stderr,
         "[migrate] {} -> {} reason={}",

@@ -136,6 +136,68 @@ impl StateDb {
         Ok(Self::chain_segment_rotation_ids(closed_id, opened_id))
     }
 
+    /// Rotate an exact-session chain while claiming the selected target endpoint
+    /// and workspace. A failed claim rolls the source close back as well.
+    pub fn rotate_chain_segment_with_provider_authority(
+        &self,
+        input: ChainSegmentRotationInput<'_>,
+        authority: &super::provider_session_authority::StoredProviderSessionAuthority,
+        cwd: &str,
+    ) -> Result<(i64, i64), DbError> {
+        if !std::path::Path::new(cwd).is_absolute() {
+            return Err("target provider session cwd must be absolute".into());
+        }
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(Self::format_chain_segment_rotation_begin_error)?;
+        let closed_id =
+            Self::require_active_source_segment(Self::close_expected_active_segment_returning_on(
+                &tx,
+                input.chain_id,
+                input.source_provider_name,
+                input.source_session_id,
+                input.changed_at,
+            )?)?;
+        Self::upsert_open_chain_segment(
+            &tx,
+            input.chain_id,
+            input.target_provider_name,
+            input.target_session_id,
+            &Self::rotation_segment_changed_at(input.changed_at),
+            input.reason,
+        )?;
+        let opened_id = Self::read_open_chain_segment_id(
+            &tx,
+            input.chain_id,
+            input.target_provider_name,
+            input.target_session_id,
+        )?;
+        super::provider_session_authority::bind_segment_authority_by_id_on(
+            &tx,
+            opened_id,
+            &authority.provider_instance_id,
+            &authority.settings_id,
+        )?;
+        tx.execute(
+            "INSERT INTO imported_session_display_metadata
+                (provider_name, provider_session_id, cwd, first_seen_at, last_seen_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)
+             ON CONFLICT(provider_name, provider_session_id) DO UPDATE SET
+                cwd = excluded.cwd, last_seen_at = excluded.last_seen_at",
+            sqlite::params![
+                input.target_provider_name,
+                input.target_session_id,
+                cwd,
+                input.changed_at.to_rfc3339(),
+            ],
+        )
+        .map_err(|error| format!("Failed to persist target provider session cwd: {error}"))?;
+        tx.commit()
+            .map_err(Self::format_chain_segment_rotation_commit_error)?;
+        Ok(Self::chain_segment_rotation_ids(closed_id, opened_id))
+    }
+
     fn open_segment_started_at(started_at: &DateTime<Utc>) -> String {
         started_at.to_rfc3339()
     }
