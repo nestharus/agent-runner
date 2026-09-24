@@ -3737,7 +3737,15 @@ fn serve_fresh_v30_at(
                     request: FreshRecipientRequest::Lookup { .. }
                 }
             );
-            if !local_lookup && !peer.process.same_executable_as(&runner_image)? {
+            // The shared front door has its own pinned image. It may observe
+            // the live lane identity, but it cannot acquire Runner authority.
+            // Every effect-bearing operation still requires the fresh Runner
+            // image and its physical release/State checks below.
+            let route_observation = operation == b'I' && matches!(payload, RequestPayload::None);
+            if !local_lookup
+                && !route_observation
+                && !peer.process.same_executable_as(&runner_image)?
+            {
                 return Err(io::Error::other(
                     "fresh lane requires installed Runner image",
                 ));

@@ -15,6 +15,10 @@ path = "src/main.rs"
 name = "oulipoly-installed-launcher"
 path = "src/installed_launcher.rs"
 
+[[bin]]
+name = "oulipoly-shared-front-door"
+path = "src/shared_front_door.rs"
+
 [dependencies]
 base64 = "0.22"
 libc.workspace = true

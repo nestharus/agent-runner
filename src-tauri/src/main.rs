@@ -60,6 +60,10 @@ mod zero_turn_orchestration;
 use crate::usage::cli::Cli;
 
 fn main() -> ExitCode {
+    if cfg!(feature = "age319-closed-fresh") {
+        eprintln!("OULIPOLY_AGE319_FRESH_CLOSED=no production fresh root route");
+        return ExitCode::FAILURE;
+    }
     #[cfg(target_os = "linux")]
     if let Err(error) = kernel_entry::verify_installed_entry_route() {
         eprintln!("OULIPOLY_KERNEL_ENTRY_GAP={error}");

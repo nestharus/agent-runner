@@ -14,6 +14,15 @@ use std::time::{Duration, Instant};
 
 #[test]
 fn private_broker_has_distinct_fresh_route_while_old_wal_writer_survives() {
+    if let Ok(socket) = std::env::var("AGE319_FRESH_OBSERVER_SOCKET") {
+        let socket = std::path::Path::new(&socket);
+        assert!(request(socket, b'I').starts_with("fresh-v30-route "));
+        assert!(
+            request_with_id(socket, b'D', uuid::Uuid::new_v4(), true)
+                .contains("fresh lane requires installed Runner image")
+        );
+        return;
+    }
     if let Ok(socket) = std::env::var("AGE319_FRESH_WRONG_PEER_SOCKET") {
         let request_id =
             uuid::Uuid::parse_str(&std::env::var("AGE319_FRESH_WRONG_PEER_REQUEST").unwrap())
@@ -131,6 +140,20 @@ fn private_broker_has_distinct_fresh_route_while_old_wal_writer_survives() {
             "fresh-v30-route {} {} {}\n",
             identity.lane_id, identity.source_generation, identity.domain_id
         )
+    );
+    // The shared front door is a different executable. A different image can
+    // observe the lane but cannot reserve fresh State or obtain a work grant.
+    let observer = private.path().join("route-observer");
+    fs::copy(&runner, &observer).unwrap();
+    assert!(
+        Command::new(&observer)
+            .arg("--exact")
+            .arg("private_broker_has_distinct_fresh_route_while_old_wal_writer_survives")
+            .arg("--nocapture")
+            .env("AGE319_FRESH_OBSERVER_SOCKET", &socket)
+            .status()
+            .unwrap()
+            .success()
     );
     assert!(request(&socket, b'C').contains("fresh v30 effects closed"));
     assert!(request(&socket, b'e').contains("Runner-result/ACK lineage"));
