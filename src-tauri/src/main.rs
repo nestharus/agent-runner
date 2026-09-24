@@ -502,7 +502,19 @@ fn run_gui_entrypoint() -> ExitCode {
 }
 
 fn run_cli_entrypoint() -> ExitCode {
-    let cli = parse_cli();
+    let cli = match parse_cli() {
+        Ok(cli) => cli,
+        Err(error) => {
+            // Clap's parse_from exits the process for help and parse errors.
+            // The v30 root must return through its broker result transition.
+            let code = u8::try_from(error.exit_code()).unwrap_or(1);
+            if let Err(print_error) = error.print() {
+                eprintln!("CLI output failed: {print_error}");
+                return ExitCode::FAILURE;
+            }
+            return ExitCode::from(code);
+        }
+    };
     schedule_entrypoint_opportunity(
         Some(&cli),
         maintenance_worker::schedule_daily_opportunity_fail_open,
@@ -558,8 +570,8 @@ fn should_run_gui() -> bool {
     arg_count(cli_args()) == 1
 }
 
-fn parse_cli() -> Cli {
-    Cli::parse_from(crate::commands::resume_list::normalize_resume_list_args(
+fn parse_cli() -> Result<Cli, clap::Error> {
+    Cli::try_parse_from(crate::commands::resume_list::normalize_resume_list_args(
         cli_args(),
     ))
 }

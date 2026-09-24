@@ -90,6 +90,95 @@ pub fn read_fresh_v30_session_at(
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct FreshRootEffectRequest {
+    pub d_key: String,
+    pub success: Option<bool>,
+}
+
+/// Begin is one-use. If its reply is lost, observe reports `Started`, which
+/// is unknown work and must never authorize a second begin.
+pub fn begin_fresh_root_effect_at(
+    path: &Path,
+    d_key: &str,
+) -> io::Result<oulipoly_state::mailbox::FreshRootEffect> {
+    root_effect_request_at(path, b'0', d_key, None)?
+        .ok_or_else(|| io::Error::other("fresh root effect start absent"))
+}
+
+pub fn observe_fresh_root_effect_at(
+    path: &Path,
+    d_key: &str,
+) -> io::Result<Option<oulipoly_state::mailbox::FreshRootEffect>> {
+    root_effect_request_at(path, b'1', d_key, None)
+}
+
+pub fn return_fresh_root_effect_at(
+    path: &Path,
+    d_key: &str,
+    success: bool,
+) -> io::Result<oulipoly_state::mailbox::FreshRootEffect> {
+    root_effect_request_at(path, b'2', d_key, Some(success))?
+        .ok_or_else(|| io::Error::other("fresh root effect return absent"))
+}
+
+fn root_effect_request_at(
+    path: &Path,
+    operation: u8,
+    d_key: &str,
+    success: Option<bool>,
+) -> io::Result<Option<oulipoly_state::mailbox::FreshRootEffect>> {
+    let id =
+        uuid::Uuid::parse_str(d_key).map_err(|_| io::Error::other("invalid root effect D key"))?;
+    if id.is_nil() || id.to_string() != d_key {
+        return Err(io::Error::other("noncanonical root effect D key"));
+    }
+    let body = serde_json::to_vec(&FreshRootEffectRequest {
+        d_key: d_key.into(),
+        success,
+    })?;
+    let mut stream = checked_connection(path)?;
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let mut frame = Vec::with_capacity(17 + body.len());
+    frame.push(operation);
+    frame.extend_from_slice(&challenge);
+    frame.extend_from_slice(&body);
+    if unsafe {
+        libc::send(
+            stream.as_raw_fd(),
+            frame.as_ptr().cast(),
+            frame.len(),
+            libc::MSG_NOSIGNAL,
+        )
+    } != frame.len() as isize
+    {
+        return Err(io::Error::other("short root effect request"));
+    }
+    let mut reply = Vec::new();
+    stream.take(8193).read_to_end(&mut reply)?;
+    if reply.len() > 8192 || !reply.ends_with(b"\n") {
+        return Err(io::Error::other(
+            "root effect response oversized or incomplete",
+        ));
+    }
+    let reply = String::from_utf8(reply).map_err(io::Error::other)?;
+    if let Some(error) = reply.strip_prefix("error ") {
+        return Err(io::Error::other(error.trim_end().to_owned()));
+    }
+    if reply == "fresh-root-effect absent\n" {
+        return Ok(None);
+    }
+    let body = reply
+        .strip_prefix("fresh-root-effect ")
+        .and_then(|value| value.strip_suffix('\n'))
+        .ok_or_else(|| io::Error::other("root effect response invalid"))?;
+    serde_json::from_str(body)
+        .map(Some)
+        .map_err(io::Error::other)
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FreshChildRequest {
     #[serde(default)]
     pub request_id: String,

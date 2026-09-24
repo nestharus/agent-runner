@@ -30,6 +30,7 @@ fn private_normal_mode() -> bool {
         arg == PRIVATE_NORMAL_ENTRY
             || arg == "__age319-private-bash-work-v1"
             || arg == "__age319-private-root-handoff-v1"
+            || (arg == "--help" && std::env::var_os("AGE319_PRIVATE_OFFLINE_ROOT_V1").is_some())
     }) && unsafe { libc::geteuid() } == 0
         && std::fs::read_to_string("/proc/self/uid_map")
             .ok()
@@ -373,14 +374,21 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
         return Err("v30 child attestation does not match physical gate".into());
     }
     #[cfg(feature = "age319-private-broker-fixture")]
+    let private_help = private_v30_child_mode()
+        && std::env::var_os("AGE319_PRIVATE_OFFLINE_ROOT_V1").is_some()
+        && std::env::args().nth(1).as_deref() == Some("--help")
+        && std::env::args().nth(2).is_none();
+    #[cfg(feature = "age319-private-broker-fixture")]
     let private_handoff = private_v30_child_mode()
-        && std::env::args().nth(1).as_deref() == Some("__age319-private-root-handoff-v1");
+        && (std::env::args().nth(1).as_deref() == Some("__age319-private-root-handoff-v1")
+            || private_help);
     #[cfg(feature = "age319-private-broker-fixture")]
     let request_handoff = private_handoff || !private_v30_child_mode();
     #[cfg(not(feature = "age319-private-broker-fixture"))]
     let request_handoff = true;
     #[cfg(feature = "age319-private-broker-fixture")]
     let mut private_receipt = None;
+    let mut effect_binding = None;
     if request_handoff {
         let fresh_socket = broker_socket().with_file_name("v30.sock");
         #[cfg(feature = "age319-private-broker-fixture")]
@@ -447,8 +455,9 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
                     "seccomp": status_value("Seccomp:")?,
                 }),
             )?;
-            private_receipt = Some(receipt);
+            private_receipt = Some(receipt.clone());
         }
+        effect_binding = Some((receipt, session));
     }
     drop(gate);
     #[cfg(feature = "age319-private-broker-fixture")]
@@ -519,6 +528,31 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
             if current != *original {
                 return Err("v30 released handoff changed before private marker".into());
             }
+            let (receipt, session) = effect_binding
+                .as_ref()
+                .ok_or("private root effect binding absent")?;
+            if std::env::var_os("AGE319_PRIVATE_EFFECT_REPLY_LOSS_V1").is_some() {
+                private_drop_fresh_reply(
+                    &broker_socket().with_file_name("v30.sock"),
+                    b'0',
+                    None,
+                    Some(&receipt.d_key),
+                )?;
+                let unknown = protocol::observe_fresh_root_effect_at(
+                    &broker_socket().with_file_name("v30.sock"),
+                    &receipt.d_key,
+                )
+                .map_err(|e| e.to_string())?;
+                if !unknown.is_some_and(|effect| {
+                    effect.state == oulipoly_state::mailbox::FreshRootEffectState::Started
+                }) {
+                    return Err("lost root effect reply did not retain unknown start".into());
+                }
+                return Err("private root effect start reply lost; execution refused".into());
+            }
+            if !private_help {
+                begin_root_effect(receipt, session)?;
+            }
         } else {
             let current = protocol::attest_released_child_at(&broker_socket(), &spec)
                 .map_err(|e| format!("v30 child release no longer live: {e}"))?;
@@ -526,10 +560,73 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
                 return Err("v30 child release changed before effect".into());
             }
         }
-        println!("OULIPOLY_KERNEL_V30_CHILD_EFFECT={}", evidence.release_id);
-        return Ok(ExitCode::SUCCESS);
+        if !private_help {
+            println!("OULIPOLY_KERNEL_V30_CHILD_EFFECT={}", evidence.release_id);
+            if let Some((receipt, session)) = effect_binding.as_ref() {
+                return_root_effect(receipt, session, true)?;
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
     }
-    Err("production v30 root U/D has no broker-controlled pre-effect grant into process_entrypoint or native provider result/unknown custody".into())
+    let (receipt, session) = effect_binding.ok_or("v30 root U/D binding absent")?;
+    if std::env::args().skip(1).collect::<Vec<_>>() != receipt.root_work_intent.arguments() {
+        return Err("root entry argv changed after broker release".into());
+    }
+    if !receipt.root_work_intent.returnable_entry() {
+        return Err("root entry intent has no returnable effect/result path".into());
+    }
+    begin_root_effect(&receipt, &session)?;
+    let result = crate::process_entrypoint();
+    return_root_effect(&receipt, &session, result == ExitCode::SUCCESS)?;
+    Ok(result)
+}
+
+fn begin_root_effect(
+    receipt: &oulipoly_state::mailbox::FreshReleasedHandoff,
+    session: &oulipoly_state::mailbox::FreshV30Session,
+) -> Result<(), String> {
+    let effect = protocol::begin_fresh_root_effect_at(
+        &broker_socket().with_file_name("v30.sock"),
+        &receipt.d_key,
+    )
+    .map_err(|e| format!("v30 root pre-effect start absent: {e}"))?;
+    if effect.handoff_id != receipt.handoff_id
+        || effect.invocation_uuid != receipt.invocation_uuid
+        || effect.session_id != session.session_id
+        || effect.intent != receipt.root_work_intent
+        || effect.state != oulipoly_state::mailbox::FreshRootEffectState::Started
+    {
+        return Err("v30 root pre-effect readback conflict".into());
+    }
+    Ok(())
+}
+
+fn return_root_effect(
+    receipt: &oulipoly_state::mailbox::FreshReleasedHandoff,
+    session: &oulipoly_state::mailbox::FreshV30Session,
+    success: bool,
+) -> Result<(), String> {
+    let socket = broker_socket().with_file_name("v30.sock");
+    let expected = if success {
+        oulipoly_state::mailbox::FreshRootEffectState::ReturnedSuccess
+    } else {
+        oulipoly_state::mailbox::FreshRootEffectState::ReturnedFailure
+    };
+    let effect = protocol::return_fresh_root_effect_at(&socket, &receipt.d_key, success)
+        .or_else(|_| {
+            protocol::observe_fresh_root_effect_at(&socket, &receipt.d_key)
+                .and_then(|value| value.ok_or_else(|| std::io::Error::other("root result unknown")))
+        })
+        .map_err(|e| format!("v30 root result unknown: {e}"))?;
+    if effect.handoff_id != receipt.handoff_id
+        || effect.invocation_uuid != receipt.invocation_uuid
+        || effect.session_id != session.session_id
+        || effect.intent != receipt.root_work_intent
+        || effect.state != expected
+    {
+        return Err("v30 root result readback conflict or unknown".into());
+    }
+    Ok(())
 }
 
 fn spec_for_handoff(spec: &protocol::StateReadSpec) -> protocol::StateReadSpec {
@@ -569,6 +666,13 @@ fn private_drop_fresh_reply(
             uuid::Uuid::parse_str(d_key.ok_or("private D key absent")?)
                 .map_err(|e| e.to_string())?
                 .as_bytes(),
+        ),
+        b'0' => frame.extend_from_slice(
+            &serde_json::to_vec(&protocol::FreshRootEffectRequest {
+                d_key: d_key.ok_or("private root effect D key absent")?.into(),
+                success: None,
+            })
+            .map_err(|e| e.to_string())?,
         ),
         _ => return Err("unsupported private lost-reply operation".into()),
     }

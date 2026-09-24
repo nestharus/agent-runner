@@ -353,6 +353,49 @@ fn private_fresh_dual_lane_live_old_wal_collision_and_restart() {
     let reopened = FreshV30Lane::open_at(&broker_root).unwrap();
     reopened.require_mailbox_row(&session, 2).unwrap();
     assert_eq!(reopened.read_session(&request_id).unwrap(), Some(session));
+
+    // A published lane from before the root effect Act gains only the
+    // additive State objects. The sidecar stays at broker version 32.
+    state.execute_batch("DROP TABLE fresh_root_effect").unwrap();
+    assert_eq!(FreshV30Lane::initialize_at(&broker_root).unwrap(), first);
+    assert_eq!(
+        state
+            .query_row("SELECT count(*) FROM fresh_root_effect", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        mailbox
+            .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        32
+    );
+    assert_eq!(
+        FreshV30Lane::open_at(&broker_root).unwrap().identity(),
+        &first
+    );
+
+    // Existing names alone do not establish the ledger's immutable shape.
+    state
+        .execute_batch(
+            "DROP TRIGGER fresh_root_effect_return_once;
+             CREATE TRIGGER fresh_root_effect_return_once BEFORE UPDATE ON fresh_root_effect
+             BEGIN SELECT 1; END;",
+        )
+        .unwrap();
+    assert!(
+        FreshV30Lane::open_at(&broker_root)
+            .err()
+            .unwrap()
+            .contains("fresh root effect schema differs")
+    );
+    assert_eq!(
+        mailbox
+            .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        32
+    );
 }
 
 fn insert_pending(db: &Connection, session: &str, handle: &str) -> i64 {

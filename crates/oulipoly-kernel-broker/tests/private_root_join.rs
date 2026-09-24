@@ -54,7 +54,13 @@ fn inner() {
     );
     let release_mode = mode.starts_with("held_release") || native_mode;
     let normal_mode = mode.starts_with("normal_");
-    let handoff_mode = matches!(mode.as_str(), "normal_handoff" | "normal_handoff_fsync");
+    let handoff_mode = matches!(
+        mode.as_str(),
+        "normal_handoff"
+            | "normal_handoff_fsync"
+            | "normal_handoff_effect_reply_loss"
+            | "normal_help"
+    );
     let recipient_mode = mode.starts_with("normal_recipient");
     let real_source = mode.starts_with("normal_bash_source");
     let nonzero_source = mode == "normal_bash_source_nonzero";
@@ -275,7 +281,9 @@ fn inner() {
         let out = temp.path().join("normal.out");
         let err = temp.path().join("normal.err");
         let mut entry = Command::new(&runner)
-            .arg(if handoff_mode {
+            .arg(if mode == "normal_help" {
+                "--help"
+            } else if handoff_mode {
                 "__age319-private-root-handoff-v1"
             } else {
                 "__age319-private-normal-v30"
@@ -286,8 +294,13 @@ fn inner() {
             .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
             .env("AGE319_PRIVATE_REPAIR_CHALLENGE_V1", "1")
             .env("AGE319_PRIVATE_SOURCE_SELECTION_CHALLENGE_V1", "1")
+            .envs((mode == "normal_help").then_some(("AGE319_PRIVATE_OFFLINE_ROOT_V1", "1")))
             .envs(
                 (mode == "normal_handoff").then_some(("AGE319_PRIVATE_HANDOFF_REPLY_LOSS_V1", "1")),
+            )
+            .envs(
+                (mode == "normal_handoff_effect_reply_loss")
+                    .then_some(("AGE319_PRIVATE_EFFECT_REPLY_LOSS_V1", "1")),
             )
             .envs(pending_binding.as_ref().map(|binding| {
                 (
@@ -509,7 +522,10 @@ fn inner() {
                 "{}",
                 fs::read_to_string(&err).unwrap()
             );
-            if mode == "normal_handoff" {
+            if matches!(
+                mode.as_str(),
+                "normal_handoff" | "normal_handoff_effect_reply_loss" | "normal_help"
+            ) {
                 let marker: serde_json::Value =
                     serde_json::from_slice(&fs::read(gate.join("child-handoff")).unwrap()).unwrap();
                 let receipt: oulipoly_state::mailbox::FreshReleasedHandoff =
@@ -540,9 +556,13 @@ fn inner() {
                 assert!(receipt.old_release == released);
                 assert_eq!(
                     receipt.root_work_intent,
-                    oulipoly_state::mailbox::FreshRootWorkIntent::PrivateProbe(vec![
-                        "__age319-private-root-handoff-v1".into()
-                    ])
+                    if mode == "normal_help" {
+                        oulipoly_state::mailbox::FreshRootWorkIntent::CliHelp(vec!["--help".into()])
+                    } else {
+                        oulipoly_state::mailbox::FreshRootWorkIntent::PrivateProbe(vec![
+                            "__age319-private-root-handoff-v1".into(),
+                        ])
+                    }
                 );
                 let receipt_json = serde_json::to_string(&receipt).unwrap();
                 assert!(!receipt_json.contains("ab30_"));
@@ -594,7 +614,14 @@ fn inner() {
                         |row| row.get(0),
                     )
                     .unwrap();
-                assert_eq!(intent_kind, "private_probe");
+                assert_eq!(
+                    intent_kind,
+                    if mode == "normal_help" {
+                        "cli_help"
+                    } else {
+                        "private_probe"
+                    }
+                );
                 assert_eq!(
                     fs::metadata(&out).unwrap().len(),
                     0,
@@ -609,6 +636,28 @@ fn inner() {
                     pidns_dev: child.pidns_dev,
                     pidns_ino: child.pidns_ino,
                 };
+                let session = lane.read_session(&receipt.d_key).unwrap().unwrap();
+                assert!(
+                    lane.read_root_effect(&receipt, &actor, &session)
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(
+                    protocol::begin_fresh_root_effect_at(
+                        &socket.with_file_name("v30.sock"),
+                        &receipt.d_key,
+                    )
+                    .is_err(),
+                    "same-image sibling began root work"
+                );
+                assert!(
+                    protocol::begin_fresh_root_effect_at(
+                        &socket.with_file_name("v30.sock"),
+                        &uuid::Uuid::new_v4().to_string(),
+                    )
+                    .is_err(),
+                    "wrong D key began root work"
+                );
                 let mut reused_pid = actor.clone();
                 reused_pid.starttime_ticks += 1;
                 assert!(
@@ -636,7 +685,14 @@ fn inner() {
                 );
                 let mut wrong_handle = receipt.clone();
                 wrong_handle.root_work_intent =
-                    oulipoly_state::mailbox::FreshRootWorkIntent::CliHelp(vec!["--help".into()]);
+                    oulipoly_state::mailbox::FreshRootWorkIntent::CliHelp(vec![
+                        if mode == "normal_help" {
+                            "-h"
+                        } else {
+                            "--help"
+                        }
+                        .into(),
+                    ]);
                 assert!(
                     lane.require_released_handoff(&receipt.d_key, &wrong_handle, &actor)
                         .is_err()
@@ -745,14 +801,50 @@ fn inner() {
                 assert_eq!(pending, 1, "old pending ACK debt must coexist with fresh D");
                 fs::write(gate.join("child-effect"), b"yes").unwrap();
                 eventually(|| entry.try_wait().unwrap().is_some());
-                assert!(
-                    entry.wait().unwrap().success(),
-                    "handoff child: {}",
-                    fs::read_to_string(&err).unwrap()
-                );
+                let completed = entry.wait().unwrap().success();
+                let effect: String = fresh_state
+                    .query_row(
+                        "SELECT state FROM fresh_root_effect WHERE handoff_id=?1",
+                        [&receipt.handoff_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                if mode == "normal_handoff_effect_reply_loss" {
+                    assert!(!completed, "lost start reply executed root work");
+                    assert_eq!(effect, "started", "lost start is durable unknown");
+                    assert_eq!(fs::metadata(&out).unwrap().len(), 0);
+                    assert!(
+                        fs::read_to_string(&err)
+                            .unwrap()
+                            .contains("root effect start reply lost; execution refused")
+                    );
+                } else {
+                    assert!(
+                        completed,
+                        "handoff child: {}",
+                        fs::read_to_string(&err).unwrap()
+                    );
+                    assert_eq!(effect, "returned_success");
+                    if mode == "normal_help" {
+                        let help = fs::read_to_string(&out).unwrap();
+                        assert!(help.contains("Usage:"), "real CLI help absent: {help}");
+                        assert!(!help.contains("OULIPOLY_KERNEL_V30_CHILD_EFFECT"));
+                    } else {
+                        assert_eq!(
+                            fs::read_to_string(&out).unwrap(),
+                            format!("OULIPOLY_KERNEL_V30_CHILD_EFFECT={}\n", released.release_id)
+                        );
+                    }
+                }
                 assert_eq!(
-                    fs::read_to_string(&out).unwrap(),
-                    format!("OULIPOLY_KERNEL_V30_CHILD_EFFECT={}\n", released.release_id)
+                    fresh_state
+                        .query_row::<i64, _, _>(
+                            "SELECT count(*) FROM fresh_root_effect",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap(),
+                    1
                 );
                 stop(&mut broker);
                 return;
@@ -2643,6 +2735,8 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_release",
         "normal_handoff",
         "normal_handoff_fsync",
+        "normal_handoff_effect_reply_loss",
+        "normal_help",
         "normal_guardian_death",
         "normal_driver_death",
         "normal_broker_death",

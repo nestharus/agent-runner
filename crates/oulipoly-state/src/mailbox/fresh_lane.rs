@@ -18,6 +18,7 @@ const FRESH_SCHEMA: &str = include_str!("migrations/0030_fresh_lane.sql");
 const FRESH_STATE_SCHEMA: &str = include_str!("migrations/0030_fresh_state_identity.sql");
 const FRESH_CHILD_REQUEST_SCHEMA: &str = include_str!("migrations/0030_fresh_child_request.sql");
 const FRESH_HANDOFF_SCHEMA: &str = include_str!("migrations/0031_fresh_released_handoff.sql");
+const FRESH_ROOT_EFFECT_SCHEMA: &str = include_str!("migrations/0032_fresh_root_effect.sql");
 const FRESH_RECIPIENT_SCHEMA: &str = include_str!("migrations/0030_fresh_recipient.sql");
 const FRESH_RECIPIENT_STATE_SCHEMA: &str =
     include_str!("migrations/0030_fresh_recipient_state.sql");
@@ -66,6 +67,41 @@ impl FreshRootWorkIntent {
             }
         }
     }
+
+    pub fn arguments(&self) -> &[String] {
+        match self {
+            Self::CliHelp(args) | Self::CliDiagnostics(args) | Self::PrivateProbe(args) => args,
+        }
+    }
+
+    /// Offline CLI roots return through the broker result transition. Normal
+    /// provider/recovery roots still need their own launch and result authority.
+    pub fn returnable_entry(&self) -> bool {
+        self.valid()
+            && match self {
+                Self::CliHelp(_) | Self::CliDiagnostics(_) => true,
+                Self::PrivateProbe(_) => cfg!(feature = "age319-private-broker-fixture"),
+            }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FreshRootEffectState {
+    Started,
+    ReturnedSuccess,
+    ReturnedFailure,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreshRootEffect {
+    pub handoff_id: String,
+    pub invocation_uuid: String,
+    pub session_id: String,
+    pub actor: FreshRecipientIdentity,
+    pub intent: FreshRootWorkIntent,
+    pub state: FreshRootEffectState,
 }
 
 /// Minted by the old release authority while its physical gate is retained.
@@ -200,7 +236,7 @@ impl FreshV30Lane {
         let state_conn = Connection::open(&state_path).map_err(|e| e.to_string())?;
         state_conn
             .execute_batch(&format!(
-                "{FRESH_STATE_SCHEMA}\n{FRESH_RECIPIENT_STATE_SCHEMA}\n{FRESH_CHILD_REQUEST_SCHEMA}\n{FRESH_HANDOFF_SCHEMA}"
+                "{FRESH_STATE_SCHEMA}\n{FRESH_RECIPIENT_STATE_SCHEMA}\n{FRESH_CHILD_REQUEST_SCHEMA}\n{FRESH_HANDOFF_SCHEMA}\n{FRESH_ROOT_EFFECT_SCHEMA}"
             ))
             .map_err(|e| e.to_string())?;
         state_conn
@@ -480,6 +516,17 @@ impl FreshV30Lane {
         if root_intent_columns != 1 || old_bash_columns != 0 {
             return Err("fresh root handoff schema conflicts with Bash placeholder schema".into());
         }
+        match fresh_root_effect_schema_count(&state_conn)? {
+            0 => state_conn
+                .execute_batch(FRESH_ROOT_EFFECT_SCHEMA)
+                .map_err(|e| e.to_string())?,
+            3 => {}
+            _ => return Err("fresh root effect schema is incomplete".into()),
+        }
+        if fresh_root_effect_schema_count(&state_conn)? != 3 {
+            return Err("fresh root effect schema is incomplete".into());
+        }
+        verify_fresh_root_effect_schema(&state_conn)?;
         state_conn
             .execute_batch("COMMIT")
             .map_err(|e| e.to_string())?;
@@ -773,6 +820,152 @@ impl FreshV30Lane {
             return Err("fresh child owner association changed".into());
         }
         Ok(())
+    }
+
+    /// The broker must call this only after reattesting the live old release.
+    /// A lost reply leaves a durable started/unknown effect; it cannot be
+    /// replayed to execute the same root a second time.
+    pub fn begin_root_effect(
+        &self,
+        receipt: &FreshReleasedHandoff,
+        actor: &FreshRecipientIdentity,
+        session: &FreshV30Session,
+    ) -> Result<FreshRootEffect, String> {
+        self.require_released_invocation(receipt, actor, session)?;
+        if !receipt.root_work_intent.returnable_entry() {
+            return Err("root intent has no returnable effect entry".into());
+        }
+        let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        state
+            .execute_batch("PRAGMA synchronous=FULL; BEGIN IMMEDIATE")
+            .map_err(|e| e.to_string())?;
+        state
+            .execute(
+                "INSERT INTO fresh_root_effect
+             (handoff_id,invocation_uuid,session_id,actor_identity,intent_json,state,started_at)
+             VALUES(?1,?2,?3,?4,?5,'started',?6)",
+                params![
+                    receipt.handoff_id,
+                    receipt.invocation_uuid,
+                    session.session_id,
+                    serde_json::to_string(actor).map_err(|e| e.to_string())?,
+                    serde_json::to_string(&receipt.root_work_intent).map_err(|e| e.to_string())?,
+                    Utc::now().to_rfc3339()
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        state.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+        self.read_root_effect(receipt, actor, session)?
+            .ok_or_else(|| "root effect start lost its durable row".into())
+    }
+
+    pub fn read_root_effect(
+        &self,
+        receipt: &FreshReleasedHandoff,
+        actor: &FreshRecipientIdentity,
+        session: &FreshV30Session,
+    ) -> Result<Option<FreshRootEffect>, String> {
+        self.require_released_invocation(receipt, actor, session)?;
+        let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let row: Option<(String, String, String, String, String, String)> = state
+            .query_row(
+                "SELECT handoff_id,invocation_uuid,session_id,actor_identity,intent_json,state
+             FROM fresh_root_effect WHERE handoff_id=?1",
+                [&receipt.handoff_id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some((handoff_id, invocation_uuid, session_id, actor_json, intent_json, status)) = row
+        else {
+            return Ok(None);
+        };
+        if handoff_id != receipt.handoff_id
+            || invocation_uuid != receipt.invocation_uuid
+            || session_id != session.session_id
+            || serde_json::from_str::<FreshRecipientIdentity>(&actor_json)
+                .map_err(|e| e.to_string())?
+                != *actor
+            || serde_json::from_str::<FreshRootWorkIntent>(&intent_json)
+                .map_err(|e| e.to_string())?
+                != receipt.root_work_intent
+        {
+            return Err("root effect identity readback conflict".into());
+        }
+        let state = match status.as_str() {
+            "started" => FreshRootEffectState::Started,
+            "returned_success" => FreshRootEffectState::ReturnedSuccess,
+            "returned_failure" => FreshRootEffectState::ReturnedFailure,
+            _ => return Err("root effect state invalid".into()),
+        };
+        Ok(Some(FreshRootEffect {
+            handoff_id,
+            invocation_uuid,
+            session_id,
+            actor: actor.clone(),
+            intent: receipt.root_work_intent.clone(),
+            state,
+        }))
+    }
+
+    /// A returned entry result is separate from physical drain and from any
+    /// provider/native-work result. Duplicate identical returns are readback.
+    pub fn return_root_effect(
+        &self,
+        receipt: &FreshReleasedHandoff,
+        actor: &FreshRecipientIdentity,
+        session: &FreshV30Session,
+        success: bool,
+    ) -> Result<FreshRootEffect, String> {
+        let existing = self
+            .read_root_effect(receipt, actor, session)?
+            .ok_or("root effect was never started")?;
+        let terminal = if success {
+            FreshRootEffectState::ReturnedSuccess
+        } else {
+            FreshRootEffectState::ReturnedFailure
+        };
+        if existing.state == terminal {
+            return Ok(existing);
+        }
+        if existing.state != FreshRootEffectState::Started {
+            return Err("root effect already returned a different result".into());
+        }
+        let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        state
+            .execute_batch("PRAGMA synchronous=FULL")
+            .map_err(|e| e.to_string())?;
+        let changed = state
+            .execute(
+                "UPDATE fresh_root_effect SET state=?2,returned_at=?3
+             WHERE handoff_id=?1 AND state='started'",
+                params![
+                    receipt.handoff_id,
+                    if success {
+                        "returned_success"
+                    } else {
+                        "returned_failure"
+                    },
+                    Utc::now().to_rfc3339()
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        let readback = self
+            .read_root_effect(receipt, actor, session)?
+            .ok_or("root effect disappeared after return")?;
+        if changed > 1 || readback.state != terminal {
+            return Err("root effect return readback conflict".into());
+        }
+        Ok(readback)
     }
 
     /// The intended caller is a released Runner root retaining both UUIDs
@@ -1166,6 +1359,47 @@ fn fresh_handoff_schema_count(state: &Connection) -> Result<i64, String> {
             |r| r.get(0),
         )
         .map_err(|e| e.to_string())
+}
+
+fn fresh_root_effect_schema_count(state: &Connection) -> Result<i64, String> {
+    state
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE
+         (type='table' AND name='fresh_root_effect') OR
+         (type='trigger' AND name IN
+          ('fresh_root_effect_no_delete','fresh_root_effect_return_once'))",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())
+}
+
+fn verify_fresh_root_effect_schema(state: &Connection) -> Result<(), String> {
+    fn objects(state: &Connection) -> Result<Vec<(String, String, String)>, String> {
+        let mut statement = state
+            .prepare(
+                "SELECT type,name,sql FROM sqlite_master WHERE
+                 (type='table' AND name='fresh_root_effect') OR
+                 (type='trigger' AND name IN
+                  ('fresh_root_effect_no_delete','fresh_root_effect_return_once'))
+                 ORDER BY type,name",
+            )
+            .map_err(|e| e.to_string())?;
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    let canonical = Connection::open_in_memory().map_err(|e| e.to_string())?;
+    canonical
+        .execute_batch(FRESH_ROOT_EFFECT_SCHEMA)
+        .map_err(|e| e.to_string())?;
+    if objects(state)? != objects(&canonical)? {
+        return Err("fresh root effect schema differs from embedded SQL".into());
+    }
+    Ok(())
 }
 
 fn validate_request_id(request_id: &str) -> Result<(), String> {
