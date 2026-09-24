@@ -39,7 +39,6 @@ pub struct SourceOutcome {
     pub ready_sentinel: Option<String>,
 }
 
-pub const MAX_OUTPUT_BYTES: usize = 1024 * 1024 * 1024;
 const OUTPUT_COPY_BUFFER_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,9 +88,10 @@ pub struct OriginalOutputSelection {
 
 impl MissingOriginalOutput {
     fn validate(&self, outcome: &SourceOutcome, digest: &str) -> Result<(), String> {
-        let selection_valid = self.selection.as_ref().is_some_and(|selection| {
-            selection.inode > 0 && selection.byte_len <= MAX_OUTPUT_BYTES as u64
-        });
+        let selection_valid = self
+            .selection
+            .as_ref()
+            .is_some_and(|selection| selection.inode > 0);
         let reason_valid = match self.reason.as_str() {
             "original_selection_not_retained" => {
                 self.selection.is_none() && self.observed_byte_len.is_none()
@@ -337,41 +337,105 @@ impl OutputArtifact {
         directory: &Path,
         output: &mut impl std::io::Write,
     ) -> Result<(), String> {
-        use std::io::Read;
         if self.representation != "retained-output-v1"
             || self.relative != "completion-output-v2.bin"
             || !matches!(self.encoding.as_str(), "raw" | "utf8-lossy")
             || !is_sha256(&self.sha256)
-            || self.byte_len > MAX_OUTPUT_BYTES as u64
         {
             return Err("unsupported completion output artifact".into());
         }
-        let mut input = open_source_file(directory, &self.relative, MAX_OUTPUT_BYTES)?;
-        if input.metadata().map_err(|e| e.to_string())?.len() != self.byte_len {
-            return Err("output artifact length conflict".into());
-        }
-        let mut hasher = Sha256::new();
-        let mut bytes = [0; OUTPUT_COPY_BUFFER_BYTES];
-        let mut total = 0u64;
-        loop {
-            let count = input.read(&mut bytes).map_err(|e| e.to_string())?;
-            if count == 0 {
-                break;
-            }
-            total += count as u64;
-            if total > self.byte_len {
-                return Err("output artifact grew".into());
-            }
-            hasher.update(&bytes[..count]);
-            output
-                .write_all(&bytes[..count])
-                .map_err(|e| e.to_string())?;
-        }
-        if total != self.byte_len || format!("{:x}", hasher.finalize()) != self.sha256 {
-            return Err("output artifact digest/length conflict".into());
-        }
+        let mut input = open_source_output(directory, &self.relative)?;
+        let before = copy_verified_raw(&mut input, self.byte_len, &self.sha256, output)?;
+        let named = open_source_output(directory, &self.relative)?;
+        require_unchanged_output(&before, &named.metadata().map_err(|e| e.to_string())?)?;
         Ok(())
     }
+}
+
+/// Verify exact regular-file bytes using fixed memory. Read/write errors and
+/// observed length, inode or mutation conflicts cannot produce a receipt.
+/// Callers must stage writes and recheck the named inode before publication.
+pub fn copy_verified_raw(
+    input: &mut std::fs::File,
+    expected_len: u64,
+    expected_digest: &str,
+    output: &mut impl std::io::Write,
+) -> Result<std::fs::Metadata, String> {
+    use std::io::Read;
+    let before = input
+        .metadata()
+        .map_err(|e| format!("output metadata: {e}"))?;
+    if !before.is_file() || before.len() != expected_len {
+        return Err("output artifact length/type conflict".into());
+    }
+    let mut hasher = Sha256::new();
+    let mut bytes = [0; OUTPUT_COPY_BUFFER_BYTES];
+    let mut total = 0u64;
+    loop {
+        let count = match input.read(&mut bytes) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result.map_err(|e| format!("output artifact read failed: {e}"))?,
+        };
+        if count == 0 {
+            break;
+        }
+        total = total
+            .checked_add(count as u64)
+            .ok_or("output byte count overflow")?;
+        if total > expected_len {
+            return Err("output artifact grew during read".into());
+        }
+        hasher.update(&bytes[..count]);
+        output
+            .write_all(&bytes[..count])
+            .map_err(|e| format!("output artifact write failed: {e}"))?;
+    }
+    if total != expected_len {
+        return Err("output artifact short read".into());
+    }
+    if format!("{:x}", hasher.finalize()) != expected_digest {
+        return Err("output artifact digest conflict".into());
+    }
+    require_unchanged_output(&before, &input.metadata().map_err(|e| e.to_string())?)?;
+    Ok(before)
+}
+
+/// Check inode, length and filesystem-observed change times during a read,
+/// and re-use this check on the freshly opened pathname. Same-UID writes
+/// hidden by timestamp resolution are outside this observation guarantee.
+pub fn require_unchanged_output(
+    before: &std::fs::Metadata,
+    after: &std::fs::Metadata,
+) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if before.is_file()
+            && after.is_file()
+            && (
+                before.dev(),
+                before.ino(),
+                before.len(),
+                before.nlink(),
+                before.mtime(),
+                before.mtime_nsec(),
+                before.ctime(),
+                before.ctime_nsec(),
+            ) == (
+                after.dev(),
+                after.ino(),
+                after.len(),
+                after.nlink(),
+                after.mtime(),
+                after.mtime_nsec(),
+                after.ctime(),
+                after.ctime_nsec(),
+            )
+        {
+            return Ok(());
+        }
+    }
+    Err("output artifact inode/length/change-time conflict".into())
 }
 
 #[cfg(test)]
@@ -457,6 +521,9 @@ mod tests {
         assert!(check(&lost).is_err());
         lost["output"]["selection"] = serde_json::json!({"device":1,"inode":2,"byte_len":42});
         check(&lost).unwrap();
+        lost["output"]["selection"]["byte_len"] = serde_json::json!(u64::MAX);
+        check(&lost).unwrap(); // missing selected storage has no positive output ceiling
+        lost["output"]["selection"]["byte_len"] = 42.into();
         lost["output"]["reason"] = "selected_storage_short".into();
         assert!(check(&lost).is_err());
         lost["output"]["observed_byte_len"] = 42.into();
@@ -606,6 +673,154 @@ mod tests {
             .unwrap();
         output.write_all(b"x").unwrap();
         assert!(VerifiedCompletion::from_source_files(&binding).is_err());
+    }
+
+    #[test]
+    #[ignore = "streams 1 GiB + 1 byte; explicit raw-output regression control"]
+    fn artifact_above_old_cap_passes_state_source_verification() {
+        let directory = tempfile::tempdir().unwrap();
+        let handle = directory.path().join("ab_fixture");
+        std::fs::create_dir(&handle).unwrap();
+        let (_, fixture) = fixture();
+        let mut registration: serde_json::Value =
+            serde_json::from_str(fixture["registration_bytes_utf8"].as_str().unwrap()).unwrap();
+        registration["spool_root"] = directory.path().to_str().unwrap().into();
+        registration["handle_dir"] = handle.to_str().unwrap().into();
+        for field in ["helper", "recovery"] {
+            registration[field]["path"] = handle.join(field).to_str().unwrap().into();
+        }
+        let binding = AdmittedSourceBinding::new(
+            "test-admission",
+            &serde_json::to_vec(&registration).unwrap(),
+        )
+        .unwrap();
+        let length = 1024 * 1024 * 1024 + 1u64;
+        let digest = "6d9bfe50425f2dfe4e2ac07efee1f0bc9d567348ad4aed62704ffe6f5884e9a8";
+        std::fs::File::create(handle.join("completion-output-v2.bin"))
+            .unwrap()
+            .set_len(length)
+            .unwrap();
+        let mut outcome: serde_json::Value =
+            serde_json::from_str(fixture["outcome_bytes_utf8"].as_str().unwrap()).unwrap();
+        let mut snapshot: serde_json::Value =
+            serde_json::from_str(fixture["artifact_snapshot_bytes_utf8"].as_str().unwrap())
+                .unwrap();
+        outcome["registration_digest"] = binding.registration_digest().into();
+        snapshot["registration_digest"] = binding.registration_digest().into();
+        let outcome = serde_json::to_vec(&outcome).unwrap();
+        snapshot["outcome_sha256"] = sha256(&outcome).into();
+        snapshot["outcome_byte_len"] = outcome.len().into();
+        snapshot["output"]["byte_len"] = length.into();
+        snapshot["output"]["sha256"] = digest.into();
+        let snapshot = serde_json::to_vec(&snapshot).unwrap();
+        assert!(snapshot.len() < 2048);
+        assert!(VerifiedCompletion::from_bytes(&binding, &snapshot, &outcome).is_err());
+        std::fs::write(handle.join("completion-snapshot-v2.json"), &snapshot).unwrap();
+        std::fs::write(handle.join("source-outcome-v2.json"), outcome).unwrap();
+        let verified = VerifiedCompletion::from_source_files(&binding).unwrap();
+        let CompletionOutput::Artifact(artifact) = verified.snapshot.output else {
+            panic!("raw artifact absent")
+        };
+        assert_eq!(artifact.byte_len, length);
+        assert_eq!(artifact.sha256, digest);
+        println!(
+            "State raw bytes={length} snapshot bytes={} sha256={digest}",
+            snapshot.len()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_copy_rejects_short_growth_replacement_and_same_length_writes() {
+        use std::io::Write;
+        struct Change<F: FnMut()>(Option<F>);
+        impl<F: FnMut()> Write for Change<F> {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if let Some(mut change) = self.0.take() {
+                    change();
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for change in ["short", "grow", "replace", "same-length"] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("completion-output-v2.bin");
+            let bytes = vec![0xff; OUTPUT_COPY_BUFFER_BYTES * 2];
+            std::fs::write(&path, &bytes).unwrap();
+            // Make a real subsequent write observably change mtime without a
+            // sleep or reliance on two writes landing in different clock ticks.
+            std::fs::File::open(&path)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH)
+                .unwrap();
+            let artifact = OutputArtifact {
+                representation: "retained-output-v1".into(),
+                relative: "completion-output-v2.bin".into(),
+                sha256: sha256(&bytes),
+                byte_len: bytes.len() as u64,
+                encoding: "raw".into(),
+            };
+            let mut writer = Change(Some(|| {
+                match change {
+                    "short" => std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&path)
+                        .unwrap()
+                        .set_len(1)
+                        .unwrap(),
+                    "grow" => std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&path)
+                        .unwrap()
+                        .write_all(b"x")
+                        .unwrap(),
+                    "replace" => {
+                        let replacement = directory.path().join("replacement");
+                        std::fs::write(&replacement, &bytes).unwrap();
+                        std::fs::rename(replacement, &path).unwrap();
+                    }
+                    // Restore already-read bytes: digest alone cannot detect this.
+                    _ => {
+                        let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                        file.write_all(b"x").unwrap();
+                        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(0)).unwrap();
+                        file.write_all(&bytes[..1]).unwrap();
+                    }
+                }
+            }));
+            let error = artifact
+                .copy_verified(directory.path(), &mut writer)
+                .unwrap_err();
+            println!("{change}: {error}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn raw_copy_disk_full_is_an_error_not_a_partial_receipt() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("completion-output-v2.bin"), b"body").unwrap();
+        let artifact = OutputArtifact {
+            representation: "retained-output-v1".into(),
+            relative: "completion-output-v2.bin".into(),
+            sha256: sha256(b"body"),
+            byte_len: 4,
+            encoding: "raw".into(),
+        };
+        let mut full = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap();
+        let error = artifact
+            .copy_verified(directory.path(), &mut full)
+            .unwrap_err();
+        assert!(
+            error.contains("write failed") && error.contains("os error 28"),
+            "{error}"
+        );
     }
 
     #[test]

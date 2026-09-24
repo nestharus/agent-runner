@@ -1,12 +1,9 @@
-//! Bounded no-follow source reads. Same UID remains the trust principal.
+//! No-follow regular source opens and bounded protocol metadata reads.
+//! Raw output has no positive size ceiling. Same UID remains the trust principal.
 use std::path::{Component, Path};
 
 #[cfg(unix)]
-pub fn open_source_file(
-    directory: &Path,
-    relative: &str,
-    limit: usize,
-) -> Result<std::fs::File, String> {
+pub fn open_source_output(directory: &Path, relative: &str) -> Result<std::fs::File, String> {
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::fs::OpenOptionsExt;
     if std::fs::canonicalize(directory).map_err(|e| e.to_string())? != directory {
@@ -46,8 +43,8 @@ pub fn open_source_file(
             continue;
         }
         let metadata = file.metadata().map_err(|e| e.to_string())?;
-        if !metadata.is_file() || metadata.len() > limit as u64 {
-            return Err("source is not a bounded regular file".into());
+        if !metadata.is_file() {
+            return Err("source is not a regular file".into());
         }
         return Ok(file);
     }
@@ -55,12 +52,21 @@ pub fn open_source_file(
 }
 
 #[cfg(not(unix))]
-pub fn open_source_file(
-    _directory: &Path,
-    _relative: &str,
-    _limit: usize,
-) -> Result<std::fs::File, String> {
+pub fn open_source_output(_directory: &Path, _relative: &str) -> Result<std::fs::File, String> {
     Err("completion-continuation-v2 source reads require the supported Unix native lane".into())
+}
+
+/// Protocol JSON is parsed as a whole object; reject excess metadata explicitly.
+pub fn open_source_file(
+    directory: &Path,
+    relative: &str,
+    limit: usize,
+) -> Result<std::fs::File, String> {
+    let file = open_source_output(directory, relative)?;
+    if file.metadata().map_err(|e| e.to_string())?.len() > limit as u64 {
+        return Err("source metadata exceeds protocol bound".into());
+    }
+    Ok(file)
 }
 
 pub fn read_source_file(directory: &Path, relative: &str, limit: usize) -> Result<Vec<u8>, String> {
