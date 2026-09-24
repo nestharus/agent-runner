@@ -1,5 +1,5 @@
 //! Host-side pinned completion authority and broker-attested root child join.
-use oulipoly_kernel_broker::protocol::{self, JoinSpec, Operation};
+use oulipoly_kernel_broker::protocol::{self, JoinSpec, Operation, StateRoute};
 use oulipoly_state::mailbox::MailboxDb;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -304,6 +304,21 @@ pub(crate) fn host_entry() -> Option<ExitCode> {
     }
     let result = stage_host_entry(
         || {
+            // A selected v30 route must never read the retired user-owned
+            // sidecar, even if an intact v29 copy is still present there.
+            // Owner publication currently precedes J, while Y/W require its
+            // consumed child. Keep admission closed until that ordering and
+            // the remaining writer/read topology are routed together.
+            match protocol::state_route_at(&broker_socket())
+                .map_err(|e| format!("broker State route unavailable: {e}"))?
+            {
+                StateRoute::Legacy => {}
+                StateRoute::BrokerOwned { source_generation } => {
+                    return Err(format!(
+                        "broker-owned State generation {source_generation} requires production client routing"
+                    ));
+                }
+            }
             // Probe before E: a detached snapshot cannot create or migrate the
             // live databases. Missing State/domain initialization is a separate
             // administrative transition, never part of a failed custody grant.

@@ -4,9 +4,10 @@
 use oulipoly_kernel_broker::protocol::{
     self, AcceptedWorkSpec, JoinSpec, Operation, ProcessWitness, SourceScope, SourceSocketWitness,
 };
-use oulipoly_state::mailbox::MailboxDb;
+use oulipoly_state::mailbox::{BrokerSidecar, MailboxDb};
 use std::fs::{self, File};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -44,6 +45,20 @@ fn inner() {
     let domain = mailbox.completion_continuation_domain().unwrap().unwrap();
     drop(mailbox);
     drop(oulipoly_state::StateDb::open(&data.join("state.db")).unwrap());
+    let broker_generation = if mode == "broker_state" {
+        let sidecar_dir = broker_state.join("sidecar");
+        fs::create_dir(&sidecar_dir).unwrap();
+        fs::set_permissions(&sidecar_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let target = sidecar_dir.join("pid-identity.db");
+        rusqlite::Connection::open(data.join("pid-identity.db"))
+            .unwrap()
+            .execute("VACUUM INTO ?1", [target.to_str().unwrap()])
+            .unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        Some(BrokerSidecar::activate_quiesced_copy(&target, &broker_state).unwrap())
+    } else {
+        None
+    };
     let socket = temp.path().join("broker.sock");
     let broker_log = temp.path().join("broker.log");
     let mut broker = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
@@ -61,6 +76,71 @@ fn inner() {
         "broker startup: {}",
         fs::read_to_string(&broker_log).unwrap()
     );
+    if let Some(generation) = broker_generation {
+        // The test executable shares UID and broker access but is not the
+        // fixed Runner image. It cannot inspect the route or select a path.
+        assert!(protocol::state_route_at(&socket).is_err());
+        // The user-owned source is now stale and even invalid. The Runner's
+        // first production preflight must still learn v30 from the live
+        // broker, before parsing any copied row or reserving an entry.
+        fs::write(data.join("pid-identity.db"), b"retired copied sidecar").unwrap();
+        let invoke = || {
+            Command::new(&runner)
+                .arg("--help")
+                .env("OULIPOLY_DATA_DIR", &data)
+                .env("OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1", "1")
+                .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                .env_remove("LD_LIBRARY_PATH")
+                .output()
+                .unwrap()
+        };
+        let first = invoke();
+        assert!(!first.status.success());
+        assert!(
+            String::from_utf8_lossy(&first.stderr).contains(&format!(
+                "broker-owned State generation {generation} requires production client routing"
+            )),
+            "{}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        assert_eq!(
+            fs::read_dir(broker_state.join("entries")).unwrap().count(),
+            0
+        );
+        stop(&mut broker);
+        let unavailable = invoke();
+        assert!(!unavailable.status.success());
+        assert!(
+            String::from_utf8_lossy(&unavailable.stderr).contains("broker State route unavailable")
+        );
+        assert_eq!(
+            fs::read_dir(broker_state.join("entries")).unwrap().count(),
+            0
+        );
+        let restart_log = temp.path().join("state-restart.log");
+        let mut restarted = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(File::create(&restart_log).unwrap()))
+            .spawn()
+            .unwrap();
+        eventually(|| {
+            restarted.try_wait().unwrap().is_some()
+                || protocol::request_at(&socket, Operation::Classify).is_ok()
+        });
+        assert!(restarted.try_wait().unwrap().is_none());
+        let second = invoke();
+        assert!(!second.status.success());
+        assert!(String::from_utf8_lossy(&second.stderr).contains(&generation));
+        assert_eq!(
+            fs::read_dir(broker_state.join("entries")).unwrap().count(),
+            0
+        );
+        stop(&mut restarted);
+        return;
+    }
     let unsupported = Command::new(&runner)
         .args(["--model", "age319-missing-model", "hello"])
         .env("OULIPOLY_DATA_DIR", &data)
@@ -320,7 +400,7 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
     if std::env::var_os("OULIPOLY_AGE319_RUNNER_IMAGE").is_none() {
         return;
     }
-    for mode in ["help", "diagnostics", "join_only"] {
+    for mode in ["help", "diagnostics", "join_only", "broker_state"] {
         let output = Command::new("unshare")
             .args(["-Urpfm", "--mount-proc"])
             .arg(std::env::current_exe().unwrap())

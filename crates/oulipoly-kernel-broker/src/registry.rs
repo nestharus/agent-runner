@@ -77,6 +77,11 @@ impl RootRegistry {
             if name == "terminals" && entry.file_type()?.is_dir() {
                 continue;
             }
+            // serve() has already opened and validated this fixed root-only
+            // storage before it opens the root registry.
+            if name == "sidecar" && entry.file_type()?.is_dir() {
+                continue;
+            }
             if !name.ends_with(".json") || !entry.file_type()?.is_file() {
                 return Err(io::Error::other("unrecognized registry entry"));
             }

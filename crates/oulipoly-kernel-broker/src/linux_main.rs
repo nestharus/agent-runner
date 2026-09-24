@@ -1505,6 +1505,12 @@ fn serve() -> io::Result<()> {
             // governed by exact gates and process death, not a 5s cutoff.
             stream.set_read_timeout(None)?;
             stream.set_write_timeout(None)?;
+            // A route observation can race broker restart and activation.
+            // Until owner and every write-driving client is routed, the old
+            // entry sequence cannot create or join work against a v30 store.
+            if broker_sidecar.is_some() && matches!(operation, b'E' | b'P' | b'G' | b'A' | b'J') {
+                return Err(io::Error::other("legacy entry closed by broker State v30"));
+            }
             if operation == b'J' {
                 if !root_launch_admitted(
                     &peer,
@@ -1762,6 +1768,27 @@ fn serve() -> io::Result<()> {
                     &entries,
                     sidecar,
                 )
+            } else if operation == b'I' {
+                // The exact installed Runner may inspect the live storage
+                // route before E/G/J. No pathname, copied row or environment
+                // value can select the broker generation.
+                if !matches!(payload, RequestPayload::None)
+                    || !root_launch_admitted(
+                        &peer,
+                        &classify_scope(&peer, &host_namespace, &registry, &works),
+                        &host_namespace,
+                    )
+                    || !peer.process.same_executable_as(&runner_image)?
+                {
+                    return Err(io::Error::other("broker State route admission refused"));
+                }
+                peer.process.verify()?;
+                Ok(match broker_sidecar.as_ref() {
+                    Some(sidecar) => {
+                        format!("state-route broker-owned {}\n", sidecar.source_generation())
+                    }
+                    None => "state-route legacy\n".into(),
+                })
             } else {
                 dispatch_authenticated(
                     operation,

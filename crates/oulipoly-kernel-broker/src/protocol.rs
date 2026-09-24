@@ -8,6 +8,33 @@ use std::path::Path;
 
 pub const INSTALLED_SOCKET: &str = "/run/oulipoly-kernel-broker/control.sock";
 
+/// Entry routing is observed from the live broker before any user-side
+/// sidecar read. This is a storage version observation, not a grant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StateRoute {
+    Legacy,
+    BrokerOwned { source_generation: String },
+}
+
+pub fn state_route_at(path: &Path) -> io::Result<StateRoute> {
+    let response = request_frame_at(path, Operation::ReadStateRoute, Payload::None)?;
+    if response == "state-route legacy\n" {
+        return Ok(StateRoute::Legacy);
+    }
+    let generation = response
+        .strip_prefix("state-route broker-owned ")
+        .and_then(|value| value.strip_suffix('\n'))
+        .ok_or_else(|| io::Error::other("invalid broker State route"))?;
+    let parsed = uuid::Uuid::parse_str(generation)
+        .map_err(|_| io::Error::other("invalid broker State generation"))?;
+    if parsed.to_string() != generation {
+        return Err(io::Error::other("noncanonical broker State generation"));
+    }
+    Ok(StateRoute::BrokerOwned {
+        source_generation: generation.into(),
+    })
+}
+
 /// Opt-in v1 readback. The broker derives the domain and supervisor from its
 /// durable entry registry; these IDs never authorize a request by themselves.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -152,6 +179,7 @@ pub enum Operation {
     Classify,
     ReserveEntry,
     ReadEntry,
+    ReadStateRoute,
     LaunchFixedRunner,
 }
 
@@ -878,6 +906,7 @@ fn request_frame_at(path: &Path, operation: Operation, payload: Payload) -> io::
         Operation::ReserveEntry if matches!(payload, Payload::Bind(..)) => b'G',
         Operation::ReserveEntry => b'E',
         Operation::ReadEntry => b'A',
+        Operation::ReadStateRoute => b'I',
         Operation::LaunchFixedRunner => b'L',
     };
     request[1..17].copy_from_slice(&challenge);
