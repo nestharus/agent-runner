@@ -32,6 +32,7 @@ coordination. Diagnostics must select the explicitly named
 | `table.provider_launch_transition_replays` | historical/diagnostic | Append-only launch replay evidence. Live retirement uses the normalized current-duty projection, never suffix matching over operation history. |
 | `table.provider_launch_native_channel_duties` | live authority | One normalized current row per retained native-channel duty; exact domain checks never scan replay history. |
 | `table.completed_turns` | bounded cross-boundary | `recovery_pending` is updated from explicit committed tail dispositions. Missing, old, or corrupt evidence remains pending. |
+| `table.completed_turn_recovery_epoch` | live authority | High-water mark and revision flag a newly admitted older invocation behind a recovery cursor. |
 | `table.invocation_completion_obligations` | bounded cross-boundary | Live readback is by derived admission key or indexed event identity; the append-only full ledger is diagnostic. |
 | `table.invocation_completion_continuity` | bounded cross-boundary | Exact admission join and bounded ordinal suffix are the only live interfaces. |
 | `table.completion_authority_continuity` | bounded cross-boundary | Sidecar repair and retirement compare the exact append-only head or read only the bounded suffix selected by State authority. |
@@ -61,6 +62,8 @@ coordination. Diagnostics must select the explicitly named
 | `index.provider_launch_cancelling` | live authority | Exact current cancellation set used by supervisor retirement revalidation. |
 | `index.provider_launch_native_channel_duty_domain` | live authority | Exact current native-channel duty by completion domain. |
 | `index.completed_turns_recovery_pending` | live authority | Partial completed-turn recovery working set; terminal rows are absent. |
+| `index.completed_turns_recovery_target` | live authority | Partial provider/session target seek for pending recovery and chain refusal. |
+| `index.completed_turns_recovery_session` | live authority | Partial session seek for legacy manual-resume refusal. |
 | `index.idx_invocation_completion_obligations_legacy` | live authority | Startup detects explicit legacy NULL bindings without reading v2 history. |
 | `index.idx_invocation_completion_obligations_event` | bounded cross-boundary | Exact event conflict/readback for immutable admissions. |
 | `index.idx_invocation_completion_continuity_head` | live authority | State continuity-head lookup is a one-row descending index read. |
@@ -98,6 +101,8 @@ coordination. Diagnostics must select the explicitly named
 | `statement.mailbox.full_listing` | historical/diagnostic | Requires a historical mailbox handle; live-handle attempts are rejected and attributed through AGE-369 diagnostics before SQLite access. |
 | `statement.mailbox.resolve_unresolved_delivery_attempts` | live authority | Short writer mutation seeded only by the unresolved partial index. |
 | `statement.completed_turns.recovery_pending` | live authority | Explicit recovery disposition and a partial pending index plus primary-key invocation join keep terminal rows outside the working set. |
+| `statement.completed_turns.recovery_target` | live authority | Indexed provider/session or exact session seek finds one conflict; chain walks use the target index per segment. |
+| `statement.completed_turns.recovery_page` | live authority | A 101-row pending-index seek returns at most 100 identities, a continuation cursor, and a restart signal for older arrivals. |
 | `statement.completion_continuation.exact_admission` | live authority | Derived admission primary key with one continuity join; immutable registration/source/handle conflicts use exact indexed identity projections. |
 | `statement.completion_continuation.continuity_suffix` | bounded cross-boundary | Positive caller limit after the durable sidecar continuity ordinal; the obligation join is by admission primary key. |
 | `statement.completion_continuation.legacy_probe` | live authority | Partial NULL-binding existence probe; it does not infer terminality. |

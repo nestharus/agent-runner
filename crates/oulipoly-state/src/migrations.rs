@@ -165,7 +165,32 @@ static MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0027_record_timestamp_contract.sql"),
         post_sql_hook: Some(crate::StateDb::install_invocation_timestamp_contract),
     },
+    Migration {
+        target_version: 28,
+        id: "0028_completed_turn_recovery_targets",
+        sql: include_str!("../migrations/0028_completed_turn_recovery_targets.sql"),
+        post_sql_hook: Some(validate_completed_turn_recovery_targets),
+    },
 ];
+
+fn validate_completed_turn_recovery_targets(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let missing: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM completed_turns WHERE recovery_pending=1
+         AND (recovery_provider_name IS NULL OR recovery_provider_session IS NULL))",
+        [],
+        |row| row.get(0),
+    )?;
+    if missing {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ffi::ErrorCode::ConstraintViolation,
+                extended_code: rusqlite::ffi::SQLITE_CONSTRAINT,
+            },
+            Some("pending completed-turn recovery target unavailable".into()),
+        ));
+    }
+    Ok(())
+}
 
 pub fn manifest() -> &'static [Migration] {
     MIGRATIONS

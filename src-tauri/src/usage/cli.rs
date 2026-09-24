@@ -260,6 +260,12 @@ pub(crate) enum Subcommands {
     CompletedTurn {
         #[arg(long)]
         invocation: Option<String>,
+        /// Continue the bounded recovery listing after this invocation row ID.
+        #[arg(long, requires = "epoch", conflicts_with_all = ["invocation", "settle", "output"])]
+        after_id: Option<i64>,
+        /// Epoch returned by the first page; restart after this pass if requested.
+        #[arg(long, requires = "after_id")]
+        epoch: Option<i64>,
         #[arg(long)]
         settle: bool,
         /// Explicitly replay retained stdout bytes; never asserts prior delivery.
@@ -834,6 +840,43 @@ pub(crate) enum SessionSubcommands {
 #[cfg(test)]
 mod observation_rearm_cli_tests {
     use super::*;
+
+    #[test]
+    fn completed_turn_cursor_requires_epoch_and_cannot_settle_a_page() {
+        assert!(Cli::try_parse_from(["runner", "completed-turn", "--after-id", "100"]).is_err());
+        assert!(Cli::try_parse_from(["runner", "completed-turn", "--epoch", "1"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "runner",
+                "completed-turn",
+                "--after-id",
+                "100",
+                "--epoch",
+                "1",
+                "--settle",
+            ])
+            .is_err()
+        );
+        let cli = Cli::try_parse_from([
+            "runner",
+            "completed-turn",
+            "--after-id",
+            "100",
+            "--epoch",
+            "1",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Subcommands::CompletedTurn {
+                invocation: None,
+                after_id: Some(100),
+                epoch: Some(1),
+                settle: false,
+                output: false,
+            })
+        ));
+    }
 
     #[test]
     fn observation_rearm_requires_exact_stop_and_resolution_separate_from_resume() {

@@ -1980,12 +1980,20 @@ impl MailboxDb {
         &mut self,
         session: &str,
         retained_claims: &[RetainedWakeClaim],
+        expected_claim: &Option<ManualWakeClaimIdentity>,
     ) -> Result<ManualWakeCoordination, String> {
         self.conn
             .busy_timeout(StdDuration::ZERO)
             .map_err(|e| e.to_string())?;
         self.wake_sessions()
-            .coordinate_manual_resume(session, retained_claims)
+            .coordinate_manual_resume(session, retained_claims, expected_claim)
+    }
+
+    pub(crate) fn manual_wake_claim_identity(
+        &self,
+        session: &str,
+    ) -> Result<Option<ManualWakeClaimIdentity>, String> {
+        wake_claim(&self.conn, session).map(|claim| claim.map(ManualWakeClaimIdentity::from))
     }
 
     pub(crate) fn begin_completion_authority_fence(
@@ -6394,6 +6402,33 @@ pub(crate) struct RetainedWakeClaim {
     pub(crate) phase: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManualWakeClaimIdentity {
+    pub(crate) claim_token: String,
+    pub(crate) wake_invocation_uuid: Option<String>,
+    claimed_at: String,
+    wake_pid: Option<i64>,
+    reason: String,
+    auto_wake_count: i64,
+    min_pending_seq_at_claim: Option<i64>,
+    max_pending_seq_at_claim: Option<i64>,
+}
+
+impl From<WakeClaimRow> for ManualWakeClaimIdentity {
+    fn from(claim: WakeClaimRow) -> Self {
+        Self {
+            claim_token: claim.claim_token,
+            wake_invocation_uuid: claim.wake_invocation_uuid,
+            claimed_at: claim.claimed_at,
+            wake_pid: claim.wake_pid,
+            reason: claim.reason,
+            auto_wake_count: claim.auto_wake_count,
+            min_pending_seq_at_claim: claim.min_pending_seq_at_claim,
+            max_pending_seq_at_claim: claim.max_pending_seq_at_claim,
+        }
+    }
+}
+
 impl WakeSessionRepository<'_> {
     pub fn upsert_session_metadata(
         &mut self,
@@ -7072,10 +7107,16 @@ impl WakeSessionRepository<'_> {
         &mut self,
         session: &str,
         retained_claims: &[RetainedWakeClaim],
+        expected_claim: &Option<ManualWakeClaimIdentity>,
     ) -> Result<ManualWakeCoordination, String> {
         // A live coherent read is only a wait/release hint, not launch authority.
         // Drop it before acquiring a writer: never upgrade a read transaction.
         let read = self.conn.transaction().map_err(|e| e.to_string())?;
+        if wake_claim_tx(&read, session)?.map(ManualWakeClaimIdentity::from) != *expected_claim {
+            return Err(
+                "manual_resume_claim_changed_retry: claim changed after exact State lookup".into(),
+            );
+        }
         let observation = manual_resume_observation_on(&read, session)?;
         drop(read);
         if let Some(observation) = observation {
@@ -7088,7 +7129,13 @@ impl WakeSessionRepository<'_> {
         if let Some(observation) = manual_native_custody_on(&tx, session)? {
             return Ok(observation);
         }
-        let Some(claim) = wake_claim_tx(&tx, session)? else {
+        let claim = wake_claim_tx(&tx, session)?;
+        if claim.clone().map(ManualWakeClaimIdentity::from) != *expected_claim {
+            return Err(
+                "manual_resume_claim_changed_retry: claim changed after exact State lookup".into(),
+            );
+        }
+        let Some(claim) = claim else {
             return Ok(ManualWakeCoordination::Absent);
         };
         if wake_claim_is_releasable_for_manual_resume(&tx, &claim)? {

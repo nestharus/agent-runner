@@ -326,7 +326,13 @@ pub(super) fn complete(
 
 /// No registry, execution service, resume loop or wake-launch function enters
 /// this selector, including when a DISTINCT next delivery remains pending.
-pub(crate) fn command(invocation: Option<&str>, settle: bool, output: bool) -> Result<i32, String> {
+pub(crate) fn command(
+    invocation: Option<&str>,
+    after_id: Option<i64>,
+    epoch: Option<i64>,
+    settle: bool,
+    output: bool,
+) -> Result<i32, String> {
     let state = StateDb::open_default()?;
     let Some(uuid) = invocation else {
         if settle || output {
@@ -334,7 +340,8 @@ pub(crate) fn command(invocation: Option<&str>, settle: bool, output: bool) -> R
         }
         println!(
             "{}",
-            serde_json::to_string(&state.completed_turn_identities()?).map_err(|e| e.to_string())?
+            serde_json::to_string(&state.completed_turn_identity_page(after_id, epoch)?)
+                .map_err(|e| e.to_string())?
         );
         return Ok(0);
     };

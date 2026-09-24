@@ -318,6 +318,7 @@ fn assert_schema5_current_plan(plan: &[&migrations::Migration]) {
             "0025_completed_turns",
             "0026_live_history_barrier",
             "0027_record_timestamp_contract",
+            "0028_completed_turn_recovery_targets",
         ]
     );
 }
