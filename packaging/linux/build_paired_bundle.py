@@ -11,25 +11,29 @@ import uuid
 from pathlib import Path
 
 
-def build(runner: Path, broker: Path, launcher: Path, service: Path, output: Path, version: str) -> dict:
+def build(runner: Path, broker: Path, launcher: Path, bash: Path, service: Path, output: Path, version: str) -> dict:
     runner_bytes = runner.read_bytes()
     broker_bytes = broker.read_bytes()
     launcher_bytes = launcher.read_bytes()
+    bash_bytes = bash.read_bytes()
     runner_hash = hashlib.sha256(runner_bytes).hexdigest()
     broker_hash = hashlib.sha256(broker_bytes).hexdigest()
     launcher_hash = hashlib.sha256(launcher_bytes).hexdigest()
+    bash_hash = hashlib.sha256(bash_bytes).hexdigest()
     manifest = {
-        "schema": 1,
+        "schema": 2,
         "version": version,
-        "generation": str(uuid.uuid5(uuid.NAMESPACE_URL, f"oulipoly-pair-v1:{version}:{runner_hash}:{broker_hash}:{launcher_hash}")),
+        "generation": str(uuid.uuid5(uuid.NAMESPACE_URL, f"oulipoly-pair-v2:{version}:{runner_hash}:{broker_hash}:{launcher_hash}:{bash_hash}")),
         "runner_sha256": runner_hash,
         "broker_sha256": broker_hash,
         "launcher_sha256": launcher_hash,
+        "bash_sha256": bash_hash,
     }
     files = {
         "usr/local/libexec/oulipoly/oulipoly-agent-runner": (runner_bytes, 0o755),
         "usr/local/libexec/oulipoly/oulipoly-kernel-broker": (broker_bytes, 0o755),
         "usr/local/libexec/oulipoly/oulipoly-installed-launcher": (launcher_bytes, 0o755),
+        "usr/local/libexec/oulipoly/agent-bash": (bash_bytes, 0o755),
         "usr/local/libexec/oulipoly/install-v1.json": ((json.dumps(manifest, sort_keys=True) + "\n").encode(), 0o644),
         "etc/systemd/system/oulipoly-kernel-broker.service": (service.read_bytes(), 0o644),
         "usr/share/applications/oulipoly-plane.desktop": (
@@ -60,7 +64,7 @@ def verify(archive_path: Path) -> dict:
         members = {member.name: member for member in archive.getmembers()}
         base = "usr/local/libexec/oulipoly/"
         manifest = json.load(archive.extractfile(members[base + "install-v1.json"]))
-        for name, key in (("oulipoly-agent-runner", "runner_sha256"), ("oulipoly-kernel-broker", "broker_sha256"), ("oulipoly-installed-launcher", "launcher_sha256")):
+        for name, key in (("oulipoly-agent-runner", "runner_sha256"), ("oulipoly-kernel-broker", "broker_sha256"), ("oulipoly-installed-launcher", "launcher_sha256"), ("agent-bash", "bash_sha256")):
             assert hashlib.sha256(archive.extractfile(members[base + name]).read()).hexdigest() == manifest[key]
         assert members["etc/systemd/system/oulipoly-kernel-broker.service"].isfile()
         for name in ("agents", "oulipoly-agent-runner", "oulipoly-plane"):
@@ -74,12 +78,13 @@ def main() -> None:
     parser.add_argument("--runner", type=Path, required=True)
     parser.add_argument("--broker", type=Path, required=True)
     parser.add_argument("--launcher", type=Path, required=True)
+    parser.add_argument("--bash", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
     with (root / "Cargo.toml").open("rb") as source:
         version = tomllib.load(source)["workspace"]["package"]["version"]
-    manifest = build(args.runner, args.broker, args.launcher, root / "packaging/linux/oulipoly-kernel-broker.service", args.output, version)
+    manifest = build(args.runner, args.broker, args.launcher, args.bash, root / "packaging/linux/oulipoly-kernel-broker.service", args.output, version)
     assert verify(args.output) == manifest
     print(f"staged {args.output}: version={version} generation={manifest['generation']}")
 

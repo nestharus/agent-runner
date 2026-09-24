@@ -456,6 +456,23 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
                 }),
             )?;
             private_receipt = Some(receipt.clone());
+            if std::env::var_os("AGE319_PRIVATE_BASH_CHILD_V1").is_some() {
+                let bash = std::env::var("AGE319_PRIVATE_BASH_IMAGE")
+                    .map_err(|_| "private Bash source image absent")?;
+                let output = std::process::Command::new(bash)
+                    .arg("__age319-private-admit-child-v1")
+                    .output()
+                    .map_err(|e| e.to_string())?;
+                if !output.status.success() {
+                    return Err(format!(
+                        "real private Bash child failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    ));
+                }
+                let report: serde_json::Value =
+                    serde_json::from_slice(&output.stdout).map_err(|e| e.to_string())?;
+                private_v30_marker("bash-child", &report)?;
+            }
         }
         effect_binding = Some((receipt, session));
     }
@@ -2066,6 +2083,7 @@ mod tests {
             runner_sha256: "a".repeat(64),
             broker_sha256: "b".repeat(64),
             launcher_sha256: None,
+            bash_sha256: None,
         };
         let observation = protocol::InstalledPairObservation {
             version: pair.version.clone(),

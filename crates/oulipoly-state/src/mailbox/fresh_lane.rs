@@ -11,6 +11,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 include!("fresh_recipient.rs");
+include!("fresh_bash_child.rs");
 
 const LANE_DIRECTORY: &str = "v30";
 const LANE_PROTOCOL: &str = "fresh-v30-lane-v1";
@@ -19,6 +20,7 @@ const FRESH_STATE_SCHEMA: &str = include_str!("migrations/0030_fresh_state_ident
 const FRESH_CHILD_REQUEST_SCHEMA: &str = include_str!("migrations/0030_fresh_child_request.sql");
 const FRESH_HANDOFF_SCHEMA: &str = include_str!("migrations/0031_fresh_released_handoff.sql");
 const FRESH_ROOT_EFFECT_SCHEMA: &str = include_str!("migrations/0032_fresh_root_effect.sql");
+const FRESH_BASH_CHILD_SCHEMA: &str = include_str!("migrations/0033_fresh_bash_child.sql");
 const FRESH_RECIPIENT_SCHEMA: &str = include_str!("migrations/0030_fresh_recipient.sql");
 const FRESH_RECIPIENT_STATE_SCHEMA: &str =
     include_str!("migrations/0030_fresh_recipient_state.sql");
@@ -236,7 +238,7 @@ impl FreshV30Lane {
         let state_conn = Connection::open(&state_path).map_err(|e| e.to_string())?;
         state_conn
             .execute_batch(&format!(
-                "{FRESH_STATE_SCHEMA}\n{FRESH_RECIPIENT_STATE_SCHEMA}\n{FRESH_CHILD_REQUEST_SCHEMA}\n{FRESH_HANDOFF_SCHEMA}\n{FRESH_ROOT_EFFECT_SCHEMA}"
+                "{FRESH_STATE_SCHEMA}\n{FRESH_RECIPIENT_STATE_SCHEMA}\n{FRESH_CHILD_REQUEST_SCHEMA}\n{FRESH_HANDOFF_SCHEMA}\n{FRESH_ROOT_EFFECT_SCHEMA}\n{FRESH_BASH_CHILD_SCHEMA}"
             ))
             .map_err(|e| e.to_string())?;
         state_conn
@@ -527,6 +529,17 @@ impl FreshV30Lane {
             return Err("fresh root effect schema is incomplete".into());
         }
         verify_fresh_root_effect_schema(&state_conn)?;
+        match fresh_bash_child_schema_count(&state_conn)? {
+            0 => state_conn
+                .execute_batch(FRESH_BASH_CHILD_SCHEMA)
+                .map_err(|e| e.to_string())?,
+            9 => {}
+            _ => return Err("fresh Bash child schema is incomplete".into()),
+        }
+        if fresh_bash_child_schema_count(&state_conn)? != 9 {
+            return Err("fresh Bash child schema is incomplete".into());
+        }
+        verify_fresh_bash_child_schema(&state_conn)?;
         state_conn
             .execute_batch("COMMIT")
             .map_err(|e| e.to_string())?;
@@ -1380,8 +1393,7 @@ fn verify_fresh_root_effect_schema(state: &Connection) -> Result<(), String> {
             .prepare(
                 "SELECT type,name,sql FROM sqlite_master WHERE
                  (type='table' AND name='fresh_root_effect') OR
-                 (type='trigger' AND name IN
-                  ('fresh_root_effect_no_delete','fresh_root_effect_return_once'))
+                 (type='trigger' AND tbl_name='fresh_root_effect')
                  ORDER BY type,name",
             )
             .map_err(|e| e.to_string())?;

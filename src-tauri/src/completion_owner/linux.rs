@@ -1097,6 +1097,23 @@ fn retain_pending_context(
     mut request: JoinRequest,
 ) {
     let started = Instant::now();
+    #[cfg(feature = "age360-fault-fixtures")]
+    if path
+        .parent()
+        .and_then(Path::parent)
+        .is_some_and(|root| root.join("force-join-identity-refusal").exists())
+        && std::fs::read(format!("/proc/{}/cmdline", request.context.pid))
+            .is_ok_and(|cmdline| cmdline.split(|byte| *byte == 0).any(|arg| arg == b"resume"))
+    {
+        refuse_join_identity(
+            owner,
+            &mut request,
+            started,
+            "J90_FIXTURE_REFUSAL",
+            "forced_before_scope_admission",
+        );
+        return;
+    }
     if matches!(
         &request.request.mode,
         super::original_work::RootJoinMode::Fresh
@@ -1144,23 +1161,6 @@ fn retain_pending_context(
             started,
             "J03_PROTOCOL",
             "root_protocol_mismatch",
-        );
-        return;
-    }
-    #[cfg(feature = "age360-fault-fixtures")]
-    if path
-        .parent()
-        .and_then(Path::parent)
-        .is_some_and(|root| root.join("force-join-identity-refusal").exists())
-        && std::fs::read(format!("/proc/{}/cmdline", request.context.pid))
-            .is_ok_and(|cmdline| cmdline.split(|byte| *byte == 0).any(|arg| arg == b"resume"))
-    {
-        refuse_join_identity(
-            owner,
-            &mut request,
-            started,
-            "J90_FIXTURE_REFUSAL",
-            "forced_before_scope_admission",
         );
         return;
     }

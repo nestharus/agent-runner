@@ -1,14 +1,14 @@
 # AGE-319 paired Linux artifact (prerequisite only)
 
 `build_paired_bundle.py` stages one versioned archive with the fixed Runner,
-broker and thin launcher images, `install-v1.json`, broker service unit, `agents` and
+broker, thin launcher and Bash images, `install-v1.json`, broker service unit, `agents` and
 `oulipoly-agent-runner` CLI links, and an `oulipoly-plane` GUI link and desktop
 entry. The archive is inert: building or extracting it does not enable the
 service or activate v30 State. The existing Tauri `.deb` and raw Runner release
 assets continue to use their legacy paths and are **not** a paired deployment.
 
 The manifest contains the workspace package version, a generation derived from
-all three exact image digests, and those SHA-256 digests. The production broker
+all four exact image digests, and those SHA-256 digests. The production broker
 checks root ownership, path safety, all named image digests, its running image,
 and the manifest before
 binding `/run/oulipoly-kernel-broker/control.sock`. A Runner started from the
@@ -59,3 +59,13 @@ must remain unrestricted.
 The manifest check is an image compatibility prerequisite only. It does not
 prove a global writer census, persistent ingress, process custody, State v30
 routing, or delivery readiness.
+
+The fixed Bash image and digest are staged for future child admission. The
+ordinary Bash `run` command still refuses a v30 owner before local handle or
+workload creation. The private Bash child fixture is compiled under a separate
+feature and is not part of this package.
+
+Bundles with Bash use manifest schema 2 and a distinct `oulipoly-pair-v2`
+generation derived from all four image digests. The reader still accepts
+retained schema 1 manifests with no Bash field. A schema 1 bundle cannot admit
+a Bash child; adding Bash to an old schema 1 manifest is invalid.

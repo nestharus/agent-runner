@@ -132,7 +132,10 @@ fn private_broker_has_distinct_fresh_route_while_old_wal_writer_survives() {
             identity.lane_id, identity.source_generation, identity.domain_id
         )
     );
-    assert!(request(&socket, b'C').contains("fresh v30 effects closed"));
+    assert!(
+        request_with_id(&socket, b'C', uuid::Uuid::new_v4(), true)
+            .contains("installed Bash image absent")
+    );
     assert!(request(&socket, b'e').contains("Runner-result/ACK lineage"));
     for operation in [b'Q', b'q', b'Z', b'z'] {
         assert!(

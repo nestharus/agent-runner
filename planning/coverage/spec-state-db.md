@@ -30,6 +30,8 @@
 - `crates/oulipoly-state/src/mailbox.rs`
 - `crates/oulipoly-state/src/mailbox/broker_authority.rs`
 - `crates/oulipoly-state/src/mailbox/fresh_lane.rs`
+- `crates/oulipoly-state/src/mailbox/fresh_bash_child.rs`
+- `crates/oulipoly-state/src/mailbox/migrations/0033_fresh_bash_child.sql`
 - `crates/oulipoly-state/src/mailbox/migrations/0030_fresh_state_identity.sql`
 - `crates/oulipoly-state/tests/age319_fresh_dual_lane.rs`
 - `crates/oulipoly-state/src/mailbox/fresh_recipient.rs`
@@ -108,6 +110,7 @@
 | Existing DB one or more versions behind. | `migrations.rs` runs forward migrations in order; row-version triggers apply per `row_version/triggers_sql/`. |
 | Existing DB at a FUTURE version. | Open fails with `SchemaTooNew` carrying actual and expected versions; do NOT downgrade. |
 | A quiesced complete v29 sidecar copy is placed under broker-controlled root-only storage. | Explicit activation stamps v30 and a broker-minted source generation in one transaction; a retained broker connection reopens the same WAL database after restart. Ordinary v29 sidecar writers refuse v30. This does not authorize native K or cut over the user-side callers. |
+| A broker-pinned Bash process in an already released root asks for a private v30 child reservation. | One immutable request row binds the exact actor and root, then a separate D/session, child invocation with the root as parent, `ab30_` handle and registration digest are committed and reread. A duplicate request returns the same identity; a changed actor or parent refuses. The private one-use effect/result rows grant no production work or physical drain. |
 | Existing DB at a known-incompatible past version (no migration path). | Open fails with `MigrationUnsupported`; advise the operator to reset or restore. |
 | Concurrent reader during writer migration. | SQLite WAL + retry handles short waits; long contention surfaces as `DbBusy`. |
 | Repository operation on a row whose `row_version` has advanced. | `repositories/mod.rs` returns a typed conflict error; caller decides retry/replace. |
