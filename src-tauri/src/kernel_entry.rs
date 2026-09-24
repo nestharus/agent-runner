@@ -562,7 +562,7 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
                 prepare_normal_work(receipt, session)?;
                 #[cfg(feature = "age319-private-broker-fixture")]
                 if std::env::var_os("AGE319_PRIVATE_FRESH_PROVIDER_V1").is_some() {
-                    return private_fresh_provider(receipt);
+                    return private_fresh_provider(FreshEntryAuthority { receipt, session });
                 }
                 return Err("normal provider route held: native K/Q, result and physical custody are absent".into());
             }
@@ -639,10 +639,191 @@ fn prepare_normal_work(
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]
-fn private_fresh_provider(
-    receipt: &oulipoly_state::mailbox::FreshReleasedHandoff,
-) -> Result<ExitCode, String> {
-    let args = match &receipt.root_work_intent {
+struct FreshEntryAuthority<'a> {
+    receipt: &'a oulipoly_state::mailbox::FreshReleasedHandoff,
+    session: &'a oulipoly_state::mailbox::FreshV30Session,
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+struct PrivateFreshBroker<'a> {
+    authority: FreshEntryAuthority<'a>,
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+impl oulipoly_runtime::executor::cli::fresh_remote::FreshProviderBackend
+    for PrivateFreshBroker<'_>
+{
+    fn run_to_physical_q(
+        &mut self,
+        plan: oulipoly_runtime::executor::cli::fresh_remote::FreshProviderPlan,
+    ) -> Result<oulipoly_runtime::executor::cli::fresh_remote::FreshProviderCompletion, String>
+    {
+        use oulipoly_kernel_broker::protocol;
+        use std::os::unix::fs::OpenOptionsExt;
+        let socket = broker_socket().with_file_name("v30.sock");
+        // Descriptor identity and byte content are rechecked and sealed by
+        // the host broker before one-use K; neither configured path nor text
+        // recipe is trusted after this point.
+        let image = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&plan.executable)
+            .map_err(|e| format!("fresh provider image: {e}"))?;
+        let cwd = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(&plan.cwd)
+            .map_err(|e| format!("fresh provider cwd: {e}"))?;
+        let input = private_sealed_bytes(b"fresh-provider-input", &plan.stdin)?;
+        let recipe_bytes = serde_json::to_vec(&serde_json::json!({
+            "argv": plan.argv, "env": plan.environment,
+        }))
+        .map_err(|e| e.to_string())?;
+        let recipe = private_sealed_bytes(b"fresh-provider-recipe", &recipe_bytes)?;
+        let submitted = protocol::private_fresh_provider_at(
+            &socket,
+            &self.authority.receipt.d_key,
+            b'5',
+            Some([
+                image.as_raw_fd(),
+                cwd.as_raw_fd(),
+                input.as_raw_fd(),
+                recipe.as_raw_fd(),
+            ]),
+        );
+        let grant = match submitted {
+            Ok(response) => response
+                .strip_prefix("fresh-provider-k ")
+                .and_then(|s| s.strip_suffix('\n'))
+                .ok_or("private provider K response invalid")?
+                .to_owned(),
+            Err(_) => {
+                // K may be consumed. Observe that same D binding; never issue
+                // a second K after a lost or ambiguous reply.
+                let state = protocol::private_fresh_provider_at(
+                    &socket,
+                    &self.authority.receipt.d_key,
+                    b'9',
+                    Some([
+                        image.as_raw_fd(),
+                        cwd.as_raw_fd(),
+                        input.as_raw_fd(),
+                        recipe.as_raw_fd(),
+                    ]),
+                )
+                .map_err(|e| format!("private provider K unknown: {e}"))?;
+                if state.starts_with("fresh-provider-unknown ") {
+                    return Err("private provider K consumed with unknown physical state".into());
+                }
+                state
+                    .split_whitespace()
+                    .nth(1)
+                    .ok_or("private provider K readback missing grant")?
+                    .to_owned()
+            }
+        };
+        uuid::Uuid::parse_str(&grant).map_err(|_| "private provider K grant invalid")?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let state = protocol::private_fresh_provider_at(
+                &socket,
+                &self.authority.receipt.d_key,
+                b'6',
+                None,
+            )
+            .map_err(|e| format!("private provider result readback failed: {e}"))?;
+            if state.starts_with(&format!("fresh-provider-exited {grant} ")) {
+                break;
+            }
+            if state.starts_with("fresh-provider-unknown ") || std::time::Instant::now() >= deadline
+            {
+                return Err("private provider result unknown".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let gate = std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+            .map_err(|_| "private provider gate directory absent")?;
+        while !std::path::Path::new(&gate).join("provider-cancel").exists() {
+            if std::time::Instant::now() >= deadline {
+                return Err("private provider cancellation fixture expired".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        protocol::private_fresh_provider_at(&socket, &self.authority.receipt.d_key, b'7', None)
+            .map_err(|e| format!("private provider cancel failed: {e}"))?;
+        loop {
+            let state = protocol::private_fresh_provider_at(
+                &socket,
+                &self.authority.receipt.d_key,
+                b'6',
+                None,
+            )
+            .map_err(|e| format!("private provider Q readback failed: {e}"))?;
+            if state.starts_with(&format!("fresh-provider-drained {grant} ")) {
+                break;
+            }
+            if state.starts_with("fresh-provider-unknown ") || std::time::Instant::now() >= deadline
+            {
+                return Err("private provider Q unknown".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let output =
+            protocol::private_fresh_provider_output_at(&socket, &self.authority.receipt.d_key)
+                .map_err(|e| format!("private provider output readback failed: {e}"))?;
+        if output.grant_id != grant || !output.cancelled {
+            return Err("private provider output grant/Q mismatch".into());
+        }
+        let stdout =
+            private_verified_output(output.stdout, output.stdout_len, &output.stdout_sha256)?;
+        let stderr =
+            private_verified_output(output.stderr, output.stderr_len, &output.stderr_sha256)?;
+        Ok(
+            oulipoly_runtime::executor::cli::fresh_remote::FreshProviderCompletion {
+                wait_status: output.wait_status,
+                stdout,
+                stderr,
+            },
+        )
+    }
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_verified_output(
+    mut file: File,
+    expected_len: u64,
+    expected_hash: &str,
+) -> Result<Vec<u8>, String> {
+    use sha2::{Digest, Sha256};
+    let mut bytes = Vec::new();
+    let mut hash = Sha256::new();
+    let mut count = 0u64;
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut chunk).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        count = count
+            .checked_add(n as u64)
+            .ok_or("private output length overflow")?;
+        if count > expected_len {
+            return Err("private output exceeds broker receipt".into());
+        }
+        hash.update(&chunk[..n]);
+        bytes.extend_from_slice(&chunk[..n]);
+    }
+    if count != expected_len || format!("{:x}", hash.finalize()) != expected_hash {
+        return Err("private output differs from broker receipt".into());
+    }
+    Ok(bytes)
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode, String> {
+    use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig};
+    use oulipoly_runtime::executor::cli::fresh_remote::execute_fresh_headless;
+    let args = match &authority.receipt.root_work_intent {
         oulipoly_state::mailbox::FreshRootWorkIntent::NormalCli(args)
             if matches!(args.as_slice(), [flag, model, _prompt]
                 if flag == "--model" && model == "fixture-model") =>
@@ -651,107 +832,41 @@ fn private_fresh_provider(
         }
         _ => return Err("private provider requires exact fixture model/prompt syntax".into()),
     };
+    if authority.session.session_id.is_empty() || authority.receipt.d_key.is_empty() {
+        return Err("private fresh entry authority incomplete".into());
+    }
     let image = std::env::var("AGE319_PRIVATE_PROVIDER_IMAGE_V1")
         .map_err(|_| "private provider image absent")?;
     let marker = std::env::var("AGE319_PRIVATE_PROVIDER_MARKER_V1")
         .map_err(|_| "private provider marker absent")?;
-    let image = File::open(&image).map_err(|e| e.to_string())?;
-    let cwd = File::open(std::env::current_dir().map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
-    let input = private_sealed_bytes(b"fresh-provider-input", args[2].as_bytes())?;
-    let recipe_bytes = serde_json::to_vec(&serde_json::json!({
-        "argv": [marker], "env": [["PATH", "/usr/bin:/bin"]],
-    }))
-    .map_err(|e| e.to_string())?;
-    let recipe = private_sealed_bytes(b"fresh-provider-recipe", &recipe_bytes)?;
-    let socket = broker_socket().with_file_name("v30.sock");
-    let submitted = protocol::private_fresh_provider_at(
-        &socket,
-        &receipt.d_key,
-        b'5',
-        Some([
-            image.as_raw_fd(),
-            cwd.as_raw_fd(),
-            input.as_raw_fd(),
-            recipe.as_raw_fd(),
-        ]),
-    );
-    let grant = match submitted {
-        Ok(response) => response
-            .strip_prefix("fresh-provider-k ")
-            .and_then(|s| s.strip_suffix('\n'))
-            .ok_or("private provider K response invalid")?
-            .to_owned(),
-        Err(_) => {
-            // K may already be consumed. Resolve the same D/held grant and
-            // never submit a second provider execution request.
-            let state = protocol::private_fresh_provider_at(&socket, &receipt.d_key, b'6', None)
-                .map_err(|e| format!("private provider K unknown; readback failed: {e}"))?;
-            if state.starts_with("fresh-provider-unknown ") {
-                return Err("private provider K consumed with unknown physical state".into());
-            }
-            state
-                .split_whitespace()
-                .nth(1)
-                .ok_or("private provider K readback missing grant")?
-                .to_owned()
-        }
+    let model = ModelConfig {
+        name: "fixture-model".into(),
+        prompt_mode: PromptMode::Stdin,
+        providers: vec![ProviderConfig::new(image, vec![marker])],
+        inputs: Vec::new(),
+        provider: None,
     };
-    uuid::Uuid::parse_str(&grant).map_err(|_| "private provider K grant invalid")?;
-    if protocol::private_fresh_provider_at(
-        &socket,
-        &receipt.d_key,
-        b'5',
-        Some([
-            image.as_raw_fd(),
-            cwd.as_raw_fd(),
-            input.as_raw_fd(),
-            recipe.as_raw_fd(),
-        ]),
-    )
-    .is_ok()
-    {
-        return Err("private provider duplicate K was accepted".into());
-    }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    loop {
-        let state = protocol::private_fresh_provider_at(&socket, &receipt.d_key, b'6', None)
-            .map_err(|e| format!("private provider result readback failed: {e}"))?;
-        if state.starts_with(&format!("fresh-provider-exited {grant} ")) {
-            break;
-        }
-        if state.starts_with("fresh-provider-unknown ") || std::time::Instant::now() >= deadline {
-            return Err("private provider result unknown".into());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let mut backend = PrivateFreshBroker { authority };
+    let result = execute_fresh_headless(&model, 0, &args[2], &cwd, &mut backend)?;
     let gate = std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
         .map_err(|_| "private provider gate directory absent")?;
-    while !std::path::Path::new(&gate).join("provider-cancel").exists() {
-        if std::time::Instant::now() >= deadline {
-            return Err("private provider cancellation fixture expired".into());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    protocol::private_fresh_provider_at(&socket, &receipt.d_key, b'7', None)
-        .map_err(|e| format!("private provider cancel failed: {e}"))?;
-    loop {
-        let state = protocol::private_fresh_provider_at(&socket, &receipt.d_key, b'6', None)
-            .map_err(|e| format!("private provider Q readback failed: {e}"))?;
-        if state.starts_with(&format!("fresh-provider-drained {grant} ")) {
-            // The broker verified the complete output and physical Q. The
-            // ordinary runtime has no remote result backend yet; this private
-            // fixture must not turn the readback into CLI terminal success.
-            return Err(format!(
-                "private provider Q verified; runtime result backend closed: {}",
-                state.trim()
-            ));
-        }
-        if state.starts_with("fresh-provider-unknown ") || std::time::Instant::now() >= deadline {
-            return Err("private provider Q unknown".into());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    let witness = serde_json::json!({
+        "mapped_after_q": true,
+        "exit_code": result.exit_code,
+        "stdout": String::from_utf8_lossy(&result.stdout),
+        "stderr": result.stderr,
+        "provider_index": result.provider_index,
+        "terminal_reason": result.terminal_reason,
+    });
+    std::fs::write(
+        std::path::Path::new(&gate).join("provider-runtime-result"),
+        serde_json::to_vec(&witness).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    // This private route has no source W / recipient ACK or root terminal
+    // publication. A mapped provider result cannot imply CLI completion.
+    Err("private provider runtime result mapped after Q; root terminal publication closed".into())
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]

@@ -917,6 +917,10 @@ fn inner() {
                         fs::read(gate.join("provider-effect")).unwrap(),
                         b"one-provider-effect\n"
                     );
+                    assert!(
+                        !gate.join("provider-runtime-result").exists(),
+                        "runtime mapped a provider result before physical Q"
+                    );
                     if mode == "normal_model_provider_restart" {
                         let fresh_socket = socket.with_file_name("v30.sock");
                         stop(&mut broker);
@@ -975,10 +979,19 @@ fn inner() {
                     assert!(
                         fs::read_to_string(&err)
                             .unwrap()
-                            .contains("private provider Q verified; runtime result backend closed"),
+                            .contains("private provider runtime result mapped after Q; root terminal publication closed"),
                         "{}",
                         fs::read_to_string(&err).unwrap()
                     );
+                    let mapped: serde_json::Value = serde_json::from_slice(
+                        &fs::read(gate.join("provider-runtime-result")).unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(mapped["mapped_after_q"], true);
+                    assert_eq!(mapped["exit_code"], 0);
+                    assert_eq!(mapped["provider_index"], 0);
+                    assert_eq!(mapped["stdout"], "provider-stdout:hello fixture");
+                    assert_eq!(mapped["stderr"], "provider-stderr\n");
                     assert_eq!(
                         fs::read(provider_dir.join(format!("{grant_id}.stdout"))).unwrap(),
                         b"provider-stdout:hello fixture"

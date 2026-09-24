@@ -3,6 +3,8 @@
 //! carries the initiator's already pinned executable and accepted descriptors.
 use crate::installed_launch::InstalledLaunchSpec;
 use std::io::{self, Read, Write};
+#[cfg(feature = "age319-private-broker-fixture")]
+use std::os::fd::FromRawFd;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -147,7 +149,9 @@ pub fn private_fresh_provider_at(
     operation: u8,
     descriptors: Option<[RawFd; 4]>,
 ) -> io::Result<String> {
-    if !matches!(operation, b'5' | b'6' | b'7') || (operation == b'5') != descriptors.is_some() {
+    if !matches!(operation, b'5' | b'6' | b'7' | b'9')
+        || matches!(operation, b'5' | b'9') != descriptors.is_some()
+    {
         return Err(io::Error::other("invalid private fresh provider operation"));
     }
     let id = uuid::Uuid::parse_str(d_key)
@@ -208,6 +212,131 @@ pub fn private_fresh_provider_at(
         return Err(io::Error::other(error.trim_end().to_owned()));
     }
     Ok(answer)
+}
+
+/// Q-gated output readback. The broker sends its verified regular files by
+/// descriptor; a text status without both descriptors is never a completion.
+#[cfg(feature = "age319-private-broker-fixture")]
+pub struct PrivateFreshProviderOutput {
+    pub grant_id: String,
+    pub wait_status: i32,
+    pub stdout: std::fs::File,
+    pub stderr: std::fs::File,
+    pub stdout_len: u64,
+    pub stderr_len: u64,
+    pub stdout_sha256: String,
+    pub stderr_sha256: String,
+    pub cancelled: bool,
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+pub fn private_fresh_provider_output_at(
+    path: &Path,
+    d_key: &str,
+) -> io::Result<PrivateFreshProviderOutput> {
+    let id = uuid::Uuid::parse_str(d_key)
+        .map_err(|_| io::Error::other("invalid fresh provider D key"))?;
+    if id.is_nil() || id.to_string() != d_key {
+        return Err(io::Error::other("noncanonical fresh provider D key"));
+    }
+    let body = serde_json::to_vec(&FreshRootEffectRequest {
+        d_key: d_key.into(),
+        success: None,
+    })?;
+    let mut stream = checked_connection(path)?;
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let mut frame = Vec::with_capacity(17 + body.len());
+    frame.push(b'8');
+    frame.extend_from_slice(&challenge);
+    frame.extend_from_slice(&body);
+    if unsafe {
+        libc::send(
+            stream.as_raw_fd(),
+            frame.as_ptr().cast(),
+            frame.len(),
+            libc::MSG_NOSIGNAL,
+        )
+    } != frame.len() as isize
+    {
+        return Err(io::Error::other("fresh provider output request uncertain"));
+    }
+    let mut data = [0u8; 512];
+    let mut control = [0u8; 64];
+    let mut iov = libc::iovec {
+        iov_base: data.as_mut_ptr().cast(),
+        iov_len: data.len(),
+    };
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = control.len();
+    let count = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
+    if count <= 0 || msg.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 {
+        return Err(io::Error::other("fresh provider output reply incomplete"));
+    }
+    let mut files = Vec::new();
+    let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+    while !cmsg.is_null() {
+        let header = unsafe { &*cmsg };
+        if header.cmsg_level != libc::SOL_SOCKET || header.cmsg_type != libc::SCM_RIGHTS {
+            return Err(io::Error::other("fresh provider output ancillary mismatch"));
+        }
+        let base = unsafe { libc::CMSG_LEN(0) } as usize;
+        let bytes = (header.cmsg_len as usize)
+            .checked_sub(base)
+            .ok_or_else(|| io::Error::other("fresh provider output ancillary length"))?;
+        if !bytes.is_multiple_of(std::mem::size_of::<i32>()) {
+            return Err(io::Error::other(
+                "fresh provider output ancillary alignment",
+            ));
+        }
+        for index in 0..bytes / std::mem::size_of::<i32>() {
+            let fd = unsafe { *(libc::CMSG_DATA(cmsg) as *const i32).add(index) };
+            files.push(unsafe { std::fs::File::from_raw_fd(fd) });
+        }
+        cmsg = unsafe { libc::CMSG_NXTHDR(&msg, cmsg) };
+    }
+    let reply = std::str::from_utf8(&data[..count as usize])
+        .map_err(|_| io::Error::other("fresh provider output reply encoding"))?;
+    let fields: Vec<_> = reply.trim_end_matches('\n').split(' ').collect();
+    if fields.len() != 8 || fields[0] != "fresh-provider-output" || files.len() != 2 {
+        return Err(io::Error::other(format!(
+            "fresh provider output not complete: {reply}"
+        )));
+    }
+    let grant_id = uuid::Uuid::parse_str(fields[1])
+        .map_err(|_| io::Error::other("fresh provider output grant invalid"))?
+        .to_string();
+    if grant_id != fields[1]
+        || fields[4].len() != 64
+        || fields[6].len() != 64
+        || ![fields[4], fields[6]]
+            .iter()
+            .all(|hash| hash.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return Err(io::Error::other("fresh provider output digest invalid"));
+    }
+    Ok(PrivateFreshProviderOutput {
+        grant_id,
+        wait_status: fields[2]
+            .parse()
+            .map_err(|_| io::Error::other("provider wait status invalid"))?,
+        stdout_len: fields[3]
+            .parse()
+            .map_err(|_| io::Error::other("stdout length invalid"))?,
+        stdout_sha256: fields[4].into(),
+        stderr_len: fields[5]
+            .parse()
+            .map_err(|_| io::Error::other("stderr length invalid"))?,
+        stderr_sha256: fields[6].into(),
+        cancelled: fields[7]
+            .parse()
+            .map_err(|_| io::Error::other("cancel flag invalid"))?,
+        stdout: files.remove(0),
+        stderr: files.remove(0),
+    })
 }
 
 fn normal_work_request_at(
