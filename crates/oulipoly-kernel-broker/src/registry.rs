@@ -100,7 +100,10 @@ impl RootRegistry {
             // stop recovery rather than being mistaken for root records.
             if matches!(
                 name.as_ref(),
-                "entry-gate.lock" | "entry-gate.v1" | "entry-admission.lock"
+                "entry-gate.lock"
+                    | "entry-gate.v1"
+                    | "entry-admission.lock"
+                    | crate::cutover_gate::FORWARD_ONLY_MARKER
             ) && entry.file_type()?.is_file()
             {
                 continue;

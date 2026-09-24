@@ -10,6 +10,8 @@ use std::sync::{Mutex, OnceLock};
 
 const OPEN: &[u8] = b"oulipoly-entry-gate-v1 open\n";
 const CLOSED: &[u8] = b"oulipoly-entry-gate-v1 closed\n";
+const FORWARD_ONLY: &[u8] = b"oulipoly-forward-only-publication-v1\n";
+pub const FORWARD_ONLY_MARKER: &str = "forward-only-publication.v1";
 pub const ADMISSION_LOCK: &str = "entry-admission.lock";
 static PROCESS_INSTANCES: OnceLock<Mutex<std::collections::BTreeSet<(u64, u64)>>> = OnceLock::new();
 
@@ -25,6 +27,7 @@ pub struct EntryGate {
     admission: File,
     directory_identity: (u64, u64),
     closed: bool,
+    forward_only: bool,
 }
 
 impl EntryGate {
@@ -74,35 +77,31 @@ impl EntryGate {
         if unsafe { libc::fcntl(instance.as_raw_fd(), libc::F_SETLK, &lock) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        let marker_exists = directory.join("entry-gate.v1").exists();
-        let closed = match fs::symlink_metadata(directory.join("entry-gate.v1")) {
-            Ok(_) => {
-                let path = directory.join("entry-gate.v1");
-                let mut file = OpenOptions::new()
-                    .read(true)
-                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                    .open(&path)?;
-                validate_file(&file, &path)?;
-                let mut bytes = Vec::new();
-                std::io::Read::by_ref(&mut file)
-                    .take((CLOSED.len() + 1) as u64)
-                    .read_to_end(&mut bytes)?;
-                match bytes.as_slice() {
-                    CLOSED => true,
-                    OPEN => false,
-                    _ => return Err(io::Error::other("invalid durable entry gate")),
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-            Err(error) => return Err(error),
+        let gate_marker = read_marker(&directory.join("entry-gate.v1"), CLOSED.len() + 1)?;
+        let closed = match gate_marker.as_deref() {
+            Some(CLOSED) => true,
+            Some(OPEN) | None => false,
+            _ => return Err(io::Error::other("invalid durable entry gate")),
         };
-        // A published sidecar is forward-only. If its durable admission
-        // marker is missing or open, refuse broker restart instead of serving
-        // a v30 sidecar with legacy admission reopened.
+        let forward_only =
+            match read_marker(&directory.join(FORWARD_ONLY_MARKER), FORWARD_ONLY.len() + 1)?
+                .as_deref()
+            {
+                None => false,
+                Some(FORWARD_ONLY) => true,
+                _ => return Err(io::Error::other("invalid forward-only publication marker")),
+            };
+        if forward_only && !closed {
+            return Err(io::Error::other(
+                "forward-only publication requires closed durable entry gate",
+            ));
+        }
+        // A published sidecar is forward-only. Both markers must survive a
+        // restart; a missing intent is an interrupted or uncoordinated install.
         match fs::symlink_metadata(directory.join("sidecar")) {
-            Ok(_) if !closed => {
+            Ok(_) if !closed || !forward_only => {
                 return Err(io::Error::other(
-                    "published sidecar requires closed durable entry gate",
+                    "published sidecar requires closed gate and forward-only intent",
                 ));
             }
             Ok(_) => {}
@@ -112,7 +111,7 @@ impl EntryGate {
         // The lock inode is durable. Recreating it after an interrupted close
         // could detach leases held by an earlier Runner incarnation.
         let admission_path = directory.join(ADMISSION_LOCK);
-        if marker_exists && !admission_path.exists() {
+        if gate_marker.is_some() && !admission_path.exists() {
             return Err(io::Error::other("durable gate lost admission lock inode"));
         }
         let admission = open_admission_lock(&admission_path, true)?;
@@ -122,11 +121,16 @@ impl EntryGate {
             admission,
             directory_identity: identity,
             closed,
+            forward_only,
         })
     }
 
     pub fn is_closed(&self) -> bool {
         self.closed
+    }
+
+    pub fn is_forward_only(&self) -> bool {
+        self.forward_only
     }
 
     /// A stable negative result means a fixed-image Runner admitted before X
@@ -163,9 +167,63 @@ impl EntryGate {
         self.persist(CLOSED)
     }
 
+    /// Persist the irreversible boundary before a proven installer renames a
+    /// staged sidecar to its fixed name. This does not prove old-writer
+    /// quiescence and is deliberately not wired to a production publisher yet.
+    /// A failed write stays closed in this process; an invalid marker refuses
+    /// restart. Recovery after a valid marker can only proceed forward.
+    pub fn begin_forward_only_publication(&mut self) -> io::Result<()> {
+        if !self.closed {
+            return Err(io::Error::other("publication requires closed entry gate"));
+        }
+        if self.forward_only {
+            return Ok(());
+        }
+        match fs::symlink_metadata(self.directory.join("sidecar")) {
+            Ok(_) => return Err(io::Error::other("sidecar already published without intent")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        self.forward_only = true;
+        let path = self.directory.join(FORWARD_ONLY_MARKER);
+        let temporary = self
+            .directory
+            .join(format!(".forward-only-{}.tmp", uuid::Uuid::new_v4()));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&temporary)?;
+        file.write_all(FORWARD_ONLY)?;
+        file.sync_all()?;
+        let source = std::ffi::CString::new(temporary.as_os_str().as_encoded_bytes())
+            .map_err(io::Error::other)?;
+        let target = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+            .map_err(io::Error::other)?;
+        if unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                source.as_ptr(),
+                libc::AT_FDCWD,
+                target.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        File::open(&self.directory)?.sync_all()
+    }
+
     /// Failed prerequisites can return to v29 only before the fixed broker
     /// sidecar name is published. A stage directory is inert and may remain.
     pub fn abort_before_publication(&mut self) -> io::Result<()> {
+        if self.forward_only {
+            return Err(io::Error::other(
+                "forward-only publication forbids gate abort",
+            ));
+        }
         match fs::symlink_metadata(self.directory.join("sidecar")) {
             Ok(_) => return Err(io::Error::other("published sidecar forbids gate abort")),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -294,6 +352,25 @@ fn validate_file(file: &File, path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn read_marker(path: &Path, max_bytes: usize) -> io::Result<Option<Vec<u8>>> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            let mut file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(path)?;
+            validate_file(&file, path)?;
+            let mut bytes = Vec::new();
+            std::io::Read::by_ref(&mut file)
+                .take(max_bytes as u64)
+                .read_to_end(&mut bytes)?;
+            Ok(Some(bytes))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,6 +432,7 @@ mod tests {
         drop(gate);
         let mut gate = EntryGate::open(directory.path()).unwrap();
         gate.close().unwrap();
+        gate.begin_forward_only_publication().unwrap();
         fs::create_dir(directory.path().join("sidecar")).unwrap();
         assert!(gate.abort_before_publication().is_err());
         drop(gate);
@@ -372,9 +450,51 @@ mod tests {
         gate.close().unwrap();
         drop(gate);
         fs::create_dir(directory.path().join("sidecar")).unwrap();
+        assert!(EntryGate::open(directory.path()).is_err());
+        fs::remove_dir(directory.path().join("sidecar")).unwrap();
+        let mut gate = EntryGate::open(directory.path()).unwrap();
+        gate.begin_forward_only_publication().unwrap();
+        drop(gate);
+        fs::create_dir(directory.path().join("sidecar")).unwrap();
         assert!(EntryGate::open(directory.path()).unwrap().is_closed());
 
         fs::write(directory.path().join("entry-gate.v1"), OPEN).unwrap();
+        assert!(EntryGate::open(directory.path()).is_err());
+    }
+
+    #[test]
+    fn interrupted_publication_stays_forward_only_without_fixed_sidecar() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut gate = EntryGate::open(directory.path()).unwrap();
+        assert!(gate.begin_forward_only_publication().is_err());
+        gate.close().unwrap();
+        gate.begin_forward_only_publication().unwrap();
+        gate.begin_forward_only_publication().unwrap();
+        assert!(gate.is_forward_only());
+        assert!(gate.abort_before_publication().is_err());
+        drop(gate);
+        let mut restarted = EntryGate::open(directory.path()).unwrap();
+        assert!(restarted.is_closed());
+        assert!(restarted.is_forward_only());
+        assert!(crate::registry::RootRegistry::open(directory.path()).is_ok());
+        assert!(restarted.abort_before_publication().is_err());
+    }
+
+    #[test]
+    fn damaged_or_aliased_publication_intent_refuses_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut gate = EntryGate::open(directory.path()).unwrap();
+        gate.close().unwrap();
+        drop(gate);
+        let marker = directory.path().join(FORWARD_ONLY_MARKER);
+        fs::write(&marker, b"partial").unwrap();
+        assert!(EntryGate::open(directory.path()).is_err());
+        fs::write(&marker, FORWARD_ONLY).unwrap();
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::hard_link(&marker, directory.path().join("alias")).unwrap();
+        assert!(EntryGate::open(directory.path()).is_err());
+        fs::remove_file(&marker).unwrap();
+        std::os::unix::fs::symlink("alias", &marker).unwrap();
         assert!(EntryGate::open(directory.path()).is_err());
     }
 

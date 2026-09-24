@@ -89,5 +89,26 @@ different boot ID, the same held storage fence, and a closed admission gate
 before a private cold proof can be constructed. An interrupted startup must
 keep admission closed; a published v29 copy requires forward-only recovery.
 The current broker refuses restart when a published `sidecar` exists without
-a closed durable entry gate, but that check alone does not establish the cold
-proof.
+a closed durable entry gate **and** a root-owned
+`forward-only-publication.v1` intent marker. A future proven installer must
+call `EntryGate::begin_forward_only_publication()` after staging and before
+renaming the stage to `sidecar`. The broker writes and syncs the marker before
+that method returns. Once it exists, `abort_before_publication()` refuses even
+if the fixed sidecar name is absent; restart remains closed and the installer
+must resume publication or activation using the same held proof. A published
+sidecar with a missing, malformed, or aliased marker refuses broker startup.
+This is an inert recovery barrier, not an installer or cold proof; no production
+caller of the publication method exists yet.
+
+The fence's trust premise must be explicit. Root, including any workload that
+intentionally invokes unrestricted host `sudo`, can change ownership, mounts,
+or a root-held fence. Therefore no filesystem fence can exclude a hostile
+host-root actor while preserving unrestricted host sudo. Even against ordinary
+same-UID old images, a fixed-path fence cannot stop a copied old image from
+selecting a fresh writable `OULIPOLY_DATA_DIR` or adjacent `config.toml` and
+reporting its own v29 success. That success is not broker v30 acceptance, but
+the old image does not know the distinction. A future proof could cover only
+enumerated retired source identities and nonadversarial root operations, plus
+an independently established early-entry or preboot durable fence. It must
+demonstrate WSL ordering and old-image refusal in a private executable test;
+the current `multi-user.target` unit and this marker establish neither.
