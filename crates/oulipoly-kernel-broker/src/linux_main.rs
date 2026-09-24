@@ -615,6 +615,7 @@ fn write_broker_state(
         attempt_id,
     };
     match spec.action {
+        StateWriteAction::Release => Err(io::Error::other("release requires held v30 protocol")),
         StateWriteAction::Prepare { .. } => {
             Err(io::Error::other("prepared owner requires v30 protocol"))
         }
@@ -1631,10 +1632,128 @@ fn encode_prepared_owner(owner: &PreparedBrokerOwner) -> io::Result<String> {
     Ok(response)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "independent live actor and State authorities"
+)]
+fn release_prepared_broker_owner(
+    spec: StateWriteSpec,
+    peer: &PeerIdentity,
+    host_namespace: &File,
+    runner_image: &File,
+    roots: &RootRegistry,
+    entries: &EntryRegistry,
+    held: &mut BTreeMap<String, root_join::HeldRootJoin>,
+    sidecar: &mut BrokerSidecar,
+) -> io::Result<BrokerReleaseEvidence> {
+    if spec.protocol != "broker-held-release-v30"
+        || !matches!(spec.action, StateWriteAction::Release)
+        || spec.source_generation != sidecar.source_generation()
+    {
+        return Err(io::Error::other("invalid held release request"));
+    }
+    let read = StateReadSpec {
+        protocol: "broker-prepared-read-v30".into(),
+        source_generation: spec.source_generation.clone(),
+        root_id: spec.root_id.clone(),
+        owner_generation: spec.owner_generation.clone(),
+        attempt_id: None,
+    };
+    let prepared = read_prepared_broker_owner(
+        read,
+        peer,
+        host_namespace,
+        runner_image,
+        roots,
+        entries,
+        held,
+        sidecar,
+    )?;
+    if ProcessStamp::from(&peer.process).host_pid != prepared.guardian.host_pid
+        || ProcessStamp::from(&peer.process).starttime_ticks != prepared.guardian.starttime_ticks
+    {
+        return Err(io::Error::other("held release requires original guardian"));
+    }
+    let gate = held
+        .get_mut(&spec.root_id)
+        .ok_or_else(|| io::Error::other("held gate absent"))?;
+    gate.write_v30_gate(&spec.source_generation, &spec.owner_generation)?;
+    let evidence = match sidecar.commit_exact_prepared_release(&prepared) {
+        Ok(evidence) => evidence,
+        Err(commit_or_read_error) => sidecar
+            .read_exact_release(
+                &prepared.source_generation,
+                &prepared.root_id,
+                &prepared.owner_generation,
+            )
+            .map_err(|_| io::Error::other(commit_or_read_error))?,
+    };
+    if evidence.prepared != prepared {
+        return Err(io::Error::other("release commit/readback identity changed"));
+    }
+    gate.record_release(evidence.release_id.clone());
+    Ok(evidence)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "independent live actor and State authorities"
+)]
+fn read_released_broker_owner(
+    spec: StateReadSpec,
+    peer: &PeerIdentity,
+    host_namespace: &File,
+    runner_image: &File,
+    roots: &RootRegistry,
+    entries: &EntryRegistry,
+    held: &BTreeMap<String, root_join::HeldRootJoin>,
+    sidecar: &BrokerSidecar,
+) -> io::Result<BrokerReleaseEvidence> {
+    if spec.protocol != "broker-release-readback-v30" {
+        return Err(io::Error::other("invalid release readback"));
+    }
+    let prepared = read_prepared_broker_owner(
+        StateReadSpec {
+            protocol: "broker-prepared-read-v30".into(),
+            ..spec
+        },
+        peer,
+        host_namespace,
+        runner_image,
+        roots,
+        entries,
+        held,
+        sidecar,
+    )?;
+    if ProcessStamp::from(&peer.process).host_pid != prepared.guardian.host_pid {
+        return Err(io::Error::other(
+            "release readback requires original guardian",
+        ));
+    }
+    let gate = held
+        .get(&prepared.root_id)
+        .ok_or_else(|| io::Error::other("held gate absent"))?;
+    let release_id = gate
+        .release_id()
+        .ok_or_else(|| io::Error::other("held release not committed"))?;
+    let evidence = sidecar
+        .read_exact_release(
+            &prepared.source_generation,
+            &prepared.root_id,
+            &prepared.owner_generation,
+        )
+        .map_err(io::Error::other)?;
+    if evidence.prepared != prepared || evidence.release_id != release_id {
+        return Err(io::Error::other("held release readback changed"));
+    }
+    Ok(evidence)
+}
+
 /// A gate byte is never authority. Even after the durable release commit,
 /// only the exact original child can obtain this post-gate observation, and
 /// every actor is reopened and compared with its prepared incarnation. The
-/// current v30 held route never writes the gate or commits release.
+/// A broker restart loses the retained gate and therefore cannot attest an
+/// old committed row as a current child release.
 #[expect(
     clippy::too_many_arguments,
     reason = "independent broker actor and State authorities"
@@ -1647,6 +1766,7 @@ fn attest_released_child(
     roots: &RootRegistry,
     works: &WorkRegistry,
     entries: &EntryRegistry,
+    held: &BTreeMap<String, root_join::HeldRootJoin>,
     sidecar: &BrokerSidecar,
 ) -> io::Result<BrokerReleaseEvidence> {
     if spec.protocol != "broker-release-attest-v30"
@@ -1668,6 +1788,15 @@ fn attest_released_child(
             &spec.owner_generation,
         )
         .map_err(io::Error::other)?;
+    if held
+        .get(&spec.root_id)
+        .and_then(root_join::HeldRootJoin::release_id)
+        != Some(evidence.release_id.as_str())
+    {
+        return Err(io::Error::other(
+            "release gate is not retained by this broker",
+        ));
+    }
     let prepared = &evidence.prepared;
     let entry = entries
         .record(&spec.root_id)
@@ -2163,6 +2292,18 @@ fn serve() -> io::Result<()> {
                         sidecar,
                     )?;
                     encode_prepared_owner(&readback)
+                } else if spec.protocol == "broker-release-readback-v30" {
+                    let evidence = read_released_broker_owner(
+                        spec,
+                        &peer,
+                        &host_namespace,
+                        &runner_image,
+                        &registry,
+                        &entries,
+                        &held_joins,
+                        sidecar,
+                    )?;
+                    encode_release_evidence(&evidence)
                 } else if spec.protocol == "broker-release-attest-v30" {
                     let evidence = attest_released_child(
                         spec,
@@ -2172,6 +2313,7 @@ fn serve() -> io::Result<()> {
                         &registry,
                         &works,
                         &entries,
+                        &held_joins,
                         sidecar,
                     )?;
                     encode_release_evidence(&evidence)
@@ -2207,6 +2349,18 @@ fn serve() -> io::Result<()> {
                         sidecar,
                     )?;
                     encode_prepared_owner(&readback)
+                } else if spec.protocol == "broker-held-release-v30" {
+                    let evidence = release_prepared_broker_owner(
+                        spec,
+                        &peer,
+                        &host_namespace,
+                        &runner_image,
+                        &registry,
+                        &entries,
+                        &mut held_joins,
+                        sidecar,
+                    )?;
+                    encode_release_evidence(&evidence)
                 } else {
                     let readback = write_broker_state(
                         spec,

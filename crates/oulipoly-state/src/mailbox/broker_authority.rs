@@ -269,13 +269,9 @@ impl BrokerSidecar {
         Ok(prepared)
     }
 
-    /// Transaction primitive for the future held-gate release path. It is
-    /// crate-private while no child post-gate attestation exists, so the
-    /// serving broker cannot commit it through a wire request yet. Once the
-    /// broker has written the exact retained gate, it must call this at most
-    /// once; a lost response is reconciled with `read_exact_release`.
-    #[allow(dead_code)]
-    pub(crate) fn commit_exact_prepared_release(
+    /// Commit only after the serving broker has written its retained gate.
+    /// A lost reply is reconciled with `read_exact_release`, never a retry.
+    pub fn commit_exact_prepared_release(
         &mut self,
         expected: &PreparedBrokerOwner,
     ) -> Result<BrokerReleaseEvidence, String> {

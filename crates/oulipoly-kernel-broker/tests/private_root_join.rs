@@ -31,6 +31,7 @@ fn stop(child: &mut Child) {
 
 fn inner() {
     let mode = std::env::var("AGE319_PRIVATE_JOIN_MODE").unwrap_or_else(|_| "help".into());
+    let release_mode = mode.starts_with("held_release");
     let runner =
         std::env::var("OULIPOLY_AGE319_RUNNER_IMAGE").expect("built Runner image required");
     let temp = tempfile::tempdir().unwrap();
@@ -48,6 +49,7 @@ fn inner() {
     let broker_generation = if mode == "broker_state"
         || mode == "held_prepared"
         || mode == "held_guardian_death"
+        || release_mode
     {
         let sidecar_dir = broker_state.join("sidecar");
         fs::create_dir(&sidecar_dir).unwrap();
@@ -70,6 +72,10 @@ fn inner() {
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+        .envs(
+            (mode == "held_release_gate_fail")
+                .then_some(("OULIPOLY_KERNEL_BROKER_FIXTURE_FAIL_GATE_WRITE_V1", "1")),
+        )
         .stdout(Stdio::null())
         .stderr(Stdio::from(File::create(&broker_log).unwrap()))
         .spawn()
@@ -80,7 +86,7 @@ fn inner() {
         "broker startup: {}",
         fs::read_to_string(&broker_log).unwrap()
     );
-    if mode == "held_prepared" || mode == "held_guardian_death" {
+    if mode == "held_prepared" || mode == "held_guardian_death" || release_mode {
         let generation = broker_generation.unwrap();
         // A copied v29 path is unusable before E and throughout W/R.
         fs::write(data.join("pid-identity.db"), b"retired copied owner").unwrap();
@@ -95,6 +101,11 @@ fn inner() {
             .envs(
                 (mode == "held_guardian_death")
                     .then_some(("AGE319_PRIVATE_EXPECT_GUARDIAN_DEATH_V1", "1")),
+            )
+            .envs(release_mode.then_some(("AGE319_PRIVATE_RELEASE_V30", "1")))
+            .envs(
+                (mode == "held_release_lost_reply")
+                    .then_some(("AGE319_PRIVATE_RELEASE_LOST_REPLY_V1", "1")),
             )
             .env_remove("LD_LIBRARY_PATH")
             .stdin(Stdio::null())
@@ -195,6 +206,14 @@ fn inner() {
         wrong.source_generation = uuid::Uuid::new_v4().to_string();
         assert!(protocol::read_prepared_owner_at(&socket, &wrong).is_err());
         assert_eq!(fs::metadata(&out).unwrap().len(), 0);
+        let wrong_release = protocol::StateWriteSpec {
+            protocol: "broker-held-release-v30".into(),
+            source_generation: generation.clone(),
+            root_id: prepared.root_id.clone(),
+            owner_generation: prepared.owner_generation.clone(),
+            action: protocol::StateWriteAction::Release,
+        };
+        assert!(protocol::release_prepared_owner_at(&socket, &wrong_release).is_err());
         if mode == "held_guardian_death" {
             unsafe {
                 libc::kill(prepared.guardian.host_pid, libc::SIGKILL);
@@ -209,6 +228,188 @@ fn inner() {
                 fs::read_to_string(&err).unwrap()
             );
             assert_eq!(fs::metadata(&out).unwrap().len(), 0);
+        }
+        if release_mode {
+            if mode == "held_release_commit_fail" {
+                rusqlite::Connection::open(broker_state.join("sidecar/pid-identity.db"))
+                    .unwrap()
+                    .execute_batch("CREATE TRIGGER age319_release_fault BEFORE INSERT ON broker_owner_release BEGIN SELECT RAISE(ABORT, 'fixture commit fault'); END;")
+                    .unwrap();
+            }
+            if mode == "held_release_child_predeath" {
+                unsafe {
+                    libc::kill(prepared.joined_child.host_pid, libc::SIGKILL);
+                }
+            }
+            fs::write(gate.join("release"), b"yes").unwrap();
+            eventually(|| gate.join("released").exists() || entry.try_wait().unwrap().is_some());
+            if mode == "held_release_commit_fail"
+                || mode == "held_release_child_predeath"
+                || mode == "held_release_gate_fail"
+            {
+                assert!(!gate.join("released").exists());
+                let errors = fs::read_to_string(&err).unwrap();
+                if mode == "held_release_commit_fail" {
+                    assert!(errors.contains("fixture commit fault"), "{errors}");
+                }
+                if mode == "held_release_gate_fail" {
+                    assert!(
+                        errors.contains("Broken pipe") || errors.contains("os error 32"),
+                        "{errors}"
+                    );
+                }
+                assert_eq!(fs::metadata(&out).unwrap().len(), 0);
+                assert!(
+                    BrokerSidecar::open_existing(
+                        &broker_state.join("sidecar/pid-identity.db"),
+                        &broker_state
+                    )
+                    .unwrap()
+                    .read_exact_release(&generation, &prepared.root_id, &prepared.owner_generation)
+                    .is_err()
+                );
+                let still_zero: i64 = db
+                    .query_row(
+                        "SELECT count(*) FROM completion_continuation_owner",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(still_zero, 0);
+                stop(&mut broker);
+                unsafe {
+                    libc::kill(prepared.root_init.host_pid, libc::SIGKILL);
+                }
+                return;
+            }
+            assert!(
+                gate.join("released").exists(),
+                "entry: {} broker: {}",
+                fs::read_to_string(&err).unwrap(),
+                fs::read_to_string(&broker_log).unwrap()
+            );
+            let evidence: oulipoly_state::mailbox::BrokerReleaseEvidence =
+                serde_json::from_slice(&fs::read(gate.join("released")).unwrap()).unwrap();
+            assert_eq!(evidence.prepared, prepared);
+            assert_eq!(evidence.owner.owner_generation, prepared.owner_generation);
+            assert_eq!(fs::metadata(&out).unwrap().len(), 0);
+            assert_eq!(
+                db.query_row::<i64, _, _>(
+                    "SELECT count(*) FROM completion_continuation_owner",
+                    [],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+                1
+            );
+            eventually(|| {
+                gate.join("child-attested").exists() || entry.try_wait().unwrap().is_some()
+            });
+            assert!(
+                gate.join("child-attested").exists(),
+                "child: {} broker: {}",
+                fs::read_to_string(&err).unwrap(),
+                fs::read_to_string(&broker_log).unwrap()
+            );
+            assert_eq!(
+                fs::read_to_string(gate.join("child-attested")).unwrap(),
+                evidence.release_id
+            );
+            assert_eq!(fs::metadata(&out).unwrap().len(), 0);
+            let durable = BrokerSidecar::open_existing(
+                &broker_state.join("sidecar/pid-identity.db"),
+                &broker_state,
+            )
+            .unwrap()
+            .read_exact_release(&generation, &prepared.root_id, &prepared.owner_generation)
+            .unwrap();
+            assert_eq!(durable, evidence);
+            if mode == "held_release_guardian_death" {
+                unsafe {
+                    libc::kill(prepared.guardian.host_pid, libc::SIGKILL);
+                }
+            }
+            if mode == "held_release_child_death" {
+                unsafe {
+                    libc::kill(prepared.joined_child.host_pid, libc::SIGKILL);
+                }
+            }
+            if mode == "held_release_broker_death" {
+                stop(&mut broker);
+                let premature_restart_log = temp.path().join("released-child-restart.log");
+                let mut premature_restart =
+                    Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
+                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
+                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
+                        .stderr(Stdio::from(File::create(&premature_restart_log).unwrap()))
+                        .spawn()
+                        .unwrap();
+                eventually(|| {
+                    protocol::request_at(&socket, Operation::Classify).is_ok()
+                        || premature_restart.try_wait().unwrap().is_some()
+                });
+                assert!(
+                    premature_restart.try_wait().unwrap().is_none(),
+                    "{}",
+                    fs::read_to_string(&premature_restart_log).unwrap()
+                );
+                fs::write(gate.join("child-effect"), b"yes").unwrap();
+                std::thread::sleep(Duration::from_millis(200));
+                assert_eq!(fs::metadata(&out).unwrap().len(), 0);
+                stop(&mut premature_restart);
+            }
+            if mode != "held_release_broker_death" {
+                fs::write(gate.join("child-effect"), b"yes").unwrap();
+            }
+            if mode == "held_release" || mode == "held_release_lost_reply" {
+                eventually(|| {
+                    fs::metadata(&out).unwrap().len() > 0 || entry.try_wait().unwrap().is_some()
+                });
+                assert_eq!(
+                    fs::read_to_string(&out).unwrap(),
+                    format!("OULIPOLY_KERNEL_V30_CHILD_EFFECT={}\n", evidence.release_id)
+                );
+            } else {
+                std::thread::sleep(Duration::from_millis(200));
+                assert_eq!(fs::metadata(&out).unwrap().len(), 0);
+            }
+            if mode != "held_release_broker_death" {
+                stop(&mut broker);
+            }
+            fs::write(gate.join("finish"), b"done").unwrap();
+            eventually(|| entry.try_wait().unwrap().is_some());
+            let _ = entry.wait();
+            let restart_log = temp.path().join("released-restart.log");
+            let mut restarted = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
+                .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
+                .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
+                .stderr(Stdio::from(File::create(&restart_log).unwrap()))
+                .spawn()
+                .unwrap();
+            eventually(|| {
+                protocol::request_at(&socket, Operation::Classify).is_ok()
+                    || restarted.try_wait().unwrap().is_some()
+            });
+            assert!(restarted.try_wait().unwrap().is_none());
+            let second = Command::new(&runner)
+                .arg("__age319-private-held-prepared-v30")
+                .env("OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1", "1")
+                .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+                .output()
+                .unwrap();
+            assert!(!second.status.success());
+            assert_eq!(
+                fs::read_dir(broker_state.join("entries")).unwrap().count(),
+                1
+            );
+            stop(&mut restarted);
+            unsafe {
+                libc::kill(prepared.root_init.host_pid, libc::SIGKILL);
+            }
+            return;
         }
         stop(&mut broker);
         fs::write(gate.join("finish"), b"done").unwrap();
@@ -660,6 +861,14 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "broker_state",
         "held_prepared",
         "held_guardian_death",
+        "held_release",
+        "held_release_broker_death",
+        "held_release_guardian_death",
+        "held_release_child_death",
+        "held_release_lost_reply",
+        "held_release_commit_fail",
+        "held_release_child_predeath",
+        "held_release_gate_fail",
     ] {
         let output = Command::new("unshare")
             .args(["-Urpfm", "--mount-proc"])

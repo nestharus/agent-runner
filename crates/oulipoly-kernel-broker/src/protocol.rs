@@ -137,6 +137,7 @@ pub enum StateWriteAction {
     Accept {
         attempt_id: String,
     },
+    Release,
 }
 
 /// Prepared evidence is inert: it does not elect an owner or open the child gate.
@@ -160,6 +161,61 @@ pub fn read_prepared_owner_at(
         return Err(io::Error::other("invalid prepared owner read"));
     }
     serde_json::from_slice(&send_state_frame_at(path, b'R', spec)?).map_err(io::Error::other)
+}
+
+/// Guardian-only exact readback after a release reply was lost. The broker
+/// still requires its original retained gate and current actor incarnations.
+pub fn read_released_owner_at(
+    path: &Path,
+    spec: &StateReadSpec,
+) -> io::Result<oulipoly_state::mailbox::BrokerReleaseEvidence> {
+    if spec.protocol != "broker-release-readback-v30" || spec.attempt_id.is_some() {
+        return Err(io::Error::other("invalid release readback request"));
+    }
+    serde_json::from_slice(&send_state_frame_at(path, b'R', spec)?).map_err(io::Error::other)
+}
+
+pub fn release_prepared_owner_at(
+    path: &Path,
+    spec: &StateWriteSpec,
+) -> io::Result<oulipoly_state::mailbox::BrokerReleaseEvidence> {
+    if spec.protocol != "broker-held-release-v30"
+        || !matches!(spec.action, StateWriteAction::Release)
+    {
+        return Err(io::Error::other("invalid held release request"));
+    }
+    serde_json::from_slice(&send_state_frame_at(path, b'W', spec)?).map_err(io::Error::other)
+}
+
+/// Private fault fixture: send the real challenged release frame, then lose
+/// only its reply. The caller must reconcile using exact live readback.
+#[cfg(feature = "age319-private-broker-fixture")]
+pub fn release_prepared_owner_drop_reply_at(path: &Path, spec: &StateWriteSpec) -> io::Result<()> {
+    if spec.protocol != "broker-held-release-v30"
+        || !matches!(spec.action, StateWriteAction::Release)
+    {
+        return Err(io::Error::other("invalid held release request"));
+    }
+    let body = serde_json::to_vec(spec)?;
+    let mut stream = checked_connection(path)?;
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let mut request = Vec::with_capacity(17 + body.len());
+    request.push(b'W');
+    request.extend_from_slice(&challenge);
+    request.extend_from_slice(&body);
+    if unsafe {
+        libc::send(
+            stream.as_raw_fd(),
+            request.as_ptr().cast(),
+            request.len(),
+            libc::MSG_NOSIGNAL,
+        )
+    } != request.len() as isize
+    {
+        return Err(io::Error::other("short lost-reply release request"));
+    }
+    Ok(())
 }
 
 /// Child-only broker attestation of a committed release and all live pinned

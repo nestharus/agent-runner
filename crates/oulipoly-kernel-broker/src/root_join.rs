@@ -17,7 +17,7 @@ const GATE_ENV: &str = "OULIPOLY_KERNEL_CHILD_JOIN_FD_V1";
 
 /// The broker owns this gate after J has durably consumed the entry and bound
 /// the exact child. Dropping it sends EOF to the child pre-exec read, which
-/// fails closed. v30 retains this object until broker exit; release is closed.
+/// fails closed. v30 retains this object across the gate write and commit.
 pub(super) struct HeldRootJoin {
     gate: UnixStream,
     root_id: String,
@@ -26,9 +26,41 @@ pub(super) struct HeldRootJoin {
     guardian: PinnedProcess,
     root_init: PinnedProcess,
     child: PinnedProcess,
+    release_attempted: bool,
+    release_id: Option<String>,
 }
 
 impl HeldRootJoin {
+    pub(super) fn release_id(&self) -> Option<&str> {
+        self.release_id.as_deref()
+    }
+
+    /// A partial write can open the physical gate. Consume the attempt before
+    /// writing so failure cannot be retried or followed by a State commit.
+    pub(super) fn write_v30_gate(
+        &mut self,
+        source_generation: &str,
+        owner_generation: &str,
+    ) -> io::Result<()> {
+        if self.release_attempted {
+            return Err(io::Error::other("held gate release already attempted"));
+        }
+        self.actors()?;
+        self.release_attempted = true;
+        #[cfg(feature = "age319-private-broker-fixture")]
+        if super::private_fixture()
+            && std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_FAIL_GATE_WRITE_V1").is_some()
+        {
+            self.gate.shutdown(std::net::Shutdown::Write)?;
+        }
+        let grant = format!("Rv30 {source_generation} {owner_generation} {}", self.grant);
+        self.gate.write_all(grant.as_bytes())
+    }
+
+    pub(super) fn record_release(&mut self, release_id: String) {
+        self.release_id = Some(release_id);
+    }
+
     pub(super) fn root_id(&self) -> &str {
         &self.root_id
     }
@@ -78,6 +110,7 @@ struct InitContext {
     uid: u32,
     gid: u32,
     groups: Vec<libc::gid_t>,
+    held_v30: bool,
 }
 
 fn validate(spec: &JoinSpec, descriptors: &[File; 5]) -> io::Result<()> {
@@ -191,6 +224,7 @@ fn run_init(context: InitContext) -> io::Result<()> {
         uid,
         gid,
         groups,
+        held_v30,
     } = context;
     close_other_descriptors(&[
         stdin.as_raw_fd(),
@@ -225,6 +259,15 @@ fn run_init(context: InitContext) -> io::Result<()> {
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
+    #[cfg(feature = "age319-private-broker-fixture")]
+    if held_v30 && super::private_fixture() {
+        command.env("OULIPOLY_KERNEL_V30_PRIVATE_CHILD_V1", "1");
+        if let Some(directory) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1") {
+            command.env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", directory);
+        }
+    }
+    #[cfg(not(feature = "age319-private-broker-fixture"))]
+    let _ = held_v30;
     #[cfg(feature = "age319-private-broker-fixture")]
     if super::private_fixture() {
         let path = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1")
@@ -330,7 +373,7 @@ pub(super) fn launch(
 
 /// Return only after the exact joined child has been fsynced while its
 /// pre-exec gate is still held by this broker. v30 keeps the handle in the
-/// serving broker; committed release and post-gate attestation remain closed.
+/// serving broker through a one-use gate write and committed State release.
 pub(super) fn hold(
     spec: JoinSpec,
     descriptors: [File; 5],
@@ -404,6 +447,7 @@ pub(super) fn hold(
         uid: peer.uid,
         gid: peer.gid,
         groups: peer.process.supplementary_groups()?,
+        held_v30: _held_v30,
     });
     let root_id = context.spec.root_id.clone();
     let domain = context.spec.domain_id.clone();
@@ -492,6 +536,8 @@ pub(super) fn hold(
         guardian,
         root_init: init,
         child,
+        release_attempted: false,
+        release_id: None,
     })
 }
 

@@ -22,6 +22,14 @@ fn private_prepared_mode() -> bool {
         && std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1").is_some()
 }
 
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_v30_child_mode() -> bool {
+    std::env::var_os("OULIPOLY_KERNEL_V30_PRIVATE_CHILD_V1").is_some()
+        && std::env::var_os(CHILD_FD_ENV).is_some()
+        && unsafe { libc::geteuid() } == 0
+        && std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1").is_some()
+}
+
 const REQUIRED_ENV: &str = "OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1";
 const CHILD_FD_ENV: &str = "OULIPOLY_KERNEL_CHILD_JOIN_FD_V1";
 const INSTALLED_RUNNER: &str = "/usr/local/libexec/oulipoly/oulipoly-agent-runner";
@@ -55,7 +63,8 @@ pub(crate) fn verify_installed_entry_route() -> Result<(), String> {
     let route = protocol::observe_entry_gate_at(&broker_socket())
         .map_err(|error| format!("installed broker entry gate unavailable: {error}"))?;
     #[cfg(feature = "age319-private-broker-fixture")]
-    if route == EntryRoute::BrokerV30Closed && private_prepared_mode() {
+    if route == EntryRoute::BrokerV30Closed && (private_prepared_mode() || private_v30_child_mode())
+    {
         return Ok(());
     }
     require_legacy_entry_route(route)
@@ -147,6 +156,9 @@ pub(crate) fn child_entry() -> Option<ExitCode> {
             line.push(byte[0]);
         }
         let line = String::from_utf8(line).map_err(|_| "invalid child grant")?;
+        if let Some(versioned) = line.strip_prefix("v30 ") {
+            return child_v30_entry(versioned, gate);
+        }
         let fields: Vec<_> = line.split(' ').collect();
         if fields.len() != 4
             || fields[..3]
@@ -309,6 +321,69 @@ pub(crate) fn child_entry() -> Option<ExitCode> {
             ExitCode::FAILURE
         }
     })
+}
+
+fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
+    let fields: Vec<_> = grant.split(' ').collect();
+    if fields.len() != 6
+        || fields[..5].iter().any(|field| {
+            uuid::Uuid::parse_str(field)
+                .map(|id| id.to_string() != *field)
+                .unwrap_or(true)
+        })
+    {
+        return Err("invalid v30 child grant".into());
+    }
+    let guardian_pid: i32 = fields[5].parse().map_err(|_| "invalid v30 guardian PID")?;
+    let spec = protocol::StateReadSpec {
+        protocol: "broker-release-attest-v30".into(),
+        source_generation: fields[0].into(),
+        owner_generation: fields[1].into(),
+        root_id: fields[2].into(),
+        attempt_id: None,
+    };
+    let evidence = protocol::attest_released_child_at(&broker_socket(), &spec)
+        .map_err(|e| format!("v30 child release absent: {e}"))?;
+    if evidence.prepared.source_generation != fields[0]
+        || evidence.prepared.owner_generation != fields[1]
+        || evidence.prepared.root_id != fields[2]
+        || evidence.prepared.domain_id != fields[3]
+        || evidence.prepared.supervisor_authority_id != fields[4]
+        || evidence.prepared.guardian.host_pid != guardian_pid
+        || evidence.owner.owner_generation != fields[1]
+        || evidence.owner.domain_id != fields[3]
+        || evidence.owner.supervisor_authority_id != fields[4]
+    {
+        return Err("v30 child attestation does not match physical gate".into());
+    }
+    drop(gate);
+    #[cfg(feature = "age319-private-broker-fixture")]
+    if private_v30_child_mode() {
+        let gate_dir = PathBuf::from(
+            std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                .ok_or("private v30 gate directory absent")?,
+        );
+        std::fs::write(
+            gate_dir.join("child-attested"),
+            evidence.release_id.as_bytes(),
+        )
+        .map_err(|e| e.to_string())?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !gate_dir.join("child-effect").exists() {
+            if std::time::Instant::now() >= deadline {
+                return Err("private v30 child effect wait expired".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let current = protocol::attest_released_child_at(&broker_socket(), &spec)
+            .map_err(|e| format!("v30 child release no longer live: {e}"))?;
+        if current != evidence {
+            return Err("v30 child release changed before effect".into());
+        }
+        println!("OULIPOLY_KERNEL_V30_CHILD_EFFECT={}", evidence.release_id);
+        return Ok(ExitCode::SUCCESS);
+    }
+    Err("production v30 child requires broker-routed owner work path".into())
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]
@@ -617,6 +692,71 @@ fn private_guardian_prepared(
         )
         .map_err(|e| e.to_string())?;
     channel.write_all(b"\n").map_err(|e| e.to_string())?;
+    if std::env::var_os("AGE319_PRIVATE_RELEASE_V30").is_some() {
+        channel.read_exact(&mut byte).map_err(|e| e.to_string())?;
+        if byte != [b'L'] {
+            return Err("private release instruction refused".into());
+        }
+        let release = protocol::StateWriteSpec {
+            protocol: "broker-held-release-v30".into(),
+            source_generation: source_generation.into(),
+            root_id: root.into(),
+            owner_generation: exact.owner_generation.clone(),
+            action: protocol::StateWriteAction::Release,
+        };
+        let mut stale_release = protocol::StateWriteSpec {
+            protocol: release.protocol.clone(),
+            source_generation: uuid::Uuid::new_v4().to_string(),
+            root_id: release.root_id.clone(),
+            owner_generation: release.owner_generation.clone(),
+            action: protocol::StateWriteAction::Release,
+        };
+        if protocol::release_prepared_owner_at(broker, &stale_release).is_ok() {
+            return Err("stale release generation accepted".into());
+        }
+        stale_release.source_generation = release.source_generation.clone();
+        stale_release.owner_generation = uuid::Uuid::new_v4().to_string();
+        if protocol::release_prepared_owner_at(broker, &stale_release).is_ok() {
+            return Err("sibling owner release accepted".into());
+        }
+        let lost_reply = std::env::var_os("AGE319_PRIVATE_RELEASE_LOST_REPLY_V1").is_some();
+        let committed = if lost_reply {
+            protocol::release_prepared_owner_drop_reply_at(broker, &release)
+                .map_err(|e| e.to_string())?;
+            None
+        } else {
+            Some(protocol::release_prepared_owner_at(broker, &release).map_err(|e| e.to_string())?)
+        };
+        if protocol::release_prepared_owner_at(broker, &release).is_ok() {
+            return Err("double held release accepted".into());
+        }
+        let readback = protocol::read_released_owner_at(
+            broker,
+            &protocol::StateReadSpec {
+                protocol: "broker-release-readback-v30".into(),
+                source_generation: source_generation.into(),
+                root_id: root.into(),
+                owner_generation: exact.owner_generation.clone(),
+                attempt_id: None,
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        if committed
+            .as_ref()
+            .is_some_and(|committed| committed != &readback)
+            || readback.prepared != exact
+        {
+            return Err("release/readback mismatch".into());
+        }
+        channel
+            .write_all(
+                serde_json::to_string(&readback)
+                    .map_err(|e| e.to_string())?
+                    .as_bytes(),
+            )
+            .map_err(|e| e.to_string())?;
+        channel.write_all(b"\n").map_err(|e| e.to_string())?;
+    }
     let _ = channel.read_exact(&mut byte);
     let _ = driver_parent.write_all(b"X");
     unsafe { libc::waitpid(driver_pid, std::ptr::null_mut(), 0) };
@@ -669,7 +809,7 @@ fn private_held_prepared_entry() -> Result<(), String> {
         unsafe { libc::_exit(0) }
     }
     drop(child);
-    let result = (|| {
+    let result = (|| -> Result<(), String> {
         let prepared = protocol::prepare_v30_guardian_at(&broker, &root, guardian_pid)
             .map_err(|e| e.to_string())?;
         if prepared != format!("prepared {root}\n") {
@@ -755,6 +895,26 @@ fn private_held_prepared_entry() -> Result<(), String> {
             serde_json::to_vec(&entry_row).map_err(|e| e.to_string())?,
         )
         .map_err(|e| e.to_string())?;
+        if std::env::var_os("AGE319_PRIVATE_RELEASE_V30").is_some() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !gate_dir.join("release").exists() {
+                if std::time::Instant::now() >= deadline {
+                    return Err("private release wait expired".into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            parent.write_all(b"L").map_err(|e| e.to_string())?;
+            let committed: oulipoly_state::mailbox::BrokerReleaseEvidence =
+                serde_json::from_str(&private_line(&mut parent)?).map_err(|e| e.to_string())?;
+            if committed.prepared != entry_row {
+                return Err("entry release identity mismatch".into());
+            }
+            std::fs::write(
+                gate_dir.join("released"),
+                serde_json::to_vec(&committed).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+        }
         let expect_death = std::env::var_os("AGE319_PRIVATE_EXPECT_GUARDIAN_DEATH_V1").is_some();
         let mut death_refused = false;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -780,7 +940,12 @@ fn private_held_prepared_entry() -> Result<(), String> {
     let _ = parent.write_all(b"X");
     drop(parent);
     unsafe { libc::waitpid(guardian_pid, std::ptr::null_mut(), 0) };
-    result.and(Err("prepared-only child gate remains closed".into()))
+    result?;
+    if std::env::var_os("AGE319_PRIVATE_RELEASE_V30").is_some() {
+        Ok(())
+    } else {
+        Err("prepared-only child gate remains closed".into())
+    }
 }
 
 fn stage_host_entry(
