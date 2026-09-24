@@ -5,6 +5,8 @@ use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::process::{Command, Stdio};
 
+const CAUSAL_BASH_INTERMEDIARY_DELAY: std::time::Duration = std::time::Duration::from_millis(80);
+
 fn causal_bash(args: &[String]) -> std::io::Result<()> {
     let marker = std::path::Path::new(&args[0]);
     let gate = marker
@@ -55,7 +57,7 @@ fn causal_bash(args: &[String]) -> std::io::Result<()> {
             libc::_exit(0);
         }
     }
-    std::thread::sleep(std::time::Duration::from_millis(80));
+    std::thread::sleep(CAUSAL_BASH_INTERMEDIARY_DELAY);
     let outcome = (|| -> std::io::Result<()> {
         std::fs::write(gate.join("causal-intermediary-start"), b"started")?;
         let status = std::fs::read_to_string("/proc/self/status")?;

@@ -192,6 +192,25 @@
       }
     },
     {
+      "id": "kernel-broker.fresh-provider-fixture.causal-bash-intermediary-delay",
+      "owner": "kernel-broker/fresh_provider_fixture",
+      "class": "test_only_patience",
+      "protected_resource": "causal Bash fixture intermediary startup",
+      "exhaustion_behavior": "The private fixture waits once before starting its child.",
+      "observability": "The fixture writes intermediary and child markers.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "Preserves the eighty millisecond private causal witness settling delay.",
+      "default_value": "std :: time :: Duration :: from_millis (80)",
+      "source": "crates/oulipoly-kernel-broker/src/fresh_provider_fixture.rs",
+      "symbol": "CAUSAL_BASH_INTERMEDIARY_DELAY",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/fresh_provider_fixture.rs",
+        "scope": "module::fn:causal_bash",
+        "kind": "direct_control"
+      }
+    },
+    {
       "id": "kernel-broker.fresh-provider.cancellation-escalation-delay",
       "owner": "kernel-broker/fresh_provider",
       "class": "external_protocol_deadline",
@@ -230,6 +249,44 @@
       }
     },
     {
+      "id": "kernel-broker.fresh-provider.provider-unavailable-release-wait",
+      "owner": "kernel-broker/fresh_provider",
+      "class": "external_protocol_deadline",
+      "protected_resource": "provider unavailable candidate hold",
+      "exhaustion_behavior": "The candidate can be considered again after five minutes.",
+      "observability": "Terminal marker timestamp and route readback show the hold.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "Preserves the typed provider unavailable marker hold.",
+      "default_value": "std :: time :: Duration :: from_secs (5 * 60)",
+      "source": "crates/oulipoly-kernel-broker/src/fresh_provider.rs",
+      "symbol": "PROVIDER_UNAVAILABLE_RELEASE_WAIT",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/fresh_provider.rs",
+        "scope": "module::impl:TerminalOutcome::fn:release_after",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.fresh-provider.rate-limited-release-wait",
+      "owner": "kernel-broker/fresh_provider",
+      "class": "external_protocol_deadline",
+      "protected_resource": "rate limited candidate hold",
+      "exhaustion_behavior": "The candidate can be considered again after one minute.",
+      "observability": "Terminal marker timestamp and route readback show the hold.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "Preserves the typed rate limited marker hold.",
+      "default_value": "std :: time :: Duration :: from_secs (60)",
+      "source": "crates/oulipoly-kernel-broker/src/fresh_provider.rs",
+      "symbol": "RATE_LIMITED_RELEASE_WAIT",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/fresh_provider.rs",
+        "scope": "module::impl:TerminalOutcome::fn:release_after",
+        "kind": "direct_control"
+      }
+    },
+    {
       "id": "kernel-broker.fresh-provider.sealed-copy-buffer-bytes",
       "owner": "kernel-broker/fresh_provider",
       "class": "resource_guard",
@@ -264,6 +321,25 @@
       "controlling_use": {
         "source": "crates/oulipoly-kernel-broker/src/fresh_provider.rs",
         "scope": "module::fn:sha_file",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "kernel-broker.fresh-provider.storage-contention-release-wait",
+      "owner": "kernel-broker/fresh_provider",
+      "class": "external_protocol_deadline",
+      "protected_resource": "storage contention candidate hold",
+      "exhaustion_behavior": "The candidate can be considered again after two minutes.",
+      "observability": "Terminal marker timestamp and route readback show the hold.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "Preserves the typed storage contention marker hold.",
+      "default_value": "std :: time :: Duration :: from_secs (2 * 60)",
+      "source": "crates/oulipoly-kernel-broker/src/fresh_provider.rs",
+      "symbol": "STORAGE_CONTENTION_RELEASE_WAIT",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/fresh_provider.rs",
+        "scope": "module::impl:TerminalOutcome::fn:release_after",
         "kind": "direct_control"
       }
     },
@@ -7750,6 +7826,25 @@
       "controlling_use": {
         "source": "src-tauri/src/kernel_entry.rs",
         "scope": "module::fn:private_run_account_effect",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "tauri.kernel-entry.private-causal-bash-result-wait",
+      "owner": "tauri/kernel_entry",
+      "class": "test_only_patience",
+      "protected_resource": "private causal Bash provider result",
+      "exhaustion_behavior": "The private fixture returns an unknown result after ninety seconds.",
+      "observability": "The broker Q readback and fixture error expose expiry.",
+      "configurability": "Fixed source declaration; no runtime override at this use.",
+      "rationale": "Allows the nested Bash physical witness to settle without changing the normal twenty second wait.",
+      "default_value": "std :: time :: Duration :: from_secs (90)",
+      "source": "src-tauri/src/kernel_entry.rs",
+      "symbol": "PRIVATE_CAUSAL_BASH_RESULT_WAIT",
+      "declaration_scope": "module::cfg:feature=\"age319-private-broker-fixture\"",
+      "controlling_use": {
+        "source": "src-tauri/src/kernel_entry.rs",
+        "scope": "module::impl:PrivateFreshBroker < '_ >::fn:run_to_physical_q",
         "kind": "direct_control"
       }
     },

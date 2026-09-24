@@ -7,6 +7,8 @@ const PRIVATE_CHILD_EFFECT_POLL: std::time::Duration = std::time::Duration::from
 #[cfg(feature = "age319-private-broker-fixture")]
 const PRIVATE_PROVIDER_RESULT_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 #[cfg(feature = "age319-private-broker-fixture")]
+const PRIVATE_CAUSAL_BASH_RESULT_WAIT: std::time::Duration = std::time::Duration::from_secs(90);
+#[cfg(feature = "age319-private-broker-fixture")]
 const PRIVATE_PROVIDER_RESULT_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 #[cfg(feature = "age319-private-broker-fixture")]
 const PRIVATE_LOST_REPLY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -890,7 +892,7 @@ impl oulipoly_runtime::executor::cli::fresh_remote::FreshProviderBackend
         let causal = std::env::var_os("AGE319_PRIVATE_PROVIDER_CAUSAL_BASH_V1").is_some();
         let deadline = std::time::Instant::now()
             + if causal {
-                std::time::Duration::from_secs(90)
+                PRIVATE_CAUSAL_BASH_RESULT_WAIT
             } else {
                 PRIVATE_PROVIDER_RESULT_WAIT
             };

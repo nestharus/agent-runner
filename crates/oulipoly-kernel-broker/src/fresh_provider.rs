@@ -10,6 +10,10 @@ const SHA_FILE_BUFFER_BYTES: usize = 64 * 1024;
 const SEALED_COPY_BUFFER_BYTES: usize = 64 * 1024;
 const VERIFIED_OUTPUT_BUFFER_BYTES: usize = 64 * 1024;
 const RECENT_FAILURE_SCORING_WINDOW: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+const PROVIDER_UNAVAILABLE_RELEASE_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(5 * 60);
+const STORAGE_CONTENTION_RELEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(2 * 60);
+const RATE_LIMITED_RELEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 use super::work_launch;
 use chrono::{DateTime, Utc};
@@ -1642,9 +1646,9 @@ impl TerminalOutcome {
 
     fn release_after(self) -> Option<Duration> {
         match self {
-            Self::ProviderUnavailable => Some(Duration::from_secs(5 * 60)),
-            Self::StorageContention => Some(Duration::from_secs(2 * 60)),
-            Self::RateLimited => Some(Duration::from_secs(60)),
+            Self::ProviderUnavailable => Some(PROVIDER_UNAVAILABLE_RELEASE_WAIT),
+            Self::StorageContention => Some(STORAGE_CONTENTION_RELEASE_WAIT),
+            Self::RateLimited => Some(RATE_LIMITED_RELEASE_WAIT),
             _ => None,
         }
     }
