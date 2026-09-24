@@ -77,6 +77,10 @@ impl RootRegistry {
             if name == "terminals" && entry.file_type()?.is_dir() {
                 continue;
             }
+            #[cfg(feature = "age319-private-broker-fixture")]
+            if name == "private-launches" && entry.file_type()?.is_dir() {
+                continue;
+            }
             // serve() has already opened and validated this fixed root-only
             // storage before it opens the root registry.
             if name == "sidecar" && entry.file_type()?.is_dir() {

@@ -79,6 +79,10 @@ fn production_entrypoint() -> ExitCode {
     if let Some(result) = kernel_entry::host_entry() {
         return result;
     }
+    #[cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
+    if let Some(result) = private_installed_probe() {
+        return result;
+    }
     if maintenance_worker::is_worker_invocation() {
         return match maintenance_worker::run_worker_invocation() {
             Ok(()) => ExitCode::SUCCESS,
@@ -105,6 +109,175 @@ fn production_entrypoint() -> ExitCode {
         };
     }
     process_entrypoint()
+}
+
+#[cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
+fn private_installed_probe() -> Option<ExitCode> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WINCH: AtomicBool = AtomicBool::new(false);
+    static INT: AtomicBool = AtomicBool::new(false);
+    extern "C" fn winch(_: libc::c_int) {
+        WINCH.store(true, Ordering::Relaxed);
+    }
+    extern "C" fn interrupt(_: libc::c_int) {
+        INT.store(true, Ordering::Relaxed);
+    }
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.first().and_then(|arg| arg.to_str()) != Some("__age319-private-installed-probe-v1") {
+        return None;
+    }
+    if (unsafe { libc::geteuid() }) != 0
+        || !std::fs::read_to_string("/proc/self/uid_map")
+            .ok()
+            .is_some_and(|map| map.split_ascii_whitespace().nth(2) == Some("1"))
+    {
+        return Some(ExitCode::FAILURE);
+    }
+    match args.get(1).and_then(|arg| arg.to_str()) {
+        Some("tty") if args.len() == 2 => {
+            unsafe {
+                libc::signal(libc::SIGWINCH, winch as libc::sighandler_t);
+                libc::signal(libc::SIGINT, interrupt as libc::sighandler_t);
+            }
+            let cwd = std::env::current_dir().unwrap();
+            let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+            let tty = unsafe { libc::isatty(0) } == 1;
+            let ctty =
+                unsafe { libc::open(c"/dev/tty".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+            if ctty >= 0 {
+                unsafe { libc::close(ctty) };
+            }
+            unsafe { libc::ioctl(0, libc::TIOCGWINSZ, &mut size) };
+            println!(
+                "PRIVATE_TTY_READY cwd={} tty={tty} ctty={} rows={} cols={} display={}",
+                cwd.display(),
+                ctty >= 0,
+                size.ws_row,
+                size.ws_col,
+                std::env::var("DISPLAY").unwrap_or_default()
+            );
+            std::io::stdout().flush().ok();
+            let mut input = Vec::new();
+            let mut byte = [0u8; 1];
+            while input.len() < 128 {
+                let read = unsafe { libc::read(0, byte.as_mut_ptr().cast(), 1) };
+                if read == 1 {
+                    if byte[0] == b'\n' {
+                        break;
+                    }
+                    input.push(byte[0]);
+                } else if read < 0
+                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                {
+                    continue;
+                } else {
+                    break;
+                }
+            }
+            println!(
+                "PRIVATE_TTY_RESULT input={} winch={} int={}",
+                String::from_utf8_lossy(&input),
+                WINCH.load(Ordering::Relaxed),
+                INT.load(Ordering::Relaxed)
+            );
+            Some(ExitCode::SUCCESS)
+        }
+        Some("ambient") if args.len() == 3 => {
+            let marker = std::path::PathBuf::from(&args[2]);
+            let child = unsafe { libc::fork() };
+            if child < 0 {
+                return Some(ExitCode::FAILURE);
+            }
+            if child == 0 {
+                unsafe {
+                    libc::setsid();
+                    libc::clearenv();
+                }
+                let observed_pid = std::fs::read_to_string("/proc/self/status")
+                    .ok()
+                    .and_then(|status| {
+                        status
+                            .lines()
+                            .find(|line| line.starts_with("NSpid:"))
+                            .and_then(|line| line.split_whitespace().nth(1))
+                            .and_then(|field| field.parse::<i32>().ok())
+                    })
+                    .unwrap_or(-1);
+                let _ = std::fs::write(
+                    &marker,
+                    format!("ambient-descendant-alive host_pid={observed_pid}\n"),
+                );
+                for fd in 0..1024 {
+                    unsafe { libc::close(fd) };
+                }
+                loop {
+                    unsafe { libc::pause() };
+                }
+            }
+            println!("PRIVATE_AMBIENT_PARENT_EXIT child={child}");
+            Some(ExitCode::SUCCESS)
+        }
+        Some("setuid") if args.len() == 2 => {
+            use std::os::fd::AsRawFd;
+            let image = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
+            let child = unsafe { libc::fork() };
+            if child < 0 {
+                return Some(ExitCode::FAILURE);
+            }
+            if child == 0 {
+                let argv = [
+                    c"oulipoly-agent-runner".as_ptr(),
+                    c"__age319-private-installed-probe-v1".as_ptr(),
+                    c"setuid-child".as_ptr(),
+                    std::ptr::null(),
+                ];
+                let envp = [std::ptr::null::<libc::c_char>()];
+                unsafe {
+                    if libc::setresgid(1, 1, 1) != 0 || libc::setresuid(1, 1, 1) != 0 {
+                        libc::_exit(71);
+                    }
+                    libc::syscall(
+                        libc::SYS_execveat,
+                        image.as_raw_fd(),
+                        c"".as_ptr(),
+                        argv.as_ptr(),
+                        envp.as_ptr(),
+                        libc::AT_EMPTY_PATH,
+                    );
+                    libc::_exit(72);
+                }
+            }
+            let mut status = 0;
+            if unsafe { libc::waitpid(child, &mut status, 0) } != child
+                || !libc::WIFEXITED(status)
+                || libc::WEXITSTATUS(status) != 0
+            {
+                eprintln!("PRIVATE_SETUID_CHILD_FAILED status={status}");
+                return Some(ExitCode::FAILURE);
+            }
+            Some(ExitCode::SUCCESS)
+        }
+        Some("setuid-child") if args.len() == 2 => {
+            let ruid = unsafe { libc::getuid() };
+            let euid = unsafe { libc::geteuid() };
+            let nnp = unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) };
+            println!("PRIVATE_SETUID_CHILD ruid={ruid} euid={euid} nnp={nnp}");
+            Some(if ruid == 1 && euid == 0 && nnp == 0 {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
+        }
+        Some("sleep") if args.len() == 2 => {
+            println!("PRIVATE_SLEEP_READY");
+            std::io::stdout().flush().ok();
+            loop {
+                unsafe { libc::pause() };
+            }
+        }
+        _ => Some(ExitCode::FAILURE),
+    }
 }
 
 fn run_with_event_sink_shutdown(

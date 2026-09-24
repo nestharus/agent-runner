@@ -13,12 +13,14 @@
 - `crates/oulipoly-kernel-broker/src/linux_main.rs`
 - `crates/oulipoly-kernel-broker/src/main.rs`
 - `crates/oulipoly-kernel-broker/src/protocol.rs`
+- `crates/oulipoly-kernel-broker/src/private_installed_exec.rs`
 - `crates/oulipoly-kernel-broker/src/registry.rs`
 - `crates/oulipoly-kernel-broker/src/root_join.rs`
 - `crates/oulipoly-kernel-broker/src/work_registry.rs`
 - `crates/oulipoly-kernel-broker/src/writer_census.rs`
 - `crates/oulipoly-kernel-broker/tests/private_root_join.rs`
 - `crates/oulipoly-kernel-broker/tests/private_accepted_h_frame.rs`
+- `crates/oulipoly-kernel-broker/tests/private_installed_exec.rs`
 - `src-tauri/src/kernel_entry.rs`
 - `src-tauri/src/completion_owner/linux.rs`
 - `src-tauri/src/completion_owner/driver.rs`
@@ -62,7 +64,8 @@
 | Exact joined child verifies a connected native-owner socket through challenged V. | Broker checks the fsynced child stamp and root PID1 ancestry, the host guardian and driver boot/starttime, and host-side socket peer credentials before returning a read-only verification receipt. |
 | A sealed Runner helper in a consumed K work verifies the connected owner socket. | A v3 H grant must pin the helper inode, Runner SHA-256, session, invocation and native registration-authority digest from the accepted intent. V must match the exact live work/grant, root, owner generation, authority digest, executable and guardian socket. The same bytes at another inode, altered witness, or missing/unconsumed grant refuse; an unchanged live work reattaches across broker restart. |
 | V carries a changed guardian incarnation or unrelated connected socket. | Refused without changing the one-use join or granting work. |
-| Provider/recovery CLI, GUI or TTY entry. | Refused before broker reservation while host/local PID plumbing and descriptor handoff are incomplete. |
+| Production provider/recovery CLI, GUI or TTY entry. | Refused before broker reservation while host/local PID plumbing and descriptor handoff are incomplete. |
+| Private feature-gated installed CLI entry with fixed Runner image, supported offline args, cwd and stdio/PTY descriptors. | One fsynced request identity; broker forks a host guardian and gated root PID1, pins the Runner child before release, and the guardian persists exit plus physical drain. Replay, unsettled second entrant, wrong image/generation and GUI refuse. Exact PID1 cancel survives broker restart and targets only that namespace. Production L remains closed. |
 | Loader-controlled environment, forged completion socket, sibling J, or replay J. | Refused without an arbitrary command launch. |
 | Broker restarts after a spent join. | Exact PID1 reattaches if live; spent join remains debt and no second child is launched. |
 | A sibling child tries to bind a prepared guardian's root ID. | Refused on pinned guardian incarnation mismatch. |

@@ -935,6 +935,15 @@ pub fn prepare_accepted_work_at(
 /// observer against a privileged workload that can replace `/proc`.
 pub fn supported_entry_args(args: &[String]) -> bool {
     #[cfg(feature = "age319-private-broker-fixture")]
+    if matches!(args, [first, second] if first == "__age319-private-installed-probe-v1" && (second == "tty" || second == "setuid" || second == "sleep"))
+        || matches!(args, [first, second, marker] if first == "__age319-private-installed-probe-v1" && second == "ambient" && marker.starts_with('/'))
+    {
+        return (unsafe { libc::geteuid() }) == 0
+            && std::fs::read_to_string("/proc/self/uid_map")
+                .ok()
+                .is_some_and(|map| map.split_ascii_whitespace().nth(2) == Some("1"));
+    }
+    #[cfg(feature = "age319-private-broker-fixture")]
     if matches!(args, [only] if only == "__age319-private-join-only-v1" || only == "__age319-private-bash-work-v1" || only == "__age319-private-normal-v30")
         && unsafe { libc::geteuid() } == 0
         && std::fs::read_to_string("/proc/self/uid_map")
@@ -964,6 +973,39 @@ pub fn submit_installed_launch_at(
 ) -> io::Result<String> {
     let stream = checked_connection(path)?;
     submit_installed_launch_on(stream, spec, descriptors)
+}
+
+/// Private feature-only readback/cancel. The request ID selects an existing
+/// journal record; it never grants another execution.
+#[cfg(feature = "age319-private-broker-fixture")]
+pub fn private_installed_control_at(
+    path: &Path,
+    request_id: &str,
+    generation: &str,
+    cancel: bool,
+) -> io::Result<String> {
+    let id = uuid::Uuid::parse_str(request_id)
+        .map_err(|_| io::Error::other("invalid private launch request ID"))?;
+    if id.to_string() != request_id {
+        return Err(io::Error::other("noncanonical private launch request ID"));
+    }
+    let generation_id = uuid::Uuid::parse_str(generation)
+        .map_err(|_| io::Error::other("invalid private launch generation"))?;
+    if generation_id.to_string() != generation {
+        return Err(io::Error::other("noncanonical private launch generation"));
+    }
+    let mut stream = checked_connection(path)?;
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let mut frame = [0u8; 49];
+    frame[0] = if cancel { b'M' } else { b'l' };
+    frame[1..17].copy_from_slice(&challenge);
+    frame[17..33].copy_from_slice(id.as_bytes());
+    frame[33..49].copy_from_slice(generation_id.as_bytes());
+    if stream.write(&frame)? != frame.len() {
+        return Err(io::Error::other("private launch status request uncertain"));
+    }
+    read_response(stream)
 }
 
 fn submit_installed_launch_on(

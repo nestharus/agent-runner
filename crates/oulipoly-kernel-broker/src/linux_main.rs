@@ -1,4 +1,7 @@
 //! Opt-in host-root broker for the pinned guardian and one-use root child join.
+#[cfg(feature = "age319-private-broker-fixture")]
+#[path = "private_installed_exec.rs"]
+mod private_installed_exec;
 #[path = "root_join.rs"]
 mod root_join;
 #[path = "work_launch.rs"]
@@ -104,6 +107,10 @@ fn require_cutover_entry_route(
             b'Y' | b'R' | b'W' | b'I' | b'e' | b'p' | b'g' | b'a' | b'j'
         )
     {
+        #[cfg(feature = "age319-private-broker-fixture")]
+        if private_fixture() && matches!(operation, b'L' | b'l' | b'M') {
+            return Ok(());
+        }
         return Err(io::Error::other(
             "broker-owned v30 sidecar requires installed v30 Runner entry routing",
         ));
@@ -179,6 +186,12 @@ enum RequestPayload {
     InstalledLaunch {
         spec: InstalledLaunchSpec,
         descriptors: Vec<File>,
+    },
+    #[cfg(feature = "age319-private-broker-fixture")]
+    PrivateLaunchStatus {
+        request_id: String,
+        generation: String,
+        cancel: bool,
     },
 }
 
@@ -279,6 +292,8 @@ fn recv_request(
         b'G' | b'g' => read == 65,
         b'P' | b'p' => read == 37,
         b'Q' | b'Z' => read == 33,
+        #[cfg(feature = "age319-private-broker-fixture")]
+        b'l' | b'M' => read == 49,
         b'A' | b'a' => read == 33,
         b'J' | b'j' => (18..=48 * 1024 + 17).contains(&read),
         b'L' => (18..=48 * 1024 + 17).contains(&read),
@@ -396,6 +411,12 @@ fn recv_request(
         b'L' => RequestPayload::InstalledLaunch {
             spec: serde_json::from_slice(&request[17..read as usize])?,
             descriptors,
+        },
+        #[cfg(feature = "age319-private-broker-fixture")]
+        b'l' | b'M' => RequestPayload::PrivateLaunchStatus {
+            request_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
+            generation: uuid::Uuid::from_bytes(request[33..49].try_into().unwrap()).to_string(),
+            cancel: request[0] == b'M',
         },
         _ => RequestPayload::None,
     };
@@ -2285,6 +2306,28 @@ fn serve() -> io::Result<()> {
     } else {
         None
     };
+    #[cfg(feature = "age319-private-broker-fixture")]
+    let private_launcher_image = if fixture {
+        std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_LAUNCHER_V1")
+            .map(File::open)
+            .transpose()?
+    } else {
+        None
+    };
+    #[cfg(feature = "age319-private-broker-fixture")]
+    let private_generation = if fixture {
+        std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GENERATION_V1").ok()
+    } else {
+        None
+    };
+    #[cfg(feature = "age319-private-broker-fixture")]
+    let private_launches = if fixture {
+        Some(private_installed_exec::LaunchLedger::open(Path::new(
+            &state,
+        ))?)
+    } else {
+        None
+    };
     let works_path = Path::new(&state).join("works");
     if !works_path.exists() {
         use std::os::unix::fs::DirBuilderExt;
@@ -2322,6 +2365,8 @@ fn serve() -> io::Result<()> {
     // Only this serving incarnation owns the pre-exec gate. A restart opens
     // durable J/prepared debt but cannot recreate or release a lost gate.
     let mut held_joins = BTreeMap::<String, root_join::HeldRootJoin>::new();
+    #[cfg(feature = "age319-private-broker-fixture")]
+    let mut private_launches = private_launches;
     let terminal_path = Path::new(&state).join("terminals");
     if !terminal_path.exists() {
         use std::os::unix::fs::DirBuilderExt;
@@ -2380,6 +2425,40 @@ fn serve() -> io::Result<()> {
                     pair.version, pair.generation
                 ))
             } else if operation == b'L' {
+                #[cfg(feature = "age319-private-broker-fixture")]
+                if fixture {
+                    let RequestPayload::InstalledLaunch { spec, descriptors } = payload else {
+                        return Err(io::Error::other("invalid private installed launch request"));
+                    };
+                    let image = private_launcher_image
+                        .as_ref()
+                        .ok_or_else(|| io::Error::other("private launcher image missing"))?;
+                    let generation = private_generation
+                        .as_deref()
+                        .ok_or_else(|| io::Error::other("private launch generation missing"))?;
+                    if !peer.process.same_executable_as(image)? || spec.generation != generation {
+                        return Err(io::Error::other(
+                            "private launcher image/generation mismatch",
+                        ));
+                    }
+                    installed_launch::validate(
+                        &spec,
+                        &installed_launch::files_as_raw(&descriptors),
+                    )?;
+                    let ledger = private_launches
+                        .as_mut()
+                        .ok_or_else(|| io::Error::other("private launch ledger missing"))?;
+                    private_installed_exec::launch(
+                        ledger,
+                        spec,
+                        descriptors,
+                        &peer,
+                        &host_namespace,
+                        &runner_image,
+                        stream.try_clone()?,
+                    )?;
+                    return Ok(String::new());
+                }
                 let pair = installed_pair
                     .as_ref()
                     .ok_or_else(|| io::Error::other("installed pair unavailable"))?;
@@ -2402,6 +2481,34 @@ fn serve() -> io::Result<()> {
                 Err(io::Error::other(
                     "installed supervisor transport staged; workload admission closed",
                 ))
+            } else if operation == b'l' || operation == b'M' {
+                #[cfg(feature = "age319-private-broker-fixture")]
+                if fixture {
+                    let RequestPayload::PrivateLaunchStatus {
+                        request_id,
+                        generation,
+                        cancel,
+                    } = payload
+                    else {
+                        return Err(io::Error::other("invalid private launch status request"));
+                    };
+                    let image = private_launcher_image
+                        .as_ref()
+                        .ok_or_else(|| io::Error::other("private launcher image missing"))?;
+                    if !peer.process.same_executable_as(image)? {
+                        return Err(io::Error::other("private launch status image mismatch"));
+                    }
+                    if private_generation.as_deref() != Some(generation.as_str()) {
+                        return Err(io::Error::other(
+                            "private launch status generation mismatch",
+                        ));
+                    }
+                    return private_launches
+                        .as_ref()
+                        .ok_or_else(|| io::Error::other("private launch ledger missing"))?
+                        .status(&request_id, &generation, peer.uid, cancel);
+                }
+                Err(io::Error::other("production launch status closed"))
             } else if operation == b'X' || operation == b'x' {
                 if peer.uid != 0 || !peer.process.in_namespace(&host_namespace)? {
                     return Err(io::Error::other("host-root gate transition required"));
@@ -2859,7 +2966,9 @@ fn serve() -> io::Result<()> {
             }
         });
         let response = result.unwrap_or_else(|error| format!("error {error}\n"));
-        let _ = stream.write_all(response.as_bytes());
+        if !response.is_empty() {
+            let _ = stream.write_all(response.as_bytes());
+        }
     }
     Ok(())
 }
