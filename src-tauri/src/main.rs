@@ -211,10 +211,16 @@ fn private_installed_probe() -> Option<ExitCode> {
                             .and_then(|field| field.parse::<i32>().ok())
                     })
                     .unwrap_or(-1);
-                let _ = std::fs::write(
-                    &marker,
-                    format!("ambient-descendant-alive host_pid={observed_pid}\n"),
-                );
+                let _ = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&marker)
+                    .and_then(|mut file| {
+                        file.write_all(
+                            format!("ambient-descendant-alive host_pid={observed_pid}\n")
+                                .as_bytes(),
+                        )
+                    });
                 for fd in 0..1024 {
                     unsafe { libc::close(fd) };
                 }

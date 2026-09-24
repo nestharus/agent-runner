@@ -301,6 +301,222 @@ fn prepare_native_v30(
     Ok((grant_id.into(), receipt_sha256, launch))
 }
 
+#[cfg(feature = "age319-private-broker-fixture")]
+pub(crate) fn private_native_lineage(
+    owner: &CompletionDomainOwner,
+    attempt: &ContinuationAttempt,
+    sibling: &ContinuationAttempt,
+    root_id: &str,
+    request_path: &Path,
+    sibling_request_path: &Path,
+    gate_dir: &Path,
+) -> Result<(), String> {
+    use std::fs::File;
+    let socket = super::linux::owner_broker_socket();
+    let route = super::broker_route::V30OwnerRoute::guardian(
+        &socket,
+        root_id,
+        &owner.domain_id,
+        &owner.supervisor_authority_id,
+        &owner.owner_generation,
+    )?;
+    let readback = route.read_running(owner, Some(&attempt.attempt_id))?;
+    let accepted = v30_accepted_snapshot(&readback, owner, attempt, root_id)?;
+    let request = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(request_path)
+        .map_err(|error| error.to_string())?;
+    let bytes = exact_request_bytes(request_path, &request)?;
+    let receipt_sha256 = publish_native_receipt(request_path, &request, &bytes, &accepted)?;
+    let directory = File::open(
+        request_path
+            .parent()
+            .ok_or("private native directory absent")?,
+    )
+    .map_err(|error| error.to_string())?;
+    let receipt = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(request_path.with_file_name(NATIVE_ACCEPTED_FILE))
+        .map_err(|error| error.to_string())?;
+    let descriptors = || {
+        [
+            directory.as_raw_fd(),
+            request.as_raw_fd(),
+            receipt.as_raw_fd(),
+        ]
+    };
+    let prepare = NativePrepareSpec {
+        protocol: "native-continuation-v30".into(),
+        root_id: root_id.into(),
+        attempt_id: attempt.attempt_id.clone(),
+        owner_generation: owner.owner_generation.clone(),
+        receipt_sha256: receipt_sha256.clone(),
+    };
+    let first = protocol::prepare_native_at(&socket, &prepare, descriptors())
+        .map_err(|error| error.to_string())?;
+    let second = protocol::prepare_native_at(&socket, &prepare, descriptors())
+        .map_err(|error| error.to_string())?;
+    if first != second {
+        return Err("private lost/duplicate N reply changed grant".into());
+    }
+    let grant_id = first
+        .strip_prefix("prepared-native-v30 ")
+        .and_then(|value| value.strip_suffix('\n'))
+        .ok_or_else(|| format!("private N did not return retained grant: {}", first.trim()))?
+        .to_owned();
+    let spec = NativeKSpec {
+        protocol: "native-continuation-v30".into(),
+        grant_id: grant_id.clone(),
+        root_id: root_id.into(),
+        attempt_id: attempt.attempt_id.clone(),
+        owner_generation: owner.owner_generation.clone(),
+        receipt_sha256,
+    };
+    let sibling_read = route.read_running(owner, Some(&sibling.attempt_id))?;
+    let sibling_accepted = v30_accepted_snapshot(&sibling_read, owner, sibling, root_id)?;
+    let sibling_request = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(sibling_request_path)
+        .map_err(|error| error.to_string())?;
+    let sibling_bytes = exact_request_bytes(sibling_request_path, &sibling_request)?;
+    let sibling_sha = publish_native_receipt(
+        sibling_request_path,
+        &sibling_request,
+        &sibling_bytes,
+        &sibling_accepted,
+    )?;
+    let sibling_dir = File::open(
+        sibling_request_path
+            .parent()
+            .ok_or("sibling native directory absent")?,
+    )
+    .map_err(|error| error.to_string())?;
+    let sibling_receipt = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(sibling_request_path.with_file_name(NATIVE_ACCEPTED_FILE))
+        .map_err(|error| error.to_string())?;
+    let sibling_descriptors = || {
+        [
+            sibling_dir.as_raw_fd(),
+            sibling_request.as_raw_fd(),
+            sibling_receipt.as_raw_fd(),
+        ]
+    };
+    let sibling_reply = protocol::prepare_native_at(
+        &socket,
+        &NativePrepareSpec {
+            protocol: "native-continuation-v30".into(),
+            root_id: root_id.into(),
+            attempt_id: sibling.attempt_id.clone(),
+            owner_generation: owner.owner_generation.clone(),
+            receipt_sha256: sibling_sha,
+        },
+        sibling_descriptors(),
+    )
+    .map_err(|error| error.to_string())?;
+    let sibling_grant = sibling_reply
+        .strip_prefix("prepared-native-v30 ")
+        .and_then(|value| value.strip_suffix('\n'))
+        .ok_or_else(|| format!("private sibling N refused: {}", sibling_reply.trim()))?;
+    if sibling_grant == grant_id {
+        return Err("private sibling reused first grant".into());
+    }
+    std::fs::write(
+        gate_dir.join("native-sibling-grant"),
+        sibling_grant.as_bytes(),
+    )
+    .map_err(|error| error.to_string())?;
+    let mut wrong = spec.clone();
+    wrong.grant_id = sibling_grant.into();
+    if !protocol::native_k_v30_at(&socket, &wrong, descriptors())
+        .map_err(|error| error.to_string())?
+        .starts_with("error ")
+    {
+        return Err("private sibling grant passed first attempt t".into());
+    }
+    wrong.grant_id = uuid::Uuid::new_v4().to_string();
+    if !protocol::native_k_v30_at(&socket, &wrong, descriptors())
+        .map_err(|error| error.to_string())?
+        .starts_with("error ")
+    {
+        return Err("private nonexistent grant passed t".into());
+    }
+    wrong = spec.clone();
+    wrong.owner_generation = uuid::Uuid::new_v4().to_string();
+    if !protocol::native_k_v30_at(&socket, &wrong, descriptors())
+        .map_err(|error| error.to_string())?
+        .starts_with("error ")
+    {
+        return Err("private sibling owner passed t".into());
+    }
+    std::fs::write(gate_dir.join("native-prepared"), grant_id.as_bytes())
+        .map_err(|error| error.to_string())?;
+    let wait = |name: &str| -> Result<(), String> {
+        let until = Instant::now() + Duration::from_secs(20);
+        while !gate_dir.join(name).exists() {
+            if Instant::now() >= until {
+                return Err(format!("private native {name} timed out"));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Ok(())
+    };
+    wait("native-k")?;
+    protocol::native_k_v30_drop_reply_at(&socket, &spec, descriptors())
+        .map_err(|error| error.to_string())?;
+    std::fs::write(gate_dir.join("native-t-sent"), grant_id.as_bytes())
+        .map_err(|error| error.to_string())?;
+    wait("native-restarted")?;
+    let replay = protocol::native_k_v30_at(&socket, &spec, descriptors())
+        .map_err(|error| error.to_string())?;
+    if !replay.starts_with("error ") {
+        return Err("private lost t reply replayed K".into());
+    }
+    let first_q = protocol::observe_native_work_v30_at(&socket, &grant_id)
+        .map_err(|error| error.to_string())?;
+    if gate_dir.join("native-pid1-loss").exists() {
+        if !first_q.starts_with("native-unknown terminal-absent-after-PID1-loss ") {
+            return Err(format!(
+                "private PID1 loss did not retain unknown debt: {first_q}"
+            ));
+        }
+        std::fs::write(gate_dir.join("native-q-readback"), first_q)
+            .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+    if !first_q.starts_with("native-terminal-pending ") {
+        return Err(format!(
+            "private long descendant settled before cancellation: {first_q}"
+        ));
+    }
+    std::fs::write(gate_dir.join("native-q-pending"), first_q)
+        .map_err(|error| error.to_string())?;
+    wait("native-cancel")?;
+    let cancel = protocol::cancel_native_work_v30_at(&socket, &grant_id)
+        .map_err(|error| error.to_string())?;
+    if !cancel.starts_with("native-cancel-signalled ") {
+        return Err(format!("private cancellation refused: {cancel}"));
+    }
+    let until = Instant::now() + Duration::from_secs(15);
+    loop {
+        let q = protocol::observe_native_work_v30_at(&socket, &grant_id)
+            .map_err(|error| error.to_string())?;
+        if q.starts_with("native-q-settled ") {
+            std::fs::write(gate_dir.join("native-q-readback"), q)
+                .map_err(|error| error.to_string())?;
+            return Ok(());
+        }
+        if Instant::now() >= until {
+            return Err(format!("private native Q remained debt: {q}"));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[cfg(test)]
 mod native_acceptance_tests {
     use super::*;

@@ -840,6 +840,27 @@ fn private_guardian_prepared(
             if byte != [b'D'] {
                 return Err("broker driver did not read accepted PK".into());
             }
+            if std::env::var_os("AGE319_PRIVATE_NATIVE_LINEAGE_V30").is_some() {
+                let sibling: oulipoly_state::mailbox::ContinuationAttempt =
+                    serde_json::from_str(&private_line(&mut driver_parent)?)
+                        .map_err(|error| error.to_string())?;
+                let sibling_read = route.accept(&readback.owner, &sibling)?;
+                if sibling_read.phase.as_deref() != Some("accepted") {
+                    return Err("private sibling attempt not accepted".into());
+                }
+                driver_parent
+                    .write_all(b"A")
+                    .map_err(|error| error.to_string())?;
+                crate::completion_owner::private_native_lineage(
+                    &readback.owner,
+                    &attempt,
+                    &sibling,
+                    root,
+                    &gate_dir.join("native-work/custodian-request.json"),
+                    &gate_dir.join("native-sibling-work/custodian-request.json"),
+                    gate_dir,
+                )?;
+            }
             std::fs::write(
                 gate_dir.join("driver-routed"),
                 attempt.attempt_id.as_bytes(),
@@ -855,6 +876,42 @@ fn private_guardian_prepared(
     let _ = driver_parent.write_all(b"X");
     unsafe { libc::waitpid(driver_pid, std::ptr::null_mut(), 0) };
     Ok(())
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_native_request(
+    gate_dir: &std::path::Path,
+    attempt: &oulipoly_state::mailbox::ContinuationAttempt,
+    name: &str,
+) -> Result<(), String> {
+    let work = gate_dir.join(name);
+    std::fs::create_dir(&work).map_err(|error| error.to_string())?;
+    let marker = gate_dir.join(if name == "native-work" {
+        "native-effect"
+    } else {
+        "native-sibling-effect"
+    });
+    let args = [
+        b"__age319-private-installed-probe-v1".to_vec(),
+        b"ambient".to_vec(),
+        marker.as_os_str().as_encoded_bytes().to_vec(),
+    ];
+    let request = serde_json::json!({
+        "path": std::path::PathBuf::from(std::env::var("OULIPOLY_DATA_DIR")
+            .map_err(|error| error.to_string())?).join("state.db"),
+        "attempt": attempt,
+        "recipe": {"Native": {"args": args, "environment": [], "directory": null}},
+    });
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(work.join("custodian-request.json"))
+        .map_err(|error| error.to_string())?;
+    serde_json::to_writer(&mut file, &request).map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())?;
+    File::open(&work)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]
@@ -900,20 +957,28 @@ fn private_v30_driver_route(
     if protocol::read_state_at(broker, &stale).is_ok() {
         return Err("sibling driver owner gained R".into());
     }
+    let native = std::env::var_os("AGE319_PRIVATE_NATIVE_LINEAGE_V30").is_some();
     let attempt = oulipoly_state::mailbox::ContinuationAttempt {
         attempt_id: uuid::Uuid::new_v4().to_string(),
         owner_generation: owner.owner_generation.clone(),
-        operation: "transport".into(),
+        operation: if native { "activation" } else { "transport" }.into(),
         request_sha256: "0".repeat(64),
         source_registration_id: None,
         source_listener_revision: None,
-        session_id: None,
-        claim_token: None,
+        session_id: native.then(|| "native-session".into()),
+        claim_token: native.then(|| "native-claim".into()),
         result_path: gate_dir
-            .join("driver-result.json")
+            .join(if native {
+                "native-work/result.json"
+            } else {
+                "driver-result.json"
+            })
             .to_string_lossy()
             .into_owned(),
     };
+    if native {
+        private_native_request(gate_dir, &attempt, "native-work")?;
+    }
     let reserved = route.reserve(&owner, &attempt)?;
     if route.reserve(&owner, &attempt)? != reserved {
         return Err("driver reservation readback changed".into());
@@ -949,6 +1014,30 @@ fn private_v30_driver_route(
         return Err("accepted attempt was revoked".into());
     }
     channel.write_all(b"D").map_err(|e| e.to_string())?;
+    if native {
+        let sibling = oulipoly_state::mailbox::ContinuationAttempt {
+            attempt_id: uuid::Uuid::new_v4().to_string(),
+            session_id: Some("native-sibling-session".into()),
+            claim_token: Some("native-sibling-claim".into()),
+            result_path: gate_dir
+                .join("native-sibling-work/result.json")
+                .to_string_lossy()
+                .into_owned(),
+            ..attempt.clone()
+        };
+        private_native_request(gate_dir, &sibling, "native-sibling-work")?;
+        route.reserve(&owner, &sibling)?;
+        serde_json::to_writer(&mut *channel, &sibling).map_err(|error| error.to_string())?;
+        channel
+            .write_all(b"\n")
+            .map_err(|error| error.to_string())?;
+        channel
+            .read_exact(&mut instruction)
+            .map_err(|error| error.to_string())?;
+        if instruction != [b'A'] {
+            return Err("private sibling acceptance refused".into());
+        }
+    }
     channel
         .read_exact(&mut instruction)
         .map_err(|e| e.to_string())?;

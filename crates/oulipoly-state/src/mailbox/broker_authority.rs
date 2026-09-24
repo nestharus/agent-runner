@@ -1466,7 +1466,7 @@ impl BrokerSidecar {
             return Ok(existing);
         }
         self.mailbox
-            .bind_exact_native_grant(accepted, grant_id, request_sha256)?;
+            .bind_exact_native_grant_for_broker(accepted, grant_id, request_sha256)?;
         self.read_exact_native_grant_v30(
             source_generation,
             root_id,

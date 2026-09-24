@@ -22,6 +22,13 @@ mod original_work;
 #[cfg(target_os = "linux")]
 mod root_supervisor;
 
+#[cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
+#[allow(
+    unused_imports,
+    reason = "used by the binary's private kernel-entry fixture"
+)]
+pub(crate) use root_supervisor::private_native_lineage;
+
 #[cfg(test)]
 pub(crate) mod test_support;
 

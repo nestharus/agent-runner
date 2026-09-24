@@ -401,6 +401,13 @@ fn create_init(
         if child < 0 {
             unsafe { libc::_exit(70) };
         }
+        // This persistent parent outlives a broker crash. Keeping the
+        // broker's inherited listener would make a lost control socket appear
+        // connectable while no process can accept requests on it.
+        if work_launch::close_other_descriptors(&[reaper_context.terminal_dir.as_raw_fd()]).is_err()
+        {
+            unsafe { libc::_exit(70) };
+        }
         // The intermediate process remains the actual parent of nested
         // PID1 across broker restart. Only its waitpid result can fill Q's
         // PID1 status; a /proc disappearance alone is insufficient.
@@ -588,6 +595,20 @@ pub(super) fn launch(
             &evidence,
         )
         .map_err(io::Error::other)?;
+    #[cfg(feature = "age319-private-broker-fixture")]
+    if super::private_fixture()
+        && let Some(directory) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_NATIVE_GATE_V1")
+    {
+        let directory = Path::new(&directory);
+        std::fs::write(directory.join("native-attached"), spent.grant_id.as_bytes())?;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !directory.join("native-release").exists() {
+            if Instant::now() >= deadline {
+                return Err(io::Error::other("private native execution gate expired"));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
     // R lets pre-exec finish; the worker's own gate remains held until E.
     gate.write_all(b"R")?;
     let mut executed = [0u8; 1];
@@ -718,8 +739,19 @@ fn settle_ready(
             }
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let gone = observed_incarnation_gone(
+                work.init_host_pid,
+                &work.boot_id,
+                work.init_starttime_ticks,
+                (work.pidns_dev, work.pidns_ino),
+            )?;
             return Ok(format!(
-                "native-terminal-pending {}\n",
+                "{} {}\n",
+                if gone {
+                    "native-unknown terminal-absent-after-PID1-loss"
+                } else {
+                    "native-terminal-pending"
+                },
                 work.work_incarnation
             ));
         }
@@ -852,7 +884,7 @@ fn settle_ready(
         receipt.worker_wait_status,
         receipt.cancellation_observed,
         terminal_sha256,
-        serde_json::to_string(&receipt.output)?
+        receipt.output.len()
     ))
 }
 

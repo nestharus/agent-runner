@@ -1069,6 +1069,37 @@ impl MailboxDb {
         grant_id: &str,
         custodian_request_sha256: &str,
     ) -> Result<NativeGrantBinding, String> {
+        require_exact_live_guardian(&accepted.guardian_identity)?;
+        self.bind_exact_native_grant_on_retained_connection(
+            accepted,
+            grant_id,
+            custodian_request_sha256,
+        )
+    }
+
+    /// BrokerSidecar calls this only after its challenged N frame authenticates
+    /// the live guardian and its exact retained owner/attempt. The broker
+    /// process itself is not that guardian, so the local-caller check above
+    /// would reject a legitimate broker-owned bind.
+    pub(in crate::mailbox) fn bind_exact_native_grant_for_broker(
+        &mut self,
+        accepted: &AcceptedNativeGrantSnapshot,
+        grant_id: &str,
+        custodian_request_sha256: &str,
+    ) -> Result<NativeGrantBinding, String> {
+        self.bind_exact_native_grant_on_retained_connection(
+            accepted,
+            grant_id,
+            custodian_request_sha256,
+        )
+    }
+
+    fn bind_exact_native_grant_on_retained_connection(
+        &mut self,
+        accepted: &AcceptedNativeGrantSnapshot,
+        grant_id: &str,
+        custodian_request_sha256: &str,
+    ) -> Result<NativeGrantBinding, String> {
         fn valid_sha256(value: &str) -> bool {
             value.len() == 64
                 && value
@@ -1089,7 +1120,6 @@ impl MailboxDb {
         {
             return Err("invalid native grant binding proposal".into());
         }
-        require_exact_live_guardian(&accepted.guardian_identity)?;
         native_main_file_must_be_named(&self.conn)?;
         let accepted_snapshot_sha256 = crate::completion_continuation::sha256(
             &serde_json::to_vec(accepted).map_err(|error| error.to_string())?,

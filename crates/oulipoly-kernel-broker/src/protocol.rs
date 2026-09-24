@@ -793,6 +793,41 @@ fn send_native_descriptors<T: serde::Serialize, const N: usize>(
     spec: &T,
     descriptors: [RawFd; N],
 ) -> io::Result<String> {
+    read_response(send_native_descriptors_frame(
+        path,
+        operation,
+        spec,
+        descriptors,
+    )?)
+}
+
+/// Exercise an uncertain t response without changing the broker's challenged
+/// request path. The sent frame can have spent K even though this caller gets
+/// no launch result; readback must use the retained grant and Q.
+#[cfg(feature = "age319-private-broker-fixture")]
+pub fn native_k_v30_drop_reply_at(
+    path: &Path,
+    spec: &NativeKSpec,
+    descriptors: [RawFd; 3],
+) -> io::Result<()> {
+    if spec.protocol != "native-continuation-v30" {
+        return Err(io::Error::other("v30 native K protocol required"));
+    }
+    drop(send_native_descriptors_frame(
+        path,
+        b't',
+        spec,
+        descriptors,
+    )?);
+    Ok(())
+}
+
+fn send_native_descriptors_frame<T: serde::Serialize, const N: usize>(
+    path: &Path,
+    operation: u8,
+    spec: &T,
+    descriptors: [RawFd; N],
+) -> io::Result<UnixStream> {
     let body = serde_json::to_vec(spec)?;
     if body.len() > 2048 {
         return Err(io::Error::other("native prepare request too large"));
@@ -827,7 +862,7 @@ fn send_native_descriptors<T: serde::Serialize, const N: usize>(
     {
         return Err(io::Error::other("short native prepare; outcome uncertain"));
     }
-    read_response(stream)
+    Ok(stream)
 }
 
 /// A prepared H grant is launched once by its original guardian. The seven

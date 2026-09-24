@@ -6,6 +6,7 @@ use oulipoly_kernel_broker::protocol::{
 };
 use oulipoly_state::completion_continuation::AdmittedSourceBinding;
 use oulipoly_state::mailbox::{AgentBashCompleteEnqueue, BrokerSidecar, EnqueueResult, MailboxDb};
+use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
@@ -32,7 +33,8 @@ fn stop(child: &mut Child) {
 
 fn inner() {
     let mode = std::env::var("AGE319_PRIVATE_JOIN_MODE").unwrap_or_else(|_| "help".into());
-    let release_mode = mode.starts_with("held_release");
+    let native_mode = mode.starts_with("native_");
+    let release_mode = mode.starts_with("held_release") || native_mode;
     let normal_mode = mode.starts_with("normal_");
     let recipient_mode = mode.starts_with("normal_recipient");
     let runner =
@@ -90,6 +92,15 @@ fn inner() {
         .unwrap_or_else(|| mailbox.completion_continuation_domain().unwrap().unwrap());
     let sidecar_generation = mailbox.sidecar_generation().unwrap();
     drop(mailbox);
+    if native_mode {
+        rusqlite::Connection::open(data.join("pid-identity.db"))
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO session_wake_claim(session_id,claim_token,claimed_at,reason,auto_wake_count) VALUES('native-session','native-claim','2026-09-24T00:00:00Z','private-lineage',1);
+                 INSERT INTO session_wake_claim(session_id,claim_token,claimed_at,reason,auto_wake_count) VALUES('native-sibling-session','native-sibling-claim','2026-09-24T00:00:00Z','private-lineage',1);",
+            )
+            .unwrap();
+    }
     if normal_mode {
         rusqlite::Connection::open(data.join("pid-identity.db"))
             .unwrap()
@@ -157,6 +168,7 @@ fn inner() {
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+        .envs(native_mode.then_some(("OULIPOLY_KERNEL_BROKER_FIXTURE_NATIVE_GATE_V1", &gate)))
         .envs(
             (mode == "held_release_gate_fail")
                 .then_some(("OULIPOLY_KERNEL_BROKER_FIXTURE_FAIL_GATE_WRITE_V1", "1")),
@@ -686,9 +698,10 @@ fn inner() {
                     .then_some(("AGE319_PRIVATE_PREPARE_LOST_REPLY_V1", "1")),
             )
             .envs(
-                (mode == "held_release_driver_route")
+                (mode == "held_release_driver_route" || native_mode)
                     .then_some(("AGE319_PRIVATE_DRIVER_ROUTE_V30", "1")),
             )
+            .envs(native_mode.then_some(("AGE319_PRIVATE_NATIVE_LINEAGE_V30", "1")))
             .envs(
                 (mode == "held_release_exec_driver")
                     .then_some(("AGE319_PRIVATE_EXEC_DRIVER_ROUTE_V30", "1")),
@@ -914,6 +927,268 @@ fn inner() {
             .read_exact_release(&generation, &prepared.root_id, &prepared.owner_generation)
             .unwrap();
             assert_eq!(durable, evidence);
+            if native_mode {
+                eventually(|| {
+                    gate.join("native-prepared").exists() || entry.try_wait().unwrap().is_some()
+                });
+                assert!(
+                    gate.join("native-prepared").exists(),
+                    "native N: entry={} broker={}",
+                    fs::read_to_string(&err).unwrap(),
+                    fs::read_to_string(&broker_log).unwrap()
+                );
+                let grant = fs::read_to_string(gate.join("native-prepared")).unwrap();
+                let native_db = broker_state.join("sidecar/pid-identity.db");
+                let read_native = || {
+                    rusqlite::Connection::open_with_flags(
+                        &native_db,
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                    )
+                    .unwrap()
+                };
+                let state = read_native();
+                let (attempt, phase, protocol, bound): (String, String, String, String) = state
+                    .query_row(
+                        "SELECT a.attempt_id,a.phase,b.protocol,b.grant_id FROM completion_continuation_attempt a JOIN completion_native_grant_binding b ON b.attempt_id=a.attempt_id WHERE a.session_id='native-session'",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )
+                    .unwrap();
+                assert_eq!(phase, "accepted");
+                // The State binding schema uses its original v1 field; the
+                // broker's exact v5 grant and owner provenance select v30.
+                assert_eq!(protocol, "native-continuation-v1");
+                assert_eq!(bound, grant);
+                let sibling_grant = fs::read_to_string(gate.join("native-sibling-grant")).unwrap();
+                assert_ne!(sibling_grant, grant);
+                assert_eq!(
+                    state
+                        .query_row::<i64, _, _>(
+                            "SELECT count(*) FROM completion_native_grant_binding",
+                            [],
+                            |row| row.get(0)
+                        )
+                        .unwrap(),
+                    2
+                );
+                assert_eq!(
+                    state
+                        .query_row::<i64, _, _>(
+                            "SELECT count(*) FROM completion_native_worker_attach",
+                            [],
+                            |row| row.get(0)
+                        )
+                        .unwrap(),
+                    0
+                );
+                assert!(!gate.join("native-effect").exists(), "effect before K");
+                fs::write(gate.join("native-k"), b"yes").unwrap();
+                eventually(|| {
+                    gate.join("native-attached").exists() || entry.try_wait().unwrap().is_some()
+                });
+                assert!(
+                    gate.join("native-attached").exists(),
+                    "native attach: entry={} broker={}",
+                    fs::read_to_string(&err).unwrap(),
+                    fs::read_to_string(&broker_log).unwrap()
+                );
+                assert_eq!(
+                    fs::read_to_string(gate.join("native-attached")).unwrap(),
+                    grant
+                );
+                assert!(
+                    !gate.join("native-effect").exists(),
+                    "effect before State-attached gate release"
+                );
+                let state = read_native();
+                let pid1_json: String = state.query_row(
+                    "SELECT pid1_identity FROM completion_native_worker_attach WHERE attempt_id=?1 AND grant_id=?2",
+                    [&attempt, &grant],
+                    |row| row.get(0),
+                ).unwrap();
+                let pid1: serde_json::Value = serde_json::from_str(&pid1_json).unwrap();
+                let pid1 = pid1["pid"].as_i64().unwrap() as i32;
+                assert!(pid1 > 0);
+                if mode == "native_pid1_loss" {
+                    assert_eq!(unsafe { libc::kill(pid1, libc::SIGKILL) }, 0);
+                    fs::write(gate.join("native-pid1-loss"), b"yes").unwrap();
+                }
+                fs::write(gate.join("native-release"), b"yes").unwrap();
+                eventually(|| {
+                    gate.join("native-t-sent").exists() || entry.try_wait().unwrap().is_some()
+                });
+                assert!(gate.join("native-t-sent").exists());
+                if mode == "native_cancel" {
+                    eventually(|| gate.join("native-effect").exists());
+                    assert_eq!(
+                        fs::read_to_string(gate.join("native-effect"))
+                            .unwrap()
+                            .lines()
+                            .count(),
+                        1
+                    );
+                } else {
+                    assert!(!gate.join("native-effect").exists());
+                }
+                // A completed t handler is required before killing its socket;
+                // the lost reply has no authority to trigger a second K.
+                eventually(|| protocol::request_at(&socket, Operation::Classify).is_ok());
+                stop(&mut broker);
+                assert!(
+                    !socket.exists() || protocol::request_at(&socket, Operation::Classify).is_err()
+                );
+                let restart_log = temp.path().join("native-restart.log");
+                let mut restarted = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
+                    .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                    .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
+                    .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
+                    .stderr(Stdio::from(File::create(&restart_log).unwrap()))
+                    .spawn()
+                    .unwrap();
+                eventually(|| {
+                    protocol::request_at(&socket, Operation::Classify).is_ok()
+                        || restarted.try_wait().unwrap().is_some()
+                });
+                assert!(
+                    restarted.try_wait().unwrap().is_none(),
+                    "restart: {}",
+                    fs::read_to_string(&restart_log).unwrap()
+                );
+                fs::write(gate.join("native-restarted"), b"yes").unwrap();
+                if mode == "native_cancel" {
+                    eventually(|| {
+                        gate.join("native-q-pending").exists()
+                            || entry.try_wait().unwrap().is_some()
+                    });
+                    assert!(
+                        gate.join("native-q-pending").exists(),
+                        "{}",
+                        fs::read_to_string(&err).unwrap()
+                    );
+                    std::thread::sleep(Duration::from_secs(6));
+                    assert_eq!(
+                        fs::read_to_string(gate.join("native-effect"))
+                            .unwrap()
+                            .lines()
+                            .count(),
+                        1
+                    );
+                    assert_eq!(
+                        state
+                            .query_row::<i64, _, _>(
+                                "SELECT count(*) FROM completion_native_kernel_q",
+                                [],
+                                |row| row.get(0)
+                            )
+                            .unwrap(),
+                        0
+                    );
+                    fs::write(gate.join("native-cancel"), b"yes").unwrap();
+                }
+                eventually(|| {
+                    gate.join("native-q-readback").exists() || entry.try_wait().unwrap().is_some()
+                });
+                assert!(
+                    gate.join("native-q-readback").exists(),
+                    "q: entry={} broker={} restart={}",
+                    fs::read_to_string(&err).unwrap(),
+                    fs::read_to_string(&broker_log).unwrap(),
+                    fs::read_to_string(&restart_log).unwrap()
+                );
+                let q = fs::read_to_string(gate.join("native-q-readback")).unwrap();
+                let state = read_native();
+                let settled: i64 = state.query_row("SELECT count(*) FROM completion_native_kernel_q WHERE attempt_id=?1 AND grant_id=?2", [&attempt, &grant], |row| row.get(0)).unwrap();
+                let incarnation: String = state.query_row(
+                    "SELECT work_incarnation_id FROM completion_native_worker_attach WHERE attempt_id=?1 AND grant_id=?2",
+                    [&attempt, &grant],
+                    |row| row.get(0),
+                ).unwrap();
+                let spent: serde_json::Value = serde_json::from_slice(
+                    &fs::read(broker_state.join("grants").join(format!("{grant}.json"))).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(spent["state"], "consumed");
+                let sibling: serde_json::Value = serde_json::from_slice(
+                    &fs::read(
+                        broker_state
+                            .join("grants")
+                            .join(format!("{sibling_grant}.json")),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(sibling["state"], "prepared");
+                assert!(!gate.join("native-sibling-effect").exists());
+                assert_eq!(fs::read_dir(broker_state.join("works")).unwrap().count(), 1);
+                if mode == "native_cancel" {
+                    assert!(q.starts_with("native-q-settled "), "{q}");
+                    assert_eq!(settled, 1);
+                    assert_eq!(
+                        fs::read_to_string(gate.join("native-effect"))
+                            .unwrap()
+                            .lines()
+                            .count(),
+                        1
+                    );
+                    let terminal = fs::read(
+                        broker_state
+                            .join("terminals")
+                            .join(format!("{incarnation}.native.json")),
+                    )
+                    .unwrap();
+                    let physical: serde_json::Value = serde_json::from_slice(&terminal).unwrap();
+                    assert_eq!(physical["physical_tree_drained"], true);
+                    assert_eq!(physical["cancellation_observed"], true);
+                    assert!(
+                        physical["output"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|item| item["name"] == "launcher.stdout")
+                    );
+                    let digest: String = state.query_row("SELECT terminal_receipt_sha256 FROM completion_native_kernel_q WHERE attempt_id=?1", [&attempt], |row| row.get(0)).unwrap();
+                    assert_eq!(digest, format!("{:x}", Sha256::digest(&terminal)));
+                    let wait: serde_json::Value = serde_json::from_slice(
+                        &fs::read(
+                            broker_state
+                                .join("terminals")
+                                .join(format!("{grant}.native-pid1-wait.json")),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(wait["reaped"], true);
+                } else {
+                    assert!(
+                        q.starts_with("native-unknown terminal-absent-after-PID1-loss "),
+                        "{q}"
+                    );
+                    assert_eq!(settled, 0);
+                    assert!(
+                        !broker_state
+                            .join("terminals")
+                            .join(format!("{incarnation}.native.json"))
+                            .exists()
+                    );
+                }
+                let (phase, integrated): (String, i64) = state.query_row("SELECT phase,integrated FROM completion_continuation_attempt WHERE attempt_id=?1", [&attempt], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+                assert_eq!(
+                    (phase.as_str(), integrated),
+                    ("accepted", 0),
+                    "Q must not stand in for Runner result"
+                );
+                assert_eq!(state.query_row::<i64, _, _>("SELECT count(*) FROM session_wake_claim WHERE session_id='native-session' AND claim_token='native-claim'", [], |row| row.get(0)).unwrap(), 1);
+                assert_eq!(
+                    fs::read(data.join("pid-identity.db")).unwrap(),
+                    b"retired copied owner"
+                );
+                stop(&mut restarted);
+                fs::write(gate.join("finish"), b"done").unwrap();
+                eventually(|| entry.try_wait().unwrap().is_some());
+                let _ = entry.wait();
+                unsafe { libc::kill(prepared.root_init.host_pid, libc::SIGKILL) };
+                return;
+            }
             if mode == "held_release_driver_route" {
                 eventually(|| {
                     gate.join("driver-routed").exists() || entry.try_wait().unwrap().is_some()
@@ -1525,6 +1800,8 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "held_release_commit_fail",
         "held_release_child_predeath",
         "held_release_gate_fail",
+        "native_cancel",
+        "native_pid1_loss",
         "normal_release",
         "normal_guardian_death",
         "normal_driver_death",
