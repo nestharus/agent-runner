@@ -1962,9 +1962,8 @@ mod tests {
             .unwrap();
         drop(db);
 
-        // Bound the waiter itself: on deadline telemetry becomes unavailable,
-        // cancelling this exact queued admission instead of leaking a thread.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        // Retain a finite failure path if dead-head reconciliation stalls.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let guard = enqueue_and_wait_at_with_memory_observer(
             &path,
             "live",

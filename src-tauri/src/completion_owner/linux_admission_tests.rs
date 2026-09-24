@@ -1,6 +1,25 @@
 use super::*;
 use fs4::FileExt;
 
+fn run_isolated_from_parallel_forks(test_name: &str) -> bool {
+    const MARKER: &str = "OULIPOLY_ADMISSION_ISOLATED_TEST";
+    if std::env::var(MARKER).ok().as_deref() == Some(test_name) {
+        return false;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test_name, "--nocapture"])
+        .env(MARKER, test_name)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+        "isolated {test_name}: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
+}
+
 fn write_fresh_join(socket: &mut UnixStream) {
     socket
         .write_all(b"join!\n{\"protocol\":\"root-authority-v1\",\"mode\":{\"kind\":\"fresh\"}}\n")
@@ -103,6 +122,11 @@ fn closing_admission_waits_for_election_release_before_first_hello() {
 
 #[test]
 fn hello_to_join_gate_prevents_idle_close_and_releases_on_failed_close() {
+    if run_isolated_from_parallel_forks(
+        "completion_owner::linux::admission_tests::hello_to_join_gate_prevents_idle_close_and_releases_on_failed_close",
+    ) {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let endpoint = root.path().join("owner.sock");
     let entry = admission_gate(&endpoint).unwrap();
@@ -202,6 +226,11 @@ fn hello_still_rejects_invalid_owner_and_empty_response() {
 // whose persistence has not run must remain pending even while hello succeeds.
 #[test]
 fn responsive_hello_does_not_ack_pending_join_and_pause_preserves_it() {
+    if run_isolated_from_parallel_forks(
+        "completion_owner::linux::admission_tests::responsive_hello_does_not_ack_pending_join_and_pause_preserves_it",
+    ) {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let endpoint = root.path().join("owner.sock");
     let listener = UnixListener::bind(&endpoint).unwrap();
@@ -219,6 +248,7 @@ fn responsive_hello_does_not_ack_pending_join_and_pause_preserves_it() {
     let service = ControlService::start(&listener, &owner).unwrap();
     let mut joining = UnixStream::connect(&endpoint).unwrap();
     write_fresh_join(&mut joining);
+    service.await_queued_join_for_test();
     assert_eq!(
         hello(&endpoint).unwrap().owner_generation,
         owner.owner_generation

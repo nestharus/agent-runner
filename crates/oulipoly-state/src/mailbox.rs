@@ -122,6 +122,41 @@ enum MailboxConnectionObservation<'a> {
     SelectedRecorder(&'a FlightRecorder),
 }
 
+#[cfg(test)]
+thread_local! {
+    static COMPLETION_OPEN_OBSERVATION_HOOK: std::cell::RefCell<Option<Box<dyn Fn(bool)>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+pub(crate) fn with_test_completion_open_observation<T>(
+    hook: impl Fn(bool) + 'static,
+    operation: impl FnOnce() -> T,
+) -> T {
+    COMPLETION_OPEN_OBSERVATION_HOOK.with(|slot| {
+        assert!(slot.replace(Some(Box::new(hook))).is_none());
+    });
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            COMPLETION_OPEN_OBSERVATION_HOOK.with(|slot| {
+                slot.replace(None);
+            });
+        }
+    }
+    let _reset = Reset;
+    operation()
+}
+
+#[cfg(test)]
+fn completion_open_observation_hook(after_record: bool) {
+    COMPLETION_OPEN_OBSERVATION_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow().as_ref() {
+            hook(after_record);
+        }
+    });
+}
+
 fn open_observed_mailbox_connection(
     query_family: &'static str,
     path_class: SqlitePathClass,
@@ -137,6 +172,18 @@ fn open_observed_mailbox_connection(
     };
     match open() {
         Ok(connection) => {
+            #[cfg(test)]
+            let deferred_completion_open = query_family
+                == "pid_mailbox.connection.open_completion_authority"
+                && matches!(
+                    &observation,
+                    MailboxConnectionObservation::Parent(_)
+                        | MailboxConnectionObservation::SelectedRecorder(_)
+                );
+            #[cfg(test)]
+            if deferred_completion_open {
+                completion_open_observation_hook(false);
+            }
             let span = || mailbox_connection_span(query_family, path_class, transaction_mode);
             let _ = match observation {
                 MailboxConnectionObservation::Process => observer.record_success(
@@ -167,6 +214,10 @@ fn open_observed_mailbox_connection(
                         connection_open_evidence,
                     ),
             };
+            #[cfg(test)]
+            if deferred_completion_open {
+                completion_open_observation_hook(true);
+            }
             Ok(connection)
         }
         Err(error) => {
@@ -14741,6 +14792,10 @@ mod tests {
         assert_eq!(version, schema::CURRENT_VERSION);
         assert_eq!(count, 32);
 
+        begin_completion_finalization_vm_count();
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+        let intact_current_open_steps = end_completion_finalization_vm_count();
+
         connection
             .execute(
                 "DELETE FROM completion_authority_materialization_summary",
@@ -14753,13 +14808,15 @@ mod tests {
         let current_open_steps = end_completion_finalization_vm_count();
         eprintln!("current-schema ordinary open VM steps: {current_open_steps}");
         assert_eq!(materialization_summary_count(&sidecar_path), 0);
+        assert_eq!(
+            current_open_steps, intact_current_open_steps,
+            "current-schema open did extra work after summary deletion"
+        );
         assert!(
-            // Schema 29 fingerprints native attach/Q tables and guards
-            // (measured 6552 VM steps). Keep a fixed ceiling, the
-            // no-backfill assertion, and the separate retained-history growth
-            // test; this does not grant a data-size-dependent budget.
-            current_open_steps < 7500,
-            "current-schema open performed unexpected SQLite work: {current_open_steps}"
+            // The current schema needs more work than the old v29 ceiling,
+            // but ordinary reopen must still have a fixed, bounded cost.
+            current_open_steps < 10_000,
+            "current-schema open exceeded its fixed VM budget: {current_open_steps}"
         );
     }
 

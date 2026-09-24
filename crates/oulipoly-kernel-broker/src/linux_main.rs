@@ -5089,18 +5089,22 @@ mod tests {
             let (mut stream, _) = listener.accept().unwrap();
             let (op, payload, peer) = peer_from_request(&mut stream).unwrap();
             assert_eq!(op, b'C');
-            assert!(matches!(payload, RequestPayload::None));
+            assert!(matches!(
+                payload,
+                RequestPayload::FreshBashChildRequest { .. }
+            ));
             assert_eq!(peer.process.host_pid, std::process::id() as i32);
         });
         let mut client = UnixStream::connect(&socket).unwrap();
         let mut challenge = [0u8; 16];
         client.read_exact(&mut challenge).unwrap();
-        let mut message = [0u8; 17];
+        let mut message = [0u8; 33];
         message[0] = b'C';
-        message[1..].copy_from_slice(&challenge);
+        message[1..17].copy_from_slice(&challenge);
+        message[17..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
         assert_eq!(
-            unsafe { libc::send(client.as_raw_fd(), message.as_ptr().cast(), 17, 0) },
-            17
+            unsafe { libc::send(client.as_raw_fd(), message.as_ptr().cast(), 33, 0) },
+            33
         );
         server.join().unwrap();
     }
@@ -5117,10 +5121,14 @@ mod tests {
         let mut client = UnixStream::connect(&socket).unwrap();
         let mut challenge = [0u8; 16];
         client.read_exact(&mut challenge).unwrap();
-        let message = [b'C'; 17];
+        let mut message = [0u8; 33];
+        message[0] = b'C';
+        message[1..17].copy_from_slice(&challenge);
+        message[1] ^= 0xff;
+        message[17..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
         assert_eq!(
-            unsafe { libc::send(client.as_raw_fd(), message.as_ptr().cast(), 17, 0) },
-            17
+            unsafe { libc::send(client.as_raw_fd(), message.as_ptr().cast(), 33, 0) },
+            33
         );
         server.join().unwrap();
     }
@@ -5135,9 +5143,15 @@ mod tests {
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                 .unwrap();
-            assert!(peer_from_request(&mut stream).is_err());
+            let error = peer_from_request(&mut stream).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("transferred/inherited socket sender"),
+                "unexpected denial: {error}"
+            );
         });
-        let script = "import os,socket,sys\ns=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.connect(sys.argv[1]);c=s.recv(16);p=os.fork()\nif p==0:\n s.sendall(b'C'+c);os._exit(0)\nos.waitpid(p,0)";
+        let script = "import os,socket,sys\ns=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.connect(sys.argv[1]);c=s.recv(16);p=os.fork()\nif p==0:\n s.sendall(b'C'+c+bytes.fromhex('11111111111141118111111111111111'));os._exit(0)\nos.waitpid(p,0)";
         let output = Command::new("python3")
             .args(["-c", script, socket.to_str().unwrap()])
             .output()
@@ -5177,7 +5191,7 @@ assert int(caps, 16) & (1 << 21), caps  # CAP_SYS_ADMIN in the child user namesp
 s = socket.socket(fileno=3)
 challenge = s.recv(16)
 assert len(challenge) == 16
-message = b'C' + challenge
+message = b'C' + challenge + bytes.fromhex('11111111111141118111111111111111')
 claimed = struct.pack('3i', int(sys.argv[1]), 0, 0)
 try:
     s.sendmsg([message], [(socket.SOL_SOCKET, socket.SCM_CREDENTIALS, claimed)])
@@ -5233,9 +5247,10 @@ assert s.send(message) == len(message)
         let mut client = UnixStream::connect(&socket).unwrap();
         let mut challenge = [0u8; 16];
         client.read_exact(&mut challenge).unwrap();
-        let mut request = [0u8; 17];
+        let mut request = [0u8; 33];
         request[0] = b'C';
-        request[1..].copy_from_slice(&challenge);
+        request[1..17].copy_from_slice(&challenge);
+        request[17..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
         let payload = File::open("/dev/null").unwrap();
         let mut iov = libc::iovec {
             iov_base: request.as_mut_ptr().cast(),
@@ -5254,7 +5269,7 @@ assert s.send(message) == len(message)
             (*cmsg).cmsg_type = libc::SCM_RIGHTS;
             (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<i32>() as _) as _;
             *(libc::CMSG_DATA(cmsg) as *mut i32) = payload.as_raw_fd();
-            assert_eq!(libc::sendmsg(client.as_raw_fd(), &message, 0), 17);
+            assert_eq!(libc::sendmsg(client.as_raw_fd(), &message, 0), 33);
         }
         server.join().unwrap();
     }
