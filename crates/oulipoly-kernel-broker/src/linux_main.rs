@@ -26,7 +26,7 @@ use oulipoly_kernel_broker::protocol::{
 use oulipoly_kernel_broker::registry::RootRegistry;
 use oulipoly_kernel_broker::work_registry::{Scope, WorkRegistry, classify_scope};
 use oulipoly_state::mailbox::{
-    BrokerReleaseEvidence, BrokerSidecar, PreparedBrokerOwner, PreparedProcessStamp,
+    BrokerReleaseEvidence, BrokerSidecar, FreshV30Lane, PreparedBrokerOwner, PreparedProcessStamp,
 };
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -39,6 +39,7 @@ use std::time::{Duration, Instant};
 
 const SOCKET: &str = "/run/oulipoly-kernel-broker/control.sock";
 const STATE: &str = "/var/lib/oulipoly-kernel-broker";
+const FRESH_SOCKET: &str = "/run/oulipoly-kernel-broker/v30.sock";
 const RUNNER: &str = "/usr/local/libexec/oulipoly/oulipoly-agent-runner";
 
 #[cfg(feature = "age319-private-broker-fixture")]
@@ -3160,12 +3161,138 @@ fn serve() -> io::Result<()> {
     Ok(())
 }
 
-pub fn run() {
-    if std::env::args_os().len() != 1 {
-        eprintln!("no command-line options accepted");
-        std::process::exit(2);
+fn serve_fresh_v30() -> io::Result<()> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Err(io::Error::other("host root required"));
     }
-    if let Err(error) = serve() {
+    unsafe { libc::umask(0o077) };
+    let fixture = private_fixture();
+    install_detached_host_proc()?;
+    if !fixture {
+        for namespace in ["user", "pid"] {
+            let self_ns = host_proc_file(&format!("self/ns/{namespace}"))?.metadata()?;
+            let init_ns = host_proc_file(&format!("1/ns/{namespace}"))?.metadata()?;
+            if (self_ns.dev(), self_ns.ino()) != (init_ns.dev(), init_ns.ino()) {
+                return Err(io::Error::other("fresh broker requires host namespaces"));
+            }
+        }
+    }
+    let state_root = if fixture {
+        std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1")
+            .map_err(|_| io::Error::other("private fresh state root missing"))?
+    } else {
+        STATE.into()
+    };
+    let socket = if fixture {
+        std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1")
+            .map_err(|_| io::Error::other("private fresh socket missing"))?
+    } else {
+        FRESH_SOCKET.into()
+    };
+    let runner = if fixture {
+        std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1")
+            .map_err(|_| io::Error::other("private fresh Runner missing"))?
+    } else {
+        RUNNER.into()
+    };
+    if !fixture {
+        checked_root_path(Path::new(&state_root), true)?;
+        checked_root_path(Path::new("/run/oulipoly-kernel-broker"), true)?;
+        checked_root_path(Path::new(&runner), false)?;
+        checked_root_path(Path::new(installed_pair::BROKER), false)?;
+        let pair = InstalledPair::load(Path::new(installed_pair::MANIFEST), true)?;
+        pair.verify_image_against(
+            Path::new(installed_pair::BROKER),
+            &pair.broker_sha256,
+            true,
+            &host_proc_file("self/exe")?,
+        )?;
+        let image = File::open(&runner)?;
+        pair.verify_file(Path::new(&runner), &pair.runner_sha256, true, &image)?;
+    }
+    let runner_image = File::open(&runner)?;
+    // A missing or incomplete publication cannot bind the new endpoint.
+    let mut lane = FreshV30Lane::open_at(Path::new(&state_root)).map_err(io::Error::other)?;
+    let instance = EntryGate::open(&Path::new(&state_root).join("v30"))?;
+    match fs::symlink_metadata(&socket) {
+        Ok(meta) if meta.file_type().is_socket() && meta.uid() == 0 && meta.nlink() == 1 => {
+            fs::remove_file(&socket)?;
+        }
+        Ok(_) => return Err(io::Error::other("fresh v30 socket pathname is untrusted")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let listener = UnixListener::bind(&socket)?;
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o660))?;
+    for incoming in listener.incoming() {
+        let Ok(mut stream) = incoming else { continue };
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        let answer = (|| -> io::Result<String> {
+            let (operation, payload, peer) = peer_from_request(&mut stream)?;
+            if !matches!(payload, RequestPayload::None) {
+                return Err(io::Error::other("fresh lane request must have no payload"));
+            }
+            peer.process.verify()?;
+            if operation == b'i' {
+                return Ok(if instance.is_closed() {
+                    "entry-gate-v1 draining\n"
+                } else {
+                    "entry-gate-v1 fresh-v30-closed\n"
+                }
+                .into());
+            }
+            if !peer.process.same_executable_as(&runner_image)? {
+                return Err(io::Error::other(
+                    "fresh lane requires installed Runner image",
+                ));
+            }
+            match operation {
+                b'I' => Ok(format!(
+                    "fresh-v30-route {} {} {}\n",
+                    lane.identity().lane_id,
+                    lane.identity().source_generation,
+                    lane.identity().domain_id,
+                )),
+                b'D' => {
+                    if instance.is_closed() {
+                        return Err(io::Error::other("fresh v30 session allocation gate closed"));
+                    }
+                    let session = lane.allocate_session().map_err(io::Error::other)?;
+                    Ok(format!(
+                        "fresh-session {}\n",
+                        serde_json::to_string(&session)?
+                    ))
+                }
+                _ => Err(io::Error::other(
+                    "fresh v30 effects closed pending source/recipient/K/Q/ACK lineage",
+                )),
+            }
+        })();
+        let response = answer.unwrap_or_else(|error| format!("error {error}\n"));
+        let _ = stream.write_all(response.as_bytes());
+    }
+    Ok(())
+}
+
+pub fn run() {
+    let args: Vec<_> = std::env::args_os().collect();
+    let result = match args.as_slice() {
+        [_] => serve(),
+        [_, mode] if mode == "--initialize-fresh-v30" => {
+            FreshV30Lane::initialize_at(Path::new(STATE))
+                .map(|identity| {
+                    println!("{}", serde_json::to_string(&identity).unwrap());
+                })
+                .map_err(io::Error::other)
+        }
+        [_, mode] if mode == "--serve-fresh-v30" => serve_fresh_v30(),
+        _ => {
+            eprintln!("unknown broker mode");
+            std::process::exit(2);
+        }
+    };
+    if let Err(error) = result {
         eprintln!("kernel broker: {error}");
         std::process::exit(1);
     }

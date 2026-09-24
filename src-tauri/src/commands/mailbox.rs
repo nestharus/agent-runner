@@ -130,6 +130,7 @@ pub(crate) fn run_status(session_id: &str, json: bool) -> Result<i32, String> {
 }
 
 pub(crate) fn run_pause(session_id: &str, paused: bool, json: bool) -> Result<i32, String> {
+    crate::completion_owner::require_unqualified_legacy_session(session_id)?;
     crate::completion_owner::require_legacy_recipient_effect_route()?;
     let mut db = MailboxDb::open_default()?;
     let wake = set_pause_and_request_wake(&mut db, session_id, paused, || {
@@ -167,6 +168,7 @@ pub(crate) fn run_ack(
     delivered_by: &str,
     json: bool,
 ) -> Result<i32, String> {
+    crate::completion_owner::require_unqualified_legacy_session(session_id)?;
     crate::completion_owner::require_legacy_recipient_effect_route()?;
     let mut db = MailboxDb::open_default()?;
     let acknowledged_count = db.acknowledge_range(session_id, from_seq, to_seq, delivered_by)?;
@@ -194,6 +196,7 @@ pub(crate) fn run_ack(
 }
 
 fn mailbox_status(session_id: &str) -> Result<MailboxStatusResponse, String> {
+    crate::completion_owner::require_unqualified_legacy_session(session_id)?;
     let Some(db) = MailboxDb::open_historical_default_if_exists()? else {
         return Ok(MailboxStatusResponse {
             session_id: session_id.to_string(),
@@ -321,6 +324,7 @@ fn render_mailbox_list(
 }
 
 fn list_rows(session_id: &str, all: bool) -> Result<Vec<MailboxRow>, String> {
+    crate::completion_owner::require_unqualified_legacy_session(session_id)?;
     let db = if all {
         MailboxDb::open_historical_default_if_exists()?
     } else {
@@ -536,6 +540,7 @@ pub(crate) fn run_rearm_observation(
     resolution: &str,
     json: bool,
 ) -> Result<i32, String> {
+    crate::completion_owner::require_unqualified_legacy_session(session_id)?;
     let db = MailboxDb::open_default()?;
     db.rearm_mailbox_observation(session_id, stop_id, resolution)?;
     if json {

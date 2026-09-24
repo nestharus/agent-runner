@@ -266,6 +266,24 @@ pub(crate) fn require_legacy_recipient_effect_route() -> Result<(), String> {
     Ok(())
 }
 
+/// Fresh v30 IDs are broker minted. A legacy command given one of these IDs
+/// cannot disambiguate an old row with the same `(session, seq)` spelling.
+/// Existing pinned v29 helpers retain their original, separate endpoint.
+pub(crate) fn require_unqualified_legacy_session(session_id: &str) -> Result<(), String> {
+    let mut parts = session_id.split(':');
+    let fresh_shape = match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some("v30"), Some(lane), Some(session), None) => [lane, session]
+            .into_iter()
+            .all(|part| uuid::Uuid::parse_str(part).is_ok_and(|id| id.to_string() == part)),
+        _ => false,
+    };
+    if fresh_shape {
+        Err("session requires an explicit versioned lane; legacy ACK/resume/wake refused".into())
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn custodian_entry() -> Option<Result<(), String>> {
     match std::env::args().nth(1).as_deref() {
@@ -284,6 +302,14 @@ pub(crate) fn custodian_entry() -> Option<Result<(), String>> {
 mod entry_tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn unqualified_legacy_session_refuses_fresh_namespace_even_if_old_row_collides() {
+        let id = uuid::Uuid::new_v4();
+        assert!(require_unqualified_legacy_session(&format!("v30:{id}:{id}")).is_err());
+        assert!(require_unqualified_legacy_session("v30:old-custom-name").is_ok());
+        assert!(require_unqualified_legacy_session("legacy-session").is_ok());
+    }
 
     #[test]
     fn service_entry_tracks_wake_producers_not_database_access() {

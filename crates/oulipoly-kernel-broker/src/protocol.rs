@@ -8,6 +8,60 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 
 pub const INSTALLED_SOCKET: &str = "/run/oulipoly-kernel-broker/control.sock";
+pub const INSTALLED_FRESH_V30_SOCKET: &str = "/run/oulipoly-kernel-broker/v30.sock";
+
+/// The fresh lane has a fixed, versioned endpoint. Callers cannot provide a
+/// State path or select a ledger by an environment string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FreshV30Route {
+    pub lane_id: String,
+    pub source_generation: String,
+    pub domain_id: String,
+}
+
+pub fn fresh_v30_state_route() -> io::Result<FreshV30Route> {
+    let response = request_frame_at(
+        Path::new(INSTALLED_FRESH_V30_SOCKET),
+        Operation::ReadStateRoute,
+        Payload::None,
+    )?;
+    let fields = response
+        .strip_prefix("fresh-v30-route ")
+        .and_then(|value| value.strip_suffix('\n'))
+        .ok_or_else(|| io::Error::other("fresh v30 broker route unavailable"))?;
+    let mut fields = fields.split(' ');
+    let route = FreshV30Route {
+        lane_id: fields.next().unwrap_or_default().into(),
+        source_generation: fields.next().unwrap_or_default().into(),
+        domain_id: fields.next().unwrap_or_default().into(),
+    };
+    if fields.next().is_some() {
+        return Err(io::Error::other("fresh v30 broker route has extra fields"));
+    }
+    for value in [&route.lane_id, &route.source_generation, &route.domain_id] {
+        let parsed = uuid::Uuid::parse_str(value)
+            .map_err(|_| io::Error::other("fresh v30 broker identity invalid"))?;
+        if parsed.to_string() != *value {
+            return Err(io::Error::other(
+                "fresh v30 broker identity is noncanonical",
+            ));
+        }
+    }
+    Ok(route)
+}
+
+pub fn allocate_fresh_v30_session() -> io::Result<oulipoly_state::mailbox::FreshV30Session> {
+    let response = request_frame_at(
+        Path::new(INSTALLED_FRESH_V30_SOCKET),
+        Operation::AllocateFreshSession,
+        Payload::None,
+    )?;
+    let body = response
+        .strip_prefix("fresh-session ")
+        .and_then(|value| value.strip_suffix('\n'))
+        .ok_or_else(|| io::Error::other("fresh v30 session allocation refused"))?;
+    serde_json::from_str(body).map_err(io::Error::other)
+}
 
 /// Entry routing is observed from the live broker before any user-side
 /// sidecar read. This is a storage version observation, not a grant.
@@ -423,6 +477,7 @@ pub enum Operation {
     ReserveEntry,
     ReadEntry,
     ReadStateRoute,
+    AllocateFreshSession,
     ReserveV30Entry,
     ReadV30Entry,
     PrepareV30Guardian,
@@ -1582,6 +1637,7 @@ fn request_frame_at(path: &Path, operation: Operation, payload: Payload) -> io::
         Operation::BindV30Guardian => b'g',
         Operation::ReadV30Entry => b'a',
         Operation::ReadStateRoute => b'I',
+        Operation::AllocateFreshSession => b'D',
         Operation::LaunchFixedRunner => b'L',
     };
     request[1..17].copy_from_slice(&challenge);

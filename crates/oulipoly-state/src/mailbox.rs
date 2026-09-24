@@ -46,6 +46,8 @@ mod broker_authority;
 mod broker_payload_custody;
 mod completion_continuation;
 mod finalization;
+#[cfg(unix)]
+mod fresh_lane;
 mod native_publication;
 mod retention;
 pub use broker_authority::{
@@ -54,6 +56,8 @@ pub use broker_authority::{
     BrokerRepairReadback, BrokerSidecar, BrokerSourceCandidate, BrokerSourceEffectGrant,
     BrokerSourceSelection, PreparedBrokerOwner, PreparedProcessStamp, QuiescedCutoverProof,
 };
+#[cfg(unix)]
+pub use fresh_lane::{FreshV30Lane, FreshV30LaneIdentity, FreshV30Session};
 pub use native_publication::NativePublication;
 #[path = "mailbox/schema.rs"]
 mod schema;
