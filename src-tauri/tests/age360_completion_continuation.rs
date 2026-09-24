@@ -2778,6 +2778,14 @@ fn native_root_state_token_cancellation(replace_driver: bool) {
             .is_none()
             .then_some(())
     });
+    wait(|| {
+        f.mailbox_for_poll()?
+            .wake_session_reader()
+            .wake_claim(SESSION)
+            .ok()?
+            .is_none()
+            .then_some(())
+    });
     let integrated: (String, i64, String) = f.sidecar_connection()
         .query_row(
             "SELECT phase,integrated,drain_receipt FROM completion_continuation_attempt WHERE attempt_id=?1",
