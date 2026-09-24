@@ -642,6 +642,13 @@ struct QuotaReuse {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+struct ManualQuotaReuse {
+    operation_id: String,
+    source_effect_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 struct AuthReuse {
     source_directory: String,
     source_effect_id: String,
@@ -799,6 +806,7 @@ fn reusable_quota_source(
             || !same_physical_effect_source(directory, &candidate, &intent)?
             || intent.environment_sha256 != environment_digest(request)?
             || source_dir.join("reuse.json").exists()
+            || source_dir.join("manual-reuse.json").exists()
         {
             continue;
         }
@@ -833,7 +841,7 @@ fn reusable_quota_source(
 /// Serialize the scan and durable auth intent across broker threads and
 /// incarnations. The lock protects the decision only; an already started K is
 /// represented by the fsynced intent and must be observed, never launched again.
-fn auth_admission_lock(directory: &Path, account: &str) -> io::Result<File> {
+pub(super) fn auth_admission_lock(directory: &Path, account: &str) -> io::Result<File> {
     let parent = directory.join("account-effects");
     std::fs::create_dir_all(&parent)?;
     let name = format!("auth-{:x}.lock", Sha256::digest(account.as_bytes()));
@@ -852,6 +860,39 @@ fn auth_admission_lock(directory: &Path, account: &str) -> io::Result<File> {
             return Err(error);
         }
     }
+}
+
+/// Manual K admission shares this lock with every account effect kind. An
+/// unresolved route K/Q is returned as an exact artifact, never replaced by
+/// a second manual probe.
+pub(super) fn unresolved_account_effect_for_physical(
+    directory: &Path,
+    physical_id: &str,
+) -> io::Result<Option<String>> {
+    let entries = match std::fs::read_dir(directory.join("account-effects")) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let dir = entry.path();
+        let Some(intent) = effect_intent(&dir)? else {
+            continue;
+        };
+        let candidate = effect_candidate(directory, &intent.binding, &intent.request)?;
+        if candidate.account_identity != physical_id {
+            continue;
+        }
+        let result = effect_readback_from_dir(&dir, &intent)?;
+        if result.state != "drained" {
+            return Ok(Some(result.artifact));
+        }
+    }
+    Ok(None)
 }
 
 fn coalescible_auth_source(
@@ -926,6 +967,36 @@ fn effect_readback_from_dir(
         .and_then(Path::parent)
         .ok_or_else(|| io::Error::other("fresh effect broker directory absent"))?;
     let candidate = effect_candidate(broker_directory, &intent.binding, &intent.request)?;
+    if let Some(reuse) = exact_file::<ManualQuotaReuse>(dir, "manual-reuse.json")? {
+        if intent.request.kind != FreshAccountEffectKind::QuotaFirst
+            || intent.plan_sha256 != format!("manual:{}", reuse.source_effect_id)
+        {
+            return Err(io::Error::other("fresh manual quota reuse intent changed"));
+        }
+        let script = candidate
+            .quota_script
+            .as_deref()
+            .ok_or_else(|| io::Error::other("manual quota reuse has no source"))?;
+        let readback = super::manual_quota::source_readback(
+            broker_directory,
+            &reuse.operation_id,
+            &candidate.account_identity,
+            script,
+            candidate.auth_refresh_command.as_deref(),
+            &intent.environment_sha256,
+            &reuse.source_effect_id,
+        )?;
+        return Ok(FreshAccountEffectReadback {
+            effect_id: intent.id.clone(),
+            state: readback.state,
+            outcome: readback.outcome,
+            windows: readback.windows,
+            completed_unix_seconds: readback.completed_unix_seconds,
+            artifact: format!("{artifact} -> {}", readback.artifact),
+            peer_effect_id: Some(reuse.source_effect_id),
+            peer_artifact: Some(readback.artifact),
+        });
+    }
     if let Some(reuse) = &intent.auth_source {
         if intent.request.kind != FreshAccountEffectKind::AuthRefresh
             || reuse.source_directory.contains('/')
@@ -1066,7 +1137,7 @@ struct RawEffectOutput {
     remaining: Option<u64>,
 }
 
-fn parse_effect_windows(raw: &str) -> io::Result<Vec<FreshQuotaWindow>> {
+pub(super) fn parse_effect_windows(raw: &str) -> io::Result<Vec<FreshQuotaWindow>> {
     let value: RawEffectOutput = serde_json::from_str(raw)?;
     let windows = if let Some(windows) = value.windows {
         windows
@@ -1139,7 +1210,9 @@ pub(super) fn begin_account_effect(
     }
     let _auth_lock = if matches!(
         request.kind,
-        FreshAccountEffectKind::AuthRefresh | FreshAccountEffectKind::QuotaFirst
+        FreshAccountEffectKind::AuthRefresh
+            | FreshAccountEffectKind::QuotaFirst
+            | FreshAccountEffectKind::QuotaRetry
     ) {
         Some(auth_admission_lock(directory, &candidate.account_identity)?)
     } else {
@@ -1149,6 +1222,13 @@ pub(super) fn begin_account_effect(
         return Err(io::Error::other(
             "fresh account effect already begun; observe exact effect",
         ));
+    }
+    if let Some(artifact) =
+        super::manual_quota::unresolved_for_physical(directory, &candidate.account_identity)?
+    {
+        return Err(io::Error::other(format!(
+            "manual quota prior K/Q unknown: {artifact}"
+        )));
     }
     let first_request = FreshAccountEffectRequest {
         kind: FreshAccountEffectKind::QuotaFirst,
@@ -1230,8 +1310,76 @@ pub(super) fn begin_account_effect(
         // A pre-rejection healthy Q must never masquerade as verification.
         route_evidence(directory, &candidate)?;
         let parent = directory.join("account-effects");
-        if let Some((source_directory, source)) =
-            reusable_quota_source(directory, binding, request)?
+        let manual = candidate
+            .quota_script
+            .as_deref()
+            .map(|script| {
+                super::manual_quota::latest(
+                    directory,
+                    &candidate.account_identity,
+                    script,
+                    candidate.auth_refresh_command.as_deref(),
+                    &environment_digest(request)?,
+                )
+            })
+            .transpose()?
+            .flatten();
+        if let Some((source, result)) = &manual {
+            if result.state != "drained" {
+                return Err(io::Error::other(format!(
+                    "manual quota prior K/Q unknown: {}",
+                    result.artifact
+                )));
+            }
+            if result.outcome.as_deref() == Some("valid_windows")
+                && quota_read_is_fresh(
+                    &FreshAccountEffectReadback {
+                        effect_id: source.effect_id.clone().unwrap_or_default(),
+                        state: result.state.clone(),
+                        outcome: result.outcome.clone(),
+                        windows: result.windows.clone(),
+                        completed_unix_seconds: result.completed_unix_seconds,
+                        artifact: result.artifact.clone(),
+                        peer_effect_id: None,
+                        peer_artifact: None,
+                    },
+                    Utc::now().timestamp(),
+                )?
+                && latest_terminal_marker_time(directory, &candidate)?.is_none_or(|marker| {
+                    super::manual_quota::physical_q_nanos(directory, &source.operation_id)
+                        .is_ok_and(|q| q > marker)
+                })
+            {
+                let effect_id = source
+                    .effect_id
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("manual quota effect ID absent"))?;
+                std::fs::create_dir(&dir)?;
+                File::open(&parent)?.sync_all()?;
+                let intent = AccountEffectIntent {
+                    version: 1,
+                    id: uuid::Uuid::new_v4().to_string(),
+                    binding: binding.clone(),
+                    request: redacted_effect_request(request),
+                    environment_sha256: environment_digest(request)?,
+                    plan_sha256: format!("manual:{effect_id}"),
+                    auth_source: None,
+                };
+                durable_new(&dir, "intent.json", &intent)?;
+                durable_new(
+                    &dir,
+                    "manual-reuse.json",
+                    &ManualQuotaReuse {
+                        operation_id: source.operation_id.clone(),
+                        source_effect_id: effect_id.clone(),
+                    },
+                )?;
+                return effect_readback_from_dir(&dir, &intent);
+            }
+        }
+        if manual.is_none()
+            && let Some((source_directory, source)) =
+                reusable_quota_source(directory, binding, request)?
         {
             std::fs::create_dir(&dir)?;
             File::open(&parent)?.sync_all()?;
@@ -1410,7 +1558,7 @@ struct TerminalRecord {
     outcome: TerminalOutcome,
 }
 
-fn file_unix_nanos(path: &Path) -> io::Result<u128> {
+pub(super) fn file_unix_nanos(path: &Path) -> io::Result<u128> {
     Ok(std::fs::metadata(path)?
         .modified()?
         .duration_since(std::time::UNIX_EPOCH)
@@ -1837,6 +1985,33 @@ fn newer_quota_effect(
     source: &AccountEffectIntent,
     source_q: u128,
 ) -> io::Result<Option<String>> {
+    if let Some(artifact) =
+        super::manual_quota::unresolved_for_physical(directory, &candidate.account_identity)?
+    {
+        return Ok(Some(format!("manual quota effect unknown: {artifact}")));
+    }
+    if let Some(script) = candidate.quota_script.as_deref()
+        && let Some((manual, result)) = super::manual_quota::latest(
+            directory,
+            &candidate.account_identity,
+            script,
+            candidate.auth_refresh_command.as_deref(),
+            &source.environment_sha256,
+        )?
+    {
+        if result.state != "drained" {
+            return Ok(Some(format!(
+                "manual quota effect unknown: {}",
+                result.artifact
+            )));
+        }
+        if super::manual_quota::physical_q_nanos(directory, &manual.operation_id)? > source_q {
+            return Ok(Some(format!(
+                "newer manual quota effect: {}",
+                result.artifact
+            )));
+        }
+    }
     for entry in std::fs::read_dir(directory.join("account-effects"))? {
         let entry = entry?;
         let name = entry.file_name();
@@ -1851,6 +2026,7 @@ fn newer_quota_effect(
         if !same_physical_effect_source(directory, candidate, &intent)?
             || intent.environment_sha256 != source.environment_sha256
             || dir.join("reuse.json").exists()
+            || dir.join("manual-reuse.json").exists()
         {
             continue;
         }
@@ -1875,6 +2051,25 @@ fn effect_physical_q_nanos(dir: &Path, intent: &AccountEffectIntent) -> io::Resu
         .and_then(Path::parent)
         .ok_or_else(|| io::Error::other("fresh effect broker directory absent"))?;
     let candidate = effect_candidate(broker_directory, &intent.binding, &intent.request)?;
+    if let Some(reuse) = exact_file::<ManualQuotaReuse>(dir, "manual-reuse.json")? {
+        let script = candidate
+            .quota_script
+            .as_deref()
+            .ok_or_else(|| io::Error::other("manual quota source absent"))?;
+        let result = super::manual_quota::source_readback(
+            broker_directory,
+            &reuse.operation_id,
+            &candidate.account_identity,
+            script,
+            candidate.auth_refresh_command.as_deref(),
+            &intent.environment_sha256,
+            &reuse.source_effect_id,
+        )?;
+        if result.state != "drained" {
+            return Err(io::Error::other("manual quota physical Q not drained"));
+        }
+        return super::manual_quota::physical_q_nanos(broker_directory, &reuse.operation_id);
+    }
     let (physical_dir, physical_intent) = if let Some(reuse) = &intent.auth_source {
         if intent.request.kind != FreshAccountEffectKind::AuthRefresh
             || reuse.source_directory.contains('/')
@@ -3095,6 +3290,227 @@ pub(super) fn cancel(dir: &Path, grant_id: &str) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn manual_physical_q_is_reused_by_route_and_new_exhausted_q_excludes() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config");
+        let broker = temp.path().join("fresh-provider");
+        std::fs::create_dir_all(config.join("models")).unwrap();
+        std::fs::create_dir(&broker).unwrap();
+        let healthy = r#"printf '{"used_percent":20,"resets_at":"2099-01-01T00:00:00Z"}'"#;
+        std::fs::write(config.join("providers.toml"), format!(
+            "[first]\ncommand = '/bin/true'\nquota_account_id = 'physical-first'\nquota_script = {}\n",
+            serde_json::to_string(healthy).unwrap(),
+        )).unwrap();
+        std::fs::write(
+            config.join("models/work.toml"),
+            "[[providers]]\nname = 'first'\n",
+        )
+        .unwrap();
+        let pool = oulipoly_runtime::executor::cli::fresh_remote::load_fresh_headless_pool(
+            &config, "work",
+        )
+        .unwrap();
+        let environment = vec![("PATH".into(), "/usr/bin:/bin".into())];
+        let first = oulipoly_kernel_broker::protocol::ManualQuotaRequest {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            model: "work".into(),
+            account: "first".into(),
+            config_sha256: pool.config_sha256.clone(),
+            environment: environment.clone(),
+        };
+        super::super::manual_quota::begin(
+            &broker,
+            &File::open(&config).unwrap(),
+            &first,
+            unsafe { libc::getuid() },
+            unsafe { libc::getgid() },
+        )
+        .unwrap();
+        let process = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+        let binding = fixture_binding(&process, &process);
+        let candidate = RouteCandidate {
+            version: 3,
+            binding: binding.clone(),
+            model: "work".into(),
+            config_sha256: pool.config_sha256.clone(),
+            account: "first".into(),
+            account_identity: "physical-first".into(),
+            index: 0,
+            total: 1,
+            pin: None,
+            plan_sha256: "p".repeat(64),
+            quota_script: Some(healthy.into()),
+            auth_refresh_command: None,
+            terminal_recognizer: FreshTerminalRecognizer::OpenAiCompat,
+        };
+        durable_new(&broker, &candidate_name(&binding.handoff_id, 0), &candidate).unwrap();
+        let effect = FreshAccountEffectRequest {
+            d_key: uuid::Uuid::new_v4().to_string(),
+            model: "work".into(),
+            config_sha256: pool.config_sha256.clone(),
+            account: "first".into(),
+            index: 0,
+            kind: FreshAccountEffectKind::QuotaFirst,
+            environment: environment.clone(),
+        };
+        assert!(
+            begin_account_effect(
+                &broker,
+                &binding,
+                &effect,
+                &process,
+                &process,
+                unsafe { libc::getuid() },
+                unsafe { libc::getgid() },
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("manual quota prior K/Q unknown")
+        );
+        assert!(!effect_directory(&broker, &binding, &effect).exists());
+        super::super::manual_quota::worker_with_environment(
+            &broker.join("manual-quota").join(&first.operation_id),
+            &first.environment,
+        )
+        .unwrap();
+        let readback = begin_account_effect(
+            &broker,
+            &binding,
+            &effect,
+            &process,
+            &process,
+            unsafe { libc::getuid() },
+            unsafe { libc::getgid() },
+        )
+        .unwrap();
+        assert_eq!(readback.outcome.as_deref(), Some("valid_windows"));
+        assert!(
+            effect_directory(&broker, &binding, &effect)
+                .join("manual-reuse.json")
+                .exists()
+        );
+        assert_eq!(
+            candidate_quota(&broker, &binding, &candidate)
+                .unwrap()
+                .0
+                .unwrap()
+                .0,
+            Some(8000)
+        );
+
+        let exhausted = r#"printf '{"used_percent":100,"resets_at":"2099-01-01T00:00:00Z"}'"#;
+        std::fs::write(config.join("providers.toml"), format!(
+            "[first]\ncommand = '/bin/true'\nquota_account_id = 'physical-first'\nquota_script = {}\n",
+            serde_json::to_string(exhausted).unwrap(),
+        )).unwrap();
+        let changed = oulipoly_runtime::executor::cli::fresh_remote::load_fresh_headless_pool(
+            &config, "work",
+        )
+        .unwrap();
+        let forced = oulipoly_kernel_broker::protocol::ManualQuotaRequest {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            config_sha256: changed.config_sha256,
+            ..first.clone()
+        };
+        super::super::manual_quota::begin(
+            &broker,
+            &File::open(&config).unwrap(),
+            &forced,
+            unsafe { libc::getuid() },
+            unsafe { libc::getgid() },
+        )
+        .unwrap();
+        super::super::manual_quota::worker_with_environment(
+            &broker.join("manual-quota").join(&forced.operation_id),
+            &forced.environment,
+        )
+        .unwrap();
+        let new_binding = fixture_binding(&process, &process);
+        let new_candidate = RouteCandidate {
+            binding: new_binding.clone(),
+            quota_script: Some(exhausted.into()),
+            config_sha256: forced.config_sha256.clone(),
+            ..candidate
+        };
+        durable_new(
+            &broker,
+            &candidate_name(&new_binding.handoff_id, 0),
+            &new_candidate,
+        )
+        .unwrap();
+        let new_effect = FreshAccountEffectRequest {
+            config_sha256: forced.config_sha256.clone(),
+            ..effect
+        };
+        let new_readback = begin_account_effect(
+            &broker,
+            &new_binding,
+            &new_effect,
+            &process,
+            &process,
+            unsafe { libc::getuid() },
+            unsafe { libc::getgid() },
+        )
+        .unwrap();
+        assert_eq!(new_readback.windows[0].used_percent, 100.0);
+        assert!(
+            candidate_quota(&broker, &new_binding, &new_candidate)
+                .unwrap()
+                .0
+                .is_none()
+        );
+        let unresolved_binding = fixture_binding(&process, &process);
+        let unresolved_candidate = RouteCandidate {
+            binding: unresolved_binding.clone(),
+            ..new_candidate.clone()
+        };
+        durable_new(
+            &broker,
+            &candidate_name(&unresolved_binding.handoff_id, 0),
+            &unresolved_candidate,
+        )
+        .unwrap();
+        let unknown_dir = effect_directory(&broker, &unresolved_binding, &new_effect);
+        std::fs::create_dir(&unknown_dir).unwrap();
+        durable_new(
+            &unknown_dir,
+            "intent.json",
+            &AccountEffectIntent {
+                version: 1,
+                id: uuid::Uuid::new_v4().to_string(),
+                binding: unresolved_binding,
+                request: redacted_effect_request(&new_effect),
+                environment_sha256: environment_digest(&new_effect).unwrap(),
+                plan_sha256: "pending-plan".into(),
+                auth_source: None,
+            },
+        )
+        .unwrap();
+        let later = oulipoly_kernel_broker::protocol::ManualQuotaRequest {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            ..forced
+        };
+        assert!(
+            super::super::manual_quota::begin(
+                &broker,
+                &File::open(&config).unwrap(),
+                &later,
+                unsafe { libc::getuid() },
+                unsafe { libc::getgid() },
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("prior route K/Q unknown")
+        );
+        assert!(
+            !broker
+                .join("manual-quota")
+                .join(later.operation_id)
+                .exists()
+        );
+    }
 
     #[test]
     fn typed_terminal_ledger_requires_new_matching_verification() {

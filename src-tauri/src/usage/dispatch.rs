@@ -13,10 +13,7 @@ pub(crate) fn run_usage(
 ) -> Result<i32, String> {
     #[cfg(feature = "age319-private-broker-fixture")]
     if std::env::var_os("AGE319_PRIVATE_FRESH_PROVIDER_V1").is_some() {
-        return Err(
-            "private fresh quota Q manual refresh is unavailable; no broker quota probe was started"
-                .into(),
-        );
+        return super::private_manual::run(providers, models, writer);
     }
     let state = services
         .state_db_opener

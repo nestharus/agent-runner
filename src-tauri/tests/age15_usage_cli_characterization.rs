@@ -825,7 +825,7 @@ fn usage_probes_one_provider_account_once_across_models() {
 
 #[cfg(feature = "age319-private-broker-fixture")]
 #[test]
-fn usage_refuses_private_manual_refresh_before_legacy_script_runs() {
+fn usage_private_manual_requires_broker_and_never_runs_legacy_script() {
     let fixture = Fixture::new();
     let log = fixture.marker_dir.join("quota.log");
     let script = fixture.write_quota_script(
@@ -835,16 +835,187 @@ fn usage_refuses_private_manual_refresh_before_legacy_script_runs() {
             r#"{"windows":[{"used_percent":24,"resets_at":"2099-01-01T00:00:00Z"}]}"#,
         ),
     );
-    fixture.write_model("fixture", &["shared"]);
-    fixture.write_providers(&[ProviderFixture::with_script("shared", "claude", &script)]);
+    fixture.write_model("fixture", &["shared", "unmetered"]);
+    fixture.write_providers(&[
+        ProviderFixture::with_script("shared", "claude", &script),
+        ProviderFixture::no_usage("unmetered", "codex"),
+    ]);
+    let path = fixture.app_config_dir.join("providers.toml");
+    let providers = fs::read_to_string(&path).unwrap();
+    fs::write(
+        &path,
+        providers
+            .replace(
+                "[shared]\n",
+                "[shared]\nquota_account_id = 'physical-shared'\n",
+            )
+            .replace(
+                "[unmetered]\n",
+                "[unmetered]\nquota_account_id = 'physical-unmetered'\n",
+            ),
+    )
+    .unwrap();
     let output = fixture
         .usage_command()
         .env("AGE319_PRIVATE_FRESH_PROVIDER_V1", "1")
+        .env("SENTINEL_SECRET", "private-token")
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("no broker quota probe was started"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("error:"));
     assert!(!log.exists());
+    let journals = fixture
+        .data_home
+        .join("oulipoly-agent-runner/manual-quota-operations");
+    for entry in fs::read_dir(journals).unwrap() {
+        assert!(
+            !fs::read_to_string(entry.unwrap().path())
+                .unwrap()
+                .contains("private-token")
+        );
+    }
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+#[test]
+fn usage_private_manual_reaches_broker_and_forces_new_physical_q() {
+    let Some(broker_image) = std::env::var_os("OULIPOLY_AGE319_BROKER_IMAGE") else {
+        return;
+    };
+    if std::env::var_os("AGE319_MANUAL_CLI_INNER").is_none() {
+        let output = Command::new("unshare")
+            .args(["-Urpfm", "--mount-proc"])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "usage_private_manual_reaches_broker_and_forces_new_physical_q",
+                "--nocapture",
+            ])
+            .env("AGE319_MANUAL_CLI_INNER", "1")
+            .env("OULIPOLY_AGE319_BROKER_IMAGE", broker_image)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let fixture = Fixture::new();
+    let log = fixture.marker_dir.join("manual.log");
+    let script = fixture.write_quota_script(
+        "manual.sh",
+        &quota_script_json(
+            &log,
+            r#"{"windows":[{"used_percent":24,"resets_at":"2099-01-01T00:00:00Z"}]}"#,
+        ),
+    );
+    fixture.write_model("fixture", &["shared", "unmetered"]);
+    fixture.write_providers(&[
+        ProviderFixture::with_script("shared", "claude", &script),
+        ProviderFixture::no_usage("unmetered", "codex"),
+    ]);
+    let providers_path = fixture.app_config_dir.join("providers.toml");
+    let providers = fs::read_to_string(&providers_path).unwrap();
+    fs::write(
+        &providers_path,
+        providers
+            .replace(
+                "[shared]\n",
+                "[shared]\nquota_account_id = 'physical-shared'\n",
+            )
+            .replace(
+                "[unmetered]\n",
+                "[unmetered]\nquota_account_id = 'physical-unmetered'\n",
+            ),
+    )
+    .unwrap();
+    let broker_state = fixture._dir.path().join("broker-state");
+    fs::create_dir_all(&broker_state).unwrap();
+    fs::set_permissions(&broker_state, fs::Permissions::from_mode(0o700)).unwrap();
+    oulipoly_state::mailbox::FreshV30Lane::initialize_at(&broker_state).unwrap();
+    let socket = fixture._dir.path().join("v30.sock");
+    let mut broker = Command::new(broker_image)
+        .arg("--serve-fresh-v30")
+        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
+        .env(
+            "OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1",
+            env!("CARGO_BIN_EXE_oulipoly-agent-runner"),
+        )
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            fs::File::create(fixture._dir.path().join("broker.log")).unwrap(),
+        ))
+        .spawn()
+        .unwrap();
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        if broker.try_wait().unwrap().is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        socket.exists(),
+        "broker did not start: {}",
+        fs::read_to_string(fixture._dir.path().join("broker.log")).unwrap()
+    );
+    for (expected_count, expected_runs) in [(1, "ran"), (2, "ranran")] {
+        let output = fixture
+            .usage_command()
+            .env("AGE319_PRIVATE_FRESH_PROVIDER_V1", "1")
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}\nbroker: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+            fs::read_to_string(fixture._dir.path().join("broker.log")).unwrap()
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("physical-shared") && stdout.contains("24%"),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains("physical-unmetered") && stdout.contains("(unmetered)"),
+            "{stdout}"
+        );
+        assert_eq!(fs::read_to_string(&log).unwrap(), expected_runs);
+        assert!(
+            !fixture.db_path().exists(),
+            "private manual path touched legacy StateDb"
+        );
+        let operations = broker_state.join("v30/fresh-provider/manual-quota");
+        let physical_q_count = fs::read_dir(operations)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.path().join("k.json").exists() && entry.path().join("q.json").exists()
+            })
+            .count();
+        assert_eq!(physical_q_count, expected_count);
+    }
+    write_executable(&script, "#!/bin/sh\nexit 7\n");
+    let failed = fixture
+        .usage_command()
+        .env("AGE319_PRIVATE_FRESH_PROVIDER_V1", "1")
+        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+        .output()
+        .unwrap();
+    assert!(!failed.status.success());
+    assert!(String::from_utf8_lossy(&failed.stdout).contains("(error: failed)"));
+    assert_eq!(fs::read_to_string(&log).unwrap(), "ranran");
+    assert!(!fixture.db_path().exists());
+    broker.kill().unwrap();
+    broker.wait().unwrap();
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]

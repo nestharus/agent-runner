@@ -2,6 +2,9 @@
 #[cfg(feature = "age319-private-broker-fixture")]
 #[path = "fresh_provider.rs"]
 mod fresh_provider;
+#[cfg(feature = "age319-private-broker-fixture")]
+#[path = "manual_quota.rs"]
+mod manual_quota;
 #[path = "native_work.rs"]
 mod native_work;
 #[cfg(feature = "age319-private-broker-fixture")]
@@ -184,6 +187,15 @@ enum RequestPayload {
     #[cfg(feature = "age319-private-broker-fixture")]
     FreshAccountEffectRequest {
         request: oulipoly_kernel_broker::protocol::FreshAccountEffectRequest,
+    },
+    #[cfg(feature = "age319-private-broker-fixture")]
+    ManualQuotaRequest {
+        request: oulipoly_kernel_broker::protocol::ManualQuotaRequest,
+        descriptors: Vec<File>,
+    },
+    #[cfg(feature = "age319-private-broker-fixture")]
+    ManualQuotaObserve {
+        operation_id: String,
     },
     FreshRecipientRequest {
         request: FreshRecipientRequest,
@@ -376,7 +388,7 @@ fn recv_request(
         #[cfg(feature = "age319-private-broker-fixture")]
         b'5' | b'6' | b'7' | b'8' | b'9' => (18..=2048 + 17).contains(&read),
         #[cfg(feature = "age319-private-broker-fixture")]
-        b'h' | b'f' | b'm' | b'n' => (18..=48 * 1024 + 17).contains(&read),
+        b'h' | b'f' | b'm' | b'n' | b'u' | b'v' => (18..=48 * 1024 + 17).contains(&read),
         b'F' => (18..=8192 + 17).contains(&read),
         b'O' => (18..=1024 + 17).contains(&read),
         b'U' => (18..=512 + 17).contains(&read),
@@ -400,6 +412,8 @@ fn recv_request(
             b'h' => descriptors.len() != 5,
             #[cfg(feature = "age319-private-broker-fixture")]
             b'f' => descriptors.len() != 1,
+            #[cfg(feature = "age319-private-broker-fixture")]
+            b'u' => descriptors.len() != 1,
             b'L' => !(1..=4).contains(&descriptors.len()),
             b'V' | b'S' | b's' | b'T' => descriptors.len() != 1,
             _ => !descriptors.is_empty(),
@@ -444,6 +458,18 @@ fn recv_request(
         #[cfg(feature = "age319-private-broker-fixture")]
         b'm' | b'n' => RequestPayload::FreshAccountEffectRequest {
             request: serde_json::from_slice(&request[17..read as usize])?,
+        },
+        #[cfg(feature = "age319-private-broker-fixture")]
+        b'u' => RequestPayload::ManualQuotaRequest {
+            request: serde_json::from_slice(&request[17..read as usize])?,
+            descriptors,
+        },
+        #[cfg(feature = "age319-private-broker-fixture")]
+        b'v' => RequestPayload::ManualQuotaObserve {
+            operation_id: serde_json::from_slice::<
+                oulipoly_kernel_broker::protocol::ManualQuotaObserveRequest,
+            >(&request[17..read as usize])?
+            .operation_id,
         },
         b'D' | b'd' => RequestPayload::FreshSessionRequest {
             request_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
@@ -3889,6 +3915,38 @@ fn serve_fresh_v30_at(
                 pidns_ino: peer.process.pidns_ino,
             };
             match operation {
+                #[cfg(feature = "age319-private-broker-fixture")]
+                b'u' | b'v' => {
+                    if !private_fixture() {
+                        return Err(io::Error::other("manual quota fixture route closed"));
+                    }
+                    let directory = state_root.join("v30/fresh-provider");
+                    let result = if operation == b'u' {
+                        let RequestPayload::ManualQuotaRequest {
+                            request,
+                            descriptors,
+                        } = payload
+                        else {
+                            return Err(io::Error::other("manual quota begin request absent"));
+                        };
+                        if instance.is_closed() {
+                            return Err(io::Error::other("manual quota entry gate closed"));
+                        }
+                        let [source]: [File; 1] = descriptors
+                            .try_into()
+                            .map_err(|_| io::Error::other("manual quota config source absent"))?;
+                        manual_quota::begin(&directory, &source, &request, peer.uid, peer.gid)?
+                    } else {
+                        let RequestPayload::ManualQuotaObserve { operation_id } = payload else {
+                            return Err(io::Error::other("manual quota observation absent"));
+                        };
+                        manual_quota::readback_id(&directory, &operation_id, peer.uid, peer.gid)?
+                    };
+                    return Ok(format!(
+                        "manual-quota {}\n",
+                        serde_json::to_string(&result)?
+                    ));
+                }
                 b'I' if matches!(payload, RequestPayload::None) => Ok(format!(
                     "fresh-v30-route {} {} {}\n",
                     lane.identity().lane_id,
@@ -4723,6 +4781,10 @@ pub fn run() {
             Err(io::Error::other(
                 "separate fresh broker authority retired; use the single broker service",
             ))
+        }
+        #[cfg(feature = "age319-private-broker-fixture")]
+        [_, mode, path] if mode == "--manual-quota-worker" && private_fixture() => {
+            manual_quota::worker(Path::new(path))
         }
         _ => {
             eprintln!("unknown broker mode");
