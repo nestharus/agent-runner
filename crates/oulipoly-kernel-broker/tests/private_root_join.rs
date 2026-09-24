@@ -80,37 +80,19 @@ fn inner() {
     let provider_image = std::env::var("OULIPOLY_AGE319_PROVIDER_IMAGE").unwrap_or_default();
     let temp = tempfile::tempdir().unwrap();
     let data = temp.path().join("data");
+    // Keep the source for the historical broker copy outside the current
+    // Runner's writable entry domain. v29 remains an independent island.
+    let historical_data = temp.path().join("historical-data");
+    fs::create_dir(&historical_data).unwrap();
+    let historical_sidecar = historical_data.join("pid-identity.db");
     let broker_state = temp.path().join("broker-state");
     let gate = temp.path().join("gate");
     fs::create_dir(&data).unwrap();
     fs::create_dir(&broker_state).unwrap();
     fs::set_permissions(&broker_state, fs::Permissions::from_mode(0o700)).unwrap();
     fs::create_dir(&gate).unwrap();
-    let mut mailbox =
+    let mailbox =
         MailboxDb::open_completion_continuation_domain(&data.join("pid-identity.db")).unwrap();
-    let recipient_mail = recipient_mode.then(|| {
-        match mailbox
-            .enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
-                session_id: "fixture-recipient",
-                handle: "fixture-completion",
-                payload_json: r#"{"protocol":"source-retention-release-v1","body":"pending"}"#,
-                owner_invocation_uuid: Some("fixture-owner"),
-                matched_os_pid: None,
-                matched_os_boot_id: None,
-                matched_os_pid_starttime_ticks: None,
-                matched_chain_index: None,
-                state_dir: "fixture-state",
-                meta_path: "fixture-meta",
-                log_path: "fixture-log",
-                rc_path: "fixture-rc",
-                rc: 0,
-            })
-            .unwrap()
-        {
-            EnqueueResult::Inserted(row) => row,
-            other => panic!("recipient fixture enqueue: {other:?}"),
-        }
-    });
     let pending_binding =
         (normal_mode && !recipient_mode && mode != "normal_empty" && !handoff_mode).then(|| {
             if real_source {
@@ -161,7 +143,35 @@ fn inner() {
         .unwrap_or_else(|| mailbox.completion_continuation_domain().unwrap().unwrap());
     let sidecar_generation = mailbox.sidecar_generation().unwrap();
     drop(mailbox);
-    let old = rusqlite::Connection::open(data.join("pid-identity.db")).unwrap();
+    rusqlite::Connection::open(data.join("pid-identity.db"))
+        .unwrap()
+        .execute("VACUUM INTO ?1", [historical_sidecar.to_str().unwrap()])
+        .unwrap();
+    let recipient_mail = recipient_mode.then(|| {
+        let mut old_mailbox = MailboxDb::open(&historical_sidecar).unwrap();
+        match old_mailbox
+            .enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
+                session_id: "fixture-recipient",
+                handle: "fixture-completion",
+                payload_json: r#"{"protocol":"source-retention-release-v1","body":"pending"}"#,
+                owner_invocation_uuid: Some("fixture-owner"),
+                matched_os_pid: None,
+                matched_os_boot_id: None,
+                matched_os_pid_starttime_ticks: None,
+                matched_chain_index: None,
+                state_dir: "fixture-state",
+                meta_path: "fixture-meta",
+                log_path: "fixture-log",
+                rc_path: "fixture-rc",
+                rc: 0,
+            })
+            .unwrap()
+        {
+            EnqueueResult::Inserted(row) => row,
+            other => panic!("recipient fixture enqueue: {other:?}"),
+        }
+    });
+    let old = rusqlite::Connection::open(&historical_sidecar).unwrap();
     old.execute_batch(
         "DROP TRIGGER completion_uncertain_input_preserve;
          DROP TABLE completion_uncertain_input;
@@ -175,9 +185,12 @@ fn inner() {
         "../../oulipoly-state/src/mailbox/migrations/0022_live_history_barrier.sql"
     ))
     .unwrap();
+    // VACUUM INTO creates a rollback-journal copy. Historical cutover source
+    // validation requires the v29 island to retain the original WAL mode.
+    old.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
     drop(old);
     if native_mode {
-        rusqlite::Connection::open(data.join("pid-identity.db"))
+        rusqlite::Connection::open(&historical_sidecar)
             .unwrap()
             .execute_batch(
                 "INSERT INTO session_wake_claim(session_id,claim_token,claimed_at,reason,auto_wake_count) VALUES('native-session','native-claim','2026-09-24T00:00:00Z','private-lineage',1);
@@ -186,7 +199,7 @@ fn inner() {
             .unwrap();
     }
     if normal_mode {
-        rusqlite::Connection::open(data.join("pid-identity.db"))
+        rusqlite::Connection::open(&historical_sidecar)
             .unwrap()
             .execute(
                 "UPDATE completion_continuation_domain SET domain_id=?1",
@@ -214,7 +227,7 @@ fn inner() {
         let proof = oulipoly_state::mailbox::QuiescedCutoverProof::private_fixture();
         let generation = if recipient_mode {
             fs::remove_dir(&sidecar_dir).unwrap();
-            let source = data.join("pid-identity.db");
+            let source = historical_sidecar.clone();
             let stage =
                 BrokerSidecar::stage_private_fixture_copy(&source, &broker_state, &proof).unwrap();
             let generation =
@@ -229,7 +242,7 @@ fn inner() {
             generation
         } else {
             let target = sidecar_dir.join("pid-identity.db");
-            rusqlite::Connection::open(data.join("pid-identity.db"))
+            rusqlite::Connection::open(&historical_sidecar)
                 .unwrap()
                 .execute("VACUUM INTO ?1", [target.to_str().unwrap()])
                 .unwrap();
@@ -2942,24 +2955,125 @@ fn inner() {
         stop(&mut restarted);
         return;
     }
-    for args in [
+    // The old source is a live, exact v29 island. A current Runner must refuse
+    // it at read-only domain preflight, including for syntactically admitted
+    // NormalCli requests, before E/J or a workload effect.
+    drop(oulipoly_state::StateDb::open(&historical_data.join("state.db")).unwrap());
+    let old_writer = rusqlite::Connection::open(&historical_sidecar).unwrap();
+    let current_version: i64 = rusqlite::Connection::open(data.join("pid-identity.db"))
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    let historical_version: i64 = old_writer
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!((current_version, historical_version), (31, 29));
+    old_writer
+        .execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0;
+             INSERT INTO mailbox(session_id,kind,handle,payload_json,enqueued_at,
+               state_dir,meta_path,log_path,rc_path,rc)
+             VALUES('old-session','fixture','old-pending','{}','2026-09-24T00:00:00Z',
+               '/old','/old/meta','/old/log','/old/rc',0);",
+        )
+        .unwrap();
+    let old_wal = historical_data.join("pid-identity.db-wal");
+    let old_main_before = fs::read(&historical_sidecar).unwrap();
+    let old_wal_before = fs::read(&old_wal).unwrap();
+    assert!(!old_wal_before.is_empty());
+    let old_pending = || -> i64 {
+        old_writer
+            .query_row(
+                "SELECT count(*) FROM mailbox WHERE handle='old-pending'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(old_pending(), 1);
+    let normal_syntax = [
         vec!["--model", "age319-missing-model", "hello"],
         vec!["--new", "local provider fixture"],
         vec!["resume", "local-fixture-session"],
-    ] {
-        let unsupported = Command::new(&runner)
-            .args(args)
-            .env("OULIPOLY_DATA_DIR", &data)
+    ];
+    for args in normal_syntax {
+        assert!(protocol::supported_entry_args(
+            &args.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+        ));
+        let refused = Command::new(&runner)
+            .args(&args)
+            .env("OULIPOLY_DATA_DIR", &historical_data)
             .env("OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1", "1")
             .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
             .env_remove("LD_LIBRARY_PATH")
             .output()
             .unwrap();
-        assert!(!unsupported.status.success());
+        assert!(!refused.status.success());
         assert!(
-            String::from_utf8_lossy(&unsupported.stderr).contains("unsupported kernel CLI mode")
+            String::from_utf8_lossy(&refused.stderr)
+                .contains("completion domain schema lineage differs"),
+            "{}",
+            String::from_utf8_lossy(&refused.stderr)
+        );
+        assert_eq!(
+            fs::read_dir(broker_state.join("entries")).unwrap().count(),
+            0
         );
     }
+    let old_help = Command::new(&runner)
+        .arg("--help")
+        .env("OULIPOLY_DATA_DIR", &historical_data)
+        .env("OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1", "1")
+        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+        .env_remove("LD_LIBRARY_PATH")
+        .output()
+        .unwrap();
+    assert!(!old_help.status.success());
+    assert!(
+        String::from_utf8_lossy(&old_help.stderr)
+            .contains("completion domain schema lineage differs")
+    );
+    assert_eq!(
+        fs::read_dir(broker_state.join("entries")).unwrap().count(),
+        0
+    );
+    assert_eq!(old_pending(), 1);
+    assert_eq!(fs::read(&historical_sidecar).unwrap(), old_main_before);
+    assert_eq!(fs::read(&old_wal).unwrap(), old_wal_before);
+    assert_eq!(
+        fs::read_dir(broker_state.join("entries")).unwrap().count(),
+        0
+    );
+    assert_eq!(
+        fs::read_dir(broker_state.join("grants")).unwrap().count(),
+        0
+    );
+    assert!(!gate.join("provider-effect").exists());
+    assert!(!gate.join("bash-effect").exists());
+    old_writer
+        .execute(
+            "INSERT INTO mailbox(session_id,kind,handle,payload_json,enqueued_at,
+               state_dir,meta_path,log_path,rc_path,rc)
+             VALUES('old-session','fixture','old-after-refusal','{}','2026-09-24T00:00:01Z',
+               '/old','/old/meta','/old/log','/old/rc',0)",
+            [],
+        )
+        .unwrap();
+    assert_eq!(old_pending(), 1);
+    assert!(!protocol::supported_entry_args(&[
+        "--age319-unsupported".into()
+    ]));
+    let unsupported = Command::new(&runner)
+        .arg("--age319-unsupported")
+        .env("OULIPOLY_DATA_DIR", &data)
+        .env("OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1", "1")
+        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+        .env_remove("LD_LIBRARY_PATH")
+        .output()
+        .unwrap();
+    assert!(!unsupported.status.success());
+    assert!(String::from_utf8_lossy(&unsupported.stderr).contains("unsupported kernel CLI mode"));
     assert_eq!(
         fs::read_dir(broker_state.join("entries")).unwrap().count(),
         0
@@ -3346,6 +3460,7 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        eprintln!("private root mode passed: {mode}");
     }
 }
 

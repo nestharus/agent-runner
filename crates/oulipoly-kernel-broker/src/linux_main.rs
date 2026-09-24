@@ -353,7 +353,10 @@ fn recv_request(
     let valid_length = match request[0] {
         b'G' | b'g' => read == 65,
         b'P' | b'p' => read == 37,
-        b'Q' | b'Z' | b'q' | b'z' | b'D' | b'd' | b'C' | b'c' | b'E' => read == 33,
+        b'Q' | b'Z' | b'q' | b'z' | b'D' | b'd' | b'C' | b'c' => read == 33,
+        // Legacy E has no body; fresh Bash E carries a request UUID on its
+        // separate socket. Preserve both exact wire shapes for pinned images.
+        b'E' => read == 17 || read == 33,
         #[cfg(feature = "age319-private-broker-fixture")]
         b'l' | b'M' => read == 49,
         b'A' | b'a' => read == 33,
@@ -424,7 +427,7 @@ fn recv_request(
         b'C' | b'c' => RequestPayload::FreshBashChildRequest {
             request_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
         },
-        b'E' => RequestPayload::FreshBashChildRequest {
+        b'E' if read == 33 => RequestPayload::FreshBashChildRequest {
             request_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
         },
         b'O' => RequestPayload::FreshBashPrivateResult {
@@ -1873,6 +1876,9 @@ fn dispatch_authenticated(
         (b'E', Scope::Outside)
             if admitted && !entries.has_debt() && !entries.has_unsettled_join() =>
         {
+            if !matches!(payload, RequestPayload::None) {
+                return Err(io::Error::other("entry reservation has a payload"));
+            }
             entries
                 .reserve(peer.uid, &peer.process)
                 .map(|id| format!("reserved {id}\n"))
@@ -4739,6 +4745,22 @@ mod tests {
             gid: unsafe { libc::getgid() },
             process: PinnedProcess::open(std::process::id() as i32).unwrap(),
         };
+        assert!(
+            dispatch_authenticated(
+                b'E',
+                RequestPayload::FreshBashChildRequest {
+                    request_id: uuid::Uuid::new_v4().to_string(),
+                },
+                &entry,
+                &host,
+                &image,
+                &registry,
+                &works,
+                &mut entries,
+            )
+            .is_err()
+        );
+        assert!(!entries.has_debt());
         let reserved = dispatch_authenticated(
             b'E',
             RequestPayload::None,
