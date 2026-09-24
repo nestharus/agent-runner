@@ -6823,6 +6823,25 @@
       }
     },
     {
+      "id": "state.mailbox.fresh-bash-source.verify-buffer-bytes",
+      "owner": "state/mailbox/fresh_bash_source",
+      "class": "resource_guard",
+      "protected_resource": "scratch memory while verifying broker-retained raw Bash output",
+      "exhaustion_behavior": "Output verification reads further chunks until EOF; the buffer does not cap total output.",
+      "observability": "An I/O or hash mismatch returns an exact W verification error.",
+      "configurability": "Fixed private W verification chunk size with no runtime override.",
+      "rationale": "The 64 KiB scratch buffer bounds each read while retaining full raw-output verification.",
+      "default_value": "64 * 1024",
+      "source": "crates/oulipoly-state/src/mailbox/fresh_bash_source.rs",
+      "symbol": "FRESH_BASH_SOURCE_VERIFY_BUFFER_BYTES",
+      "declaration_scope": "module",
+      "controlling_use": {
+        "source": "crates/oulipoly-state/src/mailbox/fresh_bash_source.rs",
+        "scope": "module::impl:FreshV30Lane::fn:verify_captured_bash_event",
+        "kind": "direct_control"
+      }
+    },
+    {
       "id": "state.mailbox.payload-digest-buffer-bytes",
       "owner": "state/mailbox",
       "class": "resource_guard",
@@ -7826,6 +7845,44 @@
       "controlling_use": {
         "source": "src-tauri/src/kernel_entry.rs",
         "scope": "module::fn:private_run_account_effect",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "tauri.kernel-entry.private-bash-f-receipt-poll",
+      "owner": "tauri/kernel_entry",
+      "class": "polling_cadence",
+      "protected_resource": "private lost F receipt readback",
+      "exhaustion_behavior": "The fixture checks the same request every ten milliseconds until its separate deadline.",
+      "observability": "A missing durable grant returns lost F grant absent; no F is resubmitted.",
+      "configurability": "Fixed source cadence under the private broker fixture feature.",
+      "rationale": "Names the existing ten-millisecond readback cadence without changing recipient authority or retry behavior.",
+      "default_value": "std :: time :: Duration :: from_millis (10)",
+      "source": "src-tauri/src/kernel_entry.rs",
+      "symbol": "PRIVATE_BASH_F_RECEIPT_POLL",
+      "declaration_scope": "module::cfg:feature=\"age319-private-broker-fixture\"",
+      "controlling_use": {
+        "source": "src-tauri/src/kernel_entry.rs",
+        "scope": "module::fn:private_bash_recipient_probe",
+        "kind": "direct_control"
+      }
+    },
+    {
+      "id": "tauri.kernel-entry.private-bash-f-receipt-wait",
+      "owner": "tauri/kernel_entry",
+      "class": "test_only_patience",
+      "protected_resource": "private lost F receipt readback wait",
+      "exhaustion_behavior": "The fixture returns lost F grant absent after five seconds without a durable row.",
+      "observability": "The fixture reports the missing grant and retains the original delivery request ID.",
+      "configurability": "Fixed source deadline under the private broker fixture feature.",
+      "rationale": "Bounds the private lost-reply readback without submitting another F or inferring ACK.",
+      "default_value": "std :: time :: Duration :: from_secs (5)",
+      "source": "src-tauri/src/kernel_entry.rs",
+      "symbol": "PRIVATE_BASH_F_RECEIPT_WAIT",
+      "declaration_scope": "module::cfg:feature=\"age319-private-broker-fixture\"",
+      "controlling_use": {
+        "source": "src-tauri/src/kernel_entry.rs",
+        "scope": "module::fn:private_bash_recipient_probe",
         "kind": "direct_control"
       }
     },

@@ -25,7 +25,8 @@ use oulipoly_kernel_broker::protocol::{
 use oulipoly_runtime::executor::cli::fresh_remote::FreshTerminalRecognizer;
 use oulipoly_runtime::executor::terminal_signal::TerminalSignalKind;
 use oulipoly_state::mailbox::{
-    FreshBashChild, FreshNormalWorkPreparation, FreshReleasedHandoff, FreshRootWorkIntent,
+    FreshBashChild, FreshBashSourceEvent, FreshNormalWorkPreparation, FreshReleasedHandoff,
+    FreshRootWorkIntent,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -910,6 +911,39 @@ pub(super) fn require_admitted_child_work_plan(
             != format!("{:x}", Sha256::digest(serde_json::to_vec(child)?))
     {
         return Err(io::Error::other("fresh Bash K differs from admitted C/D"));
+    }
+    Ok(())
+}
+
+/// W is a separate readback boundary from K. Keep the distinct child plan
+/// attached to the consumed physical grant even if the broker restarted.
+fn require_captured_child_work_selection(
+    directory: &Path,
+    child: &FreshBashChild,
+    binding: &Binding,
+    grant: &Grant,
+) -> io::Result<()> {
+    let selection: ChildWorkSelection =
+        exact_file(directory, &child_selection_name(&child.request_id))?
+            .ok_or_else(|| io::Error::other("fresh Bash W child work selection absent"))?;
+    if selection.version != 1
+        || selection.role != "bash-child-private-fixed-v1"
+        || selection.child_request_id != child.request_id
+        || selection.child_d_key != child.d_key
+        || selection.child_receipt_sha256
+            != format!("{:x}", Sha256::digest(serde_json::to_vec(child)?))
+        || selection.binding != *binding
+        || grant.version != 3
+        || grant.id.is_empty()
+        || grant.binding != *binding
+        || selection.plan_sha256 != grant.plan_sha256
+        || selection.configured_program != grant.configured_program
+        || selection.broker_resolved_path != grant.broker_resolved_path
+        || selection.image_descriptor != grant.image_descriptor
+    {
+        return Err(io::Error::other(
+            "fresh Bash W child selection or consumed K changed",
+        ));
     }
     Ok(())
 }
@@ -3519,6 +3553,121 @@ pub(super) fn observe(dir: &Path, grant_id: &str) -> io::Result<Observation> {
     }
 }
 
+/// Freeze the first eligible tree event after the broker's own K has a
+/// verified provider wait, complete namespace drain, PID1 wait and closed raw
+/// outputs. The create-new receipt is the cross-file captured debt fence.
+pub(super) fn select_bash_tree_event(
+    directory: &Path,
+    binding: &Binding,
+    child: &FreshBashChild,
+    lane_id: &str,
+    source_generation: &str,
+    registration_digest: &str,
+) -> io::Result<FreshBashSourceEvent> {
+    let grant_id = grant_for_binding(directory, binding)?
+        .ok_or_else(|| io::Error::other("fresh Bash physical K absent"))?;
+    let grant: Grant = exact_file(directory, &format!("{grant_id}.consumed.json"))?
+        .ok_or_else(|| io::Error::other("fresh Bash physical K unconsumed"))?;
+    require_captured_child_work_selection(directory, child, binding, &grant)?;
+    let name = format!("{grant_id}.source-event.json");
+    if let Some(original) = exact_file::<FreshBashSourceEvent>(directory, &name)? {
+        if original.physical_grant_id != grant_id
+            || original.request_id != child.request_id
+            || original.source_id != child.handle
+            || original.attempt_id != child.invocation_uuid
+            || original.registration_digest != registration_digest
+            || original.parent_work_grant_id != child.parent_work_grant_id
+            || original.parent_work_id != child.parent_work_id
+            || original.lane_id != lane_id
+            || original.source_generation != source_generation
+        {
+            return Err(io::Error::other("captured source event identity changed"));
+        }
+        // This is readback of the frozen event. State independently rereads
+        // the original K/Q files and bytes before accepting or replaying W.
+        return Ok(original);
+    }
+    let attach: Attach = exact_file(directory, &format!("{grant_id}.attach.json"))?
+        .ok_or_else(|| io::Error::other("fresh Bash physical attach absent"))?;
+    if grant.id != grant_id
+        || grant.binding != *binding
+        || attach.grant_id != grant_id
+        || attach.work_id.is_empty()
+        || binding.grant_key.as_deref() != Some(child.request_id.as_str())
+        || child.invocation_uuid != binding.invocation_uuid
+        || child.session.session_id != binding.session_id
+        || child.parent_work_grant_id
+            != binding
+                .causal_parent
+                .as_ref()
+                .ok_or_else(|| io::Error::other("fresh Bash causal parent absent"))?
+                .grant_id
+        || child.parent_work_id != binding.causal_parent.as_ref().unwrap().work_id
+    {
+        return Err(io::Error::other("fresh Bash source K/C/parent changed"));
+    }
+    let Observation::Drained {
+        status,
+        stdout_len,
+        stderr_len,
+        stdout_sha256,
+        stderr_sha256,
+        cancelled,
+        ..
+    } = observe(directory, &grant_id)?
+    else {
+        return Err(io::Error::other(
+            "fresh Bash source Q pending, unknown or lost",
+        ));
+    };
+    let cancel_grant_id = if cancelled {
+        let intent: serde_json::Value = exact_file(directory, &format!("{grant_id}.cancel.json"))?
+            .ok_or_else(|| io::Error::other("cancelled source lacks original intent"))?;
+        if intent.get("grant_id").and_then(|v| v.as_str()) != Some(grant_id.as_str())
+            || intent.get("work_id").and_then(|v| v.as_str()) != Some(attach.work_id.as_str())
+        {
+            return Err(io::Error::other("cancelled source intent changed"));
+        }
+        Some(grant_id.clone())
+    } else {
+        None
+    };
+    let event = FreshBashSourceEvent {
+        request_id: child.request_id.clone(),
+        source_id: child.handle.clone(),
+        attempt_id: child.invocation_uuid.clone(),
+        state_admission_id: child.session.allocation_id.clone(),
+        registration_digest: registration_digest.to_owned(),
+        lane_id: lane_id.to_owned(),
+        source_generation: source_generation.to_owned(),
+        session_id: child.session.session_id.clone(),
+        root_id: child.root_id.clone(),
+        owner_generation: binding.owner_generation.clone(),
+        parent_work_grant_id: child.parent_work_grant_id.clone(),
+        parent_work_id: child.parent_work_id.clone(),
+        physical_grant_id: grant_id.clone(),
+        physical_work_id: attach.work_id,
+        completion_policy: "tree".into(),
+        selected_kind: if cancelled {
+            "cancelled"
+        } else {
+            "tree_drained"
+        }
+        .into(),
+        wait_status: status,
+        cancelled,
+        cancel_grant_id,
+        tree_drained: true,
+        output_closed: true,
+        stdout_sha256,
+        stdout_len,
+        stderr_sha256,
+        stderr_len,
+    };
+    durable_new(directory, &name, &event)?;
+    Ok(event)
+}
+
 pub(super) fn cancel(dir: &Path, grant_id: &str) -> io::Result<()> {
     let Some(attach): Option<Attach> = exact_file(dir, &format!("{grant_id}.attach.json"))? else {
         return Err(io::Error::other("fresh provider attach absent"));
@@ -4348,9 +4497,36 @@ mod tests {
             .unwrap()
         };
         let selected = make_plan("fixed");
+        let consumed_child_grant = Grant {
+            version: 3,
+            id: uuid::Uuid::new_v4().to_string(),
+            binding: binding.clone(),
+            plan_sha256: selected.digest.clone(),
+            configured_program: selected.configured_program.clone(),
+            broker_resolved_path: selected.broker_resolved_path.clone(),
+            image_descriptor: selected.image_descriptor.clone(),
+            preflight_image: selected.preflight_image.clone(),
+        };
+        assert!(
+            require_captured_child_work_selection(
+                temp.path(),
+                &child,
+                &binding,
+                &consumed_child_grant
+            )
+            .is_err()
+        );
         assert!(require_child_work_plan(temp.path(), &binding, &selected).is_err());
         select_private_child_work(temp.path(), &child, &binding, &selected).unwrap();
         require_child_work_plan(temp.path(), &binding, &selected).unwrap();
+        require_captured_child_work_selection(temp.path(), &child, &binding, &consumed_child_grant)
+            .unwrap();
+        let mut wrong_grant = consumed_child_grant.clone();
+        wrong_grant.plan_sha256 = "0".repeat(64);
+        assert!(
+            require_captured_child_work_selection(temp.path(), &child, &binding, &wrong_grant)
+                .is_err()
+        );
         assert!(require_child_work_plan(temp.path(), &binding, &make_plan("changed")).is_err());
         assert!(
             select_private_child_work(temp.path(), &child, &binding, &make_plan("changed"))
@@ -4365,6 +4541,75 @@ mod tests {
         let mut root = binding.clone();
         root.causal_parent = None;
         assert!(require_child_work_plan(temp.path(), &root, &selected).is_err());
+
+        // A captured W is still only a broker readback; State separately
+        // verifies physical Q. Even this readback must retain child selection.
+        durable_new(
+            temp.path(),
+            &format!("{}.fresh-grant.json", child.request_id),
+            &consumed_child_grant,
+        )
+        .unwrap();
+        durable_new(
+            temp.path(),
+            &format!("{}.consumed.json", consumed_child_grant.id),
+            &consumed_child_grant,
+        )
+        .unwrap();
+        let event = FreshBashSourceEvent {
+            request_id: child.request_id.clone(),
+            source_id: child.handle.clone(),
+            attempt_id: child.invocation_uuid.clone(),
+            state_admission_id: child.session.allocation_id.clone(),
+            registration_digest: "fixture-registration".into(),
+            lane_id: child.session.lane_id.clone(),
+            source_generation: child.session.source_generation.clone(),
+            session_id: child.session.session_id.clone(),
+            root_id: child.root_id.clone(),
+            owner_generation: binding.owner_generation.clone(),
+            parent_work_grant_id: child.parent_work_grant_id.clone(),
+            parent_work_id: child.parent_work_id.clone(),
+            physical_grant_id: consumed_child_grant.id.clone(),
+            physical_work_id: uuid::Uuid::new_v4().to_string(),
+            completion_policy: "tree".into(),
+            selected_kind: "tree_drained".into(),
+            wait_status: 0,
+            cancelled: false,
+            cancel_grant_id: None,
+            tree_drained: true,
+            output_closed: true,
+            stdout_sha256: "a".repeat(64),
+            stdout_len: 0,
+            stderr_sha256: "b".repeat(64),
+            stderr_len: 0,
+        };
+        durable_new(
+            temp.path(),
+            &format!("{}.source-event.json", consumed_child_grant.id),
+            &event,
+        )
+        .unwrap();
+        let read_w = || {
+            select_bash_tree_event(
+                temp.path(),
+                &binding,
+                &child,
+                &event.lane_id,
+                &event.source_generation,
+                &event.registration_digest,
+            )
+        };
+        assert_eq!(read_w().unwrap(), event);
+        let selection_path = temp.path().join(child_selection_name(&child.request_id));
+        let mut tampered: ChildWorkSelection =
+            exact_file(temp.path(), &child_selection_name(&child.request_id))
+                .unwrap()
+                .unwrap();
+        tampered.plan_sha256 = "0".repeat(64);
+        std::fs::write(&selection_path, serde_json::to_vec(&tampered).unwrap()).unwrap();
+        assert!(read_w().is_err());
+        std::fs::remove_file(&selection_path).unwrap();
+        assert!(read_w().is_err());
     }
 
     #[test]

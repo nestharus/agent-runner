@@ -87,6 +87,7 @@ fn causal_bash(args: &[String]) -> std::io::Result<()> {
         let child = Command::new(&args[1])
             .arg("__age319-private-admit-child-v1")
             .args([&args[2], &args[3], &args[4]])
+            .args(args.get(5))
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .stdin(Stdio::null())
@@ -125,7 +126,7 @@ fn main() -> std::io::Result<()> {
         .open(marker)?;
     file.write_all(b"one-provider-effect\n")?;
     file.sync_all()?;
-    if args.len() == 5 {
+    if args.len() == 5 || args.len() == 6 {
         return causal_bash(&args);
     }
     if args.len() != 1

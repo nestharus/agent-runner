@@ -26,6 +26,10 @@ const PRIVATE_V30_BARRIER_POLL: std::time::Duration = std::time::Duration::from_
 const PRIVATE_VERIFIED_OUTPUT_BUFFER_BYTES: usize = 64 * 1024;
 #[cfg(feature = "age319-private-broker-fixture")]
 const PRIVATE_ACCOUNT_EFFECT_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+#[cfg(feature = "age319-private-broker-fixture")]
+const PRIVATE_BASH_F_RECEIPT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(feature = "age319-private-broker-fixture")]
+const PRIVATE_BASH_F_RECEIPT_POLL: std::time::Duration = std::time::Duration::from_millis(10);
 
 use oulipoly_kernel_broker::installed_pair::{self, InstalledPair};
 use oulipoly_kernel_broker::protocol::{self, EntryRoute, JoinSpec, Operation, StateRoute};
@@ -916,7 +920,19 @@ impl oulipoly_runtime::executor::cli::fresh_remote::FreshProviderBackend
         let gate = std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
             .map_err(|e| self.unknown(Some(&grant), "fixture cancellation", &e.to_string()))?;
         let mut sibling_checked = !causal;
+        let mut recipient_checked =
+            std::env::var_os("AGE319_PRIVATE_BASH_RECIPIENT_MODE_V1").is_none();
         while !std::path::Path::new(&gate).join("provider-cancel").exists() {
+            if !recipient_checked
+                && std::fs::read(std::path::Path::new(&gate).join("bash-causal-output"))
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                    .is_some_and(|report| report["fresh_source_w"]["request_id"].is_string())
+            {
+                private_bash_recipient_probe(&socket, &self.authority.receipt.d_key, &gate)
+                    .map_err(|e| self.unknown(Some(&grant), "fresh F/ACK recipient probe", &e))?;
+                recipient_checked = true;
+            }
             if !sibling_checked && std::path::Path::new(&gate).join("sibling-request").exists() {
                 let sibling_effect = std::path::Path::new(&gate).join("sibling-effect");
                 let sibling_bash = std::env::var("AGE319_PRIVATE_BASH_IMAGE")
@@ -1066,6 +1082,11 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
                 std::env::var("AGE319_PRIVATE_BASH_EFFECT_MARKER")
                     .map_err(|_| "private Bash marker absent")?,
             ]);
+            if std::env::var_os("AGE319_PRIVATE_BASH_SOURCE_SUCCESS_V1").is_some() {
+                plan.plan.argv.push("no-cancel".into());
+            } else if std::env::var_os("AGE319_PRIVATE_BASH_ORIGINAL_NOTIFY_V1").is_some() {
+                plan.plan.argv.push("notify".into());
+            }
         }
         prepared.push(plan);
     }
@@ -1362,6 +1383,190 @@ fn private_account_effect_unknown(
             "caller_retry_duplicate_effect_risk": true,
         })
     )
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_bash_recipient_probe(
+    socket: &std::path::Path,
+    root_d: &str,
+    gate: &str,
+) -> Result<(), String> {
+    use base64::Engine as _;
+    use protocol::FreshRecipientRequest;
+    use sha2::Digest as _;
+    let mode = std::env::var("AGE319_PRIVATE_BASH_RECIPIENT_MODE_V1").map_err(|e| e.to_string())?;
+    if !matches!(mode.as_str(), "ack" | "lost_pending") {
+        return Err("invalid private Bash recipient mode".into());
+    }
+    let request_id = std::env::var("AGE319_PRIVATE_BASH_REQUEST_KEY").map_err(|e| e.to_string())?;
+    let delivery_request_id = uuid::Uuid::new_v4().to_string();
+    let request_path = std::path::Path::new(gate).join("bash-f-request-id");
+    let mut request_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&request_path)
+        .map_err(|e| e.to_string())?;
+    request_file
+        .write_all(delivery_request_id.as_bytes())
+        .map_err(|e| e.to_string())?;
+    request_file.sync_all().map_err(|e| e.to_string())?;
+    File::open(gate)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|e| e.to_string())?;
+    let delivered = if mode == "lost_pending" {
+        // Deliberately lose the first F response. Read the same request before
+        // explicitly recovering the same bytes; never submit a second F.
+        let mut stream = UnixStream::connect(socket).map_err(|e| e.to_string())?;
+        let mut challenge = [0u8; 16];
+        stream
+            .read_exact(&mut challenge)
+            .map_err(|e| e.to_string())?;
+        let request = FreshRecipientRequest::Submit {
+            allocation_request_id: root_d.into(),
+            delivery_request_id: delivery_request_id.clone(),
+        };
+        let mut frame = vec![b'F'];
+        frame.extend_from_slice(&challenge);
+        frame.extend_from_slice(&serde_json::to_vec(&request).map_err(|e| e.to_string())?);
+        stream.write_all(&frame).map_err(|e| e.to_string())?;
+        drop(stream);
+        let deadline = std::time::Instant::now() + PRIVATE_BASH_F_RECEIPT_WAIT;
+        let read = loop {
+            let read = protocol::fresh_recipient_request_at(
+                socket,
+                &FreshRecipientRequest::Read {
+                    delivery_request_id: delivery_request_id.clone(),
+                },
+            )
+            .map_err(|e| e.to_string())?;
+            if !read["grant"].is_null() {
+                break read;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("lost F grant absent".into());
+            }
+            std::thread::sleep(PRIVATE_BASH_F_RECEIPT_POLL);
+        };
+        if read["grant"].is_null() || read["grant"].get("delivery_token").is_some() {
+            return Err("lost F request did not retain exact status-only readback".into());
+        }
+        let grant = &read["grant"];
+        let lookup = protocol::fresh_recipient_request_at(
+            socket,
+            &FreshRecipientRequest::Lookup {
+                lane_id: grant["lane_id"]
+                    .as_str()
+                    .ok_or("lost F lane absent")?
+                    .into(),
+                session_id: grant["session_id"]
+                    .as_str()
+                    .ok_or("lost F session absent")?
+                    .into(),
+                seq: grant["seq"].as_i64().ok_or("lost F row absent")?,
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        serde_json::json!({"kind":"manual_lookup_after_lost_reply", "grant":grant,
+            "payload_base64":lookup["payload_base64"]})
+    } else {
+        protocol::fresh_recipient_request_at(
+            socket,
+            &FreshRecipientRequest::Submit {
+                allocation_request_id: root_d.into(),
+                delivery_request_id: delivery_request_id.clone(),
+            },
+        )
+        .map_err(|e| e.to_string())?
+    };
+    let grant = &delivered["grant"];
+    let seq = grant["seq"].as_i64().ok_or("fresh F row absent")?;
+    if grant["source_id"].as_str().is_none() || grant["attempt_id"].as_str().is_none() {
+        return Err("fresh F exact source/row binding absent".into());
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(
+            delivered["payload_base64"]
+                .as_str()
+                .ok_or("fresh F payload absent")?,
+        )
+        .map_err(|e| e.to_string())?;
+    let payload: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    if payload["protocol"] != "fresh-bash-complete-v30"
+        || payload["source"]["request_id"] != request_id
+        || payload["source"]["source_id"] != grant["source_id"]
+        || payload["source"]["attempt_id"] != grant["attempt_id"]
+        || payload["stdout_bytes"] != serde_json::json!(b"broker-child-output\n")
+    {
+        return Err("fresh F payload differs from broker W raw output".into());
+    }
+    let lookup = protocol::fresh_recipient_request_at(
+        socket,
+        &FreshRecipientRequest::Lookup {
+            lane_id: grant["lane_id"].as_str().ok_or("F lane absent")?.into(),
+            session_id: grant["session_id"]
+                .as_str()
+                .ok_or("F session absent")?
+                .into(),
+            seq,
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    if lookup["payload_base64"] != delivered["payload_base64"] {
+        return Err("read-only lookup changed fresh F bytes".into());
+    }
+    if mode == "ack" {
+        if protocol::fresh_recipient_request_at(
+            socket,
+            &FreshRecipientRequest::Acknowledge {
+                grant_id: grant["grant_id"].as_str().ok_or("F grant absent")?.into(),
+                delivery_token: uuid::Uuid::new_v4().to_string(),
+            },
+        )
+        .is_ok()
+        {
+            return Err("wrong fresh F token acknowledged accepted W".into());
+        }
+        let ack = protocol::fresh_recipient_request_at(
+            socket,
+            &FreshRecipientRequest::Acknowledge {
+                grant_id: grant["grant_id"].as_str().ok_or("F grant absent")?.into(),
+                delivery_token: grant["delivery_token"]
+                    .as_str()
+                    .ok_or("F token absent")?
+                    .into(),
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        if ack["grant"]["phase"] != "acked" {
+            return Err("fresh F recipient assertion not acknowledged".into());
+        }
+    }
+    let read = protocol::fresh_recipient_request_at(
+        socket,
+        &FreshRecipientRequest::Read {
+            delivery_request_id: delivery_request_id.clone(),
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    if read["grant"]["grant_id"] != grant["grant_id"]
+        || (mode == "ack" && read["grant"]["phase"] != "acked")
+        || (mode == "lost_pending"
+            && read["grant"]["phase"] != "unknown"
+            && read["grant"]["phase"] != "submitted")
+    {
+        return Err("fresh F/ACK readback mismatch".into());
+    }
+    std::fs::write(
+        std::path::Path::new(gate).join("bash-recipient-output"),
+        serde_json::to_vec(
+            &serde_json::json!({"mode":mode,"listener_policy":"notify_at_admission",
+            "delivery_request_id":delivery_request_id,"grant":grant,"readback":read,
+            "observed_payload_sha256":format!("{:x}",sha2::Sha256::digest(&bytes))}),
+        )
+        .map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]

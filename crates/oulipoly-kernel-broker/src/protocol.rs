@@ -776,6 +776,11 @@ pub fn reserve_fresh_v30_child_request_at(
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FreshRecipientRequest {
+    /// Explicit request by the original pinned root listener for a source
+    /// registered response-only. An original async C can select notify itself.
+    ActivateBashSource {
+        request_id: String,
+    },
     Submit {
         allocation_request_id: String,
         delivery_request_id: String,

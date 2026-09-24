@@ -31,10 +31,16 @@
 - `crates/oulipoly-state/src/mailbox/broker_authority.rs`
 - `crates/oulipoly-state/src/mailbox/fresh_lane.rs`
 - `crates/oulipoly-state/src/mailbox/fresh_bash_child.rs`
+- `crates/oulipoly-state/src/mailbox/fresh_bash_source.rs`
+- `crates/oulipoly-state/src/mailbox/fresh_bash_notify.rs`
+- `crates/oulipoly-state/src/mailbox/fresh_bash_listener.rs`
 - `crates/oulipoly-state/src/mailbox/migrations/0031_fresh_released_handoff.sql`
 - `crates/oulipoly-state/src/mailbox/migrations/0032_fresh_root_effect.sql`
 - `crates/oulipoly-state/src/mailbox/migrations/0033_fresh_bash_child.sql`
 - `crates/oulipoly-state/src/mailbox/migrations/0034_fresh_normal_work.sql`
+- `crates/oulipoly-state/src/mailbox/migrations/0035_fresh_bash_source.sql`
+- `crates/oulipoly-state/src/mailbox/migrations/0036_fresh_bash_notify.sql`
+- `crates/oulipoly-state/src/mailbox/migrations/0037_fresh_bash_listener.sql`
 - `crates/oulipoly-state/src/mailbox/migrations/0030_fresh_state_identity.sql`
 - `crates/oulipoly-state/tests/age319_fresh_dual_lane.rs`
 - `crates/oulipoly-state/src/mailbox/fresh_recipient.rs`
@@ -114,6 +120,9 @@
 | Existing DB at a FUTURE version. | Open fails with `SchemaTooNew` carrying actual and expected versions; do NOT downgrade. |
 | A quiesced complete v29 sidecar copy is placed under broker-controlled root-only storage. | Explicit activation stamps v30 and a broker-minted source generation in one transaction; a retained broker connection reopens the same WAL database after restart. Ordinary v29 sidecar writers refuse v30. This does not authorize native K or cut over the user-side callers. |
 | A broker-pinned Bash process in an already released root asks for a private v30 child reservation. | One immutable request row binds the exact actor and root, then a separate D/session, child invocation with the root as parent, `ab30_` handle and registration digest are committed and reread. A duplicate request returns the same identity; a changed actor or parent refuses. The private one-use effect/result rows grant no production work or physical drain. |
+| Original Bash C registers its listener policy. | State retains exact response-only or notify policy with C/D, source, attempt, original root recipient, and owner generation. Same-ID C/c readback refuses changed policy. |
+| The broker freezes a Bash child source event after consumed child K and physical Q. | State checks C/D, parent consumed K/work, child K/exit/drain/PID1 wait and original output bytes against the broker's captured receipt. Selected W and accepted-source fact commit together; interrupted acceptance is repaired from the same event without a new K. Bash O cannot substitute for physical output. |
+| An original notify listener settles an accepted W, or the pinned root explicitly requests notification. | State retains the exact request and original recipient attachment before sidecar F materialization from verified raw stdout/stderr. Restart repairs partial materialization from the same W. Response-only W alone produces no F; F submission and token ACK remain separate, and offline pending delivery is not settled by repair. |
 | A released root with typed normal CLI intent reaches fresh preparation. | One immutable `held` row binds the exact U/D handoff, invocation, session, actor and intent. Retry reads that row; there is no provider fork, native K/Q, result or physical-drain transition. |
 | Existing DB at a known-incompatible past version (no migration path). | Open fails with `MigrationUnsupported`; advise the operator to reset or restore. |
 | Concurrent reader during writer migration. | SQLite WAL + retry handles short waits; long contention surfaces as `DbBusy`. |

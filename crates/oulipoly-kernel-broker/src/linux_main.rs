@@ -51,9 +51,9 @@ use oulipoly_kernel_broker::source_acceptance::capture_and_stage_v2_evidence;
 use oulipoly_kernel_broker::source_physical::{SourceObservation, SourcePhysicalRegistry};
 use oulipoly_kernel_broker::work_registry::{Scope, WorkRegistry, classify_scope};
 use oulipoly_state::mailbox::{
-    BrokerReleaseEvidence, BrokerSidecar, BrokerSourceEffectGrant, FreshDeliverySubmission,
-    FreshRecipientIdentity, FreshReleasedHandoff, FreshV30Lane, FreshV30LaneIdentity,
-    PreparedBrokerOwner, PreparedProcessStamp,
+    BrokerReleaseEvidence, BrokerSidecar, BrokerSourceEffectGrant, FreshBashListenerPolicy,
+    FreshDeliverySubmission, FreshRecipientIdentity, FreshReleasedHandoff, FreshV30Lane,
+    FreshV30LaneIdentity, PreparedBrokerOwner, PreparedProcessStamp,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
@@ -184,6 +184,7 @@ enum RequestPayload {
     )]
     FreshBashChildRequest {
         request_id: String,
+        listener_policy: Option<FreshBashListenerPolicy>,
     },
     #[allow(
         dead_code,
@@ -383,9 +384,10 @@ fn recv_request(
     let valid_length = match request[0] {
         b'G' | b'g' => read == 65,
         b'P' | b'p' => read == 37,
-        b'Q' | b'Z' | b'q' | b'z' | b'D' | b'd' | b'C' | b'c' => read == 33,
+        b'Q' | b'Z' | b'q' | b'z' | b'D' | b'd' | b'c' => read == 33,
+        b'C' => read == 33 || read == 34,
         #[cfg(feature = "age319-private-broker-fixture")]
-        b'%' | b'&' | b'!' => read == 33,
+        b'%' | b'!' => read == 33,
         // Legacy E has no body; fresh Bash E carries a request UUID on its
         // separate socket. Preserve both exact wire shapes for pinned images.
         b'E' => read == 17 || read == 33,
@@ -418,7 +420,9 @@ fn recv_request(
             b'k' => descriptors.len() != 4,
             b'K' => descriptors.len() != 7,
             #[cfg(feature = "age319-private-broker-fixture")]
-            b'5' | b'9' => descriptors.len() != 4,
+            b'5' => descriptors.len() != 4,
+            #[cfg(feature = "age319-private-broker-fixture")]
+            b'9' => !(read == 33 && descriptors.is_empty()) && descriptors.len() != 4,
             #[cfg(feature = "age319-private-broker-fixture")]
             b'h' => descriptors.len() != 5,
             #[cfg(feature = "age319-private-broker-fixture")]
@@ -455,10 +459,17 @@ fn recv_request(
             request: serde_json::from_slice(&request[17..read as usize])?,
         },
         #[cfg(feature = "age319-private-broker-fixture")]
-        b'5' | b'6' | b'7' | b'8' | b'9' => RequestPayload::FreshProviderRequest {
+        b'5' | b'6' | b'7' => RequestPayload::FreshProviderRequest {
             request: serde_json::from_slice(&request[17..read as usize])?,
             descriptors,
         },
+        #[cfg(feature = "age319-private-broker-fixture")]
+        b'8' | b'9' if read != 33 || !descriptors.is_empty() => {
+            RequestPayload::FreshProviderRequest {
+                request: serde_json::from_slice(&request[17..read as usize])?,
+                descriptors,
+            }
+        }
         #[cfg(feature = "age319-private-broker-fixture")]
         b'h' | b'f' => RequestPayload::FreshRouteRequest {
             request: serde_json::from_slice(&request[17..read as usize])?,
@@ -473,13 +484,24 @@ fn recv_request(
         },
         b'C' | b'c' => RequestPayload::FreshBashChildRequest {
             request_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
+            listener_policy: if request[0] == b'C' {
+                Some(match request.get(33).copied().unwrap_or(0) {
+                    0 => FreshBashListenerPolicy::ResponseOnly,
+                    1 => FreshBashListenerPolicy::Notify,
+                    _ => return Err(io::Error::other("fresh Bash C listener policy invalid")),
+                })
+            } else {
+                None
+            },
         },
         #[cfg(feature = "age319-private-broker-fixture")]
-        b'%' | b'&' | b'!' => RequestPayload::FreshBashChildRequest {
+        b'%' | b'!' | b'8' | b'9' => RequestPayload::FreshBashChildRequest {
             request_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
+            listener_policy: None,
         },
         b'E' if read == 33 => RequestPayload::FreshBashChildRequest {
             request_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
+            listener_policy: None,
         },
         b'O' => RequestPayload::FreshBashPrivateResult {
             result: serde_json::from_slice(&request[17..read as usize])?,
@@ -3851,13 +3873,18 @@ fn fixed_private_bash_child_plan() -> io::Result<fresh_provider::Plan> {
         return Err(io::Error::last_os_error());
     }
     let input = unsafe { File::from_raw_fd(fd) };
+    let command = if std::env::var_os("AGE319_PRIVATE_BASH_SOURCE_SUCCESS_V1").is_some() {
+        "printf 'broker-child-output\\n'; printf 'broker-ran\\n' > \"$1\""
+    } else {
+        "printf 'broker-child-output\\n'; printf 'broker-ran\\n' > \"$1\"; (setsid sh -c 'trap \"\" TERM; while :; do sleep 1; done' >/dev/null 2>&1 &)"
+    };
     fresh_provider::plan(
         &image,
         &gate,
         &input,
         vec![
             "-c".into(),
-            "printf 'broker-child-output\\n'; printf 'broker-ran\\n' > \"$1\"; (setsid sh -c 'trap \"\" TERM; while :; do sleep 1; done' >/dev/null 2>&1 &)".into(),
+            command.into(),
             "sh".into(),
             marker.display().to_string(),
         ],
@@ -3873,6 +3900,18 @@ fn serve_fresh_v30_at(
 ) -> io::Result<()> {
     // A missing or incomplete publication cannot bind the new endpoint.
     let mut lane = FreshV30Lane::open_at(state_root).map_err(io::Error::other)?;
+    #[cfg(feature = "age319-private-broker-fixture")]
+    if private_fixture() {
+        if let Err(error) = lane.repair_captured_private_bash_sources() {
+            eprintln!("fresh Bash source repair remains unknown: {error}");
+        }
+        if let Err(error) = lane.repair_private_bash_listener_notifications() {
+            eprintln!("fresh Bash listener repair remains pending: {error}");
+        }
+        if let Err(error) = lane.repair_private_bash_notifications() {
+            eprintln!("fresh Bash notification repair remains pending: {error}");
+        }
+    }
     let instance = EntryGate::open(&state_root.join("v30"))?;
     // An installed Bash child must match the package's pinned digest. Private
     // fixtures supply their built source binary only at broker startup.
@@ -3930,13 +3969,13 @@ fn serve_fresh_v30_at(
                 }
                 .into());
             }
-            let local_lookup =
-                matches!(
-                    &payload,
-                    RequestPayload::FreshRecipientRequest {
-                        request: FreshRecipientRequest::Lookup { .. }
-                    }
-                ) || matches!(operation, b'C' | b'c' | b'E' | b'O' | b'%' | b'&' | b'!');
+            let local_lookup = matches!(
+                &payload,
+                RequestPayload::FreshRecipientRequest {
+                    request: FreshRecipientRequest::Lookup { .. }
+                } | RequestPayload::FreshBashChildRequest { .. }
+                    | RequestPayload::FreshBashPrivateResult { .. }
+            );
             // The shared front door has its own pinned image. It may observe
             // the live lane identity, but it cannot acquire Runner authority.
             // Every effect-bearing operation still requires the fresh Runner
@@ -4032,19 +4071,25 @@ fn serve_fresh_v30_at(
                     "fresh Bash child/work/result closed until normal root grant and physical result custody",
                 )),
                 #[cfg(feature = "age319-private-broker-fixture")]
-                b'C' | b'c' | b'E' | b'O' | b'%' | b'&' | b'!' => {
+                b'C' | b'c' | b'E' | b'O' | b'%' | b'!' | b'8' | b'9'
+                    if !matches!(operation, b'8' | b'9')
+                        || matches!(&payload, RequestPayload::FreshBashChildRequest { .. }) =>
+                {
                     if !private_fixture() {
                         return Err(io::Error::other(
                             "fresh Bash child/work/result closed until normal root grant and physical result custody",
                         ));
                     }
-                    if operation == b'E' && instance.is_closed() {
+                    if matches!(operation, b'E' | b'8') && instance.is_closed() {
                         return Err(io::Error::other("fresh Bash private work gate closed"));
                     }
-                    let request_id = match &payload {
-                        RequestPayload::FreshBashChildRequest { request_id } => request_id.clone(),
+                    let (request_id, listener_policy) = match &payload {
+                        RequestPayload::FreshBashChildRequest {
+                            request_id,
+                            listener_policy,
+                        } => (request_id.clone(), *listener_policy),
                         RequestPayload::FreshBashPrivateResult { result } => {
-                            result.request_id.clone()
+                            (result.request_id.clone(), None)
                         }
                         _ => return Err(io::Error::other("Bash child request absent")),
                     };
@@ -4058,6 +4103,8 @@ fn serve_fresh_v30_at(
                             &recipient,
                             parent_work.grant_id(),
                             parent_work.work_id(),
+                            listener_policy
+                                .ok_or_else(|| io::Error::other("fresh Bash C policy absent"))?,
                         )
                         .map_err(io::Error::other)?
                     } else {
@@ -4079,6 +4126,22 @@ fn serve_fresh_v30_at(
                         child
                     };
                     peer.process.verify()?;
+                    if matches!(operation, b'C' | b'c') {
+                        lane.register_private_bash_source(&child)
+                            .map_err(io::Error::other)?;
+                        if operation == b'C' {
+                            lane.register_private_bash_listener(
+                                &child,
+                                listener_policy.ok_or_else(|| {
+                                    io::Error::other("fresh Bash C policy absent")
+                                })?,
+                            )
+                            .map_err(io::Error::other)?;
+                        } else {
+                            lane.require_private_bash_listener(&child, None)
+                                .map_err(io::Error::other)?;
+                        }
+                    }
                     match operation {
                         b'C' | b'c' => {
                             if operation == b'C' {
@@ -4123,7 +4186,7 @@ fn serve_fresh_v30_at(
                             ))
                         }
                         #[cfg(feature = "age319-private-broker-fixture")]
-                        b'%' | b'&' | b'!' => {
+                        b'8' | b'9' | b'!' | b'%' => {
                             let root_pid = root.old_release.prepared.root_init.host_pid;
                             let root_init = PinnedProcess::open(root_pid)?;
                             let actor = PinnedProcess::open(peer.process.host_pid)?;
@@ -4136,6 +4199,59 @@ fn serve_fresh_v30_at(
                             )?;
                             let directory = state_root.join("v30/fresh-provider");
                             if operation == b'%' {
+                                let registration_digest =
+                                    FreshV30Lane::private_bash_source_registration_digest(&child)
+                                        .map_err(io::Error::other)?;
+                                let event = fresh_provider::select_bash_tree_event(
+                                    &directory,
+                                    &binding,
+                                    &child,
+                                    &lane.identity().lane_id,
+                                    &lane.identity().source_generation,
+                                    &registration_digest,
+                                )
+                                .map_err(|error| {
+                                    io::Error::other(format!(
+                                        "source W unknown for C {}; physical artifact {}; {error}",
+                                        child.request_id,
+                                        directory.display()
+                                    ))
+                                })?;
+                                if std::env::var_os("AGE319_PRIVATE_SOURCE_W_CAPTURE_ONLY_V1")
+                                    .is_some()
+                                {
+                                    return Err(io::Error::other(format!(
+                                        "source W captured before State; exact repair debt at {}",
+                                        directory
+                                            .join(format!(
+                                                "{}.source-event.json",
+                                                event.physical_grant_id
+                                            ))
+                                            .display()
+                                    )));
+                                }
+                                lane.accept_private_bash_source(&event).map_err(|error| {
+                                    io::Error::other(format!(
+                                        "source W unknown; captured artifact {}: {error}",
+                                        directory
+                                            .join(format!(
+                                                "{}.source-event.json",
+                                                event.physical_grant_id
+                                            ))
+                                            .display()
+                                    ))
+                                })?;
+                                if let Err(error) = lane.settle_private_bash_listener(&request_id) {
+                                    eprintln!(
+                                        "source W accepted; listener settlement pending for C {request_id}: {error}"
+                                    );
+                                }
+                                return Ok(format!(
+                                    "fresh-bash-source-accepted {}\n",
+                                    serde_json::to_string(&event)?
+                                ));
+                            }
+                            if operation == b'8' {
                                 let plan = fixed_private_bash_child_plan()?;
                                 fresh_provider::require_admitted_child_work_plan(
                                     &directory, &child, &binding, &plan,
@@ -4708,6 +4824,16 @@ fn serve_fresh_v30_at(
                         return Err(io::Error::other("fresh recipient request absent"));
                     };
                     let reply = match request {
+                        FreshRecipientRequest::ActivateBashSource { request_id } => {
+                            if instance.is_closed() {
+                                return Err(io::Error::other("fresh recipient entry gate closed"));
+                            }
+                            let seq = lane
+                                .request_private_bash_notification(&request_id, &recipient)
+                                .map_err(io::Error::other)?;
+                            serde_json::json!({"kind":"notification_requested", "request_id":request_id,
+                                "seq":seq, "evidence":"explicit_original_listener_request"})
+                        }
                         FreshRecipientRequest::Submit {
                             allocation_request_id,
                             delivery_request_id,
@@ -4751,7 +4877,6 @@ fn serve_fresh_v30_at(
                                     &recipient,
                                 )
                                 .map_err(io::Error::other)?;
-                            submitted_grant = Some(recovered.readback.grant_id.clone());
                             fresh_payload_reply("recovered_delivery", recovered)?
                         }
                         FreshRecipientRequest::Acknowledge {
@@ -5175,6 +5300,7 @@ mod tests {
                 b'E',
                 RequestPayload::FreshBashChildRequest {
                     request_id: uuid::Uuid::new_v4().to_string(),
+                    listener_policy: None,
                 },
                 &entry,
                 &host,
@@ -5592,6 +5718,44 @@ assert s.send(message) == len(message)
             assert_eq!(libc::sendmsg(client.as_raw_fd(), &message, 0), 33);
         }
         server.join().unwrap();
+    }
+
+    #[cfg(feature = "age319-private-broker-fixture")]
+    #[test]
+    fn fresh_bash_policy_and_physical_frames_are_distinct() {
+        for (operation, policy) in [
+            (b'C', Some(1u8)),
+            (b'c', None),
+            (b'8', None),
+            (b'9', None),
+            (b'%', None),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let socket = temp.path().join("socket");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let (parsed_operation, payload, _) = peer_from_request(&mut stream).unwrap();
+                assert_eq!(parsed_operation, operation);
+                assert!(
+                    matches!(payload, RequestPayload::FreshBashChildRequest { listener_policy, .. }
+                    if if operation == b'C' {
+                        matches!(listener_policy, Some(FreshBashListenerPolicy::Notify))
+                    } else { listener_policy.is_none() })
+                );
+            });
+            let mut client = UnixStream::connect(&socket).unwrap();
+            let mut challenge = [0u8; 16];
+            client.read_exact(&mut challenge).unwrap();
+            let mut frame = vec![operation];
+            frame.extend_from_slice(&challenge);
+            frame.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+            if let Some(policy) = policy {
+                frame.push(policy);
+            }
+            client.write_all(&frame).unwrap();
+            server.join().unwrap();
+        }
     }
 
     #[test]

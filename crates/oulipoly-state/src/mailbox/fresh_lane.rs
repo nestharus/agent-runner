@@ -12,6 +12,9 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 include!("fresh_recipient.rs");
 include!("fresh_bash_child.rs");
+include!("fresh_bash_source.rs");
+include!("fresh_bash_notify.rs");
+include!("fresh_bash_listener.rs");
 
 const LANE_DIRECTORY: &str = "v30";
 const FRESH_PROVIDER_DIRECTORY: &str = "fresh-provider";
@@ -22,6 +25,9 @@ const FRESH_CHILD_REQUEST_SCHEMA: &str = include_str!("migrations/0030_fresh_chi
 const FRESH_HANDOFF_SCHEMA: &str = include_str!("migrations/0031_fresh_released_handoff.sql");
 const FRESH_ROOT_EFFECT_SCHEMA: &str = include_str!("migrations/0032_fresh_root_effect.sql");
 const FRESH_BASH_CHILD_SCHEMA: &str = include_str!("migrations/0033_fresh_bash_child.sql");
+const FRESH_BASH_SOURCE_SCHEMA: &str = include_str!("migrations/0035_fresh_bash_source.sql");
+const FRESH_BASH_NOTIFY_SCHEMA: &str = include_str!("migrations/0036_fresh_bash_notify.sql");
+const FRESH_BASH_LISTENER_SCHEMA: &str = include_str!("migrations/0037_fresh_bash_listener.sql");
 const FRESH_NORMAL_WORK_SCHEMA: &str = include_str!("migrations/0034_fresh_normal_work.sql");
 const FRESH_RECIPIENT_SCHEMA: &str = include_str!("migrations/0030_fresh_recipient.sql");
 const FRESH_RECIPIENT_STATE_SCHEMA: &str =
@@ -296,7 +302,7 @@ impl FreshV30Lane {
         let state_conn = Connection::open(&state_path).map_err(|e| e.to_string())?;
         state_conn
             .execute_batch(&format!(
-                "{FRESH_STATE_SCHEMA}\n{FRESH_RECIPIENT_STATE_SCHEMA}\n{FRESH_CHILD_REQUEST_SCHEMA}\n{FRESH_HANDOFF_SCHEMA}\n{FRESH_ROOT_EFFECT_SCHEMA}\n{FRESH_BASH_CHILD_SCHEMA}"
+                "{FRESH_STATE_SCHEMA}\n{FRESH_RECIPIENT_STATE_SCHEMA}\n{FRESH_CHILD_REQUEST_SCHEMA}\n{FRESH_HANDOFF_SCHEMA}\n{FRESH_ROOT_EFFECT_SCHEMA}\n{FRESH_BASH_CHILD_SCHEMA}\n{FRESH_BASH_SOURCE_SCHEMA}\n{FRESH_BASH_NOTIFY_SCHEMA}"
             ))
             .map_err(|e| e.to_string())?;
         state_conn
@@ -619,6 +625,30 @@ impl FreshV30Lane {
             return Err("fresh Bash child schema is incomplete".into());
         }
         verify_fresh_bash_child_schema(&state_conn)?;
+        match fresh_bash_source_schema_count(&state_conn)? {
+            0 => state_conn
+                .execute_batch(FRESH_BASH_SOURCE_SCHEMA)
+                .map_err(|e| e.to_string())?,
+            6 => {}
+            _ => return Err("fresh Bash source schema is incomplete".into()),
+        }
+        verify_fresh_bash_source_schema(&state_conn)?;
+        match fresh_bash_notify_schema_count(&state_conn)? {
+            0 => state_conn
+                .execute_batch(FRESH_BASH_NOTIFY_SCHEMA)
+                .map_err(|e| e.to_string())?,
+            3 => {}
+            _ => return Err("fresh Bash notification schema is incomplete".into()),
+        }
+        verify_fresh_bash_notify_schema(&state_conn)?;
+        match fresh_bash_listener_schema_count(&state_conn)? {
+            0 => state_conn
+                .execute_batch(FRESH_BASH_LISTENER_SCHEMA)
+                .map_err(|e| e.to_string())?,
+            3 => {}
+            _ => return Err("fresh Bash listener schema is incomplete".into()),
+        }
+        verify_fresh_bash_listener_schema(&state_conn)?;
         match fresh_normal_work_schema_count(&state_conn)? {
             0 => state_conn
                 .execute_batch(FRESH_NORMAL_WORK_SCHEMA)
