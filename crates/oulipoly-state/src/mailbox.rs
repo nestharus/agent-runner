@@ -49,8 +49,8 @@ mod finalization;
 mod native_publication;
 mod retention;
 pub use broker_authority::{
-    BrokerContinuationReadback, BrokerMailboxReadback, BrokerReleaseEvidence, BrokerSidecar,
-    PreparedBrokerOwner, PreparedProcessStamp, QuiescedCutoverProof,
+    BrokerContinuationReadback, BrokerMailboxReadback, BrokerReleaseEvidence, BrokerRepairReadback,
+    BrokerSidecar, PreparedBrokerOwner, PreparedProcessStamp, QuiescedCutoverProof,
 };
 pub use native_publication::NativePublication;
 #[path = "mailbox/schema.rs"]
@@ -1338,6 +1338,15 @@ pub(crate) struct CompletionMaterializationSummary {
 }
 
 impl CompletionAuthorityFence<'_> {
+    pub(crate) fn register_completion_event_for_broker_repair(
+        self,
+        input: CompletionEventRegistrationInput<'_>,
+        continuity: &CompletionContinuityHead,
+        binding: &crate::completion_continuation::AdmittedSourceBinding,
+    ) -> Result<CompletionEventRegistrationResult, String> {
+        self.register_completion_event_inner(input, continuity, Some(binding), None)
+    }
+
     pub(crate) fn sidecar_generation(&self) -> Result<String, String> {
         sidecar_generation_on(&self.tx)
     }

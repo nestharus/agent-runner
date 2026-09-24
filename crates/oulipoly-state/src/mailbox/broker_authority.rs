@@ -2,8 +2,9 @@
 //! there is no second acceptance ledger. Offline publication carries the
 //! quiesced v29 database and its retained payloads in one directory.
 use super::*;
+use crate::StateDb;
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Component;
 
 /// Retains the broker's live SQLite connection and its broker-minted source
@@ -14,6 +15,111 @@ pub struct BrokerSidecar {
     source_generation: String,
     storage_owner: u32,
     storage_anchor: std::path::PathBuf,
+    state_source: Option<BoundStateSource>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct BoundStateSource {
+    path: std::path::PathBuf,
+    owner: u32,
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+fn verify_bound_state_source(source: &BoundStateSource) -> Result<(), String> {
+    let meta = std::fs::symlink_metadata(&source.path).map_err(|e| e.to_string())?;
+    if !source.path.is_absolute()
+        || source.path.file_name() != Some(std::ffi::OsStr::new("state.db"))
+        || source
+            .path
+            .components()
+            .any(|part| matches!(part, Component::CurDir | Component::ParentDir))
+        || !meta.is_file()
+        || meta.file_type().is_symlink()
+        || meta.nlink() != 1
+        || (meta.uid(), meta.dev(), meta.ino()) != (source.owner, source.device, source.inode)
+    {
+        return Err("broker StateDb source identity changed".into());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_bound_state_source(_source: &BoundStateSource) -> Result<(), String> {
+    Err("broker StateDb source requires Unix identity".into())
+}
+
+#[cfg(unix)]
+fn read_state_source_binding(
+    sidecar: &Path,
+    storage_owner: u32,
+) -> Result<Option<BoundStateSource>, String> {
+    let path = sidecar
+        .parent()
+        .ok_or("broker sidecar parent absent")?
+        .join("state-source.json");
+    let meta = match std::fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    if !meta.is_file()
+        || meta.file_type().is_symlink()
+        || meta.uid() != storage_owner
+        || meta.nlink() != 1
+        || meta.mode() & 0o777 != 0o600
+    {
+        return Err("broker StateDb binding is not root-only".into());
+    }
+    let source: BoundStateSource =
+        serde_json::from_reader(std::fs::File::open(&path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    verify_bound_state_source(&source)?;
+    Ok(Some(source))
+}
+
+#[cfg(unix)]
+fn write_state_source_binding(
+    directory: &Path,
+    state_path: &Path,
+    source_owner: u32,
+    storage_owner: u32,
+) -> Result<(), String> {
+    let meta = std::fs::symlink_metadata(state_path).map_err(|e| e.to_string())?;
+    let source = BoundStateSource {
+        path: state_path.into(),
+        owner: source_owner,
+        device: meta.dev(),
+        inode: meta.ino(),
+    };
+    verify_bound_state_source(&source)?;
+    let binding_path = directory.join("state-source.json");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&binding_path)
+        .map_err(|e| e.to_string())?;
+    serde_json::to_writer(&mut file, &source).map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())?;
+    let file_meta = file.metadata().map_err(|e| e.to_string())?;
+    if file_meta.uid() != storage_owner {
+        return Err("broker StateDb binding storage owner changed".into());
+    }
+    std::fs::File::open(directory)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct BrokerRepairReadback {
+    pub source_generation: String,
+    pub root_id: String,
+    pub owner_generation: String,
+    pub authority_ordinal: i64,
+    pub has_more: bool,
+    pub pending_registration_ids: Vec<String>,
 }
 
 /// Installer-owned proof that the old service images and every sidecar writer
@@ -156,6 +262,85 @@ pub struct BrokerReleaseEvidence {
 }
 
 impl BrokerSidecar {
+    fn bound_state(&self) -> Result<StateDb, String> {
+        let source = self
+            .state_source
+            .as_ref()
+            .ok_or("broker StateDb source binding absent")?;
+        verify_bound_state_source(source)?;
+        let state = StateDb::open_broker_repair_read_only(&source.path)?;
+        verify_bound_state_source(source)?;
+        Ok(state)
+    }
+
+    /// Read only the current cursor and one bounded unaccepted page. The
+    /// server's pinned driver check must precede this call.
+    pub fn read_bounded_repair(
+        &self,
+        source_generation: &str,
+        root_id: &str,
+        owner: &CompletionDomainOwner,
+    ) -> Result<BrokerRepairReadback, String> {
+        self.check_mailbox_read(source_generation)?;
+        let state = self.bound_state()?;
+        let head = self.mailbox.completion_continuity_head()?;
+        let ordinal = head.as_ref().map_or(0, |head| head.authority_ordinal);
+        let pending = self
+            .mailbox
+            .unaccepted_completion_continuations(&owner.supervisor_authority_id, 16)?;
+        let pending_registration_ids = pending
+            .into_iter()
+            .map(|binding| binding.registration().map(|source| source.registration_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        let has_more = state.completion_repair_has_suffix(head.as_ref())?;
+        self.check_mailbox_read(source_generation)?;
+        Ok(BrokerRepairReadback {
+            source_generation: self.source_generation.clone(),
+            root_id: root_id.into(),
+            owner_generation: owner.owner_generation.clone(),
+            authority_ordinal: ordinal,
+            has_more,
+            pending_registration_ids,
+        })
+    }
+
+    /// StateDb supplies every admitted binding; the root-retained sidecar is
+    /// the only projection writer. A page failure leaves its durable cursor
+    /// at the last committed row for exact retry after broker/driver loss.
+    pub fn repair_bounded_suffix(
+        &mut self,
+        source_generation: &str,
+        root_id: &str,
+        owner: &CompletionDomainOwner,
+        expected_ordinal: i64,
+    ) -> Result<BrokerRepairReadback, String> {
+        self.check_mailbox_read(source_generation)?;
+        let mut state = self.bound_state()?;
+        let (authority_ordinal, has_more, pending_registration_ids) = state
+            .repair_pending_domain_completion_continuations_on(
+                &mut self.mailbox,
+                &owner.domain_id,
+                &owner.supervisor_authority_id,
+                expected_ordinal,
+                64,
+                16,
+            )?;
+        verify_bound_state_source(
+            self.state_source
+                .as_ref()
+                .ok_or("broker StateDb source binding absent")?,
+        )?;
+        self.check_mailbox_read(source_generation)?;
+        Ok(BrokerRepairReadback {
+            source_generation: self.source_generation.clone(),
+            root_id: root_id.into(),
+            owner_generation: owner.owner_generation.clone(),
+            authority_ordinal,
+            has_more,
+            pending_registration_ids,
+        })
+    }
+
     /// Root-side precursor for new completion mail. The caller must already
     /// have broker-proven source and recipient facts; this does not create a
     /// wire ingress grant. Payload bytes are copied into the repository
@@ -564,6 +749,22 @@ impl BrokerSidecar {
     ) -> Result<String, String> {
         require_host_root()?;
         activate_with_owner(path, 0, broker_state_root)
+    }
+
+    #[cfg(all(unix, feature = "age319-private-broker-fixture"))]
+    pub fn bind_private_fixture_state_source(
+        sidecar_path: &Path,
+        state_path: &Path,
+    ) -> Result<(), String> {
+        require_host_root()?;
+        write_state_source_binding(
+            sidecar_path
+                .parent()
+                .ok_or("broker sidecar parent absent")?,
+            state_path,
+            0,
+            0,
+        )
     }
 
     /// Prepare an inert, root-only SQLite snapshot and retained payload copy
@@ -1172,6 +1373,10 @@ fn stage_with_owner(
             storage_owner,
             &payload_identities,
         )?;
+        let state_path = source.with_file_name("state.db");
+        if state_path.exists() {
+            write_state_source_binding(&stage, &state_path, source_owner, storage_owner)?;
+        }
         let copied = Connection::open_with_flags(&copy, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|error| error.to_string())?;
         let projected = super::broker_payload_custody::projected_fingerprint(
@@ -1370,6 +1575,7 @@ fn open_with_owner(path: &Path, owner: u32, anchor: &Path) -> Result<BrokerSidec
         source_generation: generation,
         storage_owner: owner,
         storage_anchor: anchor.to_path_buf(),
+        state_source: read_state_source_binding(path, owner)?,
     })
 }
 

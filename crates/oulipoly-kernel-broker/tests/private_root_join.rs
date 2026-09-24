@@ -4,6 +4,7 @@
 use oulipoly_kernel_broker::protocol::{
     self, AcceptedWorkSpec, JoinSpec, Operation, ProcessWitness, SourceScope, SourceSocketWitness,
 };
+use oulipoly_state::completion_continuation::AdmittedSourceBinding;
 use oulipoly_state::mailbox::{BrokerSidecar, MailboxDb};
 use std::fs::{self, File};
 use std::os::fd::AsRawFd;
@@ -44,9 +45,42 @@ fn inner() {
     fs::create_dir(&gate).unwrap();
     let mailbox =
         MailboxDb::open_completion_continuation_domain(&data.join("pid-identity.db")).unwrap();
-    let domain = mailbox.completion_continuation_domain().unwrap().unwrap();
+    let pending_binding = normal_mode.then(|| {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../oulipoly-state/tests/fixtures/age360-paired-wire.json"
+        ))
+        .unwrap();
+        AdmittedSourceBinding::new(
+            "fixture-admission",
+            fixture["registration_bytes_utf8"]
+                .as_str()
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap()
+    });
+    let domain = pending_binding
+        .as_ref()
+        .map(|binding| binding.registration().unwrap().domain_id)
+        .unwrap_or_else(|| mailbox.completion_continuation_domain().unwrap().unwrap());
+    let sidecar_generation = mailbox.sidecar_generation().unwrap();
     drop(mailbox);
-    drop(oulipoly_state::StateDb::open(&data.join("state.db")).unwrap());
+    if normal_mode {
+        rusqlite::Connection::open(data.join("pid-identity.db"))
+            .unwrap()
+            .execute(
+                "UPDATE completion_continuation_domain SET domain_id=?1",
+                [&domain],
+            )
+            .unwrap();
+    }
+    let mut state = oulipoly_state::StateDb::open(&data.join("state.db")).unwrap();
+    if let Some(binding) = &pending_binding {
+        state
+            .seed_private_pending_completion_source(binding, &sidecar_generation)
+            .unwrap();
+    }
+    drop(state);
     let broker_generation = if mode == "broker_state"
         || mode == "held_prepared"
         || mode == "held_guardian_death"
@@ -63,7 +97,13 @@ fn inner() {
             .unwrap();
         fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
         let proof = oulipoly_state::mailbox::QuiescedCutoverProof::private_fixture();
-        Some(BrokerSidecar::activate_private_fixture_copy(&target, &broker_state, &proof).unwrap())
+        let generation =
+            BrokerSidecar::activate_private_fixture_copy(&target, &broker_state, &proof).unwrap();
+        if normal_mode {
+            BrokerSidecar::bind_private_fixture_state_source(&target, &data.join("state.db"))
+                .unwrap();
+        }
+        Some(generation)
     } else {
         None
     };
@@ -99,6 +139,7 @@ fn inner() {
             .env("OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1", "1")
             .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
             .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+            .env("AGE319_PRIVATE_REPAIR_CHALLENGE_V1", "1")
             .envs(
                 (mode == "normal_prepare_lost_reply")
                     .then_some(("AGE319_PRIVATE_NORMAL_PREPARE_REPLY_LOSS_V1", "1")),
@@ -106,6 +147,10 @@ fn inner() {
             .envs(
                 (mode == "normal_release_lost_reply")
                     .then_some(("AGE319_PRIVATE_NORMAL_RELEASE_REPLY_LOSS_V1", "1")),
+            )
+            .envs(
+                (mode == "normal_repair_lost_reply")
+                    .then_some(("AGE319_PRIVATE_REPAIR_REPLY_LOSS_V1", "1")),
             )
             .env_remove("LD_LIBRARY_PATH")
             .stdin(Stdio::null())
@@ -234,6 +279,24 @@ fn inner() {
                 "{}",
                 fs::read_to_string(&err).unwrap()
             );
+            let repair_read = protocol::StateReadSpec {
+                protocol: "broker-repair-read-v30".into(),
+                source_generation: generation.clone(),
+                root_id: prepared.root_id.clone(),
+                owner_generation: prepared.owner_generation.clone(),
+                attempt_id: None,
+            };
+            assert!(protocol::read_bounded_repair_at(&socket, &repair_read).is_err());
+            let repair_write = protocol::StateWriteSpec {
+                protocol: "broker-repair-write-v30".into(),
+                source_generation: generation.clone(),
+                root_id: prepared.root_id.clone(),
+                owner_generation: prepared.owner_generation.clone(),
+                action: protocol::StateWriteAction::Repair {
+                    expected_ordinal: 0,
+                },
+            };
+            assert!(protocol::write_bounded_repair_at(&socket, &repair_write).is_err());
             assert_eq!(fs::metadata(&out).unwrap().len(), 0);
             let post_death = matches!(
                 mode.as_str(),
@@ -261,15 +324,45 @@ fn inner() {
                 assert!(!entry.wait().unwrap().success());
                 assert_eq!(fs::metadata(&out).unwrap().len(), 0);
             } else {
-                eventually(|| {
+                assert!(
                     fs::read_to_string(&err)
                         .unwrap_or_default()
-                        .contains("v30 driver bounded State repair and wake route is not available")
-                });
+                        .contains("v30 source recovery requires broker source grant"),
+                    "normal repair boundary: entry={} broker={}",
+                    fs::read_to_string(&err).unwrap_or_default(),
+                    fs::read_to_string(&broker_log).unwrap_or_default(),
+                );
                 assert_eq!(
                     fs::read_to_string(&out).unwrap(),
                     format!("OULIPOLY_KERNEL_V30_CHILD_EFFECT={}\n", released.release_id)
                 );
+                let projected = rusqlite::Connection::open_with_flags(
+                    broker_state.join("sidecar/pid-identity.db"),
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .unwrap();
+                let ordinal: i64 = projected
+                    .query_row(
+                        "SELECT authority_ordinal FROM completion_authority_continuity",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(ordinal, 1, "one admitted State suffix must be projected");
+                let source_id = &pending_binding
+                    .as_ref()
+                    .unwrap()
+                    .registration()
+                    .unwrap()
+                    .registration_id;
+                let phase: String = projected
+                    .query_row(
+                        "SELECT phase FROM completion_continuation_source WHERE registration_id=?1",
+                        [source_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(phase, "registered");
             }
             assert_eq!(
                 fs::read(data.join("pid-identity.db")).unwrap(),
@@ -300,6 +393,27 @@ fn inner() {
             fs::read_dir(broker_state.join("entries")).unwrap().count(),
             1
         );
+        if matches!(
+            mode.as_str(),
+            "normal_release"
+                | "normal_prepare_lost_reply"
+                | "normal_release_lost_reply"
+                | "normal_repair_lost_reply"
+        ) {
+            let retained = rusqlite::Connection::open_with_flags(
+                broker_state.join("sidecar/pid-identity.db"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let ordinal: i64 = retained
+                .query_row(
+                    "SELECT authority_ordinal FROM completion_authority_continuity",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(ordinal, 1, "restart must retain exact repair cursor");
+        }
         stop(&mut restarted);
         unsafe { libc::kill(prepared.root_init.host_pid, libc::SIGKILL) };
         return;
@@ -1171,10 +1285,17 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_broker_death",
         "normal_prepare_lost_reply",
         "normal_release_lost_reply",
+        "normal_repair_lost_reply",
         "normal_guardian_post",
         "normal_driver_post",
         "normal_broker_post",
     ] {
+        if std::env::var("AGE319_PRIVATE_JOIN_ONLY_MODE")
+            .ok()
+            .is_some_and(|only| only != mode)
+        {
+            continue;
+        }
         let output = Command::new("unshare")
             .args(["-Urpfm", "--mount-proc"])
             .arg(std::env::current_exe().unwrap())

@@ -269,6 +269,12 @@ impl MailboxDb {
         Ok(completion_continuity_head_on(&self.conn)?.map_or(0, |head| head.authority_ordinal))
     }
 
+    pub(crate) fn completion_continuity_head(
+        &self,
+    ) -> Result<Option<CompletionContinuityHead>, String> {
+        completion_continuity_head_on(&self.conn)
+    }
+
     /// Return only source images that still lack an accepted completion.  The
     /// partial index added with sidecar v21 keeps terminal source history out of
     /// this bounded recovery selection.

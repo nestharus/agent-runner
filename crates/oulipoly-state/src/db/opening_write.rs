@@ -186,6 +186,37 @@ impl From<String> for WritableOpenError {
 }
 
 impl StateDb {
+    /// Broker v30 reads the live admitted suffix through the original State
+    /// file. Avoid the historical snapshot (a full database copy) and avoid a
+    /// writable open's migration/backfill path on every bounded repair page.
+    pub(crate) fn open_broker_repair_read_only(path: &Path) -> Result<Self, String> {
+        let source = Self::validate_read_only_paths(path).map_err(|e| format!("{e:?}"))?;
+        let conn =
+            sqlite::Connection::open_with_flags(&source, sqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|e| e.to_string())?;
+        Self::probe_read_only_schema(&source, &conn).map_err(|e| format!("{e:?}"))?;
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(|e| e.to_string())?;
+        if version != i64::from(crate::schema::CURRENT_SCHEMA_VERSION) {
+            return Err("broker repair requires current StateDb schema".into());
+        }
+        crate::completion_continuation::validate_admission_schema(&conn)?;
+        Ok(Self {
+            retained_launch_owners: Default::default(),
+            conn,
+            db_path: source,
+            completion_authority_state: None,
+            lifecycle_sink: Mutex::new(Box::new(NoopLifecycleEventSink)),
+            access_scope: crate::live_history::AccessScope::live(
+                "state.broker_repair.live",
+                crate::diagnostic_recorder::SqliteDatabaseRole::State,
+            ),
+            _read_only_snapshot: None,
+            _state_namespace_guard: None,
+        })
+    }
+
     pub fn open(path: &Path) -> Result<Self, String> {
         Self::open_with_sink(path, Box::new(NoopLifecycleEventSink))
     }

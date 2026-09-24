@@ -295,6 +295,60 @@ impl fmt::Display for OwnershipAuthorityError {
 impl std::error::Error for OwnershipAuthorityError {}
 
 impl StateDb {
+    #[cfg(feature = "age319-private-broker-fixture")]
+    pub fn seed_private_pending_completion_source(
+        &mut self,
+        binding: &AdmittedSourceBinding,
+        sidecar_generation: &str,
+    ) -> Result<(), String> {
+        let source = binding.registration()?;
+        let listener = binding.admission_listener()?;
+        self.start_invocation(&crate::InvocationStart {
+            invocation_uuid: listener.owner_invocation_uuid.clone(),
+            model_name: "fixture".into(),
+            provider_name: "fixture".into(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        })?;
+        let paths = source.paths();
+        let registration = CompletionEventRegistrationInput {
+            event_id: &source.handle,
+            delivery_mode: &source.delivery_mode,
+            owner_session_id: Some(&listener.session_id),
+            owner_invocation_uuid: Some(&listener.owner_invocation_uuid),
+            state_dir: &source.handle_dir,
+            meta_path: &paths[0],
+            log_path: &paths[1],
+            rc_path: &paths[2],
+        };
+        binding.validate_input(binding.caller_admission_id(), &registration)?;
+        let admission_id = completion_bound_admission_id(
+            binding.caller_admission_id(),
+            &registration,
+            Some(binding),
+        );
+        let tx = self
+            .conn
+            .transaction_with_behavior(sqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        require_completion_continuity_registration_ready(&tx)?;
+        let head = completion_continuity_head_on(&tx).map_err(|e| e.to_string())?;
+        record_completion_obligation_with_continuity_on(
+            &tx,
+            CompletionObligationAdmission {
+                admission_id: &admission_id,
+                invocation_uuid: &source.owner_invocation_uuid,
+                event_id: &source.handle,
+                owner_invocation_uuid: &listener.owner_invocation_uuid,
+                owner_session_id: &listener.session_id,
+                expected_sidecar_generation: sidecar_generation,
+            },
+            head.as_ref(),
+            Some(&binding.encoded()?),
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
     /// Admission still uses the original actor capability and continuity ledger.
     /// Source bytes are inserted atomically with that authority, before sidecar IO.
     pub fn register_completion_continuation_with_authority(
@@ -378,6 +432,139 @@ impl StateDb {
             self.repair_domain_binding(domain, &originals, Some(&projection), binding)?;
         }
         projection.unaccepted_completion_continuations(supervisor_authority_id, source_limit)
+    }
+
+    /// Broker-owned v30 projection of one bounded State admission suffix.
+    /// The broker supplies its retained connection; this path never resolves or
+    /// opens the retired user sidecar. Each admission is read from this StateDb,
+    /// and the sidecar cursor is advanced atomically with its exact projection.
+    pub(crate) fn repair_pending_domain_completion_continuations_on(
+        &mut self,
+        projection: &mut MailboxDb,
+        domain: &str,
+        supervisor_authority_id: &str,
+        expected_ordinal: i64,
+        suffix_limit: usize,
+        source_limit: usize,
+    ) -> Result<(i64, bool, Vec<String>), String> {
+        if !(1..=64).contains(&suffix_limit) || !(1..=16).contains(&source_limit) {
+            return Err("broker completion repair bounds invalid".into());
+        }
+        let projection_head = projection.completion_continuity_head()?;
+        let ordinal = projection_head
+            .as_ref()
+            .map_or(0, |head| head.authority_ordinal);
+        if ordinal != expected_ordinal {
+            return Err("broker completion repair cursor revision conflict".into());
+        }
+        self.completion_repair_has_suffix(projection_head.as_ref())?;
+        let suffix = self.admitted_completion_continuations_after(ordinal, suffix_limit + 1)?;
+        let page = &suffix[..suffix.len().min(suffix_limit)];
+        let originals: std::collections::BTreeSet<Vec<u8>> = page
+            .iter()
+            .filter(|binding| !binding.is_late_listener())
+            .map(|binding| binding.registration_bytes().to_vec())
+            .collect();
+        for binding in page {
+            let source = binding.registration()?;
+            if source.domain_id != domain {
+                return Err("broker completion repair domain conflict".into());
+            }
+            if binding.is_late_listener()
+                && !originals.contains(binding.registration_bytes())
+                && !projection.has_original_completion_source(binding)?
+            {
+                return Err("late listener requires original committed v2 source admission".into());
+            }
+            let paths = source.paths();
+            let listener = binding.admission_listener()?;
+            let registration = CompletionEventRegistrationInput {
+                event_id: &source.handle,
+                delivery_mode: &source.delivery_mode,
+                owner_session_id: Some(&listener.session_id),
+                owner_invocation_uuid: Some(&listener.owner_invocation_uuid),
+                state_dir: &source.handle_dir,
+                meta_path: &paths[0],
+                log_path: &paths[1],
+                rc_path: &paths[2],
+            };
+            binding.validate_input(binding.caller_admission_id(), &registration)?;
+            let admission_id = completion_bound_admission_id(
+                binding.caller_admission_id(),
+                &registration,
+                Some(binding),
+            );
+            let continuity = completion_continuity_by_admission_on(&self.conn, &admission_id)
+                .map_err(|error| error.to_string())?
+                .ok_or("broker repair admission continuity absent")?;
+            let current = projection.completion_continuity_head()?;
+            if continuity.authority_ordinal
+                != current.as_ref().map_or(0, |h| h.authority_ordinal) + 1
+                || continuity.previous_continuity_digest
+                    != current
+                        .as_ref()
+                        .map_or(COMPLETION_CONTINUITY_GENESIS_DIGEST, |h| {
+                            h.continuity_digest.as_str()
+                        })
+            {
+                return Err("broker completion repair continuity order conflict".into());
+            }
+            let fence = projection.begin_completion_authority_fence()?;
+            if fence.sidecar_generation()? != continuity.sidecar_generation
+                || fence.completion_continuity_head()?.as_ref() != current.as_ref()
+            {
+                return Err("broker repair sidecar generation/cursor changed".into());
+            }
+            fence.preflight_continuation_binding(binding, true)?;
+            fence.require_continuation_binding(&source.handle, true)?;
+            fence.preflight_completion_event_registration(&registration)?;
+            fence.register_completion_event_for_broker_repair(
+                registration,
+                &continuity,
+                binding,
+            )?;
+        }
+        let final_ordinal = projection.completion_continuity_repair_ordinal()?;
+        let final_head = projection.completion_continuity_head()?;
+        let has_more = self.completion_repair_has_suffix(final_head.as_ref())?;
+        let pending = projection
+            .unaccepted_completion_continuations(supervisor_authority_id, source_limit)?
+            .into_iter()
+            .map(|binding| binding.registration().map(|source| source.registration_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((final_ordinal, has_more, pending))
+    }
+
+    pub(crate) fn completion_repair_has_suffix(
+        &self,
+        projection_head: Option<&CompletionContinuityHead>,
+    ) -> Result<bool, String> {
+        let ordinal = projection_head.map_or(0, |head| head.authority_ordinal);
+        if let Some(head) = projection_head {
+            let admitted = completion_continuity_by_ordinal_on(&self.conn, ordinal)
+                .map_err(|error| error.to_string())?;
+            if admitted.as_ref() != Some(head) {
+                return Err("broker completion repair State/sidecar cursor conflict".into());
+            }
+        }
+        let state_head = completion_continuity_head_on(&self.conn).map_err(|e| e.to_string())?;
+        if state_head
+            .as_ref()
+            .is_some_and(|head| head.authority_ordinal < ordinal)
+        {
+            return Err("broker completion repair sidecar cursor exceeds State".into());
+        }
+        let pending = !self
+            .admitted_completion_continuations_after(ordinal, 1)?
+            .is_empty();
+        if !pending
+            && state_head
+                .as_ref()
+                .is_some_and(|head| head.authority_ordinal > ordinal)
+        {
+            return Err("broker completion repair has unprojectable State suffix".into());
+        }
+        Ok(pending)
     }
 
     fn repair_domain_binding(
@@ -1592,6 +1779,22 @@ pub(super) fn completion_continuity_head_on(
     )
     .optional()
     .map_err(persistence("read completion continuity head"))
+}
+
+fn completion_continuity_by_ordinal_on(
+    conn: &sqlite::Connection,
+    ordinal: i64,
+) -> Result<Option<CompletionContinuityHead>, OwnershipAuthorityError> {
+    conn.query_row(
+        "SELECT authority_ordinal, admission_id, expected_sidecar_generation,
+                invocation_uuid, event_id, owner_invocation_uuid, owner_session_id,
+                previous_continuity_digest, continuity_digest
+         FROM invocation_completion_continuity WHERE authority_ordinal=?1",
+        [ordinal],
+        map_completion_continuity_head,
+    )
+    .optional()
+    .map_err(persistence("read completion continuity cursor"))
 }
 
 fn completion_continuity_by_admission_on(
@@ -4203,6 +4406,137 @@ mod completion_continuation_tests {
                 || assert!(!after, "after State commit fault"),
             )
             .unwrap();
+    }
+
+    #[cfg(feature = "age319-private-broker-fixture")]
+    #[test]
+    fn broker_repair_uses_state_admission_and_bounded_cursor() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.db");
+        let original = binding();
+        let mut projection =
+            MailboxDb::open_completion_continuation_domain(&MailboxDb::path_for_state_db(&path))
+                .unwrap();
+        projection
+            .connection()
+            .execute(
+                "UPDATE completion_continuation_domain SET domain_id=?1",
+                [&original.registration().unwrap().domain_id],
+            )
+            .unwrap();
+        let generation = projection.sidecar_generation().unwrap();
+        let domain = original.registration().unwrap().domain_id;
+        let process =
+            crate::pid_identity::read_live_process_identity(i64::from(std::process::id()))
+                .unwrap()
+                .unwrap();
+        let identity = crate::completion_continuation::SourceProcessIdentity {
+            pid: process.os_pid,
+            boot_id: process.os_boot_id,
+            starttime_ticks: process.os_pid_starttime_ticks,
+        };
+        let supervisor = uuid::Uuid::new_v4().to_string();
+        projection
+            .publish_completion_continuation_owner(&crate::mailbox::CompletionDomainOwner {
+                protocol: crate::completion_continuation::PROTOCOL.into(),
+                domain_id: domain.clone(),
+                supervisor_authority_id: supervisor.clone(),
+                owner_generation: uuid::Uuid::new_v4().to_string(),
+                guardian_identity: identity.clone(),
+                driver_identity: identity,
+                endpoint: "/fixture/owner.sock".into(),
+            })
+            .unwrap();
+        let mut state = StateDb::open(&path).unwrap();
+        state
+            .seed_private_pending_completion_source(&original, &generation)
+            .unwrap();
+        let listener_id = uuid::Uuid::new_v4().to_string();
+        let late = original
+            .for_listener(
+                "fixture-late",
+                crate::completion_continuation::ListenerIdentity {
+                    listener_id: listener_id.clone(),
+                    owner_invocation_uuid: listener_id,
+                    session_id: "fixture-late-session".into(),
+                },
+            )
+            .unwrap();
+        state
+            .seed_private_pending_completion_source(&late, &generation)
+            .unwrap();
+        assert_eq!(
+            projection.completion_continuity_repair_ordinal().unwrap(),
+            0
+        );
+        assert!(
+            state
+                .repair_pending_domain_completion_continuations_on(
+                    &mut projection,
+                    &domain,
+                    &supervisor,
+                    1,
+                    1,
+                    1
+                )
+                .unwrap_err()
+                .contains("revision conflict")
+        );
+        let (ordinal, has_more, pending) = state
+            .repair_pending_domain_completion_continuations_on(
+                &mut projection,
+                &domain,
+                &supervisor,
+                0,
+                1,
+                1,
+            )
+            .unwrap();
+        assert_eq!((ordinal, has_more), (1, true));
+        assert_eq!(
+            pending,
+            vec![original.registration().unwrap().registration_id]
+        );
+        assert!(
+            state
+                .repair_pending_domain_completion_continuations_on(
+                    &mut projection,
+                    &domain,
+                    &supervisor,
+                    0,
+                    1,
+                    1
+                )
+                .unwrap_err()
+                .contains("revision conflict")
+        );
+        let (ordinal, has_more, pending) = state
+            .repair_pending_domain_completion_continuations_on(
+                &mut projection,
+                &domain,
+                &supervisor,
+                1,
+                1,
+                1,
+            )
+            .unwrap();
+        assert_eq!((ordinal, has_more), (2, false));
+        assert_eq!(
+            pending,
+            vec![original.registration().unwrap().registration_id]
+        );
+        assert!(
+            state
+                .repair_pending_domain_completion_continuations_on(
+                    &mut projection,
+                    &domain,
+                    &supervisor,
+                    2,
+                    0,
+                    1
+                )
+                .is_err()
+        );
     }
 
     #[test]

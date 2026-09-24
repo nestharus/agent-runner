@@ -786,7 +786,118 @@ fn write_broker_state(
                 .map_err(io::Error::other)?;
             Ok(readback)
         }
+        StateWriteAction::Repair { .. } => {
+            Err(io::Error::other("bounded repair requires v30 protocol"))
+        }
     }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "broker actor and retained State authorities are independent"
+)]
+fn read_bounded_repair(
+    spec: StateReadSpec,
+    peer: &PeerIdentity,
+    host_namespace: &File,
+    runner_image: &File,
+    roots: &RootRegistry,
+    works: &WorkRegistry,
+    entries: &EntryRegistry,
+    sidecar: &BrokerSidecar,
+) -> io::Result<oulipoly_state::mailbox::BrokerRepairReadback> {
+    if spec.protocol != "broker-repair-read-v30" || spec.attempt_id.is_some() {
+        return Err(io::Error::other(
+            "broker bounded repair read version conflict",
+        ));
+    }
+    let exact = read_broker_state(
+        StateReadSpec {
+            protocol: "broker-state-read-v1".into(),
+            ..spec
+        },
+        peer,
+        host_namespace,
+        runner_image,
+        roots,
+        works,
+        entries,
+        sidecar,
+    )?;
+    if !exact.broker_owned || exact.owner.driver_identity.pid != i64::from(peer.process.host_pid) {
+        return Err(io::Error::other(
+            "broker bounded repair requires exact driver",
+        ));
+    }
+    sidecar
+        .read_bounded_repair(&exact.source_generation, &exact.root_id, &exact.owner)
+        .map_err(io::Error::other)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "broker actor and retained State authorities are independent"
+)]
+fn write_bounded_repair(
+    spec: StateWriteSpec,
+    peer: &PeerIdentity,
+    host_namespace: &File,
+    runner_image: &File,
+    roots: &RootRegistry,
+    works: &WorkRegistry,
+    entries: &EntryRegistry,
+    sidecar: &mut BrokerSidecar,
+) -> io::Result<oulipoly_state::mailbox::BrokerRepairReadback> {
+    let StateWriteAction::Repair { expected_ordinal } = spec.action else {
+        return Err(io::Error::other(
+            "broker bounded repair write action conflict",
+        ));
+    };
+    if spec.protocol != "broker-repair-write-v30" || expected_ordinal < 0 {
+        return Err(io::Error::other(
+            "broker bounded repair write version/cursor conflict",
+        ));
+    }
+    let exact = read_broker_state(
+        StateReadSpec {
+            protocol: "broker-state-read-v1".into(),
+            source_generation: spec.source_generation,
+            root_id: spec.root_id,
+            owner_generation: spec.owner_generation,
+            attempt_id: None,
+        },
+        peer,
+        host_namespace,
+        runner_image,
+        roots,
+        works,
+        entries,
+        sidecar,
+    )?;
+    if !exact.broker_owned || exact.owner.driver_identity.pid != i64::from(peer.process.host_pid) {
+        return Err(io::Error::other(
+            "broker bounded repair requires exact driver",
+        ));
+    }
+    sidecar
+        .repair_bounded_suffix(
+            &exact.source_generation,
+            &exact.root_id,
+            &exact.owner,
+            expected_ordinal,
+        )
+        .map_err(io::Error::other)
+}
+
+fn encode_repair_readback(
+    readback: &oulipoly_state::mailbox::BrokerRepairReadback,
+) -> io::Result<String> {
+    let mut response = serde_json::to_string(readback)?;
+    response.push('\n');
+    if response.len() > 4096 {
+        return Err(io::Error::other("broker repair readback too large"));
+    }
+    Ok(response)
 }
 
 fn witness_matches(witness: &ProcessWitness, process: &PinnedProcess) -> io::Result<bool> {
@@ -2362,6 +2473,18 @@ fn serve() -> io::Result<()> {
                         sidecar,
                     )?;
                     encode_release_evidence(&evidence)
+                } else if spec.protocol == "broker-repair-read-v30" {
+                    let readback = read_bounded_repair(
+                        spec,
+                        &peer,
+                        &host_namespace,
+                        &runner_image,
+                        &registry,
+                        &works,
+                        &entries,
+                        sidecar,
+                    )?;
+                    encode_repair_readback(&readback)
                 } else {
                     let readback = read_broker_state(
                         spec,
@@ -2406,6 +2529,18 @@ fn serve() -> io::Result<()> {
                         sidecar,
                     )?;
                     encode_release_evidence(&evidence)
+                } else if spec.protocol == "broker-repair-write-v30" {
+                    let readback = write_bounded_repair(
+                        spec,
+                        &peer,
+                        &host_namespace,
+                        &runner_image,
+                        &registry,
+                        &works,
+                        &entries,
+                        sidecar,
+                    )?;
+                    encode_repair_readback(&readback)
                 } else {
                     let readback = write_broker_state(
                         spec,

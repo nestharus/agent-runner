@@ -16,6 +16,7 @@
 - `crates/oulipoly-state/src/db/invocation_timestamp_contract.rs`
 - `crates/oulipoly-state/src/db/opening_migrations.rs`
 - `crates/oulipoly-state/src/db/opening_write.rs`
+- `crates/oulipoly-state/src/db/ownership_authority.rs`
 - `crates/oulipoly-state/src/db/resume_lookup.rs`
 - `crates/oulipoly-state/src/db/resume_resolution.rs`
 - `crates/oulipoly-state/src/db/resume_types.rs`
@@ -205,7 +206,9 @@ table tests, repositories contract.
 - `crates/oulipoly-state/tests/age371_record_timestamps.rs`
 - `crates/oulipoly-state/tests/sidecar_cutover_refusal.rs`
 - `crates/oulipoly-state/src/mailbox/broker_authority.rs`
-  (root-only path, WAL copy, v29 activation, restart, and direct-writer refusal fixtures)
+  (root-only path, WAL copy, v29 activation, restart, direct-writer refusal, and bound StateDb repair fixtures)
+- `crates/oulipoly-state/src/db/ownership_authority.rs`
+  (bounded v30 State admission suffix, exact continuity cursor, revision conflict, late listener page, and pending source readback)
 - `crates/oulipoly-state/src/retention.rs`
   (policy boundary, fail-closed record/generation facts, cursor and observation contracts)
 - `crates/oulipoly-state/src/db/retention.rs`

@@ -140,6 +140,9 @@ pub enum StateWriteAction {
     Accept {
         attempt_id: String,
     },
+    Repair {
+        expected_ordinal: i64,
+    },
     Release,
 }
 
@@ -213,6 +216,16 @@ pub fn prepare_owner_drop_reply_at(path: &Path, spec: &StateWriteSpec) -> io::Re
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]
+pub fn repair_bounded_drop_reply_at(path: &Path, spec: &StateWriteSpec) -> io::Result<()> {
+    if spec.protocol != "broker-repair-write-v30"
+        || !matches!(spec.action, StateWriteAction::Repair { .. })
+    {
+        return Err(io::Error::other("invalid lost-reply bounded repair"));
+    }
+    state_write_drop_reply_at(path, spec)
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
 fn state_write_drop_reply_at(path: &Path, spec: &StateWriteSpec) -> io::Result<()> {
     let body = serde_json::to_vec(spec)?;
     let mut stream = checked_connection(path)?;
@@ -262,6 +275,28 @@ pub fn read_state_at(
     spec: &StateReadSpec,
 ) -> io::Result<oulipoly_state::mailbox::BrokerContinuationReadback> {
     send_state_request_at(path, b'R', spec)
+}
+
+pub fn read_bounded_repair_at(
+    path: &Path,
+    spec: &StateReadSpec,
+) -> io::Result<oulipoly_state::mailbox::BrokerRepairReadback> {
+    if spec.protocol != "broker-repair-read-v30" || spec.attempt_id.is_some() {
+        return Err(io::Error::other("invalid bounded repair read"));
+    }
+    serde_json::from_slice(&send_state_frame_at(path, b'R', spec)?).map_err(io::Error::other)
+}
+
+pub fn write_bounded_repair_at(
+    path: &Path,
+    spec: &StateWriteSpec,
+) -> io::Result<oulipoly_state::mailbox::BrokerRepairReadback> {
+    if spec.protocol != "broker-repair-write-v30"
+        || !matches!(spec.action, StateWriteAction::Repair { .. })
+    {
+        return Err(io::Error::other("invalid bounded repair write"));
+    }
+    serde_json::from_slice(&send_state_frame_at(path, b'W', spec)?).map_err(io::Error::other)
 }
 
 fn send_state_request_at<T: serde::Serialize>(

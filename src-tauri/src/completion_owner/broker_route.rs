@@ -5,8 +5,8 @@ use oulipoly_kernel_broker::protocol::{
     self, StateReadSpec, StateRoute, StateWriteAction, StateWriteSpec,
 };
 use oulipoly_state::mailbox::{
-    BrokerContinuationReadback, BrokerReleaseEvidence, CompletionDomainOwner, ContinuationAttempt,
-    PreparedBrokerOwner,
+    BrokerContinuationReadback, BrokerReleaseEvidence, BrokerRepairReadback, CompletionDomainOwner,
+    ContinuationAttempt, PreparedBrokerOwner,
 };
 use std::path::{Path, PathBuf};
 
@@ -20,6 +20,108 @@ pub(crate) struct V30OwnerRoute {
 }
 
 impl V30OwnerRoute {
+    pub(crate) fn repair_page(
+        &self,
+        owner: &CompletionDomainOwner,
+    ) -> Result<BrokerRepairReadback, String> {
+        self.read_running(owner, None)?;
+        let read = || {
+            protocol::read_bounded_repair_at(
+                &self.socket,
+                &self.read_spec("broker-repair-read-v30", None),
+            )
+            .map_err(|error| error.to_string())
+        };
+        let before = read()?;
+        self.check_repair_readback(&before)?;
+        #[cfg(feature = "age319-private-broker-fixture")]
+        if std::env::var_os("AGE319_PRIVATE_REPAIR_CHALLENGE_V1").is_some() {
+            for (field, value) in [
+                ("root", uuid::Uuid::new_v4().to_string()),
+                ("source", uuid::Uuid::new_v4().to_string()),
+                ("owner", uuid::Uuid::new_v4().to_string()),
+            ] {
+                let mut wrong = self.read_spec("broker-repair-read-v30", None);
+                match field {
+                    "root" => wrong.root_id = value,
+                    "source" => wrong.source_generation = value,
+                    _ => wrong.owner_generation = value,
+                }
+                if protocol::read_bounded_repair_at(&self.socket, &wrong).is_ok() {
+                    return Err(
+                        "private wrong-root/stale-source/sibling-owner repair read accepted".into(),
+                    );
+                }
+            }
+            let wrong_revision = self.write_spec(
+                "broker-repair-write-v30",
+                StateWriteAction::Repair {
+                    expected_ordinal: before.authority_ordinal + 1,
+                },
+            );
+            if protocol::write_bounded_repair_at(&self.socket, &wrong_revision).is_ok() {
+                return Err("private stale repair revision accepted".into());
+            }
+        }
+        if !before.has_more {
+            return Ok(before);
+        }
+        let spec = self.write_spec(
+            "broker-repair-write-v30",
+            StateWriteAction::Repair {
+                expected_ordinal: before.authority_ordinal,
+            },
+        );
+        #[cfg(feature = "age319-private-broker-fixture")]
+        let written = if std::env::var_os("AGE319_PRIVATE_REPAIR_REPLY_LOSS_V1").is_some() {
+            protocol::repair_bounded_drop_reply_at(&self.socket, &spec)
+                .map(|()| Err(std::io::Error::other("private repair reply lost")))
+                .unwrap_or_else(Err)
+        } else {
+            protocol::write_bounded_repair_at(&self.socket, &spec)
+        };
+        #[cfg(not(feature = "age319-private-broker-fixture"))]
+        let written = protocol::write_bounded_repair_at(&self.socket, &spec);
+        // A lost reply is reconciled by a fresh exact broker cursor read. A
+        // stagnant cursor while a suffix existed is uncertainty, not success.
+        let after = read().map_err(|error| {
+            format!(
+                "{}; repair readback: {error}",
+                written
+                    .as_ref()
+                    .err()
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "repair reply received".into())
+            )
+        })?;
+        self.check_repair_readback(&after)?;
+        if after.authority_ordinal <= before.authority_ordinal
+            || after.authority_ordinal > before.authority_ordinal + 64
+            || written.as_ref().is_ok_and(|written| written != &after)
+        {
+            return Err("broker bounded repair cursor/readback conflict".into());
+        }
+        #[cfg(feature = "age319-private-broker-fixture")]
+        if std::env::var_os("AGE319_PRIVATE_REPAIR_CHALLENGE_V1").is_some()
+            && protocol::write_bounded_repair_at(&self.socket, &spec).is_ok()
+        {
+            return Err("private duplicate repair write accepted".into());
+        }
+        Ok(after)
+    }
+
+    fn check_repair_readback(&self, exact: &BrokerRepairReadback) -> Result<(), String> {
+        if exact.source_generation != self.source_generation
+            || exact.root_id != self.root_id
+            || exact.owner_generation != self.owner_generation
+            || exact.authority_ordinal < 0
+            || exact.pending_registration_ids.len() > 16
+        {
+            return Err("broker bounded repair readback owner/source conflict".into());
+        }
+        Ok(())
+    }
+
     /// The guardian derives the generation from Y after its exact root bind.
     /// I must agree with Y; neither a copied sidecar nor a caller path supplies
     /// a source generation.

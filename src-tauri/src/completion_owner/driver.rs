@@ -1,8 +1,8 @@
 //! The legacy driver schedules committed State obligations even when no sidecar
 //! source row exists. It proposes immutable reservations to the root supervisor;
 //! it does not fork, reap, cancel, integrate terminal results, or succeed the
-//! root. The selected v30 route currently refuses before scheduling because
-//! bounded repair and wake still require broker-owned operations.
+//! root. The selected v30 route repairs through the retained broker source,
+//! then refuses before source recovery or wake without their grants.
 use oulipoly_kernel_broker::protocol::{self, StateRoute};
 use oulipoly_state::StateDb;
 use oulipoly_state::mailbox::{CompletionDomainOwner, ContinuationAttempt, MailboxDb};
@@ -94,6 +94,10 @@ fn run_with_root(
                         "v30 driver bounded State repair and wake route is not available".into(),
                     );
                 }
+                // Project while the guardian/driver incarnation is still
+                // pinned. The guardian keeps this channel open until the
+                // joined child has reported its terminal receipt.
+                let repair_result = run_v30_repair_boundary(&route, owner);
                 // The broker's child attestation reopens this exact driver.
                 // Stay pinned until the original guardian reports the joined
                 // child's terminal receipt; EOF is a refusal, not succession.
@@ -106,7 +110,7 @@ fn run_with_root(
                 if completed != [b'D'] {
                     return Err("v30 driver completion gate changed".into());
                 }
-                Err("v30 driver bounded State repair and wake route is not available".into())
+                repair_result
             }
         },
         None => run_owned(path, owner),
@@ -118,6 +122,25 @@ fn run_with_root(
     #[cfg(test)]
     super::root_supervisor::clear_driver_channel();
     result
+}
+
+fn run_v30_repair_boundary(
+    route: &super::broker_route::V30OwnerRoute,
+    owner: &CompletionDomainOwner,
+) -> Result<(), String> {
+    // Each broker call projects at most 64 admitted State rows. Cap a driver
+    // turn too; a large pending suffix is durable work for succession.
+    for _ in 0..8 {
+        let page = route.repair_page(owner)?;
+        if page.has_more {
+            continue;
+        }
+        if !page.pending_registration_ids.is_empty() {
+            return Err("v30 source recovery requires broker source grant".into());
+        }
+        return Err("v30 wake selection requires broker recipient grant".into());
+    }
+    Err("v30 bounded State repair page limit reached".into())
 }
 
 fn run_owned(path: &Path, owner: &CompletionDomainOwner) -> Result<(), String> {
