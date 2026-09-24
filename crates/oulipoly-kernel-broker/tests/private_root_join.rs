@@ -245,6 +245,52 @@ fn inner() {
         fs::read_link(format!("/proc/{init_pid}/ns/pid")).unwrap(),
         fs::read_link("/proc/self/ns/pid").unwrap()
     );
+    if mode == "held_death" {
+        // J has consumed its one use and fsynced the exact child, but the
+        // broker still owns the pre-exec gate. Losing the broker must deliver
+        // EOF, not an executable release or a second child.
+        stop(&mut broker);
+        eventually(|| entry.try_wait().unwrap().is_some());
+        assert!(!entry.wait().unwrap().success());
+        assert_eq!(fs::metadata(&out).unwrap().len(), 0);
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(records[0].as_ref().unwrap().path()).unwrap())
+                .unwrap();
+        assert_eq!(persisted["join_consumed"], true);
+        assert_eq!(persisted["joined_child"]["host_pid"], child_pid);
+        let restart_log = temp.path().join("held-restart.log");
+        let mut restarted = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(File::create(&restart_log).unwrap()))
+            .spawn()
+            .unwrap();
+        eventually(|| {
+            protocol::request_at(&socket, Operation::Classify).is_ok()
+                || restarted.try_wait().unwrap().is_some()
+        });
+        assert!(
+            restarted.try_wait().unwrap().is_none(),
+            "held restart: {}",
+            fs::read_to_string(&restart_log).unwrap()
+        );
+        assert!(
+            protocol::request_at(&socket, Operation::ReserveEntry)
+                .unwrap()
+                .starts_with("error ")
+        );
+        assert_eq!(
+            fs::read_dir(broker_state.join("entries")).unwrap().count(),
+            1
+        );
+        stop(&mut restarted);
+        unsafe {
+            libc::kill(init_pid, libc::SIGKILL);
+        }
+        return;
+    }
     fs::write(gate.join("release"), b"yes").unwrap();
     eventually(|| entry.try_wait().unwrap().is_some());
     let exit = entry.wait().unwrap();
@@ -402,7 +448,13 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
     if std::env::var_os("OULIPOLY_AGE319_RUNNER_IMAGE").is_none() {
         return;
     }
-    for mode in ["help", "diagnostics", "join_only", "broker_state"] {
+    for mode in [
+        "help",
+        "diagnostics",
+        "join_only",
+        "held_death",
+        "broker_state",
+    ] {
         let output = Command::new("unshare")
             .args(["-Urpfm", "--mount-proc"])
             .arg(std::env::current_exe().unwrap())

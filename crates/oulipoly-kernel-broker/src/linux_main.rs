@@ -586,6 +586,14 @@ fn write_broker_state(
             "broker State write version/generation conflict",
         ));
     }
+    // The v30 prepared/held protocol has no committed release or child
+    // post-gate attestation yet. Its old Publish action would commit a v18
+    // running row before either exists, so keep this wire action closed.
+    if matches!(&spec.action, StateWriteAction::Publish { .. }) {
+        return Err(io::Error::other(
+            "v30 running-owner publication requires held-J release protocol",
+        ));
+    }
     let read_spec = |attempt_id: Option<String>| StateReadSpec {
         protocol: "broker-state-read-v1".into(),
         source_generation: spec.source_generation.clone(),

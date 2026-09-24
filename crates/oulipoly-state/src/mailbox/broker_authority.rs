@@ -50,7 +50,213 @@ pub struct BrokerContinuationReadback {
     pub broker_owned: bool,
 }
 
+/// A process incarnation observed by the host broker. Namespace identity is
+/// retained in addition to PID/starttime so a reused PID is not authority.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct PreparedProcessStamp {
+    pub host_pid: i32,
+    pub boot_id: String,
+    pub starttime_ticks: u64,
+    pub pidns_dev: u64,
+    pub pidns_ino: u64,
+}
+
+impl PreparedProcessStamp {
+    fn valid(&self) -> bool {
+        self.host_pid > 0
+            && uuid::Uuid::parse_str(&self.boot_id).is_ok()
+            && self.starttime_ticks > 0
+            && self.pidns_dev > 0
+            && self.pidns_ino > 0
+    }
+}
+
+/// Inert v30 owner evidence. It has no row in the v18 running-owner table and
+/// grants no election, reservation, acceptance, source, or child execution.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct PreparedBrokerOwner {
+    pub source_generation: String,
+    pub root_id: String,
+    pub owner_uid: u32,
+    pub domain_id: String,
+    pub supervisor_authority_id: String,
+    pub owner_generation: String,
+    pub endpoint: String,
+    pub entry: PreparedProcessStamp,
+    pub guardian: PreparedProcessStamp,
+    pub driver: PreparedProcessStamp,
+    pub root_init: PreparedProcessStamp,
+    pub joined_child: PreparedProcessStamp,
+}
+
+impl PreparedBrokerOwner {
+    fn valid(&self) -> bool {
+        let canonical = |value: &str| {
+            uuid::Uuid::parse_str(value)
+                .map(|id| id.to_string() == value)
+                .unwrap_or(false)
+        };
+        [
+            &self.source_generation,
+            &self.root_id,
+            &self.domain_id,
+            &self.supervisor_authority_id,
+            &self.owner_generation,
+        ]
+        .into_iter()
+        .all(|id| canonical(id))
+            && !self.endpoint.is_empty()
+            && self.endpoint.len() <= 1024
+            && !self.endpoint.contains('\0')
+            && [
+                &self.entry,
+                &self.guardian,
+                &self.driver,
+                &self.root_init,
+                &self.joined_child,
+            ]
+            .into_iter()
+            .all(PreparedProcessStamp::valid)
+            && self.entry.boot_id == self.guardian.boot_id
+            && self.entry.boot_id == self.driver.boot_id
+            && self.entry.boot_id == self.root_init.boot_id
+            && self.entry.boot_id == self.joined_child.boot_id
+            && self.entry.pidns_dev == self.guardian.pidns_dev
+            && self.entry.pidns_ino == self.guardian.pidns_ino
+            && self.entry.pidns_dev == self.driver.pidns_dev
+            && self.entry.pidns_ino == self.driver.pidns_ino
+            && self.root_init.pidns_dev == self.joined_child.pidns_dev
+            && self.root_init.pidns_ino == self.joined_child.pidns_ino
+            && (self.entry.pidns_dev, self.entry.pidns_ino)
+                != (self.root_init.pidns_dev, self.root_init.pidns_ino)
+            && self.entry.host_pid != self.guardian.host_pid
+            && self.guardian.host_pid != self.driver.host_pid
+            && self.root_init.host_pid != self.joined_child.host_pid
+    }
+}
+
 impl BrokerSidecar {
+    /// Persist only broker-observed preparation on the retained root-owned
+    /// connection. A duplicate or copied v29 running generation is refused.
+    /// The caller still must prove live pinned actors before invoking this;
+    /// State never treats this record as a running owner.
+    pub fn prepare_exact_owner(
+        &mut self,
+        prepared: &PreparedBrokerOwner,
+    ) -> Result<PreparedBrokerOwner, String> {
+        if !prepared.valid() || prepared.source_generation != self.source_generation {
+            return Err("invalid broker prepared owner binding".into());
+        }
+        #[cfg(unix)]
+        check_storage(&self.mailbox.path, self.storage_owner, &self.storage_anchor)?;
+        broker_main_file_must_be_named(&self.mailbox.conn)?;
+        let tx = self
+            .mailbox
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let old: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM completion_continuation_owner WHERE generation=?1)",
+                [&prepared.owner_generation],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if old {
+            return Err("prepared generation already belongs to a running owner".into());
+        }
+        let encode =
+            |stamp: &PreparedProcessStamp| serde_json::to_string(stamp).map_err(|e| e.to_string());
+        tx.execute(
+            "INSERT INTO broker_prepared_owner(owner_generation,source_generation,root_id,
+             owner_uid,domain_id,supervisor_authority_id,endpoint,entry_identity,guardian_identity,
+             driver_identity,root_init_identity,joined_child_identity)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            params![
+                prepared.owner_generation,
+                prepared.source_generation,
+                prepared.root_id,
+                i64::from(prepared.owner_uid),
+                prepared.domain_id,
+                prepared.supervisor_authority_id,
+                prepared.endpoint,
+                encode(&prepared.entry)?,
+                encode(&prepared.guardian)?,
+                encode(&prepared.driver)?,
+                encode(&prepared.root_init)?,
+                encode(&prepared.joined_child)?,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        self.read_exact_prepared_owner(
+            &prepared.source_generation,
+            &prepared.root_id,
+            &prepared.owner_generation,
+        )
+    }
+
+    /// Exact readback also serves lost-reply reconciliation. It does not
+    /// report current liveness or authorize release after broker restart.
+    pub fn read_exact_prepared_owner(
+        &self,
+        source_generation: &str,
+        root_id: &str,
+        owner_generation: &str,
+    ) -> Result<PreparedBrokerOwner, String> {
+        if source_generation != self.source_generation {
+            return Err("broker prepared source generation changed".into());
+        }
+        #[cfg(unix)]
+        check_storage(&self.mailbox.path, self.storage_owner, &self.storage_anchor)?;
+        broker_main_file_must_be_named(&self.mailbox.conn)?;
+        let row = self
+            .mailbox
+            .conn
+            .query_row(
+                "SELECT owner_uid,domain_id,supervisor_authority_id,endpoint,entry_identity,
+                 guardian_identity,driver_identity,root_init_identity,joined_child_identity
+                 FROM broker_prepared_owner WHERE source_generation=?1 AND root_id=?2
+                 AND owner_generation=?3",
+                params![source_generation, root_id, owner_generation],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .ok_or("broker prepared owner absent")?;
+        let decode = |value: &str| serde_json::from_str(value).map_err(|e| e.to_string());
+        let prepared = PreparedBrokerOwner {
+            source_generation: source_generation.into(),
+            root_id: root_id.into(),
+            owner_uid: u32::try_from(row.0).map_err(|_| "broker prepared UID invalid")?,
+            domain_id: row.1,
+            supervisor_authority_id: row.2,
+            owner_generation: owner_generation.into(),
+            endpoint: row.3,
+            entry: decode(&row.4)?,
+            guardian: decode(&row.5)?,
+            driver: decode(&row.6)?,
+            root_init: decode(&row.7)?,
+            joined_child: decode(&row.8)?,
+        };
+        if !prepared.valid() {
+            return Err("broker prepared owner row invalid".into());
+        }
+        broker_main_file_must_be_named(&self.mailbox.conn)?;
+        Ok(prepared)
+    }
     #[cfg(unix)]
     pub fn open_existing(path: &Path, broker_state_root: &Path) -> Result<Self, String> {
         require_host_root()?;
@@ -866,6 +1072,15 @@ fn activate_with_owner(path: &Path, owner: u32, anchor: &Path) -> Result<String,
         .map_err(|error| format!("Failed to create broker authority: {error}"))?;
     tx.execute_batch(schema::BROKER_OWNER_SCHEMA)
         .map_err(|error| format!("Failed to create broker owner provenance: {error}"))?;
+    for definition in [
+        schema::BROKER_PREPARED_OWNER_SCHEMA,
+        schema::BROKER_PREPARED_OWNER_IMMUTABLE,
+        schema::BROKER_PREPARED_OWNER_RETAIN,
+        schema::BROKER_PREPARED_OWNER_NO_RUNNING,
+    ] {
+        tx.execute_batch(definition)
+            .map_err(|error| format!("Failed to create broker prepared owner: {error}"))?;
+    }
     tx.execute(
         "INSERT INTO broker_sidecar_authority(singleton,source_generation,activated_at)
          VALUES(1,?1,?2)",
@@ -978,6 +1193,153 @@ mod tests {
     use crate::completion_continuation::{PROTOCOL, SourceProcessIdentity};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_owner_is_exact_durable_and_never_running_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("sidecar");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join("pid-identity.db");
+        let mut db = MailboxDb::open(&path).unwrap();
+        let domain = db.completion_continuation_domain().unwrap().unwrap();
+        let live = crate::pid_identity::read_current_process_identity().unwrap();
+        let old = super::super::CompletionDomainOwner {
+            protocol: PROTOCOL.into(),
+            domain_id: domain.clone(),
+            supervisor_authority_id: uuid::Uuid::new_v4().to_string(),
+            owner_generation: uuid::Uuid::new_v4().to_string(),
+            guardian_identity: SourceProcessIdentity {
+                pid: live.os_pid,
+                boot_id: live.os_boot_id.clone(),
+                starttime_ticks: live.os_pid_starttime_ticks,
+            },
+            driver_identity: SourceProcessIdentity {
+                pid: live.os_pid,
+                boot_id: live.os_boot_id,
+                starttime_ticks: live.os_pid_starttime_ticks,
+            },
+            endpoint: "/old/copied-owner".into(),
+        };
+        db.publish_completion_owner_with_kernel_root(&old, Some(&uuid::Uuid::new_v4().to_string()))
+            .unwrap();
+        drop(db);
+        for artifact in [path.clone(), mailbox_authority_path(&path)] {
+            fs::set_permissions(artifact, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let uid = unsafe { libc::geteuid() };
+        let source_generation = activate_with_owner(&path, uid, root.path()).unwrap();
+        let mut broker = open_with_owner(&path, uid, root.path()).unwrap();
+        let boot_id = uuid::Uuid::new_v4().to_string();
+        let stamp = |host_pid, pidns_ino| PreparedProcessStamp {
+            host_pid,
+            boot_id: boot_id.clone(),
+            starttime_ticks: host_pid as u64 + 100,
+            pidns_dev: 1,
+            pidns_ino,
+        };
+        let prepared = PreparedBrokerOwner {
+            source_generation: source_generation.clone(),
+            root_id: uuid::Uuid::new_v4().to_string(),
+            owner_uid: uid,
+            domain_id: domain,
+            supervisor_authority_id: uuid::Uuid::new_v4().to_string(),
+            owner_generation: uuid::Uuid::new_v4().to_string(),
+            endpoint: "/prepared/owner".into(),
+            entry: stamp(101, 1),
+            guardian: stamp(102, 1),
+            driver: stamp(103, 1),
+            root_init: stamp(104, 2),
+            joined_child: stamp(105, 2),
+        };
+        let mut copied = prepared.clone();
+        copied.owner_generation = old.owner_generation.clone();
+        assert!(broker.prepare_exact_owner(&copied).is_err());
+        let mut stale = prepared.clone();
+        stale.source_generation = uuid::Uuid::new_v4().to_string();
+        assert!(broker.prepare_exact_owner(&stale).is_err());
+        let mut sibling = prepared.clone();
+        sibling.joined_child.pidns_ino = sibling.entry.pidns_ino;
+        assert!(broker.prepare_exact_owner(&sibling).is_err());
+        let mut reused_pid = prepared.clone();
+        reused_pid.driver.host_pid = reused_pid.guardian.host_pid;
+        assert!(broker.prepare_exact_owner(&reused_pid).is_err());
+        assert_eq!(broker.prepare_exact_owner(&prepared).unwrap(), prepared);
+        assert!(broker.prepare_exact_owner(&prepared).is_err());
+        let mut same_root = prepared.clone();
+        same_root.owner_generation = uuid::Uuid::new_v4().to_string();
+        assert!(broker.prepare_exact_owner(&same_root).is_err());
+        let mut premature_running = old.clone();
+        premature_running.owner_generation = prepared.owner_generation.clone();
+        premature_running.supervisor_authority_id = prepared.supervisor_authority_id.clone();
+        assert!(
+            broker
+                .mailbox_mut()
+                .publish_completion_owner_with_kernel_root(
+                    &premature_running,
+                    Some(&prepared.root_id)
+                )
+                .is_err()
+        );
+        assert!(
+            broker
+                .read_exact_prepared_owner("stale", &prepared.root_id, &prepared.owner_generation)
+                .is_err()
+        );
+        assert!(
+            broker
+                .read_exact_prepared_owner(
+                    &source_generation,
+                    &uuid::Uuid::new_v4().to_string(),
+                    &prepared.owner_generation,
+                )
+                .is_err()
+        );
+        assert!(
+            broker
+                .read_exact_continuation(
+                    &source_generation,
+                    &prepared.root_id,
+                    &prepared.domain_id,
+                    &prepared.supervisor_authority_id,
+                    &prepared.owner_generation,
+                    None,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            broker
+                .mailbox
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM completion_continuation_owner WHERE generation=?1",
+                    [&prepared.owner_generation],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+        );
+        drop(broker);
+        let broker = open_with_owner(&path, uid, root.path()).unwrap();
+        assert_eq!(
+            broker
+                .read_exact_prepared_owner(
+                    &source_generation,
+                    &prepared.root_id,
+                    &prepared.owner_generation,
+                )
+                .unwrap(),
+            prepared,
+        );
+        broker
+            .mailbox
+            .conn
+            .execute_batch("DROP TRIGGER broker_prepared_owner_no_running")
+            .unwrap();
+        drop(broker);
+        assert!(open_with_owner(&path, uid, root.path()).is_err());
+    }
 
     #[cfg(unix)]
     #[test]

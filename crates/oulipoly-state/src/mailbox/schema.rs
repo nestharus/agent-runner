@@ -720,6 +720,38 @@ pub(super) fn validate_broker_owned(conn: &Connection) -> Result<String, String>
     if owner_definition != BROKER_OWNER_SCHEMA {
         return Err("broker owner schema changed".into());
     }
+    let prepared_definition: String = tx
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='broker_prepared_owner'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("broker prepared owner schema missing: {error}"))?;
+    if prepared_definition != BROKER_PREPARED_OWNER_SCHEMA {
+        return Err("broker prepared owner schema changed".into());
+    }
+    for (name, expected) in [
+        (
+            "broker_prepared_owner_immutable",
+            BROKER_PREPARED_OWNER_IMMUTABLE,
+        ),
+        ("broker_prepared_owner_retain", BROKER_PREPARED_OWNER_RETAIN),
+        (
+            "broker_prepared_owner_no_running",
+            BROKER_PREPARED_OWNER_NO_RUNNING,
+        ),
+    ] {
+        let definition: String = tx
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+                [name],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("broker prepared owner trigger missing: {error}"))?;
+        if definition != expected {
+            return Err("broker prepared owner trigger changed".into());
+        }
+    }
     let generation: String = tx
         .query_row(
             "SELECT source_generation FROM broker_sidecar_authority WHERE singleton=1",
@@ -747,6 +779,42 @@ pub(super) const BROKER_OWNER_SCHEMA: &str = "CREATE TABLE broker_completion_own
     guardian_identity TEXT NOT NULL,
     driver_identity TEXT NOT NULL
 )";
+
+// v30 is not released. Prepared rows deliberately have no FK into the v18
+// running-owner table: an owner waiting at J must never enter its election,
+// reservation, acceptance, or source predicates.
+pub(super) const BROKER_PREPARED_OWNER_SCHEMA: &str = "CREATE TABLE broker_prepared_owner (
+    owner_generation TEXT PRIMARY KEY,
+    source_generation TEXT NOT NULL,
+    root_id TEXT NOT NULL UNIQUE,
+    owner_uid INTEGER NOT NULL CHECK(owner_uid>=0 AND owner_uid<=4294967295),
+    domain_id TEXT NOT NULL,
+    supervisor_authority_id TEXT NOT NULL,
+    endpoint TEXT NOT NULL,
+    entry_identity TEXT NOT NULL UNIQUE,
+    guardian_identity TEXT NOT NULL UNIQUE,
+    driver_identity TEXT NOT NULL UNIQUE,
+    root_init_identity TEXT NOT NULL UNIQUE,
+    joined_child_identity TEXT NOT NULL UNIQUE
+)";
+
+pub(super) const BROKER_PREPARED_OWNER_IMMUTABLE: &str =
+    "CREATE TRIGGER broker_prepared_owner_immutable
+BEFORE UPDATE ON broker_prepared_owner
+BEGIN SELECT RAISE(ABORT,'prepared owner is immutable'); END";
+
+pub(super) const BROKER_PREPARED_OWNER_RETAIN: &str = "CREATE TRIGGER broker_prepared_owner_retain
+BEFORE DELETE ON broker_prepared_owner
+BEGIN SELECT RAISE(ABORT,'prepared owner must be retained'); END";
+
+// A later reviewed release transition must replace this inert boundary with
+// an atomic broker-proven running/release commit. No current caller may turn a
+// prepared record into the old running owner by direct publication.
+pub(super) const BROKER_PREPARED_OWNER_NO_RUNNING: &str =
+    "CREATE TRIGGER broker_prepared_owner_no_running
+BEFORE INSERT ON completion_continuation_owner
+WHEN EXISTS (SELECT 1 FROM broker_prepared_owner WHERE owner_generation=NEW.generation)
+BEGIN SELECT RAISE(ABORT,'prepared owner cannot be published as running'); END";
 
 fn create_fresh_schema(conn: &Connection) -> Result<(), String> {
     apply_steps(conn, SCHEMA_STEPS)

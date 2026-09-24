@@ -14,6 +14,37 @@ use std::process::{Command, Stdio};
 
 const GATE_ENV: &str = "OULIPOLY_KERNEL_CHILD_JOIN_FD_V1";
 
+/// The broker owns this gate after J has durably consumed the entry and bound
+/// the exact child. Dropping it sends EOF to the child pre-exec read, which
+/// fails closed. No operation currently exposes this held state on v30.
+pub(super) struct HeldRootJoin {
+    gate: UnixStream,
+    root_id: String,
+    grant: String,
+    entry: PinnedProcess,
+    guardian: PinnedProcess,
+    root_init: PinnedProcess,
+    child: PinnedProcess,
+}
+
+impl HeldRootJoin {
+    fn release_legacy(mut self) -> io::Result<String> {
+        self.entry.verify()?;
+        self.guardian.verify()?;
+        self.root_init.verify()?;
+        self.child.verify()?;
+        if !self.guardian.direct_child_of(&self.entry)?
+            || !self.child.direct_child_of(&self.root_init)?
+            || !self.child.in_namespace(self.root_init.namespace())?
+        {
+            return Err(io::Error::other("held join actor incarnation changed"));
+        }
+        self.gate.write_all(b"R")?;
+        self.gate.write_all(self.grant.as_bytes())?;
+        Ok(format!("joined {} {}\n", self.root_id, self.child.host_pid))
+    }
+}
+
 struct InitContext {
     spec: JoinSpec,
     descriptors: [File; 5],
@@ -270,6 +301,20 @@ pub(super) fn launch(
     roots: &mut RootRegistry,
     entries: &mut EntryRegistry,
 ) -> io::Result<String> {
+    hold(spec, descriptors, peer, image, roots, entries)?.release_legacy()
+}
+
+/// Return only after the exact joined child has been fsynced while its
+/// pre-exec gate is still held by this broker. Future v30 admission must keep
+/// this handle in the serving broker and add committed release attestation.
+pub(super) fn hold(
+    spec: JoinSpec,
+    descriptors: [File; 5],
+    peer: &PeerIdentity,
+    image: &File,
+    roots: &mut RootRegistry,
+    entries: &mut EntryRegistry,
+) -> io::Result<HeldRootJoin> {
     validate(&spec, &descriptors)?;
     let mut receipt_peer = libc::ucred {
         pid: 0,
@@ -311,7 +356,7 @@ pub(super) fn launch(
         &peer.process,
     )?;
     let (mut broker_control, init_control) = UnixStream::pair()?;
-    let (mut broker_gate, init_gate) = UnixStream::pair()?;
+    let (broker_gate, init_gate) = UnixStream::pair()?;
     let one: libc::c_int = 1;
     if unsafe {
         libc::setsockopt(
@@ -403,10 +448,25 @@ pub(super) fn launch(
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
-    let grant = format!("{root_id} {domain} {supervisor} {guardian_pid}\n");
-    broker_gate.write_all(b"R")?;
-    broker_gate.write_all(grant.as_bytes())?;
-    Ok(format!("joined {root_id} {}\n", child.host_pid))
+    let guardian = PinnedProcess::open(guardian_pid)?;
+    if entries
+        .record(&root_id)
+        .and_then(|record| record.guardian.as_ref())
+        != Some(&oulipoly_kernel_broker::entry_registry::ProcessStamp::from(
+            &guardian,
+        ))
+    {
+        return Err(io::Error::other("held join guardian changed"));
+    }
+    Ok(HeldRootJoin {
+        gate: broker_gate,
+        grant: format!("{root_id} {domain} {supervisor} {guardian_pid}\n"),
+        root_id,
+        entry: PinnedProcess::open(peer.process.host_pid)?,
+        guardian,
+        root_init: init,
+        child,
+    })
 }
 
 #[cfg(test)]
