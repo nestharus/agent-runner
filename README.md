@@ -63,6 +63,11 @@ bunx tauri build
 cp src-tauri/target/release/oulipoly-agent-runner ~/.local/bin/
 ```
 
+The Linux `.deb` and raw binary use the legacy entry topology. A separate
+[paired Linux archive](packaging/linux/README.md) stages a broker, fixed Runner,
+service, and CLI/GUI links with a versioned image check; it is an inactive
+cutover prerequisite, not an installable v30 or one-supervisor deployment.
+
 ## Testing
 
 ```bash

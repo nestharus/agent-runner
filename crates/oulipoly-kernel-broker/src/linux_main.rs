@@ -9,6 +9,7 @@ use oulipoly_kernel_broker::entry_registry::{EntryRegistry, ProcessStamp};
 use oulipoly_kernel_broker::identity::{
     PeerIdentity, PinnedProcess, host_proc_file, host_proc_uid, install_detached_host_proc,
 };
+use oulipoly_kernel_broker::installed_pair::{self, InstalledPair};
 use oulipoly_kernel_broker::protocol::{
     AcceptedWorkSpec, JoinSpec, JoinedChildWitness, LaunchAcceptedWorkSpec, NativeKSpec,
     NativePrepareSpec, OwnerWitness, ProcessWitness, SourceControlUse, SourceScope,
@@ -85,7 +86,7 @@ fn require_cutover_entry_route(
     broker_owned_sidecar: bool,
     gate_closed: bool,
 ) -> io::Result<()> {
-    if matches!(operation, b'i' | b'X' | b'x') {
+    if matches!(operation, b'i' | b'v' | b'X' | b'x') {
         return Ok(());
     }
     if gate_closed {
@@ -1679,6 +1680,18 @@ fn serve() -> io::Result<()> {
         checked_root_path(Path::new("/run/oulipoly-kernel-broker"), true)?;
         checked_root_path(Path::new(&runner), false)?;
     }
+    let installed_pair = if fixture {
+        None
+    } else {
+        let pair = InstalledPair::load(Path::new(installed_pair::MANIFEST), true)?;
+        pair.verify_image_against(
+            Path::new(installed_pair::BROKER),
+            &pair.broker_sha256,
+            true,
+            &host_proc_file("self/exe")?,
+        )?;
+        Some(pair)
+    };
     // The singleton lock and durable latch are established before the socket
     // accepts any new request. Normal startup never closes or reopens it.
     let mut entry_gate = EntryGate::open(Path::new(&state))?;
@@ -1695,6 +1708,9 @@ fn serve() -> io::Result<()> {
         Err(error) => return Err(error),
     };
     let runner_image = File::open(&runner)?;
+    if let Some(pair) = &installed_pair {
+        pair.verify_file(Path::new(&runner), &pair.runner_sha256, true, &runner_image)?;
+    }
     let works_path = Path::new(&state).join("works");
     if !works_path.exists() {
         use std::os::unix::fs::DirBuilderExt;
@@ -1771,6 +1787,24 @@ fn serve() -> io::Result<()> {
                     "legacy-open"
                 };
                 Ok(format!("entry-gate-v1 {route}\n"))
+            } else if operation == b'v' {
+                let pair = installed_pair
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("installed pair unavailable"))?;
+                if !peer.process.same_executable_as(&runner_image)? {
+                    return Err(io::Error::other("installed pair Runner image mismatch"));
+                }
+                let route = if entry_gate.is_closed() {
+                    "draining"
+                } else if broker_sidecar.is_some() {
+                    "broker-v30-closed"
+                } else {
+                    "legacy-open"
+                };
+                Ok(format!(
+                    "installed-pair-v1 {} {} {route}\n",
+                    pair.version, pair.generation
+                ))
             } else if operation == b'X' || operation == b'x' {
                 if peer.uid != 0 || !peer.process.in_namespace(&host_namespace)? {
                     return Err(io::Error::other("host-root gate transition required"));

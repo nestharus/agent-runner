@@ -1,4 +1,5 @@
 //! Host-side pinned completion authority and broker-attested root child join.
+use oulipoly_kernel_broker::installed_pair::{self, InstalledPair};
 use oulipoly_kernel_broker::protocol::{self, EntryRoute, JoinSpec, Operation, StateRoute};
 use oulipoly_state::mailbox::MailboxDb;
 use std::fs::File;
@@ -34,6 +35,23 @@ pub(crate) fn verify_installed_entry_route() -> Result<(), String> {
     if !needs_installed_entry_gate(&image, std::env::var_os(REQUIRED_ENV).is_some()) {
         return Ok(());
     }
+    if is_fixed_installed_image(&image) {
+        let pair = InstalledPair::load(std::path::Path::new(installed_pair::MANIFEST), true)
+            .map_err(|error| format!("installed pair manifest unavailable: {error}"))?;
+        pair.verify_image(
+            std::path::Path::new(INSTALLED_RUNNER),
+            &pair.runner_sha256,
+            true,
+        )
+        .map_err(|error| format!("installed Runner image mismatch: {error}"))?;
+        let observation = protocol::observe_installed_pair_at(&broker_socket())
+            .map_err(|error| format!("installed pair broker unavailable: {error}"))?;
+        require_pair_route(&pair, &observation)?;
+        return require_paired_launch_mode(
+            std::env::var_os(REQUIRED_ENV).is_some(),
+            std::env::var_os(CHILD_FD_ENV).is_some(),
+        );
+    }
     let route = protocol::observe_entry_gate_at(&broker_socket())
         .map_err(|error| format!("installed broker entry gate unavailable: {error}"))?;
     #[cfg(feature = "age319-private-broker-fixture")]
@@ -44,9 +62,30 @@ pub(crate) fn verify_installed_entry_route() -> Result<(), String> {
 }
 
 fn needs_installed_entry_gate(image: &std::path::Path, explicit_kernel_entry: bool) -> bool {
-    explicit_kernel_entry
-        || image == std::path::Path::new(INSTALLED_RUNNER)
+    explicit_kernel_entry || is_fixed_installed_image(image)
+}
+
+fn is_fixed_installed_image(image: &std::path::Path) -> bool {
+    image == std::path::Path::new(INSTALLED_RUNNER)
         || image == std::path::Path::new(&format!("{INSTALLED_RUNNER} (deleted)"))
+}
+
+fn require_pair_route(
+    pair: &InstalledPair,
+    observed: &protocol::InstalledPairObservation,
+) -> Result<(), String> {
+    if pair.version != observed.version || pair.generation != observed.generation {
+        return Err("installed broker and Runner generation differ".into());
+    }
+    require_legacy_entry_route(observed.route)
+}
+
+fn require_paired_launch_mode(host_entry: bool, child_entry: bool) -> Result<(), String> {
+    if host_entry ^ child_entry {
+        Ok(())
+    } else {
+        Err("paired Runner requires one broker-owned entry path".into())
+    }
 }
 
 fn require_legacy_entry_route(route: EntryRoute) -> Result<(), String> {
@@ -951,6 +990,49 @@ mod tests {
         assert!(require_legacy_entry_route(EntryRoute::LegacyOpen).is_ok());
         assert!(require_legacy_entry_route(EntryRoute::Draining).is_err());
         assert!(require_legacy_entry_route(EntryRoute::BrokerV30Closed).is_err());
+    }
+
+    #[test]
+    fn two_paired_entries_require_same_broker_generation_before_dispatch() {
+        let pair = InstalledPair {
+            schema: 1,
+            version: env!("CARGO_PKG_VERSION").into(),
+            generation: uuid::Uuid::new_v4().to_string(),
+            runner_sha256: "a".repeat(64),
+            broker_sha256: "b".repeat(64),
+        };
+        let observation = protocol::InstalledPairObservation {
+            version: pair.version.clone(),
+            generation: pair.generation.clone(),
+            route: EntryRoute::LegacyOpen,
+        };
+        assert!(needs_installed_entry_gate(
+            std::path::Path::new(INSTALLED_RUNNER),
+            false
+        ));
+        assert!(require_pair_route(&pair, &observation).is_ok());
+        // The staged CLI and GUI links run the same image. Both refuse direct
+        // launch until the broker can give each an owned entry path.
+        assert!(require_paired_launch_mode(false, false).is_err());
+        assert!(require_paired_launch_mode(true, false).is_ok());
+        assert!(require_paired_launch_mode(false, true).is_ok());
+        assert!(require_paired_launch_mode(true, true).is_err());
+        // An ordinary Tauri .deb GUI path remains outside opt-in pairing.
+        assert!(!needs_installed_entry_gate(
+            std::path::Path::new("/usr/bin/oulipoly-agent-runner"),
+            false
+        ));
+        let mut old = observation;
+        old.version = "0.0.0".into();
+        assert!(require_pair_route(&pair, &old).is_err());
+        old.version = pair.version.clone();
+        old.generation = uuid::Uuid::new_v4().to_string();
+        assert!(require_pair_route(&pair, &old).is_err());
+        old.generation = pair.generation.clone();
+        old.route = EntryRoute::Draining;
+        assert!(require_pair_route(&pair, &old).is_err());
+        old.route = EntryRoute::BrokerV30Closed;
+        assert!(require_pair_route(&pair, &old).is_err());
     }
 
     #[test]

@@ -230,6 +230,7 @@ fn send_state_frame_at<T: serde::Serialize>(
 pub enum Operation {
     Classify,
     ObserveEntryGate,
+    ObserveInstalledPair,
     CloseEntryGate,
     AbortEntryGate,
     ReserveEntry,
@@ -919,6 +920,60 @@ pub enum EntryRoute {
     BrokerV30Closed,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct InstalledPairObservation {
+    pub version: String,
+    pub generation: String,
+    pub route: EntryRoute,
+}
+
+pub fn observe_installed_pair_at(path: &Path) -> io::Result<InstalledPairObservation> {
+    let response = request_at(path, Operation::ObserveInstalledPair)?;
+    parse_installed_pair_response(&response)
+}
+
+fn parse_installed_pair_response(response: &str) -> io::Result<InstalledPairObservation> {
+    if !response.ends_with('\n') {
+        return Err(io::Error::other("invalid installed pair response"));
+    }
+    let fields: Vec<_> = response.trim_end_matches('\n').split(' ').collect();
+    if fields.len() != 4
+        || fields[0] != "installed-pair-v1"
+        || uuid::Uuid::parse_str(fields[2])
+            .ok()
+            .is_none_or(|id| id.to_string() != fields[2])
+    {
+        return Err(io::Error::other("invalid installed pair response"));
+    }
+    let route = match fields[3] {
+        "legacy-open" => EntryRoute::LegacyOpen,
+        "draining" => EntryRoute::Draining,
+        "broker-v30-closed" => EntryRoute::BrokerV30Closed,
+        _ => return Err(io::Error::other("invalid installed pair route")),
+    };
+    Ok(InstalledPairObservation {
+        version: fields[1].into(),
+        generation: fields[2].into(),
+        route,
+    })
+}
+
+#[cfg(test)]
+mod installed_pair_response_tests {
+    use super::*;
+
+    #[test]
+    fn old_missing_and_malformed_broker_responses_refuse() {
+        let absent = tempfile::tempdir().unwrap().path().join("missing.sock");
+        assert!(observe_installed_pair_at(&absent).is_err());
+        assert!(parse_installed_pair_response("entry-gate-v1 legacy-open\n").is_err());
+        assert!(
+            parse_installed_pair_response("installed-pair-v1 0.1.0 bad legacy-open\n").is_err()
+        );
+        assert!(parse_installed_pair_response("installed-pair-v1 0.1.0 bad legacy-open").is_err());
+    }
+}
+
 /// Reads only broker-owned service state. A retired user sidecar is never a
 /// source for this result; absence of a reachable broker is an error.
 pub fn observe_entry_gate_at(path: &Path) -> io::Result<EntryRoute> {
@@ -1048,7 +1103,10 @@ fn request_frame_at(path: &Path, operation: Operation, payload: Payload) -> io::
     let mut stream = checked_connection(path)?;
     if matches!(
         operation,
-        Operation::ObserveEntryGate | Operation::CloseEntryGate | Operation::AbortEntryGate
+        Operation::ObserveEntryGate
+            | Operation::ObserveInstalledPair
+            | Operation::CloseEntryGate
+            | Operation::AbortEntryGate
     ) {
         let timeout = Some(std::time::Duration::from_secs(5));
         stream.set_read_timeout(timeout)?;
@@ -1060,6 +1118,7 @@ fn request_frame_at(path: &Path, operation: Operation, payload: Payload) -> io::
     request[0] = match operation {
         Operation::Classify => b'C',
         Operation::ObserveEntryGate => b'i',
+        Operation::ObserveInstalledPair => b'v',
         Operation::CloseEntryGate => b'X',
         Operation::AbortEntryGate => b'x',
         Operation::ReserveEntry if matches!(payload, Payload::Prepare(..)) => b'P',

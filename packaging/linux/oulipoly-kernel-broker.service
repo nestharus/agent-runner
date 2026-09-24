@@ -1,6 +1,6 @@
-# Source artifact only. Requires administrator installation of a root-owned
-# broker and exact Runner image plus an oulipoly group. Do not enable before
-# Runner/Bash grant and placement integration is complete.
+# Paired source artifact only. Requires a root-owned manifest, exact Runner
+# and broker images, and an oulipoly group. The service owns only the broker;
+# do not enable before a complete CLI/GUI/helper custody cutover exists.
 [Unit]
 Description=Oulipoly host PID namespace broker
 After=local-fs.target
