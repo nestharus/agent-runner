@@ -13,6 +13,10 @@ use std::sync::OnceLock;
 // Non-serving library tests retain a plain /proc view.
 static HOST_PROC: OnceLock<File> = OnceLock::new();
 
+pub fn has_detached_host_proc() -> bool {
+    HOST_PROC.get().is_some()
+}
+
 pub fn install_detached_host_proc() -> io::Result<()> {
     if HOST_PROC.get().is_some() {
         return Err(io::Error::other("host proc observer already installed"));
@@ -209,7 +213,7 @@ impl PinnedProcess {
         let boot_id = boot_id()?;
         let (starttime_ticks, state) = proc_starttime(host_pid)?;
         if state == b'Z' || state == b'X' {
-            return Err(io::Error::other("dead peer"));
+            return Err(io::Error::new(io::ErrorKind::NotFound, "dead peer"));
         }
         let pidns = host_proc_file(&format!("{host_pid}/ns/pid"))?;
         let (pidns_dev, pidns_ino) = namespace_identity(&pidns)?;

@@ -13,6 +13,7 @@
 - `crates/oulipoly-kernel-broker/src/registry.rs`
 - `crates/oulipoly-kernel-broker/src/root_join.rs`
 - `crates/oulipoly-kernel-broker/src/work_registry.rs`
+- `crates/oulipoly-kernel-broker/src/writer_census.rs`
 - `crates/oulipoly-kernel-broker/tests/private_root_join.rs`
 - `crates/oulipoly-kernel-broker/tests/private_accepted_h_frame.rs`
 - `src-tauri/src/kernel_entry.rs`
@@ -61,6 +62,7 @@
 | Host root closes broker ingress with X, then broker restarts. | Durable draining marker refuses ordinary broker opcodes; challenged i reports draining from broker-owned state. |
 | A prerequisite fails before fixed sidecar publication, or fixed sidecar exists. | Explicit host-root x can resume legacy admission only before publication; publication makes abort refuse. |
 | A direct SQLite writer retains main/WAL/SHM handles after ingress closes. | Writer remains live, so the latch gives no `QuiescedCutoverProof` and cannot authorize migration. |
+| A pinned process retains main/WAL/SHM handles or an unlinked old WAL handle. | Broker-side census reports exact PID incarnation, executable inode and each handle as a blocker; a dead or changed PID does not count as the same writer. An empty scan is not a certificate. |
 | Host-connected socket inherited by a privileged child PID namespace process. | Ancestor PID claim fails in the kernel; a real child send fails the broker's per-request credential equality check. |
 
 ## Edge cases

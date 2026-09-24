@@ -136,6 +136,26 @@ explicit kernel entry mode query `i` before helper, worker, CLI, GUI or State
 effects. They refuse a missing broker, `draining`, and `broker-v30-closed`.
 
 This is a broker ingress and new-image prerequisite, not a quiescence proof.
+The Linux release workflow ships a Tauri `.deb` but does not package the
+broker service or binary. Its `/usr/bin` GUI path therefore cannot be switched
+to a mandatory broker query in this source slice without breaking currently
+supported installs. The user-local raw binary and historical installed images
+also remain outside the fixed-image path check. A future release must package
+the supervisor, broker, CLI and GUI entry gate as one coordinated versioned
+installation before retiring old images.
+
+`writer_census::observe_open_state_handles` is a bounded negative observation
+for a future installed coordinator. It requires the serving root broker's
+detached procfs and initial PID/user namespaces. It pins each visible process
+by pidfd, boot ID, starttime and PID namespace, then records executable inode
+and any open source main/WAL/SHM descriptor by inode or exact path, including
+deleted artifacts. It fails on uncertain live process reads or source pathname
+replacement. All observed handles, including those of an unowned old process,
+are blockers; the broker never kills them by name or UID. An empty observation
+cannot authorize a snapshot: a new process or descriptor can appear after the
+scan, and an mmap may outlive its FD. The scanner has no route to
+`QuiescedCutoverProof` and does not run a cutover.
+
 The current systemd unit uses `KillMode=process` and does not own every CLI,
 GUI, guardian, driver, wake, maintenance, mailbox, provider, receipt-helper or
 State cross-store writer. No installed inventory binds all those processes to

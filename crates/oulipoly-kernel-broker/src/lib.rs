@@ -11,6 +11,7 @@ pub mod native_receipt;
 pub mod protocol;
 pub mod registry;
 pub mod work_registry;
+pub mod writer_census;
 
 pub use identity::{Classification, PeerIdentity, PinnedProcess, classify_peer};
 pub use registry::{RootRecord, RootRegistry};
