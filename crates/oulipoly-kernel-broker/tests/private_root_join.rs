@@ -340,7 +340,7 @@ fn inner() {
                 assert!(
                     fs::read_to_string(&err)
                         .unwrap_or_default()
-                        .contains("v30 source recovery requires broker snapshot custody and one-use effect grant"),
+                        .contains("v30 source recovery requires exact registration/listener file custody, preserved recovery image/environment path semantics, and a one-use effect grant"),
                     "normal repair boundary: entry={} broker={}",
                     fs::read_to_string(&err).unwrap_or_default(),
                     fs::read_to_string(&broker_log).unwrap_or_default(),

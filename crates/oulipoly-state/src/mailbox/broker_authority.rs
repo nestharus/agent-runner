@@ -954,7 +954,9 @@ impl BrokerSidecar {
         attempt: &super::ContinuationAttempt,
     ) -> Result<BrokerContinuationReadback, String> {
         if attempt.operation == "source_recovery" {
-            return Err("broker source recovery requires custody-bound one-use grant".into());
+            return Err(
+                "broker source recovery requires exact registration/listener file custody and a one-use effect grant".into(),
+            );
         }
         let before = self.read_exact_continuation(
             &self.source_generation,
@@ -3107,7 +3109,7 @@ mod tests {
             broker
                 .reserve_exact_attempt(&new_owner, &root_id, &ungranted_source)
                 .unwrap_err()
-                .contains("custody-bound one-use grant")
+                .contains("exact registration/listener file custody and a one-use effect grant")
         );
         assert!(
             broker

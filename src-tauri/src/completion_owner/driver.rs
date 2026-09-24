@@ -138,11 +138,12 @@ fn run_v30_repair_boundary(
         let selected = route.source_selection(owner, &page)?;
         if selected.candidate.is_some() {
             // This metadata came from the retained broker connection. The
-            // snapshot and recovery image are still outside broker custody;
-            // neither a reservation nor an effect is authorized here.
+            // exact registration and listener have no source-file custody
+            // proof. Its immutable paths still name user-owned files, and a
+            // copied recovery image/environment can reopen those paths.
+            // Neither a reservation nor an effect is authorized here.
             return Err(
-                "v30 source recovery requires broker snapshot custody and one-use effect grant"
-                    .into(),
+                "v30 source recovery requires exact registration/listener file custody, preserved recovery image/environment path semantics, and a one-use effect grant".into(),
             );
         }
         return Err("v30 wake selection requires broker recipient grant".into());
