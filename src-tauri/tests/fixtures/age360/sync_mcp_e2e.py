@@ -84,6 +84,138 @@ def repair_barrier(root, driver, event, start):
     return None
 
 
+def bounded_repair_observation(root, driver, owner, source, start):
+    """Current driver reads only registered sources; accepted history is excluded.
+
+    This observes completion of its scoped selection, NOT a repair COMMIT.
+    The event association is inferred from exact retained source/scope state.
+    """
+    for line in (root / 'sql-audit.tsv').read_text()[start:].splitlines():
+        parts = line.split('\t', 6)
+        if len(parts) != 7 or parts[1] != str(driver):
+            continue
+        _, _, _, _, error, autocommit, sql = parts
+        if (error == '0' and autocommit == '1'
+                and 'SELECT binding FROM completion_continuation_source' in sql
+                and "AND phase='registered'" in sql
+                and "SELECT '" + owner['supervisor_authority_id'] + "'" in sql):
+            db = root / 'data/pid-identity.db'
+            retained = rows(db, 'SELECT * FROM completion_continuation_source WHERE registration_id=?', (source['registration_id'],))
+            assert len(retained) == 1 and retained[0]['phase'] == 'accepted'
+            assert retained[0]['supervisor_authority_id'] == owner['supervisor_authority_id']
+            assert retained[0]['event_id'] == source['event_id']
+            return dict(selection_profile=line, source=retained[0],
+                        interpretation='scoped driver selection completed after acceptance; exact accepted source excluded by registered-only predicate; event association is an inference, no repair commit observed')
+    return None
+
+
+def upgrade_owner(stage, root, env, models, founder, founded):
+    """Refusal is distinct from restoration. Never replace a still-live owner."""
+    import fcntl
+    db = root / 'data/pid-identity.db'
+    endpoint = founded['owner']['endpoint']
+    checks = []
+    before_invocations = rows(root / 'data/state.db', 'SELECT invocation_uuid FROM invocations ORDER BY invocation_uuid')
+    commands = [
+        ('independent-foreground', {}, ['-m', MODEL, '--models-dir', str(models), 'must refuse']),
+        ('inherited-foreground', {'OULIPOLY_COMPLETION_ENDPOINT': endpoint}, ['-m', MODEL, '--models-dir', str(models), 'must refuse']),
+        ('inherited-helper', {'OULIPOLY_COMPLETION_ENDPOINT': endpoint}, ['notify', 'agent-bash-register', '--handle', 'not-admitted', '--delivery-mode', 'sync', '--state-dir', str(root / 'not-admitted'), '--meta', str(root / 'not-admitted/meta'), '--log', str(root / 'not-admitted/log'), '--rc', str(root / 'not-admitted/rc')]),
+    ]
+    for name, extra, args in commands:
+        result = subprocess.run([stage / 'runner', *args], env=dict(env, **extra), cwd=root, capture_output=True, timeout=15)
+        check = dict(name=name, argv=args, rc=result.returncode, stdout=result.stdout.decode(), stderr=result.stderr.decode())
+        checks.append(check)
+        (root / 'upgrade-refusals.json').write_text(json.dumps(checks, indent=2))
+        assert result.returncode != 0 and b'incompatible_completion_owner' in result.stderr, check
+        assert founder.poll() is None, 'refusal disturbed active founding context'
+        assert owner_evidence(db, stage / 'prior-runner') == founded, 'refusal replaced owner'
+        assert not rows(db, 'SELECT * FROM completion_continuation_source'), 'refusal admitted work'
+        assert not rows(db, 'SELECT * FROM completion_event_listener'), 'refusal admitted listener'
+        assert not rows(db, 'SELECT * FROM completion_continuation_attempt'), 'refusal admitted activation'
+        assert rows(root / 'data/state.db', 'SELECT invocation_uuid FROM invocations ORDER BY invocation_uuid') == before_invocations, 'refusal admitted invocation'
+    for args in [
+        ['mailbox', 'list', '--session-id', SESSION, '--all', '--json'],
+        ['notify', 'agent-bash-capability', '--json'],
+        ['session', 'schema-probe'],
+    ]:
+        result = subprocess.run([stage / 'runner', *args], env=dict(env, OULIPOLY_COMPLETION_ENDPOINT=endpoint), cwd=root, capture_output=True, timeout=15)
+        checks.append(dict(name='read-only', argv=args, rc=result.returncode, stdout=result.stdout.decode(), stderr=result.stderr.decode()))
+        assert result.returncode == 0, checks[-1]
+    (root / 'upgrade-refusals.json').write_text(json.dumps(checks, indent=2))
+    (root / 'upgrade-active-retained.json').write_text(json.dumps(owner_evidence(db, stage / 'prior-runner'), indent=2))
+    # Actual founding native context finishes via its ordinary fixture gate.
+    # No signal, ACK, synthetic drain row, source activation or data reset.
+    (root / 'release-founder').touch()
+    assert founder.wait(timeout=30) == 0
+    guardian = founded['actors']['guardian_identity']['identity']['pid']
+    driver = founded['actors']['driver_identity']['identity']['pid']
+    guardian_wait = []
+    def retired():
+        try:
+            waited, status = os.waitpid(guardian, os.WNOHANG)  # PID-namespace init adopts guardian
+            if waited:
+                guardian_wait.append(dict(pid=waited, raw_wait_status=status))
+        except ChildProcessError:
+            pass
+        return not Path(f'/proc/{guardian}').exists() and not Path(f'/proc/{driver}').exists() and not Path(endpoint).exists()
+    try:
+        wait(retired, 'full natural old-owner retirement after founder normal exit')
+    except Exception:
+        obligations = {}
+        for name in ('completion_continuation_owner', 'completion_continuation_context', 'completion_continuation_source', 'completion_event_listener', 'completion_continuation_attempt'):
+            try:
+                obligations[name] = rows(db, 'SELECT * FROM ' + name)
+            except sqlite3.OperationalError as error:
+                obligations[name] = str(error)
+        obligations['state_schema'] = rows(root / 'data/state.db', "SELECT name,sql FROM sqlite_master WHERE type='table'")
+        (root / 'upgrade-retirement-BLOCKED.json').write_text(json.dumps(obligations, indent=2))
+        raise
+    assert guardian_wait and guardian_wait[0]['raw_wait_status'] == 0, guardian_wait
+    assert rows(db, 'SELECT phase FROM completion_continuation_owner WHERE generation=?', (founded['owner']['generation'],)) == [{'phase': 'closing'}]
+    with open(Path(endpoint).parent / 'election.lock', 'rb') as election:
+        fcntl.flock(election, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(election, fcntl.LOCK_UN)
+    before = dict(sidecar=rows(db, "SELECT name FROM sqlite_master WHERE type='table'"),
+                  state=rows(root / 'data/state.db', "SELECT name FROM sqlite_master WHERE type='table'"))
+    for label, path in [('sidecar', db), ('state', root / 'data/state.db')]:
+        before[label] = {item['name']: rows(path, 'SELECT * FROM "' + item['name'] + '"') for item in before[label]}
+    (root / 'upgrade-retired-data.json').write_text(json.dumps(before, indent=2, default=lambda value: {'bytes_hex': value.hex()}))
+    (root / 'upgrade-retirement.json').write_text(json.dumps(dict(
+        founder_rc=founder.returncode, guardian_wait=guardian_wait, guardian_absent=True, driver_absent=True,
+        endpoint_absent=True, election_lock_available=True, old_owner=founded,
+        policy='normal context exit and actual natural retirement; no owner replacement signal'), indent=2))
+    # Restart in the SAME data/config domain, retaining all old data and paths.
+    (root / 'provider-initial-ready').unlink()
+    (root / 'release-founder').unlink()
+    founder = subprocess.Popen([stage / 'runner', '-m', MODEL, '--models-dir', models, 'synthetic independent owner founder'],
+                               env=env, cwd=root, stdin=subprocess.DEVNULL,
+                               stdout=open(root / 'restarted-founder.stdout', 'wb'), stderr=open(root / 'restarted-founder.stderr', 'wb'))
+    wait(lambda: (root / 'provider-initial-ready').exists(), 'restarted compatible founding context')
+    wait(lambda: rows(db, "SELECT * FROM completion_continuation_owner WHERE phase='running'"), 'restarted owner publication')
+    restarted = owner_evidence(db, stage / 'runner')
+    assert restarted['owner']['domain_id'] == founded['owner']['domain_id']
+    assert restarted['owner']['generation'] != founded['owner']['generation']
+    assert restarted['owner']['supervisor_authority_id'] != founded['owner']['supervisor_authority_id']
+    # Retain every pre-restart table and row identity. Liveness/current-authority
+    # fields may evolve; record both full states instead of claiming byte equality.
+    preservation = {}
+    for label, path in [('sidecar', db), ('state', root / 'data/state.db')]:
+        preservation[label] = {}
+        for table, saved in before[label].items():
+            now = rows(path, 'SELECT * FROM "' + table + '"')
+            columns = rows(path, 'PRAGMA table_info("' + table + '")')
+            keys = [column['name'] for column in sorted(columns, key=lambda c: c['pk']) if column['pk']]
+            if table == 'sqlite_sequence':
+                keys = ['name']
+            for old in saved:
+                assert any(all(row[key] == old[key] for key in keys) if keys else row == old for row in now), (label, table, 'lost prior row')
+            preservation[label][table] = dict(prior_rows=len(saved), current_rows=len(now), identity_keys=keys, rows=now)
+    (root / 'upgrade-preserved-data.json').write_text(json.dumps(preservation, indent=2, default=lambda value: {'bytes_hex': value.hex()}))
+    (root / 'upgrade-restarted.json').write_text(json.dumps(restarted, indent=2))
+    return founder, restarted
+
+
+
 def activation_output_obligations(root, terminal, expected):
     """Launcher output, provider outcome and physical wait are distinct from ACK."""
     state_db = root / 'data/state.db'
@@ -178,6 +310,10 @@ executable="{wrapper}"
         assert founder.poll() is None
         founded = owner_evidence(data / 'pid-identity.db', owner_binary)
         (root / 'owner-founded.json').write_text(json.dumps(founded, indent=2))
+        if owner_kind == 'prior' and (stage / 'owner-upgrade').exists():
+            founder, founded = upgrade_owner(stage, root, env, models, founder, founded)
+            owner_binary = stage / 'runner'
+            (root / 'owner-compatible-founded.json').write_text(json.dumps(founded, indent=2))
         if coordinated:
             # Candidate operational transition, NOT a product drain API. This
             # closed fixture has exactly one admission-capable entry and no
@@ -245,7 +381,7 @@ CREATE TRIGGER e2e_listener_writer AFTER INSERT ON e2e_listener_audit BEGIN
             assert joined['owner']['domain_id'] == founded['owner']['domain_id'], 'domain was not preserved'
             assert joined['owner']['generation'] != founded['owner']['generation'], 'old generation survived'
         else:
-            assert joined['owner']['generation'] == founded['owner']['generation'], 'foreground did not retain independent owner'
+            assert joined['owner'] == founded['owner'], 'foreground did not retain exact independent owner authority'
         (root / 'owner-joined.json').write_text(json.dumps(joined, indent=2))
         # Identical private schedule: fixed helper accepts before owner repairs.
         driver = joined['actors']['driver_identity']['identity']['pid']
@@ -328,11 +464,17 @@ CREATE TRIGGER e2e_listener_writer AFTER INSERT ON e2e_listener_audit BEGIN
             assert len(before) == 1 and before[0]['active'] == 0, 'sync must be inactive after fixed helper acceptance'
         start = len((root / 'sql-audit.tsv').read_text())
         os.kill(driver, signal.SIGCONT)
-        barrier = wait(lambda: repair_barrier(root, driver, source['event_id'], start),
-                       'actual independent driver repair commit')
+        if (stage / 'owner-upgrade').exists():
+            barrier = wait(lambda: bounded_repair_observation(root, driver, joined['owner'], source, start),
+                           'current scoped driver selection after accepted source')
+            evidence_name = 'bounded-repair-observation.json'
+        else:
+            barrier = wait(lambda: repair_barrier(root, driver, source['event_id'], start),
+                           'actual independent driver repair commit')
+            evidence_name = 'repair-barrier.json'
         barrier['owner'] = owner_evidence(db, owner_binary)
         barrier['trace_start_offset'] = start
-        (root / 'repair-barrier.json').write_text(json.dumps(barrier, indent=2))
+        (root / evidence_name).write_text(json.dumps(barrier, indent=2, default=lambda value: {'bytes_hex': value.hex()}))
     qualified = bool(rows(db, "SELECT name FROM sqlite_master WHERE name='completion_continuation_notification'"))
     if qualified and mode == 'sync' and not owner_kind:
         owner_before_release = owner_evidence(db, stage / 'runner')
@@ -482,11 +624,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for arg in ('runner', 'agent-bash', 'bun', 'codex-source', 'bash-source', 'evidence'):
         parser.add_argument('--' + arg, required=True, type=Path)
+    parser.add_argument('--owner-upgrade', action='store_true', help='refuse prior owner, observe natural retirement, restart same domain before exact oracles')
     parser.add_argument('--handoff-cases', action='store_true', help='real paired detach before/after/race controls')
     parser.add_argument('--prior-runner', type=Path, help='enables fixed/prior independent-owner contrast')
     parser.add_argument('--coordinated-idle-replacement', action='store_true', help='test normal sole-context release and exact guardian wait BEFORE new admissions; requires prior runner')
     parser.add_argument('--prior-sha256', help='required exact expected prior artifact hash')
     args = parser.parse_args()
+    assert not args.owner_upgrade or (args.prior_runner and not args.coordinated_idle_replacement and not args.handoff_cases), 'owner upgrade requires prior inputs and a separate schedule from coordinated replacement/handoff'
     assert not args.coordinated_idle_replacement or args.prior_runner, 'replacement requires contrast inputs'
     if args.prior_runner:
         assert args.prior_sha256 and digest(args.prior_runner) == args.prior_sha256, 'prior hash mismatch'
@@ -495,6 +639,8 @@ def main():
     with tempfile.TemporaryDirectory(prefix='age360-mcp-e2e-') as directory:
         stage = Path(directory)
         identities = {}
+        if args.owner_upgrade:
+            (stage / 'owner-upgrade').touch()
         if args.handoff_cases:
             assert not args.prior_runner, 'handoff cases require candidate-only owners'
             (stage / 'handoff-cases').touch()
@@ -581,5 +727,8 @@ if __name__ == '__main__':
                 failed = True
                 traceback.print_exc()
                 print(mode + ' FAIL', flush=True)
+                if list(stage.glob('*/upgrade-retirement-BLOCKED.json')):
+                    print('STOP: natural retirement blocked; consumer recovery decision required', flush=True)
+                    break
         sys.exit(1 if failed else 2 if duplicate else 0)
     sys.exit(main())

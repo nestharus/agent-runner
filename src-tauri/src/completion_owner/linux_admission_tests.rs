@@ -77,12 +77,12 @@ fn hello_to_join_gate_prevents_idle_close_and_releases_on_failed_close() {
         let mut bytes = [0; 6];
         socket.read_exact(&mut bytes).unwrap();
         assert_eq!(&bytes, b"hello\n");
-        serde_json::to_writer(&mut socket, &owner).unwrap();
+        serde_json::to_writer(&mut socket, &declared_owner(&owner)).unwrap();
         drop(socket);
         let (mut socket, _) = listener.accept().unwrap();
         socket.read_exact(&mut bytes).unwrap();
         assert_eq!(&bytes, b"join!\n");
-        serde_json::to_writer(&mut socket, &owner).unwrap();
+        serde_json::to_writer(&mut socket, &declared_owner(&owner)).unwrap();
         socket.write_all(b"\n").unwrap();
         socket
     });
@@ -134,7 +134,7 @@ fn hello_still_rejects_invalid_owner_and_empty_response() {
                     driver_identity: id,
                     endpoint: "invalid".into(),
                 };
-                serde_json::to_writer(&mut socket, &owner).unwrap();
+                serde_json::to_writer(&mut socket, &declared_owner(&owner)).unwrap();
             }
         });
         let error = hello(&endpoint).unwrap_err();
@@ -145,6 +145,92 @@ fn hello_still_rejects_invalid_owner_and_empty_response() {
                 error.contains("EOF")
             },
             "{error}"
+        );
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn hello_and_join_require_explicit_owner_behavior() {
+    for join_reply in [false, true] {
+        for declaration in [
+            None,
+            Some("null"),
+            Some("other-policy"),
+            Some(OWNER_BEHAVIOR),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let endpoint = root.path().join("owner.sock");
+            let listener = UnixListener::bind(&endpoint).unwrap();
+            let expected = test_owner(&endpoint);
+            let mut reply = serde_json::to_value(&expected).unwrap();
+            if let Some(declaration) = declaration {
+                reply["owner_behavior"] = if declaration == "null" {
+                    serde_json::Value::Null
+                } else {
+                    declaration.into()
+                };
+            } else {
+                // An older live image predates today's supervisor identity too.
+                reply
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("supervisor_authority_id");
+            }
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 6];
+                socket.read_exact(&mut request).unwrap();
+                assert_eq!(&request, if join_reply { b"join!\n" } else { b"hello\n" });
+                serde_json::to_writer(&mut socket, &reply).unwrap();
+                if join_reply {
+                    socket.write_all(b"\n").unwrap();
+                }
+            });
+            let result = if join_reply {
+                connect_context(&endpoint, &expected).map(|_| ())
+            } else {
+                hello(&endpoint).map(|owner| assert_eq!(owner, expected))
+            };
+            if declaration == Some(OWNER_BEHAVIOR) {
+                result.unwrap();
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .contains("incompatible_completion_owner")
+                );
+            }
+            server.join().unwrap();
+        }
+    }
+}
+
+#[test]
+fn declared_join_still_requires_exact_hello_authority() {
+    for field in [
+        "protocol",
+        "domain_id",
+        "supervisor_authority_id",
+        "owner_generation",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let endpoint = root.path().join("owner.sock");
+        let listener = UnixListener::bind(&endpoint).unwrap();
+        let expected = test_owner(&endpoint);
+        let mut reply = serde_json::to_value(declared_owner(&expected)).unwrap();
+        reply[field] = "different".into();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0; 6];
+            socket.read_exact(&mut request).unwrap();
+            serde_json::to_writer(&mut socket, &reply).unwrap();
+            socket.write_all(b"\n").unwrap();
+        });
+        assert!(
+            connect_context(&endpoint, &expected)
+                .unwrap_err()
+                .contains("completion join owner authority changed")
         );
         server.join().unwrap();
     }
@@ -251,8 +337,8 @@ fn join_refusal_compatibility_and_identity_boundaries() {
             socket.read_exact(&mut request).unwrap();
             assert_eq!(&request, b"join!\n");
             if case == "success" {
-                // Existing server response; no new envelope or version gate.
-                serde_json::to_writer(&mut socket, &owner).unwrap();
+                // Current successful response declares the executing owner policy.
+                serde_json::to_writer(&mut socket, &declared_owner(&owner)).unwrap();
                 socket.write_all(b"\n").unwrap();
                 return;
             }
@@ -504,7 +590,7 @@ fn committed_join_is_old_client_compatible_and_persistence_refusal_is_not_succes
                     .is_empty()
             );
         } else {
-            // Old client's actual response type, with unchanged successful shape.
+            // Old clients may ignore the additive declaration; current clients require it.
             let response: CompletionDomainOwner = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(
                 serde_json::to_value(response).unwrap(),

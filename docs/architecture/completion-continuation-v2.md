@@ -226,3 +226,35 @@ invocation authority and owner endpoint, with a distinct outer session listener.
 Removing the inherited endpoint must still reject managed ancestry. The outer
 entry stays live through the inner initial/delivery relationship checks; fixture
 rows no longer impersonate the test process as an independently bootstrapped owner.
+
+## Joining a surviving owner
+
+Service-producing entries require the live socket response's `owner_behavior`
+to equal `oulipoly.completion-owner/sync-tool-only-v1`, in both hello and join.
+The control reader declares it on hello; the guardian declares it only after
+persisting a successful join. Authenticated `JoinRefusal` responses remain
+separate negatives. A successful join must retain the exact hello authority,
+including `supervisor_authority_id`, generation and process identities.
+
+This declaration is separate from the durable v2 source protocol. It describes
+the executing owner's automatic policy, not an executable hash, installed path,
+source acceptance or recipient ACK. Guardian/driver fork succession retains the
+executing image and declaration. Inherited helpers and independent entries
+finding an occupied election refuse absent, null or different declarations,
+including older fixed-policy images that never declared support.
+
+`incompatible_completion_owner` is explicit service refusal, not successful sync
+completion. It neither upgrades nor drains an owner. Read-only inspection and
+sequence-grounded ACK do not acquire a service lease; retained logs/status
+remain available for manual recovery. Activation/detach and other service entries
+still require a compatible owner. The fence cannot alter old binaries already
+executing or retract historical activation. It adds no sandbox or resource limit.
+
+Restart requires separately established preservation of active native contexts,
+original custodians/adopters, retained files and outstanding duties. The private
+fixture ends its sole founding native context normally, waits that exact guardian
+successfully, verifies full natural retirement, and restarts in the same domain.
+This is not a populated-domain drain procedure. Current retirement consults the
+`retirement_pending` projection; older owners can retain inactive unacknowledged
+sync debt indefinitely. Unresolved debt requires explicit consumer recovery,
+never a forced ACK, activation, DB reset or inferred custody discharge.

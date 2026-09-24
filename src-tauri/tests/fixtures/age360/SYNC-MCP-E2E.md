@@ -170,3 +170,51 @@ so it is not described as exclusively passive when these cases are selected.
 changes after staging cannot be credited to an earlier run. Lost reply uses the
 existing unattributed Runner administrative activation route for its separate
 retry control, not an invented authenticated initiating identity.
+
+## Explicit behavior fence and preservation-safe private restart
+
+`--owner-upgrade` (requires the exact `--prior-*` inputs) retains the historical
+contrast mode unchanged when omitted. It first runs compatible-owner controls.
+For each prior-owner case, it separately requires independent foreground,
+inherited foreground and inherited helper refusal with
+`incompatible_completion_owner`, while the actual founding native context and
+both old owner identities remain alive and unchanged. Read-only native commands
+must still succeed. Refusal is not the sync-output oracle.
+
+The fixture then releases the founding provider's ordinary completion gate and
+waits for its normal exit, actual guardian/driver disappearance, removed endpoint
+and available election lock. It sends no retirement/replacement signal and
+writes no product settlement facts. It saves retained database rows, restarts a
+candidate founder against the same domain and paths, and only then executes the
+exact sync/async MCP and actual recipient/ACK oracles, plus the current bounded
+driver observation described below.
+A bounded observation expiring is a blocked/incomplete experiment, not drain;
+`upgrade-retirement-BLOCKED.json` stops further upgrade cases and returns debt.
+There is no general drain command or arbitrary active-owner upgrade claim.
+Older owners may retain inactive sync debt until ordinary namespace teardown;
+current owners use qualified settlement and the retirement-pending projection.
+Namespace teardown is never replacement or physical-drain evidence.
+
+This mode is mutually exclusive with coordinated replacement and handoff cases.
+It checks the current supervisor authority as well as generation: foreground
+join retains the exact owner, and normal independent restart establishes a new
+supervisor authority. The current activation-output and physical-drain assertions
+remain in force after recipient ACK. An undeclared prior binary must use compatible
+State/sidecar schemas; this mode does not authorize migration under an old writer.
+The original contrast mode requires a foreground image compatible with its prior
+owner. With a fenced candidate and undeclared prior, use `--owner-upgrade` to
+assert refusal explicitly rather than timing out waiting for source admission.
+
+On current main the driver repairs only the unprojected State suffix and selects
+only `phase='registered'` sources in its supervisor scope. A successfully accepted
+source has already advanced continuity and is excluded; waiting for an activation
+UPDATE/COMMIT would test an obsolete implementation. In `--owner-upgrade` mode,
+`bounded-repair-observation.json` instead requires a post-acceptance SQL PROFILE
+from the exact driver completing that registered-only selection for the exact
+supervisor authority, and records the exact accepted source in that scope. The
+association with this event is an inference from the retained source and query
+predicate, not an event-specific repair commit or a stack trace. Exact inactive
+sync state/no transient activation/no mailbox and actual async recipient/ACK plus
+activation output/drain assertions still follow. The historical contrast mode
+retains its stronger, different UPDATE plus same-connection COMMIT requirement;
+its `repair-barrier.json` is never synthesized from this read observation.

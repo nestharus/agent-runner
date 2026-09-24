@@ -1,6 +1,6 @@
 //! The control reader does no durable work. The guardian remains the sole
 //! context/custody/retirement writer and joins this thread before every fork.
-use super::{identity, peer_pid};
+use super::{declared_owner, identity, peer_pid};
 use oulipoly_state::completion_continuation::SourceProcessIdentity;
 use oulipoly_state::mailbox::CompletionDomainOwner;
 use serde::{Deserialize, Serialize};
@@ -171,7 +171,7 @@ fn serve(
     commands: Receiver<Command>,
     joins: SyncSender<JoinRequest>,
 ) {
-    let Ok(reply) = serde_json::to_vec(&owner) else {
+    let Ok(reply) = serde_json::to_vec(&declared_owner(&owner)) else {
         return;
     };
     let mut accepting = true;

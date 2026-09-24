@@ -13,6 +13,40 @@ use std::time::Duration;
 const CLIENT_CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(2);
 const GUARDIAN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const OWNER_HELLO_MAX_BYTES: u64 = 8_192;
+
+// Independent of the durable source protocol. Only the executing owner can
+// declare its automatic policy; a helper hash or database version cannot.
+const OWNER_BEHAVIOR: &str = "oulipoly.completion-owner/sync-tool-only-v1";
+
+#[derive(serde::Serialize)]
+struct OwnerHello<'a> {
+    #[serde(flatten)]
+    owner: &'a CompletionDomainOwner,
+    owner_behavior: &'static str,
+}
+
+fn declared_owner(owner: &CompletionDomainOwner) -> OwnerHello<'_> {
+    OwnerHello {
+        owner,
+        owner_behavior: OWNER_BEHAVIOR,
+    }
+}
+
+fn compatible_owner(value: serde_json::Value) -> Result<CompletionDomainOwner, String> {
+    // Check the declaration before decoding today's authority fields so older
+    // owners missing supervisor_authority_id also receive the explicit fence.
+    if value
+        .get("owner_behavior")
+        .and_then(serde_json::Value::as_str)
+        != Some(OWNER_BEHAVIOR)
+    {
+        return Err(format!(
+            "incompatible_completion_owner: live owner does not declare {OWNER_BEHAVIOR}. Service entry refused; existing owner, active work, custody and stored data are retained. Do not kill or replace the owner to bypass this fence. Restart requires preservation-safe natural retirement of existing contexts and obligations. Read-only inspection and grounded manual recovery remain available; no general drain command is provided."
+        ));
+    }
+    serde_json::from_value(value).map_err(|e| e.to_string())
+}
+
 #[path = "control.rs"]
 mod control;
 use control::{ControlService, JoinRefusal, JoinRequest, RefusalReason};
@@ -72,8 +106,7 @@ fn hello(endpoint: &Path) -> Result<CompletionDomainOwner, String> {
     if response.len() as u64 > OWNER_HELLO_MAX_BYTES {
         return Err("oversized completion owner hello".into());
     }
-    let owner: CompletionDomainOwner =
-        serde_json::from_slice(&response).map_err(|e| e.to_string())?;
+    let owner = compatible_owner(serde_json::from_slice(&response).map_err(|e| e.to_string())?)?;
     if owner.guardian_identity != identity(peer)?
         || owner.driver_identity != identity(owner.driver_identity.pid)?
     {
@@ -147,9 +180,12 @@ fn connect_context(
             "completion join refused: {category}; admission outcome uncertain; no replay authorized"
         ));
     }
-    let owner: CompletionDomainOwner = serde_json::from_value(value).map_err(|e| e.to_string())?;
+    let owner = compatible_owner(value)?;
     if owner.guardian_identity != identity(peer)? || owner.endpoint != endpoint.to_string_lossy() {
         return Err("completion join peer conflict".into());
+    }
+    if owner != *expected {
+        return Err("completion join owner authority changed".into());
     }
     Ok(socket)
 }
@@ -508,7 +544,7 @@ fn retain_pending_context(
     }
     // Persistence preceded the reply. Even a lost reply is owned locally;
     // grouping sockets by incarnation prevents one release deleting another.
-    let _ = serde_json::to_writer(&mut request.socket, owner)
+    let _ = serde_json::to_writer(&mut request.socket, &declared_owner(owner))
         .map_err(|e| e.to_string())
         .and_then(|()| request.socket.write_all(b"\n").map_err(|e| e.to_string()));
     let _ = request.socket.set_nonblocking(true);
