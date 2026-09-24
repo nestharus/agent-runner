@@ -166,7 +166,15 @@ fn run_v30_repair_boundary(
                 "v30 source effect grant retained; physical recovery child custody and root-only exact acceptance remain closed".into(),
             );
         }
-        return Err("v30 wake selection requires broker recipient grant".into());
+        let selected = route.recipient_selection(owner, &page)?;
+        if selected.candidate.is_some() {
+            // The broker has selected and verified a retained pending row, but
+            // this preview is not an executable grant. The native recipient
+            // route must bind an actual session and the one-use provider K
+            // before any claim, transport submission, or delivery result.
+            return Err("v30 recipient effect requires actual session authentication, one-use broker work grant, and provider K".into());
+        }
+        return Err("v30 no pending broker recipient; wake effect refused".into());
     }
 }
 

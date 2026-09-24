@@ -5,7 +5,7 @@ use oulipoly_kernel_broker::protocol::{
     self, AcceptedWorkSpec, JoinSpec, Operation, ProcessWitness, SourceScope, SourceSocketWitness,
 };
 use oulipoly_state::completion_continuation::AdmittedSourceBinding;
-use oulipoly_state::mailbox::{BrokerSidecar, MailboxDb};
+use oulipoly_state::mailbox::{AgentBashCompleteEnqueue, BrokerSidecar, EnqueueResult, MailboxDb};
 use std::fs::{self, File};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
@@ -34,6 +34,7 @@ fn inner() {
     let mode = std::env::var("AGE319_PRIVATE_JOIN_MODE").unwrap_or_else(|_| "help".into());
     let release_mode = mode.starts_with("held_release");
     let normal_mode = mode.starts_with("normal_");
+    let recipient_mode = mode.starts_with("normal_recipient");
     let runner =
         std::env::var("OULIPOLY_AGE319_RUNNER_IMAGE").expect("built Runner image required");
     let temp = tempfile::tempdir().unwrap();
@@ -42,10 +43,34 @@ fn inner() {
     let gate = temp.path().join("gate");
     fs::create_dir(&data).unwrap();
     fs::create_dir(&broker_state).unwrap();
+    fs::set_permissions(&broker_state, fs::Permissions::from_mode(0o700)).unwrap();
     fs::create_dir(&gate).unwrap();
-    let mailbox =
+    let mut mailbox =
         MailboxDb::open_completion_continuation_domain(&data.join("pid-identity.db")).unwrap();
-    let pending_binding = normal_mode.then(|| {
+    let recipient_mail = recipient_mode.then(|| {
+        match mailbox
+            .enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
+                session_id: "fixture-recipient",
+                handle: "fixture-completion",
+                payload_json: r#"{"protocol":"source-retention-release-v1","body":"pending"}"#,
+                owner_invocation_uuid: Some("fixture-owner"),
+                matched_os_pid: None,
+                matched_os_boot_id: None,
+                matched_os_pid_starttime_ticks: None,
+                matched_chain_index: None,
+                state_dir: "fixture-state",
+                meta_path: "fixture-meta",
+                log_path: "fixture-log",
+                rc_path: "fixture-rc",
+                rc: 0,
+            })
+            .unwrap()
+        {
+            EnqueueResult::Inserted(row) => row,
+            other => panic!("recipient fixture enqueue: {other:?}"),
+        }
+    });
+    let pending_binding = (normal_mode && !recipient_mode && mode != "normal_empty").then(|| {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
             "../../oulipoly-state/tests/fixtures/age360-paired-wire.json"
         ))
@@ -74,13 +99,14 @@ fn inner() {
             )
             .unwrap();
     }
-    let mut state = oulipoly_state::StateDb::open(&data.join("state.db")).unwrap();
-    if let Some(binding) = &pending_binding {
-        state
-            .seed_private_pending_completion_source(binding, &sidecar_generation)
-            .unwrap();
+    if !recipient_mode {
+        let mut state = oulipoly_state::StateDb::open(&data.join("state.db")).unwrap();
+        if let Some(binding) = &pending_binding {
+            state
+                .seed_private_pending_completion_source(binding, &sidecar_generation)
+                .unwrap();
+        }
     }
-    drop(state);
     let broker_generation = if mode == "broker_state"
         || mode == "held_prepared"
         || mode == "held_guardian_death"
@@ -90,16 +116,33 @@ fn inner() {
         let sidecar_dir = broker_state.join("sidecar");
         fs::create_dir(&sidecar_dir).unwrap();
         fs::set_permissions(&sidecar_dir, fs::Permissions::from_mode(0o700)).unwrap();
-        let target = sidecar_dir.join("pid-identity.db");
-        rusqlite::Connection::open(data.join("pid-identity.db"))
-            .unwrap()
-            .execute("VACUUM INTO ?1", [target.to_str().unwrap()])
-            .unwrap();
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
         let proof = oulipoly_state::mailbox::QuiescedCutoverProof::private_fixture();
-        let generation =
-            BrokerSidecar::activate_private_fixture_copy(&target, &broker_state, &proof).unwrap();
-        if normal_mode {
+        let generation = if recipient_mode {
+            fs::remove_dir(&sidecar_dir).unwrap();
+            let source = data.join("pid-identity.db");
+            let stage =
+                BrokerSidecar::stage_private_fixture_copy(&source, &broker_state, &proof).unwrap();
+            let generation =
+                BrokerSidecar::publish_private_fixture_copy(&source, &stage, &broker_state, &proof)
+                    .unwrap();
+            drop(oulipoly_state::StateDb::open(&data.join("state.db")).unwrap());
+            BrokerSidecar::bind_private_fixture_state_source(
+                &sidecar_dir.join("pid-identity.db"),
+                &data.join("state.db"),
+            )
+            .unwrap();
+            generation
+        } else {
+            let target = sidecar_dir.join("pid-identity.db");
+            rusqlite::Connection::open(data.join("pid-identity.db"))
+                .unwrap()
+                .execute("VACUUM INTO ?1", [target.to_str().unwrap()])
+                .unwrap();
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+            BrokerSidecar::activate_private_fixture_copy(&target, &broker_state, &proof).unwrap()
+        };
+        if normal_mode && !recipient_mode {
+            let target = sidecar_dir.join("pid-identity.db");
             BrokerSidecar::bind_private_fixture_state_source(&target, &data.join("state.db"))
                 .unwrap();
         }
@@ -141,10 +184,21 @@ fn inner() {
             .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
             .env("AGE319_PRIVATE_REPAIR_CHALLENGE_V1", "1")
             .env("AGE319_PRIVATE_SOURCE_SELECTION_CHALLENGE_V1", "1")
-            .env(
-                "AGE319_PRIVATE_EXPECT_SOURCE_DIGEST_V1",
-                pending_binding.as_ref().unwrap().registration_digest(),
+            .envs(pending_binding.as_ref().map(|binding| {
+                (
+                    "AGE319_PRIVATE_EXPECT_SOURCE_DIGEST_V1",
+                    binding.registration_digest(),
+                )
+            }))
+            .envs(
+                recipient_mode.then_some(("AGE319_PRIVATE_RECIPIENT_SELECTION_CHALLENGE_V1", "1")),
             )
+            .envs(recipient_mail.as_ref().map(|row| {
+                (
+                    "AGE319_PRIVATE_EXPECT_RECIPIENT_SHA_V1",
+                    row.payload_sha256.as_deref().unwrap(),
+                )
+            }))
             .envs(
                 (mode == "normal_prepare_lost_reply")
                     .then_some(("AGE319_PRIVATE_NORMAL_PREPARE_REPLY_LOSS_V1", "1")),
@@ -309,6 +363,16 @@ fn inner() {
                 ..source_read
             };
             assert!(protocol::read_source_effect_grant_at(&socket, &grant_read).is_err());
+            let recipient_read = protocol::StateReadSpec {
+                protocol: "broker-recipient-selection-v30".into(),
+                source_generation: generation.clone(),
+                root_id: prepared.root_id.clone(),
+                owner_generation: prepared.owner_generation.clone(),
+                attempt_id: None,
+            };
+            assert!(
+                protocol::read_bounded_recipient_selection_at(&socket, &recipient_read).is_err()
+            );
             let repair_write = protocol::StateWriteSpec {
                 protocol: "broker-repair-write-v30".into(),
                 source_generation: generation.clone(),
@@ -322,11 +386,14 @@ fn inner() {
             assert_eq!(fs::metadata(&out).unwrap().len(), 0);
             let post_death = matches!(
                 mode.as_str(),
-                "normal_guardian_post" | "normal_driver_post" | "normal_broker_post"
+                "normal_guardian_post"
+                    | "normal_driver_post"
+                    | "normal_broker_post"
+                    | "normal_recipient_driver_post"
             );
             if mode == "normal_guardian_post" {
                 unsafe { libc::kill(prepared.guardian.host_pid, libc::SIGKILL) };
-            } else if mode == "normal_driver_post" {
+            } else if mode == "normal_driver_post" || mode == "normal_recipient_driver_post" {
                 unsafe { libc::kill(prepared.driver.host_pid, libc::SIGKILL) };
             } else if mode == "normal_broker_post" {
                 stop(&mut broker);
@@ -340,7 +407,7 @@ fn inner() {
                     .unwrap();
                 eventually(|| protocol::request_at(&socket, Operation::Classify).is_ok());
             }
-            if !post_death {
+            if !post_death && pending_binding.is_some() {
                 eventually(|| {
                     gate.join("source-grant-ready").exists() || entry.try_wait().unwrap().is_some()
                 });
@@ -356,10 +423,21 @@ fn inner() {
                 assert!(!entry.wait().unwrap().success());
                 assert_eq!(fs::metadata(&out).unwrap().len(), 0);
             } else {
+                let expected_stop = if recipient_mode {
+                    "v30 recipient effect requires actual session authentication, one-use broker work grant, and provider K"
+                } else if mode == "normal_empty" {
+                    "v30 no pending broker recipient; wake effect refused"
+                } else {
+                    "v30 source recovery requires exact registration/listener file custody, preserved recovery image/environment path semantics, and a one-use effect grant"
+                };
                 assert!(
                     fs::read_to_string(&err)
                         .unwrap_or_default()
-                        .contains("v30 source effect grant retained; physical recovery child custody and root-only exact acceptance remain closed"),
+                        .contains(if recipient_mode || mode == "normal_empty" {
+                            expected_stop
+                        } else {
+                            "v30 source effect grant retained; physical recovery child custody and root-only exact acceptance remain closed"
+                        }),
                     "normal repair boundary: entry={} broker={}",
                     fs::read_to_string(&err).unwrap_or_default(),
                     fs::read_to_string(&broker_log).unwrap_or_default(),
@@ -375,26 +453,30 @@ fn inner() {
                 .unwrap();
                 let ordinal: i64 = projected
                     .query_row(
-                        "SELECT authority_ordinal FROM completion_authority_continuity",
+                        "SELECT COALESCE((SELECT authority_ordinal FROM completion_authority_continuity),0)",
                         [],
                         |row| row.get(0),
                     )
                     .unwrap();
-                assert_eq!(ordinal, 1, "one admitted State suffix must be projected");
-                let source_id = &pending_binding
-                    .as_ref()
-                    .unwrap()
-                    .registration()
-                    .unwrap()
-                    .registration_id;
-                let phase: String = projected
-                    .query_row(
-                        "SELECT phase FROM completion_continuation_source WHERE registration_id=?1",
-                        [source_id],
-                        |row| row.get(0),
-                    )
-                    .unwrap();
-                assert_eq!(phase, "registered");
+                assert_eq!(
+                    ordinal,
+                    if recipient_mode || mode == "normal_empty" {
+                        0
+                    } else {
+                        1
+                    }
+                );
+                if let Some(binding) = &pending_binding {
+                    let source_id = &binding.registration().unwrap().registration_id;
+                    let phase: String = projected
+                        .query_row(
+                            "SELECT phase FROM completion_continuation_source WHERE registration_id=?1",
+                            [source_id],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(phase, "registered");
+                }
                 let attempts: i64 = projected
                     .query_row(
                         "SELECT count(*) FROM completion_continuation_attempt WHERE operation='source_recovery'",
@@ -403,36 +485,60 @@ fn inner() {
                     )
                     .unwrap();
                 assert_eq!(attempts, 0, "source preview cannot reserve or launch");
-                let grant: (String, String, String, Vec<u8>, String, i64) = projected
-                    .query_row(
-                        "SELECT phase,registration_id,registration_digest,registration_bytes,
+                if let Some(binding) = &pending_binding {
+                    let source_id = &binding.registration().unwrap().registration_id;
+                    let grant: (String, String, String, Vec<u8>, String, i64) = projected
+                        .query_row(
+                            "SELECT phase,registration_id,registration_digest,registration_bytes,
                          owner_generation,revision
                          FROM broker_source_effect_grant",
-                        [],
-                        |row| {
-                            Ok((
-                                row.get(0)?,
-                                row.get(1)?,
-                                row.get(2)?,
-                                row.get(3)?,
-                                row.get(4)?,
-                                row.get(5)?,
-                            ))
-                        },
-                    )
-                    .unwrap();
-                assert_eq!(grant.0, "reserved");
-                assert_eq!(grant.1, *source_id);
-                assert_eq!(
-                    grant.2,
-                    pending_binding.as_ref().unwrap().registration_digest()
-                );
-                assert_eq!(
-                    grant.3,
-                    pending_binding.as_ref().unwrap().registration_bytes()
-                );
-                assert_eq!(grant.4, prepared.owner_generation);
-                assert_eq!(grant.5, 1);
+                            [],
+                            |row| {
+                                Ok((
+                                    row.get(0)?,
+                                    row.get(1)?,
+                                    row.get(2)?,
+                                    row.get(3)?,
+                                    row.get(4)?,
+                                    row.get(5)?,
+                                ))
+                            },
+                        )
+                        .unwrap();
+                    assert_eq!(grant.0, "reserved");
+                    assert_eq!(grant.1, *source_id);
+                    assert_eq!(grant.2, binding.registration_digest());
+                    assert_eq!(grant.3, binding.registration_bytes());
+                    assert_eq!(grant.4, prepared.owner_generation);
+                    assert_eq!(grant.5, 1);
+                } else {
+                    let grants: i64 = projected
+                        .query_row(
+                            "SELECT count(*) FROM broker_source_effect_grant",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(grants, 0, "recipient preview cannot reserve a source grant");
+                }
+                if let Some(mail) = &recipient_mail {
+                    let (session, digest, delivered): (String, String, Option<String>) = projected
+                        .query_row(
+                            "SELECT session_id,payload_sha256,delivered_at FROM mailbox WHERE seq=?1",
+                            [mail.seq],
+                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                        )
+                        .unwrap();
+                    assert_eq!(session, "fixture-recipient");
+                    assert_eq!(digest, mail.payload_sha256.as_deref().unwrap());
+                    assert!(delivered.is_none(), "selection must not autoACK");
+                    let claims: i64 = projected
+                        .query_row("SELECT count(*) FROM session_wake_claim", [], |row| {
+                            row.get(0)
+                        })
+                        .unwrap();
+                    assert_eq!(claims, 0, "selection must not claim or launch");
+                }
             }
             assert_eq!(
                 fs::read(data.join("pid-identity.db")).unwrap(),
@@ -1370,6 +1476,9 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_release_lost_reply",
         "normal_repair_lost_reply",
         "normal_source_grant_lost_reply",
+        "normal_recipient",
+        "normal_recipient_driver_post",
+        "normal_empty",
         "normal_guardian_post",
         "normal_driver_post",
         "normal_broker_post",

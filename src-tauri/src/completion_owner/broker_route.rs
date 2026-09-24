@@ -5,9 +5,9 @@ use oulipoly_kernel_broker::protocol::{
     self, StateReadSpec, StateRoute, StateWriteAction, StateWriteSpec,
 };
 use oulipoly_state::mailbox::{
-    BrokerContinuationReadback, BrokerReleaseEvidence, BrokerRepairReadback,
-    BrokerSourceEffectGrant, BrokerSourceSelection, CompletionDomainOwner, ContinuationAttempt,
-    PreparedBrokerOwner,
+    BrokerContinuationReadback, BrokerRecipientSelection, BrokerReleaseEvidence,
+    BrokerRepairReadback, BrokerSourceEffectGrant, BrokerSourceSelection, CompletionDomainOwner,
+    ContinuationAttempt, PreparedBrokerOwner,
 };
 use std::path::{Path, PathBuf};
 
@@ -21,6 +21,79 @@ pub(crate) struct V30OwnerRoute {
 }
 
 impl V30OwnerRoute {
+    pub(crate) fn recipient_selection(
+        &self,
+        owner: &CompletionDomainOwner,
+        completed: &BrokerRepairReadback,
+    ) -> Result<BrokerRecipientSelection, String> {
+        if completed.has_more || !completed.pending_registration_ids.is_empty() {
+            return Err("broker recipient selection before source boundary completed".into());
+        }
+        self.check_repair_readback(completed)?;
+        self.read_running(owner, None)?;
+        let selection = protocol::read_bounded_recipient_selection_at(
+            &self.socket,
+            &self.read_spec("broker-recipient-selection-v30", None),
+        )
+        .map_err(|e| e.to_string())?;
+        #[cfg(feature = "age319-private-broker-fixture")]
+        if std::env::var_os("AGE319_PRIVATE_RECIPIENT_SELECTION_CHALLENGE_V1").is_some() {
+            // A selection reply may be lost. Re-reading is harmless because
+            // this operation has no claim or one-use effect to replay.
+            if protocol::read_bounded_recipient_selection_at(
+                &self.socket,
+                &self.read_spec("broker-recipient-selection-v30", None),
+            )
+            .map_err(|e| e.to_string())?
+                != selection
+            {
+                return Err("private recipient selection readback changed".into());
+            }
+            for (field, value) in [
+                ("root", uuid::Uuid::new_v4().to_string()),
+                ("source", uuid::Uuid::new_v4().to_string()),
+                ("owner", uuid::Uuid::new_v4().to_string()),
+            ] {
+                let mut wrong = self.read_spec("broker-recipient-selection-v30", None);
+                match field {
+                    "root" => wrong.root_id = value,
+                    "source" => wrong.source_generation = value,
+                    _ => wrong.owner_generation = value,
+                }
+                if protocol::read_bounded_recipient_selection_at(&self.socket, &wrong).is_ok() {
+                    return Err("private foreign recipient selection accepted".into());
+                }
+            }
+        }
+        if selection.source_generation != self.source_generation
+            || selection.root_id != self.root_id
+            || selection.owner_generation != self.owner_generation
+            || selection.authority_ordinal != completed.authority_ordinal
+            || selection.candidate.as_ref().is_some_and(|candidate| {
+                candidate.session_id.is_empty()
+                    || candidate.seq <= 0
+                    || candidate.payload_sha256.len() != 64
+                    || candidate.payload_byte_len < 0
+            })
+        {
+            return Err("broker recipient selection/repair readback conflict".into());
+        }
+        #[cfg(feature = "age319-private-broker-fixture")]
+        if let Some(expected) = std::env::var_os("AGE319_PRIVATE_EXPECT_RECIPIENT_SHA_V1") {
+            let selected = selection
+                .candidate
+                .as_ref()
+                .ok_or("private pending recipient selection absent")?;
+            if selected.session_id != "fixture-recipient"
+                || selected.handle != "fixture-completion"
+                || selected.payload_sha256 != expected.to_string_lossy()
+            {
+                return Err("private retained recipient identity changed".into());
+            }
+        }
+        Ok(selection)
+    }
+
     pub(crate) fn reserve_source_grant(
         &self,
         owner: &CompletionDomainOwner,

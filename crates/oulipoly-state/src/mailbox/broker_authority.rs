@@ -160,6 +160,28 @@ pub struct BrokerSourceEffectGrant {
     pub revision: i64,
 }
 
+/// A pending recipient selected on the retained broker connection. This is
+/// metadata for planning only: the row can change, and neither the session ID
+/// nor the payload digest is a recipient authentication or work grant.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct BrokerRecipientSelection {
+    pub source_generation: String,
+    pub root_id: String,
+    pub owner_generation: String,
+    pub authority_ordinal: i64,
+    pub candidate: Option<BrokerRecipientCandidate>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct BrokerRecipientCandidate {
+    pub session_id: String,
+    pub seq: i64,
+    pub kind: String,
+    pub handle: String,
+    pub payload_sha256: String,
+    pub payload_byte_len: i64,
+}
+
 /// Installer-owned proof that the old service images and every sidecar writer
 /// were stopped, joined and fenced. No production constructor exists yet:
 /// the installed service/launcher census and new-entry fence must be added
@@ -381,6 +403,72 @@ impl BrokerSidecar {
         }
         self.check_mailbox_read(source_generation)?;
         Ok(BrokerSourceSelection {
+            source_generation: self.source_generation.clone(),
+            root_id: root_id.into(),
+            owner_generation: owner.owner_generation.clone(),
+            authority_ordinal: head.map_or(0, |head| head.authority_ordinal),
+            candidate,
+        })
+    }
+
+    /// Read one pending recipient from at most 32 sessions. The broker must
+    /// first prove the exact live root, owner and driver. This does not claim
+    /// the session, read payload bytes onto the wire, or authorize delivery.
+    pub fn read_bounded_recipient_selection(
+        &mut self,
+        source_generation: &str,
+        root_id: &str,
+        owner: &CompletionDomainOwner,
+    ) -> Result<BrokerRecipientSelection, String> {
+        self.check_mailbox_read(source_generation)?;
+        let state = self.bound_state()?;
+        let head = self.mailbox.completion_continuity_head()?;
+        if state.completion_repair_has_suffix(head.as_ref())? {
+            return Err("broker recipient selection requires complete State projection".into());
+        }
+        let sessions = self
+            .mailbox
+            .wake_sessions()
+            .pending_delivery_session_ids(32)?;
+        let mut candidate = None;
+        for session_id in sessions {
+            if self.mailbox.notifications_paused(&session_id)? {
+                continue;
+            }
+            let Some(row) = self
+                .mailbox
+                .list_pending_for_delivery_after(&session_id, None, 0, 1)?
+                .into_iter()
+                .next()
+            else {
+                continue;
+            };
+            // Verification uses the retained root-owned payload repository.
+            // The response carries only its exact digest and length.
+            self.mailbox.payloads().verify_mailbox_row_payload(&row)?;
+            let (Some(payload_sha256), Some(payload_byte_len)) =
+                (row.payload_sha256, row.payload_byte_len)
+            else {
+                return Err("broker pending recipient has no retained payload identity".into());
+            };
+            if payload_byte_len < 0 || row.session_id != session_id {
+                return Err("broker pending recipient identity changed".into());
+            }
+            candidate = Some(BrokerRecipientCandidate {
+                session_id,
+                seq: row.seq,
+                kind: row.kind,
+                handle: row.handle,
+                payload_sha256,
+                payload_byte_len,
+            });
+            break;
+        }
+        if state.completion_repair_has_suffix(head.as_ref())? {
+            return Err("broker State source changed during recipient selection".into());
+        }
+        self.check_mailbox_read(source_generation)?;
+        Ok(BrokerRecipientSelection {
             source_generation: self.source_generation.clone(),
             root_id: root_id.into(),
             owner_generation: owner.owner_generation.clone(),
