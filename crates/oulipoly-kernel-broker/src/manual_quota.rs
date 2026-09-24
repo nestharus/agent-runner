@@ -625,6 +625,9 @@ pub(super) fn offline_collect(
         let effect = EffectIntent {
             kind: EffectKind::ManualQuota,
             source: source_key,
+            decision_handoff: String::new(),
+            route_source: None,
+            candidate: None,
             intent: Artifact::from_existing(directory, &relative.join("intent.json"))
                 .map_err(io::Error::other)?,
             reuse: None,
@@ -651,6 +654,7 @@ pub(super) fn offline_collect(
             } else {
                 None
             },
+            result: None,
         };
         let account = snapshot
             .accounts

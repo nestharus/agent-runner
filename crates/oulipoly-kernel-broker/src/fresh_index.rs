@@ -553,6 +553,8 @@ impl Index {
         index.validate_live_routes()?;
         super::fresh_provider::reconcile_live_provider_accounts(&index)
             .map_err(|error| corrupt(format!("live provider account admission: {error}")))?;
+        super::fresh_provider::reconcile_live_account_effects(&index)
+            .map_err(|error| corrupt(format!("live effect account admission: {error}")))?;
         Ok(index)
     }
 
@@ -1300,12 +1302,20 @@ impl SourceKey {
 pub(super) struct EffectIntent {
     pub kind: EffectKind,
     pub source: SourceKey,
+    #[serde(default)]
+    pub decision_handoff: String,
+    #[serde(default)]
+    pub route_source: Option<Artifact>,
+    #[serde(default)]
+    pub candidate: Option<Artifact>,
     pub intent: Artifact,
     #[serde(default)]
     pub reuse: Option<Artifact>,
     pub consumed_k: Option<Artifact>,
     #[serde(default)]
     pub certified_q: Option<PhysicalQ>,
+    #[serde(default)]
+    pub result: Option<Artifact>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -1398,6 +1408,12 @@ impl Index {
         }
         for effect in account.effects.values() {
             effect.intent.validate()?;
+            if let Some(source) = &effect.route_source {
+                source.require_present(&self.root)?;
+            }
+            if let Some(candidate) = &effect.candidate {
+                candidate.require_present(&self.root)?;
+            }
             if let Some(reference) = &effect.reuse {
                 reference.require_present(&self.root)?;
             }
@@ -1412,6 +1428,12 @@ impl Index {
                     return Err(corrupt("certified effect Q/K mismatch"));
                 }
                 q.verify(&self.root)?;
+            }
+            if let Some(result) = &effect.result {
+                if effect.certified_q.is_none() {
+                    return Err(corrupt("effect result lacks Q"));
+                }
+                result.require_present(&self.root)?;
             }
         }
         for source in account.source_q.values() {
@@ -1556,12 +1578,19 @@ impl Index {
                     || a.effects.contains_key(&id)
                     || effect.consumed_k.is_some()
                     || effect.certified_q.is_some()
+                    || effect.result.is_some()
                 {
                     return Err(IndexError::Conflict(
                         "effect identity already announced or includes K",
                     ));
                 }
                 effect.intent.validate()?;
+                if let Some(source) = &effect.route_source {
+                    source.require_present(&self.root)?;
+                }
+                if let Some(candidate) = &effect.candidate {
+                    candidate.require_present(&self.root)?;
+                }
                 if let Some(reference) = &effect.reuse {
                     reference.validate()?;
                 }
@@ -1582,11 +1611,19 @@ impl Index {
                 }
                 effect.consumed_k = Some(k);
             }
-            AccountUpdate::SettleEffect { id, q, marker } => {
+            AccountUpdate::SettleEffect {
+                id,
+                q,
+                result,
+                marker,
+            } => {
                 let effect = a
                     .effects
                     .get(&id)
                     .ok_or(IndexError::Conflict("effect absent"))?;
+                if result.is_some() && (effect.certified_q.is_some() || effect.result.is_some()) {
+                    return Err(IndexError::Conflict("effect Q/result already certified"));
+                }
                 let k = effect
                     .consumed_k
                     .as_ref()
@@ -1595,12 +1632,21 @@ impl Index {
                     return Err(IndexError::Conflict("effect Q/K mismatch"));
                 }
                 q.verify(&self.root)?;
+                if let Some(result) = &result {
+                    result.require_present(&self.root)?;
+                }
                 let kind = effect.kind.clone();
                 let source = effect.source.clone();
-                a.effects.remove(&id);
-                if marker {
-                    a.mark(&kind, q.completed_unix_nanos);
+                if let Some(result) = result {
+                    let effect = a.effects.get_mut(&id).unwrap();
+                    effect.certified_q = Some(q.clone());
+                    effect.result = Some(result);
                 } else {
+                    a.effects.remove(&id);
+                }
+                if marker == Some(true) {
+                    a.mark(&kind, q.completed_unix_nanos);
+                } else if marker == Some(false) {
                     let digest = keyed(&source)?;
                     let projection = a.source_q.entry(digest).or_insert_with(|| SourceQ {
                         source: source.clone(),
@@ -1712,7 +1758,10 @@ pub(super) enum AccountUpdate {
     SettleEffect {
         id: String,
         q: PhysicalQ,
-        marker: bool,
+        result: Option<Artifact>,
+        /// Some(true): typed rejection; Some(false): healthy source Q.
+        /// None: exact known result without quota or auth authority.
+        marker: Option<bool>,
     },
     PruneFailures {
         before_nanos: i64,
@@ -2106,10 +2155,14 @@ mod tests {
                             commands_sha256: "command".into(),
                             environment_sha256: "environment".into(),
                         },
+                        decision_handoff: String::new(),
+                        route_source: None,
+                        candidate: None,
                         intent: intent.clone(),
                         reuse: None,
                         consumed_k: None,
                         certified_q: None,
+                        result: None,
                     },
                 },
             )
@@ -2165,7 +2218,8 @@ mod tests {
                         terminal: None,
                         completed_unix_nanos: 20,
                     },
-                    marker: false,
+                    result: None,
+                    marker: Some(false),
                 },
             )
             .unwrap();
@@ -2283,10 +2337,14 @@ mod tests {
                                 commands_sha256: format!("{id}-source"),
                                 environment_sha256: "env".into(),
                             },
+                            decision_handoff: String::new(),
+                            route_source: None,
+                            candidate: None,
                             intent: future_artifact(&format!("{id}-intent"), b"I"),
                             reuse: None,
                             consumed_k: None,
                             certified_q: None,
+                            result: None,
                         },
                     },
                 )
@@ -2327,7 +2385,8 @@ mod tests {
                         terminal: None,
                         completed_unix_nanos: 40,
                     },
-                    marker: true,
+                    result: None,
+                    marker: Some(true),
                 },
             )
             .unwrap();
@@ -2416,7 +2475,8 @@ mod tests {
                         terminal: None,
                         completed_unix_nanos: 50,
                     },
-                    marker: false,
+                    result: None,
+                    marker: Some(false),
                 },
             )
             .unwrap();
@@ -2433,5 +2493,87 @@ mod tests {
         let mut a = index.account("physical").unwrap();
         a.recent_failure_nanos = vec![1; MAX_RECENT_FAILURES];
         assert!(matches!(a.add_failure(2), Err(IndexError::Conflict(_))));
+    }
+
+    #[test]
+    fn indexed_effect_older_certified_q_cannot_replace_newer_source_q() {
+        let (temp, index) = fresh();
+        let source = SourceKey {
+            commands_sha256: "same-command".into(),
+            environment_sha256: "same-environment".into(),
+        };
+        for (id, nanos) in [("newer", 50), ("older", 10)] {
+            let account = index.account("physical").unwrap();
+            index
+                .update_account(
+                    "physical",
+                    account.revision,
+                    AccountUpdate::AnnounceEffect {
+                        id: id.into(),
+                        effect: EffectIntent {
+                            kind: EffectKind::Quota,
+                            source: source.clone(),
+                            decision_handoff: id.into(),
+                            route_source: None,
+                            candidate: None,
+                            intent: future_artifact(&format!("{id}-intent"), b"intent"),
+                            reuse: None,
+                            consumed_k: None,
+                            certified_q: None,
+                            result: None,
+                        },
+                    },
+                )
+                .unwrap();
+            artifact(temp.path(), &format!("{id}-intent"), b"intent");
+            let k = artifact(temp.path(), &format!("{id}-k"), b"K");
+            let account = index.account("physical").unwrap();
+            index
+                .update_account(
+                    "physical",
+                    account.revision,
+                    AccountUpdate::ConsumeEffect {
+                        id: id.into(),
+                        k: k.clone(),
+                    },
+                )
+                .unwrap();
+            let q = artifact(temp.path(), &format!("{id}-q"), b"Q");
+            let result = artifact(temp.path(), &format!("{id}-result"), b"result");
+            let account = index.account("physical").unwrap();
+            index
+                .update_account(
+                    "physical",
+                    account.revision,
+                    AccountUpdate::SettleEffect {
+                        id: id.into(),
+                        q: PhysicalQ {
+                            physical_k: k,
+                            q,
+                            terminal: None,
+                            completed_unix_nanos: nanos,
+                        },
+                        result: Some(result),
+                        marker: Some(false),
+                    },
+                )
+                .unwrap();
+        }
+        let account = index.account("physical").unwrap();
+        assert_eq!(account.effects.len(), 2);
+        assert!(
+            account
+                .effects
+                .values()
+                .all(|effect| effect.result.is_some())
+        );
+        assert_eq!(
+            account.source_q[&keyed(&source).unwrap()]
+                .latest_quota_q
+                .as_ref()
+                .unwrap()
+                .completed_unix_nanos,
+            50
+        );
     }
 }

@@ -34,6 +34,19 @@ fn stop(child: &mut Child) {
     let _ = child.wait();
 }
 
+fn indexed_physical_account(provider_dir: &Path, physical: &str) -> serde_json::Value {
+    for entry in fs::read_dir(provider_dir.join("index-v1/accounts")).unwrap() {
+        let path = entry.unwrap().path();
+        if let Ok(bytes) = fs::read(path)
+            && let Ok(sealed) = serde_json::from_slice::<serde_json::Value>(&bytes)
+            && sealed["data"]["physical_key"] == physical
+        {
+            return sealed["data"].clone();
+        }
+    }
+    panic!("indexed physical account {physical} absent");
+}
+
 struct SnapshotRestore {
     path: std::path::PathBuf,
     bytes: Vec<u8>,
@@ -198,7 +211,7 @@ fn inner() {
         fs::write(
             config_dir.join("providers.toml"),
             format!(
-                "[unused]\ncommand = {provider_command}\nargs = [{unused_marker}]\n[{provider_name}]\ncommand = {provider_command}\nargs = [{local_args}]\n{prompt_mode}{quota}"
+                "[unused]\ncommand = {provider_command}\nargs = [{unused_marker}]\nquota_account_id = 'physical-unused'\n[{provider_name}]\ncommand = {provider_command}\nargs = [{local_args}]\nquota_account_id = 'physical-local'\n{prompt_mode}{quota}"
             ),
         )
         .unwrap();
@@ -1510,6 +1523,22 @@ fn inner() {
                         .unwrap();
                         assert_eq!(effect["state"], "drained");
                         assert_eq!(effect["outcome"], "valid_windows");
+                        if std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_ROUTE_INDEX_V1")
+                            .is_some()
+                        {
+                            let account = indexed_physical_account(&provider_dir, "physical-local");
+                            let intent: serde_json::Value = serde_json::from_slice(
+                                &fs::read(effect_dir.join("intent.json")).unwrap(),
+                            )
+                            .unwrap();
+                            let indexed = &account["effects"][intent["id"].as_str().unwrap()];
+                            assert_eq!(indexed["decision_handoff"], receipt.handoff_id);
+                            assert!(indexed["route_source"].is_object());
+                            assert!(indexed["candidate"].is_object());
+                            assert!(indexed["consumed_k"].is_object());
+                            assert!(indexed["certified_q"].is_object());
+                            assert!(indexed["result"].is_object());
+                        }
                         if mode == "normal_model_provider_quota_reply_loss" {
                             assert!(
                                 gate.join("account-effect-reply-dropped").exists(),
@@ -1555,6 +1584,20 @@ fn inner() {
                             .unwrap();
                             assert_eq!(effect["state"], "drained");
                             assert_eq!(effect["outcome"], expected);
+                            if std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_ROUTE_INDEX_V1")
+                                .is_some()
+                            {
+                                let account =
+                                    indexed_physical_account(&provider_dir, "physical-local");
+                                let intent: serde_json::Value = serde_json::from_slice(
+                                    &fs::read(effect_dir.join("intent.json")).unwrap(),
+                                )
+                                .unwrap();
+                                let indexed = &account["effects"][intent["id"].as_str().unwrap()];
+                                assert!(indexed["consumed_k"].is_object());
+                                assert!(indexed["certified_q"].is_object());
+                                assert!(indexed["result"].is_object());
+                            }
                             assert_eq!(
                                 fs::read_dir(&effect_dir)
                                     .unwrap()

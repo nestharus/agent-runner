@@ -491,33 +491,33 @@ fn collect_effects(root: &Path, source: &Path, snapshot: &mut OfflineSnapshot) -
         };
         let source_key = source_key(&candidate, &intent.environment_sha256)?;
         let relative = dir.strip_prefix(root).map_err(io::Error::other)?;
-        let certified_q = if readback.state == "drained" {
-            if let (Some(k), Some(grant)) = (k.as_ref(), grant.as_ref()) {
-                let q_path = relative.join(format!("{}.drain.json", grant.id));
-                Some(PhysicalQ {
-                    physical_k: k.clone(),
-                    q: artifact(root, &q_path)?,
-                    terminal: None,
-                    completed_unix_nanos: i64::try_from(file_unix_nanos(&root.join(&q_path))?)
-                        .map_err(io::Error::other)?,
-                })
-            } else {
-                None
-            }
-        } else {
-            None
-        };
         let effect = EffectIntent {
             kind,
             source: source_key,
+            decision_handoff: intent.binding.handoff_id.clone(),
+            route_source: Some(artifact(
+                root,
+                format!("{}.route-source.json", intent.binding.handoff_id),
+            )?),
+            candidate: Some(artifact(
+                root,
+                candidate_name(&intent.binding.handoff_id, candidate.index),
+            )?),
             intent: artifact(root, relative.join("intent.json"))?,
-            reuse: ["reuse.json", "manual-reuse.json"]
-                .iter()
-                .find(|name| dir.join(name).exists())
-                .map(|name| artifact(root, relative.join(name)))
-                .transpose()?,
+            reuse: if intent.auth_source.is_some() {
+                Some(artifact(root, relative.join("intent.json"))?)
+            } else {
+                ["reuse.json", "manual-reuse.json"]
+                    .iter()
+                    .find(|name| dir.join(name).exists())
+                    .map(|name| artifact(root, relative.join(name)))
+                    .transpose()?
+            },
             consumed_k: k,
-            certified_q,
+            // Publication stays read-only. Live admission certifies exact
+            // physical Q and result together after independent readback.
+            certified_q: None,
+            result: None,
         };
         let a = account(snapshot, &candidate.account_identity);
         if a.effects.insert(intent.id.clone(), effect).is_some() {
@@ -598,6 +598,11 @@ pub(crate) fn reconcile_offline_account(
     }
     let effects = current.effects.clone();
     for (id, indexed) in effects {
+        if indexed.kind != EffectKind::ManualQuota {
+            // The live writer retains physical effect IDs and certifies Q
+            // together with the materialized result at broker admission.
+            continue;
+        }
         let Some(k) = indexed.consumed_k else {
             continue;
         };
@@ -670,7 +675,8 @@ pub(crate) fn reconcile_offline_account(
                 AccountUpdate::SettleEffect {
                     id,
                     q,
-                    marker: false,
+                    result: None,
+                    marker: Some(false),
                 },
             )
             .map_err(io::Error::other)?;
@@ -1508,12 +1514,17 @@ mod tests {
             before
                 .effects
                 .values()
-                .all(|effect| effect.consumed_k.is_some() && effect.certified_q.is_some())
+                .all(|effect| effect.consumed_k.is_some() && effect.certified_q.is_none())
         );
         let after = index
             .reconcile_offline_account("physical-first", &fixture.source)
             .unwrap();
-        assert!(after.effects.is_empty());
+        assert_eq!(after.effects.len(), 2);
+        assert!(after.source_q.is_empty());
+        let lease = broker_admission_lease(&fixture.root).unwrap();
+        let live = Index::admit_live_routes(&fixture.root, &lease).unwrap();
+        let after = live.account("physical-first").unwrap();
+        assert!(after.effects.values().all(|effect| effect.result.is_some()));
         assert_eq!(after.source_q.len(), 1);
         let q = after.source_q.values().next().unwrap();
         assert!(q.latest_quota_q.is_some());

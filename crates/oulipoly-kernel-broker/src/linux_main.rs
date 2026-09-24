@@ -4536,7 +4536,7 @@ fn serve_fresh_v30_at(
                             ));
                         }
                         let effect = if operation == b'm' {
-                            fresh_provider::begin_account_effect(
+                            fresh_provider::begin_account_effect_indexed(
                                 &directory,
                                 &binding,
                                 &effect_request,
@@ -4544,12 +4544,14 @@ fn serve_fresh_v30_at(
                                 &actor,
                                 actor_uid,
                                 actor_gid,
+                                route_index.as_ref(),
                             )?
                         } else {
-                            fresh_provider::observe_account_effect(
+                            fresh_provider::observe_account_effect_indexed(
                                 &directory,
                                 &binding,
                                 &effect_request,
+                                route_index.as_ref(),
                             )?
                         };
                         if operation == b'm'

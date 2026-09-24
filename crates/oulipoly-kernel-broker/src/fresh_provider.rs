@@ -4,8 +4,8 @@
 //! its Q-gated readbacks without publishing terminal success.
 use super::work_launch;
 use crate::linux_main::fresh_index::{
-    AccountUpdate, Artifact, CursorKey, Decision, Index, PhysicalQ, ProviderGrant,
-    TerminalMarkerKind,
+    AccountUpdate, Artifact, CursorKey, Decision, EffectIntent, EffectKind, Index, PhysicalQ,
+    ProviderGrant, SourceKey, TerminalMarkerKind,
 };
 use chrono::{DateTime, Utc};
 use oulipoly_kernel_broker::identity::{PinnedProcess, host_proc_file, observed_incarnation_gone};
@@ -426,6 +426,7 @@ pub(super) struct Prepared {
     plan: Plan,
     directory: PathBuf,
     indexed_account: Option<String>,
+    indexed_effect: Option<AccountEffectIntent>,
 }
 
 impl Prepared {
@@ -1026,6 +1027,308 @@ fn effect_candidate(
     Ok(candidate)
 }
 
+fn effect_artifact(root: &Path, path: &Path) -> io::Result<Artifact> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| io::Error::other("effect artifact outside broker root"))?;
+    Artifact::from_existing(root, relative).map_err(io::Error::other)
+}
+
+/// Mirror one exact retained effect into its source-selected physical account.
+/// The announcement is read back before K; a lost CAS reply after K is debt,
+/// never a reason to create another process.
+fn reconcile_indexed_account_effect(
+    index: &Index,
+    dir: &Path,
+    intent: &AccountEffectIntent,
+) -> io::Result<String> {
+    let root = index.evidence_root();
+    if index
+        .decision(&intent.binding.handoff_id)
+        .map_err(io::Error::other)?
+        .is_some()
+        || root
+            .join(decision_name(&intent.binding.handoff_id))
+            .exists()
+    {
+        index
+            .require_live_route(&intent.binding.handoff_id)
+            .map_err(io::Error::other)?;
+    }
+    let candidate = effect_candidate(root, &intent.binding, &intent.request)?;
+    let source_name = format!("{}.route-source.json", intent.binding.handoff_id);
+    let registered: RouteSource = exact_file(root, &source_name)?
+        .ok_or_else(|| io::Error::other("indexed effect route source absent"))?;
+    if intent.version != 1
+        || intent.plan_sha256.is_empty()
+        || intent.id.is_empty()
+        || intent.environment_sha256.len() != 64
+        || !intent
+            .environment_sha256
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit())
+        || registered.version != 1
+        || registered.binding != intent.binding
+        || registered.config_sha256 != candidate.config_sha256
+        || candidate.total == 0
+        || candidate.index >= candidate.total
+        || effect_directory(root, &intent.binding, &intent.request) != dir
+        || effect_intent(dir)?.as_ref() != Some(intent)
+    {
+        return Err(io::Error::other("indexed effect route or intent changed"));
+    }
+    let key = candidate.account_identity.clone();
+    if dir.join("reuse.json").exists() && dir.join("manual-reuse.json").exists() {
+        return Err(io::Error::other("indexed effect has conflicting reuse"));
+    }
+    let reuse_path = ["reuse.json", "manual-reuse.json"]
+        .into_iter()
+        .find(|name| dir.join(name).exists());
+    let reuse_path = if intent.auth_source.is_some() {
+        Some("intent.json")
+    } else {
+        reuse_path
+    };
+    let reuse = reuse_path
+        .map(|name| effect_artifact(root, &dir.join(name)))
+        .transpose()?;
+    if reuse.is_none()
+        && (intent.plan_sha256.starts_with("reused:")
+            || intent.plan_sha256.starts_with("manual:")
+            || intent.plan_sha256.starts_with("coalesced:"))
+    {
+        return Err(io::Error::other("indexed effect reuse reference absent"));
+    }
+    let intent_artifact = effect_artifact(root, &dir.join("intent.json"))?;
+    let candidate_artifact = effect_artifact(
+        root,
+        &root.join(candidate_name(&intent.binding.handoff_id, candidate.index)),
+    )?;
+    let source = SourceKey {
+        commands_sha256: format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&(
+                &candidate.quota_script,
+                &candidate.auth_refresh_command
+            ))?)
+        ),
+        environment_sha256: intent.environment_sha256.clone(),
+    };
+    let kind = match intent.request.kind {
+        FreshAccountEffectKind::AuthRefresh => EffectKind::Auth,
+        FreshAccountEffectKind::QuotaFirst | FreshAccountEffectKind::QuotaRetry => {
+            EffectKind::Quota
+        }
+    };
+    let announced = EffectIntent {
+        kind,
+        source,
+        decision_handoff: intent.binding.handoff_id.clone(),
+        route_source: Some(effect_artifact(root, &root.join(source_name))?),
+        candidate: Some(candidate_artifact),
+        intent: intent_artifact,
+        reuse,
+        consumed_k: None,
+        certified_q: None,
+        result: None,
+    };
+    let grant = grant_for_binding(dir, &intent.binding)?;
+    let retained_grant = grant
+        .as_ref()
+        .map(|_| {
+            exact_file::<Grant>(
+                dir,
+                &format!("{}.fresh-grant.json", intent.binding.handoff_id),
+            )
+        })
+        .transpose()?
+        .flatten();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if let Some(id) = name.strip_suffix(".consumed.json")
+            && grant.as_deref() != Some(id)
+        {
+            return Err(io::Error::other("indexed effect K lacks exact grant"));
+        }
+    }
+    let k = grant
+        .as_ref()
+        .map(|id| exact_file::<Grant>(dir, &format!("{id}.consumed.json")))
+        .transpose()?
+        .flatten();
+    if let Some(ref k) = k {
+        if Some(k) != retained_grant.as_ref() || k.plan_sha256 != intent.plan_sha256 {
+            return Err(io::Error::other("indexed effect physical K changed"));
+        }
+    }
+    let mut account = index.account(&key).map_err(io::Error::other)?;
+    if let Some(existing) = account.effects.get(&intent.id) {
+        if existing.kind != announced.kind
+            || existing.source != announced.source
+            || existing.decision_handoff != announced.decision_handoff
+            || existing.route_source != announced.route_source
+            || existing.candidate != announced.candidate
+            || existing.intent != announced.intent
+            || existing.reuse != announced.reuse
+        {
+            return Err(io::Error::other("indexed effect announcement changed"));
+        }
+    } else {
+        if k.is_some() {
+            return Err(io::Error::other(
+                "physical effect K lacks indexed announcement",
+            ));
+        }
+        let update = index.update_account(
+            &key,
+            account.revision,
+            AccountUpdate::AnnounceEffect {
+                id: intent.id.clone(),
+                effect: announced.clone(),
+            },
+        );
+        account = index.account(&key).map_err(io::Error::other)?;
+        if account.effects.get(&intent.id) != Some(&announced) {
+            return Err(io::Error::other(format!(
+                "indexed effect announcement failed: {update:?}"
+            )));
+        }
+    }
+    if announced.reuse.is_some() {
+        if k.is_some() || account.effects[&intent.id].consumed_k.is_some() {
+            return Err(io::Error::other("reused effect has physical K"));
+        }
+        return Ok(key);
+    }
+    if let Some(k) = k {
+        let grant_id = k.id.clone();
+        let k_artifact = effect_artifact(root, &dir.join(format!("{grant_id}.consumed.json")))?;
+        if account.effects[&intent.id].consumed_k.as_ref() != Some(&k_artifact) {
+            if account.effects[&intent.id].consumed_k.is_some() {
+                return Err(io::Error::other("indexed effect K changed"));
+            }
+            let update = index.update_account(
+                &key,
+                account.revision,
+                AccountUpdate::ConsumeEffect {
+                    id: intent.id.clone(),
+                    k: k_artifact.clone(),
+                },
+            );
+            account = index.account(&key).map_err(io::Error::other)?;
+            if account.effects[&intent.id].consumed_k.as_ref() != Some(&k_artifact) {
+                return Err(io::Error::other(format!(
+                    "indexed effect K publication failed: {update:?}"
+                )));
+            }
+        }
+        let result = effect_readback_from_dir(dir, intent)?;
+        if result.state == "drained" {
+            let q_path = dir.join(format!("{grant_id}.drain.json"));
+            let q = PhysicalQ {
+                physical_k: k_artifact,
+                q: effect_artifact(root, &q_path)?,
+                terminal: None,
+                completed_unix_nanos: i64::try_from(file_unix_nanos(&q_path)?)
+                    .map_err(io::Error::other)?,
+            };
+            let result_artifact = effect_artifact(root, &dir.join("result.json"))?;
+            let indexed = &account.effects[&intent.id];
+            if indexed.certified_q.as_ref() != Some(&q)
+                || indexed.result.as_ref() != Some(&result_artifact)
+            {
+                if indexed.certified_q.is_some() || indexed.result.is_some() {
+                    return Err(io::Error::other("indexed effect Q/result changed"));
+                }
+                let marker = match result.outcome.as_deref() {
+                    Some("valid_windows" | "refreshed") => Some(false),
+                    _ => None,
+                };
+                let update = index.update_account(
+                    &key,
+                    account.revision,
+                    AccountUpdate::SettleEffect {
+                        id: intent.id.clone(),
+                        q: q.clone(),
+                        result: Some(result_artifact.clone()),
+                        marker,
+                    },
+                );
+                account = index.account(&key).map_err(io::Error::other)?;
+                let indexed = &account.effects[&intent.id];
+                if indexed.certified_q.as_ref() != Some(&q)
+                    || indexed.result.as_ref() != Some(&result_artifact)
+                {
+                    return Err(io::Error::other(format!(
+                        "indexed effect Q/result publication failed: {update:?}"
+                    )));
+                }
+            }
+        } else if account.effects[&intent.id].certified_q.is_some() {
+            return Err(io::Error::other(
+                "indexed effect settlement lost physical Q",
+            ));
+        }
+    } else if account.effects[&intent.id].consumed_k.is_some() {
+        return Err(io::Error::other("indexed effect K lost physical reference"));
+    } else if announced.reuse.is_none() {
+        if dir.join("result.json").exists() {
+            return Err(io::Error::other("indexed effect result precedes K"));
+        }
+        for entry in std::fs::read_dir(dir)? {
+            if entry?
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".drain.json")
+            {
+                return Err(io::Error::other("indexed effect Q precedes K"));
+            }
+        }
+    }
+    Ok(key)
+}
+
+pub(super) fn reconcile_live_account_effects(index: &Index) -> io::Result<()> {
+    let parent = index.evidence_root().join("account-effects");
+    let entries = match std::fs::read_dir(&parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !entry.file_type()?.is_dir() {
+            if name.ends_with("-quota-first")
+                || name.ends_with("-quota-retry")
+                || name.ends_with("-auth-refresh")
+            {
+                return Err(io::Error::other("indexed effect directory is not physical"));
+            }
+            continue;
+        }
+        let dir = entry.path();
+        if let Some(intent) = effect_intent(&dir)? {
+            reconcile_indexed_account_effect(index, &dir, &intent)?;
+        } else {
+            for artifact in std::fs::read_dir(&dir)? {
+                let name = artifact?.file_name();
+                let name = name.to_string_lossy();
+                if name.ends_with(".consumed.json")
+                    || name.ends_with(".drain.json")
+                    || name == "result.json"
+                {
+                    return Err(io::Error::other("physical effect evidence without intent"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The identity is source-owned, and the source command must agree too. A
 /// matching label, model name, or member index is never quota authority.
 fn same_physical_effect_source(
@@ -1499,10 +1802,20 @@ pub(super) fn parse_effect_windows(raw: &str) -> io::Result<Vec<FreshQuotaWindow
         .collect()
 }
 
+#[cfg(test)]
 pub(super) fn observe_account_effect(
     directory: &Path,
     binding: &Binding,
     request: &FreshAccountEffectRequest,
+) -> io::Result<FreshAccountEffectReadback> {
+    observe_account_effect_indexed(directory, binding, request, None)
+}
+
+pub(super) fn observe_account_effect_indexed(
+    directory: &Path,
+    binding: &Binding,
+    request: &FreshAccountEffectRequest,
+    index: Option<&Index>,
 ) -> io::Result<FreshAccountEffectReadback> {
     effect_candidate(directory, binding, request)?;
     let dir = effect_directory(directory, binding, request);
@@ -1515,11 +1828,16 @@ pub(super) fn observe_account_effect(
     {
         return Err(io::Error::other("fresh account effect readback mismatch"));
     }
-    effect_readback_from_dir(&dir, &intent)
+    let result = effect_readback_from_dir(&dir, &intent)?;
+    if let Some(index) = index {
+        reconcile_indexed_account_effect(index, &dir, &intent)?;
+    }
+    Ok(result)
 }
 
 /// The intent is fsynced before a separate one-use K. Any failure after that
 /// point is unknown, and a second begin can only be observed, never launched.
+#[cfg(test)]
 pub(super) fn begin_account_effect(
     directory: &Path,
     binding: &Binding,
@@ -1528,6 +1846,19 @@ pub(super) fn begin_account_effect(
     actor: &PinnedProcess,
     uid: u32,
     gid: u32,
+) -> io::Result<FreshAccountEffectReadback> {
+    begin_account_effect_indexed(directory, binding, request, root, actor, uid, gid, None)
+}
+
+pub(super) fn begin_account_effect_indexed(
+    directory: &Path,
+    binding: &Binding,
+    request: &FreshAccountEffectRequest,
+    root: &PinnedProcess,
+    actor: &PinnedProcess,
+    uid: u32,
+    gid: u32,
+    index: Option<&Index>,
 ) -> io::Result<FreshAccountEffectReadback> {
     let candidate = effect_candidate(directory, binding, request)?;
     let command = effect_command(&candidate, request.kind)?;
@@ -1564,7 +1895,7 @@ pub(super) fn begin_account_effect(
         ..request.clone()
     };
     if request.kind != FreshAccountEffectKind::QuotaFirst {
-        let first = observe_account_effect(directory, binding, &first_request)?;
+        let first = observe_account_effect_indexed(directory, binding, &first_request, index)?;
         // The provider can reject expired credentials while quota still
         // reports healthy. Require its exact typed, physical Q before auth.
         let provider_auth_rejection = if first.outcome.as_deref() == Some("valid_windows") {
@@ -1589,13 +1920,14 @@ pub(super) fn begin_account_effect(
             ));
         }
         if request.kind == FreshAccountEffectKind::QuotaRetry {
-            let auth = observe_account_effect(
+            let auth = observe_account_effect_indexed(
                 directory,
                 binding,
                 &FreshAccountEffectRequest {
                     kind: FreshAccountEffectKind::AuthRefresh,
                     ..request.clone()
                 },
+                index,
             )?;
             if auth.state != "drained" || auth.outcome.as_deref() != Some("refreshed") {
                 return Err(io::Error::other(format!(
@@ -1631,6 +1963,9 @@ pub(super) fn begin_account_effect(
                 }),
             };
             durable_new(&dir, "intent.json", &intent)?;
+            if let Some(index) = index {
+                reconcile_indexed_account_effect(index, &dir, &intent)?;
+            }
             return effect_readback_from_dir(&dir, &intent);
         }
     }
@@ -1703,6 +2038,9 @@ pub(super) fn begin_account_effect(
                         source_effect_id: effect_id.clone(),
                     },
                 )?;
+                if let Some(index) = index {
+                    reconcile_indexed_account_effect(index, &dir, &intent)?;
+                }
                 return effect_readback_from_dir(&dir, &intent);
             }
         }
@@ -1730,6 +2068,9 @@ pub(super) fn begin_account_effect(
                     source_effect_id: source.id,
                 },
             )?;
+            if let Some(index) = index {
+                reconcile_indexed_account_effect(index, &dir, &intent)?;
+            }
             return effect_readback_from_dir(&dir, &intent);
         }
     }
@@ -1763,9 +2104,17 @@ pub(super) fn begin_account_effect(
         auth_source: None,
     };
     durable_new(&dir, "intent.json", &intent)?;
-    let prepared = prepare(&dir, binding.clone(), plan)?;
-    launch(prepared, root, actor, uid, gid, None)?;
-    effect_readback_from_dir(&dir, &intent)
+    let mut prepared = prepare(&dir, binding.clone(), plan)?;
+    if let Some(index) = index {
+        prepared.indexed_account = Some(reconcile_indexed_account_effect(index, &dir, &intent)?);
+        prepared.indexed_effect = Some(intent.clone());
+    }
+    launch(prepared, root, actor, uid, gid, index)?;
+    let result = effect_readback_from_dir(&dir, &intent)?;
+    if let Some(index) = index {
+        reconcile_indexed_account_effect(index, &dir, &intent)?;
+    }
+    Ok(result)
 }
 
 /// A candidate is a broker-pinned exact provider plan. It is durable before
@@ -2983,6 +3332,7 @@ pub(super) fn prepare(directory: &Path, binding: Binding, plan: Plan) -> io::Res
         plan,
         directory: directory.to_owned(),
         indexed_account: None,
+        indexed_effect: None,
     })
 }
 
@@ -3366,13 +3716,24 @@ pub(super) fn launch(
         return Err(io::Error::other("fresh provider plan changed before K"));
     }
     if let Some(index) = index {
-        prepared.require_indexed_route(index)?;
-        if prepared.indexed_account.as_deref()
-            != Some(reconcile_indexed_provider_grant(index, &prepared.grant)?.as_str())
-        {
-            return Err(io::Error::other(
-                "indexed provider account changed before K",
-            ));
+        if let Some(intent) = &prepared.indexed_effect {
+            let account = reconcile_indexed_account_effect(index, &prepared.directory, intent)?;
+            if prepared.indexed_account.as_deref() != Some(account.as_str())
+                || index.account(&account).map_err(io::Error::other)?.effects[&intent.id]
+                    .consumed_k
+                    .is_some()
+            {
+                return Err(io::Error::other("indexed effect account changed before K"));
+            }
+        } else {
+            prepared.require_indexed_route(index)?;
+            if prepared.indexed_account.as_deref()
+                != Some(reconcile_indexed_provider_grant(index, &prepared.grant)?.as_str())
+            {
+                return Err(io::Error::other(
+                    "indexed provider account changed before K",
+                ));
+            }
         }
     }
     if prepared
@@ -3390,7 +3751,11 @@ pub(super) fn launch(
     if let Some(index) = index {
         // The provider child has not been created. A failed publication leaves
         // one-use K debt, but cannot release the executable.
-        reconcile_indexed_provider_grant(index, &prepared.grant)?;
+        if let Some(intent) = &prepared.indexed_effect {
+            reconcile_indexed_account_effect(index, &prepared.directory, intent)?;
+        } else {
+            reconcile_indexed_provider_grant(index, &prepared.grant)?;
+        }
     }
     let stdout = OpenOptions::new()
         .read(true)
@@ -4502,6 +4867,364 @@ mod tests {
             quota_script: None,
             auth_refresh_command: None,
         }
+    }
+
+    struct IndexedEffectFixture {
+        temp: tempfile::TempDir,
+        index: Index,
+        binding: Binding,
+    }
+
+    impl IndexedEffectFixture {
+        fn new() -> Self {
+            use crate::linux_main::fresh_index::broker_admission_lease;
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("broker");
+            std::fs::create_dir(&root).unwrap();
+            let lease = broker_admission_lease(&root).unwrap();
+            let index = Index::admit_live_routes(&root, &lease).unwrap();
+            let process = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+            let binding = fixture_binding(&process, &process);
+            let source_dir = temp.path().join("source");
+            std::fs::create_dir(&source_dir).unwrap();
+            let source = File::open(&source_dir).unwrap();
+            let source_meta = source.metadata().unwrap();
+            durable_new(
+                &root,
+                &format!("{}.route-source.json", binding.handoff_id),
+                &RouteSource {
+                    version: 1,
+                    binding: binding.clone(),
+                    config_sha256: "c".repeat(64),
+                    directory_device: source_meta.dev(),
+                    directory_inode: source_meta.ino(),
+                },
+            )
+            .unwrap();
+            for (i, physical) in ["physical-first", "physical-second"].iter().enumerate() {
+                durable_new(
+                    &root,
+                    &candidate_name(&binding.handoff_id, i),
+                    &RouteCandidate {
+                        version: 3,
+                        binding: binding.clone(),
+                        model: "work".into(),
+                        config_sha256: "c".repeat(64),
+                        account: format!("account-{i}"),
+                        account_identity: (*physical).into(),
+                        index: i,
+                        total: 2,
+                        pin: None,
+                        plan_sha256: "a".repeat(64),
+                        quota_script: Some("printf ok".into()),
+                        auth_refresh_command: Some("true".into()),
+                        terminal_recognizer: FreshTerminalRecognizer::OpenAiCompat,
+                    },
+                )
+                .unwrap();
+            }
+            Self {
+                temp,
+                index,
+                binding,
+            }
+        }
+
+        fn root(&self) -> PathBuf {
+            self.temp.path().join("broker")
+        }
+
+        fn effect(&self, member: usize) -> (PathBuf, AccountEffectIntent, Grant) {
+            let request = FreshAccountEffectRequest {
+                d_key: uuid::Uuid::new_v4().to_string(),
+                model: "work".into(),
+                config_sha256: "c".repeat(64),
+                account: format!("account-{member}"),
+                index: member,
+                kind: FreshAccountEffectKind::QuotaFirst,
+                environment: Vec::new(),
+            };
+            let dir = effect_directory(&self.root(), &self.binding, &request);
+            std::fs::create_dir_all(&dir).unwrap();
+            let intent = AccountEffectIntent {
+                version: 1,
+                id: uuid::Uuid::new_v4().to_string(),
+                binding: self.binding.clone(),
+                request: redacted_effect_request(&request),
+                environment_sha256: environment_digest(&request).unwrap(),
+                plan_sha256: "b".repeat(64),
+                auth_source: None,
+            };
+            durable_new(&dir, "intent.json", &intent).unwrap();
+            let grant = Grant {
+                version: 1,
+                id: uuid::Uuid::new_v4().to_string(),
+                binding: self.binding.clone(),
+                plan_sha256: intent.plan_sha256.clone(),
+            };
+            durable_new(
+                &dir,
+                &format!("{}.fresh-grant.json", self.binding.handoff_id),
+                &grant,
+            )
+            .unwrap();
+            (dir, intent, grant)
+        }
+
+        fn physical_q_before_wait(dir: &Path, grant: &Grant, stdout_bytes: &[u8]) -> String {
+            let work = uuid::Uuid::new_v4().to_string();
+            durable_new(
+                dir,
+                &format!("{}.attach.json", grant.id),
+                &Attach {
+                    version: 1,
+                    grant_id: grant.id.clone(),
+                    work_id: work.clone(),
+                    pid1: 999_999_999,
+                    pid1_starttime: 1,
+                    pidns_dev: 0,
+                    pidns_ino: 0,
+                    pid1_parent_namespace_pid: 999_999_999,
+                    provider_pid: 999_999_999,
+                    provider_starttime: 1,
+                    provider_local_pid: 2,
+                },
+            )
+            .unwrap();
+            let stdout_path = dir.join(format!("{}.stdout", grant.id));
+            let stderr_path = dir.join(format!("{}.stderr", grant.id));
+            std::fs::write(&stdout_path, stdout_bytes).unwrap();
+            std::fs::write(&stderr_path, b"").unwrap();
+            durable_new(
+                dir,
+                &format!("{}.drain.json", grant.id),
+                &Drain {
+                    version: 1,
+                    grant_id: grant.id.clone(),
+                    work_id: work.clone(),
+                    stdout: output(&File::open(stdout_path).unwrap()).unwrap(),
+                    stderr: output(&File::open(stderr_path).unwrap()).unwrap(),
+                    cancelled: false,
+                    zero_remaining: true,
+                },
+            )
+            .unwrap();
+            work
+        }
+
+        fn physical_exit_and_wait(dir: &Path, grant: &Grant, work: String) {
+            durable_new(
+                dir,
+                &format!("{}.exit.json", grant.id),
+                &ProviderExit {
+                    version: 1,
+                    grant_id: grant.id.clone(),
+                    work_id: work.clone(),
+                    provider_local_pid: 2,
+                    wait_status: 0,
+                },
+            )
+            .unwrap();
+            durable_new(
+                dir,
+                &format!("{}.pid1-wait.json", grant.id),
+                &Pid1Wait {
+                    version: 1,
+                    grant_id: grant.id.clone(),
+                    work_id: work,
+                    pid1_parent_namespace_pid: 999_999_999,
+                    wait_status: 0,
+                    reaped: true,
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn indexed_effect_intent_precedes_k_and_restart_reads_exact_physical_debt() {
+        let f = IndexedEffectFixture::new();
+        let wal = f.temp.path().join("state.db-wal");
+        std::fs::write(&wal, b"old WAL stays exact").unwrap();
+        let (dir, intent, grant) = f.effect(0);
+        assert_eq!(
+            reconcile_indexed_account_effect(&f.index, &dir, &intent).unwrap(),
+            "physical-first"
+        );
+        let announced = f.index.account("physical-first").unwrap();
+        let record = &announced.effects[&intent.id];
+        assert_eq!(record.decision_handoff, f.binding.handoff_id);
+        assert!(record.route_source.is_some() && record.candidate.is_some());
+        assert!(record.consumed_k.is_none());
+        assert!(!dir.join(format!("{}.consumed.json", grant.id)).exists());
+        durable_new(&dir, &format!("{}.consumed.json", grant.id), &grant).unwrap();
+        reconcile_indexed_account_effect(&f.index, &dir, &intent).unwrap();
+        let debt = f.index.account("physical-first").unwrap();
+        assert!(debt.effects[&intent.id].consumed_k.is_some());
+        assert!(debt.effects[&intent.id].certified_q.is_none());
+        let restarted = Index::open(&f.root()).unwrap();
+        reconcile_indexed_account_effect(&restarted, &dir, &intent).unwrap();
+        assert_eq!(restarted.account("physical-first").unwrap(), debt);
+        assert_eq!(std::fs::read(wal).unwrap(), b"old WAL stays exact");
+        let (other_dir, other_intent, _) = f.effect(1);
+        reconcile_indexed_account_effect(&restarted, &other_dir, &other_intent).unwrap();
+        assert!(
+            restarted.account("physical-second").unwrap().effects[&other_intent.id]
+                .consumed_k
+                .is_none()
+        );
+        assert_eq!(restarted.account("physical-first").unwrap(), debt);
+    }
+
+    #[test]
+    fn indexed_effect_failed_announcement_and_damaged_generation_leave_no_k() {
+        let f = IndexedEffectFixture::new();
+        let (dir, intent, grant) = f.effect(0);
+        let manifest = f.root().join("index-v1/manifest.json");
+        let original = std::fs::read(&manifest).unwrap();
+        std::fs::write(&manifest, b"damaged generation").unwrap();
+        assert!(reconcile_indexed_account_effect(&f.index, &dir, &intent).is_err());
+        assert!(!dir.join(format!("{}.consumed.json", grant.id)).exists());
+        std::fs::write(manifest, original).unwrap();
+        reconcile_indexed_account_effect(&f.index, &dir, &intent).unwrap();
+        assert!(
+            f.index.account("physical-first").unwrap().effects[&intent.id]
+                .consumed_k
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn indexed_effect_k_persisted_before_failed_cas_is_never_re_effected() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = IndexedEffectFixture::new();
+        let (dir, intent, grant) = f.effect(0);
+        reconcile_indexed_account_effect(&f.index, &dir, &intent).unwrap();
+        durable_new(&dir, &format!("{}.consumed.json", grant.id), &grant).unwrap();
+        let accounts = f.root().join("index-v1/accounts");
+        std::fs::set_permissions(&accounts, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let failed = reconcile_indexed_account_effect(&f.index, &dir, &intent);
+        std::fs::set_permissions(&accounts, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(failed.is_err(), "CAS unexpectedly persisted: {failed:?}");
+        assert!(
+            f.index.account("physical-first").unwrap().effects[&intent.id]
+                .consumed_k
+                .is_none()
+        );
+        let process = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+        assert!(
+            begin_account_effect_indexed(
+                &f.root(),
+                &f.binding,
+                &intent.request,
+                &process,
+                &process,
+                0,
+                0,
+                Some(&f.index)
+            )
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .filter(|entry| entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".consumed.json"))
+                .count(),
+            1
+        );
+        reconcile_indexed_account_effect(&f.index, &dir, &intent).unwrap();
+        assert!(
+            f.index.account("physical-first").unwrap().effects[&intent.id]
+                .consumed_k
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn indexed_effect_q_waits_for_physical_certification_and_keeps_result_on_restart() {
+        use crate::linux_main::fresh_index::broker_admission_lease;
+        let f = IndexedEffectFixture::new();
+        let (dir, intent, grant) = f.effect(0);
+        reconcile_indexed_account_effect(&f.index, &dir, &intent).unwrap();
+        durable_new(&dir, &format!("{}.consumed.json", grant.id), &grant).unwrap();
+        reconcile_indexed_account_effect(&f.index, &dir, &intent).unwrap();
+        let work = IndexedEffectFixture::physical_q_before_wait(
+            &dir,
+            &grant,
+            br#"{"used_percent":20,"resets_at":"2099-01-01T00:00:00Z"}"#,
+        );
+        reconcile_indexed_account_effect(&f.index, &dir, &intent).unwrap();
+        assert!(
+            f.index.account("physical-first").unwrap().effects[&intent.id]
+                .certified_q
+                .is_none()
+        );
+        durable_new(
+            &dir,
+            &format!("{}.exit.json", grant.id),
+            &ProviderExit {
+                version: 1,
+                grant_id: grant.id.clone(),
+                work_id: work.clone(),
+                provider_local_pid: 2,
+                wait_status: 0,
+            },
+        )
+        .unwrap();
+        reconcile_indexed_account_effect(&f.index, &dir, &intent).unwrap();
+        assert!(
+            f.index.account("physical-first").unwrap().effects[&intent.id]
+                .certified_q
+                .is_none()
+        );
+        durable_new(
+            &dir,
+            &format!("{}.pid1-wait.json", grant.id),
+            &Pid1Wait {
+                version: 1,
+                grant_id: grant.id.clone(),
+                work_id: work,
+                pid1_parent_namespace_pid: 999_999_999,
+                wait_status: 0,
+                reaped: true,
+            },
+        )
+        .unwrap();
+        reconcile_indexed_account_effect(&f.index, &dir, &intent).unwrap();
+        let settled = f.index.account("physical-first").unwrap();
+        let effect = &settled.effects[&intent.id];
+        assert!(effect.certified_q.is_some() && effect.result.is_some());
+        assert_eq!(settled.source_q.len(), 1);
+        let result: FreshAccountEffectReadback = exact_file(&dir, "result.json").unwrap().unwrap();
+        assert_eq!(result.outcome.as_deref(), Some("valid_windows"));
+        let lease = broker_admission_lease(&f.root()).unwrap();
+        let restarted = Index::admit_live_routes(&f.root(), &lease).unwrap();
+        assert_eq!(restarted.account("physical-first").unwrap(), settled);
+        assert!(!dir.join(format!("{}.terminal.json", grant.id)).exists());
+    }
+
+    #[test]
+    fn indexed_effect_typed_invalid_result_stays_local_without_quota_authority() {
+        let f = IndexedEffectFixture::new();
+        let (other_dir, other_intent, _) = f.effect(0);
+        reconcile_indexed_account_effect(&f.index, &other_dir, &other_intent).unwrap();
+        let before = f.index.account("physical-first").unwrap();
+        let (dir, intent, grant) = f.effect(1);
+        reconcile_indexed_account_effect(&f.index, &dir, &intent).unwrap();
+        durable_new(&dir, &format!("{}.consumed.json", grant.id), &grant).unwrap();
+        let work = IndexedEffectFixture::physical_q_before_wait(&dir, &grant, b"invalid quota");
+        IndexedEffectFixture::physical_exit_and_wait(&dir, &grant, work);
+        reconcile_indexed_account_effect(&f.index, &dir, &intent).unwrap();
+        let account = f.index.account("physical-second").unwrap();
+        assert!(account.effects[&intent.id].result.is_some());
+        assert!(account.markers.quota_rejection_nanos.is_none());
+        assert!(account.source_q.is_empty());
+        assert_eq!(f.index.account("physical-first").unwrap(), before);
     }
 
     #[test]
