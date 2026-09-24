@@ -712,9 +712,9 @@ impl FreshV30Lane {
             return Err("fresh released handoff absent".into());
         };
         let stored: FreshReleasedHandoff =
-            serde_json::from_str(&json).map_err(|e| e.to_string())?;
+            read_bash_json(&json, "fresh_released_handoff.receipt_json")?;
         let stored_actor: FreshRecipientIdentity =
-            serde_json::from_str(&actor_json).map_err(|e| e.to_string())?;
+            read_bash_json(&actor_json, "fresh_released_handoff.actor_identity")?;
         if stored != *receipt || stored_actor != *actor {
             return Err("fresh released handoff changed or belongs to another child".into());
         }
@@ -738,7 +738,7 @@ impl FreshV30Lane {
             .map_err(|e| e.to_string())?
             .ok_or("fresh released handoff absent before D")?;
         let receipt: FreshReleasedHandoff =
-            serde_json::from_str(&json).map_err(|e| e.to_string())?;
+            read_bash_json(&json, "fresh_released_handoff.receipt_json")?;
         self.require_released_handoff(d_key, &receipt, actor)?;
         Ok(receipt)
     }
@@ -1013,11 +1013,11 @@ impl FreshV30Lane {
         if handoff_id != receipt.handoff_id
             || invocation_uuid != receipt.invocation_uuid
             || session_id != session.session_id
-            || serde_json::from_str::<FreshRecipientIdentity>(&actor_json)
-                .map_err(|e| e.to_string())?
-                != *actor
-            || serde_json::from_str::<FreshRootWorkIntent>(&intent_json)
-                .map_err(|e| e.to_string())?
+            || read_bash_json::<FreshRecipientIdentity>(
+                &actor_json,
+                "fresh_root_effect.actor_identity",
+            )? != *actor
+            || read_bash_json::<FreshRootWorkIntent>(&intent_json, "fresh_root_effect.intent_json")?
                 != receipt.root_work_intent
         {
             return Err("root effect identity readback conflict".into());
@@ -1172,11 +1172,11 @@ impl FreshV30Lane {
             || invocation_uuid != receipt.invocation_uuid
             || session_id != session.session_id
             || state != "held"
-            || serde_json::from_str::<FreshRecipientIdentity>(&actor_json)
-                .map_err(|e| e.to_string())?
-                != *actor
-            || serde_json::from_str::<FreshRootWorkIntent>(&intent_json)
-                .map_err(|e| e.to_string())?
+            || read_bash_json::<FreshRecipientIdentity>(
+                &actor_json,
+                "fresh_normal_work.actor_identity",
+            )? != *actor
+            || read_bash_json::<FreshRootWorkIntent>(&intent_json, "fresh_normal_work.intent_json")?
                 != receipt.root_work_intent
         {
             return Err("normal work preparation identity readback conflict".into());
@@ -1248,9 +1248,10 @@ impl FreshV30Lane {
             return Err("fresh child request absent".into());
         };
         if stored_invocation != invocation_uuid
-            || serde_json::from_str::<FreshRecipientIdentity>(&stored_actor)
-                .map_err(|e| e.to_string())?
-                != *actor
+            || read_bash_json::<FreshRecipientIdentity>(
+                &stored_actor,
+                "fresh_lane_child_request.actor_identity",
+            )? != *actor
             || lane_id != self.identity.lane_id
             || source_generation != self.identity.source_generation
         {
@@ -1279,9 +1280,10 @@ impl FreshV30Lane {
             .map_err(|e| e.to_string())?;
         match stored {
             Some(stored)
-                if serde_json::from_str::<FreshRecipientIdentity>(&stored)
-                    .map_err(|e| e.to_string())?
-                    == *actor => {}
+                if read_bash_json::<FreshRecipientIdentity>(
+                    &stored,
+                    "fresh_lane_child_request.actor_identity",
+                )? == *actor => {}
             Some(_) => return Err("fresh child request belongs to another actor".into()),
             None if required => return Err("fresh child request absent before D".into()),
             None => {}

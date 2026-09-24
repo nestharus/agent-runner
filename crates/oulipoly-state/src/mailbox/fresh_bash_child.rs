@@ -1,5 +1,17 @@
 /// A broker-minted child identity. Neither the request key nor the handle is
 /// authority without the broker's pinned actor and released-root readback.
+fn read_bash_json<T: serde::de::DeserializeOwned>(raw: &str, source: &str) -> Result<T, String> {
+    use sha2::{Digest, Sha256};
+    serde_json::from_str(raw).map_err(|error| {
+        eprintln!(
+            "oulipoly JSON artifact: stage=bash_child_readback source=v30/state.db:{source} bytes={} sha256={:x} cause={error}",
+            raw.len(),
+            Sha256::digest(raw.as_bytes())
+        );
+        "broker State JSON read failed".to_owned()
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FreshBashChild {
@@ -125,8 +137,8 @@ impl FreshV30Lane {
             |row| Ok((row.get(0)?, row.get(1)?)),
         ).optional().map_err(|e| e.to_string())?
             .ok_or("released root absent for Bash child")?;
-        let receipt: FreshReleasedHandoff = serde_json::from_str(&row.0).map_err(|e| e.to_string())?;
-        let actor: FreshRecipientIdentity = serde_json::from_str(&row.1).map_err(|e| e.to_string())?;
+        let receipt: FreshReleasedHandoff = read_bash_json(&row.0, "fresh_released_handoff.receipt_json")?;
+        let actor: FreshRecipientIdentity = read_bash_json(&row.1, "fresh_released_handoff.actor_identity")?;
         self.require_released_handoff(&receipt.d_key, &receipt, &actor)?;
         Ok((receipt, actor))
     }
@@ -227,7 +239,7 @@ impl FreshV30Lane {
             parent_invocation_uuid, actor_json, receipt_json)) = row else {
             return Ok(None);
         };
-        let receipt: FreshBashChild = serde_json::from_str(&receipt_json).map_err(|e| e.to_string())?;
+        let receipt: FreshBashChild = read_bash_json(&receipt_json, "fresh_bash_child.receipt_json")?;
         if receipt.request_id != request_id || receipt.d_key != d_key
             || receipt.invocation_uuid != invocation_uuid || receipt.handle != handle
             || receipt.root_handoff_id != root_handoff_id || receipt.root_id != root_id

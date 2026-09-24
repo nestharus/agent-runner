@@ -804,6 +804,10 @@ fn inner() {
                     .ok()
                     .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
                     .is_none()
+                    && fs::read(gate.join("bash-causal-terminal-status"))
+                        .ok()
+                        .as_deref()
+                        != Some(b"70")
                     && entry.try_wait().unwrap().is_none()
                     && Instant::now() < until
                 {
@@ -820,14 +824,25 @@ fn inner() {
                     &fs::read(gate.join("bash-causal-output")).unwrap(),
                 )
                 .unwrap_or_else(|error| {
+                    let output = fs::read(gate.join("bash-causal-output")).unwrap_or_default();
+                    let prefix = if output.starts_with(b"{") { "json-object" } else { "other-or-empty" };
                     panic!(
-                        "causal Bash: {error}; stderr: {}; entry: {}; broker: {}; helper: {}",
+                        "causal Bash: {error}; stdout_bytes={} stdout_newline={} stdout_prefix={prefix} terminal_intent={} effect_marker={} stderr: {}; entry: {}; broker: {}; helper: {}",
+                        output.len(),
+                        output.ends_with(b"\n"),
+                        fs::read_to_string(gate.join("bash-causal-terminal-status")).unwrap_or_else(|_| "absent".into()),
+                        gate.join("bash-effect").exists(),
                         fs::read_to_string(gate.join("bash-causal-error")).unwrap_or_default(),
                         fs::read_to_string(&err).unwrap_or_default(),
                         fs::read_to_string(&broker_log).unwrap_or_default(),
                         fs::read_to_string(gate.join("causal-helper-error")).unwrap_or_default()
                     )
                 });
+                eventually(|| gate.join("bash-causal-terminal-status").exists());
+                assert_eq!(
+                    fs::read(gate.join("bash-causal-terminal-status")).unwrap(),
+                    b"0"
+                );
                 let child: oulipoly_state::mailbox::FreshBashChild =
                     serde_json::from_value(report["child"].clone()).unwrap();
                 let result: oulipoly_state::mailbox::FreshBashPrivateResult =
@@ -965,6 +980,14 @@ fn inner() {
                             .get::<_, i64>(0))
                         .unwrap(),
                     1
+                );
+                assert_eq!(
+                    fresh
+                        .query_row("SELECT count(*) FROM fresh_bash_child", [], |r| r
+                            .get::<_, i64>(0))
+                        .unwrap(),
+                    1,
+                    "lost first C reply must not admit a second child"
                 );
                 assert_eq!(
                     fresh
@@ -4261,6 +4284,13 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         );
         assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
         eprintln!("private root mode passed: {mode}");
+        if std::env::var("AGE319_PRIVATE_JOIN_THROUGH_MODE")
+            .ok()
+            .as_deref()
+            == Some(mode)
+        {
+            break;
+        }
     }
 }
 

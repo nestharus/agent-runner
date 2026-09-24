@@ -1,8 +1,9 @@
 use crate::identity::{PinnedProcess, boot_id};
+use crate::json_artifact;
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::fs;
+use std::io;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -120,10 +121,16 @@ impl RootRegistry {
             {
                 continue;
             }
+            if name.starts_with(".json-pending-") {
+                return Err(json_artifact::pending_error(
+                    &entry.path(),
+                    "root_registry_open",
+                ));
+            }
             if !name.ends_with(".json") || !entry.file_type()?.is_file() {
                 return Err(io::Error::other("unrecognized registry entry"));
             }
-            let record: RootRecord = serde_json::from_slice(&fs::read(entry.path())?)?;
+            let record: RootRecord = json_artifact::read(&entry.path(), "root_registry_open")?;
             if format!("{}.json", record.root_id) != name
                 || uuid::Uuid::parse_str(&record.root_id).is_err()
             {
@@ -176,21 +183,14 @@ impl RootRegistry {
         }) {
             return Err(io::Error::other("duplicate live root"));
         }
-        let path = self.directory.join(format!("{}.json", record.root_id));
-        let persisted = (|| {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(path)?;
-            serde_json::to_writer(&mut file, &record)?;
-            file.write_all(b"\n")?;
-            file.sync_all()?;
-            File::open(&self.directory)?.sync_all()
-        })();
+        let persisted = json_artifact::create_new(
+            &self.directory,
+            &format!("{}.json", record.root_id),
+            &record,
+        );
         if let Err(error) = persisted {
-            // A partial or merely unsynced record may be on disk. Do not
-            // continue from the old in-memory view after this ambiguity.
+            // A complete final name or an unresolved private temporary may
+            // exist. Reopen exact custody before admitting more roots.
             self.poisoned = true;
             return Err(error);
         }

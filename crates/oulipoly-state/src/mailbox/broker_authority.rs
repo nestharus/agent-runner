@@ -55,6 +55,17 @@ fn read_state_source_binding(
     sidecar: &Path,
     storage_owner: u32,
 ) -> Result<Option<BoundStateSource>, String> {
+    let parent = sidecar.parent().ok_or("broker sidecar parent absent")?;
+    for entry in std::fs::read_dir(parent).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".state-source-pending-")
+        {
+            return Err("unresolved broker State source publication".into());
+        }
+    }
     let path = sidecar
         .parent()
         .ok_or("broker sidecar parent absent")?
@@ -72,9 +83,15 @@ fn read_state_source_binding(
     {
         return Err("broker StateDb binding is not root-only".into());
     }
-    let source: BoundStateSource =
-        serde_json::from_reader(std::fs::File::open(&path).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
+    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+    let source: BoundStateSource = serde_json::from_slice(&bytes).map_err(|error| {
+        use sha2::{Digest, Sha256};
+        eprintln!(
+            "oulipoly JSON artifact: stage=state_source_binding source={} bytes={} sha256={:x} cause={error}",
+            path.display(), bytes.len(), Sha256::digest(&bytes)
+        );
+        "broker State source JSON read failed".to_owned()
+    })?;
     verify_bound_state_source(&source)?;
     Ok(Some(source))
 }
@@ -95,21 +112,28 @@ fn write_state_source_binding(
     };
     verify_bound_state_source(&source)?;
     let binding_path = directory.join("state-source.json");
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&binding_path)
-        .map_err(|e| e.to_string())?;
-    serde_json::to_writer(&mut file, &source).map_err(|e| e.to_string())?;
-    file.sync_all().map_err(|e| e.to_string())?;
-    let file_meta = file.metadata().map_err(|e| e.to_string())?;
-    if file_meta.uid() != storage_owner {
-        return Err("broker StateDb binding storage owner changed".into());
-    }
-    std::fs::File::open(directory)
-        .and_then(|dir| dir.sync_all())
-        .map_err(|e| e.to_string())
+    let temporary = directory.join(format!(".state-source-pending-{}", uuid::Uuid::new_v4()));
+    let result = (|| -> Result<(), String> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+            .map_err(|e| e.to_string())?;
+        serde_json::to_writer(&mut file, &source).map_err(|e| e.to_string())?;
+        file.sync_all().map_err(|e| e.to_string())?;
+        let file_meta = file.metadata().map_err(|e| e.to_string())?;
+        if file_meta.uid() != storage_owner {
+            return Err("broker StateDb binding storage owner changed".into());
+        }
+        std::fs::hard_link(&temporary, &binding_path).map_err(|e| e.to_string())?;
+        std::fs::File::open(directory)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| e.to_string())
+    })();
+    let _ = std::fs::remove_file(&temporary);
+    result?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]

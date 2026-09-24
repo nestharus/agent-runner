@@ -55,6 +55,8 @@ use oulipoly_state::mailbox::{
     FreshRecipientIdentity, FreshReleasedHandoff, FreshV30Lane, FreshV30LaneIdentity,
     PreparedBrokerOwner, PreparedProcessStamp,
 };
+#[cfg(feature = "age319-private-broker-fixture")]
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -3873,6 +3875,9 @@ fn serve_fresh_v30_at(
 ) -> io::Result<()> {
     // A missing or incomplete publication cannot bind the new endpoint.
     let mut lane = FreshV30Lane::open_at(state_root).map_err(io::Error::other)?;
+    oulipoly_kernel_broker::json_artifact::require_no_pending(
+        &state_root.join("v30/fresh-provider"),
+    )?;
     let instance = EntryGate::open(&state_root.join("v30"))?;
     // An installed Bash child must match the package's pinned digest. Private
     // fixtures supply their built source binary only at broker startup.
@@ -3916,9 +3921,16 @@ fn serve_fresh_v30_at(
         let mut drop_account_effect_reply = false;
         #[cfg(feature = "age319-private-broker-fixture")]
         let mut provider_output_files: Option<[File; 2]> = None;
+        let mut diagnostic_opcode = b'?';
+        let mut diagnostic_stage = "request_decode";
+        #[cfg(feature = "age319-private-broker-fixture")]
+        let mut diagnostic_key_hash = String::from("unavailable");
         let answer = (|| -> io::Result<String> {
             let (operation, payload, peer) = peer_from_request(&mut stream)?;
+            diagnostic_opcode = operation;
+            diagnostic_stage = "peer_authority";
             peer.process.verify()?;
+            diagnostic_stage = "request_dispatch";
             if operation == b'i' {
                 if !matches!(payload, RequestPayload::None) {
                     return Err(io::Error::other("fresh gate read has a payload"));
@@ -4033,6 +4045,7 @@ fn serve_fresh_v30_at(
                 )),
                 #[cfg(feature = "age319-private-broker-fixture")]
                 b'C' | b'c' | b'E' | b'O' | b'%' | b'&' | b'!' => {
+                    diagnostic_stage = "bash_child_parent_readback";
                     if !private_fixture() {
                         return Err(io::Error::other(
                             "fresh Bash child/work/result closed until normal root grant and physical result custody",
@@ -4048,9 +4061,11 @@ fn serve_fresh_v30_at(
                         }
                         _ => return Err(io::Error::other("Bash child request absent")),
                     };
+                    diagnostic_key_hash = format!("{:x}", Sha256::digest(request_id.as_bytes()));
                     let (root, root_actor, parent_work) =
                         fresh_bash_parent(state_root, &lane, &peer, bash_image.as_ref())?;
                     let child = if operation == b'C' && !instance.is_closed() {
+                        diagnostic_stage = "bash_child_admission";
                         lane.admit_bash_child(
                             &request_id,
                             &root,
@@ -4061,6 +4076,7 @@ fn serve_fresh_v30_at(
                         )
                         .map_err(io::Error::other)?
                     } else {
+                        diagnostic_stage = "bash_child_exact_readback";
                         let mut child = lane
                             .read_bash_child(&request_id)
                             .map_err(io::Error::other)?
@@ -4082,6 +4098,7 @@ fn serve_fresh_v30_at(
                     match operation {
                         b'C' | b'c' => {
                             if operation == b'C' {
+                                diagnostic_stage = "bash_child_selection";
                                 let root_init = PinnedProcess::open(
                                     root.old_release.prepared.root_init.host_pid,
                                 )?;
@@ -4106,12 +4123,14 @@ fn serve_fresh_v30_at(
                             ))
                         }
                         b'E' => {
+                            diagnostic_stage = "bash_child_work_grant";
                             let grant = lane
                                 .admit_private_bash_work(&child)
                                 .map_err(io::Error::other)?;
                             Ok(format!("fresh-bash-work {grant}\n"))
                         }
                         b'O' => {
+                            diagnostic_stage = "bash_child_result";
                             let RequestPayload::FreshBashPrivateResult { result } = payload else {
                                 unreachable!()
                             };
@@ -4829,7 +4848,28 @@ fn serve_fresh_v30_at(
             }
             continue;
         }
-        let response = answer.unwrap_or_else(|error| format!("error {error}\n"));
+        let response = answer.unwrap_or_else(|error| {
+            eprintln!(
+                "oulipoly broker request error: opcode={} stage={} key_sha256={} kind={:?} os_error={:?}",
+                diagnostic_opcode as char,
+                diagnostic_stage,
+                {
+                    #[cfg(feature = "age319-private-broker-fixture")]
+                    { diagnostic_key_hash.as_str() }
+                    #[cfg(not(feature = "age319-private-broker-fixture"))]
+                    { "unavailable" }
+                },
+                error.kind(),
+                error.raw_os_error()
+            );
+            let wire: String = error
+                .to_string()
+                .chars()
+                .filter(|ch| !ch.is_control())
+                .take(240)
+                .collect();
+            format!("error {wire}\n")
+        });
         #[cfg(feature = "age319-private-broker-fixture")]
         if let Some(files) = provider_output_files {
             let fds = [files[0].as_raw_fd(), files[1].as_raw_fd()];
@@ -4854,7 +4894,33 @@ fn serve_fresh_v30_at(
             }
             continue;
         }
-        if stream.write_all(response.as_bytes()).is_ok() {
+        let write = stream.write_all(response.as_bytes());
+        if matches!(
+            diagnostic_opcode,
+            b'C' | b'c' | b'E' | b'O' | b'%' | b'&' | b'!'
+        ) {
+            eprintln!(
+                "oulipoly broker reply: opcode={} bytes={} newline={} prefix={} write={}",
+                diagnostic_opcode as char,
+                response.len(),
+                response.ends_with('\n'),
+                if response.starts_with("error ") {
+                    "error"
+                } else {
+                    "success"
+                },
+                if write.is_ok() { "ok" } else { "error" }
+            );
+            if let Err(error) = &write {
+                eprintln!(
+                    "oulipoly broker reply write error: opcode={} kind={:?} os_error={:?}",
+                    diagnostic_opcode as char,
+                    error.kind(),
+                    error.raw_os_error()
+                );
+            }
+        }
+        if write.is_ok() {
             if let Some(grant_id) = submitted_grant {
                 let _ = lane.mark_recipient_submitted(&grant_id);
             }
