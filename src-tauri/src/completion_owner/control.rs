@@ -102,6 +102,8 @@ enum Command {
 pub(super) struct ControlService {
     commands: Sender<Command>,
     requests: Receiver<ControlRequest>,
+    #[cfg(test)]
+    test_requeue: SyncSender<ControlRequest>,
     thread: Option<JoinHandle<()>>,
     pinned_root_id: Option<String>,
 }
@@ -130,6 +132,8 @@ impl ControlService {
         // A full queue fails without an admission ACK; it never discards a
         // committed lease. Do not turn slow storage into unbounded sockets.
         let (send, requests) = mpsc::sync_channel(PENDING_LIMIT);
+        #[cfg(test)]
+        let test_requeue = send.clone();
         let root = pinned_root_id.clone();
         let thread = std::thread::Builder::new()
             .name("completion-control".into())
@@ -138,6 +142,8 @@ impl ControlService {
         Ok(Self {
             commands,
             requests,
+            #[cfg(test)]
+            test_requeue,
             thread: Some(thread),
             pinned_root_id,
         })
@@ -147,6 +153,20 @@ impl ControlService {
         // Receiving frees slots that a concurrent producer can refill. Bound
         // this extraction itself, not merely the channel occupancy.
         collect_pending(self.requests.try_iter())
+    }
+
+    #[cfg(test)]
+    pub(super) fn await_queued_join_for_test(&self) {
+        // Wait for the reader's actual queue handoff, then restore the exact
+        // request so pause/pending still exercise the production queue path.
+        let queued = self
+            .requests
+            .recv_timeout(Duration::from_secs(5))
+            .expect("control reader did not queue the join");
+        assert!(matches!(&queued, ControlRequest::Join(_)));
+        self.test_requeue
+            .try_send(queued)
+            .unwrap_or_else(|_| panic!("could not restore the queued join"));
     }
 
     pub fn recover_finished(
@@ -1255,6 +1275,7 @@ mod tests {
         let owner = owner(&root.path().join("unused"));
         let (commands, _receiver) = mpsc::channel();
         let (send, requests) = mpsc::sync_channel(PENDING_LIMIT);
+        let test_requeue = send.clone();
         let (socket, _client) = UnixStream::pair().unwrap();
         for _ in 0..PENDING_LIMIT {
             send.send(join_request(
@@ -1281,6 +1302,7 @@ mod tests {
         let service = ControlService {
             commands,
             requests,
+            test_requeue,
             thread: None,
             pinned_root_id: None,
         };

@@ -1351,25 +1351,41 @@ mod tests {
         let release_writer = recorder.block_writer_for_test().unwrap();
         let worker_recorder = recorder.clone();
         let (completed, completion) = mpsc::channel();
+        let (entered, observation_entered) = mpsc::channel();
+        let (left, observation_left) = mpsc::channel();
 
         let worker = std::thread::spawn(move || {
-            let result = with_test_process_recorder(worker_recorder, || {
-                with_test_process_policy(SqliteObservationPolicy::all(), || {
-                    state.coordinate_manual_resume("session")
-                })
-            });
+            let result = crate::mailbox::with_test_completion_open_observation(
+                move |after_record| {
+                    let _ = if after_record {
+                        left.send(())
+                    } else {
+                        entered.send(())
+                    };
+                },
+                || {
+                    with_test_process_recorder(worker_recorder, || {
+                        with_test_process_policy(SqliteObservationPolicy::all(), || {
+                            state.coordinate_manual_resume("session")
+                        })
+                    })
+                },
+            );
             completed.send(result).unwrap();
         });
 
-        let result = completion.recv_timeout(Duration::from_millis(250));
+        observation_entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("manual-resume sidecar open reached its recorder handoff");
+        let observation_finished = observation_left.recv_timeout(Duration::from_millis(250));
         release_writer.send(()).unwrap();
         worker.join().unwrap();
         assert!(
-            result.is_ok(),
-            "manual-resume coordination waited for recorder progress while holding State"
+            observation_finished.is_ok(),
+            "manual-resume sidecar open waited for recorder progress while holding State"
         );
         assert_eq!(
-            result.unwrap().unwrap(),
+            completion.recv().unwrap().unwrap(),
             crate::mailbox::ManualWakeCoordination::Released
         );
         assert!(

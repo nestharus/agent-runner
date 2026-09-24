@@ -248,7 +248,8 @@ pub fn defer_wake_to_owner() -> Result<bool, String> {
 /// broker still reports a legacy entry route. The v30 copy is retained by the
 /// broker; a user-side copy (including an intact one) is never write authority.
 /// Local installs without a broker keep their existing mailbox behavior.
-pub(crate) fn require_legacy_recipient_effect_route() -> Result<(), String> {
+#[doc(hidden)]
+pub fn require_legacy_recipient_effect_route() -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
         use oulipoly_kernel_broker::protocol::{self, EntryRoute};
@@ -276,7 +277,8 @@ pub(crate) fn require_legacy_recipient_effect_route() -> Result<(), String> {
 /// Fresh v30 IDs are broker minted. A legacy command given one of these IDs
 /// cannot disambiguate an old row with the same `(session, seq)` spelling.
 /// Existing pinned v29 helpers retain their original, separate endpoint.
-pub(crate) fn require_unqualified_legacy_session(session_id: &str) -> Result<(), String> {
+#[doc(hidden)]
+pub fn require_unqualified_legacy_session(session_id: &str) -> Result<(), String> {
     let mut parts = session_id.split(':');
     let fresh_shape = match (parts.next(), parts.next(), parts.next(), parts.next()) {
         (Some("v30"), Some(lane), Some(session), None) => [lane, session]
