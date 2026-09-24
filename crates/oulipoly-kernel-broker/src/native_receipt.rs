@@ -192,7 +192,10 @@ mod tests {
     use crate::registry::{RootRecord, RootRegistry};
     use crate::work_registry::WorkRegistry;
     use oulipoly_state::completion_continuation::{PROTOCOL, SourceProcessIdentity};
-    use oulipoly_state::mailbox::{CompletionDomainOwner, MailboxDb};
+    use oulipoly_state::mailbox::{
+        AgentBashCompleteEnqueue, CompletionDomainOwner, EnqueueResult, MailboxDb,
+        MailboxDeliveryObservationAnchor, SessionMetadataUpsert,
+    };
     use serde_json::json;
     use std::fs;
     use std::io::{Read, Write};
@@ -247,6 +250,82 @@ mod tests {
         let accepted = db
             .accept_exact_native_attempt(&attempt, &owner, &root)
             .unwrap();
+        // A schema-backed submitted receipt row can share this v29 sidecar and even
+        // its attempt ID with a continuation acceptance. The row's delivery
+        // invocation is independent of the broker-bound guardian. Neither an
+        // inode pin nor a successful N preflight joins those authorities.
+        let receipt_session = "receipt-session";
+        let receipt_invocation = "unrelated-delivery-invocation";
+        let EnqueueResult::Inserted(mail) = db
+            .enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
+                session_id: receipt_session,
+                handle: "completed-receipt-work",
+                payload_json: "{}",
+                owner_invocation_uuid: Some("mailbox-owner"),
+                matched_os_pid: Some(1),
+                matched_os_boot_id: Some("mailbox-boot"),
+                matched_os_pid_starttime_ticks: Some(1),
+                matched_chain_index: Some(0),
+                state_dir: "/offline/state",
+                meta_path: "/offline/meta",
+                log_path: "/offline/log",
+                rc_path: "/offline/rc",
+                rc: 0,
+            })
+            .unwrap()
+        else {
+            panic!("receipt mailbox row was not inserted");
+        };
+        db.register_headless_delivery_attempt(
+            &attempt.attempt_id,
+            receipt_session,
+            None,
+            receipt_invocation,
+            &[mail.seq],
+            0,
+        )
+        .unwrap();
+        let anchor = MailboxDeliveryObservationAnchor {
+            provider_name: "receipt-provider".into(),
+            provider_instance_id: "receipt-provider-instance".into(),
+            settings_id: "receipt-settings".into(),
+            provider_session_id: receipt_session.into(),
+            resume_token: Some("immutable-pre-delivery-tail".into()),
+            expected_sha256: "b".repeat(64),
+        };
+        db.record_delivery_observation_anchor(&attempt.attempt_id, receipt_session, &anchor)
+            .unwrap();
+        db.wake_sessions()
+            .upsert_session_metadata(SessionMetadataUpsert {
+                session_id: receipt_session,
+                mode: "headless",
+                invocation_uuid: Some(receipt_invocation),
+                provider_name: Some("receipt-provider"),
+                model_name: Some("receipt-model"),
+                models_dir: Some("/offline/models"),
+                effective_cwd: Some("/offline"),
+            })
+            .unwrap();
+        db.begin_headless_delivery_submission(
+            &attempt.attempt_id,
+            receipt_session,
+            receipt_invocation,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            db.pending_receipt_scan_owner(&attempt.attempt_id, &anchor)
+                .unwrap()
+                .as_deref(),
+            Some(receipt_invocation)
+        );
+        let mut wrong_anchor = anchor.clone();
+        wrong_anchor.expected_sha256 = "c".repeat(64);
+        assert!(
+            db.pending_receipt_scan_owner(&attempt.attempt_id, &wrong_anchor)
+                .unwrap()
+                .is_none()
+        );
         let request_path = dir.path().join(REQUEST_NAME);
         let receipt_path = dir.path().join(RECEIPT_NAME);
         let request_bytes = serde_json::to_vec(&json!({
