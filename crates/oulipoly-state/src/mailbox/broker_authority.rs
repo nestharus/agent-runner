@@ -3,6 +3,8 @@
 //! into this directory is a separate prerequisite to activation.
 use super::*;
 #[cfg(unix)]
+use sha2::{Digest, Sha256};
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Component;
 
@@ -14,6 +16,23 @@ pub struct BrokerSidecar {
     source_generation: String,
     storage_owner: u32,
     storage_anchor: std::path::PathBuf,
+}
+
+/// Installer-owned proof that the old service images and every sidecar writer
+/// were stopped, joined and fenced. No production constructor exists yet:
+/// the installed service/launcher census and new-entry fence must be added
+/// before a caller can request even an offline snapshot.
+pub struct QuiescedCutoverProof {
+    _private: (),
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+impl QuiescedCutoverProof {
+    /// Only private namespace fixtures may stand in for the unavailable
+    /// installed writer census. This feature is absent from normal builds.
+    pub fn private_fixture() -> Self {
+        Self { _private: () }
+    }
 }
 
 /// One exact, generation-bound observation from the broker's retained SQLite
@@ -47,15 +66,69 @@ impl BrokerSidecar {
     /// and the complete main/WAL state has been copied into root-only storage.
     /// This operation never reads a guardian-selected source pathname.
     #[cfg(unix)]
-    pub fn activate_quiesced_copy(path: &Path, broker_state_root: &Path) -> Result<String, String> {
+    pub fn activate_quiesced_copy(
+        path: &Path,
+        broker_state_root: &Path,
+        _proof: &QuiescedCutoverProof,
+    ) -> Result<String, String> {
+        require_host_root()?;
+        require_root_owned_ancestors(broker_state_root)?;
+        activate_with_owner(path, 0, broker_state_root)
+    }
+
+    /// The private user-namespace broker fixture stages beneath a temporary
+    /// parent. It still exercises exact v29-to-v30 activation and storage
+    /// checks from the fixture anchor down, without treating /tmp as an
+    /// installed root-owned ancestor.
+    #[cfg(all(unix, feature = "age319-private-broker-fixture"))]
+    pub fn activate_private_fixture_copy(
+        path: &Path,
+        broker_state_root: &Path,
+        _proof: &QuiescedCutoverProof,
+    ) -> Result<String, String> {
         require_host_root()?;
         activate_with_owner(path, 0, broker_state_root)
+    }
+
+    /// Prepare an inert, root-only SQLite snapshot of an exact v29 source.
+    /// The returned directory is never consulted by the broker. Installation
+    /// must separately stop and join all old writers, fence new entries,
+    /// verify source handles, and then publish/activate under that proof.
+    /// Staging alone grants no authority and never changes the source.
+    #[cfg(unix)]
+    pub fn stage_offline_v29_snapshot(
+        source: &Path,
+        source_owner: u32,
+        broker_state_root: &Path,
+        _proof: &QuiescedCutoverProof,
+    ) -> Result<std::path::PathBuf, String> {
+        require_host_root()?;
+        require_root_owned_ancestors(broker_state_root)?;
+        stage_with_owner(source, source_owner, broker_state_root, 0)
+    }
+
+    /// Publish only a previously validated snapshot under an installed
+    /// quiescence proof. The directory rename never replaces an existing
+    /// sidecar. A crash after rename leaves v29 at the fixed name and broker
+    /// startup refuses until the installer resumes activation explicitly.
+    #[cfg(target_os = "linux")]
+    pub fn publish_and_activate_quiesced_copy(
+        source: &Path,
+        source_owner: u32,
+        stage: &Path,
+        broker_state_root: &Path,
+        _proof: &QuiescedCutoverProof,
+    ) -> Result<String, String> {
+        require_host_root()?;
+        require_root_owned_ancestors(broker_state_root)?;
+        publish_with_owner(source, source_owner, stage, broker_state_root, 0)
     }
 
     #[cfg(not(unix))]
     pub fn activate_quiesced_copy(
         _path: &Path,
         _broker_state_root: &Path,
+        _proof: &QuiescedCutoverProof,
     ) -> Result<String, String> {
         Err("broker-owned sidecar requires Unix root storage".into())
     }
@@ -337,6 +410,377 @@ impl BrokerSidecar {
         broker_main_file_must_be_named(&self.mailbox.conn)?;
         Ok(result)
     }
+}
+
+#[cfg(unix)]
+fn require_root_owned_ancestors(path: &Path) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err("cutover storage root must be absolute".into());
+    }
+    let mut current = path;
+    loop {
+        let meta = fs::symlink_metadata(current).map_err(|error| error.to_string())?;
+        if !meta.is_dir()
+            || meta.file_type().is_symlink()
+            || meta.uid() != 0
+            || meta.mode() & 0o022 != 0
+        {
+            return Err("cutover storage has an untrusted ancestor".into());
+        }
+        if current == Path::new("/") {
+            break;
+        }
+        current = current.parent().ok_or("cutover storage parent missing")?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SourceArtifact {
+    path: std::path::PathBuf,
+    identity: Option<(u64, u64, u64, i64, i64)>,
+}
+
+#[cfg(unix)]
+fn source_artifacts_unchanged(before: &[SourceArtifact], after: &[SourceArtifact]) -> bool {
+    before
+        .iter()
+        .zip(after)
+        .enumerate()
+        .all(|(index, (old, new))| {
+            old == new
+            // SQLite may create an empty WAL and SHM when reading a clean
+            // WAL-mode database. A nonempty new WAL is always a refusal.
+            || (index == 1 && old.identity.is_none() && new.identity.is_some_and(|id| id.2 == 0))
+            || (index == 2 && old.identity.is_none() && new.identity.is_some())
+        })
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_SNAPSHOT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
+}
+
+#[cfg(test)]
+fn after_snapshot_hook() {
+    AFTER_SNAPSHOT_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(unix)]
+fn source_artifacts(path: &Path, owner: u32) -> Result<Vec<SourceArtifact>, String> {
+    if !path.is_absolute()
+        || path.file_name() != Some(std::ffi::OsStr::new("pid-identity.db"))
+        || path
+            .components()
+            .any(|part| matches!(part, Component::CurDir | Component::ParentDir))
+    {
+        return Err("cutover requires an exact absolute v29 source name".into());
+    }
+    let mut result = Vec::new();
+    for (index, artifact) in [
+        path.to_path_buf(),
+        path_with_storage_suffix(path, "-wal"),
+        path_with_storage_suffix(path, "-shm"),
+        path_with_storage_suffix(path, "-journal"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let identity = match fs::symlink_metadata(&artifact) {
+            Ok(meta) => {
+                if !meta.is_file()
+                    || meta.file_type().is_symlink()
+                    || meta.uid() != owner
+                    || meta.nlink() != 1
+                {
+                    return Err(format!(
+                        "untrusted cutover source artifact: {}",
+                        artifact.display()
+                    ));
+                }
+                // SQLite may update the shared-memory lock bytes while a
+                // reader opens; its inode must remain fixed, while the WAL
+                // and main bytes must also retain their size and timestamp.
+                if index == 2 {
+                    Some((meta.dev(), meta.ino(), 0, 0, 0))
+                } else {
+                    Some((
+                        meta.dev(),
+                        meta.ino(),
+                        meta.len(),
+                        meta.mtime(),
+                        meta.mtime_nsec(),
+                    ))
+                }
+            }
+            Err(error) if index != 0 && error.kind() == ErrorKind::NotFound => None,
+            Err(error) => return Err(format!("cutover source artifact unavailable: {error}")),
+        };
+        result.push(SourceArtifact {
+            path: artifact,
+            identity,
+        });
+    }
+    Ok(result)
+}
+
+#[cfg(unix)]
+fn complete_v29_fingerprint(conn: &Connection) -> Result<[u8; 32], String> {
+    schema::validate_exact_v29(conn)?;
+    let integrity: String = conn
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    if integrity != "ok" {
+        return Err(format!("cutover SQLite integrity failure: {integrity}"));
+    }
+    let foreign_key_failure: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_check)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if foreign_key_failure {
+        return Err("cutover source has foreign-key violations".into());
+    }
+    let mut digest = Sha256::new();
+    let mut schema_rows = conn
+        .prepare("SELECT type,name,tbl_name,COALESCE(sql,'') FROM sqlite_master ORDER BY type,name")
+        .map_err(|error| error.to_string())?;
+    let rows = schema_rows
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?;
+    let mut tables = Vec::new();
+    for row in rows {
+        let (kind, name, parent, sql) = row.map_err(|error| error.to_string())?;
+        for field in [&kind, &name, &parent, &sql] {
+            digest.update((field.len() as u64).to_le_bytes());
+            digest.update(field.as_bytes());
+        }
+        if kind == "table" {
+            tables.push(name);
+        }
+    }
+    tables.sort();
+    for table in tables {
+        // SQLite's own identifier came from sqlite_master; quote it as an
+        // identifier rather than interpolating it as SQL syntax.
+        let quoted = format!("\"{}\"", table.replace('"', "\"\""));
+        let statement = conn
+            .prepare(&format!("SELECT * FROM {quoted}"))
+            .map_err(|error| error.to_string())?;
+        let columns = statement.column_count();
+        let order = (1..=columns)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut statement = conn
+            .prepare(&format!("SELECT * FROM {quoted} ORDER BY {order}"))
+            .map_err(|error| error.to_string())?;
+        digest.update((table.len() as u64).to_le_bytes());
+        digest.update(table.as_bytes());
+        let mut rows = statement.query([]).map_err(|error| error.to_string())?;
+        while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+            digest.update([0xff]);
+            for index in 0..columns {
+                use rusqlite::types::ValueRef;
+                let (tag, bytes): (u8, Vec<u8>) =
+                    match row.get_ref(index).map_err(|error| error.to_string())? {
+                        ValueRef::Null => (0, Vec::new()),
+                        ValueRef::Integer(value) => (1, value.to_le_bytes().to_vec()),
+                        ValueRef::Real(value) => (2, value.to_bits().to_le_bytes().to_vec()),
+                        ValueRef::Text(value) => (3, value.to_vec()),
+                        ValueRef::Blob(value) => (4, value.to_vec()),
+                    };
+                digest.update([tag]);
+                digest.update((bytes.len() as u64).to_le_bytes());
+                digest.update(bytes);
+            }
+        }
+    }
+    Ok(digest.finalize().into())
+}
+
+#[cfg(unix)]
+fn stage_with_owner(
+    source: &Path,
+    source_owner: u32,
+    anchor: &Path,
+    storage_owner: u32,
+) -> Result<std::path::PathBuf, String> {
+    // Check the fixed root storage anchor before creating anything. The
+    // staging name is unique and never the broker's live `sidecar` name.
+    let anchor_meta = fs::symlink_metadata(anchor).map_err(|error| error.to_string())?;
+    if !anchor.is_absolute()
+        || !anchor_meta.is_dir()
+        || anchor_meta.file_type().is_symlink()
+        || anchor_meta.uid() != storage_owner
+        || anchor_meta.mode() & 0o077 != 0
+    {
+        return Err("cutover storage root is not owner-only".into());
+    }
+    if fs::symlink_metadata(anchor.join("sidecar")).is_ok() {
+        return Err("broker sidecar already exists; refusing a second live copy".into());
+    }
+    let initial = source_artifacts(source, source_owner)?;
+    let conn = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| format!("Failed to open v29 cutover source: {error}"))?;
+    broker_main_file_must_be_named(&conn)?;
+    let before = source_artifacts(source, source_owner)?;
+    if before[0] != initial[0] {
+        return Err("cutover source main file replaced during open".into());
+    }
+    let journal: String = conn
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    if !journal.eq_ignore_ascii_case("wal") {
+        return Err("cutover source must use SQLite WAL mode".into());
+    }
+    let expected = complete_v29_fingerprint(&conn)?;
+    let stage = anchor.join(format!("sidecar-stage-{}", uuid::Uuid::new_v4()));
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&stage)
+        .map_err(|error| error.to_string())?;
+    let copy = stage.join("pid-identity.db");
+    let result = (|| {
+        conn.execute("VACUUM INTO ?1", [copy.to_string_lossy().as_ref()])
+            .map_err(|error| format!("Failed to snapshot v29 WAL state: {error}"))?;
+        #[cfg(test)]
+        after_snapshot_hook();
+        broker_main_file_must_be_named(&conn)?;
+        let after = source_artifacts(source, source_owner)?;
+        if !source_artifacts_unchanged(&before, &after) {
+            return Err(format!(
+                "cutover source artifact changed during snapshot: {before:?} -> {after:?}"
+            ));
+        }
+        if complete_v29_fingerprint(&conn)? != expected {
+            return Err("cutover source rows changed during snapshot".into());
+        }
+        fs::set_permissions(&copy, fs::Permissions::from_mode(0o600))
+            .map_err(|error| error.to_string())?;
+        let copied = Connection::open_with_flags(&copy, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| error.to_string())?;
+        if complete_v29_fingerprint(&copied)? != expected {
+            return Err("cutover copy schema or rows differ from v29 source".into());
+        }
+        drop(copied);
+        File::open(&copy)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| error.to_string())?;
+        File::open(&stage)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|error| error.to_string())?;
+        File::open(anchor)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|error| error.to_string())?;
+        Ok(stage.clone())
+    })();
+    if result.is_err() {
+        // The live name was never touched. Leave a failed root-only stage for
+        // explicit installer inspection; startup ignores it.
+        return result;
+    }
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn publish_with_owner(
+    source: &Path,
+    source_owner: u32,
+    stage: &Path,
+    anchor: &Path,
+    storage_owner: u32,
+) -> Result<String, String> {
+    use std::os::unix::ffi::OsStrExt;
+    if stage.parent() != Some(anchor)
+        || !stage
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("sidecar-stage-"))
+    {
+        return Err("cutover stage is not under the fixed broker state root".into());
+    }
+    let stage_meta = fs::symlink_metadata(stage).map_err(|error| error.to_string())?;
+    if !stage_meta.is_dir()
+        || stage_meta.file_type().is_symlink()
+        || stage_meta.uid() != storage_owner
+        || stage_meta.mode() & 0o077 != 0
+    {
+        return Err("cutover stage directory is not owner-only".into());
+    }
+    let stage_db = stage.join("pid-identity.db");
+    let stage_meta = fs::symlink_metadata(&stage_db).map_err(|error| error.to_string())?;
+    if !stage_meta.is_file()
+        || stage_meta.file_type().is_symlink()
+        || stage_meta.uid() != storage_owner
+        || stage_meta.nlink() != 1
+        || stage_meta.mode() & 0o077 != 0
+    {
+        return Err("cutover stage database is not owner-only".into());
+    }
+    // The stage must contain exactly the single consistent SQLite copy.
+    // A stale WAL or another entry could change the read after validation.
+    let entries = fs::read_dir(stage).map_err(|error| error.to_string())?;
+    for entry in entries {
+        if entry.map_err(|error| error.to_string())?.file_name()
+            != std::ffi::OsStr::new("pid-identity.db")
+        {
+            return Err("cutover stage has unexpected artifacts".into());
+        }
+    }
+    let before = source_artifacts(source, source_owner)?;
+    let source_conn = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| error.to_string())?;
+    broker_main_file_must_be_named(&source_conn)?;
+    let source_hash = complete_v29_fingerprint(&source_conn)?;
+    let copy_conn = Connection::open_with_flags(&stage_db, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| error.to_string())?;
+    if complete_v29_fingerprint(&copy_conn)? != source_hash {
+        return Err("cutover source and staged rows/schema differ".into());
+    }
+    drop(copy_conn);
+    if !source_artifacts_unchanged(&before, &source_artifacts(source, source_owner)?) {
+        return Err("cutover source changed before publication".into());
+    }
+    broker_main_file_must_be_named(&source_conn)?;
+    let target_dir = anchor.join("sidecar");
+    let old =
+        std::ffi::CString::new(stage.as_os_str().as_bytes()).map_err(|error| error.to_string())?;
+    let new = std::ffi::CString::new(target_dir.as_os_str().as_bytes())
+        .map_err(|error| error.to_string())?;
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            old.as_ptr(),
+            libc::AT_FDCWD,
+            new.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result != 0 {
+        return Err(format!(
+            "cutover publication refused: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    File::open(anchor)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|error| error.to_string())?;
+    activate_with_owner(&target_dir.join("pid-identity.db"), storage_owner, anchor)
 }
 
 #[cfg(target_os = "linux")]
@@ -631,6 +1075,204 @@ mod tests {
                 .source_generation(),
             generation
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn offline_stage_preserves_committed_wal_and_requires_separate_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let source_dir = root.path().join("old");
+        let broker_root = root.path().join("broker");
+        fs::create_dir(&source_dir).unwrap();
+        fs::create_dir(&broker_root).unwrap();
+        fs::set_permissions(&broker_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let source = source_dir.join("pid-identity.db");
+        drop(MailboxDb::open(&source).unwrap());
+        let writer = Connection::open(&source).unwrap();
+        writer.execute_batch("PRAGMA wal_autocheckpoint=0; CREATE TABLE cutover_probe(value TEXT); INSERT INTO cutover_probe VALUES('committed WAL row');").unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let stage = stage_with_owner(&source, uid, &broker_root, uid).unwrap();
+        assert!(!broker_root.join("sidecar").exists());
+        let staged = Connection::open_with_flags(
+            stage.join("pid-identity.db"),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        assert_eq!(
+            staged
+                .query_row("SELECT value FROM cutover_probe", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "committed WAL row"
+        );
+        drop(staged);
+        assert!(stage_with_owner(&source, uid, &broker_root, uid).is_ok());
+        // A crash after an installer atomically publishes the complete
+        // directory, but before activation, is a refusal on broker restart.
+        let target_dir = broker_root.join("sidecar");
+        fs::rename(&stage, &target_dir).unwrap();
+        File::open(&broker_root).unwrap().sync_all().unwrap();
+        let target = target_dir.join("pid-identity.db");
+        assert!(open_with_owner(&target, uid, &broker_root).is_err());
+        // The installed broker sets umask(077) before any authority lock.
+        // This unprivileged unit process need not have that umask.
+        fs::set_permissions(
+            mailbox_authority_path(&target),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        assert!(stage_with_owner(&source, uid, &broker_root, uid).is_err());
+        let generation = activate_with_owner(&target, uid, &broker_root).unwrap();
+        assert_eq!(
+            open_with_owner(&target, uid, &broker_root)
+                .unwrap()
+                .source_generation(),
+            generation
+        );
+        writer
+            .execute(
+                "INSERT INTO cutover_probe VALUES('retired source only')",
+                [],
+            )
+            .unwrap();
+        let broker = open_with_owner(&target, uid, &broker_root).unwrap();
+        let count: i64 = broker
+            .mailbox
+            .conn
+            .query_row("SELECT count(*) FROM cutover_probe", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn offline_stage_rejects_source_replacement_and_bad_storage() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("pid-identity.db");
+        drop(MailboxDb::open(&source).unwrap());
+        let broker_root = root.path().join("broker");
+        fs::create_dir(&broker_root).unwrap();
+        let uid = unsafe { libc::geteuid() };
+        assert!(stage_with_owner(&source, uid, &broker_root, uid).is_err());
+        fs::set_permissions(&broker_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let link = root.path().join("linked-broker");
+        symlink(&broker_root, &link).unwrap();
+        assert!(stage_with_owner(&source, uid, &link, uid).is_err());
+        let replacement = root.path().join("replacement");
+        fs::rename(&source, &replacement).unwrap();
+        symlink(&replacement, &source).unwrap();
+        assert!(stage_with_owner(&source, uid, &broker_root, uid).is_err());
+        fs::remove_file(&source).unwrap();
+        fs::rename(&replacement, &source).unwrap();
+        let stage = stage_with_owner(&source, uid, &broker_root, uid).unwrap();
+        assert!(stage.join("pid-identity.db").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn offline_stage_refuses_a_source_path_swap_during_copy() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("pid-identity.db");
+        drop(MailboxDb::open(&source).unwrap());
+        let broker_root = root.path().join("broker");
+        fs::create_dir(&broker_root).unwrap();
+        fs::set_permissions(&broker_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let swapped = source.clone();
+        AFTER_SNAPSHOT_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let old = swapped.with_extension("retired");
+                fs::rename(&swapped, &old).unwrap();
+                fs::copy(&old, &swapped).unwrap();
+            }));
+        });
+        let uid = unsafe { libc::geteuid() };
+        assert!(stage_with_owner(&source, uid, &broker_root, uid).is_err());
+        assert!(!broker_root.join("sidecar").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_copy_leaves_v29_source_as_the_only_live_database() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("pid-identity.db");
+        drop(MailboxDb::open(&source).unwrap());
+        let broker_root = root.path().join("broker");
+        fs::create_dir(&broker_root).unwrap();
+        fs::set_permissions(&broker_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let copied_root = broker_root.clone();
+        AFTER_SNAPSHOT_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let stage = fs::read_dir(&copied_root)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path();
+                fs::write(stage.join("pid-identity.db"), b"broken copy").unwrap();
+            }));
+        });
+        let uid = unsafe { libc::geteuid() };
+        assert!(stage_with_owner(&source, uid, &broker_root, uid).is_err());
+        assert!(!broker_root.join("sidecar").exists());
+        assert!(MailboxDb::open(&source).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn publication_refuses_stale_snapshot_and_activates_only_matching_v29() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("pid-identity.db");
+        drop(MailboxDb::open(&source).unwrap());
+        let writer = Connection::open(&source).unwrap();
+        writer.execute_batch("CREATE TABLE cutover_probe(value TEXT); INSERT INTO cutover_probe VALUES('first');").unwrap();
+        let broker_root = root.path().join("broker");
+        fs::create_dir(&broker_root).unwrap();
+        fs::set_permissions(&broker_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let stale = stage_with_owner(&source, uid, &broker_root, uid).unwrap();
+        writer
+            .execute("INSERT INTO cutover_probe VALUES('second')", [])
+            .unwrap();
+        assert!(publish_with_owner(&source, uid, &stale, &broker_root, uid).is_err());
+        assert!(!broker_root.join("sidecar").exists());
+        let stage = stage_with_owner(&source, uid, &broker_root, uid).unwrap();
+        let generation = publish_with_owner(&source, uid, &stage, &broker_root, uid).unwrap();
+        assert!(!stage.exists());
+        let target = broker_root.join("sidecar/pid-identity.db");
+        let broker = open_with_owner(&target, uid, &broker_root).unwrap();
+        assert_eq!(broker.source_generation(), generation);
+        assert_eq!(
+            broker
+                .mailbox
+                .conn
+                .query_row("SELECT count(*) FROM cutover_probe", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert!(publish_with_owner(&source, uid, &stale, &broker_root, uid).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn publication_refuses_mispermissioned_or_symlinked_stage() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("pid-identity.db");
+        drop(MailboxDb::open(&source).unwrap());
+        let broker_root = root.path().join("broker");
+        fs::create_dir(&broker_root).unwrap();
+        fs::set_permissions(&broker_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let stage = stage_with_owner(&source, uid, &broker_root, uid).unwrap();
+        fs::set_permissions(&stage, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(publish_with_owner(&source, uid, &stage, &broker_root, uid).is_err());
+        fs::set_permissions(&stage, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_file(stage.join("pid-identity.db")).unwrap();
+        symlink(&source, stage.join("pid-identity.db")).unwrap();
+        assert!(publish_with_owner(&source, uid, &stage, &broker_root, uid).is_err());
+        assert!(!broker_root.join("sidecar").exists());
     }
 
     #[cfg(unix)]

@@ -4,6 +4,7 @@ mod root_join;
 #[path = "work_launch.rs"]
 mod work_launch;
 use oulipoly_kernel_broker::accepted_grant::GrantRegistry;
+use oulipoly_kernel_broker::cutover_gate::EntryGate;
 use oulipoly_kernel_broker::entry_registry::{EntryRegistry, ProcessStamp};
 use oulipoly_kernel_broker::identity::{
     PeerIdentity, PinnedProcess, host_proc_file, host_proc_uid, install_detached_host_proc,
@@ -68,6 +69,32 @@ fn checked_root_path(path: &Path, directory: bool) -> io::Result<()> {
         current = current
             .parent()
             .ok_or_else(|| io::Error::other("bad path"))?;
+    }
+    Ok(())
+}
+
+// The current installed Runner still has direct user-sidecar writers. A v30
+// database must not admit that image into a new root or let it exercise the
+// old source/control/work endpoint. Y/R/W are the staged, generation-bound
+// broker State protocol; I is a read-only live route observation. None can
+// create a root on their own. Remove this gate only with the complete
+// production caller routing and image-version
+// admission protocol, never as part of ordinary broker startup.
+fn require_cutover_entry_route(
+    operation: u8,
+    broker_owned_sidecar: bool,
+    gate_closed: bool,
+) -> io::Result<()> {
+    if matches!(operation, b'i' | b'X' | b'x') {
+        return Ok(());
+    }
+    if gate_closed {
+        return Err(io::Error::other("broker entry gate is durably closed"));
+    }
+    if broker_owned_sidecar && !matches!(operation, b'Y' | b'R' | b'W' | b'I') {
+        return Err(io::Error::other(
+            "broker-owned v30 sidecar requires installed v30 Runner entry routing",
+        ));
     }
     Ok(())
 }
@@ -1433,6 +1460,9 @@ fn serve() -> io::Result<()> {
         checked_root_path(Path::new("/run/oulipoly-kernel-broker"), true)?;
         checked_root_path(Path::new(&runner), false)?;
     }
+    // The singleton lock and durable latch are established before the socket
+    // accepts any new request. Normal startup never closes or reopens it.
+    let mut entry_gate = EntryGate::open(Path::new(&state))?;
     let sidecar_directory = Path::new(&state).join("sidecar");
     // A staged cutover is all-or-nothing at broker restart. Retain the exact
     // v30 connection for future broker State operations, while legacy native
@@ -1505,13 +1535,32 @@ fn serve() -> io::Result<()> {
             // governed by exact gates and process death, not a 5s cutoff.
             stream.set_read_timeout(None)?;
             stream.set_write_timeout(None)?;
-            // A route observation can race broker restart and activation.
-            // Until owner and every write-driving client is routed, the old
-            // entry sequence cannot create or join work against a v30 store.
-            if broker_sidecar.is_some() && matches!(operation, b'E' | b'P' | b'G' | b'A' | b'J') {
-                return Err(io::Error::other("legacy entry closed by broker State v30"));
-            }
-            if operation == b'J' {
+            require_cutover_entry_route(
+                operation,
+                broker_sidecar.is_some(),
+                entry_gate.is_closed(),
+            )?;
+            if operation == b'i' {
+                let route = if entry_gate.is_closed() {
+                    "draining"
+                } else if broker_sidecar.is_some() {
+                    "broker-v30-closed"
+                } else {
+                    "legacy-open"
+                };
+                Ok(format!("entry-gate-v1 {route}\n"))
+            } else if operation == b'X' || operation == b'x' {
+                if peer.uid != 0 || !peer.process.in_namespace(&host_namespace)? {
+                    return Err(io::Error::other("host-root gate transition required"));
+                }
+                if operation == b'X' {
+                    entry_gate.close()?;
+                    Ok("entry-gate-v1 draining\n".into())
+                } else {
+                    entry_gate.abort_before_publication()?;
+                    Ok("entry-gate-v1 legacy-open\n".into())
+                }
+            } else if operation == b'J' {
                 if !root_launch_admitted(
                     &peer,
                     &classify_scope(&peer, &host_namespace, &registry, &works),
@@ -1822,6 +1871,38 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v30_service_refuses_every_legacy_entry_and_work_operation() {
+        for operation in [
+            b'E', b'P', b'G', b'A', b'J', b'B', b'V', b'S', b's', b'T', b'H', b'N', b'k', b'K',
+            b'Q', b'Z', b'C', b'L',
+        ] {
+            assert!(
+                require_cutover_entry_route(operation, true, false).is_err(),
+                "legacy opcode {} admitted",
+                operation as char
+            );
+            assert!(require_cutover_entry_route(operation, false, false).is_ok());
+        }
+        for operation in [b'Y', b'R', b'W', b'I'] {
+            assert!(require_cutover_entry_route(operation, true, false).is_ok());
+            assert!(require_cutover_entry_route(operation, false, true).is_err());
+        }
+        for operation in [b'i', b'X', b'x'] {
+            assert!(require_cutover_entry_route(operation, true, true).is_ok());
+        }
+        for operation in [
+            b'E', b'P', b'G', b'A', b'J', b'B', b'V', b'S', b's', b'T', b'H', b'N', b'k', b'K',
+            b'Q', b'Z', b'C', b'L', b'Y', b'R', b'W', b'I',
+        ] {
+            assert!(
+                require_cutover_entry_route(operation, false, true).is_err(),
+                "closed gate admitted opcode {}",
+                operation as char
+            );
+        }
+    }
     use std::io::Read;
     use std::process::Command;
     use std::thread;

@@ -1,5 +1,5 @@
 //! Host-side pinned completion authority and broker-attested root child join.
-use oulipoly_kernel_broker::protocol::{self, JoinSpec, Operation, StateRoute};
+use oulipoly_kernel_broker::protocol::{self, EntryRoute, JoinSpec, Operation, StateRoute};
 use oulipoly_state::mailbox::MailboxDb;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -10,6 +10,35 @@ use std::process::ExitCode;
 
 const REQUIRED_ENV: &str = "OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1";
 const CHILD_FD_ENV: &str = "OULIPOLY_KERNEL_CHILD_JOIN_FD_V1";
+const INSTALLED_RUNNER: &str = "/usr/local/libexec/oulipoly/oulipoly-agent-runner";
+
+/// The fixed installed image and the explicit kernel entry path must consult
+/// broker-owned ingress state before worker, helper, CLI, GUI, or State work.
+/// A missing broker is an admission refusal for those supported paths.
+pub(crate) fn verify_installed_entry_route() -> Result<(), String> {
+    let image = std::env::current_exe()
+        .map_err(|error| format!("cannot identify Runner image: {error}"))?;
+    if !needs_installed_entry_gate(&image, std::env::var_os(REQUIRED_ENV).is_some()) {
+        return Ok(());
+    }
+    let route = protocol::observe_entry_gate_at(&broker_socket())
+        .map_err(|error| format!("installed broker entry gate unavailable: {error}"))?;
+    require_legacy_entry_route(route)
+}
+
+fn needs_installed_entry_gate(image: &std::path::Path, explicit_kernel_entry: bool) -> bool {
+    explicit_kernel_entry
+        || image == std::path::Path::new(INSTALLED_RUNNER)
+        || image == std::path::Path::new(&format!("{INSTALLED_RUNNER} (deleted)"))
+}
+
+fn require_legacy_entry_route(route: EntryRoute) -> Result<(), String> {
+    match route {
+        EntryRoute::LegacyOpen => Ok(()),
+        EntryRoute::Draining => Err("installed broker entry gate is draining".into()),
+        EntryRoute::BrokerV30Closed => Err("installed Runner has no v30 route".into()),
+    }
+}
 
 pub(crate) fn child_entry() -> Option<ExitCode> {
     let fd = std::env::var(CHILD_FD_ENV).ok()?;
@@ -588,6 +617,29 @@ fn join_child(
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn installed_image_refuses_draining_and_unrouteable_v30() {
+        assert!(needs_installed_entry_gate(
+            std::path::Path::new(INSTALLED_RUNNER),
+            false
+        ));
+        assert!(needs_installed_entry_gate(
+            std::path::Path::new(&format!("{INSTALLED_RUNNER} (deleted)")),
+            false
+        ));
+        assert!(needs_installed_entry_gate(
+            std::path::Path::new("/build/debug/oulipoly-agent-runner"),
+            true
+        ));
+        assert!(!needs_installed_entry_gate(
+            std::path::Path::new("/build/debug/oulipoly-agent-runner"),
+            false
+        ));
+        assert!(require_legacy_entry_route(EntryRoute::LegacyOpen).is_ok());
+        assert!(require_legacy_entry_route(EntryRoute::Draining).is_err());
+        assert!(require_legacy_entry_route(EntryRoute::BrokerV30Closed).is_err());
+    }
 
     #[test]
     fn pregrant_failure_never_reserves_or_bootstraps() {

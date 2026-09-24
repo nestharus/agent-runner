@@ -9,6 +9,7 @@ name = "oulipoly_state"
 
 [features]
 age360-fault-fixtures = []
+age319-private-broker-fixture = []
 test-support = []
 
 [dependencies]

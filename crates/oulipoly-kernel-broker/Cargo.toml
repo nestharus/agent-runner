@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [features]
-age319-private-broker-fixture = []
+age319-private-broker-fixture = ["oulipoly-state/age319-private-broker-fixture"]
 
 [[bin]]
 name = "oulipoly-kernel-broker"

@@ -57,8 +57,96 @@ An accepted row is debt, not a worker grant. Legacy v4 N/k remains closed.
    user-owned old pathname cannot be physically forbidden to every historical
    same-UID executable without changing ownership of its ancestor.
 
-This commit supplies only the versioned owner/reservation/acceptance transport
-and exact readback. It does not perform the copy, install the launcher gate,
-route production writers, create wake claims in v30, prepare a new native
-grant, or release a worker. These dependencies keep normal CLI/GUI native
-admission and positive K closed.
+The current source supplies the versioned owner/reservation/acceptance
+transport, exact readback, an inert offline copy API, a broker ingress latch,
+and a gate for the fixed installed Runner image. It does not perform an
+installed cutover, gate every packaged launcher, route all production writers,
+create wake claims in v30, prepare a new native grant, or release a worker.
+These dependencies keep normal CLI/GUI native admission and positive K closed.
+
+## Offline v29 snapshot and v30 entry fence
+
+`BrokerSidecar::stage_offline_v29_snapshot` is an inert preparation API. It,
+`publish_and_activate_quiesced_copy`, and `activate_quiesced_copy` require
+`QuiescedCutoverProof`, which has no constructor in the normal production
+build until the installed writer census and launcher gate exist. Unit tests
+construct it internally; the private broker fixture feature exposes a
+fixture-only proof and activation helper for temporary namespace storage.
+The snapshot API requires host root and root-owned, non-writable storage
+ancestry. It checks an
+exact `pid-identity.db` regular single-link source and present WAL/SHM/journal
+artifacts, refuses a preexisting live `sidecar/`, opens v29 read-only in WAL
+mode, and verifies the current completion-schema fingerprint. It computes a
+full `sqlite_master` plus typed-row fingerprint for every table, checks SQLite
+integrity and foreign keys, uses `VACUUM INTO` to include committed WAL rows,
+then compares source and copy. It checks the source pathname/inode and artifact
+identity again, makes the stage root-only, and fsyncs the copy and directories.
+The returned `sidecar-stage-<uuid>/` is never loaded by broker startup. A
+failure leaves at most an inert root-only stage for installer inspection; no
+live name is changed. The API is intentionally not a CLI or activation path.
+
+The broker now rejects all legacy entry, join, source, work and diagnostic
+opcodes whenever it opens a v30 sidecar. The challenged, already-bound
+`Y/R/W` State transport and authenticated read-only `I` route observation
+remain available, along with `i/X/x` for ingress observation and administrative
+transition. The durable draining state refuses `Y/R/W/I` as well. This is a
+closed service gate while production callers still open the retired user path.
+It also blocks new roots
+after a v30 restart; it is not a claim that an old manually invoked binary
+cannot write a user-owned historical pathname.
+
+The missing installed coordinator must create a durable launcher version gate
+*before* publication, stop and join every supported CLI/GUI Runner,
+guardian, driver, maintenance/wake/mailbox worker, provider runtime and helper,
+fence their respawn, and inspect open main/WAL/SHM writer handles. An old image
+or an unrouteable new image must fail before State/mailbox side effects. A
+cooperative `MailboxAuthorityFence` alone cannot establish this against an
+old binary. The coordinator must select the exact v29 source, hold the fence,
+stage once, revalidate the source and State continuity head under quiescence,
+then call the publication method. It rechecks the exact source and complete
+copy, atomically renames the stage directory to the fixed `sidecar/` name
+without replacement, fsyncs the parent, and invokes v29-to-v30 activation.
+Normal broker startup never calls either migration method.
+
+Crash handling is deliberately closed: an un-published stage is ignored; a
+published v29 directory makes broker startup refuse service; a committed v30
+generation reopens unchanged. A failed copy leaves the old v29 source as the
+only live truth. After publication, rollback needs a separately stopped and
+verified recovery procedure, never an ordinary v29 writer open. The installed
+coordinator and complete production caller routing are still required before
+this source can perform a live cutover. Do not issue native v4 K, a new worker,
+or Q from copied v29 records.
+
+## Broker ingress prerequisite added after the offline copy
+
+The broker now owns a durable `entry-gate.v1` latch in its root-owned State
+directory and holds a singleton `entry-gate.lock` for its process lifetime.
+The challenged `i` request reports `legacy-open`, `draining`, or
+`broker-v30-closed` from broker state only; it never reads the retired user
+sidecar. A host-root process in the host PID namespace can explicitly close
+the latch with challenged `X`. The broker serializes this transition with its
+request dispatch, fsyncs the marker, and refuses all ordinary opcodes
+afterward, including Y/R/W. An invalid or partial marker prevents restart.
+If a prerequisite fails before publication, host root can explicitly abort
+with challenged `x`, which persists `open` and resumes legacy admission.
+Abort refuses whenever the fixed `sidecar/` name exists. Normal service
+startup does not change the latch.
+The fixed `/usr/local/libexec/oulipoly/oulipoly-agent-runner` image and the
+explicit kernel entry mode query `i` before helper, worker, CLI, GUI or State
+effects. They refuse a missing broker, `draining`, and `broker-v30-closed`.
+
+This is a broker ingress and new-image prerequisite, not a quiescence proof.
+The current systemd unit uses `KillMode=process` and does not own every CLI,
+GUI, guardian, driver, wake, maintenance, mailbox, provider, receipt-helper or
+State cross-store writer. No installed inventory binds all those processes to
+exact executable images and PID incarnations, stops respawn, joins their
+children, or inspects every open main/WAL/SHM writer handle under a held
+sidecar authority fence. Existing old images can still write the user-owned
+path without making any broker request. Consequently the latch cannot build
+`QuiescedCutoverProof`, publish a stage, or lift v30 routing. A future
+installer must own all supported entry paths, including packaged GUI paths
+outside the fixed Runner image, and provide that process census and join.
+If it crashes after closing the latch, the broker remains closed on restart;
+an operator may abort before publication or handle postpublication recovery
+under stopped-service authority. The service does not automatically activate
+a stage.

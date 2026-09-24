@@ -177,6 +177,9 @@ fn send_state_request_at<T: serde::Serialize>(
 #[derive(Clone, Copy)]
 pub enum Operation {
     Classify,
+    ObserveEntryGate,
+    CloseEntryGate,
+    AbortEntryGate,
     ReserveEntry,
     ReadEntry,
     ReadStateRoute,
@@ -836,6 +839,44 @@ pub fn request_at(path: &Path, operation: Operation) -> io::Result<String> {
     request_frame_at(path, operation, Payload::None)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntryRoute {
+    LegacyOpen,
+    Draining,
+    BrokerV30Closed,
+}
+
+/// Reads only broker-owned service state. A retired user sidecar is never a
+/// source for this result; absence of a reachable broker is an error.
+pub fn observe_entry_gate_at(path: &Path) -> io::Result<EntryRoute> {
+    match request_at(path, Operation::ObserveEntryGate)?.as_str() {
+        "entry-gate-v1 legacy-open\n" => Ok(EntryRoute::LegacyOpen),
+        "entry-gate-v1 draining\n" => Ok(EntryRoute::Draining),
+        "entry-gate-v1 broker-v30-closed\n" => Ok(EntryRoute::BrokerV30Closed),
+        _ => Err(io::Error::other("unrecognized broker entry gate response")),
+    }
+}
+
+/// Administrative prerequisite only. This prevents new broker admission and
+/// survives restart; it does not stop already-running direct sidecar writers.
+pub fn close_entry_gate_at(path: &Path) -> io::Result<()> {
+    if request_at(path, Operation::CloseEntryGate)? == "entry-gate-v1 draining\n" {
+        Ok(())
+    } else {
+        Err(io::Error::other("broker entry gate closure refused"))
+    }
+}
+
+/// Reopens v29 admission after a failed cutover prerequisite only while no
+/// broker sidecar has been published. A published copy needs separate recovery.
+pub fn abort_entry_gate_at(path: &Path) -> io::Result<()> {
+    if request_at(path, Operation::AbortEntryGate)? == "entry-gate-v1 legacy-open\n" {
+        Ok(())
+    } else {
+        Err(io::Error::other("broker entry gate abort refused"))
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Payload {
     None,
@@ -897,11 +938,22 @@ pub fn read_entry(root_id: &str) -> io::Result<String> {
 
 fn request_frame_at(path: &Path, operation: Operation, payload: Payload) -> io::Result<String> {
     let mut stream = checked_connection(path)?;
+    if matches!(
+        operation,
+        Operation::ObserveEntryGate | Operation::CloseEntryGate | Operation::AbortEntryGate
+    ) {
+        let timeout = Some(std::time::Duration::from_secs(5));
+        stream.set_read_timeout(timeout)?;
+        stream.set_write_timeout(timeout)?;
+    }
     let mut challenge = [0u8; 16];
     stream.read_exact(&mut challenge)?;
     let mut request = [0u8; 65];
     request[0] = match operation {
         Operation::Classify => b'C',
+        Operation::ObserveEntryGate => b'i',
+        Operation::CloseEntryGate => b'X',
+        Operation::AbortEntryGate => b'x',
         Operation::ReserveEntry if matches!(payload, Payload::Prepare(..)) => b'P',
         Operation::ReserveEntry if matches!(payload, Payload::Bind(..)) => b'G',
         Operation::ReserveEntry => b'E',

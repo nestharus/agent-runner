@@ -4,6 +4,7 @@
 
 - `crates/oulipoly-kernel-broker/src/identity.rs`
 - `crates/oulipoly-kernel-broker/src/accepted_grant.rs`
+- `crates/oulipoly-kernel-broker/src/cutover_gate.rs`
 - `crates/oulipoly-kernel-broker/src/entry_registry.rs`
 - `crates/oulipoly-kernel-broker/src/lib.rs`
 - `crates/oulipoly-kernel-broker/src/linux_main.rs`
@@ -57,6 +58,9 @@
 | Broker restarts after a spent join. | Exact PID1 reattaches if live; spent join remains debt and no second child is launched. |
 | A sibling child tries to bind a prepared guardian's root ID. | Refused on pinned guardian incarnation mismatch. |
 | Legacy `L` request. | Refused; no ungated Runner is released. |
+| Host root closes broker ingress with X, then broker restarts. | Durable draining marker refuses ordinary broker opcodes; challenged i reports draining from broker-owned state. |
+| A prerequisite fails before fixed sidecar publication, or fixed sidecar exists. | Explicit host-root x can resume legacy admission only before publication; publication makes abort refuse. |
+| A direct SQLite writer retains main/WAL/SHM handles after ingress closes. | Writer remains live, so the latch gives no `QuiescedCutoverProof` and cannot authorize migration. |
 | Host-connected socket inherited by a privileged child PID namespace process. | Ancestor PID claim fails in the kernel; a real child send fails the broker's per-request credential equality check. |
 
 ## Edge cases

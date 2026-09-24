@@ -55,7 +55,8 @@ fn inner() {
             .execute("VACUUM INTO ?1", [target.to_str().unwrap()])
             .unwrap();
         fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
-        Some(BrokerSidecar::activate_quiesced_copy(&target, &broker_state).unwrap())
+        let proof = oulipoly_state::mailbox::QuiescedCutoverProof::private_fixture();
+        Some(BrokerSidecar::activate_private_fixture_copy(&target, &broker_state, &proof).unwrap())
     } else {
         None
     };
@@ -76,7 +77,7 @@ fn inner() {
         "broker startup: {}",
         fs::read_to_string(&broker_log).unwrap()
     );
-    if let Some(generation) = broker_generation {
+    if let Some(_generation) = broker_generation {
         // The test executable shares UID and broker access but is not the
         // fixed Runner image. It cannot inspect the route or select a path.
         assert!(protocol::state_route_at(&socket).is_err());
@@ -97,9 +98,7 @@ fn inner() {
         let first = invoke();
         assert!(!first.status.success());
         assert!(
-            String::from_utf8_lossy(&first.stderr).contains(&format!(
-                "broker-owned State generation {generation} requires production client routing"
-            )),
+            String::from_utf8_lossy(&first.stderr).contains("installed Runner has no v30 route"),
             "{}",
             String::from_utf8_lossy(&first.stderr)
         );
@@ -111,7 +110,8 @@ fn inner() {
         let unavailable = invoke();
         assert!(!unavailable.status.success());
         assert!(
-            String::from_utf8_lossy(&unavailable.stderr).contains("broker State route unavailable")
+            String::from_utf8_lossy(&unavailable.stderr)
+                .contains("installed broker entry gate unavailable")
         );
         assert_eq!(
             fs::read_dir(broker_state.join("entries")).unwrap().count(),
@@ -133,7 +133,9 @@ fn inner() {
         assert!(restarted.try_wait().unwrap().is_none());
         let second = invoke();
         assert!(!second.status.success());
-        assert!(String::from_utf8_lossy(&second.stderr).contains(&generation));
+        assert!(
+            String::from_utf8_lossy(&second.stderr).contains("installed Runner has no v30 route")
+        );
         assert_eq!(
             fs::read_dir(broker_state.join("entries")).unwrap().count(),
             0
