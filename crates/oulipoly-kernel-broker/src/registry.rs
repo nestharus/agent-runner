@@ -2,7 +2,7 @@ use crate::identity::{PinnedProcess, boot_id};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -63,6 +63,16 @@ impl RootRegistry {
             let entry = entry?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
+            // Fresh storage is a distinct authority. Only its exact published
+            // directory and the initializer's exact abandoned staging names
+            // coexist with old root records. Never descend into either here.
+            if name == "v30" || is_fresh_staging_name(&name) {
+                let meta = fs::symlink_metadata(entry.path())?;
+                if !meta.file_type().is_dir() || meta.uid() != 0 || meta.mode() & 0o777 != 0o700 {
+                    return Err(io::Error::other("unsafe fresh lane directory"));
+                }
+                continue;
+            }
             // The work registry is opened separately by the broker before it
             // serves requests. Never silently skip an arbitrary directory.
             if name == "works" && entry.file_type()?.is_dir() {
@@ -182,4 +192,13 @@ impl RootRegistry {
     pub fn debt_records(&self) -> &[RootRecord] {
         &self.debt
     }
+}
+
+fn is_fresh_staging_name(name: &str) -> bool {
+    let Some(suffix) = name.strip_prefix(".v30-fresh-") else {
+        return false;
+    };
+    suffix.len() == 32
+        && uuid::Uuid::parse_str(suffix)
+            .is_ok_and(|id| id.get_version_num() == 4 && id.simple().to_string() == suffix)
 }

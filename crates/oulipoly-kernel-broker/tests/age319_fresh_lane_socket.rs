@@ -1,5 +1,6 @@
 #![cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
 
+use oulipoly_kernel_broker::registry::RootRegistry;
 use oulipoly_state::StateDb;
 use oulipoly_state::mailbox::{FreshRecipientIdentity, FreshV30Lane, FreshV30Session, MailboxDb};
 use rusqlite::{Connection, params};
@@ -43,6 +44,13 @@ fn private_broker_has_distinct_fresh_route_while_old_wal_writer_survives() {
     fs::create_dir(&old_root).unwrap();
     fs::create_dir(&broker_root).unwrap();
     fs::set_permissions(&broker_root, fs::Permissions::from_mode(0o700)).unwrap();
+    let runner = std::env::current_exe().unwrap();
+    let old_socket = private.path().join("control.sock");
+    let mut old_only = start_broker(&broker_root, &old_socket, &runner);
+    assert_eq!(request(&old_socket, b'i'), "entry-gate-v1 legacy-open\n");
+    assert!(!private.path().join("v30.sock").exists());
+    old_only.kill().unwrap();
+    old_only.wait().unwrap();
     let old_state = old_root.join("state.db");
     let old_mailbox = old_root.join("pid-identity.db");
     drop(StateDb::open(&old_state).unwrap());
@@ -68,6 +76,10 @@ fn private_broker_has_distinct_fresh_route_while_old_wal_writer_survives() {
     });
     ready_rx.recv().unwrap();
     let identity = FreshV30Lane::initialize_at(&broker_root).unwrap();
+    let abandoned_stage = broker_root.join(format!(".v30-fresh-{}", uuid::Uuid::new_v4().simple()));
+    fs::create_dir(&abandoned_stage).unwrap();
+    fs::set_permissions(&abandoned_stage, fs::Permissions::from_mode(0o700)).unwrap();
+    RootRegistry::open(&broker_root).unwrap();
     // Model a root published by the previous source version: all prior
     // identity/admission tables exist, while the additive child table does
     // not. Reopen applies only the embedded fresh-lane migration.
@@ -87,9 +99,18 @@ fn private_broker_has_distinct_fresh_route_while_old_wal_writer_survives() {
             .unwrap(),
         0
     );
-    let socket = broker_root.join("fresh-v30.sock");
-    let runner = std::env::current_exe().unwrap();
+    let socket = private.path().join("v30.sock");
     let mut broker = start_broker(&broker_root, &socket, &runner);
+    assert_eq!(socket_peer_pid(&socket), broker.id());
+    assert_eq!(socket_peer_pid(&old_socket), broker.id());
+    assert_eq!(request(&old_socket, b'i'), "entry-gate-v1 legacy-open\n");
+    assert!(!request(&old_socket, b'I').starts_with("fresh-v30-route "));
+    assert!(request(&old_socket, b'U').contains("error"));
+    assert!(request_with_id(&old_socket, b'D', uuid::Uuid::new_v4(), true).contains("error"));
+    assert_eq!(
+        request(&socket, b'v'),
+        "error fresh v30 effects closed pending source/recipient/K/Q/Runner-result/ACK lineage\n"
+    );
     assert_eq!(request(&socket, b'i'), "entry-gate-v1 fresh-v30-closed\n");
     assert_eq!(
         request(&socket, b'I'),
@@ -120,6 +141,7 @@ fn private_broker_has_distinct_fresh_route_while_old_wal_writer_survives() {
     assert_eq!(session.request_id, request_id.to_string());
     assert_eq!(request_with_id(&socket, b'D', request_id, true), response);
     assert!(request(&socket, b'D').contains("invalid challenged request"));
+    assert_eq!(request(&old_socket, b'i'), "entry-gate-v1 legacy-open\n");
     assert!(
         request_with_id(&socket, b'D', uuid::Uuid::nil(), true)
             .contains("noncanonical or nil fresh request UUID")
@@ -178,7 +200,17 @@ fn private_broker_has_distinct_fresh_route_while_old_wal_writer_survives() {
 
     broker.kill().unwrap();
     broker.wait().unwrap();
+    let arbitrary = broker_root.join(".v30-fresh-not-a-stage");
+    fs::create_dir(&arbitrary).unwrap();
+    assert!(RootRegistry::open(&broker_root).is_err());
+    fs::remove_dir(&arbitrary).unwrap();
+    let fake_stage = broker_root.join(format!(".v30-fresh-{}", uuid::Uuid::new_v4().simple()));
+    std::os::unix::fs::symlink(&abandoned_stage, &fake_stage).unwrap();
+    assert!(RootRegistry::open(&broker_root).is_err());
+    fs::remove_file(&fake_stage).unwrap();
     broker = start_broker(&broker_root, &socket, &runner);
+    assert_eq!(socket_peer_pid(&socket), broker.id());
+    assert_eq!(socket_peer_pid(&old_socket), broker.id());
     assert_eq!(request_with_id(&socket, b'd', request_id, true), response);
     assert_eq!(request_with_id(&socket, b'D', request_id, true), response);
     assert_eq!(
@@ -343,9 +375,11 @@ fn start_broker(
     runner: &std::path::Path,
 ) -> Child {
     let mut child = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
-        .arg("--serve-fresh-v30")
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", root)
-        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", socket)
+        .env(
+            "OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1",
+            root.parent().unwrap().join("control.sock"),
+        )
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", runner)
         .spawn()
         .unwrap();
@@ -363,6 +397,26 @@ fn start_broker(
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn socket_peer_pid(socket: &std::path::Path) -> u32 {
+    use std::os::fd::AsRawFd;
+    let stream = UnixStream::connect(socket).unwrap();
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    assert_eq!(
+        unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut cred as *mut libc::ucred).cast(),
+                &mut len,
+            )
+        },
+        0
+    );
+    cred.pid as u32
 }
 
 fn request(socket: &std::path::Path, operation: u8) -> String {

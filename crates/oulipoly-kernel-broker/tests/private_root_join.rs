@@ -6,7 +6,9 @@ use oulipoly_kernel_broker::protocol::{
 };
 use oulipoly_kernel_broker::source_physical::{SourceObservation, SourcePhysicalRegistry};
 use oulipoly_state::completion_continuation::AdmittedSourceBinding;
-use oulipoly_state::mailbox::{AgentBashCompleteEnqueue, BrokerSidecar, EnqueueResult, MailboxDb};
+use oulipoly_state::mailbox::{
+    AgentBashCompleteEnqueue, BrokerSidecar, EnqueueResult, FreshV30Lane, MailboxDb,
+};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -1461,6 +1463,16 @@ fn inner() {
                 // A completed t handler is required before killing its socket;
                 // the lost reply has no authority to trigger a second K.
                 eventually(|| protocol::request_at(&socket, Operation::Classify).is_ok());
+                if mode == "native_cancel" {
+                    // The same old broker must recover pending native/State Q
+                    // and physical debt with both published fresh storage and
+                    // an abandoned initializer stage in its root directory.
+                    FreshV30Lane::initialize_at(&broker_state).unwrap();
+                    let stage =
+                        broker_state.join(format!(".v30-fresh-{}", uuid::Uuid::new_v4().simple()));
+                    fs::create_dir(&stage).unwrap();
+                    fs::set_permissions(&stage, fs::Permissions::from_mode(0o700)).unwrap();
+                }
                 stop(&mut broker);
                 assert!(
                     !socket.exists() || protocol::request_at(&socket, Operation::Classify).is_err()

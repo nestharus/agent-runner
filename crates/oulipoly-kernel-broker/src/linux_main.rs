@@ -42,7 +42,7 @@ use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const SOCKET: &str = "/run/oulipoly-kernel-broker/control.sock";
@@ -2609,6 +2609,29 @@ fn serve() -> io::Result<()> {
     let listener = UnixListener::bind(&socket)?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o660))?;
     listener.set_nonblocking(true)?;
+    // The old loop alone owns the release gate and mutable kernel registries.
+    // Fresh storage stays on another thread and is opened only at the fixed
+    // broker-owned v30 directory. Neither handler can wait on the other's
+    // socket or select the other's State connection.
+    let fresh_root = Path::new(&state).join("v30");
+    if fs::symlink_metadata(&fresh_root).is_ok() {
+        let fresh_state_root = PathBuf::from(&state);
+        let fresh_runner_image = runner_image.try_clone()?;
+        let fresh_socket = if fixture {
+            Path::new(&socket).with_file_name("v30.sock")
+        } else {
+            PathBuf::from(FRESH_SOCKET)
+        };
+        std::thread::Builder::new()
+            .name("fresh-v30-lane".into())
+            .spawn(move || {
+                if let Err(error) =
+                    serve_fresh_v30_at(&fresh_state_root, &fresh_socket, fresh_runner_image)
+                {
+                    eprintln!("fresh v30 lane closed: {error}");
+                }
+            })?;
+    }
     loop {
         let mut stream = match listener.accept() {
             Ok((stream, _)) => stream,
@@ -3443,6 +3466,7 @@ fn fresh_payload_reply(
         "payload_base64": base64::engine::general_purpose::STANDARD.encode(submission.payload) }))
 }
 
+#[cfg(feature = "age319-private-broker-fixture")]
 fn serve_fresh_v30() -> io::Result<()> {
     if unsafe { libc::geteuid() } != 0 {
         return Err(io::Error::other("host root required"));
@@ -3492,20 +3516,27 @@ fn serve_fresh_v30() -> io::Result<()> {
         let image = File::open(&runner)?;
         pair.verify_file(Path::new(&runner), &pair.runner_sha256, true, &image)?;
     }
-    let runner_image = File::open(&runner)?;
+    serve_fresh_v30_at(
+        Path::new(&state_root),
+        Path::new(&socket),
+        File::open(&runner)?,
+    )
+}
+
+fn serve_fresh_v30_at(state_root: &Path, socket: &Path, runner_image: File) -> io::Result<()> {
     // A missing or incomplete publication cannot bind the new endpoint.
-    let mut lane = FreshV30Lane::open_at(Path::new(&state_root)).map_err(io::Error::other)?;
-    let instance = EntryGate::open(&Path::new(&state_root).join("v30"))?;
-    match fs::symlink_metadata(&socket) {
+    let mut lane = FreshV30Lane::open_at(state_root).map_err(io::Error::other)?;
+    let instance = EntryGate::open(&state_root.join("v30"))?;
+    match fs::symlink_metadata(socket) {
         Ok(meta) if meta.file_type().is_socket() && meta.uid() == 0 && meta.nlink() == 1 => {
-            fs::remove_file(&socket)?;
+            fs::remove_file(socket)?;
         }
         Ok(_) => return Err(io::Error::other("fresh v30 socket pathname is untrusted")),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    let listener = UnixListener::bind(&socket)?;
-    fs::set_permissions(&socket, fs::Permissions::from_mode(0o660))?;
+    let listener = UnixListener::bind(socket)?;
+    fs::set_permissions(socket, fs::Permissions::from_mode(0o660))?;
     for incoming in listener.incoming() {
         let Ok(mut stream) = incoming else { continue };
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -3630,6 +3661,13 @@ fn serve_fresh_v30() -> io::Result<()> {
                     ))
                 }
                 b'F' => {
+                    // No production delivery can be authorized by a private
+                    // prefix D/session or by a copied old mailbox row.
+                    if !private_fixture() {
+                        return Err(io::Error::other(
+                            "fresh recipient effect closed until released-child handoff, real invocation, registration, W, result and ACK",
+                        ));
+                    }
                     let RequestPayload::FreshRecipientRequest { request } = payload else {
                         return Err(io::Error::other("fresh recipient request absent"));
                     };
@@ -3762,7 +3800,18 @@ pub fn run() {
                 })
                 .map_err(io::Error::other)
         }
-        [_, mode] if mode == "--serve-fresh-v30" => serve_fresh_v30(),
+        [_, mode] if mode == "--serve-fresh-v30" => {
+            #[cfg(feature = "age319-private-broker-fixture")]
+            if private_fixture() {
+                return if let Err(error) = serve_fresh_v30() {
+                    eprintln!("kernel broker: {error}");
+                    std::process::exit(1);
+                };
+            }
+            Err(io::Error::other(
+                "separate fresh broker authority retired; use the single broker service",
+            ))
+        }
         _ => {
             eprintln!("unknown broker mode");
             std::process::exit(2);
