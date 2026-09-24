@@ -125,6 +125,9 @@ fn require_cutover_entry_route(
 #[derive(Debug)]
 enum RequestPayload {
     None,
+    FreshSessionRequest {
+        request_id: String,
+    },
     Prepare {
         root_id: String,
         guardian_pid: i32,
@@ -299,7 +302,7 @@ fn recv_request(
     let valid_length = match request[0] {
         b'G' | b'g' => read == 65,
         b'P' | b'p' => read == 37,
-        b'Q' | b'Z' => read == 33,
+        b'Q' | b'Z' | b'D' | b'd' => read == 33,
         #[cfg(feature = "age319-private-broker-fixture")]
         b'l' | b'M' => read == 49,
         b'A' | b'a' => read == 33,
@@ -343,6 +346,9 @@ fn recv_request(
     }
     process.verify()?;
     let payload = match request[0] {
+        b'D' | b'd' => RequestPayload::FreshSessionRequest {
+            request_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
+        },
         b'P' | b'p' => RequestPayload::Prepare {
             root_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
             guardian_pid: i32::from_ne_bytes(request[33..37].try_into().unwrap()),
@@ -3230,11 +3236,11 @@ fn serve_fresh_v30() -> io::Result<()> {
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
         let answer = (|| -> io::Result<String> {
             let (operation, payload, peer) = peer_from_request(&mut stream)?;
-            if !matches!(payload, RequestPayload::None) {
-                return Err(io::Error::other("fresh lane request must have no payload"));
-            }
             peer.process.verify()?;
             if operation == b'i' {
+                if !matches!(payload, RequestPayload::None) {
+                    return Err(io::Error::other("fresh gate read has a payload"));
+                }
                 return Ok(if instance.is_closed() {
                     "entry-gate-v1 draining\n"
                 } else {
@@ -3248,17 +3254,33 @@ fn serve_fresh_v30() -> io::Result<()> {
                 ));
             }
             match operation {
-                b'I' => Ok(format!(
+                b'I' if matches!(payload, RequestPayload::None) => Ok(format!(
                     "fresh-v30-route {} {} {}\n",
                     lane.identity().lane_id,
                     lane.identity().source_generation,
                     lane.identity().domain_id,
                 )),
-                b'D' => {
-                    if instance.is_closed() {
-                        return Err(io::Error::other("fresh v30 session allocation gate closed"));
+                b'D' | b'd' => {
+                    let RequestPayload::FreshSessionRequest { request_id } = payload else {
+                        return Err(io::Error::other("fresh session request identity absent"));
+                    };
+                    let existing = lane.read_session(&request_id).map_err(io::Error::other)?;
+                    if operation == b'd' && existing.is_none() {
+                        return Ok("fresh-session absent\n".into());
                     }
-                    let session = lane.allocate_session().map_err(io::Error::other)?;
+                    if instance.is_closed() {
+                        if existing.is_none() {
+                            return Err(io::Error::other(
+                                "fresh v30 session allocation gate closed",
+                            ));
+                        }
+                    }
+                    let session = match existing {
+                        Some(session) => session,
+                        None => lane
+                            .allocate_session(&request_id)
+                            .map_err(io::Error::other)?,
+                    };
                     Ok(format!(
                         "fresh-session {}\n",
                         serde_json::to_string(&session)?

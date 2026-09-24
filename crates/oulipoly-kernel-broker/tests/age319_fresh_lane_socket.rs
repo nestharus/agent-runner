@@ -77,9 +77,30 @@ fn private_broker_has_distinct_fresh_route_while_old_wal_writer_survives() {
         )
     );
     assert!(request(&socket, b'C').contains("fresh v30 effects closed"));
-    let response = request(&socket, b'D');
+    let request_id = uuid::Uuid::new_v4();
+    assert_eq!(
+        request_with_id(&socket, b'd', request_id, true),
+        "fresh-session absent\n"
+    );
+    // First reply is deliberately discarded after the broker commits.
+    request_with_id(&socket, b'D', request_id, false);
+    let response = request_with_id(&socket, b'd', request_id, true);
     let session: FreshV30Session =
         serde_json::from_str(response.strip_prefix("fresh-session ").unwrap().trim_end()).unwrap();
+    assert_eq!(session.request_id, request_id.to_string());
+    assert_eq!(request_with_id(&socket, b'D', request_id, true), response);
+    assert!(request(&socket, b'D').contains("invalid challenged request"));
+    assert!(
+        request_with_id(&socket, b'D', uuid::Uuid::nil(), true)
+            .contains("noncanonical or nil fresh request UUID")
+    );
+    assert_eq!(
+        fresh
+            .query_row("SELECT count(*) FROM fresh_lane_session", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
     assert_eq!(session.lane_id, identity.lane_id);
     let lane = FreshV30Lane::open_at(&broker_root).unwrap();
     lane.require_session(&session).unwrap();
@@ -95,6 +116,19 @@ fn private_broker_has_distinct_fresh_route_while_old_wal_writer_survives() {
     broker.kill().unwrap();
     broker.wait().unwrap();
     broker = start_broker(&broker_root, &socket, &runner);
+    assert_eq!(request_with_id(&socket, b'd', request_id, true), response);
+    assert_eq!(request_with_id(&socket, b'D', request_id, true), response);
+    assert_eq!(
+        request_with_id(&socket, b'd', uuid::Uuid::new_v4(), true),
+        "fresh-session absent\n"
+    );
+    assert_eq!(
+        fresh
+            .query_row("SELECT count(*) FROM fresh_lane_session", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
     assert_eq!(
         request(&socket, b'I'),
         format!(
@@ -175,6 +209,19 @@ fn start_broker(
 }
 
 fn request(socket: &std::path::Path, operation: u8) -> String {
+    request_frame(socket, operation, None, true)
+}
+
+fn request_with_id(socket: &std::path::Path, operation: u8, id: uuid::Uuid, read: bool) -> String {
+    request_frame(socket, operation, Some(id), read)
+}
+
+fn request_frame(
+    socket: &std::path::Path,
+    operation: u8,
+    id: Option<uuid::Uuid>,
+    read: bool,
+) -> String {
     let mut stream = UnixStream::connect(socket).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
@@ -184,10 +231,18 @@ fn request(socket: &std::path::Path, operation: u8) -> String {
         .unwrap();
     let mut challenge = [0u8; 16];
     stream.read_exact(&mut challenge).unwrap();
-    let mut frame = [0u8; 17];
+    let mut frame = [0u8; 33];
     frame[0] = operation;
-    frame[1..].copy_from_slice(&challenge);
-    stream.write_all(&frame).unwrap();
+    frame[1..17].copy_from_slice(&challenge);
+    if let Some(id) = id {
+        frame[17..33].copy_from_slice(id.as_bytes());
+    }
+    stream
+        .write_all(&frame[..if id.is_some() { 33 } else { 17 }])
+        .unwrap();
+    if !read {
+        return String::new();
+    }
     let mut response = String::new();
     stream.read_to_string(&mut response).unwrap();
     response

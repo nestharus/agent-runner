@@ -27,6 +27,7 @@ pub struct FreshV30Session {
     pub lane_id: String,
     pub source_generation: String,
     pub session_id: String,
+    pub request_id: String,
     pub allocation_id: String,
 }
 
@@ -210,6 +211,33 @@ impl FreshV30Lane {
         if protected_schema_count != 6 {
             return Err("fresh lane immutable schema is incomplete".into());
         }
+        let request_key_columns: i64 = sidecar
+            .mailbox()
+            .conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('fresh_lane_session') WHERE name='request_id' AND \"notnull\"=1",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if request_key_columns != 1 {
+            return Err("fresh lane session request identity is absent".into());
+        }
+        let unique_request_indexes: i64 = sidecar
+            .mailbox()
+            .conn
+            .query_row(
+                "SELECT count(*) FROM pragma_index_list('fresh_lane_session') AS idx
+                 WHERE idx.\"unique\"=1
+                   AND (SELECT count(*) FROM pragma_index_info(idx.name))=1
+                   AND (SELECT name FROM pragma_index_info(idx.name))='request_id'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if unique_request_indexes != 1 {
+            return Err("fresh lane session request identity is not unique".into());
+        }
         let identity = FreshV30LaneIdentity {
             lane_id: row.1,
             domain_id: row.2,
@@ -280,23 +308,66 @@ impl FreshV30Lane {
         &self.identity
     }
 
-    /// Mint a new provider session; caller-provided session strings are never
-    /// accepted as allocation input, so an old session cannot be imported by
-    /// spelling its ID at the new endpoint.
-    pub fn allocate_session(&mut self) -> Result<FreshV30Session, String> {
+    /// A request UUID is created before the first send and retained by the
+    /// caller until readback. SQLite's unique request key makes concurrent
+    /// retries and lost replies return the exact first allocation. The key
+    /// never selects a session ID or an old ledger.
+    pub fn allocate_session(&mut self, request_id: &str) -> Result<FreshV30Session, String> {
+        validate_request_id(request_id)?;
+        if let Some(existing) = self.read_session(request_id)? {
+            return Ok(existing);
+        }
         let allocation_id = Uuid::new_v4().to_string();
         let session = FreshV30Session {
             lane_id: self.identity.lane_id.clone(),
             source_generation: self.identity.source_generation.clone(),
             session_id: format!("v30:{}:{}", self.identity.lane_id, Uuid::new_v4()),
+            request_id: request_id.to_owned(),
             allocation_id,
         };
         self.sidecar.mailbox().conn.execute(
-            "INSERT INTO fresh_lane_session(session_id,allocation_id,lane_id,source_generation,allocated_at)
-             VALUES(?1,?2,?3,?4,?5)",
-            params![session.session_id, session.allocation_id, session.lane_id,
-                session.source_generation, Utc::now().to_rfc3339()],
+            "INSERT INTO fresh_lane_session(session_id,request_id,allocation_id,lane_id,source_generation,allocated_at)
+             VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(request_id) DO NOTHING",
+            params![session.session_id, session.request_id, session.allocation_id,
+                session.lane_id, session.source_generation, Utc::now().to_rfc3339()],
         ).map_err(|e| e.to_string())?;
+        self.read_session(request_id)?
+            .ok_or_else(|| "fresh session allocation lost its durable row".into())
+    }
+
+    /// Exact readback is available without allocating, including after a
+    /// restart or while the entry gate is closed.
+    pub fn read_session(&self, request_id: &str) -> Result<Option<FreshV30Session>, String> {
+        validate_request_id(request_id)?;
+        let mut query = self
+            .sidecar
+            .mailbox()
+            .conn
+            .prepare(
+                "SELECT session_id,request_id,allocation_id,lane_id,source_generation
+             FROM fresh_lane_session WHERE request_id=?1",
+            )
+            .map_err(|e| e.to_string())?;
+        let mut rows = query
+            .query(params![request_id])
+            .map_err(|e| e.to_string())?;
+        let session = rows
+            .next()
+            .map_err(|e| e.to_string())?
+            .map(|row| {
+                Ok::<_, rusqlite::Error>(FreshV30Session {
+                    session_id: row.get(0)?,
+                    request_id: row.get(1)?,
+                    allocation_id: row.get(2)?,
+                    lane_id: row.get(3)?,
+                    source_generation: row.get(4)?,
+                })
+            })
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        if let Some(ref session) = session {
+            self.require_session(session)?;
+        }
         Ok(session)
     }
 
@@ -315,9 +386,10 @@ impl FreshV30Lane {
             .conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM fresh_lane_session WHERE session_id=?1
-             AND allocation_id=?2 AND lane_id=?3 AND source_generation=?4)",
+             AND request_id=?2 AND allocation_id=?3 AND lane_id=?4 AND source_generation=?5)",
                 params![
                     session.session_id,
+                    session.request_id,
                     session.allocation_id,
                     session.lane_id,
                     session.source_generation
@@ -349,6 +421,14 @@ impl FreshV30Lane {
         }
         Ok(())
     }
+}
+
+fn validate_request_id(request_id: &str) -> Result<(), String> {
+    let parsed = Uuid::parse_str(request_id).map_err(|_| "invalid fresh request UUID")?;
+    if parsed.is_nil() || parsed.to_string() != request_id {
+        return Err("noncanonical or nil fresh request UUID".into());
+    }
+    Ok(())
 }
 
 fn require_root() -> Result<(), String> {

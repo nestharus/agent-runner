@@ -112,7 +112,28 @@ fn private_fresh_dual_lane_live_old_wal_collision_and_restart() {
     assert_eq!(FreshV30Lane::initialize_at(&broker_root).unwrap(), first);
     let mut lane = FreshV30Lane::open_at(&broker_root).unwrap();
     assert_eq!(lane.identity(), &first);
-    let session = lane.allocate_session().unwrap();
+    let request_id = uuid::Uuid::new_v4().to_string();
+    assert!(lane.read_session(&request_id).unwrap().is_none());
+    let session = lane.allocate_session(&request_id).unwrap();
+    assert_eq!(lane.allocate_session(&request_id).unwrap(), session);
+    assert_eq!(
+        lane.read_session(&request_id).unwrap(),
+        Some(session.clone())
+    );
+    assert_eq!(
+        mailbox
+            .query_row("SELECT count(*) FROM fresh_lane_session", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert!(
+        lane.read_session(&uuid::Uuid::new_v4().to_string())
+            .unwrap()
+            .is_none()
+    );
+    assert!(lane.allocate_session("not-a-request-id").is_err());
+    assert!(lane.read_session(&uuid::Uuid::nil().to_string()).is_err());
     assert_eq!(insert_pending(&mailbox, "v30-primer", "new-primer"), 1);
     let new_row = insert_pending(&mailbox, &session.session_id, "same-handle");
     assert_eq!(new_row, 2);
@@ -178,6 +199,7 @@ fn private_fresh_dual_lane_live_old_wal_collision_and_restart() {
     );
     let reopened = FreshV30Lane::open_at(&broker_root).unwrap();
     reopened.require_mailbox_row(&session, 2).unwrap();
+    assert_eq!(reopened.read_session(&request_id).unwrap(), Some(session));
 }
 
 fn insert_pending(db: &Connection, session: &str, handle: &str) -> i64 {

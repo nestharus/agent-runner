@@ -50,17 +50,48 @@ pub fn fresh_v30_state_route() -> io::Result<FreshV30Route> {
     Ok(route)
 }
 
-pub fn allocate_fresh_v30_session() -> io::Result<oulipoly_state::mailbox::FreshV30Session> {
+/// Persist `request_id` before sending. Reuse it for a retry or readback
+/// after an uncertain socket result; a new UUID requests a new session.
+pub fn allocate_fresh_v30_session(
+    request_id: &str,
+) -> io::Result<oulipoly_state::mailbox::FreshV30Session> {
+    fresh_v30_session_request(Operation::AllocateFreshSession, request_id)?
+        .ok_or_else(|| io::Error::other("fresh v30 allocation row absent"))
+}
+
+pub fn read_fresh_v30_session(
+    request_id: &str,
+) -> io::Result<Option<oulipoly_state::mailbox::FreshV30Session>> {
+    fresh_v30_session_request(Operation::ReadFreshSession, request_id)
+}
+
+fn fresh_v30_session_request(
+    operation: Operation,
+    request_id: &str,
+) -> io::Result<Option<oulipoly_state::mailbox::FreshV30Session>> {
+    let id = uuid::Uuid::parse_str(request_id)
+        .map_err(|_| io::Error::other("invalid fresh request UUID"))?;
+    if id.is_nil() || id.to_string() != request_id {
+        return Err(io::Error::other("noncanonical or nil fresh request UUID"));
+    }
     let response = request_frame_at(
         Path::new(INSTALLED_FRESH_V30_SOCKET),
-        Operation::AllocateFreshSession,
-        Payload::None,
+        operation,
+        Payload::FreshRequest(id),
     )?;
+    if response == "fresh-session absent\n" {
+        return Ok(None);
+    }
     let body = response
         .strip_prefix("fresh-session ")
         .and_then(|value| value.strip_suffix('\n'))
         .ok_or_else(|| io::Error::other("fresh v30 session allocation refused"))?;
-    serde_json::from_str(body).map_err(io::Error::other)
+    let session: oulipoly_state::mailbox::FreshV30Session =
+        serde_json::from_str(body).map_err(io::Error::other)?;
+    if session.request_id != request_id {
+        return Err(io::Error::other("fresh v30 request readback mismatch"));
+    }
+    Ok(Some(session))
 }
 
 /// Entry routing is observed from the live broker before any user-side
@@ -478,6 +509,7 @@ pub enum Operation {
     ReadEntry,
     ReadStateRoute,
     AllocateFreshSession,
+    ReadFreshSession,
     ReserveV30Entry,
     ReadV30Entry,
     PrepareV30Guardian,
@@ -1515,6 +1547,7 @@ pub fn abort_entry_gate_at(path: &Path) -> io::Result<()> {
 #[derive(Clone, Copy)]
 enum Payload {
     None,
+    FreshRequest(uuid::Uuid),
     Prepare(uuid::Uuid, i32),
     Bind(uuid::Uuid, uuid::Uuid, uuid::Uuid),
     Read(uuid::Uuid),
@@ -1638,11 +1671,16 @@ fn request_frame_at(path: &Path, operation: Operation, payload: Payload) -> io::
         Operation::ReadV30Entry => b'a',
         Operation::ReadStateRoute => b'I',
         Operation::AllocateFreshSession => b'D',
+        Operation::ReadFreshSession => b'd',
         Operation::LaunchFixedRunner => b'L',
     };
     request[1..17].copy_from_slice(&challenge);
     let length = match payload {
         Payload::None => 17,
+        Payload::FreshRequest(id) => {
+            request[17..33].copy_from_slice(id.as_bytes());
+            33
+        }
         Payload::Prepare(root, pid) => {
             request[17..33].copy_from_slice(root.as_bytes());
             request[33..37].copy_from_slice(&pid.to_ne_bytes());

@@ -4,10 +4,13 @@
 
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
+use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 fn eventually(mut done: impl FnMut() -> bool, detail: impl Fn() -> String) {
@@ -24,6 +27,26 @@ fn eventually(mut done: impl FnMut() -> bool, detail: impl Fn() -> String) {
 fn stop(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
+}
+
+fn fresh_session_request(socket: &Path, operation: u8, request_id: uuid::Uuid) -> String {
+    let mut stream = UnixStream::connect(socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge).unwrap();
+    let mut frame = [0u8; 33];
+    frame[0] = operation;
+    frame[1..17].copy_from_slice(&challenge);
+    frame[17..33].copy_from_slice(request_id.as_bytes());
+    stream.write_all(&frame).unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    response
 }
 
 struct PrivateDir(Option<tempfile::TempDir>);
@@ -526,6 +549,7 @@ fn inner() {
     fs::create_dir(&data).unwrap();
     fs::create_dir(&bash_state).unwrap();
     fs::create_dir(&broker_state).unwrap();
+    fs::set_permissions(&broker_state, fs::Permissions::from_mode(0o700)).unwrap();
     fs::create_dir(&config).unwrap();
     fs::create_dir(&home).unwrap();
     let mailbox = oulipoly_state::mailbox::MailboxDb::open_completion_continuation_domain(
@@ -539,7 +563,7 @@ fn inner() {
     fs::create_dir("/run/oulipoly-kernel-broker").unwrap();
     std::os::unix::fs::symlink(&socket, "/run/oulipoly-kernel-broker/control.sock").unwrap();
     let broker_log = temp_path.join("broker.log");
-    let mut broker = Command::new(broker_image)
+    let mut broker = Command::new(&broker_image)
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
@@ -603,8 +627,10 @@ fn inner() {
     drop(preaccept_mailbox);
 
     let test_image = std::env::current_exe().unwrap();
+    let release_source = temp_path.join("release-old-source");
     let script = format!(
-        "AGE319_V_PROBE_INNER=1 AGE319_V_PROBE_DATA={} AGE319_V_PROBE_BASH_STATE={} AGE319_V_PROBE_BROKER_STATE={} AGE319_V_PROBE_BROKER_SOCKET={} AGE319_V_PROBE_EFFECT={} {} --exact paired_owner_v_negative_probe_node --ignored --nocapture && printf 'executed\\n' >> {}",
+        "while [ ! -f {} ]; do sleep 0.05; done; AGE319_V_PROBE_INNER=1 AGE319_V_PROBE_DATA={} AGE319_V_PROBE_BASH_STATE={} AGE319_V_PROBE_BROKER_STATE={} AGE319_V_PROBE_BROKER_SOCKET={} AGE319_V_PROBE_EFFECT={} {} --exact paired_owner_v_negative_probe_node --ignored --nocapture && printf 'executed\\n' >> {}",
+        release_source.display(),
         data.display(),
         bash_state.display(),
         broker_state.display(),
@@ -634,6 +660,108 @@ fn inner() {
         .stderr(Stdio::from(File::create(&err).unwrap()))
         .spawn()
         .unwrap();
+    // A real v29 Bash handle has committed its source identity, but its
+    // pinned helper is held before workload output and notification. The old
+    // State writer remains live while a separate v30 service is published.
+    eventually(
+        || {
+            fs::read_dir(bash_state.join("agent-bash"))
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .any(|item| {
+                    item.path().join("source-registration-v2.json").exists()
+                        && item.path().join("registration-receipt-v2.json").exists()
+                })
+        },
+        || {
+            format!(
+                "old Bash handle not committed: {}",
+                fs::read_to_string(&err).unwrap_or_default()
+            )
+        },
+    );
+    let committed_old_handle = fs::read_dir(bash_state.join("agent-bash"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|item| item.path())
+        .find(|path| path.join("registration-receipt-v2.json").exists())
+        .unwrap();
+    assert_eq!(
+        json(committed_old_handle.join("registration-receipt-v2.json"))["registration_committed"],
+        true
+    );
+    assert!(committed_old_handle.join("delivery-helper").is_file());
+    assert!(!ran.exists(), "old source effect preceded fresh service");
+    let (writer_ready_tx, writer_ready_rx) = mpsc::channel();
+    let (writer_release_tx, writer_release_rx) = mpsc::channel();
+    let old_state_path = data.join("state.db");
+    let old_writer = std::thread::spawn(move || {
+        let db = rusqlite::Connection::open(old_state_path).unwrap();
+        db.execute_batch("PRAGMA journal_mode=WAL; BEGIN IMMEDIATE; CREATE TABLE old_late_wal(value TEXT NOT NULL);").unwrap();
+        writer_ready_tx.send(()).unwrap();
+        writer_release_rx.recv().unwrap();
+        db.execute(
+            "INSERT INTO old_late_wal VALUES('committed-after-fresh-allocation')",
+            [],
+        )
+        .unwrap();
+        db.execute_batch("COMMIT").unwrap();
+    });
+    writer_ready_rx.recv().unwrap();
+    let fresh_identity =
+        oulipoly_state::mailbox::FreshV30Lane::initialize_at(&broker_state).unwrap();
+    let fresh_socket = temp_path.join("fresh-v30.sock");
+    let mut fresh_broker = Command::new(&broker_image)
+        .arg("--serve-fresh-v30")
+        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &fresh_socket)
+        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
+        .env(
+            "OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1",
+            std::env::current_exe().unwrap(),
+        )
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            File::create(temp_path.join("fresh-broker.log")).unwrap(),
+        ))
+        .spawn()
+        .unwrap();
+    eventually(
+        || {
+            fresh_socket.exists() && UnixStream::connect(&fresh_socket).is_ok()
+                || fresh_broker.try_wait().unwrap().is_some()
+        },
+        || format!("fresh broker socket absent: {}", fresh_socket.display()),
+    );
+    assert!(fresh_socket.exists(), "fresh broker exited before socket");
+    let request_id = uuid::Uuid::new_v4();
+    let fresh_response = fresh_session_request(&fresh_socket, b'D', request_id);
+    let fresh_session: oulipoly_state::mailbox::FreshV30Session = serde_json::from_str(
+        fresh_response
+            .strip_prefix("fresh-session ")
+            .unwrap()
+            .trim_end(),
+    )
+    .unwrap();
+    assert_eq!(fresh_session.lane_id, fresh_identity.lane_id);
+    assert_eq!(fresh_session.request_id, request_id.to_string());
+    assert_eq!(
+        fresh_session_request(&fresh_socket, b'd', request_id),
+        fresh_response
+    );
+    assert!(!ran.exists(), "old source effect preceded fresh allocation");
+    writer_release_tx.send(()).unwrap();
+    old_writer.join().unwrap();
+    assert_eq!(
+        rusqlite::Connection::open(data.join("state.db"))
+            .unwrap()
+            .query_row("SELECT value FROM old_late_wal", [], |row| row
+                .get::<_, String>(0))
+            .unwrap(),
+        "committed-after-fresh-allocation"
+    );
+    fs::write(&release_source, b"release\n").unwrap();
     eventually(
         || ran.exists(),
         || {
@@ -914,8 +1042,53 @@ fn inner() {
                 .all(|listener| listener.acknowledged_at.is_some()),
         "recipient ACK missing after consumption: listeners={listeners:?}"
     );
+    // The old committed handle, delayed recipient and ACK never entered the
+    // new ledger, even though its service was live before old source release.
+    let fresh_state = rusqlite::Connection::open(broker_state.join("v30/state.db")).unwrap();
+    let fresh_mailbox =
+        rusqlite::Connection::open(broker_state.join("v30/sidecar/pid-identity.db")).unwrap();
+    let old_mailbox = rusqlite::Connection::open(data.join("pid-identity.db")).unwrap();
+    assert_eq!(
+        old_mailbox
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        29
+    );
+    assert_eq!(
+        fresh_mailbox
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        30
+    );
+    assert_eq!(
+        fresh_state
+            .query_row("SELECT count(*) FROM invocations", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        fresh_mailbox
+            .query_row("SELECT count(*) FROM mailbox", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        fresh_mailbox
+            .query_row("SELECT count(*) FROM fresh_lane_session", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        fresh_session_request(&fresh_socket, b'd', request_id),
+        fresh_response
+    );
+    assert_ne!(fresh_session.session_id, session);
     assert_eq!(fs::read_to_string(&ran).unwrap(), "executed\n");
     stop(&mut entry);
+    stop(&mut fresh_broker);
     stop(&mut broker);
 }
 

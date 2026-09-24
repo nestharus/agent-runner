@@ -193,6 +193,19 @@ connection provenance before a future K may have effects.
 Older prepared v4 records without the new sidecar pin can still replay the
 same N grant ID, but native k refuses them as retained debt.
 
+## Fresh v30 session request
+
+The separate fresh v30 socket accepts challenged `I` route readback and
+`D`/`d` session allocation/readback only. `D` carries a caller-created,
+persisted 16-byte request UUID after the challenge. The broker records that
+request with the minted session in its root-owned v30 sidecar; repeating `D`
+with the same UUID returns the exact row, including after a lost reply or
+restart. `d` uses the same frame and returns that row or `fresh-session absent`
+without allocating. A caller must retain the UUID before its first `D` send;
+using a new UUID requests a new session. Neither operation grants work,
+notification, recipient delivery, or ACK. The legacy socket and v29 debt stay
+separate.
+
 ## Remaining interfaces
 
 - The merged State/runtime/Runner PID readers translate namespace-local PIDs

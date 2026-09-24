@@ -13,6 +13,7 @@ CREATE TRIGGER fresh_lane_identity_no_delete BEFORE DELETE ON fresh_lane_identit
 BEGIN SELECT RAISE(ABORT,'fresh lane identity immutable'); END;
 CREATE TABLE fresh_lane_session (
  session_id TEXT PRIMARY KEY,
+ request_id TEXT NOT NULL UNIQUE,
  allocation_id TEXT NOT NULL UNIQUE,
  lane_id TEXT NOT NULL,
  source_generation TEXT NOT NULL,
