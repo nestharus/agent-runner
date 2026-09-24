@@ -9,6 +9,7 @@ fn main() -> std::io::Result<()> {
         .nth(1)
         .ok_or_else(|| std::io::Error::other("marker absent"))?;
     let fail = std::env::args().nth(2).as_deref() == Some("--fail");
+    let quota = std::env::args().nth(2).as_deref() == Some("--quota");
     let mut input = Vec::new();
     std::io::stdin().read_to_end(&mut input)?;
     let mut file = OpenOptions::new()
@@ -18,6 +19,12 @@ fn main() -> std::io::Result<()> {
         .open(marker)?;
     file.write_all(b"one-provider-effect\n")?;
     file.sync_all()?;
+    if quota {
+        std::io::stderr().write_all(
+            br#"{"type":"error","error":{"data":{"message":"quota exhausted for account"}}}"#,
+        )?;
+        std::process::exit(1);
+    }
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         return Err(std::io::Error::last_os_error());
