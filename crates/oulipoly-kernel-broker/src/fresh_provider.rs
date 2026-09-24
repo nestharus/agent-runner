@@ -4,6 +4,7 @@
 //! its readbacks.
 use super::work_launch;
 use oulipoly_kernel_broker::identity::{PinnedProcess, host_proc_file, observed_incarnation_gone};
+use oulipoly_kernel_broker::protocol::{FreshRouteRequest, FreshRouteSelection};
 use oulipoly_state::mailbox::{
     FreshNormalWorkPreparation, FreshReleasedHandoff, FreshRootWorkIntent,
 };
@@ -419,6 +420,254 @@ fn durable_new<T: Serialize>(directory: &Path, name: &str, value: &T) -> io::Res
     file.write_all(b"\n")?;
     file.sync_all()?;
     File::open(directory)?.sync_all()
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct RouteCandidate {
+    version: u32,
+    binding: Binding,
+    model: String,
+    config_sha256: String,
+    account: String,
+    index: usize,
+    total: usize,
+    pin: Option<String>,
+    plan_sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct RouteDecision {
+    version: u32,
+    binding: Binding,
+    total: usize,
+    pin: Option<String>,
+    selection: FreshRouteSelection,
+}
+
+fn route_request_valid(request: &FreshRouteRequest, binding: &Binding) -> io::Result<()> {
+    if request.d_key.is_empty()
+        || request.model.is_empty()
+        || request.account.as_deref().is_some_and(str::is_empty)
+        || request.config_sha256.len() != 64
+        || !request.config_sha256.bytes().all(|c| c.is_ascii_hexdigit())
+        || request.total == 0
+        || request.index.is_some_and(|index| index >= request.total)
+        || request.pin.as_deref().is_some_and(str::is_empty)
+        || uuid::Uuid::parse_str(&binding.handoff_id).is_err()
+    {
+        return Err(io::Error::other("fresh route request invalid"));
+    }
+    Ok(())
+}
+
+fn candidate_name(handoff: &str, index: usize) -> String {
+    format!("{handoff}.route-{index}.json")
+}
+
+fn decision_name(handoff: &str) -> String {
+    format!("{handoff}.route-selection.json")
+}
+
+/// A candidate is a broker-pinned exact provider plan. It is durable before
+/// selection and has no fork/effect. Repeated registrations must be identical.
+pub(super) fn register_route_candidate(
+    directory: &Path,
+    binding: &Binding,
+    request: &FreshRouteRequest,
+    plan: Plan,
+) -> io::Result<()> {
+    route_request_valid(request, binding)?;
+    let index = request
+        .index
+        .ok_or_else(|| io::Error::other("fresh route index absent"))?;
+    let account = request
+        .account
+        .as_ref()
+        .ok_or_else(|| io::Error::other("fresh route account absent"))?;
+    let candidate = RouteCandidate {
+        version: 1,
+        binding: binding.clone(),
+        model: request.model.clone(),
+        config_sha256: request.config_sha256.clone(),
+        account: account.clone(),
+        index,
+        total: request.total,
+        pin: request.pin.clone(),
+        plan_sha256: plan.digest.clone(),
+    };
+    let name = candidate_name(&binding.handoff_id, index);
+    if let Some(existing) = exact_file::<RouteCandidate>(directory, &name)? {
+        if existing != candidate {
+            return Err(io::Error::other("fresh route candidate changed"));
+        }
+    } else {
+        durable_new(directory, &name, &candidate)?;
+    }
+    Ok(())
+}
+
+fn route_candidates(
+    directory: &Path,
+    binding: &Binding,
+    request: &FreshRouteRequest,
+) -> io::Result<Vec<RouteCandidate>> {
+    let mut candidates = Vec::new();
+    let mut names = HashSet::new();
+    for index in 0..request.total {
+        let candidate: RouteCandidate =
+            exact_file(directory, &candidate_name(&binding.handoff_id, index))?
+                .ok_or_else(|| io::Error::other("fresh route candidate set incomplete"))?;
+        if candidate.version != 1
+            || candidate.binding != *binding
+            || candidate.model != request.model
+            || candidate.config_sha256 != request.config_sha256
+            || candidate.index != index
+            || candidate.total != request.total
+            || candidate.pin != request.pin
+            || !names.insert(candidate.account.clone())
+        {
+            return Err(io::Error::other("fresh route candidate set changed"));
+        }
+        candidates.push(candidate);
+    }
+    Ok(candidates)
+}
+
+fn route_evidence(directory: &Path, candidate: &RouteCandidate) -> io::Result<(u64, u64, u64)> {
+    let mut live = 0;
+    let mut failures = 0;
+    let mut invocations = 0;
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.ends_with(".route-selection.json") {
+            continue;
+        }
+        let previous: RouteDecision = serde_json::from_reader(File::open(entry.path())?)?;
+        if previous.version != 1
+            || previous.selection.model != candidate.model
+            || previous.selection.config_sha256 != candidate.config_sha256
+            || previous.selection.account != candidate.account
+        {
+            continue;
+        }
+        let Some(grant): Option<Grant> = exact_file(
+            directory,
+            &format!("{}.fresh-grant.json", previous.binding.handoff_id),
+        )?
+        else {
+            continue;
+        };
+        if grant.binding != previous.binding || grant.plan_sha256 != previous.selection.plan_sha256
+        {
+            return Err(io::Error::other("fresh route history grant mismatch"));
+        }
+        if exact_file::<Grant>(directory, &format!("{}.consumed.json", grant.id))?.is_none() {
+            continue;
+        }
+        invocations += 1;
+        match observe(directory, &grant.id)? {
+            Observation::Drained { status, .. } => {
+                if status != 0 {
+                    failures += 1;
+                }
+            }
+            _ => live += 1,
+        }
+    }
+    Ok((live, failures, invocations))
+}
+
+/// One fsynced choice for this held J. Selection has no provider effect.
+/// Cached Q and live K are measured only from this fresh broker directory.
+pub(super) fn select_route(
+    directory: &Path,
+    binding: &Binding,
+    request: &FreshRouteRequest,
+) -> io::Result<FreshRouteSelection> {
+    route_request_valid(request, binding)?;
+    if request.account.is_some() || request.index.is_some() {
+        return Err(io::Error::other("fresh route selection includes candidate"));
+    }
+    let candidates = route_candidates(directory, binding, request)?;
+    let name = decision_name(&binding.handoff_id);
+    if let Some(existing) = exact_file::<RouteDecision>(directory, &name)? {
+        if existing.version != 1
+            || existing.binding != *binding
+            || existing.total != request.total
+            || existing.pin != request.pin
+            || existing.selection.model != request.model
+            || existing.selection.config_sha256 != request.config_sha256
+            || candidates.get(existing.selection.index).is_none_or(|c| {
+                c.account != existing.selection.account
+                    || c.plan_sha256 != existing.selection.plan_sha256
+            })
+        {
+            return Err(io::Error::other("fresh route selection changed"));
+        }
+        return Ok(existing.selection);
+    }
+    let mut best: Option<((u64, u64, u64, usize), FreshRouteSelection)> = None;
+    for candidate in candidates {
+        if request
+            .pin
+            .as_deref()
+            .is_some_and(|pin| pin != candidate.account)
+        {
+            continue;
+        }
+        let (live, failures, invocations) = route_evidence(directory, &candidate)?;
+        let score = (live, failures, invocations, candidate.index);
+        let selection = FreshRouteSelection {
+            model: candidate.model,
+            config_sha256: candidate.config_sha256,
+            account: candidate.account,
+            index: candidate.index,
+            plan_sha256: candidate.plan_sha256,
+            observed_live: live,
+            observed_failures: failures,
+            observed_invocations: invocations,
+        };
+        if best.as_ref().is_none_or(|(old, _)| score < *old) {
+            best = Some((score, selection));
+        }
+    }
+    let selection = best
+        .ok_or_else(|| io::Error::other("fresh route pin absent"))?
+        .1;
+    durable_new(
+        directory,
+        &name,
+        &RouteDecision {
+            version: 1,
+            binding: binding.clone(),
+            total: request.total,
+            pin: request.pin.clone(),
+            selection: selection.clone(),
+        },
+    )?;
+    Ok(selection)
+}
+
+pub(super) fn require_selected_plan(
+    directory: &Path,
+    binding: &Binding,
+    plan: &Plan,
+) -> io::Result<()> {
+    let decision: RouteDecision = exact_file(directory, &decision_name(&binding.handoff_id))?
+        .ok_or_else(|| io::Error::other("fresh route selection absent before K"))?;
+    if decision.version != 1
+        || decision.binding != *binding
+        || decision.selection.plan_sha256 != plan.digest
+    {
+        return Err(io::Error::other(
+            "fresh provider K differs from selected route",
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn prepare(directory: &Path, binding: Binding, plan: Plan) -> io::Result<Prepared> {
@@ -1204,7 +1453,13 @@ mod tests {
         let actor = PinnedProcess::open(actor_child.id() as i32).unwrap();
         let binding = fixture_binding(&root, &actor);
         let image = Path::new(&std::env::var("OULIPOLY_AGE319_PROVIDER_IMAGE").unwrap()).to_owned();
-        let prepare_plan = |args: Vec<String>| {
+        let prepare_plan = |mut args: Vec<String>| {
+            if args
+                .first()
+                .is_some_and(|arg| arg == &marker.display().to_string())
+            {
+                args.push("--fail".into());
+            }
             plan(
                 &image,
                 temporary.path(),
@@ -1214,6 +1469,50 @@ mod tests {
             )
             .unwrap()
         };
+        let route = |binding: &Binding, pin: Option<&str>| {
+            let request = |index: Option<usize>, account: Option<&str>| FreshRouteRequest {
+                d_key: uuid::Uuid::new_v4().to_string(),
+                model: "configured-model".into(),
+                config_sha256: "a".repeat(64),
+                account: account.map(str::to_owned),
+                index,
+                total: 2,
+                pin: pin.map(str::to_owned),
+            };
+            register_route_candidate(
+                temporary.path(),
+                binding,
+                &request(Some(0), Some("first")),
+                prepare_plan(vec![marker.display().to_string()]),
+            )
+            .unwrap();
+            register_route_candidate(
+                temporary.path(),
+                binding,
+                &request(Some(1), Some("second")),
+                prepare_plan(vec![
+                    temporary.path().join("other-effect").display().to_string(),
+                ]),
+            )
+            .unwrap();
+            select_route(temporary.path(), binding, &request(None, None)).unwrap()
+        };
+        let first_route = route(&binding, None);
+        assert_eq!(first_route.account, "first");
+        require_selected_plan(
+            temporary.path(),
+            &binding,
+            &prepare_plan(vec![marker.display().to_string()]),
+        )
+        .unwrap();
+        assert!(
+            require_selected_plan(
+                temporary.path(),
+                &binding,
+                &prepare_plan(vec!["changed".into()])
+            )
+            .is_err()
+        );
         let prepared = prepare(
             temporary.path(),
             binding.clone(),
@@ -1315,6 +1614,38 @@ mod tests {
             ),
             "provider exit with adopted child was treated as Q"
         );
+        let mut second_binding = binding.clone();
+        second_binding.handoff_id = uuid::Uuid::new_v4().to_string();
+        let loaded_route = route(&second_binding, None);
+        assert_eq!(
+            loaded_route.account, "second",
+            "genuine consumed K without Q must count as live"
+        );
+        assert_eq!(
+            route(&binding, None),
+            first_route,
+            "uncertain K changed the held root's durable choice"
+        );
+        let mut changed_config = FreshRouteRequest {
+            d_key: uuid::Uuid::new_v4().to_string(),
+            model: "configured-model".into(),
+            config_sha256: "b".repeat(64),
+            account: None,
+            index: None,
+            total: 2,
+            pin: None,
+        };
+        assert!(
+            select_route(temporary.path(), &second_binding, &changed_config).is_err(),
+            "config change reselected a held root"
+        );
+        changed_config.config_sha256 = "a".repeat(64);
+        let mut wrong_actor = second_binding.clone();
+        wrong_actor.actor_starttime += 1;
+        assert!(
+            select_route(temporary.path(), &wrong_actor, &changed_config).is_err(),
+            "wrong actor read back a route"
+        );
         std::thread::sleep(Duration::from_millis(250));
         assert!(!temporary.path().join(format!("{id}.drain.json")).exists());
         cancel(temporary.path(), &id).unwrap();
@@ -1339,7 +1670,7 @@ mod tests {
         }
         let (status, mut stdout, mut stderr, stdout_len, stderr_len, cancelled) =
             drained.expect("physical Q absent");
-        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 && cancelled);
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 9 && cancelled);
         let mut stdout_bytes = Vec::new();
         stdout.read_to_end(&mut stdout_bytes).unwrap();
         let mut stderr_bytes = Vec::new();
@@ -1358,6 +1689,25 @@ mod tests {
             "Q plus provider exit certified missing stdout"
         );
         std::fs::rename(hidden, stdout_path).unwrap();
+        let first_candidate: RouteCandidate =
+            exact_file(temporary.path(), &candidate_name(&binding.handoff_id, 0))
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            route_evidence(temporary.path(), &first_candidate).unwrap(),
+            (0, 1, 1),
+            "only physical Q may turn the nonzero exit into failure evidence"
+        );
+        let mut third_binding = binding.clone();
+        third_binding.handoff_id = uuid::Uuid::new_v4().to_string();
+        assert_eq!(route(&third_binding, None).account, "second");
+        let mut pinned_binding = binding.clone();
+        pinned_binding.handoff_id = uuid::Uuid::new_v4().to_string();
+        assert_eq!(
+            route(&pinned_binding, Some("first")).account,
+            "first",
+            "explicit pin must retain account identity"
+        );
         actor_child.kill().unwrap();
         actor_child.wait().unwrap();
     }

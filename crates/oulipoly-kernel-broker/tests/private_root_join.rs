@@ -53,7 +53,7 @@ fn inner() {
         "normal_model_provider_bad_config"
             | "normal_model_provider_unsupported"
             | "normal_model_provider_quota"
-            | "normal_model_provider_no_pin"
+            | "normal_model_provider_auth"
     );
     let model_mode = mode == "normal_model_held" || provider_mode;
     let native_mode = mode.starts_with("native_");
@@ -76,6 +76,7 @@ fn inner() {
             | "normal_model_provider_bad_config"
             | "normal_model_provider_unsupported"
             | "normal_model_provider_quota"
+            | "normal_model_provider_auth"
             | "normal_model_provider_no_pin"
     );
     let recipient_mode = mode.starts_with("normal_recipient");
@@ -99,6 +100,8 @@ fn inner() {
         fs::create_dir_all(config_dir.join("models")).unwrap();
         let provider_command = serde_json::to_string(&provider_image).unwrap();
         let marker = serde_json::to_string(gate.join("provider-effect").to_str().unwrap()).unwrap();
+        let unused_marker =
+            serde_json::to_string(gate.join("provider-effect-unused").to_str().unwrap()).unwrap();
         let provider_name = if mode == "normal_model_provider_bad_config" {
             "wrong-account"
         } else {
@@ -111,13 +114,15 @@ fn inner() {
         };
         let quota = if mode == "normal_model_provider_quota" {
             "quota_script = \"quota-must-not-run\"\n"
+        } else if mode == "normal_model_provider_auth" {
+            "auth_refresh_command = \"auth-must-not-run\"\n"
         } else {
             ""
         };
         fs::write(
             config_dir.join("providers.toml"),
             format!(
-                "[unused]\ncommand = \"/bin/false\"\n[{provider_name}]\ncommand = {provider_command}\nargs = [{marker}]\n{prompt_mode}{quota}"
+                "[unused]\ncommand = {provider_command}\nargs = [{unused_marker}]\n[{provider_name}]\ncommand = {provider_command}\nargs = [{marker}]\n{prompt_mode}{quota}"
             ),
         )
         .unwrap();
@@ -611,6 +616,7 @@ fn inner() {
                     | "normal_model_provider_bad_config"
                     | "normal_model_provider_unsupported"
                     | "normal_model_provider_quota"
+                    | "normal_model_provider_auth"
                     | "normal_model_provider_no_pin"
             ) {
                 let marker: serde_json::Value =
@@ -944,13 +950,13 @@ fn inner() {
                             "fresh provider \"local\" absent before K"
                         }
                         "normal_model_provider_unsupported" => {
-                            "fresh broker provider shape unsupported before K"
+                            "fresh pool has incompatible prompt modes before K"
                         }
                         "normal_model_provider_quota" => {
                             "fresh provider quota authority unavailable before K"
                         }
-                        "normal_model_provider_no_pin" => {
-                            "fresh pool selection needs fresh-owned quota and routing evidence before K"
+                        "normal_model_provider_auth" => {
+                            "fresh provider quota authority unavailable before K"
                         }
                         _ => unreachable!(),
                     };
@@ -971,11 +977,14 @@ fn inner() {
                 }
                 if provider_mode {
                     let provider_dir = broker_state.join("v30/fresh-provider");
-                    eventually(|| {
-                        gate.join("provider-effect").exists() || entry.try_wait().unwrap().is_some()
-                    });
+                    let selected_marker = if mode == "normal_model_provider_no_pin" {
+                        gate.join("provider-effect-unused")
+                    } else {
+                        gate.join("provider-effect")
+                    };
+                    eventually(|| selected_marker.exists() || entry.try_wait().unwrap().is_some());
                     assert!(
-                        gate.join("provider-effect").exists(),
+                        selected_marker.exists(),
                         "{}",
                         fs::read_to_string(&err).unwrap()
                     );
@@ -984,6 +993,26 @@ fn inner() {
                     eventually(|| grant_file.exists());
                     let grant: serde_json::Value =
                         serde_json::from_slice(&fs::read(&grant_file).unwrap()).unwrap();
+                    let route_file =
+                        provider_dir.join(format!("{}.route-selection.json", receipt.handoff_id));
+                    let route: serde_json::Value =
+                        serde_json::from_slice(&fs::read(route_file).unwrap()).unwrap();
+                    let selected_account = if mode == "normal_model_provider_no_pin" {
+                        "unused"
+                    } else {
+                        "local"
+                    };
+                    assert_eq!(route["selection"]["account"], selected_account);
+                    assert_eq!(
+                        route["selection"]["index"],
+                        if mode == "normal_model_provider_no_pin" {
+                            0
+                        } else {
+                            1
+                        }
+                    );
+                    assert_eq!(route["selection"]["plan_sha256"], grant["plan_sha256"]);
+                    assert_eq!(route["binding"]["handoff_id"], receipt.handoff_id);
                     let grant_id = grant["id"].as_str().unwrap();
                     eventually(|| provider_dir.join(format!("{grant_id}.exit.json")).exists());
                     assert!(
@@ -1001,6 +1030,28 @@ fn inner() {
                         "sibling observed provider K"
                     );
                     assert!(
+                        protocol::private_fresh_route_at(
+                            &socket.with_file_name("v30.sock"),
+                            &protocol::FreshRouteRequest {
+                                d_key: receipt.d_key.clone(),
+                                model: "configured-model".into(),
+                                config_sha256: route["selection"]["config_sha256"]
+                                    .as_str()
+                                    .unwrap()
+                                    .into(),
+                                account: None,
+                                index: None,
+                                total: 2,
+                                pin: (mode != "normal_model_provider_no_pin")
+                                    .then(|| "local".into()),
+                            },
+                            b'f',
+                            None,
+                        )
+                        .is_err(),
+                        "sibling read back fresh route"
+                    );
+                    assert!(
                         protocol::private_fresh_provider_at(
                             &socket.with_file_name("v30.sock"),
                             &uuid::Uuid::new_v4().to_string(),
@@ -1011,7 +1062,7 @@ fn inner() {
                         "wrong D key observed provider K"
                     );
                     assert_eq!(
-                        fs::read(gate.join("provider-effect")).unwrap(),
+                        fs::read(&selected_marker).unwrap(),
                         b"one-provider-effect\n"
                     );
                     assert!(
@@ -1086,9 +1137,25 @@ fn inner() {
                     .unwrap();
                     assert_eq!(mapped["mapped_after_q"], true);
                     assert_eq!(mapped["exit_code"], 0);
-                    assert_eq!(mapped["provider_index"], 1);
+                    assert_eq!(
+                        mapped["provider_index"],
+                        if mode == "normal_model_provider_no_pin" {
+                            0
+                        } else {
+                            1
+                        }
+                    );
                     assert_eq!(mapped["model"], "configured-model");
-                    assert_eq!(mapped["provider"], "local");
+                    assert_eq!(
+                        mapped["provider"],
+                        if mode == "normal_model_provider_no_pin" {
+                            "unused"
+                        } else {
+                            "local"
+                        }
+                    );
+                    assert_eq!(mapped["route_observed_live"], 0);
+                    assert_eq!(mapped["route_observed_invocations"], 0);
                     assert_eq!(mapped["stdout"], "provider-stdout:hello fixture");
                     assert_eq!(mapped["stderr"], "provider-stderr\n");
                     assert_eq!(
@@ -3162,6 +3229,7 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_model_provider_bad_config",
         "normal_model_provider_unsupported",
         "normal_model_provider_quota",
+        "normal_model_provider_auth",
         "normal_model_provider_no_pin",
         "normal_guardian_death",
         "normal_driver_death",

@@ -170,6 +170,11 @@ enum RequestPayload {
         request: FreshRootEffectRequest,
         descriptors: Vec<File>,
     },
+    #[cfg(feature = "age319-private-broker-fixture")]
+    FreshRouteRequest {
+        request: oulipoly_kernel_broker::protocol::FreshRouteRequest,
+        descriptors: Vec<File>,
+    },
     FreshRecipientRequest {
         request: FreshRecipientRequest,
     },
@@ -357,6 +362,8 @@ fn recv_request(
         | b'Y' | b'0' | b'1' | b'2' | b'3' | b'4' => (18..=2048 + 17).contains(&read),
         #[cfg(feature = "age319-private-broker-fixture")]
         b'5' | b'6' | b'7' | b'8' | b'9' => (18..=2048 + 17).contains(&read),
+        #[cfg(feature = "age319-private-broker-fixture")]
+        b'c' | b'f' => (18..=48 * 1024 + 17).contains(&read),
         b'F' => (18..=8192 + 17).contains(&read),
         b'U' => (18..=512 + 17).contains(&read),
         _ => read == 17,
@@ -375,6 +382,8 @@ fn recv_request(
             b'K' => descriptors.len() != 7,
             #[cfg(feature = "age319-private-broker-fixture")]
             b'5' | b'9' => descriptors.len() != 4,
+            #[cfg(feature = "age319-private-broker-fixture")]
+            b'c' => descriptors.len() != 4,
             b'L' => !(1..=4).contains(&descriptors.len()),
             b'V' | b'S' | b's' | b'T' => descriptors.len() != 1,
             _ => !descriptors.is_empty(),
@@ -408,6 +417,11 @@ fn recv_request(
         },
         #[cfg(feature = "age319-private-broker-fixture")]
         b'5' | b'6' | b'7' | b'8' | b'9' => RequestPayload::FreshProviderRequest {
+            request: serde_json::from_slice(&request[17..read as usize])?,
+            descriptors,
+        },
+        #[cfg(feature = "age319-private-broker-fixture")]
+        b'c' | b'f' => RequestPayload::FreshRouteRequest {
             request: serde_json::from_slice(&request[17..read as usize])?,
             descriptors,
         },
@@ -4061,22 +4075,23 @@ fn serve_fresh_v30_at(
                     }
                 }
                 #[cfg(feature = "age319-private-broker-fixture")]
-                b'5' | b'6' | b'7' | b'8' | b'9' => {
+                b'5' | b'6' | b'7' | b'8' | b'9' | b'c' | b'f' => {
                     if !private_fixture() {
                         return Err(io::Error::other("fresh provider fixture route closed"));
                     }
-                    let RequestPayload::FreshProviderRequest {
-                        request,
-                        descriptors,
-                    } = payload
-                    else {
-                        return Err(io::Error::other("fresh provider request absent"));
+                    let (d_key, route_request, descriptors) = match payload {
+                        RequestPayload::FreshProviderRequest {
+                            request,
+                            descriptors,
+                        } if request.success.is_none() => (request.d_key, None, descriptors),
+                        RequestPayload::FreshRouteRequest {
+                            request,
+                            descriptors,
+                        } => (request.d_key.clone(), Some(request), descriptors),
+                        _ => return Err(io::Error::other("fresh provider/route request absent")),
                     };
-                    if request.success.is_some() {
-                        return Err(io::Error::other("fresh provider request has CLI result"));
-                    }
                     let receipt = lane
-                        .released_handoff_for_child(&request.d_key, &recipient)
+                        .released_handoff_for_child(&d_key, &recipient)
                         .map_err(io::Error::other)?;
                     let actor_pid = peer.process.host_pid;
                     let actor_uid = peer.uid;
@@ -4105,7 +4120,7 @@ fn serve_fresh_v30_at(
                         ));
                     }
                     let session = lane
-                        .read_session(&request.d_key)
+                        .read_session(&d_key)
                         .map_err(io::Error::other)?
                         .ok_or_else(|| io::Error::other("fresh provider D absent"))?;
                     lane.require_released_invocation(&receipt, &recipient, &session)
@@ -4127,6 +4142,61 @@ fn serve_fresh_v30_at(
                     let binding =
                         fresh_provider::binding_from_held(&receipt, &held, &actor, &root)?;
                     let directory = state_root.join("v30/fresh-provider");
+                    if let Some(route_request) = route_request {
+                        let expected_pin = match &held.intent {
+                            oulipoly_state::mailbox::FreshRootWorkIntent::NormalCli(args)
+                                if args.len() == 3
+                                    && args[0] == "--model"
+                                    && args[1] == route_request.model =>
+                            {
+                                None
+                            }
+                            oulipoly_state::mailbox::FreshRootWorkIntent::NormalCli(args)
+                                if args.len() == 5
+                                    && args[0] == "--model"
+                                    && args[1] == route_request.model
+                                    && args[2] == "--pin-provider" =>
+                            {
+                                Some(args[3].as_str())
+                            }
+                            _ => {
+                                return Err(io::Error::other(
+                                    "fresh route model differs from held root intent",
+                                ));
+                            }
+                        };
+                        if route_request.pin.as_deref() != expected_pin {
+                            return Err(io::Error::other(
+                                "fresh route pin differs from held root intent",
+                            ));
+                        }
+                        if operation == b'c' {
+                            if instance.is_closed() {
+                                return Err(io::Error::other("fresh route entry gate closed"));
+                            }
+                            let [image_fd, cwd, input, recipe]: [File; 4] = descriptors
+                                .try_into()
+                                .map_err(|_| io::Error::other("fresh route descriptors absent"))?;
+                            let image =
+                                fs::read_link(format!("/proc/self/fd/{}", image_fd.as_raw_fd()))?;
+                            let plan = fresh_provider::plan_from_descriptors(
+                                &image, image_fd, cwd, input, recipe,
+                            )?;
+                            fresh_provider::register_route_candidate(
+                                &directory,
+                                &binding,
+                                &route_request,
+                                plan,
+                            )?;
+                            return Ok("fresh-route-registered\n".into());
+                        }
+                        let selection =
+                            fresh_provider::select_route(&directory, &binding, &route_request)?;
+                        return Ok(format!(
+                            "fresh-route-selected {}\n",
+                            serde_json::to_string(&selection)?
+                        ));
+                    }
                     if operation == b'5' {
                         if instance.is_closed() {
                             return Err(io::Error::other("fresh provider K entry gate closed"));
@@ -4139,6 +4209,7 @@ fn serve_fresh_v30_at(
                         let plan = fresh_provider::plan_from_descriptors(
                             &image, image_fd, cwd, input, recipe,
                         )?;
+                        fresh_provider::require_selected_plan(&directory, &binding, &plan)?;
                         let prepared = fresh_provider::prepare(&directory, binding, plan)?;
                         let grant =
                             fresh_provider::launch(prepared, &root, &actor, actor_uid, actor_gid)?;

@@ -8,6 +8,7 @@ fn main() -> std::io::Result<()> {
     let marker = std::env::args()
         .nth(1)
         .ok_or_else(|| std::io::Error::other("marker absent"))?;
+    let fail = std::env::args().nth(2).as_deref() == Some("--fail");
     let mut input = Vec::new();
     std::io::stdin().read_to_end(&mut input)?;
     let mut file = OpenOptions::new()
@@ -36,5 +37,8 @@ fn main() -> std::io::Result<()> {
     std::io::stdout().write_all(b"provider-stdout:")?;
     std::io::stdout().write_all(&input)?;
     std::io::stderr().write_all(b"provider-stderr\n")?;
+    if fail {
+        std::process::exit(9);
+    }
     Ok(())
 }

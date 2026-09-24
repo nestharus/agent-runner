@@ -97,6 +97,33 @@ pub struct FreshRootEffectRequest {
     pub success: Option<bool>,
 }
 
+#[cfg(feature = "age319-private-broker-fixture")]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreshRouteRequest {
+    pub d_key: String,
+    pub model: String,
+    pub config_sha256: String,
+    pub account: Option<String>,
+    pub index: Option<usize>,
+    pub total: usize,
+    pub pin: Option<String>,
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FreshRouteSelection {
+    pub model: String,
+    pub config_sha256: String,
+    pub account: String,
+    pub index: usize,
+    pub plan_sha256: String,
+    pub observed_live: u64,
+    pub observed_failures: u64,
+    pub observed_invocations: u64,
+}
+
 /// Begin is one-use. If its reply is lost, observe reports `Started`, which
 /// is unknown work and must never authorize a second begin.
 pub fn begin_fresh_root_effect_at(
@@ -212,6 +239,90 @@ pub fn private_fresh_provider_at(
         return Err(io::Error::other(error.trim_end().to_owned()));
     }
     Ok(answer)
+}
+
+/// Register one sealed candidate plan, then durably select/read back the
+/// complete pool. The same D-bound broker socket authenticates every step.
+#[cfg(feature = "age319-private-broker-fixture")]
+pub fn private_fresh_route_at(
+    path: &Path,
+    request: &FreshRouteRequest,
+    operation: u8,
+    descriptors: Option<[RawFd; 4]>,
+) -> io::Result<Option<FreshRouteSelection>> {
+    if !matches!(operation, b'c' | b'f') || (operation == b'c') != descriptors.is_some() {
+        return Err(io::Error::other("invalid fresh route operation"));
+    }
+    let id = uuid::Uuid::parse_str(&request.d_key)
+        .map_err(|_| io::Error::other("invalid fresh route D key"))?;
+    if id.is_nil() || id.to_string() != request.d_key {
+        return Err(io::Error::other("noncanonical fresh route D key"));
+    }
+    let body = serde_json::to_vec(request)?;
+    let mut stream = checked_connection(path)?;
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let mut frame = Vec::with_capacity(17 + body.len());
+    frame.push(operation);
+    frame.extend_from_slice(&challenge);
+    frame.extend_from_slice(&body);
+    if let Some(descriptors) = descriptors {
+        let mut iov = libc::iovec {
+            iov_base: frame.as_mut_ptr().cast(),
+            iov_len: frame.len(),
+        };
+        let mut control = [0u8; 64];
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr().cast();
+        msg.msg_controllen =
+            unsafe { libc::CMSG_SPACE(std::mem::size_of_val(&descriptors) as _) } as usize;
+        unsafe {
+            let header = libc::CMSG_FIRSTHDR(&msg);
+            (*header).cmsg_level = libc::SOL_SOCKET;
+            (*header).cmsg_type = libc::SCM_RIGHTS;
+            (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(&descriptors) as _) as usize;
+            std::ptr::copy_nonoverlapping(descriptors.as_ptr(), libc::CMSG_DATA(header).cast(), 4);
+        }
+        if unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) }
+            != frame.len() as isize
+        {
+            return Err(io::Error::other("fresh route registration uncertain"));
+        }
+    } else if unsafe {
+        libc::send(
+            stream.as_raw_fd(),
+            frame.as_ptr().cast(),
+            frame.len(),
+            libc::MSG_NOSIGNAL,
+        )
+    } != frame.len() as isize
+    {
+        return Err(io::Error::other("fresh route selection uncertain"));
+    }
+    let mut answer_bytes = Vec::new();
+    stream.take(4097).read_to_end(&mut answer_bytes)?;
+    if answer_bytes.len() > 4096 || !answer_bytes.ends_with(b"\n") {
+        return Err(io::Error::other("invalid fresh route response"));
+    }
+    let answer = String::from_utf8(answer_bytes)
+        .map_err(|_| io::Error::other("non-UTF8 fresh route response"))?;
+    if let Some(error) = answer.strip_prefix("error ") {
+        return Err(io::Error::other(error.trim_end().to_owned()));
+    }
+    if operation == b'c' {
+        if answer != "fresh-route-registered\n" {
+            return Err(io::Error::other(
+                "fresh route registration response invalid",
+            ));
+        }
+        return Ok(None);
+    }
+    let value = answer
+        .strip_prefix("fresh-route-selected ")
+        .ok_or_else(|| io::Error::other("fresh route selection response invalid"))?;
+    Ok(Some(serde_json::from_str(value.trim_end())?))
 }
 
 /// Q-gated output readback. The broker sends its verified regular files by
