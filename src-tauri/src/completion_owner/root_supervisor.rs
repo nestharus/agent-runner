@@ -496,10 +496,12 @@ pub(crate) fn private_native_lineage(
     std::fs::write(gate_dir.join("native-q-pending"), first_q)
         .map_err(|error| error.to_string())?;
     wait("native-cancel")?;
-    let cancel = protocol::cancel_native_work_v30_at(&socket, &grant_id)
-        .map_err(|error| error.to_string())?;
-    if !cancel.starts_with("native-cancel-signalled ") {
-        return Err(format!("private cancellation refused: {cancel}"));
+    if !gate_dir.join("native-drain").exists() {
+        let cancel = protocol::cancel_native_work_v30_at(&socket, &grant_id)
+            .map_err(|error| error.to_string())?;
+        if !cancel.starts_with("native-cancel-signalled ") {
+            return Err(format!("private cancellation refused: {cancel}"));
+        }
     }
     let until = Instant::now() + Duration::from_secs(15);
     loop {
