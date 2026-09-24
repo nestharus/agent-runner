@@ -65,6 +65,78 @@ pub fn read_fresh_v30_session(
     fresh_v30_session_request(Operation::ReadFreshSession, request_id)
 }
 
+/// Versioned recipient operations. The caller persists a delivery request UUID
+/// before submission and uses `Read` after an uncertain reply. The broker
+/// derives recipient identity from the pinned socket peer, never these fields.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum FreshRecipientRequest {
+    Submit {
+        allocation_request_id: String,
+        delivery_request_id: String,
+    },
+    Read {
+        delivery_request_id: String,
+    },
+    Recover {
+        delivery_request_id: String,
+    },
+    Acknowledge {
+        grant_id: String,
+        delivery_token: String,
+    },
+    Delegate {
+        grant_ids: Vec<String>,
+        delegate: oulipoly_state::mailbox::FreshRecipientIdentity,
+    },
+    AcknowledgeDelegated {
+        delegation_id: String,
+    },
+    Lookup {
+        lane_id: String,
+        session_id: String,
+        seq: i64,
+    },
+}
+
+pub fn fresh_recipient_request_at(
+    path: &Path,
+    request: &FreshRecipientRequest,
+) -> io::Result<serde_json::Value> {
+    let body = serde_json::to_vec(request)?;
+    if body.len() > 8192 {
+        return Err(io::Error::other("fresh recipient request too large"));
+    }
+    let mut stream = checked_connection(path)?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(30)))?;
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let mut frame = Vec::with_capacity(17 + body.len());
+    frame.push(b'F');
+    frame.extend_from_slice(&challenge);
+    frame.extend_from_slice(&body);
+    if unsafe {
+        libc::send(
+            stream.as_raw_fd(),
+            frame.as_ptr().cast(),
+            frame.len(),
+            libc::MSG_NOSIGNAL,
+        )
+    } != frame.len() as isize
+    {
+        return Err(io::Error::other("short fresh recipient request"));
+    }
+    let mut answer = Vec::new();
+    stream.read_to_end(&mut answer)?;
+    if answer.starts_with(b"error ") {
+        return Err(io::Error::other(
+            String::from_utf8_lossy(&answer).into_owned(),
+        ));
+    }
+    serde_json::from_slice(&answer).map_err(io::Error::other)
+}
+
 fn fresh_v30_session_request(
     operation: Operation,
     request_id: &str,

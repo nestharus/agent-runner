@@ -10,10 +10,15 @@ use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
+include!("fresh_recipient.rs");
+
 const LANE_DIRECTORY: &str = "v30";
 const LANE_PROTOCOL: &str = "fresh-v30-lane-v1";
 const FRESH_SCHEMA: &str = include_str!("migrations/0030_fresh_lane.sql");
 const FRESH_STATE_SCHEMA: &str = include_str!("migrations/0030_fresh_state_identity.sql");
+const FRESH_RECIPIENT_SCHEMA: &str = include_str!("migrations/0030_fresh_recipient.sql");
+const FRESH_RECIPIENT_STATE_SCHEMA: &str =
+    include_str!("migrations/0030_fresh_recipient_state.sql");
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FreshV30LaneIdentity {
@@ -116,7 +121,7 @@ impl FreshV30Lane {
         sidecar
             .mailbox()
             .conn
-            .execute_batch(FRESH_SCHEMA)
+            .execute_batch(&format!("{FRESH_SCHEMA}\n{FRESH_RECIPIENT_SCHEMA}"))
             .map_err(|e| e.to_string())?;
         sidecar
             .mailbox()
@@ -136,7 +141,9 @@ impl FreshV30Lane {
         drop(sidecar);
         let state_conn = Connection::open(&state_path).map_err(|e| e.to_string())?;
         state_conn
-            .execute_batch(FRESH_STATE_SCHEMA)
+            .execute_batch(&format!(
+                "{FRESH_STATE_SCHEMA}\n{FRESH_RECIPIENT_STATE_SCHEMA}"
+            ))
             .map_err(|e| e.to_string())?;
         state_conn
             .execute(
@@ -227,6 +234,28 @@ impl FreshV30Lane {
             .map_err(|e| e.to_string())?;
         if protected_schema_count != 6 {
             return Err("fresh lane immutable schema is incomplete".into());
+        }
+        let recipient_schema_count: i64 = sidecar
+            .mailbox()
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE
+             (type='table' AND name IN ('fresh_recipient_source','fresh_recipient_binding',
+              'fresh_recipient_row_source','fresh_recipient_grant',
+              'fresh_recipient_ack_delegation','fresh_recipient_ack_delegation_item')) OR
+             (type='trigger' AND name IN ('fresh_recipient_source_no_update',
+              'fresh_recipient_source_no_delete','fresh_recipient_binding_no_update',
+              'fresh_recipient_binding_no_delete','fresh_recipient_row_source_no_update',
+              'fresh_recipient_row_source_no_delete','fresh_recipient_grant_no_delete',
+              'fresh_recipient_grant_update_guard',
+              'fresh_recipient_ack_delegation_item_no_update',
+              'fresh_recipient_ack_delegation_item_no_delete'))",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if recipient_schema_count != 16 {
+            return Err("fresh recipient authority schema is incomplete".into());
         }
         let request_key_columns: i64 = sidecar
             .mailbox()
@@ -330,6 +359,22 @@ impl FreshV30Lane {
             .map_err(|e| e.to_string())?;
         if admission_schema_count != 3 {
             return Err("fresh State session admission schema is incomplete".into());
+        }
+        let accepted_schema_count: i64 = state_conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE
+             (type='table' AND name IN ('fresh_lane_accepted_source',
+              'fresh_lane_recipient_attachment')) OR
+             (type='trigger' AND name IN ('fresh_lane_accepted_source_no_update',
+              'fresh_lane_accepted_source_no_delete',
+              'fresh_lane_recipient_attachment_no_update',
+              'fresh_lane_recipient_attachment_no_delete'))",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if accepted_schema_count != 6 {
+            return Err("fresh accepted source schema is incomplete".into());
         }
         Ok(Self {
             sidecar,
