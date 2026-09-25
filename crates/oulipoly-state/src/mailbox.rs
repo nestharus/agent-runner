@@ -60,11 +60,12 @@ pub use broker_authority::{
 #[cfg(target_os = "linux")]
 pub use fresh_lane::{
     FreshAckDelegation, FreshBashChild, FreshBashListenerPolicy, FreshBashPrivateResult,
-    FreshBashSourceEvent, FreshDeliveryReadback, FreshDeliverySubmission, FreshNativeFPreparation,
-    FreshNativeFPrepareRequest, FreshNormalWorkPreparation, FreshPhysicalTerminal,
-    FreshRecipientIdentity, FreshReleasedHandoff, FreshRootEffect, FreshRootEffectState,
-    FreshRootTerminalExecution, FreshRootTerminalReadback, FreshRootWorkIntent, FreshV30Lane,
-    FreshV30LaneIdentity, FreshV30Session, normal_root_arguments,
+    FreshBashSourceEvent, FreshDeliveryReadback, FreshDeliverySubmission,
+    FreshInteractiveResidentRegistration, FreshNativeFPreparation, FreshNativeFPrepareRequest,
+    FreshNormalWorkPreparation, FreshPhysicalTerminal, FreshRecipientIdentity,
+    FreshReleasedHandoff, FreshRootEffect, FreshRootEffectState, FreshRootTerminalExecution,
+    FreshRootTerminalReadback, FreshRootWorkIntent, FreshV30Lane, FreshV30LaneIdentity,
+    FreshV30Session, normal_root_arguments,
 };
 pub use native_publication::NativePublication;
 #[path = "mailbox/schema.rs"]
@@ -2176,8 +2177,33 @@ impl RuntimeLifecycleRepository<'_> {
         request: CreateRuntimeGeneration<'_>,
         custody_proof: Option<&Path>,
     ) -> Result<GenerationMutation<RuntimeGenerationRow>, GenerationStorageError> {
-        validate_runtime_generation_create(&request)?;
         let creator_process_identity = current_runtime_creator_identity()?;
+        self.create_runtime_generation_for_attested_creator(
+            request,
+            custody_proof,
+            &creator_process_identity,
+        )
+    }
+
+    /// The fresh broker has already pinned the original root and the released
+    /// provider. Its procfs observer must match the sidecar's future readers.
+    /// This entry never interprets a local Child::id as the provider PID.
+    pub(crate) fn create_runtime_generation_for_attested_creator(
+        &mut self,
+        request: CreateRuntimeGeneration<'_>,
+        custody_proof: Option<&Path>,
+        creator_process_identity: &ProcessIdentity,
+    ) -> Result<GenerationMutation<RuntimeGenerationRow>, GenerationStorageError> {
+        validate_runtime_generation_create(&request)?;
+        if pid_identity::read_live_process_identity(creator_process_identity.os_pid)
+            .map_err(GenerationStorageError::new)?
+            .as_ref()
+            != Some(creator_process_identity)
+        {
+            return Err(GenerationStorageError::new(
+                "Attested runtime creator is not live in this procfs observer".into(),
+            ));
+        }
         let now = now_rfc3339();
         let tx = self
             .conn

@@ -217,6 +217,16 @@ pub fn query_pty_generation_identity(
     let identity: PtyControlGenerationIdentity =
         serde_json::from_str(&response.message).map_err(|e| e.to_string())?;
     check_path()?;
+    // SO_PEERCRED reports a PID in this caller's PID namespace. A released
+    // root can challenge its own socket with a local PID while /proc remains
+    // mounted from the host observer. Translate only that provable self case;
+    // every other peer must already be a key in the mounted procfs observer.
+    let peer_identity = if peer.pid == unsafe { libc::getpid() } {
+        pid_identity::read_current_process_identity()?
+    } else {
+        pid_identity::read_live_process_identity(i64::from(peer.pid))?
+            .ok_or("PTY control peer absent from procfs observer")?
+    };
     if identity.challenge != challenge
         || identity.generation_id.is_empty()
         || identity.spawn_invocation_uuid.is_empty()
@@ -225,8 +235,7 @@ pub fn query_pty_generation_identity(
         || identity.settings_id.is_empty()
         || identity.provider_session_id.is_empty()
         || peer.pid <= 0
-        || pid_identity::read_live_process_identity(i64::from(peer.pid))?
-            != Some(identity.creator_process.clone())
+        || peer_identity != identity.creator_process
         || pid_identity::read_live_process_identity(identity.provider_process.os_pid)?
             != Some(identity.provider_process.clone())
     {

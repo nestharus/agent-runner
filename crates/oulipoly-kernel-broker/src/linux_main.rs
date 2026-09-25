@@ -466,7 +466,7 @@ fn recv_request(
         #[cfg(feature = "age319-private-broker-fixture")]
         b'h' | b'f' | b'(' | b')' | b'm' | b'n' => (18..=48 * 1024 + 17).contains(&read),
         #[cfg(feature = "age319-private-broker-fixture")]
-        b'^' | b'{' | b'}' | b']' | b'|' => (18..=2048 + 17).contains(&read),
+        b'^' | b'{' | b'}' | b']' | b'|' | b'~' | b'?' => (18..=2048 + 17).contains(&read),
         b'F' => (18..=8192 + 17).contains(&read),
         b'O' => (18..=1024 + 17).contains(&read),
         b'U' => (18..=512 + 17).contains(&read),
@@ -494,6 +494,8 @@ fn recv_request(
             b'f' | b')' => descriptors.len() != 1,
             #[cfg(feature = "age319-private-broker-fixture")]
             b'^' => descriptors.len() != 2,
+            #[cfg(feature = "age319-private-broker-fixture")]
+            b'~' | b'?' => descriptors.len() != 1,
             #[cfg(feature = "age319-private-broker-fixture")]
             b'{' => descriptors.len() != 7,
             #[cfg(feature = "age319-private-broker-fixture")]
@@ -547,10 +549,12 @@ fn recv_request(
             descriptors,
         },
         #[cfg(feature = "age319-private-broker-fixture")]
-        b'^' | b'{' | b'}' | b']' | b'|' => RequestPayload::FreshInteractivePtyHandoff {
-            request: serde_json::from_slice(&request[17..read as usize])?,
-            descriptors,
-        },
+        b'^' | b'{' | b'}' | b']' | b'|' | b'~' | b'?' => {
+            RequestPayload::FreshInteractivePtyHandoff {
+                request: serde_json::from_slice(&request[17..read as usize])?,
+                descriptors,
+            }
+        }
         #[cfg(feature = "age319-private-broker-fixture")]
         b'm' | b'n' => RequestPayload::FreshAccountEffectRequest {
             request: serde_json::from_slice(&request[17..read as usize])?,
@@ -4620,7 +4624,7 @@ fn serve_fresh_v30_at(
                 }
                 #[cfg(feature = "age319-private-broker-fixture")]
                 b'5' | b'6' | b'7' | b'8' | b'9' | b'h' | b'f' | b'(' | b')' | b'm' | b'n'
-                | b'^' | b'{' | b'}' | b']' | b'|' => {
+                | b'^' | b'{' | b'}' | b']' | b'|' | b'~' | b'?' => {
                     if !private_fixture() {
                         return Err(io::Error::other("fresh provider fixture route closed"));
                     }
@@ -4714,8 +4718,9 @@ fn serve_fresh_v30_at(
                         fresh_provider::binding_from_held(&receipt, &held, &actor, &root)?;
                     let directory = state_root.join("v30/fresh-provider");
                     if let Some(pty_request) = pty_request {
-                        if !matches!(operation, b'^' | b'{' | b'}' | b']' | b'|')
-                            || (!matches!(operation, b']' | b'|') && instance.is_closed())
+                        if !matches!(operation, b'^' | b'{' | b'}' | b']' | b'|' | b'~' | b'?')
+                            || (!matches!(operation, b']' | b'|' | b'~' | b'?')
+                                && instance.is_closed())
                         {
                             return Err(io::Error::other("fresh PTY handoff gate closed"));
                         }
@@ -4734,6 +4739,64 @@ fn serve_fresh_v30_at(
                             )?;
                             provider_output_files = Some(vec![file]);
                             return Ok(reply);
+                        }
+                        if matches!(operation, b'~' | b'?') {
+                            let [master]: [File; 1] = descriptors.try_into().map_err(|_| {
+                                io::Error::other("resident original PTY master absent")
+                            })?;
+                            let resident = fresh_provider::observe_interactive_resident(
+                                &directory,
+                                &binding,
+                                &pty_request,
+                                &actor,
+                                &master,
+                            )?;
+                            if resident.registration.session_id != session.session_id
+                                || resident.registration.invocation_uuid != receipt.invocation_uuid
+                                || resident.registration.creator.os_pid
+                                    != i64::from(recipient.host_pid)
+                                || resident.registration.creator.os_boot_id != recipient.boot_id
+                                || resident.registration.creator.os_pid_starttime_ticks
+                                    != recipient.starttime_ticks as i64
+                            {
+                                return Err(io::Error::other(
+                                    "resident original root or D changed",
+                                ));
+                            }
+                            let generation = lane
+                                .register_interactive_resident(&resident.registration)
+                                .map_err(io::Error::other)?;
+                            let socket_identity = if operation == b'?' {
+                                let statement = oulipoly_runtime::executor::cli::pty_broker::query_pty_generation_identity(
+                                    &pty_request.control_path,
+                                    resident.control_device,
+                                    resident.control_inode,
+                                ).map_err(io::Error::other)?;
+                                if statement.generation_id != resident.registration.grant_id
+                                    || statement.spawn_invocation_uuid != receipt.invocation_uuid
+                                    || statement.creator_process != resident.registration.creator
+                                    || statement.provider_process != resident.registration.provider
+                                    || statement.provider_account != resident.registration.account
+                                    || statement.provider_session_id != session.session_id
+                                {
+                                    return Err(io::Error::other(
+                                        "resident broker socket challenge changed",
+                                    ));
+                                }
+                                Some(statement)
+                            } else {
+                                None
+                            };
+                            return Ok(format!(
+                                "fresh-interactive-resident {}\n",
+                                serde_json::to_string(&serde_json::json!({
+                                    "resident": resident,
+                                    "generation": generation,
+                                    "lane_id": session.lane_id,
+                                    "source_generation": session.source_generation,
+                                    "socket": socket_identity,
+                                }))?
+                            ));
                         }
                         if operation == b'^' {
                             let [master, slave]: [File; 2] =

@@ -121,6 +121,25 @@ fn main() -> std::io::Result<()> {
         let tty = unsafe { libc::isatty(0) } == 1
             && unsafe { libc::isatty(1) } == 1
             && unsafe { libc::tcgetsid(0) } == unsafe { libc::getsid(0) };
+        if let Ok(path) = std::env::var("AGE319_PRIVATE_NATIVE_STORE") {
+            let session_id = std::env::var("AGE319_PRIVATE_NATIVE_SESSION")
+                .map_err(|_| std::io::Error::other("broker-minted native session absent"))?;
+            let native = serde_json::json!({
+                "format": "age319-interactive-native-session/v1",
+                "session_id": session_id,
+                "store_nonce": uuid::Uuid::new_v4().to_string(),
+                "provider_local_pid": unsafe { libc::getpid() },
+                "controlling_tty": tty,
+                "turns": [],
+            });
+            let mut store = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)?;
+            store.write_all(&serde_json::to_vec(&native)?)?;
+            store.sync_all()?;
+        }
         std::io::stdout().write_all(b"interactive-ready\n")?;
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;

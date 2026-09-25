@@ -834,6 +834,111 @@ fn private_pin_plan(
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]
+fn private_interactive_plan(
+    model: &oulipoly_config::ModelConfig,
+    index: usize,
+    cwd: &std::path::Path,
+    session_id: &str,
+) -> Result<oulipoly_runtime::executor::cli::fresh_remote::FreshProviderPlan, String> {
+    let mut plan = oulipoly_runtime::executor::cli::fresh_remote::prepare_fresh_interactive(
+        model, index, cwd,
+    )?;
+    if std::env::var_os("AGE319_PRIVATE_ROOT_PTY_RESIDENT_V1").is_some() {
+        if plan
+            .environment
+            .iter()
+            .any(|(key, _)| key == "AGE319_PRIVATE_NATIVE_SESSION")
+        {
+            return Err("private native session environment already set".into());
+        }
+        plan.environment
+            .push(("AGE319_PRIVATE_NATIVE_SESSION".into(), session_id.into()));
+        plan.environment.sort();
+    }
+    Ok(plan)
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_resident_registry(
+    config_dir: &std::path::Path,
+    model: &oulipoly_config::ModelConfig,
+) -> Result<oulipoly_runtime::provider_registry::ProviderRegistry, String> {
+    let source =
+        std::fs::read_to_string(config_dir.join("providers.toml")).map_err(|e| e.to_string())?;
+    let providers = oulipoly_config::ProvidersConfig::from_toml(&source)?;
+    let data_root = oulipoly_state::paths::data_dir()?;
+    oulipoly_runtime::provider_registry::ProviderRegistry::from_configs(
+        &[model.clone()],
+        &providers,
+        oulipoly_runtime::provider_registry::ProviderRegistryOptions::default()
+            .with_config_root(config_dir.to_owned())
+            .with_data_root(data_root),
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_resident_empty_tail(
+    registry: &oulipoly_runtime::provider_registry::ProviderRegistry,
+    model: &str,
+    account: &str,
+    instance: &str,
+    settings: &str,
+    session: &str,
+    cwd: &std::path::Path,
+) -> Result<serde_json::Value, String> {
+    use oulipoly_runtime::session_provider::{
+        SessionProviderIdentity, SessionProviderPageCursor, SessionProviderReadPageRequest,
+        SessionProviderTurnProjection, read_turn_page,
+    };
+    use sha2::Digest as _;
+    let cancellation = oulipoly_provider::client::CancellationToken::new();
+    let observation_nonce = format!("{:x}", sha2::Sha256::digest(session.as_bytes()));
+    let page = read_turn_page(SessionProviderReadPageRequest {
+        registry,
+        identity: SessionProviderIdentity {
+            model_name: model.into(),
+            provider_name: account.into(),
+            provider_instance_id: Some(instance.into()),
+            settings_id: settings.into(),
+        },
+        session_id: session,
+        effective_cwd: Some(cwd),
+        projection: SessionProviderTurnProjection::UserObservation,
+        expected_delivery_nonce: Some(&observation_nonce),
+        cursor: SessionProviderPageCursor::Tail,
+        expected_page_index: 0,
+        expected_turn_sequence: 0,
+        max_turns: 64,
+        max_response_bytes: 256 * 1024,
+        max_source_bytes: 4 * 1024 * 1024,
+        max_inline_body_bytes: 16 * 1024,
+        cancellation: &cancellation,
+        timeout: std::time::Duration::from_secs(5),
+    })
+    .map_err(|e| e.to_string())?;
+    if page.provider_instance_id != instance
+        || page.settings_id != settings
+        || page.session_id != session
+        || !page.snapshot_complete
+        || !page.turns.is_empty()
+        || page.resume_token.as_deref().is_none_or(str::is_empty)
+    {
+        return Err("selected native store Tail is not complete and empty".into());
+    }
+    Ok(serde_json::json!({
+        "session_id": page.session_id,
+        "provider_instance_id": page.provider_instance_id,
+        "settings_id": page.settings_id,
+        "snapshot_id": page.snapshot_id,
+        "resume_token": page.resume_token,
+        "snapshot_complete": page.snapshot_complete,
+        "turn_count": page.turns.len(),
+        "source_bytes_examined": page.source_bytes_examined,
+    }))
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
 impl oulipoly_runtime::executor::cli::fresh_remote::FreshProviderBackend
     for PrivateFreshBroker<'_>
 {
@@ -1052,8 +1157,7 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
         self, FreshAccountEffectKind, FreshAccountEffectRequest, FreshPlanRole, FreshRouteRequest,
     };
     use oulipoly_runtime::executor::cli::fresh_remote::{
-        load_fresh_headless_pool, prepare_fresh_headless, prepare_fresh_interactive,
-        run_prepared_fresh_headless,
+        load_fresh_headless_pool, prepare_fresh_headless, run_prepared_fresh_headless,
     };
     let (model_name, provider_pin, prompt) = match &authority.receipt.root_work_intent {
         oulipoly_state::mailbox::FreshRootWorkIntent::NormalCli(args) => match args.as_slice() {
@@ -1123,7 +1227,8 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
         )
         .map_err(|e| format!("fresh route candidate refused before K: {e}"))?;
         if std::env::var_os("AGE319_PRIVATE_ROOT_PTY_CONTROL_V1").is_some() {
-            let interactive = prepare_fresh_interactive(&pool.model, index, &cwd)?;
+            let interactive =
+                private_interactive_plan(&pool.model, index, &cwd, &authority.session.session_id)?;
             if std::env::var_os("AGE319_PRIVATE_ROOT_PTY_NEGATIVE_V1").is_some() {
                 let mut mislabeled = interactive.clone();
                 mislabeled.argv = candidate.plan.argv.clone();
@@ -1261,7 +1366,12 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
         )
         .map_err(|e| format!("interactive route selection refused before K: {e}"))?
         .ok_or("interactive route selection absent before K")?;
-        let local_interactive = prepare_fresh_interactive(&pool.model, selected.index, &cwd)?;
+        let local_interactive = private_interactive_plan(
+            &pool.model,
+            selected.index,
+            &cwd,
+            &authority.session.session_id,
+        )?;
         let local_pinned = private_pin_plan(&local_interactive, FreshPlanRole::Interactive)?;
         let readback = protocol::private_fresh_interactive_route_at(
             &socket,
@@ -1377,7 +1487,12 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
                 return Err("interactive selection changed after broker restart".into());
             }
             control.rechallenge(&socket)?;
-            let interactive = prepare_fresh_interactive(&pool.model, selected.index, &cwd)?;
+            let interactive = private_interactive_plan(
+                &pool.model,
+                selected.index,
+                &cwd,
+                &authority.session.session_id,
+            )?;
             let pinned = private_pin_plan(&interactive, FreshPlanRole::Interactive)?;
             control.prepare_interactive_k(
                 &socket,
@@ -1407,19 +1522,146 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
-        let interactive = prepare_fresh_interactive(&pool.model, selected.index, &cwd)?;
-        let pinned = private_pin_plan(&interactive, FreshPlanRole::Interactive)?;
-        let (q, output) = control.run_interactive(
-            &socket,
-            [
-                pinned.image.as_raw_fd(),
-                pinned.cwd.as_raw_fd(),
-                pinned.input.as_raw_fd(),
-                pinned.recipe.as_raw_fd(),
-                config_source.as_raw_fd(),
-            ],
-            b"fixture-input-through-pty\n",
+        let interactive = private_interactive_plan(
+            &pool.model,
+            selected.index,
+            &cwd,
+            &authority.session.session_id,
         )?;
+        let pinned = private_pin_plan(&interactive, FreshPlanRole::Interactive)?;
+        let plan_source = [
+            pinned.image.as_raw_fd(),
+            pinned.cwd.as_raw_fd(),
+            pinned.input.as_raw_fd(),
+            pinned.recipe.as_raw_fd(),
+            config_source.as_raw_fd(),
+        ];
+        let resident_mode = std::env::var_os("AGE319_PRIVATE_ROOT_PTY_RESIDENT_V1").is_some();
+        let (q, output) = if resident_mode {
+            let registry = private_resident_registry(&config_dir, &pool.model)?;
+            let endpoint = registry
+                .preflight_account(&selected.account)
+                .map_err(|e| format!("selected resident adapter unavailable before K: {e}"))?;
+            let instance = format!("{}-instance", endpoint.capabilities().provider_id);
+            let settings = endpoint
+                .settings_id()
+                .map_err(|e| e.to_string())?
+                .to_owned();
+            if !endpoint.capabilities().capabilities.session
+                || !endpoint.capabilities().capabilities.session_turn_pages_v1
+            {
+                return Err("selected resident adapter lacks native pages before K".into());
+            }
+            let running = control.start_interactive(&socket, plan_source)?;
+            if let Ok(failure) = std::env::var("AGE319_PRIVATE_RESIDENT_FAILURE_V1") {
+                let (q, output, refusal) = if failure == "stale_provider" {
+                    let (q, output) = control.finish_interactive(
+                        &socket,
+                        running,
+                        b"fixture-input-through-pty\n",
+                    )?;
+                    let refusal = control.probe_resident_refusal(&socket, &failure)?;
+                    (q, output, refusal)
+                } else {
+                    let refusal = control.probe_resident_refusal(&socket, &failure)?;
+                    let (q, output) = control.finish_interactive(
+                        &socket,
+                        running,
+                        b"fixture-input-through-pty\n",
+                    )?;
+                    (q, output, refusal)
+                };
+                let gate = std::path::PathBuf::from(
+                    std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                        .map_err(|e| e.to_string())?,
+                );
+                std::fs::write(gate.join("interactive-resident-refusal"), refusal)
+                    .map_err(|e| e.to_string())?;
+                (q, output)
+            } else {
+                let resident = control.register_resident(&socket)?;
+                control.set_selected_adapter(&instance, &settings)?;
+                let challenge = control.challenge_resident()?;
+                if challenge.provider_account != selected.account
+                    || resident["resident"]["registration"]["plan_sha256"]
+                        != selected_interactive
+                            .as_ref()
+                            .ok_or("interactive selection missing for resident")?
+                            .plan_sha256
+                    || challenge.provider_session_id != authority.session.session_id
+                    || challenge.provider_instance_id != instance
+                    || challenge.settings_id != settings
+                    || challenge.generation_id != resident["resident"]["registration"]["grant_id"]
+                {
+                    return Err("resident socket differs from selected adapter or broker K".into());
+                }
+                if private_resident_empty_tail(
+                    &registry,
+                    &pool.model.name,
+                    &selected.account,
+                    &instance,
+                    "wrong-settings",
+                    &authority.session.session_id,
+                    &cwd,
+                )
+                .is_ok()
+                {
+                    return Err("wrong selected adapter settings read native Tail".into());
+                }
+                if private_resident_empty_tail(
+                    &registry,
+                    &pool.model.name,
+                    &selected.account,
+                    &instance,
+                    &settings,
+                    &uuid::Uuid::new_v4().to_string(),
+                    &cwd,
+                )
+                .is_ok()
+                {
+                    return Err("wrong native session read selected Tail".into());
+                }
+                let native = private_resident_empty_tail(
+                    &registry,
+                    &pool.model.name,
+                    &selected.account,
+                    &instance,
+                    &settings,
+                    &authority.session.session_id,
+                    &cwd,
+                )?;
+                let broker_challenged = control.broker_resident_readback(&socket)?;
+                if broker_challenged["resident"] != resident["resident"]
+                    || broker_challenged["generation"] != resident["generation"]
+                    || broker_challenged["socket"]["provider_instance_id"] != instance
+                    || broker_challenged["socket"]["settings_id"] != settings
+                {
+                    return Err("broker resident readback changed after native Tail".into());
+                }
+                let gate = std::path::PathBuf::from(
+                    std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                        .map_err(|e| e.to_string())?,
+                );
+                std::fs::write(
+                    gate.join("interactive-resident-readback.json"),
+                    serde_json::to_vec(&serde_json::json!({
+                        "broker": broker_challenged, "socket": challenge, "native_tail": native,
+                    }))
+                    .map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| e.to_string())?;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+                while !gate.join("interactive-resident-continue").exists() {
+                    if std::time::Instant::now() >= deadline {
+                        return Err("resident live readback gate expired".into());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                control.finish_interactive(&socket, running, b"fixture-input-through-pty\n")?
+            }
+        } else {
+            control.run_interactive(&socket, plan_source, b"fixture-input-through-pty\n")?
+        };
         let gate = std::path::PathBuf::from(
             std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
                 .map_err(|e| e.to_string())?,
@@ -1427,6 +1669,9 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
         std::fs::write(gate.join("interactive-q-readback"), q).map_err(|e| e.to_string())?;
         std::fs::write(gate.join("interactive-output-readback"), output)
             .map_err(|e| e.to_string())?;
+        if resident_mode {
+            return Ok(ExitCode::SUCCESS);
+        }
     }
     let mut backend = PrivateFreshBroker {
         authority,

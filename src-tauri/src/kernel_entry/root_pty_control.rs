@@ -11,6 +11,7 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
@@ -25,9 +26,18 @@ pub(super) struct RootPtyControl {
     alive: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     server: Option<JoinHandle<()>>,
+    resident: Arc<
+        Mutex<Option<oulipoly_runtime::executor::cli::pty_broker::PtyControlGenerationIdentity>>,
+    >,
     // Keep the selected context alive with the descriptor. The broker checks
     // the same fields against its durable h/f decision on each ^ submission.
     _binding: PrivateFreshPtyHandoff,
+}
+
+pub(super) struct RunningInteractive {
+    live_reader: JoinHandle<Result<Vec<u8>, String>>,
+    grant: String,
+    k_error: Option<String>,
 }
 
 impl RootPtyControl {
@@ -73,9 +83,19 @@ impl RootPtyControl {
             let held_master = master.try_clone().map_err(|e| e.to_string())?;
             let server_alive = alive.clone();
             let server_stop = stop.clone();
+            let resident = Arc::new(Mutex::new(None));
+            let server_resident = resident.clone();
             let server = std::thread::Builder::new()
                 .name("root-pty-control".into())
-                .spawn(move || serve(listener, held_master, server_alive, server_stop))
+                .spawn(move || {
+                    serve(
+                        listener,
+                        held_master,
+                        server_alive,
+                        server_stop,
+                        server_resident,
+                    )
+                })
                 .map_err(|e| e.to_string())?;
             let control = Self {
                 master,
@@ -86,6 +106,7 @@ impl RootPtyControl {
                 alive,
                 stop,
                 server: Some(server),
+                resident,
                 _binding: binding,
             };
             control.ensure_live()?;
@@ -173,6 +194,15 @@ impl RootPtyControl {
         plan_source: [i32; 5],
         input: &[u8],
     ) -> Result<(String, Vec<u8>), String> {
+        let running = self.start_interactive(broker, plan_source)?;
+        self.finish_interactive(broker, running, input)
+    }
+
+    pub(super) fn start_interactive(
+        &mut self,
+        broker: &Path,
+        plan_source: [i32; 5],
+    ) -> Result<RunningInteractive, String> {
         self.ensure_live()?;
         self.rechallenge(broker)?;
         let slave = self.slave.as_ref().ok_or("root PTY slave released")?;
@@ -296,6 +326,189 @@ impl RootPtyControl {
             }
             return Err(format!("interactive post-K broker restart debt: {state}"));
         }
+        let grant = first
+            .split_whitespace()
+            .nth(1)
+            .ok_or("interactive K grant absent")?
+            .to_owned();
+        Ok(RunningInteractive {
+            live_reader,
+            grant,
+            k_error,
+        })
+    }
+
+    pub(super) fn register_resident(&self, broker: &Path) -> Result<serde_json::Value, String> {
+        self.ensure_live()?;
+        let value = protocol::private_fresh_interactive_resident_at(
+            broker,
+            &self._binding,
+            self.master.as_raw_fd(),
+        )
+        .map_err(|e| format!("interactive resident registration refused: {e}"))?;
+        let record = &value["resident"]["registration"];
+        let observer = oulipoly_state::pid_identity::procfs_observer_domain()?;
+        let creator: oulipoly_state::pid_identity::ProcessIdentity =
+            serde_json::from_value(record["creator"].clone()).map_err(|e| e.to_string())?;
+        let provider: oulipoly_state::pid_identity::ProcessIdentity =
+            serde_json::from_value(record["provider"].clone()).map_err(|e| e.to_string())?;
+        if record["observer_domain"] != observer
+            || record["session_id"] != self._binding.session_id
+            || record["account"] != self._binding.account
+            || record["control_path"] != self.path.display().to_string()
+            || value["generation"]["generation_id"] != record["grant_id"]
+            || value["generation"]["spawn_invocation_uuid"] != record["invocation_uuid"]
+            || value["generation"]["runtime_mode"] != "pty_interactive"
+            || value["generation"]["lifecycle_state"] != "running"
+            || oulipoly_state::pid_identity::read_current_process_identity()? != creator
+            || oulipoly_state::pid_identity::read_live_process_identity(provider.os_pid)?
+                != Some(provider.clone())
+        {
+            return Err("interactive resident observer or generation changed".into());
+        }
+        let identity = oulipoly_runtime::executor::cli::pty_broker::PtyControlGenerationIdentity {
+            challenge: String::new(),
+            generation_id: record["grant_id"]
+                .as_str()
+                .ok_or("resident grant absent")?
+                .into(),
+            spawn_invocation_uuid: record["invocation_uuid"]
+                .as_str()
+                .ok_or("resident invocation absent")?
+                .into(),
+            creator_process: creator,
+            provider_process: provider,
+            provider_account: record["account"]
+                .as_str()
+                .ok_or("resident account absent")?
+                .into(),
+            provider_instance_id: String::new(),
+            settings_id: String::new(),
+            provider_session_id: record["session_id"]
+                .as_str()
+                .ok_or("resident session absent")?
+                .into(),
+        };
+        *self.resident.lock().map_err(|e| e.to_string())? = Some(identity);
+        self.ensure_live()?;
+        Ok(value)
+    }
+
+    pub(super) fn set_selected_adapter(
+        &self,
+        instance: &str,
+        settings: &str,
+    ) -> Result<(), String> {
+        if instance.is_empty() || settings.is_empty() {
+            return Err("resident selected adapter identity absent".into());
+        }
+        let mut identity = self.resident.lock().map_err(|e| e.to_string())?;
+        let value = identity
+            .as_mut()
+            .ok_or("resident generation not registered")?;
+        value.provider_instance_id = instance.into();
+        value.settings_id = settings.into();
+        Ok(())
+    }
+
+    pub(super) fn challenge_resident(
+        &self,
+    ) -> Result<oulipoly_runtime::executor::cli::pty_broker::PtyControlGenerationIdentity, String>
+    {
+        self.ensure_live()?;
+        let expected = self
+            .resident
+            .lock()
+            .map_err(|e| e.to_string())?
+            .clone()
+            .ok_or("resident identity absent")?;
+        let read = oulipoly_runtime::executor::cli::pty_broker::query_pty_generation_identity(
+            &self.path,
+            self.device,
+            self.inode,
+        )?;
+        let mut expected = expected;
+        expected.challenge = read.challenge.clone();
+        if read != expected {
+            return Err("resident live socket challenge changed".into());
+        }
+        Ok(read)
+    }
+
+    pub(super) fn broker_resident_readback(
+        &self,
+        broker: &Path,
+    ) -> Result<serde_json::Value, String> {
+        self.ensure_live()?;
+        let read = protocol::private_fresh_interactive_resident_readback_at(
+            broker,
+            &self._binding,
+            self.master.as_raw_fd(),
+        )
+        .map_err(|e| format!("broker resident challenged readback refused: {e}"))?;
+        let challenged = self.challenge_resident()?;
+        if read["socket"]["generation_id"] != challenged.generation_id
+            || read["socket"]["creator_process"]
+                != serde_json::to_value(&challenged.creator_process).map_err(|e| e.to_string())?
+            || read["socket"]["provider_process"]
+                != serde_json::to_value(&challenged.provider_process).map_err(|e| e.to_string())?
+            || read["socket"]["provider_instance_id"] != challenged.provider_instance_id
+            || read["socket"]["settings_id"] != challenged.settings_id
+            || read["generation"]["generation_id"] != challenged.generation_id
+        {
+            return Err("broker and original-root resident socket readbacks differ".into());
+        }
+        Ok(read)
+    }
+
+    pub(super) fn probe_resident_refusal(
+        &self,
+        broker: &Path,
+        case: &str,
+    ) -> Result<String, String> {
+        let mut request = self._binding.clone();
+        let _replacement = match case {
+            "absent_socket" | "replaced_socket" => {
+                fs::remove_file(&self.path).map_err(|e| e.to_string())?;
+                if case == "replaced_socket" {
+                    Some(UnixListener::bind(&self.path).map_err(|e| e.to_string())?)
+                } else {
+                    None
+                }
+            }
+            "wrong_account" => {
+                request.account = "wrong-account".into();
+                None
+            }
+            "wrong_session" => {
+                request.session_id = uuid::Uuid::new_v4().to_string();
+                None
+            }
+            "stale_provider" => None,
+            _ => return Err("invalid resident refusal case".into()),
+        };
+        let result = protocol::private_fresh_interactive_resident_at(
+            broker,
+            &request,
+            self.master.as_raw_fd(),
+        );
+        match result {
+            Ok(_) => Err(format!("resident {case} unexpectedly registered")),
+            Err(error) => Ok(error.to_string()),
+        }
+    }
+
+    pub(super) fn finish_interactive(
+        &mut self,
+        broker: &Path,
+        running: RunningInteractive,
+        input: &[u8],
+    ) -> Result<(String, Vec<u8>), String> {
+        let RunningInteractive {
+            live_reader,
+            grant,
+            k_error,
+        } = running;
         self.master
             .try_clone()
             .map_err(|e| e.to_string())?
@@ -310,11 +523,17 @@ impl RootPtyControl {
             let state = protocol::private_fresh_interactive_q_at(broker, &self._binding)
                 .map_err(|e| format!("interactive Q unknown after K: {e}"))?;
             if state.starts_with("fresh-interactive-drained ") {
-                self.ensure_live()?;
+                if !matches!(
+                    std::env::var("AGE319_PRIVATE_RESIDENT_FAILURE_V1").as_deref(),
+                    Ok("absent_socket" | "replaced_socket")
+                ) {
+                    self.ensure_live()?;
+                }
                 let output = protocol::private_fresh_interactive_output_at(broker, &self._binding)
                     .map_err(|e| format!("interactive output transfer failed after Q: {e}"))?;
                 let fields: Vec<_> = state.split_whitespace().collect();
                 if fields.len() != 5
+                    || fields[1] != grant
                     || fields[1] != output.grant_id
                     || fields[2] != output.wait_status.to_string()
                     || fields[3] != output.bytes.to_string()
@@ -377,6 +596,21 @@ impl RootPtyControl {
                 return Err("wrong PTY plan role, digest or account accepted".into());
             }
         }
+        let not_tty = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .map_err(|e| e.to_string())?;
+        if protocol::private_fresh_pty_handoff_at(
+            broker,
+            &self._binding,
+            self.master.as_raw_fd(),
+            not_tty.as_raw_fd(),
+        )
+        .is_ok()
+        {
+            return Err("non-TTY slave accepted for interactive handoff".into());
+        }
         self.rechallenge(broker)
     }
 }
@@ -424,7 +658,15 @@ fn open_pty() -> io::Result<(File, File)> {
     Ok(pair)
 }
 
-fn serve(listener: UnixListener, master: File, alive: Arc<AtomicBool>, stop: Arc<AtomicBool>) {
+fn serve(
+    listener: UnixListener,
+    master: File,
+    alive: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    resident: Arc<
+        Mutex<Option<oulipoly_runtime::executor::cli::pty_broker::PtyControlGenerationIdentity>>,
+    >,
+) {
     while !stop.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((mut stream, _)) => {
@@ -433,9 +675,17 @@ fn serve(listener: UnixListener, master: File, alive: Arc<AtomicBool>, stop: Arc
                 }
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
                 let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-                let mut challenge = [0u8; 16];
-                if stream.read_exact(&mut challenge).is_ok() {
-                    let _ = send_master(&stream, &challenge, master.as_raw_fd());
+                let mut first = [0u8; 4];
+                if stream.read_exact(&mut first).is_ok() {
+                    if &first == b"OPTY" {
+                        let _ = answer_resident_identity(&mut stream, &resident);
+                    } else {
+                        let mut challenge = [0u8; 16];
+                        challenge[..4].copy_from_slice(&first);
+                        if stream.read_exact(&mut challenge[4..]).is_ok() {
+                            let _ = send_master(&stream, &challenge, master.as_raw_fd());
+                        }
+                    }
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -445,6 +695,68 @@ fn serve(listener: UnixListener, master: File, alive: Arc<AtomicBool>, stop: Arc
         }
     }
     alive.store(false, Ordering::Release);
+}
+
+fn answer_resident_identity(
+    stream: &mut UnixStream,
+    resident: &Mutex<
+        Option<oulipoly_runtime::executor::cli::pty_broker::PtyControlGenerationIdentity>,
+    >,
+) -> io::Result<()> {
+    let mut rest = [0u8; 8];
+    stream.read_exact(&mut rest)?;
+    let len = u32::from_be_bytes(rest[4..8].try_into().unwrap()) as usize;
+    let answer = if rest[0] != 1 || rest[1] != 3 || rest[2..4] != [0, 0] || len != 36 {
+        Err("resident identity request invalid".to_owned())
+    } else {
+        let mut challenge = vec![0u8; len];
+        stream.read_exact(&mut challenge)?;
+        let challenge = std::str::from_utf8(&challenge).map_err(io::Error::other)?;
+        if uuid::Uuid::parse_str(challenge).is_err() {
+            Err("resident challenge invalid".to_owned())
+        } else {
+            let held = resident
+                .lock()
+                .map_err(|_| io::Error::other("resident identity lock poisoned"))?;
+            let mut identity = held.as_ref().ok_or("resident generation absent").cloned();
+            if let Ok(value) = &mut identity {
+                if value.provider_instance_id.is_empty()
+                    || value.settings_id.is_empty()
+                    || oulipoly_state::pid_identity::read_current_process_identity()
+                        .ok()
+                        .as_ref()
+                        != Some(&value.creator_process)
+                    || oulipoly_state::pid_identity::read_live_process_identity(
+                        value.provider_process.os_pid,
+                    )
+                    .ok()
+                    .flatten()
+                    .as_ref()
+                        != Some(&value.provider_process)
+                {
+                    identity = Err("resident process or selected adapter changed");
+                } else {
+                    value.challenge = challenge.to_owned();
+                }
+            }
+            identity
+                .and_then(|value| {
+                    serde_json::to_string(&value).map_err(|_| "resident JSON invalid")
+                })
+                .map_err(str::to_owned)
+        }
+    };
+    let (ack, body) = match answer {
+        Ok(value) => (true, value),
+        Err(error) => (false, error),
+    };
+    let mut header = [0u8; 12];
+    header[..4].copy_from_slice(b"OPTY");
+    header[4] = 1;
+    header[5] = if ack { 0 } else { 1 };
+    header[8..12].copy_from_slice(&(body.len() as u32).to_be_bytes());
+    stream.write_all(&header)?;
+    stream.write_all(body.as_bytes())
 }
 
 fn send_master(stream: &UnixStream, challenge: &[u8; 16], master: i32) -> io::Result<()> {

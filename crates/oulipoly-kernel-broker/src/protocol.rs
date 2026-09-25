@@ -382,6 +382,37 @@ pub fn private_fresh_interactive_q_at(
     private_fresh_pty_request_at(path, request, b']', &[])
 }
 
+/// Read the broker-attested running K and register/read its one fresh-sidecar
+/// generation while the original root still holds the PTY master. This does
+/// not request Q or authorize any provider input.
+#[cfg(feature = "age319-private-broker-fixture")]
+pub fn private_fresh_interactive_resident_at(
+    path: &Path,
+    request: &PrivateFreshPtyHandoff,
+    master: RawFd,
+) -> io::Result<serde_json::Value> {
+    let reply = private_fresh_pty_request_at(path, request, b'~', &[master])?;
+    let value = reply
+        .strip_prefix("fresh-interactive-resident ")
+        .and_then(|v| v.strip_suffix('\n'))
+        .ok_or_else(|| io::Error::other("interactive resident readback invalid"))?;
+    serde_json::from_str(value).map_err(io::Error::other)
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+pub fn private_fresh_interactive_resident_readback_at(
+    path: &Path,
+    request: &PrivateFreshPtyHandoff,
+    master: RawFd,
+) -> io::Result<serde_json::Value> {
+    let reply = private_fresh_pty_request_at(path, request, b'?', &[master])?;
+    let value = reply
+        .strip_prefix("fresh-interactive-resident ")
+        .and_then(|v| v.strip_suffix('\n'))
+        .ok_or_else(|| io::Error::other("interactive resident challenged readback invalid"))?;
+    serde_json::from_str(value).map_err(io::Error::other)
+}
+
 #[cfg(feature = "age319-private-broker-fixture")]
 fn private_fresh_pty_request_at(
     path: &Path,
@@ -436,7 +467,17 @@ fn private_fresh_pty_request_at(
     {
         return Err(io::Error::other("PTY handoff submission uncertain"));
     }
-    let response = read_response(stream)?;
+    let response = if matches!(operation, b'~' | b'?') {
+        let mut response = Vec::new();
+        stream.take(16 * 1024 + 1).read_to_end(&mut response)?;
+        if response.len() > 16 * 1024 || !response.ends_with(b"\n") {
+            return Err(io::Error::other("interactive resident response incomplete"));
+        }
+        String::from_utf8(response)
+            .map_err(|_| io::Error::other("interactive resident response encoding"))?
+    } else {
+        read_response(stream)?
+    };
     let expected = match operation {
         b'^' => Some("fresh-pty-handoff-pre-k\n"),
         b'{' => Some("fresh-interactive-k-preparation-pre-k\n"),

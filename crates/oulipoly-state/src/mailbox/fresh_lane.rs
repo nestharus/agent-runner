@@ -223,7 +223,125 @@ pub struct FreshV30Lane {
     state_path: PathBuf,
 }
 
+/// Broker-observed process facts for one consumed interactive K. The caller
+/// must have independently authenticated the released root, K, attach and
+/// selected plan; numeric PIDs are keys in `observer_domain` only.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FreshInteractiveResidentRegistration {
+    pub grant_id: String,
+    pub session_id: String,
+    pub invocation_uuid: String,
+    pub account: String,
+    pub model: String,
+    pub plan_sha256: String,
+    pub control_path: String,
+    pub effective_cwd: String,
+    pub observer_domain: String,
+    pub creator: crate::pid_identity::ProcessIdentity,
+    pub provider: crate::pid_identity::ProcessIdentity,
+}
+
 impl FreshV30Lane {
+    /// The broker is the sole writer of this fresh-sidecar generation. The
+    /// original Runner has no writable path into the sidecar and never supplies
+    /// a local child ID. A repeated readback of the same K is idempotent.
+    pub fn register_interactive_resident(
+        &mut self,
+        record: &FreshInteractiveResidentRegistration,
+    ) -> Result<RuntimeGenerationRow, String> {
+        if !Self::is_reserved_session_id(&record.session_id)
+            || record.observer_domain != crate::pid_identity::procfs_observer_domain()?
+            || record.account.is_empty()
+            || record.model.is_empty()
+            || record.plan_sha256.len() != 64
+            || !record
+                .plan_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || record.control_path.is_empty()
+            || record.effective_cwd.is_empty()
+            || crate::pid_identity::read_live_process_identity(record.creator.os_pid)?
+                != Some(record.creator.clone())
+            || crate::pid_identity::read_live_process_identity(record.provider.os_pid)?
+                != Some(record.provider.clone())
+        {
+            return Err("fresh interactive resident process or observer changed".into());
+        }
+        let generation_id =
+            RuntimeGenerationId::parse(&record.grant_id).map_err(|e| e.to_string())?;
+        let existing = self
+            .sidecar
+            .mailbox()
+            .runtime_lifecycle_reader()
+            .session_generation_projection(&record.session_id)
+            .map_err(|e| e.to_string())?;
+        match existing {
+            SessionGenerationProjection::None => {}
+            SessionGenerationProjection::One(row)
+                if row.generation_id == generation_id
+                    && row.lifecycle_state == RuntimeLifecycleState::Running
+                    && row.spawn_invocation_uuid == record.invocation_uuid
+                    && row.session_id.as_deref() == Some(record.session_id.as_str())
+                    && row.runtime_mode == "pty_interactive"
+                    && row.provider_name == record.account
+                    && row.model_name.as_deref() == Some(record.model.as_str())
+                    && row.pty_control_path.as_deref() == Some(record.control_path.as_str())
+                    && row.effective_cwd.as_deref() == Some(record.effective_cwd.as_str())
+                    && row.creator_process_evidence
+                        == ExactProcessEvidence::Recorded(record.creator.clone())
+                    && row.exact_process_evidence
+                        == ExactProcessEvidence::Recorded(record.provider.clone()) =>
+            {
+                return Ok(*row);
+            }
+            _ => return Err("fresh session already has another runtime generation".into()),
+        }
+        let created = self
+            .sidecar
+            .mailbox_mut()
+            .runtime_lifecycle()
+            .create_runtime_generation_for_attested_creator(
+                CreateRuntimeGeneration {
+                    generation_id: &generation_id,
+                    spawn_invocation_uuid: &record.invocation_uuid,
+                    session_id: Some(&record.session_id),
+                    runtime_mode: "pty_interactive",
+                    provider_name: &record.account,
+                    model_name: Some(&record.model),
+                    pty_control_path: Some(&record.control_path),
+                    models_dir: None,
+                    effective_cwd: Some(&record.effective_cwd),
+                },
+                None,
+                &record.creator,
+            )
+            .map_err(|e| e.to_string())?;
+        if let GenerationMutation::Rejected(reason) = created {
+            return Err(format!(
+                "fresh interactive generation creation refused: {reason:?}"
+            ));
+        }
+        let running = self
+            .sidecar
+            .mailbox_mut()
+            .runtime_lifecycle()
+            .bind_runtime_generation_running(BindRuntimeGenerationRunning {
+                fence: RuntimeGenerationFence {
+                    generation_id: &generation_id,
+                    spawn_invocation_uuid: &record.invocation_uuid,
+                },
+                spawned_os_pid: record.provider.os_pid,
+                exact_process_identity: &record.provider,
+                os_pgid: None,
+            })
+            .map_err(|e| e.to_string())?;
+        match running {
+            GenerationMutation::Applied(row) | GenerationMutation::AlreadyApplied(row) => Ok(row),
+            GenerationMutation::Rejected(reason) => Err(format!(
+                "fresh interactive generation bind refused: {reason:?}"
+            )),
+        }
+    }
     /// Reserved namespace for broker-minted session IDs. Legacy unqualified
     /// commands must refuse it even if an old row has the same spelling.
     pub fn is_reserved_session_id(session_id: &str) -> bool {

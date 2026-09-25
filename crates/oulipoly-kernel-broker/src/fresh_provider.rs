@@ -1408,6 +1408,125 @@ struct InteractiveIdentity {
     peer_gid: u32,
 }
 
+#[derive(Debug, Serialize)]
+pub(super) struct InteractiveResident {
+    pub registration: oulipoly_state::mailbox::FreshInteractiveResidentRegistration,
+    pub provider_local_pid: i32,
+    pub provider_pidns_dev: u64,
+    pub provider_pidns_ino: u64,
+    pub control_device: u64,
+    pub control_inode: u64,
+}
+
+/// Read one consumed K while its selected child is still live. The caller
+/// supplies the held original master, never a PID or a replacement socket.
+pub(super) fn observe_interactive_resident(
+    directory: &Path,
+    binding: &Binding,
+    request: &PrivateFreshPtyHandoff,
+    actor: &PinnedProcess,
+    master: &File,
+) -> io::Result<InteractiveResident> {
+    actor.verify()?;
+    let k: InteractiveK = exact_file(directory, &interactive_k_name(binding))?
+        .ok_or_else(|| io::Error::other("interactive K absent for resident"))?;
+    let grant = &k.grant;
+    if k.version != 1
+        || k.state != "consumed-before-child-release"
+        || grant.binding != *binding
+        || request.session_id != binding.session_id
+        || request.role != FreshPlanRole::Interactive
+        || request.account != k.preparation.handoff.selection.account
+        || request.plan_sha256 != grant.plan_sha256
+        || request.control_path != k.preparation.handoff.control_path
+        || k.preparation.handoff.binding != *binding
+        || k.preparation.handoff.selection.plan_sha256 != grant.plan_sha256
+        || exact_file::<Grant>(directory, &format!("{}.consumed.json", grant.id))?.as_ref()
+            != Some(grant)
+    {
+        return Err(io::Error::other("resident K, account, plan or D changed"));
+    }
+    if PtyHandoffStamp::of(master)? != k.preparation.handoff.master {
+        return Err(io::Error::other("resident original PTY master changed"));
+    }
+    let (control_device, control_inode) =
+        attest_original_control(&request.control_path, binding.actor_pid, master)?;
+    if (control_device, control_inode)
+        != (
+            k.preparation.handoff.control_device,
+            k.preparation.handoff.control_inode,
+        )
+    {
+        return Err(io::Error::other("resident control socket replaced"));
+    }
+    let attach: Attach = exact_file(directory, &format!("{}.attach.json", grant.id))?
+        .ok_or_else(|| io::Error::other("resident broker attach absent"))?;
+    let identity: InteractiveIdentity = exact_file(
+        directory,
+        &format!("{}.interactive-identity.json", grant.id),
+    )?
+    .ok_or_else(|| io::Error::other("resident broker identity absent"))?;
+    let provider = PinnedProcess::open(attach.provider_pid)?;
+    provider.verify()?;
+    if attach.grant_id != grant.id
+        || identity.grant_id != grant.id
+        || identity.work_id != attach.work_id
+        || identity.provider_host_pid != provider.host_pid
+        || identity.provider_local_pid != attach.provider_local_pid
+        || identity.provider_boot_id != provider.boot_id
+        || identity.provider_starttime_ticks != provider.starttime_ticks
+        || (identity.provider_pidns_dev, identity.provider_pidns_ino)
+            != (provider.pidns_dev, provider.pidns_ino)
+        || (attach.pidns_dev, attach.pidns_ino) != (provider.pidns_dev, provider.pidns_ino)
+        || attach.provider_starttime != provider.starttime_ticks
+    {
+        return Err(io::Error::other(
+            "resident provider attach or namespace changed",
+        ));
+    }
+    let cwd = std::fs::read_link(format!("/proc/{}/cwd", provider.host_pid))?;
+    let cwd_meta = std::fs::metadata(&cwd)?;
+    if (cwd_meta.dev(), cwd_meta.ino()) != (k.preparation.cwd_device, k.preparation.cwd_inode) {
+        return Err(io::Error::other("resident provider cwd changed"));
+    }
+    let observer_domain =
+        oulipoly_state::pid_identity::procfs_observer_domain().map_err(io::Error::other)?;
+    let creator = oulipoly_state::pid_identity::read_live_process_identity(actor.host_pid.into())
+        .map_err(io::Error::other)?
+        .ok_or_else(|| io::Error::other("resident original root disappeared"))?;
+    let provider_identity =
+        oulipoly_state::pid_identity::read_live_process_identity(provider.host_pid.into())
+            .map_err(io::Error::other)?
+            .ok_or_else(|| io::Error::other("resident provider disappeared"))?;
+    if creator.os_boot_id != binding.actor_boot_id
+        || creator.os_pid_starttime_ticks != binding.actor_starttime as i64
+        || provider_identity.os_boot_id != identity.provider_boot_id
+        || provider_identity.os_pid_starttime_ticks != identity.provider_starttime_ticks as i64
+    {
+        return Err(io::Error::other("resident process observer not comparable"));
+    }
+    Ok(InteractiveResident {
+        registration: oulipoly_state::mailbox::FreshInteractiveResidentRegistration {
+            grant_id: grant.id.clone(),
+            session_id: binding.session_id.clone(),
+            invocation_uuid: binding.invocation_uuid.clone(),
+            account: request.account.clone(),
+            model: k.preparation.handoff.selection.model.clone(),
+            plan_sha256: grant.plan_sha256.clone(),
+            control_path: request.control_path.to_string_lossy().into_owned(),
+            effective_cwd: cwd.to_string_lossy().into_owned(),
+            observer_domain,
+            creator,
+            provider: provider_identity,
+        },
+        provider_local_pid: attach.provider_local_pid,
+        provider_pidns_dev: provider.pidns_dev,
+        provider_pidns_ino: provider.pidns_ino,
+        control_device,
+        control_inode,
+    })
+}
+
 fn interactive_k_name(binding: &Binding) -> String {
     format!("{}.interactive-k.json", binding.handoff_id)
 }

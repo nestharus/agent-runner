@@ -79,6 +79,10 @@ impl Drop for SnapshotRestore {
 fn inner() {
     let mode = std::env::var("AGE319_PRIVATE_JOIN_MODE").unwrap_or_else(|_| "help".into());
     let physical_mode = mode.starts_with("normal_model_provider_pty_physical");
+    let resident_mode = mode.starts_with("normal_model_provider_pty_physical_resident_");
+    let resident_failure = mode
+        .strip_prefix("normal_model_provider_pty_physical_resident_")
+        .filter(|case| *case != "tail");
     let physical_success = physical_mode
         && !matches!(
             mode.as_str(),
@@ -124,6 +128,12 @@ fn inner() {
             | "normal_model_provider_pty_physical_restart"
             | "normal_model_provider_pty_physical_restart_after_k"
             | "normal_model_provider_pty_physical_root_exit"
+            | "normal_model_provider_pty_physical_resident_tail"
+            | "normal_model_provider_pty_physical_resident_absent_socket"
+            | "normal_model_provider_pty_physical_resident_replaced_socket"
+            | "normal_model_provider_pty_physical_resident_wrong_account"
+            | "normal_model_provider_pty_physical_resident_wrong_session"
+            | "normal_model_provider_pty_physical_resident_stale_provider"
             | "normal_model_provider_pty_restart"
             | "normal_model_provider_pty_replaced"
             | "normal_model_provider_pty_root_exit"
@@ -180,6 +190,17 @@ fn inner() {
     fs::create_dir(&broker_state).unwrap();
     fs::set_permissions(&broker_state, fs::Permissions::from_mode(0o700)).unwrap();
     fs::create_dir(&gate).unwrap();
+    let native_store = gate.join("provider-native-session.json");
+    let native_adapter = gate.join("resident-native-adapter.py");
+    if resident_mode {
+        fs::write(
+            &native_adapter,
+            include_str!("fixtures/age319-resident-native-adapter.py"),
+        )
+        .unwrap();
+        fs::set_permissions(&native_adapter, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!native_store.exists());
+    }
     let config_home = temp.path().join("config-home");
     if provider_mode {
         let config_dir = config_home.join("oulipoly-agent-runner");
@@ -294,10 +315,18 @@ fn inner() {
         } else {
             String::new()
         };
+        let native_implementation = if resident_mode {
+            format!(
+                "settings_id = \"age319-resident-settings\"\nimplementation = {{ family = \"age319-resident\", executable = {} }}\n",
+                serde_json::to_string(native_adapter.to_str().unwrap()).unwrap(),
+            )
+        } else {
+            String::new()
+        };
         fs::write(
             config_dir.join("providers.toml"),
             format!(
-                "[unused]\ncommand = {provider_command}\nargs = [{unused_marker}]\n{interactive_args}{provider_environment}[{provider_name}]\ncommand = {provider_command}\nargs = [{local_args}]\n{interactive_args}{provider_environment}{prompt_mode}{quota}"
+                "[unused]\ncommand = {provider_command}\nargs = [{unused_marker}]\n{interactive_args}{provider_environment}{native_implementation}[{provider_name}]\ncommand = {provider_command}\nargs = [{local_args}]\n{interactive_args}{provider_environment}{prompt_mode}{quota}{native_implementation}"
             ),
         )
         .unwrap();
@@ -598,6 +627,9 @@ fn inner() {
             .env("OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1", "1")
             .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
             .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+            .envs(resident_mode.then_some(("AGE319_PRIVATE_NATIVE_STORE", &native_store)))
+            .envs(resident_mode.then_some(("AGE319_PRIVATE_ROOT_PTY_RESIDENT_V1", "1")))
+            .envs(resident_failure.map(|case| ("AGE319_PRIVATE_RESIDENT_FAILURE_V1", case)))
             .envs(
                 bash.as_ref()
                     .map(|path| ("AGE319_PRIVATE_BASH_IMAGE", path)),
@@ -630,7 +662,8 @@ fn inner() {
                     .then_some(("AGE319_PRIVATE_ROOT_PTY_REPLAY_V1", "1")),
             )
             .envs(
-                (mode == "normal_model_provider_pty_control")
+                (mode == "normal_model_provider_pty_control"
+                    || mode == "normal_model_provider_pty_physical_resident_tail")
                     .then_some(("AGE319_PRIVATE_ROOT_PTY_NEGATIVE_V1", "1")),
             )
             .envs(
@@ -1985,6 +2018,12 @@ fn inner() {
                     | "normal_model_provider"
                     | "normal_model_provider_pty_control"
                     | "normal_model_provider_pty_physical"
+                    | "normal_model_provider_pty_physical_resident_tail"
+                    | "normal_model_provider_pty_physical_resident_absent_socket"
+                    | "normal_model_provider_pty_physical_resident_replaced_socket"
+                    | "normal_model_provider_pty_physical_resident_wrong_account"
+                    | "normal_model_provider_pty_physical_resident_wrong_session"
+                    | "normal_model_provider_pty_physical_resident_stale_provider"
                     | "normal_model_provider_pty_physical_wrong_plan"
                     | "normal_model_provider_pty_physical_wrong_actor"
                     | "normal_model_provider_pty_physical_reply_loss"
@@ -2740,6 +2779,280 @@ fn inner() {
                             1
                         );
                         assert_old_debt_and_no_f_ack(&broker_state);
+                        stop(&mut broker);
+                        return;
+                    }
+                    if let Some(failure) = resident_failure {
+                        eventually(|| {
+                            gate.join("interactive-resident-refusal").exists()
+                                || entry.try_wait().unwrap().is_some()
+                        });
+                        assert!(
+                            gate.join("interactive-resident-refusal").exists(),
+                            "resident {failure}: {}",
+                            fs::read_to_string(&err).unwrap_or_default()
+                        );
+                        let refusal =
+                            fs::read_to_string(gate.join("interactive-resident-refusal")).unwrap();
+                        assert!(!refusal.is_empty(), "resident refusal was empty");
+                        eventually(|| entry.try_wait().unwrap().is_some());
+                        assert!(
+                            entry.wait().unwrap().success(),
+                            "resident {failure} Q: {}",
+                            fs::read_to_string(&err).unwrap_or_default()
+                        );
+                        let k: serde_json::Value = serde_json::from_slice(
+                            &fs::read(
+                                provider_dir
+                                    .join(format!("{}.interactive-k.json", receipt.handoff_id)),
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap();
+                        let q: serde_json::Value = serde_json::from_slice(
+                            &fs::read(
+                                provider_dir
+                                    .join(format!("{}.interactive-q.json", receipt.handoff_id)),
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap();
+                        assert_eq!(q["k"], k);
+                        assert_eq!(q["provider_exit"]["wait_status"], 0);
+                        let sidecar = rusqlite::Connection::open_with_flags(
+                            broker_state.join("v30/sidecar/pid-identity.db"),
+                            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                        )
+                        .unwrap();
+                        let generations: i64 = sidecar
+                            .query_row(
+                                "SELECT count(*) FROM runtime_generation WHERE session_id=?1",
+                                [&session.session_id],
+                                |row| row.get(0),
+                            )
+                            .unwrap();
+                        let preparations: i64 = sidecar
+                            .query_row(
+                                "SELECT count(*) FROM fresh_native_f_preparation",
+                                [],
+                                |row| row.get(0),
+                            )
+                            .unwrap();
+                        assert_eq!(generations, 0, "refused resident created a generation");
+                        assert_eq!(preparations, 0, "refused resident prepared F");
+                        assert!(!gate.join("interactive-resident-readback.json").exists());
+                        assert_eq!(
+                            fs::read_dir(&provider_dir)
+                                .unwrap()
+                                .filter_map(Result::ok)
+                                .filter(|entry| entry
+                                    .file_name()
+                                    .to_string_lossy()
+                                    .ends_with(".interactive-k.json"))
+                                .count(),
+                            1
+                        );
+                        eprintln!(
+                            "resident refusal evidence: case={failure} grant={} reason={refusal}",
+                            k["grant"]["id"]
+                        );
+                        stop(&mut broker);
+                        return;
+                    }
+                    if resident_mode {
+                        let readback_path = gate.join("interactive-resident-readback.json");
+                        eventually(|| {
+                            readback_path.exists() || entry.try_wait().unwrap().is_some()
+                        });
+                        assert!(
+                            readback_path.exists(),
+                            "resident root: {}; broker: {}",
+                            fs::read_to_string(&err).unwrap_or_default(),
+                            fs::read_to_string(&broker_log).unwrap_or_default()
+                        );
+                        assert!(
+                            entry.try_wait().unwrap().is_none(),
+                            "original root exited before live inspection"
+                        );
+                        let readback: serde_json::Value =
+                            serde_json::from_slice(&fs::read(&readback_path).unwrap()).unwrap();
+                        let resident = &readback["broker"]["resident"];
+                        let registration = &resident["registration"];
+                        let generation = &readback["broker"]["generation"];
+                        let grant_id = registration["grant_id"].as_str().unwrap();
+                        let selected_plan: serde_json::Value = serde_json::from_slice(
+                            &fs::read(provider_dir.join(format!(
+                                "{}.interactive-route-selection.json",
+                                receipt.handoff_id
+                            )))
+                            .unwrap(),
+                        )
+                        .unwrap();
+                        assert_eq!(registration["session_id"], session.session_id);
+                        assert_eq!(registration["invocation_uuid"], receipt.invocation_uuid);
+                        assert_eq!(registration["account"], "local");
+                        assert_eq!(
+                            registration["plan_sha256"],
+                            selected_plan["selection"]["plan_sha256"]
+                        );
+                        assert_eq!(readback["broker"]["lane_id"], session.lane_id);
+                        assert_eq!(generation["generation_id"], grant_id);
+                        assert_eq!(generation["lifecycle_state"], "running");
+                        assert_eq!(generation["runtime_mode"], "pty_interactive");
+                        assert_eq!(generation["session_id"], session.session_id);
+                        assert_eq!(generation["provider_name"], registration["account"]);
+                        assert_eq!(generation["model_name"], registration["model"]);
+                        assert_eq!(generation["pty_control_path"], registration["control_path"]);
+                        assert_eq!(generation["effective_cwd"], registration["effective_cwd"]);
+                        assert_eq!(
+                            generation["creator_process_evidence"]["Recorded"],
+                            registration["creator"]
+                        );
+                        assert_eq!(
+                            generation["exact_process_evidence"]["Recorded"],
+                            registration["provider"]
+                        );
+                        let sidecar = rusqlite::Connection::open_with_flags(
+                            broker_state.join("v30/sidecar/pid-identity.db"),
+                            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                        )
+                        .unwrap();
+                        let stored: (String, String, String, String, i64, i64) = sidecar.query_row(
+                            "SELECT generation_uuid,lifecycle_state,session_id,provider_name,creator_identity_os_pid,identity_os_pid FROM runtime_generation WHERE generation_uuid=?1",
+                            [grant_id],
+                            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
+                        ).unwrap();
+                        assert_eq!(stored.0, grant_id);
+                        assert_eq!(stored.1, "running");
+                        assert_eq!(stored.2, session.session_id);
+                        assert_eq!(stored.3, "local");
+                        assert_eq!(
+                            stored.4,
+                            registration["creator"]["os_pid"].as_i64().unwrap()
+                        );
+                        assert_eq!(
+                            stored.5,
+                            registration["provider"]["os_pid"].as_i64().unwrap()
+                        );
+                        let provider_pid = stored.5;
+                        assert_eq!(
+                            oulipoly_state::pid_identity::read_live_process_identity(provider_pid)
+                                .unwrap()
+                                .unwrap()
+                                .os_pid,
+                            provider_pid
+                        );
+                        assert_eq!(
+                            registration["observer_domain"],
+                            oulipoly_state::pid_identity::procfs_observer_domain().unwrap()
+                        );
+                        let attested: oulipoly_state::mailbox::FreshInteractiveResidentRegistration =
+                            serde_json::from_value(registration.clone()).unwrap();
+                        let mut lane = FreshV30Lane::open_at(&broker_state).unwrap();
+                        let replay = lane.register_interactive_resident(&attested).unwrap();
+                        assert_eq!(serde_json::to_value(replay).unwrap(), *generation);
+                        let mut wrong_observer = attested.clone();
+                        wrong_observer.observer_domain.push_str(":other");
+                        assert!(lane.register_interactive_resident(&wrong_observer).is_err());
+                        let mut stale_identity = attested.clone();
+                        stale_identity.provider.os_pid_starttime_ticks += 1;
+                        assert!(lane.register_interactive_resident(&stale_identity).is_err());
+                        assert_eq!(
+                            readback["socket"]["provider_process"],
+                            registration["provider"]
+                        );
+                        assert_eq!(
+                            readback["socket"]["creator_process"],
+                            registration["creator"]
+                        );
+                        assert_eq!(readback["socket"]["generation_id"], grant_id);
+                        let path = registration["control_path"].as_str().unwrap();
+                        let identity = oulipoly_runtime::executor::cli::pty_broker::query_pty_generation_identity(
+                            std::path::Path::new(path),
+                            resident["control_device"].as_u64().unwrap(),
+                            resident["control_inode"].as_u64().unwrap(),
+                        ).unwrap();
+                        assert_eq!(identity.provider_process.os_pid, provider_pid);
+                        let native: serde_json::Value =
+                            serde_json::from_slice(&fs::read(&native_store).unwrap()).unwrap();
+                        assert_eq!(native["format"], "age319-interactive-native-session/v1");
+                        assert_eq!(native["session_id"], session.session_id);
+                        assert_eq!(native["provider_local_pid"], resident["provider_local_pid"]);
+                        assert_eq!(native["controlling_tty"], true);
+                        assert_eq!(native["turns"], serde_json::json!([]));
+                        assert_eq!(readback["native_tail"]["session_id"], session.session_id);
+                        assert_eq!(
+                            readback["native_tail"]["provider_instance_id"],
+                            readback["socket"]["provider_instance_id"]
+                        );
+                        assert_eq!(
+                            readback["native_tail"]["provider_instance_id"],
+                            "age319-resident-native-fixture-instance"
+                        );
+                        assert_eq!(
+                            readback["native_tail"]["settings_id"],
+                            "age319-resident-settings"
+                        );
+                        assert_eq!(readback["native_tail"]["snapshot_complete"], true);
+                        assert_eq!(readback["native_tail"]["turn_count"], 0);
+                        assert!(
+                            readback["native_tail"]["resume_token"]
+                                .as_str()
+                                .unwrap()
+                                .ends_with(native["store_nonce"].as_str().unwrap())
+                        );
+                        let preparation_count: i64 = sidecar
+                            .query_row(
+                                "SELECT count(*) FROM fresh_native_f_preparation",
+                                [],
+                                |row| row.get(0),
+                            )
+                            .unwrap();
+                        assert_eq!(preparation_count, 0);
+                        assert!(
+                            !provider_dir
+                                .join(format!("{}.interactive-q.json", receipt.handoff_id))
+                                .exists()
+                        );
+                        fs::write(gate.join("interactive-resident-continue"), b"continue").unwrap();
+                        eventually(|| entry.try_wait().unwrap().is_some());
+                        assert!(
+                            entry.wait().unwrap().success(),
+                            "resident root Q: {}",
+                            fs::read_to_string(&err).unwrap_or_default()
+                        );
+                        let q: serde_json::Value = serde_json::from_slice(
+                            &fs::read(
+                                provider_dir
+                                    .join(format!("{}.interactive-q.json", receipt.handoff_id)),
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap();
+                        assert_eq!(q["k"]["grant"]["id"], grant_id);
+                        assert_eq!(q["identity"]["provider_host_pid"], provider_pid);
+                        assert_eq!(q["provider_exit"]["wait_status"], 0);
+                        assert_eq!(q["tree_drain"]["zero_remaining"], true);
+                        assert_eq!(q["pid1_wait"]["reaped"], true);
+                        assert_eq!(
+                            fs::read_dir(&provider_dir)
+                                .unwrap()
+                                .filter_map(Result::ok)
+                                .filter(|entry| entry
+                                    .file_name()
+                                    .to_string_lossy()
+                                    .ends_with(".interactive-k.json"))
+                                .count(),
+                            1
+                        );
+                        eprintln!(
+                            "resident physical evidence: grant={grant_id} provider_host_pid={provider_pid} provider_local_pid={} pidns_ino={} native_session={} tail_token={} q_wait={}",
+                            resident["provider_local_pid"],
+                            resident["provider_pidns_ino"],
+                            native["session_id"],
+                            readback["native_tail"]["resume_token"],
+                            q["provider_exit"]["wait_status"]
+                        );
                         stop(&mut broker);
                         return;
                     }
@@ -5758,6 +6071,12 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_model_provider",
         "normal_model_provider_pty_control",
         "normal_model_provider_pty_physical",
+        "normal_model_provider_pty_physical_resident_tail",
+        "normal_model_provider_pty_physical_resident_absent_socket",
+        "normal_model_provider_pty_physical_resident_replaced_socket",
+        "normal_model_provider_pty_physical_resident_wrong_account",
+        "normal_model_provider_pty_physical_resident_wrong_session",
+        "normal_model_provider_pty_physical_resident_stale_provider",
         "normal_model_provider_pty_physical_wrong_plan",
         "normal_model_provider_pty_physical_wrong_actor",
         "normal_model_provider_pty_physical_reply_loss",
@@ -5834,7 +6153,9 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
-        if mode == "normal_model_provider_pty_physical" {
+        if mode == "normal_model_provider_pty_physical"
+            || mode == "normal_model_provider_pty_physical_resident_tail"
+        {
             eprint!("{}", String::from_utf8_lossy(&output.stderr));
         }
         eprintln!("private root mode passed: {mode}");

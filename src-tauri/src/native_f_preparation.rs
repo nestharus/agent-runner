@@ -132,7 +132,7 @@ pub(crate) fn prepare_private_native_f_input(
         expected_page_index: 0,
         expected_turn_sequence: 0,
         max_turns: 64,
-        max_response_bytes: 1024 * 1024,
+        max_response_bytes: 256 * 1024,
         max_source_bytes: 4 * 1024 * 1024,
         max_inline_body_bytes: 16 * 1024,
         cancellation: &cancellation,
