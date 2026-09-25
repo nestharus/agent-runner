@@ -959,7 +959,9 @@ fn private_resident_fence_pending_f(
         SessionProviderIdentity, SessionProviderPageCursor, SessionProviderReadPageRequest,
         SessionProviderTurnProjection, read_turn_page,
     };
-    use oulipoly_state::mailbox::{FreshDeliveryReadback, FreshNativeFObservedTurn};
+    use oulipoly_state::mailbox::{
+        FreshDeliveryReadback, FreshNativeFObservedTurn, FreshNativeFReceipt, FreshNativeFTransport,
+    };
     use sha2::{Digest as _, Sha256};
     let delivery_request_id = uuid::Uuid::new_v4().to_string();
     let request_path = gate.join("interactive-f-request-id");
@@ -1108,8 +1110,19 @@ fn private_resident_fence_pending_f(
     let Some(control) = physical_control else {
         return Ok(());
     };
+    let fault = std::env::var("AGE319_PRIVATE_NATIVE_F_FAULT_V1").unwrap_or_default();
+    if fault == "after_fence" {
+        private_native_f_fault_gate(gate, &fault)?;
+        private_native_f_reattest(socket, control, &prepared, &fence)?;
+        return Err("native F fence spent before byte; pending unknown, no replay".into());
+    }
     let input = format!("{}\n", prepared.envelope_text);
     let sent = control.send_native_f_once(socket, &fence, input.as_bytes());
+    if fault == "after_partial" {
+        private_native_f_fault_gate(gate, &fault)?;
+        private_native_f_reattest(socket, control, &prepared, &fence)?;
+        return Err("native F partial write unknown; pending, no replay".into());
+    }
     if std::env::var_os("AGE319_PRIVATE_NATIVE_F_PARTIAL_WRITE_V1").is_some()
         && sent.is_err()
         && control
@@ -1119,23 +1132,51 @@ fn private_resident_fence_pending_f(
         return Err("native F partial write replay accepted".into());
     }
     sent?;
+    if fault == "after_write" {
+        private_native_f_fault_gate(gate, &fault)?;
+        private_native_f_reattest(socket, control, &prepared, &fence)?;
+    }
     if control
         .send_native_f_once(socket, &fence, input.as_bytes())
         .is_ok()
     {
         return Err("duplicate native F PTY send accepted".into());
     }
-    let transport = protocol::fresh_recipient_request_at(
+    let transport_answer = protocol::fresh_recipient_request_at(
         socket,
         &FreshRecipientRequest::RecordNativeFTransport {
             preparation_request_id: preparation_request_id.clone(),
         },
-    )
-    .map_err(|e| format!("native F transport acceptance unknown: {e}"))?;
-    if transport["kind"] != "native_f_transport"
-        || transport["transport"]["input_sha256"] != fence.input_sha256
+    );
+    let transport = if transport_answer.is_err() {
+        private_native_f_reattest(socket, control, &prepared, &fence)?;
+        private_native_f_readback(
+            socket,
+            control,
+            &prepared,
+            &fence,
+            FreshRecipientRequest::ReadNativeFTransport {
+                preparation_request_id: preparation_request_id.clone(),
+            },
+            "transport",
+            "native_f_transport_readback",
+        )?
+    } else {
+        let answer = transport_answer.map_err(|e| e.to_string())?;
+        if answer["kind"] != "native_f_transport" {
+            return Err("native F transport reply changed; pending".into());
+        }
+        answer["transport"].clone()
+    };
+    let transport: FreshNativeFTransport =
+        serde_json::from_value(transport).map_err(|e| e.to_string())?;
+    if transport.preparation_request_id != preparation_request_id
+        || transport.grant_id != fence.grant_id
+        || transport.recipient_identity != fence.recipient_identity
+        || transport.input_sha256 != fence.input_sha256
+        || transport.input_byte_len != fence.input_byte_len
     {
-        return Err("native F transport acceptance readback changed".into());
+        return Err("native F transport readback changed exact fence; pending".into());
     }
     let identity = SessionProviderIdentity {
         model_name: model.into(),
@@ -1207,6 +1248,10 @@ fn private_resident_fence_pending_f(
         body: body.into(),
         canonical_text_sha256: turn.canonical_text_sha256.clone().unwrap_or_default(),
     };
+    if fault == "after_turn" {
+        private_native_f_fault_gate(gate, &fault)?;
+        private_native_f_reattest(socket, control, &prepared, &fence)?;
+    }
     for changed in ["tail", "turn", "session", "nonce", "body"] {
         let mut wrong = observed.clone();
         match changed {
@@ -1229,16 +1274,48 @@ fn private_resident_fence_pending_f(
             return Err(format!("native F {changed} negative receipt was accepted"));
         }
     }
-    let receipt = protocol::fresh_recipient_request_at(
+    let receipt_answer = protocol::fresh_recipient_request_at(
         socket,
         &FreshRecipientRequest::CertifyNativeFReceipt {
             preparation_request_id: preparation_request_id.clone(),
             observed: observed.clone(),
         },
-    )
-    .map_err(|e| format!("native F receipt unknown; pending: {e}"))?;
-    if receipt["kind"] != "native_f_receipt" || receipt["receipt"]["grant_id"] != grant.grant_id {
-        return Err("native F receipt readback changed; pending".into());
+    );
+    let receipt = if receipt_answer.is_err() {
+        private_native_f_reattest(socket, control, &prepared, &fence)?;
+        private_native_f_readback(
+            socket,
+            control,
+            &prepared,
+            &fence,
+            FreshRecipientRequest::ReadNativeFReceipt {
+                preparation_request_id: preparation_request_id.clone(),
+            },
+            "receipt",
+            "native_f_receipt_readback",
+        )?
+    } else {
+        let answer = receipt_answer.map_err(|e| e.to_string())?;
+        if answer["kind"] != "native_f_receipt" {
+            return Err("native F receipt reply changed; pending".into());
+        }
+        answer["receipt"].clone()
+    };
+    let receipt: FreshNativeFReceipt =
+        serde_json::from_value(receipt).map_err(|e| e.to_string())?;
+    if receipt.preparation_request_id != preparation_request_id
+        || receipt.grant_id != grant.grant_id
+        || receipt.recipient_identity != fence.recipient_identity
+        || receipt.provider_session_id != prepared.provider_session_id
+        || receipt.envelope_sha256 != prepared.envelope_sha256
+        || receipt.payload_sha256 != prepared.payload_sha256
+        || receipt.observation != observed
+    {
+        return Err("native F receipt readback changed exact native turn; pending".into());
+    }
+    if fault == "after_receipt" {
+        private_native_f_fault_gate(gate, &fault)?;
+        private_native_f_reattest(socket, control, &prepared, &fence)?;
     }
     if protocol::fresh_recipient_request_at(
         socket,
@@ -1262,16 +1339,68 @@ fn private_resident_fence_pending_f(
     {
         return Err("native F wrong-token ACK accepted".into());
     }
-    let ack = protocol::fresh_recipient_request_at(
+    let ack_answer = protocol::fresh_recipient_request_at(
         socket,
         &FreshRecipientRequest::AcknowledgeNativeFReceipt {
             preparation_request_id: preparation_request_id.clone(),
             delivery_token: token.into(),
         },
-    )
-    .map_err(|e| format!("native F automatic ACK unknown: {e}"))?;
-    if ack["kind"] != "native_f_auto_ack" || ack["grant"]["phase"] != "acked" {
-        return Err("native F automatic ACK readback changed".into());
+    );
+    let ack = if ack_answer.is_err() {
+        private_native_f_reattest(socket, control, &prepared, &fence)?;
+        private_native_f_readback(
+            socket,
+            control,
+            &prepared,
+            &fence,
+            FreshRecipientRequest::Read {
+                delivery_request_id: delivery_request_id.clone(),
+            },
+            "grant",
+            "readback",
+        )?
+    } else {
+        let answer = ack_answer.map_err(|e| e.to_string())?;
+        if answer["kind"] != "native_f_auto_ack" {
+            return Err("native F ACK reply changed; pending".into());
+        }
+        answer["grant"].clone()
+    };
+    let ack: FreshDeliveryReadback = serde_json::from_value(ack).map_err(|e| e.to_string())?;
+    let mut expected_ack = grant.clone();
+    expected_ack.phase = "acked".into();
+    if ack != expected_ack {
+        return Err("native F ACK readback changed exact grant; pending".into());
+    }
+    let durable_ack: oulipoly_state::mailbox::FreshNativeFAutoAck =
+        serde_json::from_value(private_native_f_readback(
+            socket,
+            control,
+            &prepared,
+            &fence,
+            FreshRecipientRequest::ReadNativeFAutoAck {
+                preparation_request_id: preparation_request_id.clone(),
+            },
+            "ack",
+            "native_f_auto_ack_readback",
+        )?)
+        .map_err(|e| e.to_string())?;
+    if durable_ack.grant_id != grant.grant_id
+        || durable_ack.preparation_request_id != preparation_request_id
+        || durable_ack.delivery_request_id != delivery_request_id
+        || durable_ack.delivery_token_sha256 != prepared.delivery_token_sha256
+        || durable_ack.session_id != grant.session_id
+        || durable_ack.seq != grant.seq
+        || durable_ack.source_id != grant.source_id
+        || durable_ack.attempt_id != grant.attempt_id
+        || durable_ack.recipient_identity_json
+            != serde_json::to_string(&fence.recipient_identity).map_err(|e| e.to_string())?
+        || durable_ack.payload_sha256 != grant.payload_sha256
+        || durable_ack.payload_byte_len != grant.payload_byte_len
+        || durable_ack.turn_id != receipt.turn_id
+        || durable_ack.basis != "native_f_receipt"
+    {
+        return Err("native F automatic ACK row changed exact receipt; pending".into());
     }
     if protocol::fresh_recipient_request_at(
         socket,
@@ -1287,13 +1416,121 @@ fn private_resident_fence_pending_f(
     std::fs::write(
         gate.join("interactive-f-physical.json"),
         serde_json::to_vec(&serde_json::json!({
-            "transport": transport["transport"], "receipt": receipt["receipt"],
-            "ack": ack["grant"],
+            "transport": transport, "receipt": receipt,
+            "ack": ack,
         }))
         .map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_native_f_fault_gate(gate: &std::path::Path, stage: &str) -> Result<(), String> {
+    std::fs::write(gate.join("interactive-f-crash-ready"), stage).map_err(|e| e.to_string())?;
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !gate.join("interactive-f-crash-continue").exists() {
+        if std::time::Instant::now() >= until {
+            return Err(format!(
+                "native F {stage} restart gate expired; pending unknown"
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_native_f_reattest(
+    socket: &std::path::Path,
+    control: &root_pty_control::RootPtyControl,
+    prepared: &oulipoly_state::mailbox::FreshNativeFPreparation,
+    fence: &oulipoly_state::mailbox::FreshNativeFSubmission,
+) -> Result<(), String> {
+    use oulipoly_kernel_broker::protocol::{self, FreshRecipientRequest};
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let result: Result<(), String> = (|| {
+            control.broker_resident_readback(socket)?;
+            let key = prepared.preparation_request_id.clone();
+            let read = protocol::fresh_recipient_request_at(
+                socket,
+                &FreshRecipientRequest::ReadNativeFPreparation {
+                    preparation_request_id: key.clone(),
+                },
+            )
+            .map_err(|e| e.to_string())?;
+            let actual: oulipoly_state::mailbox::FreshNativeFPreparation =
+                serde_json::from_value(read["preparation"].clone())
+                    .map_err(|_| "native F preparation absent after crash".to_string())?;
+            if read["kind"] != "native_f_preparation_readback" || actual != *prepared {
+                return Err(
+                    "native F preparation, session, root or source changed after crash".into(),
+                );
+            }
+            let read = protocol::fresh_recipient_request_at(
+                socket,
+                &FreshRecipientRequest::ReadNativeFSubmission {
+                    preparation_request_id: key,
+                },
+            )
+            .map_err(|e| e.to_string())?;
+            let actual: oulipoly_state::mailbox::FreshNativeFSubmission =
+                serde_json::from_value(read["fence"].clone())
+                    .map_err(|_| "native F fence absent after crash".to_string())?;
+            if read["kind"] != "native_f_submission_readback" || actual != *fence {
+                return Err("native F fence changed after crash; no replay".into());
+            }
+            let read = protocol::fresh_recipient_request_at(
+                socket,
+                &FreshRecipientRequest::ReadNativeFReceipt {
+                    preparation_request_id: prepared.preparation_request_id.clone(),
+                },
+            )
+            .map_err(|e| e.to_string())?;
+            if read["kind"] != "native_f_receipt_readback" {
+                return Err("native F receipt readback kind changed".into());
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) if std::time::Instant::now() >= until => {
+                return Err(format!(
+                    "native F reattestation unknown; pending, no replay: {error}"
+                ));
+            }
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_native_f_readback(
+    socket: &std::path::Path,
+    control: &root_pty_control::RootPtyControl,
+    prepared: &oulipoly_state::mailbox::FreshNativeFPreparation,
+    fence: &oulipoly_state::mailbox::FreshNativeFSubmission,
+    request: oulipoly_kernel_broker::protocol::FreshRecipientRequest,
+    field: &str,
+    kind: &str,
+) -> Result<serde_json::Value, String> {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        private_native_f_reattest(socket, control, prepared, fence)?;
+        match oulipoly_kernel_broker::protocol::fresh_recipient_request_at(socket, &request) {
+            Ok(answer) if answer["kind"] == kind && !answer[field].is_null() => {
+                return Ok(answer[field].clone());
+            }
+            Ok(_) => return Err(format!("native F {field} absent after lost reply; pending")),
+            Err(error) if std::time::Instant::now() >= until => {
+                return Err(format!(
+                    "native F {field} readback unknown; pending: {error}"
+                ));
+            }
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]

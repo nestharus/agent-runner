@@ -61,12 +61,13 @@ pub use broker_authority::{
 pub use fresh_lane::{
     FreshAckDelegation, FreshBashChild, FreshBashListenerPolicy, FreshBashPrivateResult,
     FreshBashSourceEvent, FreshDeliveryReadback, FreshDeliverySubmission,
-    FreshInteractiveResidentRegistration, FreshNativeFObservedTurn, FreshNativeFPreparation,
-    FreshNativeFPrepareRequest, FreshNativeFReceipt, FreshNativeFSubmission, FreshNativeFTransport,
-    FreshNormalWorkPreparation, FreshPhysicalTerminal, FreshRecipientIdentity,
-    FreshReleasedHandoff, FreshRootEffect, FreshRootEffectState, FreshRootTerminalExecution,
-    FreshRootTerminalReadback, FreshRootWorkIntent, FreshV30Lane, FreshV30LaneIdentity,
-    FreshV30Session, normal_root_arguments,
+    FreshInteractiveResidentRegistration, FreshNativeFAutoAck, FreshNativeFObservedTurn,
+    FreshNativeFPreparation, FreshNativeFPrepareRequest, FreshNativeFReceipt,
+    FreshNativeFSubmission, FreshNativeFTransport, FreshNormalWorkPreparation,
+    FreshPhysicalTerminal, FreshRecipientIdentity, FreshReleasedHandoff, FreshRootEffect,
+    FreshRootEffectState, FreshRootTerminalExecution, FreshRootTerminalReadback,
+    FreshRootWorkIntent, FreshV30Lane, FreshV30LaneIdentity, FreshV30Session,
+    normal_root_arguments,
 };
 pub use native_publication::NativePublication;
 #[path = "mailbox/schema.rs"]

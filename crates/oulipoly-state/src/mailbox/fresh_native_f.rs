@@ -115,6 +115,25 @@ pub struct FreshNativeFReceipt {
     pub observed_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreshNativeFAutoAck {
+    pub grant_id: String,
+    pub preparation_request_id: String,
+    pub delivery_request_id: String,
+    pub delivery_token_sha256: String,
+    pub session_id: String,
+    pub seq: i64,
+    pub source_id: String,
+    pub attempt_id: String,
+    pub recipient_identity_json: String,
+    pub payload_sha256: String,
+    pub payload_byte_len: i64,
+    pub turn_id: String,
+    pub basis: String,
+    pub acknowledged_at: String,
+}
+
 fn nonempty_bounded(name: &str, value: &str, max: usize) -> Result<(), String> {
     if value.is_empty() || value.len() > max || value.chars().any(char::is_control) {
         return Err(format!("invalid native F {name}"));
@@ -123,6 +142,29 @@ fn nonempty_bounded(name: &str, value: &str, max: usize) -> Result<(), String> {
 }
 
 impl FreshV30Lane {
+    pub fn read_native_f_auto_ack(
+        &self,
+        request: &str,
+        recipient: &FreshRecipientIdentity,
+    ) -> Result<Option<FreshNativeFAutoAck>, String> {
+        validate_request_id(request)?;
+        self.sidecar.mailbox().conn.query_row(
+            "SELECT grant_id,preparation_request_id,delivery_request_id,delivery_token_sha256,
+             session_id,seq,source_id,attempt_id,recipient_identity,payload_sha256,
+             payload_byte_len,turn_id,basis,acknowledged_at FROM fresh_native_f_auto_ack
+             WHERE preparation_request_id=?1 AND recipient_identity=?2",
+            params![request, Self::recipient_identity_json(recipient)?],
+            |r| Ok(FreshNativeFAutoAck {
+                grant_id: r.get(0)?, preparation_request_id: r.get(1)?,
+                delivery_request_id: r.get(2)?, delivery_token_sha256: r.get(3)?,
+                session_id: r.get(4)?, seq: r.get(5)?, source_id: r.get(6)?,
+                attempt_id: r.get(7)?, recipient_identity_json: r.get(8)?,
+                payload_sha256: r.get(9)?, payload_byte_len: r.get(10)?,
+                turn_id: r.get(11)?, basis: r.get(12)?, acknowledged_at: r.get(13)?,
+            }),
+        ).optional().map_err(|e| e.to_string())
+    }
+
     pub fn read_native_f_transport(&self, request: &str, recipient: &FreshRecipientIdentity)
         -> Result<Option<FreshNativeFTransport>, String> {
         validate_request_id(request)?;

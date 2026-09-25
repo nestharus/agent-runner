@@ -1160,6 +1160,9 @@ pub enum FreshRecipientRequest {
         preparation_request_id: String,
         delivery_token: String,
     },
+    ReadNativeFAutoAck {
+        preparation_request_id: String,
+    },
     Acknowledge {
         grant_id: String,
         delivery_token: String,

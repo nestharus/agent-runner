@@ -193,6 +193,30 @@ fn certify_native_f_with_source(
     lane.certify_native_f_receipt(request, recipient, observed)
 }
 
+#[cfg(feature = "age319-private-broker-fixture")]
+fn verify_native_f_committed_receipt(
+    lane: &FreshV30Lane,
+    request: &str,
+    recipient: &FreshRecipientIdentity,
+) -> Result<(), String> {
+    let Some(receipt) = lane.read_native_f_receipt(request, recipient)? else {
+        return Ok(());
+    };
+    let prepared = lane
+        .read_native_f_preparation(request, recipient)?
+        .ok_or("native F committed receipt preparation absent")?;
+    verify_private_native_f_source(lane, &prepared, &receipt.observation)?;
+    if receipt.preparation_request_id != prepared.preparation_request_id
+        || receipt.grant_id != prepared.grant_id
+        || receipt.recipient_identity != *recipient
+        || receipt.envelope_sha256 != prepared.envelope_sha256
+        || receipt.payload_sha256 != prepared.payload_sha256
+    {
+        return Err("native F committed receipt lineage changed".into());
+    }
+    Ok(())
+}
+
 #[cfg(not(feature = "age319-private-broker-fixture"))]
 fn certify_native_f_with_source(
     _lane: &mut FreshV30Lane,
@@ -210,6 +234,22 @@ fn private_fixture() -> bool {
             .ok()
             .is_some_and(|map| map.split_ascii_whitespace().nth(2) == Some("1"))
         && std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1").is_some()
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_native_f_drop_reply(stage: &str) {
+    if !private_fixture()
+        || std::env::var("AGE319_PRIVATE_NATIVE_F_DROP_REPLY_V1")
+            .ok()
+            .as_deref()
+            != Some(stage)
+    {
+        return;
+    }
+    if let Ok(gate) = std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1") {
+        let _ = fs::write(Path::new(&gate).join("interactive-f-reply-dropped"), stage);
+    }
+    std::process::exit(82);
 }
 #[cfg(not(feature = "age319-private-broker-fixture"))]
 fn private_fixture() -> bool {
@@ -5414,9 +5454,18 @@ fn serve_fresh_v30_at(
                         FreshRecipientRequest::RecordNativeFTransport {
                             preparation_request_id,
                         } => {
+                            let prepared = lane
+                                .read_native_f_preparation(&preparation_request_id, &recipient)
+                                .map_err(io::Error::other)?
+                                .ok_or_else(|| {
+                                    io::Error::other("native F transport preparation absent")
+                                })?;
+                            verify_native_f_readback(&lane, &prepared).map_err(io::Error::other)?;
                             let transport = lane
                                 .record_native_f_transport(&preparation_request_id, &recipient)
                                 .map_err(io::Error::other)?;
+                            #[cfg(feature = "age319-private-broker-fixture")]
+                            private_native_f_drop_reply("transport");
                             serde_json::json!({"kind":"native_f_transport", "transport":transport})
                         }
                         FreshRecipientRequest::ReadNativeFTransport {
@@ -5425,6 +5474,16 @@ fn serve_fresh_v30_at(
                             let transport = lane
                                 .read_native_f_transport(&preparation_request_id, &recipient)
                                 .map_err(io::Error::other)?;
+                            if transport.is_some() {
+                                let prepared = lane
+                                    .read_native_f_preparation(&preparation_request_id, &recipient)
+                                    .map_err(io::Error::other)?
+                                    .ok_or_else(|| {
+                                        io::Error::other("native F transport preparation absent")
+                                    })?;
+                                verify_native_f_readback(&lane, &prepared)
+                                    .map_err(io::Error::other)?;
+                            }
                             serde_json::json!({"kind":"native_f_transport_readback", "transport":transport})
                         }
                         FreshRecipientRequest::CertifyNativeFReceipt {
@@ -5438,11 +5497,20 @@ fn serve_fresh_v30_at(
                                 &observed,
                             )
                             .map_err(io::Error::other)?;
+                            #[cfg(feature = "age319-private-broker-fixture")]
+                            private_native_f_drop_reply("receipt");
                             serde_json::json!({"kind":"native_f_receipt", "receipt":receipt})
                         }
                         FreshRecipientRequest::ReadNativeFReceipt {
                             preparation_request_id,
                         } => {
+                            #[cfg(feature = "age319-private-broker-fixture")]
+                            verify_native_f_committed_receipt(
+                                &lane,
+                                &preparation_request_id,
+                                &recipient,
+                            )
+                            .map_err(io::Error::other)?;
                             let receipt = lane
                                 .read_native_f_receipt(&preparation_request_id, &recipient)
                                 .map_err(io::Error::other)?;
@@ -5452,6 +5520,13 @@ fn serve_fresh_v30_at(
                             preparation_request_id,
                             delivery_token,
                         } => {
+                            #[cfg(feature = "age319-private-broker-fixture")]
+                            verify_native_f_committed_receipt(
+                                &lane,
+                                &preparation_request_id,
+                                &recipient,
+                            )
+                            .map_err(io::Error::other)?;
                             let grant = lane
                                 .acknowledge_native_f_receipt(
                                     &preparation_request_id,
@@ -5459,7 +5534,24 @@ fn serve_fresh_v30_at(
                                     &recipient,
                                 )
                                 .map_err(io::Error::other)?;
+                            #[cfg(feature = "age319-private-broker-fixture")]
+                            private_native_f_drop_reply("ack");
                             serde_json::json!({"kind":"native_f_auto_ack", "grant":grant})
+                        }
+                        FreshRecipientRequest::ReadNativeFAutoAck {
+                            preparation_request_id,
+                        } => {
+                            #[cfg(feature = "age319-private-broker-fixture")]
+                            verify_native_f_committed_receipt(
+                                &lane,
+                                &preparation_request_id,
+                                &recipient,
+                            )
+                            .map_err(io::Error::other)?;
+                            let ack = lane
+                                .read_native_f_auto_ack(&preparation_request_id, &recipient)
+                                .map_err(io::Error::other)?;
+                            serde_json::json!({"kind":"native_f_auto_ack_readback", "ack":ack})
                         }
                         FreshRecipientRequest::Acknowledge {
                             grant_id,

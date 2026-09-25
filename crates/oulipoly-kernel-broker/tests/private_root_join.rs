@@ -65,6 +65,17 @@ fn assert_old_debt_and_no_f_ack(broker_state: &Path) {
     }
 }
 
+fn assert_old_pending_v29(broker_state: &Path) {
+    let old = rusqlite::Connection::open_with_flags(
+        broker_state.join("sidecar/pid-identity.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    assert_eq!(old.query_row(
+        "SELECT count(*) FROM mailbox WHERE session_id='old-pending' AND handle='old-unacked' AND delivered_at IS NULL",
+        [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+}
+
 fn assert_pending_notify_without_delivery(broker_state: &Path) {
     let fresh = rusqlite::Connection::open_with_flags(
         broker_state.join("v30/sidecar/pid-identity.db"),
@@ -120,6 +131,10 @@ fn inner() {
     let resident_mode = mode.starts_with("normal_model_provider_pty_physical_resident_");
     let resident_bash = mode.starts_with("normal_model_provider_pty_physical_resident_bash_");
     let physical_f = mode.contains("_f_fenced_physical");
+    let native_crash = mode
+        .strip_prefix("normal_model_provider_pty_physical_resident_bash_f_fenced_physical_crash_");
+    let native_lost_reply = mode
+        .strip_prefix("normal_model_provider_pty_physical_resident_bash_f_fenced_physical_lost_");
     let resident_notify = resident_bash
         && (mode.ends_with("_notify")
             || mode.contains("_f_fenced")
@@ -181,6 +196,18 @@ fn inner() {
             | "normal_model_provider_pty_physical_resident_bash_f_fenced_physical"
             | "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_restart"
             | "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_partial"
+            | "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_crash_after_fence"
+            | "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_crash_after_partial"
+            | "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_crash_after_write"
+            | "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_crash_after_turn"
+            | "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_crash_after_receipt"
+            | "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_crash_after_turn_changed_native"
+            | "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_crash_after_turn_changed_session"
+            | "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_crash_after_receipt_changed_native"
+            | "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_crash_after_write_changed_control"
+            | "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_lost_transport"
+            | "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_lost_receipt"
+            | "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_lost_ack"
             | "normal_model_provider_pty_physical_resident_bash_f_fenced_adapter_unsupported"
             | "normal_model_provider_pty_physical_resident_bash_response"
             | "normal_model_provider_pty_physical_resident_bash_wrong_image"
@@ -610,6 +637,7 @@ fn inner() {
                 .map(|path| ("OULIPOLY_KERNEL_BROKER_FIXTURE_BASH_V1", path)),
         )
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+        .envs(native_lost_reply.map(|stage| ("AGE319_PRIVATE_NATIVE_F_DROP_REPLY_V1", stage)))
         .envs(
             (mode == "normal_model_provider_bash_causal_success")
                 .then_some(("AGE319_PRIVATE_BASH_SOURCE_SUCCESS_V1", "1")),
@@ -719,8 +747,14 @@ fn inner() {
                     .then_some(("AGE319_PRIVATE_ROOT_PTY_NATIVE_F_FENCE_V1", "1")),
             )
             .envs(physical_f.then_some(("AGE319_PRIVATE_ROOT_PTY_NATIVE_F_PHYSICAL_V1", "1")))
+            .envs(native_crash.map(|stage| {
+                (
+                    "AGE319_PRIVATE_NATIVE_F_FAULT_V1",
+                    stage.split("_changed_").next().unwrap(),
+                )
+            }))
             .envs(
-                mode.ends_with("_physical_partial")
+                (mode.ends_with("_physical_partial") || native_crash == Some("after_partial"))
                     .then_some(("AGE319_PRIVATE_NATIVE_F_PARTIAL_WRITE_V1", "1")),
             )
             .envs(
@@ -2127,6 +2161,18 @@ fn inner() {
                     | "normal_model_provider_pty_physical_resident_bash_f_fenced_physical"
                     | "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_restart"
                     | "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_partial"
+                    | "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_crash_after_fence"
+                    | "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_crash_after_partial"
+                    | "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_crash_after_write"
+                    | "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_crash_after_turn"
+                    | "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_crash_after_receipt"
+                    | "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_crash_after_turn_changed_native"
+                    | "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_crash_after_turn_changed_session"
+                    | "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_crash_after_receipt_changed_native"
+                    | "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_crash_after_write_changed_control"
+                    | "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_lost_transport"
+                    | "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_lost_receipt"
+                    | "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_lost_ack"
                     | "normal_model_provider_pty_physical_resident_bash_f_fenced_adapter_unsupported"
                     | "normal_model_provider_pty_physical_resident_bash_response"
                     | "normal_model_provider_pty_physical_resident_bash_wrong_image"
@@ -2463,6 +2509,10 @@ fn inner() {
                         )
                     }))
                     .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+                    .envs(
+                        native_lost_reply
+                            .map(|stage| ("AGE319_PRIVATE_NATIVE_F_DROP_REPLY_V1", stage)),
+                    )
                     .envs(mode.contains("resident_bash_after_append").then_some((
                         "OULIPOLY_KERNEL_BROKER_FIXTURE_INTERACTIVE_AFTER_APPEND_V1",
                         "1",
@@ -3532,6 +3582,180 @@ fn inner() {
                             }
                         }
                         fs::write(gate.join("interactive-resident-continue"), b"continue").unwrap();
+                        if native_crash.is_some() || native_lost_reply.is_some() {
+                            if let Some(stage) = native_crash {
+                                eventually(|| {
+                                    gate.join("interactive-f-crash-ready").exists()
+                                        || entry.try_wait().unwrap().is_some()
+                                });
+                                assert_eq!(
+                                    fs::read_to_string(gate.join("interactive-f-crash-ready"))
+                                        .unwrap(),
+                                    stage.split("_changed_").next().unwrap()
+                                );
+                                assert!(
+                                    entry.try_wait().unwrap().is_none(),
+                                    "original root died before F crash"
+                                );
+                                stop(&mut broker);
+                                if stage.ends_with("_changed_native") {
+                                    let mut native: serde_json::Value =
+                                        serde_json::from_slice(&fs::read(&native_store).unwrap())
+                                            .unwrap();
+                                    native["turns"][0]["body"] =
+                                        serde_json::json!("changed-native-body");
+                                    fs::write(&native_store, serde_json::to_vec(&native).unwrap())
+                                        .unwrap();
+                                }
+                                if stage.ends_with("_changed_session") {
+                                    let mut native: serde_json::Value =
+                                        serde_json::from_slice(&fs::read(&native_store).unwrap())
+                                            .unwrap();
+                                    native["session_id"] =
+                                        serde_json::json!(uuid::Uuid::new_v4().to_string());
+                                    fs::write(&native_store, serde_json::to_vec(&native).unwrap())
+                                        .unwrap();
+                                }
+                                if stage.ends_with("_changed_control") {
+                                    let fenced: serde_json::Value = serde_json::from_slice(
+                                        &fs::read(gate.join("interactive-f-fenced.json")).unwrap(),
+                                    )
+                                    .unwrap();
+                                    let path = std::path::PathBuf::from(
+                                        fenced["preparation"]["pty_control_path"].as_str().unwrap(),
+                                    );
+                                    fs::rename(&path, path.with_extension("removed-sock")).unwrap();
+                                }
+                            } else {
+                                eventually(|| {
+                                    gate.join("interactive-f-reply-dropped").exists()
+                                        && broker.try_wait().unwrap().is_some()
+                                });
+                                assert_eq!(
+                                    fs::read_to_string(gate.join("interactive-f-reply-dropped"))
+                                        .unwrap(),
+                                    native_lost_reply.unwrap()
+                                );
+                                assert!(
+                                    entry.try_wait().unwrap().is_none(),
+                                    "original root died before F readback"
+                                );
+                            }
+                            let side = rusqlite::Connection::open(
+                                broker_state.join("v30/sidecar/pid-identity.db"),
+                            )
+                            .unwrap();
+                            let counts = [
+                                "fresh_native_f_submission",
+                                "fresh_native_f_transport",
+                                "fresh_native_f_receipt",
+                                "fresh_native_f_auto_ack",
+                            ]
+                            .map(|table| {
+                                side.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| {
+                                    r.get::<_, i64>(0)
+                                })
+                                .unwrap()
+                            });
+                            assert_eq!(counts[0], 1, "one-use fence missing at crash");
+                            if let Some(stage) = native_crash {
+                                assert_eq!(
+                                    counts[1],
+                                    i64::from(
+                                        !(stage == "after_fence"
+                                            || stage == "after_partial"
+                                            || stage.starts_with("after_write"))
+                                    )
+                                );
+                                assert_eq!(
+                                    counts[2],
+                                    i64::from(stage.starts_with("after_receipt"))
+                                );
+                                assert_eq!(counts[3], 0);
+                            } else {
+                                let stage = native_lost_reply.unwrap();
+                                assert_eq!(counts[1], 1);
+                                assert_eq!(counts[2], i64::from(stage != "transport"));
+                                assert_eq!(counts[3], i64::from(stage == "ack"));
+                            }
+                            broker = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
+                                .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                                .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
+                                .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
+                                .env(
+                                    "OULIPOLY_KERNEL_BROKER_FIXTURE_BASH_V1",
+                                    bash.as_ref().unwrap(),
+                                )
+                                .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+                                .stderr(Stdio::from(
+                                    File::create(temp.path().join("native-f-restart.log")).unwrap(),
+                                ))
+                                .spawn()
+                                .unwrap();
+                            eventually(|| {
+                                protocol::request_at(&socket, Operation::Classify).is_ok()
+                            });
+                            if native_crash.is_some() {
+                                fs::write(gate.join("interactive-f-crash-continue"), b"continue")
+                                    .unwrap();
+                            }
+                        }
+                        if matches!(
+                            native_crash,
+                            Some(
+                                "after_fence"
+                                    | "after_partial"
+                                    | "after_turn_changed_native"
+                                    | "after_turn_changed_session"
+                                    | "after_receipt_changed_native"
+                                    | "after_write_changed_control"
+                            )
+                        ) {
+                            let until = Instant::now() + Duration::from_secs(25);
+                            while entry.try_wait().unwrap().is_none() && Instant::now() < until {
+                                std::thread::sleep(Duration::from_millis(20));
+                            }
+                            assert!(
+                                entry.try_wait().unwrap().is_some(),
+                                "F refusal did not settle in bound"
+                            );
+                            assert!(!entry.wait().unwrap().success());
+                            let failure = fs::read_to_string(&err).unwrap_or_default();
+                            assert!(
+                                failure.contains("pending") || failure.contains("no replay"),
+                                "{failure}"
+                            );
+                            let side = rusqlite::Connection::open(
+                                broker_state.join("v30/sidecar/pid-identity.db"),
+                            )
+                            .unwrap();
+                            assert_eq!(
+                                side.query_row(
+                                    "SELECT count(*) FROM mailbox WHERE delivered_at IS NULL",
+                                    [],
+                                    |r| r.get::<_, i64>(0)
+                                )
+                                .unwrap(),
+                                1
+                            );
+                            assert_eq!(
+                                side.query_row(
+                                    "SELECT count(*) FROM fresh_native_f_auto_ack",
+                                    [],
+                                    |r| r.get::<_, i64>(0)
+                                )
+                                .unwrap(),
+                                0
+                            );
+                            assert!(
+                                !provider_dir
+                                    .join(format!("{}.interactive-q.json", receipt.handoff_id))
+                                    .exists()
+                            );
+                            assert_old_pending_v29(&broker_state);
+                            stop(&mut broker);
+                            return;
+                        }
                         if mode.ends_with("_physical_partial") {
                             let until = Instant::now() + Duration::from_secs(20);
                             while entry.try_wait().unwrap().is_none() && Instant::now() < until {
@@ -3924,6 +4148,7 @@ fn inner() {
                                     envelope.replace('\n', "\r\n")
                                 );
                                 assert_eq!(transcript, exact.as_bytes());
+                                assert_old_pending_v29(&broker_state);
                             } else {
                                 assert_eq!(native_after_q["turns"], serde_json::json!([]));
                             }
@@ -6970,6 +7195,18 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_model_provider_pty_physical_resident_bash_f_fenced_physical",
         "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_restart",
         "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_partial",
+        "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_crash_after_fence",
+        "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_crash_after_partial",
+        "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_crash_after_write",
+        "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_crash_after_turn",
+        "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_crash_after_receipt",
+        "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_crash_after_turn_changed_native",
+        "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_crash_after_turn_changed_session",
+        "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_crash_after_receipt_changed_native",
+        "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_crash_after_write_changed_control",
+        "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_lost_transport",
+        "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_lost_receipt",
+        "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_lost_ack",
         "normal_model_provider_pty_physical_resident_bash_f_fenced_adapter_unsupported",
         "normal_model_provider_pty_physical_resident_bash_response",
         "normal_model_provider_pty_physical_resident_bash_wrong_image",
