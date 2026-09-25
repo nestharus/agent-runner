@@ -103,6 +103,7 @@ fn check_terminal(
     decision: &RouteDecision,
     candidate: &RouteCandidate,
     grant: &Grant,
+    allow_uncertain_q: bool,
 ) -> io::Result<Option<(TerminalOutcome, i64)>> {
     let q_name = format!("{}.drain.json", grant.id);
     if !root.join(&q_name).exists() {
@@ -116,12 +117,23 @@ fn check_terminal(
         ..
     } = observe(root, &grant.id)?
     else {
-        return Err(invalid(
-            "offline provider Q lacks independent physical certification",
-        ));
+        return if allow_uncertain_q {
+            Ok(None)
+        } else {
+            Err(invalid(
+                "offline provider Q lacks independent physical certification",
+            ))
+        };
     };
-    let terminal: TerminalRecord = exact_file(root, &format!("{}.terminal.json", grant.id))?
-        .ok_or_else(|| invalid("offline provider Q terminal record absent"))?;
+    let Some(terminal): Option<TerminalRecord> =
+        exact_file(root, &format!("{}.terminal.json", grant.id))?
+    else {
+        return if allow_uncertain_q {
+            Ok(None)
+        } else {
+            Err(invalid("offline provider Q terminal record absent"))
+        };
+    };
     let q_sha = sha_file(&File::open(root.join(&q_name))?)?.0;
     let q_time = file_unix_nanos(&root.join(q_name))?;
     let mut stdout_bytes = Vec::new();
@@ -159,6 +171,18 @@ fn check_terminal(
 }
 
 pub(crate) fn offline_snapshot(root: &Path, source: &Path) -> io::Result<OfflineSnapshot> {
+    offline_snapshot_inner(root, source, false)
+}
+
+pub(crate) fn offline_snapshot_v3(root: &Path, source: &Path) -> io::Result<OfflineSnapshot> {
+    offline_snapshot_inner(root, source, true)
+}
+
+fn offline_snapshot_inner(
+    root: &Path,
+    source: &Path,
+    allow_uncertain_q: bool,
+) -> io::Result<OfflineSnapshot> {
     let mut snapshot = OfflineSnapshot::default();
     let mut decisions = HashSet::new();
     let mut grants = HashSet::new();
@@ -308,7 +332,8 @@ pub(crate) fn offline_snapshot(root: &Path, source: &Path) -> io::Result<Offline
             }
             if k.is_some() {
                 a.observed_invocations += 1;
-                if let Some((outcome, time)) = check_terminal(root, &decision, &candidate, &grant)?
+                if let Some((outcome, time)) =
+                    check_terminal(root, &decision, &candidate, &grant, allow_uncertain_q)?
                 {
                     terminals.insert(grant.id.clone());
                     a.grants.get_mut(&grant.id).unwrap().certified_q = Some(PhysicalQ {
@@ -392,8 +417,78 @@ pub(crate) fn offline_snapshot(root: &Path, source: &Path) -> io::Result<Offline
         }
     }
     collect_effects(root, source, &mut snapshot)?;
-    super::super::manual_quota::offline_collect(root, source, &mut snapshot)?;
+    if allow_uncertain_q {
+        super::super::manual_quota::offline_collect_mode(root, source, &mut snapshot, true)?;
+    } else {
+        super::super::manual_quota::offline_collect(root, source, &mut snapshot)?;
+    }
     Ok(snapshot)
+}
+
+/// Complete the read-only v3 projection from independently observed physical
+/// effect Q and the retained typed result. An absent or uncertain result stays
+/// debt; no result file is materialized by a rebuild.
+pub(crate) fn complete_v3_effects(root: &Path, snapshot: &mut OfflineSnapshot) -> io::Result<()> {
+    for (physical_key, account) in &mut snapshot.accounts {
+        for (id, indexed) in &mut account.effects {
+            if indexed.kind == EffectKind::ManualQuota || indexed.reuse.is_some() {
+                continue;
+            }
+            let relative = Path::new(&indexed.intent.path);
+            let dir = root.join(
+                relative
+                    .parent()
+                    .ok_or_else(|| invalid("v3 effect path invalid"))?,
+            );
+            let intent = effect_intent(&dir)?.ok_or_else(|| invalid("v3 effect intent absent"))?;
+            if intent.id != *id {
+                return Err(invalid("v3 effect identity changed"));
+            }
+            let candidate = effect_candidate(root, &intent.binding, &intent.request)?;
+            if candidate.account_identity != *physical_key {
+                return Err(invalid("v3 effect physical account changed"));
+            }
+            let grant = exact_file::<Grant>(
+                &dir,
+                &format!("{}.fresh-grant.json", intent.binding.handoff_id),
+            )?;
+            let Some(grant) = grant else {
+                if indexed.consumed_k.is_some() {
+                    return Err(invalid("v3 effect K without grant"));
+                }
+                continue;
+            };
+            let q_name = format!("{}.drain.json", grant.id);
+            if !dir.join(&q_name).exists() {
+                continue;
+            }
+            let Some(k) = indexed.consumed_k.clone() else {
+                return Err(invalid("v3 effect Q without K"));
+            };
+            let readback = effect_readback_from_dir_mode(&dir, &intent, false)?;
+            if readback.state != "drained" {
+                // A filename without independent physical readback remains debt.
+                continue;
+            }
+            let q_path = dir.join(&q_name);
+            indexed.certified_q = Some(PhysicalQ {
+                physical_k: k,
+                q: artifact(root, q_path.strip_prefix(root).map_err(io::Error::other)?)?,
+                terminal: None,
+                completed_unix_nanos: i64::try_from(file_unix_nanos(&q_path)?)
+                    .map_err(io::Error::other)?,
+            });
+            if dir.join("result.json").exists() {
+                indexed.result = Some(artifact(
+                    root,
+                    dir.join("result.json")
+                        .strip_prefix(root)
+                        .map_err(io::Error::other)?,
+                )?);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn collect_effects(root: &Path, source: &Path, snapshot: &mut OfflineSnapshot) -> io::Result<()> {
@@ -561,7 +656,7 @@ pub(crate) fn reconcile_offline_account(
             return Err(invalid("reconcile provider K changed"));
         }
         let Some((outcome, completed_unix_nanos)) =
-            check_terminal(root, &decision, &candidate, &grant)?
+            check_terminal(root, &decision, &candidate, &grant, false)?
         else {
             continue;
         };
@@ -690,7 +785,10 @@ pub(crate) fn reconcile_offline_account(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::linux_main::fresh_index::{Index, broker_admission_lease};
+    use crate::linux_main::fresh_index::{
+        Index, KeyedGeneration, broker_admission_lease, rebuild_keyed_offline,
+        rebuild_keyed_offline_test_hook,
+    };
     use oulipoly_kernel_broker::protocol::ManualQuotaRequest;
 
     fn other_process_can_freeze(path: &Path) -> bool {
@@ -1066,6 +1164,216 @@ mod tests {
             Index::open(&fixture.root).unwrap().generation(),
             next.generation()
         );
+    }
+
+    #[test]
+    fn v3_empty_genesis_and_pre_k_debt_are_private_and_idempotent() {
+        let fixture = Fixture::new();
+        fixture.prepared();
+        let wal = fixture.temp.path().join("state.db-wal");
+        std::fs::write(&wal, b"old WAL stays byte exact").unwrap();
+        fixture.ready();
+        rebuild_keyed_offline(&fixture.root, &fixture.socket, &fixture.source).unwrap();
+        let first = KeyedGeneration::open(&fixture.root).unwrap();
+        let account = first.account("physical-first").unwrap();
+        let (revision, pending, source) = account.compact_source("absent").unwrap();
+        assert!(revision > 0);
+        assert_eq!(pending, 1);
+        assert!(source.is_none());
+        assert!(account.get("grant", &fixture.grant.id).unwrap().is_some());
+        assert!(
+            account
+                .get("pending", &format!("grant:{}", fixture.grant.id))
+                .unwrap()
+                .is_some()
+        );
+        assert!(Index::open(&fixture.root).is_err());
+        assert_eq!(std::fs::read(&wal).unwrap(), b"old WAL stays byte exact");
+        rebuild_keyed_offline(&fixture.root, &fixture.socket, &fixture.source).unwrap();
+        let second = KeyedGeneration::open(&fixture.root).unwrap();
+        assert_ne!(first.generation, second.generation);
+        assert_eq!(
+            second
+                .account("physical-first")
+                .unwrap()
+                .summary()
+                .unwrap()
+                .1,
+            1
+        );
+        assert_eq!(std::fs::read(&wal).unwrap(), b"old WAL stays byte exact");
+        std::fs::remove_dir_all(
+            fixture
+                .root
+                .join("index-v1/generations")
+                .join(&second.generation)
+                .join("keyed-accounts")
+                .join(sha_text(&"physical-first").unwrap()),
+        )
+        .unwrap();
+        assert!(KeyedGeneration::open(&fixture.root).is_err());
+    }
+
+    #[test]
+    fn v3_pre_manifest_failure_keeps_v2_and_source_damage_refuses() {
+        let fixture = Fixture::new();
+        fixture.prepared();
+        fixture.ready();
+        let v2 = fixture.rebuild().unwrap();
+        let prior = v2.generation().to_owned();
+        assert!(
+            rebuild_keyed_offline_test_hook(
+                &fixture.root,
+                &fixture.socket,
+                &fixture.source,
+                || Err(crate::linux_main::fresh_index::IndexError::Conflict(
+                    "simulated manifest crash"
+                )),
+            )
+            .is_err()
+        );
+        assert_eq!(Index::open(&fixture.root).unwrap().generation(), prior);
+        std::fs::write(fixture.source.join("models/work.toml"), b"broken").unwrap();
+        assert!(rebuild_keyed_offline(&fixture.root, &fixture.socket, &fixture.source).is_err());
+        assert_eq!(Index::open(&fixture.root).unwrap().generation(), prior);
+    }
+
+    #[test]
+    fn v3_imports_typed_quota_auth_and_manual_physical_q() {
+        let fixture = Fixture::new();
+        fixture.prepared();
+        for (id, kind, output_bytes) in [
+            (
+                "quota",
+                FreshAccountEffectKind::QuotaFirst,
+                b"{\"used_percent\":20,\"resets_at\":\"2099-01-01T00:00:00Z\"}".as_slice(),
+            ),
+            ("auth", FreshAccountEffectKind::AuthRefresh, b"".as_slice()),
+        ] {
+            let request = FreshAccountEffectRequest {
+                d_key: uuid::Uuid::new_v4().to_string(),
+                model: "work".into(),
+                config_sha256: fixture.candidate.config_sha256.clone(),
+                account: "first".into(),
+                index: 0,
+                kind,
+                environment: vec![],
+            };
+            let dir = effect_directory(&fixture.root, &fixture.binding, &request);
+            std::fs::create_dir_all(&dir).unwrap();
+            let grant = Grant {
+                version: 1,
+                id: uuid::Uuid::new_v4().to_string(),
+                binding: fixture.binding.clone(),
+                plan_sha256: "b".repeat(64),
+            };
+            let intent = AccountEffectIntent {
+                version: 1,
+                id: id.into(),
+                binding: fixture.binding.clone(),
+                request: request.clone(),
+                environment_sha256: environment_digest(&request).unwrap(),
+                plan_sha256: grant.plan_sha256.clone(),
+                auth_source: None,
+            };
+            durable_new(&dir, "intent.json", &intent).unwrap();
+            durable_new(
+                &dir,
+                &format!("{}.fresh-grant.json", fixture.binding.handoff_id),
+                &grant,
+            )
+            .unwrap();
+            durable_new(&dir, &format!("{}.consumed.json", grant.id), &grant).unwrap();
+            Fixture::effect_q(&dir, &grant, output_bytes);
+            effect_readback_from_dir(&dir, &intent).unwrap();
+        }
+        let operation_id = uuid::Uuid::new_v4().to_string();
+        let manual = ManualQuotaRequest {
+            operation_id: operation_id.clone(),
+            model: "work".into(),
+            account: "first".into(),
+            config_sha256: fixture.candidate.config_sha256.clone(),
+            environment: vec![],
+        };
+        crate::linux_main::manual_quota::begin(
+            &fixture.root,
+            &File::open(&fixture.source).unwrap(),
+            &manual,
+            unsafe { libc::geteuid() },
+            unsafe { libc::getegid() },
+        )
+        .unwrap();
+        crate::linux_main::manual_quota::worker_with_environment(
+            &fixture.root.join("manual-quota").join(&operation_id),
+            &[],
+        )
+        .unwrap();
+        fixture.ready();
+        rebuild_keyed_offline(&fixture.root, &fixture.socket, &fixture.source).unwrap();
+        let generation = KeyedGeneration::open(&fixture.root).unwrap();
+        let account = generation.account("physical-first").unwrap();
+        assert!(account.get("effect", "quota").unwrap().is_some());
+        assert!(account.get("effect", "auth").unwrap().is_some());
+        assert!(account.get("manual", &operation_id).unwrap().is_some());
+        let snapshot = offline_snapshot(&fixture.root, &fixture.source).unwrap();
+        let source_key = &snapshot.accounts["physical-first"].effects["quota"].source;
+        let source = account
+            .get("source", &sha_text(source_key).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(source["quota"]["outcome"], "valid_windows");
+        assert_eq!(source["auth"]["outcome"], "refreshed");
+        assert_eq!(source["quota"]["windows"].as_array().unwrap().len(), 1);
+        assert_eq!(account.summary().unwrap().1, 1); // prepared provider grant
+    }
+
+    #[test]
+    fn v3_uncertain_provider_q_remains_keyed_debt() {
+        let fixture = Fixture::new();
+        fixture.consumed();
+        fixture.certified_q(b"done");
+        std::fs::remove_file(
+            fixture
+                .root
+                .join(format!("{}.terminal.json", fixture.grant.id)),
+        )
+        .unwrap();
+        fixture.ready();
+        rebuild_keyed_offline(&fixture.root, &fixture.socket, &fixture.source).unwrap();
+        let account = KeyedGeneration::open(&fixture.root)
+            .unwrap()
+            .account("physical-first")
+            .unwrap();
+        assert_eq!(account.summary().unwrap().1, 1);
+        assert!(
+            account
+                .get("pending", &format!("grant:{}", fixture.grant.id))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            account
+                .get("uncertain-q", &format!("grant:{}", fixture.grant.id))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn v3_refuses_missing_v2_announcement_without_replacing_manifest() {
+        let fixture = Fixture::new();
+        fixture.prepared();
+        fixture.ready();
+        let v2 = fixture.rebuild().unwrap();
+        let prior = v2.generation().to_owned();
+        std::fs::remove_file(
+            fixture
+                .root
+                .join(format!("{}.fresh-grant.json", fixture.binding.handoff_id)),
+        )
+        .unwrap();
+        assert!(rebuild_keyed_offline(&fixture.root, &fixture.socket, &fixture.source).is_err());
+        assert_eq!(Index::open(&fixture.root).unwrap().generation(), prior);
     }
 
     #[test]

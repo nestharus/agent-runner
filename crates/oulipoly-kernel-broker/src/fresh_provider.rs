@@ -34,6 +34,20 @@ use std::time::{Duration, Instant};
 
 #[path = "fresh_rebuild.rs"]
 mod fresh_rebuild;
+
+pub(super) fn complete_v3_effects(
+    root: &Path,
+    snapshot: &mut super::fresh_index::OfflineSnapshot,
+) -> io::Result<()> {
+    fresh_rebuild::complete_v3_effects(root, snapshot)
+}
+
+pub(super) fn offline_snapshot_v3(
+    root: &Path,
+    source: &Path,
+) -> io::Result<super::fresh_index::OfflineSnapshot> {
+    fresh_rebuild::offline_snapshot_v3(root, source)
+}
 pub(super) use fresh_rebuild::{offline_snapshot, reconcile_offline_account};
 
 static CANCEL: AtomicBool = AtomicBool::new(false);

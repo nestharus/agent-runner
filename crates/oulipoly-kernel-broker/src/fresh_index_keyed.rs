@@ -198,7 +198,7 @@ pub(super) struct Change {
     pub value: Option<Value>,
 }
 #[derive(Clone, Debug)]
-pub(super) struct KeyedAccountStore {
+pub(crate) struct KeyedAccountStore {
     path: PathBuf,
     generation: String,
     account: String,
@@ -396,12 +396,12 @@ impl KeyedAccountStore {
         sync_dir(&self.path)?;
         Ok(root)
     }
-    pub(super) fn summary(&self) -> Result<(u64, u64)> {
+    pub(crate) fn summary(&self) -> Result<(u64, u64)> {
         let _lock = self.lock()?;
         let root = self.recover()?;
         Ok((root.revision, root.pending_count))
     }
-    pub(super) fn get(&self, class: &str, key: &str) -> Result<Option<Value>> {
+    pub(crate) fn get(&self, class: &str, key: &str) -> Result<Option<Value>> {
         let _lock = self.lock()?;
         let root = self.recover()?;
         self.get_unlocked(class, key, &root)
@@ -420,7 +420,7 @@ impl KeyedAccountStore {
     }
     /// One account-locked compact read for a named physical source. The debt
     /// summary and source record share the same committed root revision.
-    pub(super) fn compact_source(&self, source: &str) -> Result<(u64, u64, Option<Value>)> {
+    pub(crate) fn compact_source(&self, source: &str) -> Result<(u64, u64, Option<Value>)> {
         let _lock = self.lock()?;
         let root = self.recover()?;
         let value = self.get_unlocked("source", source, &root)?;
@@ -493,6 +493,9 @@ impl KeyedAccountStore {
                 &object,
                 false,
             )?;
+            if stop == Some(CrashPoint::AfterObject) {
+                return Err(IndexError::Conflict("simulated crash after keyed object"));
+            }
             pointers.push(PointerChange {
                 class: change.class,
                 key: change.key,
@@ -532,7 +535,7 @@ impl KeyedAccountStore {
             },
             false,
         )?;
-        if stop == Some(CrashPoint::BeforeRoot) {
+        if stop == Some(CrashPoint::BeforeRoot) || stop == Some(CrashPoint::AfterIntent) {
             return Err(IndexError::Conflict("simulated crash before keyed root"));
         }
         write(&self.path.join("root.json"), &after, true)?;
@@ -545,6 +548,8 @@ impl KeyedAccountStore {
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CrashPoint {
+    AfterObject,
+    AfterIntent,
     BeforeRoot,
     AfterRoot,
 }
@@ -558,6 +563,27 @@ mod tests {
             class: class.into(),
             key: key.into(),
             value: Some(Value::String(value.into())),
+        }
+    }
+    #[test]
+    fn keyed_object_and_intent_crashes_do_not_publish_pending_debt() {
+        for point in [CrashPoint::AfterObject, CrashPoint::AfterIntent] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("account");
+            let store = KeyedAccountStore::create(&path, "generation", "physical").unwrap();
+            assert!(
+                store
+                    .commit_inner(0, vec![change("pending", "abandoned", "K?")], Some(point))
+                    .is_err()
+            );
+            let reopened = KeyedAccountStore::open(&path, "generation", "physical").unwrap();
+            assert_eq!(reopened.summary().unwrap(), (0, 0));
+            assert!(reopened.get("pending", "abandoned").unwrap().is_none());
+            reopened
+                .commit(0, vec![change("pending", "committed", "K?")])
+                .unwrap();
+            assert_eq!(reopened.summary().unwrap(), (1, 1));
+            assert!(reopened.get("pending", "abandoned").unwrap().is_none());
         }
     }
     #[test]

@@ -772,6 +772,15 @@ pub(super) fn offline_collect(
     source: &Path,
     snapshot: &mut super::fresh_index::OfflineSnapshot,
 ) -> io::Result<()> {
+    offline_collect_mode(directory, source, snapshot, false)
+}
+
+pub(super) fn offline_collect_mode(
+    directory: &Path,
+    source: &Path,
+    snapshot: &mut super::fresh_index::OfflineSnapshot,
+    allow_uncertain_q: bool,
+) -> io::Result<()> {
     use super::fresh_index::{
         Account, Artifact, EffectIntent, EffectKind, MarkerTimes, PhysicalQ as IndexPhysicalQ,
         SourceKey,
@@ -858,7 +867,9 @@ pub(super) fn offline_collect(
             }
         }
         let result = readback_intent(directory, &intent)?;
-        if dir.join("q.json").exists() && (k.is_none() || result.state != "drained") {
+        if dir.join("q.json").exists()
+            && (k.is_none() || (!allow_uncertain_q && result.state != "drained"))
+        {
             return Err(io::Error::other(
                 "offline manual Q lacks certified K/readback",
             ));

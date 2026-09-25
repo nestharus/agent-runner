@@ -4880,7 +4880,10 @@ pub fn run() {
                 .map_err(io::Error::other)
         }
         #[cfg(feature = "age319-private-broker-fixture")]
-        [_, mode, source] if mode == "--offline-rebuild-fresh-index" => {
+        [_, mode, source]
+            if mode == "--offline-rebuild-fresh-index"
+                || mode == "--offline-rebuild-fresh-index-v3" =>
+        {
             let state = if private_fixture() {
                 std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1")
                     .ok_or_else(|| io::Error::other("offline fixture state absent"))
@@ -4897,12 +4900,20 @@ pub fn run() {
             };
             state.and_then(|state| {
                 socket.and_then(|socket| {
-                    fresh_index::Index::rebuild_offline(
-                        &state.join("v30/fresh-provider"),
-                        &socket,
-                        Path::new(source),
-                    )
-                    .map(|_| ())
+                    if mode == "--offline-rebuild-fresh-index-v3" {
+                        fresh_index::rebuild_keyed_offline(
+                            &state.join("v30/fresh-provider"),
+                            &socket,
+                            Path::new(source),
+                        )
+                    } else {
+                        fresh_index::Index::rebuild_offline(
+                            &state.join("v30/fresh-provider"),
+                            &socket,
+                            Path::new(source),
+                        )
+                        .map(|_| ())
+                    }
                     .map_err(io::Error::other)
                 })
             })

@@ -30,6 +30,25 @@ use std::sync::{Mutex, OnceLock};
 #[path = "fresh_index_keyed.rs"]
 #[allow(dead_code)]
 mod keyed_store;
+#[path = "fresh_index_v3.rs"]
+#[allow(dead_code)]
+mod v3;
+#[cfg(test)]
+pub(super) use v3::KeyedGeneration;
+
+pub(super) fn rebuild_keyed_offline(root: &Path, socket: &Path, source: &Path) -> Result<()> {
+    v3::rebuild(root, socket, source).map(|_| ())
+}
+
+#[cfg(test)]
+pub(super) fn rebuild_keyed_offline_test_hook(
+    root: &Path,
+    socket: &Path,
+    source: &Path,
+    before_manifest: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    v3::rebuild_test_hook(root, socket, source, before_manifest).map(|_| ())
+}
 
 // v1 account records have no atomic compact head. They must be rebuilt offline.
 const VERSION: u32 = 2;
@@ -1648,6 +1667,12 @@ pub(super) struct Account {
 }
 impl AccountHead {
     fn from_account(root: &Path, account: &Account) -> Result<Self> {
+        Self::build_from_account(root, account, true)
+    }
+    fn from_account_unbounded(root: &Path, account: &Account) -> Result<Self> {
+        Self::build_from_account(root, account, false)
+    }
+    fn build_from_account(root: &Path, account: &Account, bounded: bool) -> Result<Self> {
         let mut head = Self {
             generation: account.generation.clone(),
             physical_key: account.physical_key.clone(),
@@ -1803,6 +1828,11 @@ impl AccountHead {
             };
             match target {
                 Some(old)
+                    if !bounded
+                        && old.q.completed_unix_nanos == q.completed_unix_nanos
+                        && old.outcome == "unknown"
+                        && old.windows.is_empty() => {}
+                Some(old)
                     if old.q.completed_unix_nanos == q.completed_unix_nanos && old.q != *q =>
                 {
                     old.outcome = "unknown".into();
@@ -1831,9 +1861,10 @@ impl AccountHead {
         {
             head.unknown_marker_scope = true;
         }
-        if head.pending.len() > MAX_HEAD_PENDING
-            || head.sources.len() > MAX_HEAD_SOURCES
-            || head.model_capacity.len() > MAX_HEAD_SOURCES
+        if bounded
+            && (head.pending.len() > MAX_HEAD_PENDING
+                || head.sources.len() > MAX_HEAD_SOURCES
+                || head.model_capacity.len() > MAX_HEAD_SOURCES)
         {
             return Err(IndexError::Conflict(
                 "compact account head cardinality exceeded",
@@ -1842,13 +1873,20 @@ impl AccountHead {
         Ok(head)
     }
     fn validate_current(&self, root: &Path, generation: &str, key: &str) -> Result<()> {
+        self.validate(root, generation, key, true)
+    }
+    fn validate_unbounded(&self, root: &Path, generation: &str, key: &str) -> Result<()> {
+        self.validate(root, generation, key, false)
+    }
+    fn validate(&self, root: &Path, generation: &str, key: &str, bounded: bool) -> Result<()> {
         if !self.committed
             || self.generation != generation
             || self.physical_key != key
             || self.revision == 0
-            || self.pending.len() > MAX_HEAD_PENDING
-            || self.sources.len() > MAX_HEAD_SOURCES
-            || self.model_capacity.len() > MAX_HEAD_SOURCES
+            || (bounded
+                && (self.pending.len() > MAX_HEAD_PENDING
+                    || self.sources.len() > MAX_HEAD_SOURCES
+                    || self.model_capacity.len() > MAX_HEAD_SOURCES))
         {
             return Err(IndexError::RebuildRequired(
                 "compact account head incomplete",

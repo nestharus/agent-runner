@@ -4,6 +4,7 @@ The feature-gated broker exposes detached maintenance commands:
 
 ```text
 oulipoly-kernel-broker --offline-rebuild-fresh-index <retained-config-directory>
+oulipoly-kernel-broker --offline-rebuild-fresh-index-v3 <retained-config-directory>
 oulipoly-kernel-broker --offline-reconcile-fresh-index <retained-config-directory> <physical-account-id>
 ```
 
@@ -45,3 +46,31 @@ missing registered source inodes, missing terminal records for already visible
 provider Q, and unverifiable original environment bytes are not migrated.
 The live selector and provider/effect index writers are still closed, so this
 index is not authority for live eligibility or a general pre-index migration.
+
+## Non-activating keyed v3 rebuild
+
+The separate `--offline-rebuild-fresh-index-v3` mode uses the same exclusive
+admission freeze and retained-source checks. It cross-checks an existing v2
+route/account index against retained announcements, then stages route decisions
+and cursors plus per-physical-account hashed keyed grant, effect, manual,
+pending, typed source Q, and marker records. Provider Q without a terminal
+certificate and effect Q without a verified result remain keyed pending debt;
+their observed Q artifact is recorded separately as uncertain Q. The newest
+quota and auth Q per exact command/environment source includes failed, empty,
+invalid, and all valid windows. Equal-time conflicting Q remains unknown.
+Typed provider failures are keyed by grant; account quota/auth markers and
+model/config capacity markers have separate keys. An account catalog checks
+that every staged physical account directory remains present at open.
+
+Each keyed account write uses the object → audit → intent → root → pointer
+publication protocol. The stage reads back every key, checks pending counts,
+syncs account and route directories, and rereads model config digests before
+the single v3 manifest replacement. A crash before the manifest leaves the
+previous generation visible; rerunning the frozen rebuild creates a fresh
+generation from the same retained evidence. The old State DB and WAL are not
+opened.
+
+**This is a private migration artifact, not live activation.** The existing
+v2 `Index::open` intentionally refuses a v3 manifest; the service cannot use
+it until a later coordinated keyed writer, selector, and admission cutover.
+There is no v3 live reconciliation or routing authority in this slice.
