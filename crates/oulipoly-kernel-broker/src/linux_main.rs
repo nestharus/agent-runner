@@ -500,6 +500,8 @@ fn recv_request(
             b'{' => descriptors.len() != 7,
             #[cfg(feature = "age319-private-broker-fixture")]
             b'}' => descriptors.len() != 8,
+            #[cfg(feature = "age319-private-broker-fixture")]
+            b']' => !matches!(descriptors.len(), 0 | 2),
             b'L' => !(1..=4).contains(&descriptors.len()),
             b'V' | b'S' | b's' | b'T' => descriptors.len() != 1,
             _ => !descriptors.is_empty(),
@@ -4725,6 +4727,20 @@ fn serve_fresh_v30_at(
                             return Err(io::Error::other("fresh PTY handoff gate closed"));
                         }
                         if operation == b']' {
+                            if !descriptors.is_empty() {
+                                let [master, transcript]: [File; 2] =
+                                    descriptors.try_into().map_err(|_| {
+                                        io::Error::other("interactive finalizer descriptors absent")
+                                    })?;
+                                fresh_provider::finalize_interactive_output(
+                                    &directory,
+                                    &binding,
+                                    &pty_request,
+                                    &actor,
+                                    master,
+                                    transcript,
+                                )?;
+                            }
                             return fresh_provider::observe_interactive(
                                 &directory,
                                 &binding,

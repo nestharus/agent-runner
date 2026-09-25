@@ -124,6 +124,7 @@ fn inner() {
             | "normal_model_provider_pty_physical"
             | "normal_model_provider_pty_physical_wrong_plan"
             | "normal_model_provider_pty_physical_wrong_actor"
+            | "normal_model_provider_pty_physical_finalizer_wrong_pair"
             | "normal_model_provider_pty_physical_reply_loss"
             | "normal_model_provider_pty_physical_post_k_unknown"
             | "normal_model_provider_pty_physical_restart"
@@ -139,6 +140,8 @@ fn inner() {
             | "normal_model_provider_pty_physical_resident_bash_wrong_actor"
             | "normal_model_provider_pty_physical_resident_bash_unconsumed_parent"
             | "normal_model_provider_pty_physical_resident_bash_restart"
+            | "normal_model_provider_pty_physical_resident_bash_after_append"
+            | "normal_model_provider_pty_physical_resident_bash_after_append_corrupt"
             | "normal_model_provider_pty_physical_resident_absent_socket"
             | "normal_model_provider_pty_physical_resident_replaced_socket"
             | "normal_model_provider_pty_physical_resident_wrong_account"
@@ -590,6 +593,10 @@ fn inner() {
                 "1",
             )),
         )
+        .envs(mode.contains("resident_bash_after_append").then_some((
+            "OULIPOLY_KERNEL_BROKER_FIXTURE_INTERACTIVE_AFTER_APPEND_V1",
+            "1",
+        )))
         .envs(
             matches!(
                 mode.as_str(),
@@ -707,6 +714,10 @@ fn inner() {
             .envs(
                 (mode == "normal_model_provider_pty_physical_wrong_actor")
                     .then_some(("AGE319_PRIVATE_ROOT_PTY_PHYSICAL_ACTOR_GATE_V1", "1")),
+            )
+            .envs(
+                (mode == "normal_model_provider_pty_physical_finalizer_wrong_pair")
+                    .then_some(("AGE319_PRIVATE_ROOT_PTY_FINALIZER_WRONG_PAIR_V1", "1")),
             )
             .envs(
                 (mode == "normal_model_provider_pty_physical_root_exit")
@@ -2056,6 +2067,8 @@ fn inner() {
                     | "normal_model_provider_pty_physical_resident_bash_wrong_actor"
                     | "normal_model_provider_pty_physical_resident_bash_unconsumed_parent"
                     | "normal_model_provider_pty_physical_resident_bash_restart"
+                    | "normal_model_provider_pty_physical_resident_bash_after_append"
+                    | "normal_model_provider_pty_physical_resident_bash_after_append_corrupt"
                     | "normal_model_provider_pty_physical_resident_absent_socket"
                     | "normal_model_provider_pty_physical_resident_replaced_socket"
                     | "normal_model_provider_pty_physical_resident_wrong_account"
@@ -2063,6 +2076,7 @@ fn inner() {
                     | "normal_model_provider_pty_physical_resident_stale_provider"
                     | "normal_model_provider_pty_physical_wrong_plan"
                     | "normal_model_provider_pty_physical_wrong_actor"
+                    | "normal_model_provider_pty_physical_finalizer_wrong_pair"
                     | "normal_model_provider_pty_physical_reply_loss"
                     | "normal_model_provider_pty_physical_post_k_unknown"
                     | "normal_model_provider_pty_physical_restart"
@@ -2380,6 +2394,10 @@ fn inner() {
                         )
                     }))
                     .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+                    .envs(mode.contains("resident_bash_after_append").then_some((
+                        "OULIPOLY_KERNEL_BROKER_FIXTURE_INTERACTIVE_AFTER_APPEND_V1",
+                        "1",
+                    )))
                     .envs((mode == "normal_model_provider_reply_loss").then_some((
                         "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_PROVIDER_K_REPLY_V1",
                         "1",
@@ -2798,16 +2816,17 @@ fn inner() {
                         )
                         .unwrap();
                         let id = k["grant"]["id"].as_str().unwrap();
-                        eventually(|| {
-                            provider_dir.join(format!("{id}.pid1-wait.json")).exists()
-                                && provider_dir
-                                    .join(format!("{id}.interactive-output.json"))
-                                    .exists()
-                        });
+                        eventually(|| provider_dir.join(format!("{id}.pid1-wait.json")).exists());
                         assert!(provider_dir.join(format!("{id}.consumed.json")).exists());
                         assert!(provider_dir.join(format!("{id}.attach.json")).exists());
                         assert!(provider_dir.join(format!("{id}.exit.json")).exists());
                         assert!(provider_dir.join(format!("{id}.drain.json")).exists());
+                        assert!(
+                            !provider_dir
+                                .join(format!("{id}.interactive-output.json"))
+                                .exists(),
+                            "a dead original root cannot attest PTY EOF or transcript"
+                        );
                         assert!(
                             !provider_dir
                                 .join(format!("{}.interactive-q.json", receipt.handoff_id))
@@ -3399,6 +3418,102 @@ fn inner() {
                             }
                         }
                         fs::write(gate.join("interactive-resident-continue"), b"continue").unwrap();
+                        if mode.contains("_after_append") {
+                            let raw = provider_dir.join(format!("{grant_id}.interactive-output"));
+                            let output_receipt =
+                                provider_dir.join(format!("{grant_id}.interactive-output.json"));
+                            let until = Instant::now() + Duration::from_secs(10);
+                            while !gate.join("interactive-after-append-ready").exists()
+                                && Instant::now() < until
+                            {
+                                std::thread::sleep(Duration::from_millis(20));
+                            }
+                            assert!(
+                                gate.join("interactive-after-append-ready").exists()
+                                    && fs::metadata(&raw).is_ok_and(|meta| meta.len() == 92)
+                                    && !output_receipt.exists(),
+                                "after append gap: root={} broker={} artifacts={:?}",
+                                fs::read_to_string(&err).unwrap_or_default(),
+                                fs::read_to_string(&broker_log).unwrap_or_default(),
+                                fs::read_dir(&provider_dir)
+                                    .unwrap()
+                                    .filter_map(Result::ok)
+                                    .map(|item| item.file_name().to_string_lossy().into_owned())
+                                    .collect::<Vec<_>>()
+                            );
+                            assert!(entry.try_wait().unwrap().is_none());
+                            assert!(
+                                !provider_dir
+                                    .join(format!("{}.interactive-q.json", receipt.handoff_id))
+                                    .exists()
+                            );
+                            if mode.ends_with("_corrupt") {
+                                use std::os::unix::fs::FileExt;
+                                File::options()
+                                    .write(true)
+                                    .open(&raw)
+                                    .unwrap()
+                                    .write_all_at(b"X", 0)
+                                    .unwrap();
+                            }
+                            stop(&mut broker);
+                            broker = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
+                                .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                                .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
+                                .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
+                                .env(
+                                    "OULIPOLY_KERNEL_BROKER_FIXTURE_BASH_V1",
+                                    bash.as_ref().unwrap(),
+                                )
+                                .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+                                .stderr(Stdio::from(
+                                    File::create(temp.path().join("after-append-restart.log"))
+                                        .unwrap(),
+                                ))
+                                .spawn()
+                                .unwrap();
+                            eventually(|| {
+                                protocol::request_at(&socket, Operation::Classify).is_ok()
+                            });
+                            if mode.ends_with("_corrupt") {
+                                let until = Instant::now() + Duration::from_secs(25);
+                                while entry.try_wait().unwrap().is_none() && Instant::now() < until
+                                {
+                                    std::thread::sleep(Duration::from_millis(20));
+                                }
+                                assert!(
+                                    !entry.wait().unwrap().success(),
+                                    "corrupt transcript received Q"
+                                );
+                                assert!(
+                                    fs::read_to_string(&err)
+                                        .unwrap_or_default()
+                                        .contains("interactive finalizer prior transcript corrupt"),
+                                    "corruption did not return a bounded explicit unknown: {}",
+                                    fs::read_to_string(&err).unwrap_or_default()
+                                );
+                                assert!(!output_receipt.exists());
+                                assert!(
+                                    !provider_dir
+                                        .join(format!("{}.interactive-q.json", receipt.handoff_id))
+                                        .exists()
+                                );
+                                assert_eq!(
+                                    fs::read_dir(&provider_dir)
+                                        .unwrap()
+                                        .filter_map(Result::ok)
+                                        .filter(|item| item
+                                            .file_name()
+                                            .to_string_lossy()
+                                            .ends_with(".interactive-k.json"))
+                                        .count(),
+                                    1
+                                );
+                                assert_old_debt_and_no_f_ack(&broker_state);
+                                stop(&mut broker);
+                                return;
+                            }
+                        }
                         let deadline = Instant::now() + Duration::from_secs(20);
                         while entry.try_wait().unwrap().is_none() && Instant::now() < deadline {
                             std::thread::sleep(Duration::from_millis(20));
@@ -3418,8 +3533,10 @@ fn inner() {
                         );
                         assert!(
                             entry.wait().unwrap().success(),
-                            "resident root Q: {}",
-                            fs::read_to_string(&err).unwrap_or_default()
+                            "resident root Q: {}; after-append broker: {}",
+                            fs::read_to_string(&err).unwrap_or_default(),
+                            fs::read_to_string(temp.path().join("after-append-restart.log"))
+                                .unwrap_or_default()
                         );
                         let q: serde_json::Value = serde_json::from_slice(
                             &fs::read(
@@ -3434,10 +3551,29 @@ fn inner() {
                         assert_eq!(q["provider_exit"]["wait_status"], 0);
                         assert_eq!(q["tree_drain"]["zero_remaining"], true);
                         assert_eq!(q["pid1_wait"]["reaped"], true);
+                        let transcript =
+                            fs::read(provider_dir.join(format!("{grant_id}.interactive-output")))
+                                .unwrap();
+                        assert_eq!(
+                            fs::read(gate.join("interactive-output-readback")).unwrap(),
+                            transcript
+                        );
+                        assert_eq!(q["pty_output"]["bytes"], transcript.len());
+                        assert_eq!(
+                            q["pty_output"]["sha256"],
+                            format!("{:x}", Sha256::digest(&transcript))
+                        );
+                        assert!(
+                            transcript
+                                .windows(b"interactive-ready".len())
+                                .any(|part| part == b"interactive-ready")
+                        );
+                        assert!(transcript.windows(b"interactive-output:fixture-input-through-pty".len()).any(|part| part == b"interactive-output:fixture-input-through-pty"));
                         if resident_bash
                             && (mode.ends_with("_notify")
                                 || mode.ends_with("_response")
-                                || mode.ends_with("_restart"))
+                                || mode.ends_with("_restart")
+                                || mode.ends_with("_after_append"))
                         {
                             let report: serde_json::Value = serde_json::from_slice(
                                 &fs::read(gate.join("bash-causal-output")).unwrap(),
@@ -3460,12 +3596,14 @@ fn inner() {
                             1
                         );
                         eprintln!(
-                            "resident physical evidence: grant={grant_id} provider_host_pid={provider_pid} provider_local_pid={} pidns_ino={} native_session={} tail_token={} q_wait={}",
+                            "resident physical evidence: grant={grant_id} provider_host_pid={provider_pid} provider_local_pid={} pidns_ino={} native_session={} tail_token={} q_wait={} output_bytes={} output_sha256={}",
                             resident["provider_local_pid"],
                             resident["provider_pidns_ino"],
                             native["session_id"],
                             readback["native_tail"]["resume_token"],
-                            q["provider_exit"]["wait_status"]
+                            q["provider_exit"]["wait_status"],
+                            q["pty_output"]["bytes"],
+                            q["pty_output"]["sha256"]
                         );
                         stop(&mut broker);
                         return;
@@ -6497,6 +6635,7 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_model_provider_pty_physical_resident_bash_wrong_plan",
         "normal_model_provider_pty_physical_resident_bash_wrong_actor",
         "normal_model_provider_pty_physical_resident_bash_unconsumed_parent",
+        "normal_model_provider_pty_physical_finalizer_wrong_pair",
         "normal_model_provider_pty_physical_resident_absent_socket",
         "normal_model_provider_pty_physical_resident_replaced_socket",
         "normal_model_provider_pty_physical_resident_wrong_account",
@@ -6596,7 +6735,6 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
 }
 
 #[test]
-#[ignore = "live broker restart after W loses the broker-owned PTY output receipt before provider Q"]
 fn resident_bash_restart_after_w_retains_failing_signal() {
     let output = Command::new("unshare")
         .args(["-Urpfm", "--mount-proc"])
@@ -6610,6 +6748,56 @@ fn resident_bash_restart_after_w_retains_failing_signal() {
         .env(
             "AGE319_PRIVATE_JOIN_MODE",
             "normal_model_provider_pty_physical_resident_bash_restart",
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    eprint!("{}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+fn resident_bash_restart_after_transcript_append_recovers_exact_q() {
+    let output = Command::new("unshare")
+        .args(["-Urpfm", "--mount-proc"])
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "original_runner_joins_once_behind_persistent_root_pid1",
+            "--nocapture",
+        ])
+        .env("AGE319_PRIVATE_JOIN_INNER", "1")
+        .env(
+            "AGE319_PRIVATE_JOIN_MODE",
+            "normal_model_provider_pty_physical_resident_bash_after_append",
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    eprint!("{}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+fn resident_bash_corrupt_prior_transcript_refuses_q() {
+    let output = Command::new("unshare")
+        .args(["-Urpfm", "--mount-proc"])
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "original_runner_joins_once_behind_persistent_root_pid1",
+            "--nocapture",
+        ])
+        .env("AGE319_PRIVATE_JOIN_INNER", "1")
+        .env(
+            "AGE319_PRIVATE_JOIN_MODE",
+            "normal_model_provider_pty_physical_resident_bash_after_append_corrupt",
         )
         .output()
         .unwrap();

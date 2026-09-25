@@ -5,7 +5,7 @@
 
 use oulipoly_kernel_broker::protocol::{self, FreshPlanRole, PrivateFreshPtyHandoff};
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -206,7 +206,8 @@ impl RootPtyControl {
         self.ensure_live()?;
         self.rechallenge(broker)?;
         let slave = self.slave.as_ref().ok_or("root PTY slave released")?;
-        let (mut relay_rx, relay_tx) = UnixStream::pair().map_err(|e| e.to_string())?;
+        let mut output_master = self.master.try_clone().map_err(|e| e.to_string())?;
+        let (_relay_rx, relay_tx) = UnixStream::pair().map_err(|e| e.to_string())?;
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let live_reader = std::thread::Builder::new()
             .name("root-interactive-pty-output".into())
@@ -215,7 +216,12 @@ impl RootPtyControl {
                 let mut announced = false;
                 let mut buffer = [0u8; 8192];
                 loop {
-                    let n = relay_rx.read(&mut buffer).map_err(|e| e.to_string())?;
+                    let n = match output_master.read(&mut buffer) {
+                        Ok(n) => n,
+                        Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(error) => return Err(error.to_string()),
+                    };
                     if n == 0 {
                         break;
                     }
@@ -509,6 +515,9 @@ impl RootPtyControl {
             grant,
             k_error,
         } = running;
+        if self.resident.lock().map_err(|e| e.to_string())?.is_some() {
+            self.broker_resident_readback(broker)?;
+        }
         self.master
             .try_clone()
             .map_err(|e| e.to_string())?
@@ -519,9 +528,82 @@ impl RootPtyControl {
         }
         self.slave.take();
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        loop {
+        while !live_reader.is_finished() {
+            if std::time::Instant::now() >= deadline {
+                return Err(format!("interactive PTY drain unknown after K {grant}"));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let streamed = live_reader
+            .join()
+            .map_err(|_| "interactive live PTY reader panicked".to_string())??;
+        let mut transcript = tempfile::tempfile().map_err(|e| e.to_string())?;
+        transcript.write_all(&streamed).map_err(|e| e.to_string())?;
+        transcript.sync_all().map_err(|e| e.to_string())?;
+        use sha2::Digest as _;
+        let source_sha256 = format!("{:x}", sha2::Sha256::digest(&streamed));
+        transcript.rewind().map_err(|e| e.to_string())?;
+        if super::private_verified_output(
+            transcript.try_clone().map_err(|e| e.to_string())?,
+            streamed.len() as u64,
+            &source_sha256,
+        )? != streamed
+        {
+            return Err("interactive original-root transcript changed before finalization".into());
+        }
+        if std::env::var_os("AGE319_PRIVATE_ROOT_PTY_FINALIZER_WRONG_PAIR_V1").is_some() {
+            let (wrong_master, _wrong_slave) = open_pty().map_err(|e| e.to_string())?;
+            if protocol::private_fresh_interactive_finalize_at(
+                broker,
+                &self._binding,
+                wrong_master.as_raw_fd(),
+                transcript.as_raw_fd(),
+            )
+            .is_ok()
+            {
+                return Err("interactive finalizer accepted a replaced master".into());
+            }
+            let wrong_control = PrivateFreshPtyHandoff {
+                control_path: self.path.with_file_name("wrong-control.sock"),
+                ..self._binding.clone()
+            };
+            if protocol::private_fresh_interactive_finalize_at(
+                broker,
+                &wrong_control,
+                self.master.as_raw_fd(),
+                transcript.as_raw_fd(),
+            )
+            .is_ok()
+            {
+                return Err("interactive finalizer accepted a replaced control socket".into());
+            }
             let state = protocol::private_fresh_interactive_q_at(broker, &self._binding)
-                .map_err(|e| format!("interactive Q unknown after K: {e}"))?;
+                .map_err(|e| e.to_string())?;
+            if !state.starts_with(&format!("fresh-interactive-unknown-or-pending {grant}")) {
+                return Err(format!("wrong finalizer pair published Q: {state}"));
+            }
+        }
+        loop {
+            self.ensure_live()
+                .map_err(|e| format!("interactive original control unknown after K: {e}"))?;
+            let finalized = protocol::private_fresh_interactive_finalize_at(
+                broker,
+                &self._binding,
+                self.master.as_raw_fd(),
+                transcript.as_raw_fd(),
+            );
+            let state = match protocol::private_fresh_interactive_q_at(broker, &self._binding) {
+                Ok(state) => state,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "interactive Q unknown after K: {error}; finalize: {finalized:?}"
+                    ));
+                }
+            };
             if state.starts_with("fresh-interactive-drained ") {
                 if !matches!(
                     std::env::var("AGE319_PRIVATE_RESIDENT_FAILURE_V1").as_deref(),
@@ -543,11 +625,8 @@ impl RootPtyControl {
                 }
                 let bytes =
                     super::private_verified_output(output.output, output.bytes, &output.sha256)?;
-                let streamed = live_reader
-                    .join()
-                    .map_err(|_| "interactive live PTY relay panicked".to_string())??;
                 if streamed != bytes {
-                    return Err("interactive live PTY relay differs from Q transcript".into());
+                    return Err("interactive original-root PTY transcript differs from Q".into());
                 }
                 return Ok((state, bytes));
             }
@@ -555,7 +634,7 @@ impl RootPtyControl {
                 || std::time::Instant::now() >= deadline
             {
                 return Err(format!(
-                    "interactive Q unknown after K: {state}; K reply: {k_error:?}"
+                    "interactive Q unknown after K: {state}; finalize: {finalized:?}; K reply: {k_error:?}"
                 ));
             }
             std::thread::sleep(Duration::from_millis(20));

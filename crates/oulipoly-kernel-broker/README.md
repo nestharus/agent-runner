@@ -52,14 +52,16 @@ rechecks the selected image, argv/env/cwd and pinned config, then fsyncs a
 distinct one-use `interactive-k.json` before any child release. Its separate
 consumed grant gates a broker fork into the held root's PID namespace. The
 provider acquires the offered slave as its controlling terminal under the
-selected peer UID/GID/groups. The root retains the master and control socket,
-writes PTY input and receives live PTY output over a peer-checked relay; the
-broker also records the raw transcript. The selected fixture waits for a live
-prompt before input, then the root verifies the streamed bytes against the
-Q-gated transcript descriptor. `]` reads the same K after a lost reply or
-broker restart and never resubmits K. A missing attach or output closure stays
-unknown debt. After provider wait, PID1 tree drain, PID1 wait, PTY closure and
-output hash verification, `]` creates or checks exact `interactive-q.json`
+selected peer UID/GID/groups. The original root retains the master and control
+socket and is the sole PTY reader across broker restarts. After PTY EOF it
+supplies its complete transcript and held master to private `]`. The broker
+reattests the original D/actor/session, selected K/account/plan, attach and
+provider identity, control socket and master, physical wait/tree/PID1 drain,
+and PTY EOF before copying and hashing the transcript. An interrupted copy
+can resume only from a byte-for-byte matching prefix supplied by that same
+root; a changed prefix or lost root is unknown debt. Plain `]` reads the same
+K after a lost reply or broker restart and never resubmits K. A missing attach
+or output closure stays unknown debt. After these checks, `]` creates or checks exact `interactive-q.json`
 with the K, observed PID/boot/starttime/PID namespace, wait and output facts.
 The ordinary runtime generation registrar accepts only a local direct child;
 it cannot register the broker-forked provider. This private physical K/Q does

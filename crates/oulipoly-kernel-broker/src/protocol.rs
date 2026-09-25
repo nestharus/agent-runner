@@ -382,6 +382,19 @@ pub fn private_fresh_interactive_q_at(
     private_fresh_pty_request_at(path, request, b']', &[])
 }
 
+/// Present the original root's completed PTY transcript and held master.
+/// The broker may publish Q only after its independent physical wait/drain
+/// checks and an EOF challenge of this exact master.
+#[cfg(feature = "age319-private-broker-fixture")]
+pub fn private_fresh_interactive_finalize_at(
+    path: &Path,
+    request: &PrivateFreshPtyHandoff,
+    master: RawFd,
+    transcript: RawFd,
+) -> io::Result<String> {
+    private_fresh_pty_request_at(path, request, b']', &[master, transcript])
+}
+
 /// Read the broker-attested running K and register/read its one fresh-sidecar
 /// generation while the original root still holds the PTY master. This does
 /// not request Q or authorize any provider input.

@@ -3989,7 +3989,7 @@ struct ProviderExit {
     provider_local_pid: i32,
     wait_status: i32,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Output {
     bytes: u64,
@@ -4031,54 +4031,211 @@ fn output(file: &File) -> io::Result<Output> {
     })
 }
 
-fn capture_interactive_output(
-    master: File,
-    relay: UnixStream,
-    directory: PathBuf,
-    grant_id: String,
+/// Finish only the original root's complete PTY read after physical drain.
+/// An interrupted copy retains a verifiable prefix; the same root may retry
+/// with its complete source, but a changed prefix is an explicit unknown.
+pub(super) fn finalize_interactive_output(
+    directory: &Path,
+    binding: &Binding,
+    request: &PrivateFreshPtyHandoff,
+    actor: &PinnedProcess,
+    mut master: File,
+    source: File,
 ) -> io::Result<()> {
-    let mut transcript = OpenOptions::new()
+    actor.verify()?;
+    if actor.host_pid != binding.actor_pid
+        || actor.starttime_ticks != binding.actor_starttime
+        || actor.boot_id != binding.actor_boot_id
+        || (actor.pidns_dev, actor.pidns_ino) != (binding.actor_pidns_dev, binding.actor_pidns_ino)
+    {
+        return Err(io::Error::other(
+            "interactive finalizer original actor changed",
+        ));
+    }
+    let k: InteractiveK = exact_file(directory, &interactive_k_name(binding))?
+        .ok_or_else(|| io::Error::other("interactive finalizer K absent"))?;
+    let grant = &k.grant;
+    let decision: InteractiveDecision =
+        exact_file(directory, &interactive_decision_name(&binding.handoff_id))?
+            .ok_or_else(|| io::Error::other("interactive finalizer selection absent"))?;
+    if k.version != 1
+        || k.state != "consumed-before-child-release"
+        || grant.binding != *binding
+        || request.session_id != binding.session_id
+        || request.role != FreshPlanRole::Interactive
+        || request.account != k.preparation.handoff.selection.account
+        || request.plan_sha256 != grant.plan_sha256
+        || request.control_path != k.preparation.handoff.control_path
+        || k.preparation.handoff.binding != *binding
+        || k.preparation.handoff.selection.plan_sha256 != grant.plan_sha256
+        || decision.version != 1
+        || decision.role != FreshPlanRole::Interactive
+        || decision.binding != *binding
+        || decision.selection != k.preparation.handoff.selection
+        || exact_file::<Grant>(directory, &format!("{}.consumed.json", grant.id))?.as_ref()
+            != Some(grant)
+    {
+        return Err(io::Error::other(
+            "interactive finalizer D, K or selected plan changed",
+        ));
+    }
+    if PtyHandoffStamp::of(&master)? != k.preparation.handoff.master {
+        return Err(io::Error::other(
+            "interactive finalizer original master replaced",
+        ));
+    }
+    let control = attest_original_control(&request.control_path, binding.actor_pid, &master)?;
+    if control
+        != (
+            k.preparation.handoff.control_device,
+            k.preparation.handoff.control_inode,
+        )
+    {
+        return Err(io::Error::other(
+            "interactive finalizer control socket replaced",
+        ));
+    }
+    let attach: Attach = exact_file(directory, &format!("{}.attach.json", grant.id))?
+        .ok_or_else(|| io::Error::other("interactive finalizer attach absent"))?;
+    let identity: InteractiveIdentity = exact_file(
+        directory,
+        &format!("{}.interactive-identity.json", grant.id),
+    )?
+    .ok_or_else(|| io::Error::other("interactive finalizer identity absent"))?;
+    if attach.version != 1
+        || identity.version != 1
+        || attach.grant_id != grant.id
+        || identity.grant_id != grant.id
+        || identity.work_id != attach.work_id
+        || identity.provider_host_pid != attach.provider_pid
+        || identity.provider_local_pid != attach.provider_local_pid
+        || identity.provider_starttime_ticks != attach.provider_starttime
+        || identity.pid1_host_pid != attach.pid1
+        || identity.pid1_starttime_ticks != attach.pid1_starttime
+        || (identity.provider_pidns_dev, identity.provider_pidns_ino)
+            != (attach.pidns_dev, attach.pidns_ino)
+        || (identity.pid1_pidns_dev, identity.pid1_pidns_ino)
+            != (attach.pidns_dev, attach.pidns_ino)
+        || identity.provider_boot_id != binding.actor_boot_id
+        || identity.pid1_boot_id != binding.actor_boot_id
+        || !observed_incarnation_gone(
+            attach.provider_pid,
+            &binding.actor_boot_id,
+            attach.provider_starttime,
+            (attach.pidns_dev, attach.pidns_ino),
+        )?
+    {
+        return Err(io::Error::other(
+            "interactive finalizer provider identity changed",
+        ));
+    }
+    if !matches!(observe(directory, &grant.id)?, Observation::Drained { .. }) {
+        return Err(io::Error::other(
+            "interactive finalizer physical wait/tree/PID1 drain pending",
+        ));
+    }
+    let mut poll = libc::pollfd {
+        fd: master.as_raw_fd(),
+        events: libc::POLLIN | libc::POLLHUP,
+        revents: 0,
+    };
+    if unsafe { libc::poll(&mut poll, 1, 1000) } <= 0 {
+        return Err(io::Error::other("interactive finalizer PTY EOF unproven"));
+    }
+    let mut probe = [0u8; 1];
+    match master.read(&mut probe) {
+        Ok(0) => {}
+        Err(error) if error.raw_os_error() == Some(libc::EIO) => {}
+        Ok(_) => {
+            return Err(io::Error::other(
+                "interactive finalizer uncertain PTY byte gap",
+            ));
+        }
+        Err(error) => return Err(error),
+    }
+    if !source.metadata()?.is_file() {
+        return Err(io::Error::other(
+            "interactive finalizer transcript is not a file",
+        ));
+    }
+    let (expected_sha, expected_len) = sha_file(&source)?;
+    let name = format!("{}.interactive-output", grant.id);
+    let path = directory.join(&name);
+    let transcript = match OpenOptions::new()
         .read(true)
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(directory.join(format!("{grant_id}.interactive-output")))?;
-    std::thread::Builder::new()
-        .name("fresh-interactive-pty-output".into())
-        .spawn(move || {
-            let result = (|| -> io::Result<()> {
-                let mut master = master;
-                let mut relay = Some(relay);
-                let mut buffer = [0u8; 8192];
-                loop {
-                    match master.read(&mut buffer) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            transcript.write_all(&buffer[..n])?;
-                            if relay
-                                .as_mut()
-                                .is_some_and(|stream| stream.write_all(&buffer[..n]).is_err())
-                            {
-                                relay = None;
-                            }
-                        }
-                        Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
-                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                        Err(error) => return Err(error),
-                    }
-                }
-                let receipt = output(&transcript)?;
-                durable_new(
-                    &directory,
-                    &format!("{grant_id}.interactive-output.json"),
-                    &receipt,
-                )
-            })();
-            if let Err(error) = result {
-                eprintln!("fresh interactive PTY output unknown for {grant_id}: {error}");
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)?,
+        Err(error) => return Err(error),
+    };
+    let meta = transcript.metadata()?;
+    if !meta.is_file() || meta.len() > expected_len {
+        return Err(io::Error::other(
+            "interactive finalizer transcript length changed",
+        ));
+    }
+    let mut offset = 0u64;
+    let mut expected = [0u8; VERIFIED_OUTPUT_BUFFER_BYTES];
+    let mut actual = [0u8; VERIFIED_OUTPUT_BUFFER_BYTES];
+    while offset < expected_len {
+        let count = source.read_at(&mut expected, offset)?;
+        if count == 0 {
+            return Err(io::Error::other("interactive finalizer source shortened"));
+        }
+        let prefix = meta.len().saturating_sub(offset).min(count as u64) as usize;
+        if prefix > 0 {
+            transcript.read_exact_at(&mut actual[..prefix], offset)?;
+            if actual[..prefix] != expected[..prefix] {
+                return Err(io::Error::other(
+                    "interactive finalizer prior transcript corrupt",
+                ));
             }
-        })?;
-    Ok(())
+        }
+        if count > prefix {
+            transcript.write_all_at(&expected[prefix..count], offset + prefix as u64)?;
+        }
+        offset += count as u64;
+    }
+    if sha_file(&source)? != (expected_sha.clone(), expected_len) {
+        return Err(io::Error::other("interactive finalizer source changed"));
+    }
+    let receipt = output(&transcript)?;
+    if receipt.bytes != expected_len || receipt.sha256 != expected_sha {
+        return Err(io::Error::other(
+            "interactive finalizer transcript mismatch",
+        ));
+    }
+    if std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_INTERACTIVE_AFTER_APPEND_V1").is_some() {
+        let gate = std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+            .map_err(io::Error::other)?;
+        fs::write(
+            Path::new(&gate).join("interactive-after-append-ready"),
+            b"ready",
+        )?;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        return Err(io::Error::other(
+            "injected unknown after interactive transcript append",
+        ));
+    }
+    let receipt_name = format!("{}.interactive-output.json", grant.id);
+    match exact_file::<Output>(directory, &receipt_name)? {
+        Some(existing) if existing == receipt => Ok(()),
+        Some(_) => Err(io::Error::other(
+            "interactive finalizer output receipt changed",
+        )),
+        None => durable_new(directory, &receipt_name, &receipt),
+    }
 }
 
 struct Init {
@@ -4590,14 +4747,9 @@ fn launch_with_pty(
         groups: actor.supplementary_groups()?,
     };
     let (pid, mut control, mut gate) = create_init(&parent_namespace, init)?;
-    if let (Some(master), Some(relay)) = (master, relay) {
-        capture_interactive_output(
-            master,
-            relay,
-            prepared.directory.clone(),
-            prepared.grant.id.clone(),
-        )?;
-    }
+    // The original root is the sole PTY reader. A broker-owned reader can
+    // lose bytes between read(2) and fsync when the broker is restarted.
+    drop((master, relay));
     let init_pin = PinnedProcess::open(pid)?;
     if !init_pin.is_namespace_init()? {
         return Err(io::Error::other("fresh provider PID1 not namespace init"));
