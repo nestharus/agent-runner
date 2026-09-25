@@ -651,32 +651,59 @@ fn validate_schema_version_on(
         let mut statement = conn
             .prepare(
                 "SELECT type,name,sql FROM sqlite_master
-                 WHERE sql IS NOT NULL AND (
-                    name LIKE 'completion_continuation_%'
-                    OR name LIKE 'completion_uncertain_input%'
-                    OR name LIKE 'completion_native_grant_%'
-                    OR name LIKE 'completion_native_worker_%'
-                    OR name LIKE 'completion_native_kernel_%'
-                    OR name LIKE 'completion_supervisor_%'
-                    OR name LIKE 'completion_owner_supervisor_%'
-                    OR name LIKE 'completion_source_supervisor_%'
-                    OR name LIKE 'completion_attempt_supervisor_%'
-                    OR name='mailbox'
-                    OR name='mailbox_completion_provenance_immutable'
-                    OR name='mailbox_completion_provenance_insert_valid'
-                    OR name='mailbox_completion_provenance_update_valid'
-                    OR (?1=1 AND name IN ('idx_mailbox_deliverable_session_live',
-                        'idx_mailbox_deliverable_target_live',
-                        'idx_mailbox_deliverable_global',
-                        'completion_uncertain_input_preserve')))
+                 WHERE sql IS NOT NULL
                  ORDER BY type,name",
             )
             .map_err(|e| e.to_string())?;
         statement
-            .query_map([include_uncertain], |r| {
+            .query_map([], |r| {
                 let kind: String = r.get(0)?;
                 let name: String = r.get(1)?;
                 let mut sql: String = r.get(2)?;
+                // Filter the bounded schema catalog in memory. Evaluating a
+                // dozen LIKE arms in SQLite for every catalog row made an
+                // ordinary current-schema open exceed its VM-step ceiling.
+                // These are the fixed prefixes of the former SQLite LIKE
+                // patterns. SQLite treats '_' as one character and compares
+                // ASCII letters without case sensitivity by default.
+                let like_prefix = |pattern: &str| {
+                    let mut actual = name.chars();
+                    pattern.chars().all(|expected| {
+                        actual.next().is_some_and(|actual| {
+                            expected == '_' || expected.eq_ignore_ascii_case(&actual)
+                        })
+                    })
+                };
+                let selected = [
+                    "completion_continuation_",
+                    "completion_uncertain_input",
+                    "completion_native_grant_",
+                    "completion_native_worker_",
+                    "completion_native_kernel_",
+                    "completion_supervisor_",
+                    "completion_owner_supervisor_",
+                    "completion_source_supervisor_",
+                    "completion_attempt_supervisor_",
+                ]
+                .iter()
+                .any(|pattern| like_prefix(pattern))
+                    || matches!(
+                        name.as_str(),
+                        "mailbox"
+                            | "mailbox_completion_provenance_immutable"
+                            | "mailbox_completion_provenance_insert_valid"
+                            | "mailbox_completion_provenance_update_valid"
+                    )
+                    || (include_uncertain
+                        && matches!(
+                            name.as_str(),
+                            "idx_mailbox_deliverable_session_live"
+                                | "idx_mailbox_deliverable_target_live"
+                                | "idx_mailbox_deliverable_global"
+                        ));
+                if !selected {
+                    return Ok(None);
+                }
                 if name == "completion_continuation_attempt" {
                     // Synthetic older-version fixtures may retain v25's
                     // additive column while replaying v21's supervisor
@@ -721,11 +748,12 @@ fn validate_schema_version_on(
                         }
                     }
                 }
-                Ok((kind, name, sql))
+                Ok(Some((kind, name, sql)))
             })
             .map_err(|e| e.to_string())?
             .map(|r| r.map_err(|e| e.to_string()))
-            .collect()
+            .collect::<Result<Vec<_>, _>>()
+            .map(|rows| rows.into_iter().flatten().collect())
     }
     fn expected_definitions(include_uncertain: bool) -> Result<Vec<Definition>, String> {
         let expected = Connection::open_in_memory().map_err(|e| e.to_string())?;
