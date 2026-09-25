@@ -454,7 +454,7 @@ fn private_fresh_recipient_delivery_ack_collision_and_restart() {
             &socket,
             &FreshRecipientRequest::CertifyNativeFReceipt {
                 preparation_request_id: preparation.preparation_request_id.clone(),
-                observed: claimed_turn,
+                observed: claimed_turn.clone(),
             }
         )
         .is_err(),
@@ -500,6 +500,57 @@ fn private_fresh_recipient_delivery_ack_collision_and_restart() {
             .unwrap(),
         0
     );
+    if let Some(marker) = std::env::var_os("AGE319_NATIVE_F_EXPORT_MARKER") {
+        // Export a fully State-certified receipt without a provider source.
+        // This models retained/imported State from a different Broker image;
+        // the private Broker itself must still refuse ACK without its source.
+        let mut lane = FreshV30Lane::open_at(&broker_root).unwrap();
+        let receipt = lane
+            .certify_native_f_receipt(&preparation.preparation_request_id, &owner, &claimed_turn)
+            .unwrap();
+        assert_eq!(receipt.grant_id, first_id);
+        assert!(
+            fresh_recipient_request_at(
+                &socket,
+                &FreshRecipientRequest::ReadNativeFReceipt {
+                    preparation_request_id: preparation.preparation_request_id.clone(),
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            fresh_recipient_request_at(
+                &socket,
+                &FreshRecipientRequest::AcknowledgeNativeFReceipt {
+                    preparation_request_id: preparation.preparation_request_id.clone(),
+                    delivery_token: first_token.clone(),
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            lane.read_native_f_auto_ack(&preparation.preparation_request_id, &owner)
+                .unwrap()
+                .is_none()
+        );
+        drop(lane);
+        broker.kill().unwrap();
+        broker.wait().unwrap();
+        let retained = private.keep();
+        fs::write(
+            marker,
+            serde_json::to_vec(&serde_json::json!({
+                "state_root": retained.join("broker").display().to_string(),
+                "request": preparation.preparation_request_id,
+                "delivery_request": first_request,
+                "token": first_token,
+                "recipient": owner,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        return;
+    }
     assert_eq!(
         Connection::open(broker_root.join("v30/state.db"))
             .unwrap()

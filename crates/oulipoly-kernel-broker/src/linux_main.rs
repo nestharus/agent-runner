@@ -227,6 +227,50 @@ fn certify_native_f_with_source(
     Err("native F provider source verifier unavailable; pending".into())
 }
 
+#[cfg(not(feature = "age319-private-broker-fixture"))]
+fn verify_native_f_committed_receipt(
+    lane: &FreshV30Lane,
+    request: &str,
+    recipient: &FreshRecipientIdentity,
+) -> Result<(), String> {
+    // A receipt imported from another Broker image is a historical State fact,
+    // not independent provider-native evidence for this image. Preserve an
+    // absent-receipt status read, but never use an existing receipt for ACK or
+    // as a currently certified readback without a supported source verifier.
+    if lane.read_native_f_receipt(request, recipient)?.is_some() {
+        return Err("native F provider source verifier unavailable; pending".into());
+    }
+    Ok(())
+}
+
+fn read_native_f_receipt_with_source(
+    lane: &FreshV30Lane,
+    request: &str,
+    recipient: &FreshRecipientIdentity,
+) -> Result<Option<oulipoly_state::mailbox::FreshNativeFReceipt>, String> {
+    verify_native_f_committed_receipt(lane, request, recipient)?;
+    lane.read_native_f_receipt(request, recipient)
+}
+
+fn acknowledge_native_f_receipt_with_source(
+    lane: &mut FreshV30Lane,
+    request: &str,
+    token: &str,
+    recipient: &FreshRecipientIdentity,
+) -> Result<oulipoly_state::mailbox::FreshDeliveryReadback, String> {
+    verify_native_f_committed_receipt(lane, request, recipient)?;
+    lane.acknowledge_native_f_receipt(request, token, recipient)
+}
+
+fn read_native_f_auto_ack_with_source(
+    lane: &FreshV30Lane,
+    request: &str,
+    recipient: &FreshRecipientIdentity,
+) -> Result<Option<oulipoly_state::mailbox::FreshNativeFAutoAck>, String> {
+    verify_native_f_committed_receipt(lane, request, recipient)?;
+    lane.read_native_f_auto_ack(request, recipient)
+}
+
 #[cfg(feature = "age319-private-broker-fixture")]
 fn private_fixture() -> bool {
     (unsafe { libc::geteuid() }) == 0
@@ -5504,36 +5548,25 @@ fn serve_fresh_v30_at(
                         FreshRecipientRequest::ReadNativeFReceipt {
                             preparation_request_id,
                         } => {
-                            #[cfg(feature = "age319-private-broker-fixture")]
-                            verify_native_f_committed_receipt(
+                            let receipt = read_native_f_receipt_with_source(
                                 &lane,
                                 &preparation_request_id,
                                 &recipient,
                             )
                             .map_err(io::Error::other)?;
-                            let receipt = lane
-                                .read_native_f_receipt(&preparation_request_id, &recipient)
-                                .map_err(io::Error::other)?;
                             serde_json::json!({"kind":"native_f_receipt_readback", "receipt":receipt})
                         }
                         FreshRecipientRequest::AcknowledgeNativeFReceipt {
                             preparation_request_id,
                             delivery_token,
                         } => {
-                            #[cfg(feature = "age319-private-broker-fixture")]
-                            verify_native_f_committed_receipt(
-                                &lane,
+                            let grant = acknowledge_native_f_receipt_with_source(
+                                &mut lane,
                                 &preparation_request_id,
+                                &delivery_token,
                                 &recipient,
                             )
                             .map_err(io::Error::other)?;
-                            let grant = lane
-                                .acknowledge_native_f_receipt(
-                                    &preparation_request_id,
-                                    &delivery_token,
-                                    &recipient,
-                                )
-                                .map_err(io::Error::other)?;
                             #[cfg(feature = "age319-private-broker-fixture")]
                             private_native_f_drop_reply("ack");
                             serde_json::json!({"kind":"native_f_auto_ack", "grant":grant})
@@ -5541,16 +5574,12 @@ fn serve_fresh_v30_at(
                         FreshRecipientRequest::ReadNativeFAutoAck {
                             preparation_request_id,
                         } => {
-                            #[cfg(feature = "age319-private-broker-fixture")]
-                            verify_native_f_committed_receipt(
+                            let ack = read_native_f_auto_ack_with_source(
                                 &lane,
                                 &preparation_request_id,
                                 &recipient,
                             )
                             .map_err(io::Error::other)?;
-                            let ack = lane
-                                .read_native_f_auto_ack(&preparation_request_id, &recipient)
-                                .map_err(io::Error::other)?;
                             serde_json::json!({"kind":"native_f_auto_ack_readback", "ack":ack})
                         }
                         FreshRecipientRequest::Acknowledge {
@@ -5759,6 +5788,78 @@ mod tests {
     use super::*;
     use oulipoly_kernel_broker::installed_launch::capture_from;
     use std::ffi::OsString;
+
+    #[cfg(not(feature = "age319-private-broker-fixture"))]
+    #[test]
+    #[ignore = "requires a retained State receipt exported by the private Broker image"]
+    fn imported_native_f_receipt_cannot_become_default_ack_after_restart() {
+        let marker = std::env::var_os("AGE319_NATIVE_F_EXPORT_MARKER")
+            .expect("private Broker receipt export marker required");
+        let exported: serde_json::Value =
+            serde_json::from_slice(&fs::read(marker).unwrap()).unwrap();
+        let state_root = Path::new(exported["state_root"].as_str().unwrap());
+        let request = exported["request"].as_str().unwrap();
+        let token = exported["token"].as_str().unwrap();
+        let delivery_request = exported["delivery_request"].as_str().unwrap();
+        let recipient: FreshRecipientIdentity =
+            serde_json::from_value(exported["recipient"].clone()).unwrap();
+        let unavailable = "native F provider source verifier unavailable; pending";
+        for _ in 0..2 {
+            // The second open models a default Broker restart after an
+            // uncertain read/ACK reply against the same retained State.
+            let mut lane = FreshV30Lane::open_at(state_root).unwrap();
+            let retained = lane
+                .read_native_f_receipt(request, &recipient)
+                .unwrap()
+                .expect("private image exported a committed receipt");
+            assert_eq!(
+                certify_native_f_with_source(
+                    &mut lane,
+                    request,
+                    &recipient,
+                    &retained.observation,
+                )
+                .unwrap_err(),
+                unavailable
+            );
+            assert_eq!(
+                read_native_f_receipt_with_source(&lane, request, &recipient).unwrap_err(),
+                unavailable
+            );
+            assert_eq!(
+                acknowledge_native_f_receipt_with_source(&mut lane, request, token, &recipient,)
+                    .unwrap_err(),
+                unavailable
+            );
+            assert_eq!(
+                read_native_f_auto_ack_with_source(&lane, request, &recipient).unwrap_err(),
+                unavailable
+            );
+            assert!(
+                lane.read_native_f_auto_ack(request, &recipient)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                lane.read_native_f_receipt(request, &recipient)
+                    .unwrap()
+                    .is_some()
+            );
+            let grant = lane
+                .read_recipient_delivery_by_request(delivery_request, &recipient)
+                .unwrap()
+                .unwrap();
+            assert_ne!(grant.phase, "acked");
+        }
+        let lane = FreshV30Lane::open_at(state_root).unwrap();
+        assert!(read_native_f_receipt_with_source(
+            &lane,
+            &uuid::Uuid::new_v4().to_string(),
+            &recipient,
+        )
+        .unwrap()
+        .is_none());
+    }
 
     #[test]
     fn v30_service_refuses_every_legacy_entry_and_work_operation() {
