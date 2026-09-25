@@ -1564,7 +1564,7 @@ fn inner() {
                     ) {
                         "fresh account effect unknown"
                     } else if v3_quota {
-                        "v3 route, auth/manual, cancellation and provider K writers are closed"
+                        "v3 route, cancellation and provider K writers are closed"
                     } else {
                         match mode.as_str() {
                             "normal_model_provider_bad_config" => {
@@ -1574,7 +1574,7 @@ fn inner() {
                                 "fresh pool has incompatible prompt modes before K"
                             }
                             "normal_model_provider_v3_closed" => {
-                                "v3 route, auth/manual, cancellation and provider K writers are closed"
+                                "v3 route, cancellation and provider K writers are closed"
                             }
                             "normal_model_provider_quota" => {
                                 "fresh route has no eligible account or pin"

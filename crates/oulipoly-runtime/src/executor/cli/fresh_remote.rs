@@ -194,12 +194,13 @@ pub fn execute_fresh_headless(
     run_prepared_fresh_headless(prepared, backend)
 }
 
-pub fn prepare_fresh_headless(
+/// Structural preflight shared by the original Runner plan and the broker's
+/// source-owned manual quota probe. It does not read inherited process env.
+pub fn validate_fresh_headless_shape(
     model: &ModelConfig,
     provider_index: usize,
-    prompt: &str,
     working_dir: &Path,
-) -> Result<PreparedFreshHeadless, String> {
+) -> Result<(), String> {
     let provider = provider_for_index(model, provider_index)?;
     if model.prompt_mode != PromptMode::Stdin
         || !model.inputs.is_empty()
@@ -219,7 +220,6 @@ pub fn prepare_fresh_headless(
     if parts.len() != 1 || !Path::new(&parts[0]).is_absolute() {
         return Err("fresh broker requires one absolute executable before K".into());
     }
-    let input_args = resolve_input_flags(model, &HashMap::new())?;
     if provider
         .environment
         .keys()
@@ -227,6 +227,19 @@ pub fn prepare_fresh_headless(
     {
         return Err("fresh broker provider environment unsupported before K".into());
     }
+    Ok(())
+}
+
+pub fn prepare_fresh_headless(
+    model: &ModelConfig,
+    provider_index: usize,
+    prompt: &str,
+    working_dir: &Path,
+) -> Result<PreparedFreshHeadless, String> {
+    validate_fresh_headless_shape(model, provider_index, working_dir)?;
+    let provider = provider_for_index(model, provider_index)?;
+    let parts = super::shell_split(&provider.command);
+    let input_args = resolve_input_flags(model, &HashMap::new())?;
     let mut launch = assemble_provider_launch(
         ProviderLaunchRequest {
             provider,

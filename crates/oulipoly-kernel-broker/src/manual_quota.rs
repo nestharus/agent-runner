@@ -6,7 +6,7 @@ use oulipoly_kernel_broker::protocol::{ManualQuotaReadback, ManualQuotaRequest};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
@@ -17,19 +17,19 @@ const MAX_OUTPUT: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Intent {
+pub(super) struct Intent {
     version: u32,
-    request: ManualQuotaRequest,
-    environment_sha256: String,
+    pub(super) request: ManualQuotaRequest,
+    pub(super) environment_sha256: String,
     peer_uid: u32,
     peer_gid: u32,
-    physical_account_id: String,
-    quota_script: Option<String>,
-    auth_refresh_command: Option<String>,
+    pub(super) physical_account_id: String,
+    pub(super) quota_script: Option<String>,
+    pub(super) auth_refresh_command: Option<String>,
     source_device: u64,
     source_inode: u64,
-    effect_id: Option<String>,
-    source_operation_id: Option<String>,
+    pub(super) effect_id: Option<String>,
+    pub(super) source_operation_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -61,29 +61,91 @@ fn redacted_request(request: &ManualQuotaRequest) -> ManualQuotaRequest {
 }
 
 fn durable_new<T: Serialize>(dir: &Path, name: &str, value: &T) -> io::Result<()> {
-    let mut file = OpenOptions::new()
+    let opened = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(dir.join(name))?;
-    serde_json::to_writer(&mut file, value)?;
+        .open(dir.join(name));
+    super::fresh_index::reader_open_attempt();
+    if opened.is_ok() {
+        super::fresh_index::reader_opened();
+    }
+    let mut file = opened?;
+    let bytes = serde_json::to_vec(value)?;
+    file.write_all(&bytes)?;
+    super::fresh_index::reader_bytes_written(bytes.len() as u64);
     file.write_all(b"\n")?;
+    super::fresh_index::reader_bytes_written(1);
     file.sync_all()?;
-    File::open(dir)?.sync_all()
+    let opened = File::open(dir);
+    super::fresh_index::reader_open_attempt();
+    if opened.is_ok() {
+        super::fresh_index::reader_opened();
+    }
+    opened?.sync_all()
 }
 
 fn read_exact<T: for<'a> Deserialize<'a>>(dir: &Path, name: &str) -> io::Result<Option<T>> {
-    match File::open(dir.join(name)) {
-        Ok(file) => serde_json::from_reader(file)
-            .map(Some)
-            .map_err(io::Error::other),
+    let opened = File::open(dir.join(name));
+    super::fresh_index::reader_open_attempt();
+    if opened.is_ok() {
+        super::fresh_index::reader_opened();
+    }
+    match opened {
+        Ok(mut file) => {
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            super::fresh_index::reader_bytes_parsed(bytes.len() as u64);
+            serde_json::from_slice(&bytes)
+                .map(Some)
+                .map_err(io::Error::other)
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
 }
 
+fn read_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    let opened = File::open(path);
+    super::fresh_index::reader_open_attempt();
+    if opened.is_ok() {
+        super::fresh_index::reader_opened();
+    }
+    let mut file = opened?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    super::fresh_index::reader_bytes_parsed(bytes.len() as u64);
+    Ok(bytes)
+}
+
 fn operation_dir(directory: &Path, id: &str) -> PathBuf {
     directory.join("manual-quota").join(id)
+}
+
+pub(super) fn v3_intent(directory: &Path, id: &str) -> io::Result<Intent> {
+    if !valid_id(id) {
+        return Err(io::Error::other("v3 manual operation ID invalid"));
+    }
+    let intent: Intent = read_exact(&operation_dir(directory, id), "intent.json")?
+        .ok_or_else(|| io::Error::other("manual quota operation absent"))?;
+    if intent.version != 1 || intent.request.operation_id != id {
+        return Err(io::Error::other("v3 manual intent identity changed"));
+    }
+    Ok(intent)
+}
+
+pub(super) fn v3_readback(directory: &Path, intent: &Intent) -> io::Result<ManualQuotaReadback> {
+    readback_intent(directory, intent)
+}
+
+pub(super) fn v3_source_key(intent: &Intent) -> io::Result<super::fresh_index::SourceKey> {
+    Ok(super::fresh_index::SourceKey {
+        commands_sha256: sha(&serde_json::to_vec(&(
+            &intent.quota_script,
+            &intent.auth_refresh_command,
+        ))?),
+        environment_sha256: intent.environment_sha256.clone(),
+    })
 }
 
 fn valid_id(id: &str) -> bool {
@@ -521,6 +583,138 @@ pub(super) fn begin_indexed(
     readback_intent(directory, &intent)
 }
 
+/// Private v3 manual entry. The account flight is read by exact key while the
+/// physical account admission lock is held. An unresolved K is never replayed.
+pub(super) fn begin_v3(
+    directory: &Path,
+    source: &File,
+    request: &ManualQuotaRequest,
+    uid: u32,
+    gid: u32,
+    generation: &super::fresh_index::KeyedGeneration,
+) -> io::Result<ManualQuotaReadback> {
+    let mut intent = source_intent(source, request, uid, gid)?;
+    let source_path = PathBuf::from(format!("/proc/self/fd/{}", source.as_raw_fd()));
+    let pool = oulipoly_runtime::executor::cli::fresh_remote::load_fresh_headless_pool(
+        &source_path,
+        &request.model,
+    )
+    .map_err(io::Error::other)?;
+    let index = pool
+        .model
+        .providers
+        .iter()
+        .position(|p| p.name == request.account)
+        .ok_or_else(|| io::Error::other("v3 manual source account absent"))?;
+    oulipoly_runtime::executor::cli::fresh_remote::validate_fresh_headless_shape(
+        &pool.model,
+        index,
+        Path::new("/"),
+    )
+    .map_err(|error| io::Error::other(format!("v3 manual source unsupported: {error}")))?;
+    let admitted = generation.admitted_source().map_err(io::Error::other)?;
+    let source_meta = source.metadata()?;
+    let admitted_meta = admitted.metadata()?;
+    if (source_meta.dev(), source_meta.ino()) != (admitted_meta.dev(), admitted_meta.ino()) {
+        return Err(io::Error::other(
+            "v3 manual config directory differs from admission",
+        ));
+    }
+    generation
+        .check_manual_model(&request.model, &request.config_sha256)
+        .map_err(io::Error::other)?;
+    let parent = directory.join("manual-quota");
+    fs::create_dir_all(&parent)?;
+    let _lock = super::fresh_provider::auth_admission_lock(directory, &intent.physical_account_id)?;
+    let own = operation_dir(directory, &request.operation_id);
+    if own.exists() {
+        let old = v3_intent(directory, &request.operation_id)?;
+        if old.request != redacted_request(request)
+            || old.environment_sha256 != environment_digest(&request.environment)?
+            || old.peer_uid != uid
+            || old.peer_gid != gid
+            || !same_source(&old, &intent)
+        {
+            return Err(io::Error::other("v3 manual operation/source mismatch"));
+        }
+        return generation.observe_manual(&old).map_err(io::Error::other);
+    }
+    if intent.quota_script.is_some() {
+        if let Some(peer) = generation
+            .manual_flight(&intent.physical_account_id)
+            .map_err(io::Error::other)?
+        {
+            let prior = v3_intent(directory, &peer)?;
+            if prior.source_operation_id.is_some() || !same_source(&intent, &prior) {
+                return Err(io::Error::other("v3 manual prior physical K unknown"));
+            }
+            intent.source_operation_id = Some(peer);
+            intent.effect_id = prior.effect_id;
+        }
+    }
+    fs::create_dir(&own)?;
+    File::open(&parent)?.sync_all()?;
+    durable_new(&own, "intent.json", &intent)?;
+    let revision = generation
+        .announce_manual(&intent)
+        .map_err(io::Error::other)?;
+    if intent.source_operation_id.is_some() || intent.quota_script.is_none() {
+        return generation.observe_manual(&intent).map_err(io::Error::other);
+    }
+    let before_k = source_intent(source, request, uid, gid)?;
+    if !same_source(&intent, &before_k)
+        || before_k.request != intent.request
+        || before_k.peer_uid != intent.peer_uid
+        || before_k.peer_gid != intent.peer_gid
+    {
+        return Err(io::Error::other("v3 manual source changed before K"));
+    }
+    durable_new(
+        &own,
+        "k.json",
+        &serde_json::json!({
+            "version": 1, "effect_id": intent.effect_id,
+            "operation_id": request.operation_id,
+        }),
+    )?;
+    generation
+        .record_manual_k(&intent, revision)
+        .map_err(io::Error::other)?;
+    #[cfg(not(test))]
+    {
+        let executable = std::env::current_exe()?;
+        Command::new(executable)
+            .arg("--manual-quota-worker")
+            .arg(&own)
+            .env_clear()
+            .envs(request.environment.iter().cloned())
+            .env(
+                "OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1",
+                std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1")
+                    .ok_or_else(|| io::Error::other("manual quota fixture socket absent"))?,
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+    }
+    generation.observe_manual(&intent).map_err(io::Error::other)
+}
+
+pub(super) fn readback_id_v3(
+    directory: &Path,
+    operation_id: &str,
+    uid: u32,
+    gid: u32,
+    generation: &super::fresh_index::KeyedGeneration,
+) -> io::Result<ManualQuotaReadback> {
+    let intent = v3_intent(directory, operation_id)?;
+    if intent.peer_uid != uid || intent.peer_gid != gid {
+        return Err(io::Error::other("v3 manual readback peer changed"));
+    }
+    generation.observe_manual(&intent).map_err(io::Error::other)
+}
+
 pub(super) fn readback(
     directory: &Path,
     request: &ManualQuotaRequest,
@@ -617,8 +811,8 @@ fn readback_intent(directory: &Path, intent: &Intent) -> io::Result<ManualQuotaR
     if q.version != 1 || Some(&q.effect_id) != intent.effect_id.as_ref() {
         return Err(io::Error::other("manual quota physical Q identity changed"));
     }
-    let stdout = fs::read(dir.join("stdout.bin"))?;
-    let stderr = fs::read(dir.join("stderr.bin"))?;
+    let stdout = read_bytes(&dir.join("stdout.bin"))?;
+    let stderr = read_bytes(&dir.join("stderr.bin"))?;
     if stdout.len() as u64 != q.stdout_len
         || sha(&stdout) != q.stdout_sha256
         || stderr.len() as u64 != q.stderr_len
@@ -1686,15 +1880,23 @@ mod tests {
     }
 
     #[test]
-    fn private_v3_socket_refuses_manual_usage_before_k() {
+    fn private_v3_socket_announces_manual_before_k() {
         if std::env::var_os("AGE319_MANUAL_V3_SOCKET_INNER").is_none() {
             let output = Command::new("unshare")
                 .args(["-Urpfm", "--mount-proc"])
                 .arg(std::env::current_exe().unwrap())
-                .args(["--exact", "linux_main::manual_quota::tests::private_v3_socket_refuses_manual_usage_before_k", "--nocapture"])
+                .args([
+                    "--exact",
+                    "linux_main::manual_quota::tests::private_v3_socket_announces_manual_before_k",
+                    "--nocapture",
+                ])
                 .env("AGE319_MANUAL_V3_SOCKET_INNER", "1")
-                .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", "/tmp/age319-manual-v3-fixture")
-                .output().unwrap();
+                .env(
+                    "OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1",
+                    "/tmp/age319-manual-v3-fixture",
+                )
+                .output()
+                .unwrap();
             assert!(
                 output.status.success(),
                 "stdout: {}\nstderr: {}",
@@ -1704,6 +1906,15 @@ mod tests {
             return;
         }
         let f = Fixture::new("printf '{\"used_percent\":31}'");
+        let providers_path = f.source.join("providers.toml");
+        let providers = fs::read_to_string(&providers_path).unwrap();
+        fs::write(
+            &providers_path,
+            providers
+                .replace("[first]\n", "[first]\nprompt_mode = 'stdin'\n")
+                .replace("[second]\n", "[second]\nprompt_mode = 'stdin'\n"),
+        )
+        .unwrap();
         let state = f._temp.path().join("state");
         fs::create_dir_all(&state).unwrap();
         use std::os::unix::fs::PermissionsExt;
@@ -1741,16 +1952,458 @@ mod tests {
         assert!(std::os::unix::net::UnixStream::connect(&socket).is_ok());
         let request = f.request("first");
         let source = File::open(&f.source).unwrap();
+        let started = oulipoly_kernel_broker::protocol::private_manual_quota_at(
+            &socket,
+            &request,
+            true,
+            Some(source.as_raw_fd()),
+        )
+        .unwrap();
+        assert_eq!(started.state, "unknown");
         assert!(
-            oulipoly_kernel_broker::protocol::private_manual_quota_at(
-                &socket,
-                &request,
-                true,
-                Some(source.as_raw_fd()),
-            )
-            .is_err()
+            root.join("manual-quota")
+                .join(&request.operation_id)
+                .join("k.json")
+                .exists()
         );
-        assert!(!root.join("manual-quota").exists());
+        let generation = super::super::fresh_index::KeyedGeneration::open(&root).unwrap();
+        assert_eq!(
+            generation.manual_flight("physical-first").unwrap(),
+            Some(request.operation_id)
+        );
         assert!(super::super::fresh_index::Index::open(&root).is_err());
+    }
+
+    #[test]
+    fn v3_manual_post_k_unknown_survives_restart_without_second_k() {
+        let f = Fixture::new(r#"printf '{"used_percent":24,"resets_at":"2099-01-01T00:00:00Z"}'"#);
+        let path = f.source.join("providers.toml");
+        let providers = fs::read_to_string(&path).unwrap();
+        fs::write(
+            &path,
+            providers
+                .replace("[first]\n", "[first]\nprompt_mode = 'stdin'\n")
+                .replace("[second]\n", "[second]\nprompt_mode = 'stdin'\n"),
+        )
+        .unwrap();
+        let socket = f._temp.path().join("absent.sock");
+        drop(broker_admission_lease(&f.ledger).unwrap());
+        super::super::fresh_index::rebuild_keyed_offline(&f.ledger, &socket, &f.source).unwrap();
+        let lease = broker_admission_lease(&f.ledger).unwrap();
+        let generation = super::super::fresh_index::KeyedGeneration::admit_provider_readback(
+            &f.ledger, &lease, &f.source,
+        )
+        .unwrap();
+        let source = File::open(&f.source).unwrap();
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        let request = f.request("first");
+        // This test uses an isolated source tree and the suite's serial test
+        // mode; the injected failure occurs after the physical K fsync.
+        unsafe {
+            std::env::set_var(
+                "OULIPOLY_KERNEL_BROKER_FIXTURE_FAIL_MANUAL_POST_K_CAS_V3_V1",
+                "1",
+            );
+        }
+        let failed = begin_v3(&f.ledger, &source, &request, uid, gid, &generation);
+        unsafe {
+            std::env::remove_var("OULIPOLY_KERNEL_BROKER_FIXTURE_FAIL_MANUAL_POST_K_CAS_V3_V1");
+        }
+        assert!(failed.unwrap_err().to_string().contains("post-K CAS"));
+        let dir = operation_dir(&f.ledger, &request.operation_id);
+        let k = fs::read(dir.join("k.json")).unwrap();
+        assert!(!dir.join("q.json").exists());
+        assert_eq!(
+            readback_id_v3(&f.ledger, &request.operation_id, uid, gid, &generation)
+                .unwrap()
+                .state,
+            "unknown"
+        );
+        drop(generation);
+        drop(lease);
+        let lease = broker_admission_lease(&f.ledger).unwrap();
+        let restarted = super::super::fresh_index::KeyedGeneration::admit_provider_readback(
+            &f.ledger, &lease, &f.source,
+        )
+        .unwrap();
+        assert_eq!(
+            begin_v3(&f.ledger, &source, &request, uid, gid, &restarted)
+                .unwrap()
+                .state,
+            "unknown"
+        );
+        let follower = f.request("first");
+        let reused = begin_v3(&f.ledger, &source, &follower, uid, gid, &restarted).unwrap();
+        assert_eq!(reused.state, "unknown");
+        assert_eq!(
+            reused.effect_id,
+            readback_id_v3(&f.ledger, &request.operation_id, uid, gid, &restarted)
+                .unwrap()
+                .effect_id
+        );
+        assert_eq!(fs::read(dir.join("k.json")).unwrap(), k);
+        assert!(
+            !operation_dir(&f.ledger, &follower.operation_id)
+                .join("k.json")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn v3_manual_refuses_changed_source_environment_and_account_before_k() {
+        let f = Fixture::new("printf '{}'");
+        let path = f.source.join("providers.toml");
+        let providers = fs::read_to_string(&path).unwrap();
+        fs::write(
+            &path,
+            providers
+                .replace("[first]\n", "[first]\nprompt_mode = 'stdin'\n")
+                .replace("[second]\n", "[second]\nprompt_mode = 'stdin'\n"),
+        )
+        .unwrap();
+        let socket = f._temp.path().join("absent.sock");
+        drop(broker_admission_lease(&f.ledger).unwrap());
+        super::super::fresh_index::rebuild_keyed_offline(&f.ledger, &socket, &f.source).unwrap();
+        let lease = broker_admission_lease(&f.ledger).unwrap();
+        let generation = super::super::fresh_index::KeyedGeneration::admit_provider_readback(
+            &f.ledger, &lease, &f.source,
+        )
+        .unwrap();
+        let source = File::open(&f.source).unwrap();
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        let request = f.request("first");
+        assert_eq!(
+            begin_v3(&f.ledger, &source, &request, uid, gid, &generation)
+                .unwrap()
+                .state,
+            "unknown"
+        );
+        let mut changed_env = request.clone();
+        changed_env.environment[0].1 = "/different/path".into();
+        assert!(begin_v3(&f.ledger, &source, &changed_env, uid, gid, &generation).is_err());
+        let mut changed_account = f.request("first");
+        changed_account.account = "missing".into();
+        assert!(begin_v3(&f.ledger, &source, &changed_account, uid, gid, &generation).is_err());
+        let unmetered = f.request("second");
+        assert_eq!(
+            begin_v3(&f.ledger, &source, &unmetered, uid, gid, &generation)
+                .unwrap()
+                .state,
+            "unmetered"
+        );
+        assert!(
+            !operation_dir(&f.ledger, &unmetered.operation_id)
+                .join("k.json")
+                .exists()
+        );
+        fs::write(
+            &path,
+            providers.replace("quota_script", "quota_script_changed"),
+        )
+        .unwrap();
+        let mut changed_source = request.clone();
+        changed_source.operation_id = uuid::Uuid::new_v4().to_string();
+        assert!(begin_v3(&f.ledger, &source, &changed_source, uid, gid, &generation).is_err());
+        assert!(
+            !operation_dir(&f.ledger, &changed_source.operation_id)
+                .join("k.json")
+                .exists()
+        );
+        let unsupported_config = providers
+            .replace("[first]\n", "[first]\nprompt_mode = 'stdin'\n")
+            .replace("[second]\n", "[second]\nprompt_mode = 'stdin'\n")
+            .replacen("command = '/bin/true'", "command = 'env /bin/true'", 1);
+        fs::write(&path, unsupported_config).unwrap();
+        let unsupported = f.request("first");
+        assert!(
+            begin_v3(&f.ledger, &source, &unsupported, uid, gid, &generation)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported")
+        );
+        assert!(
+            !operation_dir(&f.ledger, &unsupported.operation_id)
+                .join("k.json")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn v3_manual_physical_q_owns_newest_route_fact() {
+        use super::super::fresh_index::{KeyedGeneration, RouteEligibility, rebuild_keyed_offline};
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("quota.sh");
+        let f = Fixture::new(&format!("sh {}", script.display()));
+        let path = f.source.join("providers.toml");
+        let providers = fs::read_to_string(&path).unwrap();
+        fs::write(
+            &path,
+            providers
+                .replace("[first]\n", "[first]\nprompt_mode = 'stdin'\n")
+                .replace("[second]\n", "[second]\nprompt_mode = 'stdin'\n"),
+        )
+        .unwrap();
+        let socket = f._temp.path().join("absent.sock");
+        drop(broker_admission_lease(&f.ledger).unwrap());
+        rebuild_keyed_offline(&f.ledger, &socket, &f.source).unwrap();
+        let lease = broker_admission_lease(&f.ledger).unwrap();
+        let generation =
+            KeyedGeneration::admit_provider_readback(&f.ledger, &lease, &f.source).unwrap();
+        let source = File::open(&f.source).unwrap();
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        for (body, expected, eligibility) in [
+            (
+                "printf '{\"used_percent\":20,\"resets_at\":\"2099-01-01T00:00:00Z\"}'",
+                "valid_windows",
+                "eligible",
+            ),
+            ("printf 'invalid quota'", "invalid", "probe"),
+            (
+                "printf '{\"windows\":[{\"used_percent\":20,\"resets_at\":\"2099-01-01T00:00:00Z\"},{\"used_percent\":100,\"resets_at\":\"2099-01-01T00:00:00Z\"}]}'",
+                "valid_windows",
+                "excluded",
+            ),
+            ("exit 7", "failed", "probe"),
+        ] {
+            fs::write(&script, body).unwrap();
+            let request = f.request("first");
+            assert_eq!(
+                begin_v3(&f.ledger, &source, &request, uid, gid, &generation)
+                    .unwrap()
+                    .state,
+                "unknown"
+            );
+            let dir = operation_dir(&f.ledger, &request.operation_id);
+            worker_with_environment(&dir, &request.environment).unwrap();
+            let result =
+                readback_id_v3(&f.ledger, &request.operation_id, uid, gid, &generation).unwrap();
+            assert_eq!(result.outcome.as_deref(), Some(expected));
+            let intent = v3_intent(&f.ledger, &request.operation_id).unwrap();
+            let key = v3_source_key(&intent).unwrap();
+            let fact = generation
+                .route_facts(
+                    "physical-first",
+                    Some(&key),
+                    "work",
+                    &request.config_sha256,
+                    Utc::now().timestamp(),
+                )
+                .unwrap();
+            assert!(
+                match eligibility {
+                    "eligible" => matches!(fact, RouteEligibility::Eligible { .. }),
+                    "probe" => fact == RouteEligibility::ProbeRequired,
+                    "excluded" => fact == RouteEligibility::Excluded,
+                    _ => false,
+                },
+                "{eligibility}: {fact:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn v3_manual_cross_model_follower_shares_one_physical_k_then_refreshes() {
+        use super::super::fresh_index::{KeyedGeneration, rebuild_keyed_offline};
+        let f = Fixture::new(r#"printf '{"used_percent":24,"resets_at":"2099-01-01T00:00:00Z"}'"#);
+        let path = f.source.join("providers.toml");
+        let providers = fs::read_to_string(&path).unwrap();
+        fs::write(
+            &path,
+            providers
+                .replace("[first]\n", "[first]\nprompt_mode = 'stdin'\n")
+                .replace("[second]\n", "[second]\nprompt_mode = 'stdin'\n"),
+        )
+        .unwrap();
+        fs::write(
+            f.source.join("models/alias.toml"),
+            "[[providers]]\nname = 'first'\n",
+        )
+        .unwrap();
+        let socket = f._temp.path().join("absent.sock");
+        drop(broker_admission_lease(&f.ledger).unwrap());
+        rebuild_keyed_offline(&f.ledger, &socket, &f.source).unwrap();
+        let lease = broker_admission_lease(&f.ledger).unwrap();
+        let generation =
+            KeyedGeneration::admit_provider_readback(&f.ledger, &lease, &f.source).unwrap();
+        let source = File::open(&f.source).unwrap();
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        let first = f.request("first");
+        assert_eq!(
+            begin_v3(&f.ledger, &source, &first, uid, gid, &generation)
+                .unwrap()
+                .state,
+            "unknown"
+        );
+        let alias_pool = oulipoly_runtime::executor::cli::fresh_remote::load_fresh_headless_pool(
+            &f.source, "alias",
+        )
+        .unwrap();
+        let alias = ManualQuotaRequest {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            model: "alias".into(),
+            account: "first".into(),
+            config_sha256: alias_pool.config_sha256,
+            environment: first.environment.clone(),
+        };
+        let follower = begin_v3(&f.ledger, &source, &alias, uid, gid, &generation).unwrap();
+        assert_eq!(follower.state, "unknown");
+        assert_eq!(
+            follower.effect_id,
+            readback_id_v3(&f.ledger, &first.operation_id, uid, gid, &generation)
+                .unwrap()
+                .effect_id
+        );
+        assert!(
+            !operation_dir(&f.ledger, &alias.operation_id)
+                .join("k.json")
+                .exists()
+        );
+        worker_with_environment(
+            &operation_dir(&f.ledger, &first.operation_id),
+            &first.environment,
+        )
+        .unwrap();
+        assert_eq!(
+            readback_id_v3(&f.ledger, &alias.operation_id, uid, gid, &generation)
+                .unwrap()
+                .outcome
+                .as_deref(),
+            Some("valid_windows")
+        );
+        drop(generation);
+        drop(lease);
+        let lease = broker_admission_lease(&f.ledger).unwrap();
+        let restarted =
+            KeyedGeneration::admit_provider_readback(&f.ledger, &lease, &f.source).unwrap();
+        assert_eq!(
+            readback_id_v3(&f.ledger, &alias.operation_id, uid, gid, &restarted)
+                .unwrap()
+                .outcome
+                .as_deref(),
+            Some("valid_windows")
+        );
+        let later = f.request("first");
+        assert_eq!(
+            begin_v3(&f.ledger, &source, &later, uid, gid, &restarted)
+                .unwrap()
+                .state,
+            "unknown"
+        );
+        assert!(
+            operation_dir(&f.ledger, &later.operation_id)
+                .join("k.json")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn v3_manual_exact_io_is_constant_with_hundreds_of_settled_sources() {
+        use super::super::fresh_index::{
+            KeyedGeneration, ReaderIo, ReaderIoGuard, last_reader_io, measure_keyed_io,
+            rebuild_keyed_offline,
+        };
+        fn measured(count: usize) -> Vec<(super::super::fresh_index::KeyedIoCount, ReaderIo)> {
+            let f =
+                Fixture::new(r#"printf '{"used_percent":24,"resets_at":"2099-01-01T00:00:00Z"}'"#);
+            let path = f.source.join("providers.toml");
+            let providers = fs::read_to_string(&path).unwrap();
+            fs::write(
+                &path,
+                providers
+                    .replace("[first]\n", "[first]\nprompt_mode = 'stdin'\n")
+                    .replace("[second]\n", "[second]\nprompt_mode = 'stdin'\n"),
+            )
+            .unwrap();
+            let socket = f._temp.path().join("absent.sock");
+            drop(broker_admission_lease(&f.ledger).unwrap());
+            rebuild_keyed_offline(&f.ledger, &socket, &f.source).unwrap();
+            let lease = broker_admission_lease(&f.ledger).unwrap();
+            let generation =
+                KeyedGeneration::admit_provider_readback(&f.ledger, &lease, &f.source).unwrap();
+            let source = File::open(&f.source).unwrap();
+            let uid = unsafe { libc::getuid() };
+            let gid = unsafe { libc::getgid() };
+            for n in 0..count {
+                let mut request = f.request("first");
+                request.environment.push(("SOURCE".into(), n.to_string()));
+                assert_eq!(
+                    begin_v3(&f.ledger, &source, &request, uid, gid, &generation)
+                        .unwrap()
+                        .state,
+                    "unknown"
+                );
+                worker_with_environment(
+                    &operation_dir(&f.ledger, &request.operation_id),
+                    &request.environment,
+                )
+                .unwrap();
+                assert_eq!(
+                    readback_id_v3(&f.ledger, &request.operation_id, uid, gid, &generation)
+                        .unwrap()
+                        .outcome
+                        .as_deref(),
+                    Some("valid_windows")
+                );
+            }
+            let mut request = f.request("first");
+            request.environment.push(("SOURCE".into(), "writer".into()));
+            let step = |label: &'static str, run: &mut dyn FnMut()| {
+                let (_, keyed) = measure_keyed_io(|| {
+                    let _guard = ReaderIoGuard::start(label);
+                    run();
+                });
+                (keyed, last_reader_io().unwrap())
+            };
+            let begin = step("v3-manual-begin", &mut || {
+                assert_eq!(
+                    begin_v3(&f.ledger, &source, &request, uid, gid, &generation)
+                        .unwrap()
+                        .state,
+                    "unknown"
+                );
+            });
+            worker_with_environment(
+                &operation_dir(&f.ledger, &request.operation_id),
+                &request.environment,
+            )
+            .unwrap();
+            let settle = step("v3-manual-settle", &mut || {
+                assert_eq!(
+                    readback_id_v3(&f.ledger, &request.operation_id, uid, gid, &generation)
+                        .unwrap()
+                        .outcome
+                        .as_deref(),
+                    Some("valid_windows")
+                );
+            });
+            let read = step("v3-manual-read", &mut || {
+                assert_eq!(
+                    readback_id_v3(&f.ledger, &request.operation_id, uid, gid, &generation)
+                        .unwrap()
+                        .outcome
+                        .as_deref(),
+                    Some("valid_windows")
+                );
+            });
+            vec![begin, settle, read]
+        }
+        let small = measured(1);
+        let large = measured(205);
+        eprintln!("v3 manual begin/settle/read keyed+physical 1={small:?} 205={large:?}");
+        for (one, many) in small.iter().zip(&large) {
+            assert_eq!(one.0.open_attempts, many.0.open_attempts);
+            assert_eq!(one.0.opened, many.0.opened);
+            assert_eq!(one.1.open_attempts, many.1.open_attempts);
+            assert_eq!(one.1.opened, many.1.opened);
+            assert_eq!(one.0.directory_entries + one.1.directory_entries, 0);
+            assert_eq!(many.0.directory_entries + many.1.directory_entries, 0);
+        }
+        assert!(small[0].0.bytes_written + small[0].1.bytes_written > 0);
+        assert!(small[1].0.bytes_written + small[1].1.bytes_written > 0);
+        assert_eq!(small[2].0.bytes_written + small[2].1.bytes_written, 0);
     }
 }

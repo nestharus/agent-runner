@@ -1,6 +1,6 @@
-//! Frozen v3 importer and a separate private, readback-only admission. The v2
-//! Index deliberately refuses this manifest. The keyed route facts below do
-//! not authorize a route or K writer.
+//! Frozen v3 importer and private keyed account-effect admission. The v2 Index
+//! deliberately refuses this manifest. Route selection and provider K remain
+//! closed here.
 use super::*;
 use chrono::Utc;
 use keyed_store::{Change, KeyedAccountStore};
@@ -151,6 +151,419 @@ impl KeyedGeneration {
             },
         )?;
         self.account(account)?;
+        Ok(())
+    }
+
+    pub(crate) fn check_manual_model(&self, model: &str, config: &str) -> Result<()> {
+        self.check_current()?;
+        let ledger: BTreeMap<String, String> = read(&self.storage.join("source-models.json"))?
+            .ok_or(IndexError::RebuildRequired(
+                "v3 manual source model ledger absent",
+            ))?;
+        if ledger.get(model).is_some_and(|prior| prior != config) {
+            return Err(IndexError::Conflict("v3 manual model config changed"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn manual_flight(&self, account: &str) -> Result<Option<String>> {
+        self.check_current()?;
+        let digest = keyed(&account)?;
+        let path = self.storage.join("keyed-accounts").join(&digest);
+        if !path.exists() {
+            if self
+                .storage
+                .join("account-catalog")
+                .join(format!("{digest}.json"))
+                .exists()
+            {
+                return Err(IndexError::RebuildRequired(
+                    "v3 manual account catalog incomplete",
+                ));
+            }
+            return Ok(None);
+        }
+        let store = self.account(account)?;
+        let (revision, pending_count, mut values) =
+            store.read_many(&[("account", "summary"), ("manual-flight", "account")])?;
+        let flight: Option<Artifact> = typed(values.pop().unwrap())?;
+        let summary = values.pop().unwrap().ok_or(IndexError::RebuildRequired(
+            "v3 manual account summary absent",
+        ))?;
+        if revision == 0 || summary["pending_count"].as_u64() != Some(pending_count) {
+            return Err(corrupt("v3 manual account revision differs"));
+        }
+        match (pending_count, flight) {
+            (0, None) => Ok(None),
+            (1, Some(artifact)) => {
+                artifact.require_present(&self.root)?;
+                let id = Path::new(&artifact.path)
+                    .parent()
+                    .and_then(|parent| parent.file_name())
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| corrupt("v3 manual flight path invalid"))?;
+                let pending: PendingHead =
+                    typed(store.get("pending", &format!("effect:{id}"))?)?
+                        .ok_or(IndexError::Conflict("v3 manual flight debt absent"))?;
+                if pending.announcement != artifact || pending.kind != "ManualQuota" {
+                    return Err(corrupt("v3 manual flight debt differs"));
+                }
+                Ok(Some(id.to_owned()))
+            }
+            _ => Err(IndexError::Conflict("v3 physical account has pending debt")),
+        }
+    }
+
+    pub(crate) fn announce_manual(
+        &self,
+        intent: &super::super::manual_quota::Intent,
+    ) -> Result<u64> {
+        let directory = &self.root;
+        let id = &intent.request.operation_id;
+        let physical = super::super::manual_quota::v3_intent(directory, id)
+            .map_err(|e| corrupt(format!("v3 manual intent: {e}")))?;
+        if &physical != intent {
+            return Err(corrupt("v3 manual physical intent changed"));
+        }
+        self.ensure_quota_account(
+            &intent.physical_account_id,
+            &intent.request.model,
+            &intent.request.config_sha256,
+        )?;
+        let store = self.account(&intent.physical_account_id)?;
+        let source = super::super::manual_quota::v3_source_key(intent)
+            .map_err(|e| corrupt(e.to_string()))?;
+        let artifact = Artifact::from_existing(
+            directory,
+            Path::new(&format!("manual-quota/{id}/intent.json")),
+        )?;
+        let effect = EffectIntent {
+            kind: EffectKind::ManualQuota,
+            source: source.clone(),
+            decision_handoff: String::new(),
+            route_source: None,
+            candidate: None,
+            intent: artifact.clone(),
+            reuse: None,
+            consumed_k: None,
+            certified_q: None,
+            result: None,
+        };
+        let (revision, pending_count, mut values) = store.read_many(&[
+            ("account", "summary"),
+            ("manual", id),
+            ("manual-flight", "account"),
+        ])?;
+        let flight: Option<Artifact> = typed(values.pop().unwrap())?;
+        if values.pop().unwrap().is_some() {
+            return Err(IndexError::Conflict("v3 manual already announced"));
+        }
+        let mut summary = values.pop().unwrap().ok_or(IndexError::RebuildRequired(
+            "v3 manual account summary absent",
+        ))?;
+        if summary["pending_count"].as_u64() != Some(pending_count)
+            || summary["unknown_marker_scope"].as_bool() != Some(false)
+        {
+            return Err(IndexError::Conflict("v3 manual account state changed"));
+        }
+        let alias = intent.source_operation_id.is_some();
+        if alias {
+            let peer = intent.source_operation_id.as_ref().unwrap();
+            let peer_artifact = Artifact::from_existing(
+                directory,
+                Path::new(&format!("manual-quota/{peer}/intent.json")),
+            )?;
+            if pending_count != 1 || flight.as_ref() != Some(&peer_artifact) {
+                return Err(IndexError::Conflict("v3 manual peer flight changed"));
+            }
+        } else if pending_count != 0 || flight.is_some() {
+            return Err(IndexError::Conflict("v3 manual account has pending debt"));
+        }
+        let count = summary["effect_count"]
+            .as_u64()
+            .ok_or_else(|| corrupt("v3 manual effect count absent"))?;
+        summary["effect_count"] = count
+            .checked_add(1)
+            .ok_or(IndexError::Conflict("v3 manual effect count overflow"))?
+            .into();
+        let physical = !alias && intent.quota_script.is_some();
+        if physical {
+            summary["pending_count"] = 1.into();
+        }
+        let next = store.commit(revision, {
+            let mut changes = vec![
+                change("manual", id, &effect)?,
+                change("account", "summary", &summary)?,
+            ];
+            if physical {
+                changes.push(change(
+                    "pending",
+                    &format!("effect:{id}"),
+                    &PendingHead {
+                        announcement: artifact.clone(),
+                        candidate: None,
+                        physical_k: None,
+                        source: Some(source),
+                        model: Some(intent.request.model.clone()),
+                        config_sha256: Some(intent.request.config_sha256.clone()),
+                        decision_handoff: String::new(),
+                        kind: "ManualQuota".into(),
+                    },
+                )?);
+                changes.push(change("manual-flight", "account", &artifact)?);
+            }
+            changes
+        })?;
+        self.check_current()?;
+        Ok(next)
+    }
+
+    pub(crate) fn record_manual_k(
+        &self,
+        intent: &super::super::manual_quota::Intent,
+        expected_revision: u64,
+    ) -> Result<()> {
+        self.check_current()?;
+        let id = &intent.request.operation_id;
+        if intent.source_operation_id.is_some() || intent.quota_script.is_none() {
+            return Err(IndexError::Conflict("v3 manual nonphysical K"));
+        }
+        let k =
+            Artifact::from_existing(&self.root, Path::new(&format!("manual-quota/{id}/k.json")))?;
+        let value: serde_json::Value = k.read_json(&self.root)?;
+        if value["version"] != 1
+            || value["operation_id"] != *id
+            || value["effect_id"].as_str() != intent.effect_id.as_deref()
+        {
+            return Err(corrupt("v3 manual K identity changed"));
+        }
+        let store = self.account(&intent.physical_account_id)?;
+        let (revision, pending_count, mut values) =
+            store.read_many(&[("manual", id), ("pending", &format!("effect:{id}"))])?;
+        let mut pending: PendingHead = typed(values.pop().unwrap())?
+            .ok_or(IndexError::Conflict("v3 manual pending absent"))?;
+        let mut effect: EffectIntent = typed(values.pop().unwrap())?
+            .ok_or(IndexError::Conflict("v3 manual announcement absent"))?;
+        let source = super::super::manual_quota::v3_source_key(intent)
+            .map_err(|e| corrupt(e.to_string()))?;
+        let physical_intent = Artifact::from_existing(
+            &self.root,
+            Path::new(&format!("manual-quota/{id}/intent.json")),
+        )?;
+        if revision != expected_revision
+            || pending_count != 1
+            || pending.announcement != effect.intent
+            || effect.intent != physical_intent
+            || effect.source != source
+            || pending.source.as_ref() != Some(&source)
+            || effect.kind != EffectKind::ManualQuota
+            || effect.consumed_k.is_some()
+            || pending.physical_k.is_some()
+        {
+            return Err(IndexError::Conflict("v3 manual K revision changed"));
+        }
+        #[cfg(feature = "age319-private-broker-fixture")]
+        if std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_FAIL_MANUAL_POST_K_CAS_V3_V1").is_some()
+        {
+            return Err(IndexError::Conflict("fixture v3 manual post-K CAS failure"));
+        }
+        effect.consumed_k = Some(k.clone());
+        pending.physical_k = Some(k);
+        store.commit(
+            revision,
+            vec![
+                change("manual", id, &effect)?,
+                change("pending", &format!("effect:{id}"), &pending)?,
+            ],
+        )?;
+        self.check_current()?;
+        Ok(())
+    }
+
+    pub(crate) fn observe_manual(
+        &self,
+        intent: &super::super::manual_quota::Intent,
+    ) -> Result<oulipoly_kernel_broker::protocol::ManualQuotaReadback> {
+        self.check_current()?;
+        let id = &intent.request.operation_id;
+        let retained = super::super::manual_quota::v3_intent(&self.root, id)
+            .map_err(|e| corrupt(format!("v3 manual readback: {e}")))?;
+        if &retained != intent {
+            return Err(corrupt("v3 manual readback intent changed"));
+        }
+        let store = self.account(&intent.physical_account_id)?;
+        let effect: EffectIntent = typed(store.get("manual", id)?)?
+            .ok_or(IndexError::Conflict("v3 manual keyed intent absent"))?;
+        let artifact = Artifact::from_existing(
+            &self.root,
+            Path::new(&format!("manual-quota/{id}/intent.json")),
+        )?;
+        if effect.kind != EffectKind::ManualQuota
+            || effect.intent != artifact
+            || effect.source
+                != super::super::manual_quota::v3_source_key(intent)
+                    .map_err(|e| corrupt(e.to_string()))?
+        {
+            return Err(corrupt("v3 manual keyed intent/source differs"));
+        }
+        if let Some(peer) = &intent.source_operation_id {
+            if effect.consumed_k.is_some() || effect.certified_q.is_some() {
+                return Err(corrupt("v3 manual follower owns physical K/Q"));
+            }
+            let source = super::super::manual_quota::v3_intent(&self.root, peer)
+                .map_err(|e| corrupt(format!("v3 manual peer: {e}")))?;
+            if source.source_operation_id.is_some()
+                || source.physical_account_id != intent.physical_account_id
+                || source.effect_id != intent.effect_id
+                || super::super::manual_quota::v3_source_key(&source)
+                    .map_err(|e| corrupt(e.to_string()))?
+                    != effect.source
+            {
+                return Err(corrupt("v3 manual peer provenance changed"));
+            }
+            self.observe_manual_source(&source)?;
+        } else {
+            self.observe_manual_source(intent)?;
+        }
+        super::super::manual_quota::v3_readback(&self.root, intent)
+            .map_err(|e| corrupt(format!("v3 manual physical readback: {e}")))
+    }
+
+    fn observe_manual_source(&self, intent: &super::super::manual_quota::Intent) -> Result<()> {
+        let id = &intent.request.operation_id;
+        if intent.source_operation_id.is_some() {
+            return Err(IndexError::Conflict("v3 manual source is follower"));
+        }
+        let result = super::super::manual_quota::v3_readback(&self.root, intent)
+            .map_err(|e| corrupt(format!("v3 manual physical Q: {e}")))?;
+        if result.state != "drained" {
+            return Ok(());
+        }
+        let k =
+            Artifact::from_existing(&self.root, Path::new(&format!("manual-quota/{id}/k.json")))?;
+        let q_ref =
+            Artifact::from_existing(&self.root, Path::new(&format!("manual-quota/{id}/q.json")))?;
+        let q = PhysicalQ {
+            physical_k: k.clone(),
+            q: q_ref.clone(),
+            terminal: None,
+            completed_unix_nanos: i64::try_from(
+                super::super::manual_quota::physical_q_nanos(&self.root, id)
+                    .map_err(|e| corrupt(e.to_string()))?,
+            )
+            .map_err(|_| corrupt("v3 manual Q time overflow"))?,
+        };
+        let source_key = super::super::manual_quota::v3_source_key(intent)
+            .map_err(|e| corrupt(e.to_string()))?;
+        let digest = keyed(&source_key)?;
+        let store = self.account(&intent.physical_account_id)?;
+        let (revision, pending_count, mut values) = store.read_many(&[
+            ("account", "summary"),
+            ("manual", id),
+            ("pending", &format!("effect:{id}")),
+            ("source", &digest),
+            ("manual-flight", "account"),
+        ])?;
+        let flight: Option<Artifact> = typed(values.pop().unwrap())?;
+        let old_source: Option<SourceHead> = typed(values.pop().unwrap())?;
+        let pending: Option<PendingHead> = typed(values.pop().unwrap())?;
+        let mut effect: EffectIntent =
+            typed(values.pop().unwrap())?.ok_or(IndexError::Conflict("v3 manual effect absent"))?;
+        let mut summary = values
+            .pop()
+            .unwrap()
+            .ok_or(IndexError::RebuildRequired("v3 manual summary absent"))?;
+        let physical_intent = Artifact::from_existing(
+            &self.root,
+            Path::new(&format!("manual-quota/{id}/intent.json")),
+        )?;
+        if effect.certified_q.as_ref() == Some(&q) && effect.result.as_ref() == Some(&q_ref) {
+            return Ok(());
+        }
+        if pending_count != 1
+            || summary["pending_count"].as_u64() != Some(1)
+            || effect.kind != EffectKind::ManualQuota
+            || effect.intent != physical_intent
+            || effect.source != source_key
+            || effect.consumed_k.as_ref() != Some(&k)
+            || effect.certified_q.is_some()
+            || effect.result.is_some()
+            || pending.as_ref().is_none_or(|p| {
+                p.announcement != effect.intent || p.physical_k.as_ref() != Some(&k)
+            })
+            || flight.as_ref() != Some(&effect.intent)
+        {
+            return Err(IndexError::Conflict("v3 manual Q/K/debt changed"));
+        }
+        let windows = result
+            .windows
+            .iter()
+            .map(|window| {
+                let reset = chrono::DateTime::parse_from_rfc3339(&window.resets_at)
+                    .map_err(|_| corrupt("v3 manual reset invalid"))?;
+                Ok(WindowHead {
+                    used_percent: window.used_percent,
+                    resets_at: window.resets_at.clone(),
+                    reset_unix_seconds: reset.timestamp(),
+                    remaining: window.remaining,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let observation = ObservationHead {
+            q: q.clone(),
+            result: Some(q_ref.clone()),
+            outcome: result.outcome.clone().unwrap_or_else(|| "unknown".into()),
+            origin_model: Some(intent.request.model.clone()),
+            origin_config_sha256: Some(intent.request.config_sha256.clone()),
+            completed_unix_seconds: result.completed_unix_seconds,
+            windows,
+        };
+        let mut source = old_source.clone().unwrap_or(SourceHead {
+            source: source_key.clone(),
+            quota: None,
+            auth: None,
+        });
+        if source.source != source_key {
+            return Err(corrupt("v3 manual source identity changed"));
+        }
+        if source
+            .quota
+            .as_ref()
+            .is_none_or(|old| old.q.completed_unix_nanos <= q.completed_unix_nanos)
+        {
+            source.quota = Some(observation);
+        }
+        effect.certified_q = Some(q);
+        effect.result = Some(q_ref);
+        summary["pending_count"] = 0.into();
+        if old_source.is_none() {
+            let count = summary["source_count"]
+                .as_u64()
+                .ok_or_else(|| corrupt("v3 manual source count absent"))?;
+            summary["source_count"] = count
+                .checked_add(1)
+                .ok_or(IndexError::Conflict("v3 manual source count overflow"))?
+                .into();
+        }
+        store.commit(
+            revision,
+            vec![
+                change("manual", id, &effect)?,
+                Change {
+                    class: "pending".into(),
+                    key: format!("effect:{id}"),
+                    value: None,
+                },
+                Change {
+                    class: "manual-flight".into(),
+                    key: "account".into(),
+                    value: None,
+                },
+                change("source", &digest, &source)?,
+                change("account", "summary", &summary)?,
+            ],
+        )?;
+        self.check_current()?;
         Ok(())
     }
 
@@ -1501,9 +1914,10 @@ impl KeyedGeneration {
                     common.consumed_k = actual.consumed_k.clone();
                     common.certified_q = actual.certified_q.clone();
                     common.result = actual.result.clone();
-                    if class != "effect"
-                        || !matches!(effect.kind, EffectKind::Quota | EffectKind::Auth)
-                        || effect.reuse.is_some()
+                    if !matches!(
+                        effect.kind,
+                        EffectKind::Quota | EffectKind::Auth | EffectKind::ManualQuota
+                    ) || effect.reuse.is_some()
                         || common != actual
                         || actual.consumed_k.is_some() && actual.consumed_k != effect.consumed_k
                         || actual.certified_q.is_some() && actual.certified_q != effect.certified_q
@@ -1586,6 +2000,35 @@ impl KeyedGeneration {
             if expected_auth_flight.is_some() {
                 expected_keys.insert(("auth-flight".to_owned(), "account".to_owned()));
             }
+            let mut manual_flights: Vec<_> = head
+                .pending
+                .values()
+                .filter(|pending| pending.kind == "ManualQuota")
+                .map(|pending| pending.announcement.clone())
+                .collect();
+            manual_flights.extend(
+                lag_effects
+                    .values()
+                    .filter(|effect| effect.kind == EffectKind::ManualQuota)
+                    .map(|effect| effect.intent.clone()),
+            );
+            manual_flights.sort_by(|a, b| a.path.cmp(&b.path));
+            manual_flights.dedup();
+            let expected_manual_flight =
+                (manual_flights.len() == 1).then(|| manual_flights[0].clone());
+            if store.get("manual-flight", "account")?
+                != expected_manual_flight
+                    .as_ref()
+                    .map(|artifact| {
+                        serde_json::to_value(artifact).map_err(|e| corrupt(e.to_string()))
+                    })
+                    .transpose()?
+            {
+                return Err(corrupt("v3 manual flight pointer differs"));
+            }
+            if expected_manual_flight.is_some() {
+                expected_keys.insert(("manual-flight".to_owned(), "account".to_owned()));
+            }
             for (id, effect) in &lag_effects {
                 let pending_key = format!("effect:{id}");
                 let pending: PendingHead = typed(store.get("pending", &pending_key)?)?
@@ -1596,10 +2039,10 @@ impl KeyedGeneration {
                     || pending.source.as_ref() != Some(&effect.source)
                     || pending.decision_handoff != effect.decision_handoff
                     || pending.kind
-                        != if effect.kind == EffectKind::Auth {
-                            "Auth"
-                        } else {
-                            "Quota"
+                        != match effect.kind {
+                            EffectKind::Auth => "Auth",
+                            EffectKind::ManualQuota => "ManualQuota",
+                            EffectKind::Quota => "Quota",
                         }
                 {
                     return Err(corrupt("v3 lagging quota pending debt differs"));
@@ -1879,6 +2322,18 @@ fn stage_account(root: &Path, staged: &Index, key: &str, mut account: Account) -
             &store,
             &mut revision,
             change("auth-flight", "account", &auth_flights[0].announcement)?,
+        )?;
+    }
+    let manual_flights: Vec<_> = head
+        .pending
+        .values()
+        .filter(|pending| pending.kind == "ManualQuota")
+        .collect();
+    if manual_flights.len() == 1 {
+        insert_checked(
+            &store,
+            &mut revision,
+            change("manual-flight", "account", &manual_flights[0].announcement)?,
         )?;
     }
     for (source, typed) in &head.sources {

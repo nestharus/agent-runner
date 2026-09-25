@@ -26,8 +26,9 @@ use std::os::unix::net::UnixStream;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-// The keyed generation has a separate private, provider-readback-only
-// admission. Route/effect/manual writers and physical K remain closed there.
+// The keyed generation has separate private admission. Quota, auth, and
+// manual account effects have explicit keyed writers; route and provider K
+// remain closed here.
 #[path = "fresh_index_keyed.rs"]
 #[allow(dead_code)]
 mod keyed_store;
@@ -39,6 +40,8 @@ pub(super) use keyed_store::measured as measure_keyed_io;
 #[allow(dead_code)]
 mod v3;
 pub(super) use v3::KeyedGeneration;
+#[cfg(test)]
+pub(super) use v3::RouteEligibility;
 
 pub(super) fn rebuild_keyed_offline(root: &Path, socket: &Path, source: &Path) -> Result<()> {
     v3::rebuild(root, socket, source).map(|_| ())
