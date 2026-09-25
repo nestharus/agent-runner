@@ -35,6 +35,7 @@ use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
@@ -245,11 +246,13 @@ struct Recipe {
 }
 
 pub(super) struct Plan {
-    image: File,
+    image: Option<File>,
+    path_execution: bool,
     configured_program: String,
     broker_resolved_path: PathBuf,
     image_descriptor: ImageDescriptor,
     preflight_image: ImagePreflight,
+    path_at_k: Option<ImageDescriptor>,
     cwd: File,
     input: File,
     stdin_dev_null: bool,
@@ -262,7 +265,13 @@ pub(super) struct Plan {
 impl Plan {
     fn verify(&self) -> io::Result<()> {
         let cwd = self.cwd.metadata()?;
-        if ImageDescriptor::of(&self.image)? != self.image_descriptor
+        if (!self.path_execution
+            && ImageDescriptor::of(
+                self.image
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("fresh provider image absent"))?,
+            )? != self.image_descriptor)
+            || (self.path_execution && !self.broker_resolved_path.is_absolute())
             || cwd.dev() != self.cwd_device
             || cwd.ino() != self.cwd_inode
             || !fully_sealed(&self.input)
@@ -282,7 +291,7 @@ fn fully_sealed(file: &File) -> bool {
 
 /// Only async-signal-safe writes are used from the post-fork child.
 unsafe fn write_exec_errno(error: i32) {
-    let prefix = b"fresh provider execveat failed errno=";
+    let prefix = b"fresh provider exec failed errno=";
     unsafe { libc::write(2, prefix.as_ptr().cast(), prefix.len()) };
     let mut digits = [0u8; 11];
     let mut at = digits.len();
@@ -303,16 +312,16 @@ unsafe fn write_exec_errno(error: i32) {
 /// different noexec/nosuid policy. This identity is stable across an in-place
 /// update; the host kernel decides what the inode contains and permits at exec.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-struct ImageDescriptor {
+pub(super) struct ImageDescriptor {
     device: u64,
     inode: u64,
     mount_id: u64,
 }
 
 /// Diagnostic observations made before K. These are never an attestation of
-/// the bytes or metadata later consumed by execveat on a mutable inode.
+/// the bytes or metadata later consumed by exec on a mutable inode/path.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-struct ImagePreflight {
+pub(super) struct ImagePreflight {
     metadata: ImageIdentity,
     observed_sha256: Option<String>,
     observed_shebang: Option<bool>,
@@ -548,6 +557,7 @@ pub(super) fn plan(
         argv,
         env,
         false,
+        None,
     )
 }
 
@@ -559,6 +569,7 @@ fn plan_with_environment_policy(
     argv: Vec<String>,
     env: Vec<(String, String)>,
     allow_bash_environment: bool,
+    selected_path_source: Option<(ImageDescriptor, ImagePreflight)>,
 ) -> io::Result<Plan> {
     let mut keys = HashSet::new();
     if !image_path.is_absolute()
@@ -580,12 +591,26 @@ fn plan_with_environment_policy(
     {
         return Err(io::Error::other("unsupported fresh provider plan"));
     }
-    let image = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_PATH)
-        .open(image_path)?;
-    let image_descriptor = ImageDescriptor::of(&image)?;
-    let preflight_image = ImagePreflight::observe(&image, image_path)?;
+    let image = if selected_path_source.is_some() {
+        None
+    } else {
+        Some(
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_PATH)
+                .open(image_path)?,
+        )
+    };
+    let (image_descriptor, preflight_image) = match selected_path_source {
+        Some(source) => source,
+        None => {
+            let image = image.as_ref().unwrap();
+            (
+                ImageDescriptor::of(image)?,
+                ImagePreflight::observe(image, image_path)?,
+            )
+        }
+    };
     let cwd = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
@@ -632,10 +657,12 @@ fn plan_with_environment_policy(
     );
     Ok(Plan {
         image,
+        path_execution: false,
         configured_program,
         broker_resolved_path: image_path.to_owned(),
         image_descriptor,
         preflight_image,
+        path_at_k: None,
         cwd,
         input,
         stdin_dev_null: false,
@@ -716,11 +743,13 @@ pub(super) fn plan_from_descriptors(
         ))?)
     );
     Ok(Plan {
-        image: resolved,
+        image: Some(resolved),
+        path_execution: false,
         configured_program: parsed.configured_program,
         broker_resolved_path: resolved_image.to_owned(),
         image_descriptor: resolved_descriptor,
         preflight_image,
+        path_at_k: None,
         cwd,
         input,
         stdin_dev_null: false,
@@ -743,6 +772,10 @@ struct Grant {
     image_descriptor: ImageDescriptor,
     /// Pre-K observation only. Mutable inode bytes/metadata may differ at exec.
     preflight_image: ImagePreflight,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path_at_k: Option<ImageDescriptor>,
+    #[serde(default)]
+    path_execution: bool,
 }
 
 pub(super) struct Prepared {
@@ -843,6 +876,10 @@ struct ChildWorkSelection {
     configured_program: String,
     broker_resolved_path: PathBuf,
     image_descriptor: ImageDescriptor,
+    #[serde(default)]
+    path_execution: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    selected_source: Option<ImagePreflight>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ordinary_command_sha256: Option<String>,
 }
@@ -968,7 +1005,15 @@ pub(super) fn require_ordinary_bash_command(
     Ok(())
 }
 
-pub(super) fn ordinary_bash_plan(command: &OrdinaryBashCommand) -> io::Result<Plan> {
+pub(super) enum OrdinarySelectedSource {
+    Descriptor,
+    Path(ImageDescriptor, ImagePreflight),
+}
+
+pub(super) fn ordinary_bash_plan(
+    command: &OrdinaryBashCommand,
+    selected_source: Option<OrdinarySelectedSource>,
+) -> io::Result<Plan> {
     if command.version != 1
         || command.argv.is_empty()
         || command.argv[0].is_empty()
@@ -981,9 +1026,9 @@ pub(super) fn ordinary_bash_plan(command: &OrdinaryBashCommand) -> io::Result<Pl
             "ordinary Bash command shape unavailable before K",
         ));
     }
-    // The pinned Bash image resolves PATH under its own effective credentials
-    // at original C. The broker checks that the selected path belongs to that
-    // exact command/PATH and pins the original inode; argv0 remains original.
+    // The pinned Bash image resolves PATH at original C. The broker binds that
+    // exact pathname and command; the source inode is an observation, not an
+    // execution identity for path-based ordinary commands.
     let first = Path::new(&command.argv[0]);
     let candidates: Vec<PathBuf> = if command.argv[0].contains('/') {
         vec![command.cwd.join(first)]
@@ -1011,22 +1056,13 @@ pub(super) fn ordinary_bash_plan(command: &OrdinaryBashCommand) -> io::Result<Pl
             "ordinary Bash resolved command differs from original PATH",
         ));
     }
-    let image = std::fs::canonicalize(&command.resolved_program)?;
-    let mut probe = File::open(&image)
-        .map_err(|_| io::Error::other("ordinary Bash executable format unavailable before K"))?;
-    let mut magic = [0u8; 4];
-    let count = probe.read(&mut magic)?;
-    if count >= 2 && magic[..2] == *b"#!" {
-        return Err(io::Error::other(
-            "ordinary Bash shebang script path semantics unavailable before K",
-        ));
-    }
-    if count < 4 || magic != *b"\x7fELF" {
-        return Err(io::Error::other(
-            "ordinary Bash execvp format fallback unavailable before K",
-        ));
-    }
-    preflight_ordinary_elf(&mut probe)?;
+    let image = &command.resolved_program;
+    let path_source = match &selected_source {
+        Some(OrdinarySelectedSource::Path(descriptor, preflight)) => {
+            Some((descriptor.clone(), preflight.clone()))
+        }
+        _ => None,
+    };
     let input_fd =
         unsafe { libc::memfd_create(c"ordinary-bash-empty-input".as_ptr(), libc::MFD_CLOEXEC) };
     if input_fd < 0 {
@@ -1034,123 +1070,106 @@ pub(super) fn ordinary_bash_plan(command: &OrdinaryBashCommand) -> io::Result<Pl
     }
     let input = unsafe { File::from_raw_fd(input_fd) };
     let mut plan = plan_with_environment_policy(
-        &image,
+        image,
         &command.cwd,
         &input,
         command.argv[0].clone(),
         command.argv[1..].to_vec(),
         command.environment.clone(),
         true,
+        path_source,
     )?;
+    plan.path_execution = match selected_source {
+        Some(OrdinarySelectedSource::Path(..)) => true,
+        Some(OrdinarySelectedSource::Descriptor) => false,
+        None => {
+            let readable = File::open(image).ok();
+            !readable.is_some_and(|mut file| {
+                let mut magic = [0u8; 4];
+                ImageDescriptor::of(&file).ok() == Some(plan.image_descriptor.clone())
+                    && file.read_exact(&mut magic).is_ok()
+                    && magic == *b"\x7fELF"
+            })
+        }
+    };
+    if plan.path_execution {
+        // This source is advisory. A replacement before K is visible here,
+        // but another can occur before execve or the interpreter's open.
+        plan.path_at_k = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH)
+            .open(image)
+            .ok()
+            .and_then(|file| ImageDescriptor::of(&file).ok());
+    }
     // Legacy Bash redirects its workload stdin from the character device.
     // Keep the sealed empty input in the plan guard, but bind the ordinary
     // launch mode into the digest and use the same /dev/null fd type at exec.
     plan.stdin_dev_null = true;
-    plan.digest = format!(
-        "{:x}",
-        Sha256::digest(serde_json::to_vec(&(
-            &plan.digest,
-            "ordinary-stdin-dev-null-v1"
-        ))?)
-    );
+    plan.digest = if plan.path_execution {
+        format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&(
+                &plan.digest,
+                "ordinary-path-exec-stdin-dev-null-v1",
+                &plan.preflight_image,
+            ))?)
+        )
+    } else {
+        format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&(
+                &plan.digest,
+                "ordinary-stdin-dev-null-v1",
+            ))?)
+        )
+    };
     Ok(plan)
-}
-
-fn preflight_ordinary_elf(image: &mut File) -> io::Result<()> {
-    let unavailable = || io::Error::other("ordinary Bash ELF format unavailable before K");
-    let length = image.metadata()?.len();
-    if length < 64 {
-        return Err(unavailable());
-    }
-    image.seek(SeekFrom::Start(0))?;
-    let mut header = [0u8; 64];
-    image.read_exact(&mut header).map_err(|_| unavailable())?;
-    #[cfg(target_arch = "x86_64")]
-    let host_machine = 62u16;
-    #[cfg(target_arch = "aarch64")]
-    let host_machine = 183u16;
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    let host_machine = 0u16;
-    let elf_type = u16::from_le_bytes(header[16..18].try_into().unwrap());
-    let machine = u16::from_le_bytes(header[18..20].try_into().unwrap());
-    let version = u32::from_le_bytes(header[20..24].try_into().unwrap());
-    let phoff = u64::from_le_bytes(header[32..40].try_into().unwrap());
-    let ehsize = u16::from_le_bytes(header[52..54].try_into().unwrap());
-    let phentsize = u16::from_le_bytes(header[54..56].try_into().unwrap());
-    let phnum = u16::from_le_bytes(header[56..58].try_into().unwrap());
-    if header[..4] != *b"\x7fELF"
-        || header[4] != 2
-        || header[5] != 1
-        || header[6] != 1
-        || !matches!(elf_type, 2 | 3)
-        || machine != host_machine
-        || version != 1
-        || ehsize != 64
-        || phentsize != 56
-        || !(1..=256).contains(&phnum)
-        || phoff < 64
-        || phoff
-            .checked_add(u64::from(phnum) * 56)
-            .is_none_or(|end| end > length)
-    {
-        return Err(unavailable());
-    }
-    let mut executable_load = false;
-    let mut interpreter = None;
-    for index in 0..phnum {
-        image.seek(SeekFrom::Start(phoff + u64::from(index) * 56))?;
-        let mut program = [0u8; 56];
-        image.read_exact(&mut program).map_err(|_| unavailable())?;
-        let kind = u32::from_le_bytes(program[..4].try_into().unwrap());
-        let flags = u32::from_le_bytes(program[4..8].try_into().unwrap());
-        let offset = u64::from_le_bytes(program[8..16].try_into().unwrap());
-        let filesz = u64::from_le_bytes(program[32..40].try_into().unwrap());
-        let memsz = u64::from_le_bytes(program[40..48].try_into().unwrap());
-        if offset.checked_add(filesz).is_none_or(|end| end > length) {
-            return Err(unavailable());
-        }
-        if kind == 1 {
-            if filesz > memsz {
-                return Err(unavailable());
-            }
-            executable_load |= flags & 1 != 0 && memsz > 0;
-        }
-        if kind == 3 {
-            if interpreter.is_some() || !(2..=4096).contains(&filesz) {
-                return Err(unavailable());
-            }
-            let mut bytes = vec![0u8; filesz as usize];
-            image.seek(SeekFrom::Start(offset))?;
-            image.read_exact(&mut bytes).map_err(|_| unavailable())?;
-            if bytes.last() != Some(&0) || bytes[..bytes.len() - 1].contains(&0) {
-                return Err(unavailable());
-            }
-            interpreter = Some(bytes);
-        }
-    }
-    if !executable_load {
-        return Err(unavailable());
-    }
-    if let Some(interpreter) = interpreter {
-        use std::os::unix::ffi::OsStrExt;
-        let path = Path::new(std::ffi::OsStr::from_bytes(
-            &interpreter[..interpreter.len() - 1],
-        ));
-        if !path.is_absolute()
-            || !path
-                .metadata()
-                .is_ok_and(|meta| meta.is_file() && meta.mode() & 0o111 != 0)
-        {
-            return Err(io::Error::other(
-                "ordinary Bash ELF interpreter unavailable before K",
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn child_selection_name(request_id: &str) -> String {
     format!("{request_id}.child-work-selection.json")
+}
+
+pub(super) fn ordinary_selected_source(
+    directory: &Path,
+    request_id: &str,
+) -> io::Result<OrdinarySelectedSource> {
+    let selection: ChildWorkSelection =
+        exact_file(directory, &child_selection_name(request_id))?
+            .ok_or_else(|| io::Error::other("ordinary Bash child selection absent"))?;
+    if selection.version != 2
+        || selection.role != "bash-child-ordinary-tree-v1"
+        || selection.child_request_id != request_id
+    {
+        return Err(io::Error::other("ordinary Bash selected source changed"));
+    }
+    if !selection.path_execution {
+        if selection.selected_source.is_some() {
+            return Err(io::Error::other(
+                "ordinary Bash ELF selected source changed",
+            ));
+        }
+        return Ok(OrdinarySelectedSource::Descriptor);
+    }
+    let source = selection
+        .selected_source
+        .ok_or_else(|| io::Error::other("ordinary Bash selected source absent"))?;
+    if (
+        source.metadata.device,
+        source.metadata.inode,
+        source.metadata.mount_id,
+    ) != (
+        selection.image_descriptor.device,
+        selection.image_descriptor.inode,
+        selection.image_descriptor.mount_id,
+    ) {
+        return Err(io::Error::other("ordinary Bash selected source changed"));
+    }
+    Ok(OrdinarySelectedSource::Path(
+        selection.image_descriptor,
+        source,
+    ))
 }
 
 pub(super) fn child_selection_is_ordinary(
@@ -1258,6 +1277,8 @@ pub(super) fn select_private_child_work(
         configured_program: plan.configured_program.clone(),
         broker_resolved_path: plan.broker_resolved_path.clone(),
         image_descriptor: plan.image_descriptor.clone(),
+        path_execution: false,
+        selected_source: None,
         ordinary_command_sha256: None,
     };
     let name = child_selection_name(&child.request_id);
@@ -1298,6 +1319,8 @@ pub(super) fn select_ordinary_child_work(
         configured_program: plan.configured_program.clone(),
         broker_resolved_path: plan.broker_resolved_path.clone(),
         image_descriptor: plan.image_descriptor.clone(),
+        path_execution: plan.path_execution,
+        selected_source: plan.path_execution.then(|| plan.preflight_image.clone()),
         ordinary_command_sha256: Some(format!(
             "{:x}",
             Sha256::digest(serde_json::to_vec(command)?)
@@ -1337,6 +1360,9 @@ pub(super) fn require_child_work_plan(
         || selection.configured_program != plan.configured_program
         || selection.broker_resolved_path != plan.broker_resolved_path
         || selection.image_descriptor != plan.image_descriptor
+        || selection.path_execution != plan.path_execution
+        || (selection.path_execution
+            && selection.selected_source.as_ref() != Some(&plan.preflight_image))
         || (selection.version == 1 && selection.ordinary_command_sha256.is_some())
         || (selection.version == 2 && !ordinary_selection_digest_matches(directory, &selection)?)
     {
@@ -1410,6 +1436,9 @@ fn require_captured_child_work_selection(
         || selection.configured_program != grant.configured_program
         || selection.broker_resolved_path != grant.broker_resolved_path
         || selection.image_descriptor != grant.image_descriptor
+        || selection.path_execution != grant.path_execution
+        || (selection.path_execution
+            && selection.selected_source.as_ref() != Some(&grant.preflight_image))
         || (selection.version == 1 && selection.ordinary_command_sha256.is_some())
         || (selection.version == 2 && !ordinary_selection_digest_matches(directory, &selection)?)
     {
@@ -3109,6 +3138,7 @@ pub(super) fn prepare(directory: &Path, binding: Binding, plan: Plan) -> io::Res
             || old.configured_program != plan.configured_program
             || old.broker_resolved_path != plan.broker_resolved_path
             || old.image_descriptor != plan.image_descriptor
+            || old.path_execution != plan.path_execution
         {
             return Err(io::Error::other(
                 "fresh provider grant binding or plan changed",
@@ -3125,6 +3155,8 @@ pub(super) fn prepare(directory: &Path, binding: Binding, plan: Plan) -> io::Res
             broker_resolved_path: plan.broker_resolved_path.clone(),
             image_descriptor: plan.image_descriptor.clone(),
             preflight_image: plan.preflight_image.clone(),
+            path_at_k: plan.path_at_k.clone(),
+            path_execution: plan.path_execution,
         };
         durable_new(directory, &name, &grant)?;
         grant
@@ -3173,6 +3205,7 @@ pub(super) fn grant_for_matching_plan(
         || grant.configured_program != plan.configured_program
         || grant.broker_resolved_path != plan.broker_resolved_path
         || grant.image_descriptor != plan.image_descriptor
+        || grant.path_execution != plan.path_execution
     {
         return Err(io::Error::other("fresh provider K readback plan mismatch"));
     }
@@ -3353,7 +3386,7 @@ extern "C" fn init_start(ptr: *mut libc::c_void) -> libc::c_int {
 
 fn run_init(mut init: Init) -> io::Result<()> {
     work_launch::close_other_descriptors(&[
-        init.plan.image.as_raw_fd(),
+        init.plan.image.as_ref().map_or(-1, AsRawFd::as_raw_fd),
         init.plan.cwd.as_raw_fd(),
         init.plan.input.as_raw_fd(),
         init.plan.recipe.as_raw_fd(),
@@ -3386,7 +3419,17 @@ fn run_init(mut init: Init) -> io::Result<()> {
     }
     init.plan.verify()?;
     let recipe: Recipe = serde_json::from_reader(&init.plan.recipe)?;
-    let image = format!("/proc/self/fd/{}", init.plan.image.as_raw_fd());
+    let image = if init.plan.path_execution {
+        init.plan
+            .broker_resolved_path
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        format!(
+            "/proc/self/fd/{}",
+            init.plan.image.as_ref().unwrap().as_raw_fd()
+        )
+    };
     let argv = std::iter::once(recipe.configured_program.as_str())
         .chain(recipe.argv.iter().map(String::as_str))
         .map(CString::new)
@@ -3395,6 +3438,13 @@ fn run_init(mut init: Init) -> io::Result<()> {
     let argv_ptrs = argv
         .iter()
         .map(|value| value.as_ptr() as usize)
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let path_exec = init.plan.path_execution;
+    let exec_path = CString::new(init.plan.broker_resolved_path.as_os_str().as_bytes())?;
+    let shell_argv_ptrs = std::iter::once(c"/bin/sh".as_ptr() as usize)
+        .chain(std::iter::once(exec_path.as_ptr() as usize))
+        .chain(argv.iter().skip(1).map(|value| value.as_ptr() as usize))
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
     let env = recipe
@@ -3408,7 +3458,11 @@ fn run_init(mut init: Init) -> io::Result<()> {
         .map(|value| value.as_ptr() as usize)
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
-    let mut command = Command::new(image);
+    let mut command = if init.plan.path_execution {
+        Command::new(&init.plan.broker_resolved_path)
+    } else {
+        Command::new(image)
+    };
     command.env_clear();
     let stdin = if init.plan.stdin_dev_null {
         File::open("/dev/null")?
@@ -3426,7 +3480,7 @@ fn run_init(mut init: Init) -> io::Result<()> {
     let uid = init.uid;
     let gid = init.gid;
     let groups = init.groups;
-    let image_fd = init.plan.image.as_raw_fd();
+    let image_fd = init.plan.image.as_ref().map_or(-1, AsRawFd::as_raw_fd);
     let image_probe = CString::new(format!("/proc/self/fd/{image_fd}"))?;
     let preflight_shebang = init.plan.preflight_image.observed_shebang;
     let fixture = super::private_fixture();
@@ -3456,6 +3510,27 @@ fn run_init(mut init: Init) -> io::Result<()> {
             // pinned inode after the gate, then keep its fd only for scripts.
             // A last concurrent write can still change the result or cause an
             // OS exec error; this probe does not attest executed bytes.
+            if path_exec {
+                let _keep_strings_alive = (&argv, &env, &exec_path);
+                libc::execve(
+                    exec_path.as_ptr(),
+                    argv_ptrs.as_ptr().cast::<*const libc::c_char>(),
+                    env_ptrs.as_ptr().cast::<*const libc::c_char>(),
+                );
+                if *libc::__errno_location() == libc::ENOEXEC {
+                    // Match execvp's ordinary text-command fallback after K.
+                    // The shell receives the original pathname as its script
+                    // argument, so it opens that name and sees normal $0.
+                    libc::execve(
+                        c"/bin/sh".as_ptr(),
+                        shell_argv_ptrs.as_ptr().cast::<*const libc::c_char>(),
+                        env_ptrs.as_ptr().cast::<*const libc::c_char>(),
+                    );
+                }
+                let error = *libc::__errno_location();
+                write_exec_errno(error);
+                libc::_exit(if error == libc::ENOENT { 127 } else { 126 });
+            }
             let probe = libc::open(image_probe.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
             let script = if probe >= 0 {
                 let mut magic = [0u8; 2];
@@ -3756,6 +3831,7 @@ pub(super) fn launch(
         || prepared.plan.configured_program != prepared.grant.configured_program
         || prepared.plan.broker_resolved_path != prepared.grant.broker_resolved_path
         || prepared.plan.image_descriptor != prepared.grant.image_descriptor
+        || prepared.plan.path_execution != prepared.grant.path_execution
     {
         return Err(io::Error::other("fresh provider plan changed before K"));
     }
@@ -4228,7 +4304,7 @@ mod tests {
         });
         assert_eq!(
             candidate.image_descriptor,
-            ImageDescriptor::of(&candidate.image).unwrap()
+            ImageDescriptor::of(candidate.image.as_ref().unwrap()).unwrap()
         );
         candidate.verify().unwrap();
         std::fs::set_permissions(&image, std::fs::Permissions::from_mode(0o111)).unwrap();
@@ -4326,7 +4402,7 @@ mod tests {
         assert!(
             plan_from_descriptors(
                 &replacement,
-                held.plan.image.try_clone().unwrap(),
+                held.plan.image.as_ref().unwrap().try_clone().unwrap(),
                 held.plan.cwd.try_clone().unwrap(),
                 held.plan.input.try_clone().unwrap(),
                 held.plan.recipe.try_clone().unwrap()
@@ -4429,7 +4505,7 @@ mod tests {
         let (status, stdout, stderr) = wait_for_q(temporary.path(), &refused_grant);
         assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 126);
         assert!(stdout.is_empty());
-        assert!(stderr.starts_with(b"fresh provider execveat failed errno=13\n"));
+        assert!(stderr.starts_with(b"fresh provider exec failed errno=13\n"));
         actor_child.kill().unwrap();
         actor_child.wait().unwrap();
     }
@@ -4458,6 +4534,8 @@ mod tests {
             broker_resolved_path: image_path.to_path_buf(),
             image_descriptor: ImageDescriptor::of(&image).unwrap(),
             preflight_image: ImagePreflight::observe(&image, image_path).unwrap(),
+            path_at_k: None,
+            path_execution: false,
         };
         let selection = FreshRouteSelection {
             model: "work".into(),
@@ -4983,6 +5061,8 @@ mod tests {
             broker_resolved_path: selected.broker_resolved_path.clone(),
             image_descriptor: selected.image_descriptor.clone(),
             preflight_image: selected.preflight_image.clone(),
+            path_at_k: None,
+            path_execution: false,
         };
         assert!(
             require_captured_child_work_selection(
@@ -5109,6 +5189,8 @@ mod tests {
             broker_resolved_path: image_path.to_path_buf(),
             image_descriptor: ImageDescriptor::of(&image).unwrap(),
             preflight_image: ImagePreflight::observe(&image, image_path).unwrap(),
+            path_at_k: None,
+            path_execution: false,
         };
         durable_new(
             temp.path(),

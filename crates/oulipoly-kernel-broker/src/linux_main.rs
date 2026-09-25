@@ -4266,7 +4266,7 @@ fn serve_fresh_v30_at(
                         ordinary_command
                             .as_ref()
                             .map(|command| {
-                                let plan = fresh_provider::ordinary_bash_plan(command)?;
+                                let plan = fresh_provider::ordinary_bash_plan(command, None)?;
                                 fresh_provider::bind_ordinary_bash_intent(
                                     &directory,
                                     &request_id,
@@ -4492,7 +4492,11 @@ fn serve_fresh_v30_at(
                                             "ordinary Bash argv/cwd/environment changed after C before K",
                                         ));
                                     }
-                                    fresh_provider::ordinary_bash_plan(command)?
+                                    let source = fresh_provider::ordinary_selected_source(
+                                        &directory,
+                                        &child.request_id,
+                                    )?;
+                                    fresh_provider::ordinary_bash_plan(command, Some(source))?
                                 } else {
                                     fixed_private_bash_child_plan()?
                                 };
