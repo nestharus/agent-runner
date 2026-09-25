@@ -227,6 +227,12 @@ pub fn create_full_state_schema(conn: &Connection, user_version: i32) {
         "
     ))
     .unwrap();
+    if user_version >= 5 {
+        conn.execute_batch(include_str!(
+            "../../migrations/0005_invocation_dual_session_ids.sql"
+        ))
+        .unwrap();
+    }
     if user_version >= 14 {
         conn.execute_batch(include_str!(
             "../../migrations/0014_invocation_completion_obligations.sql"
@@ -258,6 +264,12 @@ pub fn create_full_state_schema(conn: &Connection, user_version: i32) {
     if user_version >= 27 {
         conn.execute_batch(include_str!(
             "../../migrations/0027_record_timestamp_contract.sql"
+        ))
+        .unwrap();
+    }
+    if user_version >= 28 {
+        conn.execute_batch(include_str!(
+            "../../migrations/0028_completed_turn_recovery_targets.sql"
         ))
         .unwrap();
     }

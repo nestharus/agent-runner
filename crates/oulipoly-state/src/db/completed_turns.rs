@@ -2,20 +2,78 @@
 //! ## Declared roles
 //! accessor, validator, orchestration, mapper
 use super::*;
-use crate::diagnostic_recorder::process_recorder;
+use crate::diagnostic_producer::{
+    TransactionAttempt, TransactionPhaseGuard, record_sqlite_failure, record_unacquired_release,
+};
+use crate::diagnostic_recorder::{
+    DiagnosticPhase, OutcomeCertainty, SpanStart, SqliteDatabaseRole, SqliteEventIdentity,
+    SqliteMeasurementGap, SqlitePathClass, SqlitePhaseEvidence, SqliteTransactionMode,
+    SqliteTransactionPhase, process_recorder,
+};
+use crate::sqlite_observability::SqliteOperationObserver;
 use oulipoly_agent_messenger::ReturnedArtifactRef;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const COMPLETED_TURN_RECOVERY_IDENTITY_LIMIT: usize = 100;
-const COMPLETED_TURN_RECOVERY_SQL: &str =
+
+fn recovery_span(path: &Path, operation: &'static str, family: &'static str) -> SpanStart {
+    SpanStart::new(operation, "state_sqlite").with_sqlite_identity(SqliteEventIdentity::new(
+        SqliteDatabaseRole::State,
+        if path == Path::new(":memory:") {
+            SqlitePathClass::Memory
+        } else {
+            SqlitePathClass::ManagedFile
+        },
+        family,
+    ))
+}
+
+fn observe_recovery_read<T>(
+    span: impl FnOnce() -> SpanStart,
+    read: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let observer = SqliteOperationObserver::process();
+    let result = read();
+    match &result {
+        Ok(_) => {
+            observer.record_success(
+                span,
+                DiagnosticPhase::Released,
+                OutcomeCertainty::Terminal,
+                |elapsed| {
+                    SqlitePhaseEvidence::for_phase(SqliteTransactionPhase::StatementExecution)
+                        .with_execution(elapsed)
+                        .with_gap(SqliteMeasurementGap::WriterAuthorityNotApplicable)
+                        .with_gap(SqliteMeasurementGap::CommitNotApplicable)
+                        .with_gap(SqliteMeasurementGap::RowsExaminedNotExposed)
+                },
+            );
+        }
+        Err(_) => {
+            observer.record_failure_cause(
+                span,
+                "completed_turn_recovery_read_failed",
+                OutcomeCertainty::StartedUnknown,
+                |elapsed| {
+                    SqlitePhaseEvidence::for_phase(SqliteTransactionPhase::StatementExecution)
+                        .with_execution(elapsed)
+                        .with_gap(SqliteMeasurementGap::WriterAuthorityNotApplicable)
+                        .with_gap(SqliteMeasurementGap::CommitNotApplicable)
+                        .with_gap(SqliteMeasurementGap::RowsExaminedNotExposed)
+                },
+            );
+        }
+    }
+    result
+}
+const COMPLETED_TURN_RECOVERY_ROW_SQL: &str =
     "SELECT c.invocation_uuid,c.settlement_id,c.owner_json,c.effects_json,
             c.context_json,c.content_sha256,c.committed_at IS NOT NULL,
             c.tails_json,i.provider_name,i.provider_session_id,i.session_id
      FROM completed_turns c INDEXED BY completed_turns_recovery_pending
      JOIN invocations i ON i.id=c.invocation_id
-     WHERE c.recovery_pending=1
-     ORDER BY c.invocation_id";
+     WHERE c.recovery_pending=1 AND c.invocation_id=?1";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompletedTurnEffects {
@@ -76,12 +134,24 @@ pub struct CompletedTurnRecoveryIdentity {
     pub phase: String,
 }
 
+/// A bounded raw-index page. The cursor is the last examined invocation row,
+/// including an inconsistent finished tail skipped by the legacy projection.
+/// Continue while `has_more` is true, even if `items` is empty. If an older
+/// invocation acquires a new duty mid-scan, finish the pass and restart when
+/// `restart_required` is true; new higher IDs do not starve the current pass.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CompletedTurnRecoveryPage {
+    pub items: Vec<CompletedTurnRecoveryIdentity>,
+    pub next_after: Option<i64>,
+    pub has_more: bool,
+    pub epoch: i64,
+    pub restart_required: bool,
+}
+
 #[derive(Debug, Clone)]
 struct CompletedTurnRecoveryDuty {
     invocation_uuid: String,
     settlement_id: String,
-    provider_name: String,
-    provider_session: String,
     original_wake_claim: Option<String>,
     phase: String,
 }
@@ -218,13 +288,16 @@ struct CustodyOwner {
     native: Option<ProviderLaunchOwnerFence>,
 }
 impl StateDb {
-    fn completed_turn_recovery_duties(&self) -> Result<Vec<CompletedTurnRecoveryDuty>, String> {
+    fn completed_turn_recovery_duties_at(
+        &self,
+        invocation_id: i64,
+    ) -> Result<Vec<CompletedTurnRecoveryDuty>, String> {
         let mut stmt = self
             .conn
-            .prepare(COMPLETED_TURN_RECOVERY_SQL)
+            .prepare(COMPLETED_TURN_RECOVERY_ROW_SQL)
             .map_err(custody_error)?;
         let rows = stmt
-            .query_map([], |row| {
+            .query_map([invocation_id], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -253,7 +326,7 @@ impl StateDb {
                     content_sha256,
                     committed,
                     tails_json,
-                    provider_name,
+                    _provider_name,
                     provider_session_id,
                     session_id,
                 )| {
@@ -280,7 +353,7 @@ impl StateDb {
                         Ok(value) => value,
                         Err(error) => return Some(Err(error.to_string())),
                     };
-                    let provider_session = provider_session_id
+                    let _provider_session = provider_session_id
                         .or(session_id)
                         .or_else(|| {
                             context
@@ -292,8 +365,6 @@ impl StateDb {
                     Some(Ok(CompletedTurnRecoveryDuty {
                         invocation_uuid,
                         settlement_id,
-                        provider_name,
-                        provider_session,
                         original_wake_claim: context
                             .get("original_wake_claim")
                             .and_then(serde_json::Value::as_str)
@@ -308,6 +379,102 @@ impl StateDb {
                 },
             )
             .collect()
+    }
+
+    fn completed_turn_recovery_duty_at(
+        &self,
+        invocation_id: i64,
+    ) -> Result<CompletedTurnRecoveryDuty, String> {
+        self.completed_turn_recovery_duties_at(invocation_id)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| "completed_turn_pending_projection_inconsistent".into())
+    }
+
+    fn first_recovery_duty_id<P: rusqlite::Params>(
+        &self,
+        sql: &str,
+        params: P,
+    ) -> Result<Option<i64>, String> {
+        self.conn
+            .query_row(sql, params, |row| row.get(0))
+            .optional()
+            .map_err(custody_error)
+    }
+
+    fn first_recovery_duty_for_target(
+        &self,
+        provider: &str,
+        session: Option<&str>,
+        chain: Option<&str>,
+    ) -> Result<Option<CompletedTurnRecoveryDuty>, String> {
+        let target_id = if let Some(session) = session {
+            self.first_recovery_duty_id(
+                "SELECT invocation_id FROM completed_turns INDEXED BY completed_turns_recovery_target
+                 WHERE recovery_pending=1 AND recovery_provider_name=?1
+                   AND recovery_provider_session=?2 LIMIT 1",
+                params![provider, session],
+            )?
+        } else {
+            self.first_recovery_duty_id(
+                "SELECT invocation_id FROM completed_turns INDEXED BY completed_turns_recovery_target
+                 WHERE recovery_pending=1 AND recovery_provider_name=?1 LIMIT 1",
+                [provider],
+            )?
+        };
+        let id = if target_id.is_some() || chain.is_none() {
+            target_id
+        } else {
+            self.first_recovery_duty_id(
+                "SELECT c.invocation_id FROM session_chain_segments s
+                 CROSS JOIN completed_turns c INDEXED BY completed_turns_recovery_target
+                 WHERE s.chain_id=?1 AND c.recovery_pending=1
+                   AND c.recovery_provider_name=s.provider_name
+                   AND c.recovery_provider_session=s.session_id LIMIT 1",
+                [chain.unwrap()],
+            )?
+        };
+        id.map(|id| self.completed_turn_recovery_duty_at(id))
+            .transpose()
+    }
+
+    fn first_recovery_duty_for_session(
+        &self,
+        session: &str,
+    ) -> Result<Option<CompletedTurnRecoveryDuty>, String> {
+        let direct = self.first_recovery_duty_id(
+            "SELECT invocation_id FROM completed_turns INDEXED BY completed_turns_recovery_session
+             WHERE recovery_pending=1 AND recovery_provider_session=?1 LIMIT 1",
+            [session],
+        )?;
+        let id = if direct.is_some() {
+            direct
+        } else {
+            self.first_recovery_duty_id(
+                "SELECT c.invocation_id FROM session_chain_segments target
+                 CROSS JOIN session_chain_segments original
+                 CROSS JOIN completed_turns c INDEXED BY completed_turns_recovery_target
+                 WHERE target.session_id=?1 AND target.ended_at IS NULL
+                   AND original.chain_id=target.chain_id AND c.recovery_pending=1
+                   AND c.recovery_provider_name=original.provider_name
+                   AND c.recovery_provider_session=original.session_id LIMIT 1",
+                [session],
+            )?
+        };
+        id.map(|id| self.completed_turn_recovery_duty_at(id))
+            .transpose()
+    }
+
+    fn recovery_duty_for_uuid(
+        &self,
+        uuid: &str,
+    ) -> Result<Option<CompletedTurnRecoveryDuty>, String> {
+        self.first_recovery_duty_id(
+            "SELECT invocation_id FROM completed_turns WHERE invocation_uuid=?1 AND recovery_pending=1",
+            [uuid],
+        )?
+        .map(|id| self.completed_turn_recovery_duty_at(id))
+        .transpose()
     }
 
     fn validate_resolved_resume_identity(&self, resolved: &ResolvedResume) -> Result<(), String> {
@@ -329,21 +496,6 @@ impl StateDb {
         } else {
             Err("completed_turn_resume_identity_changed_or_unavailable".into())
         }
-    }
-
-    fn duty_is_on_chain(
-        &self,
-        duty: &CompletedTurnRecoveryDuty,
-        chain_id: &str,
-    ) -> Result<bool, String> {
-        self.conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM session_chain_segments
-                 WHERE chain_id=?1 AND provider_name=?2 AND session_id=?3)",
-                params![chain_id, duty.provider_name, duty.provider_session],
-                |row| row.get(0),
-            )
-            .map_err(custody_error)
     }
 
     fn migration_chain_memberships(
@@ -401,23 +553,51 @@ impl StateDb {
         target_session: Option<&str>,
         scope: CompletedTurnMigrationScope,
     ) -> Result<Vec<String>, String> {
-        let mut conflicts = Vec::new();
-        for duty in self.completed_turn_recovery_duties()? {
-            let target_conflict = duty.provider_name == target_provider
-                && match scope {
-                    CompletedTurnMigrationScope::ExternalProviderWide => true,
-                    CompletedTurnMigrationScope::BuiltInExact => {
-                        target_session.is_some_and(|session| duty.provider_session == session)
-                    }
-                };
-            if target_conflict || self.duty_is_on_chain(&duty, chain_id)? {
-                conflicts.push(format!("{}[{}]", duty.invocation_uuid, duty.phase));
-            }
-        }
-        Ok(conflicts)
+        let session = match scope {
+            CompletedTurnMigrationScope::ExternalProviderWide => None,
+            CompletedTurnMigrationScope::BuiltInExact => target_session,
+        };
+        Ok(self
+            .first_recovery_duty_for_target(target_provider, session, Some(chain_id))?
+            .map(|duty| vec![format!("{}[{}]", duty.invocation_uuid, duty.phase)])
+            .unwrap_or_default())
     }
 
     fn refuse_completed_turn_migration_target_stage(
+        &self,
+        fence: &CompletedTurnMigrationFence,
+        target_session: Option<&str>,
+        scope: CompletedTurnMigrationScope,
+        stage: CompletedTurnMigrationStage,
+    ) -> Result<(), String> {
+        observe_recovery_read(
+            || {
+                let mut start = recovery_span(
+                    self.path(),
+                    "completed_turn_migration_target_recheck",
+                    "completed_turn.recovery.target_recheck",
+                )
+                .with_hashed_correlation("chain_id", &fence.chain_id)
+                .with_hashed_correlation("provider_name", &fence.target_provider)
+                .with_identifier("migration_stage", format!("{stage:?}"))
+                .with_identifier("migration_scope", format!("{scope:?}"));
+                if let Some(session) = target_session {
+                    start = start.with_hashed_correlation("session_id", session);
+                }
+                start
+            },
+            || {
+                self.refuse_completed_turn_migration_target_stage_unobserved(
+                    fence,
+                    target_session,
+                    scope,
+                    stage,
+                )
+            },
+        )
+    }
+
+    fn refuse_completed_turn_migration_target_stage_unobserved(
         &self,
         fence: &CompletedTurnMigrationFence,
         target_session: Option<&str>,
@@ -775,35 +955,42 @@ impl StateDb {
         }))
     }
 
-    fn completed_turns_for_session_in(
-        &self,
-        session: &str,
-        duties: &[CompletedTurnRecoveryDuty],
-    ) -> Result<Vec<String>, String> {
-        let mut pending = Vec::new();
-        for duty in duties {
-            let related_chain: bool = self
-                .conn
-                .query_row(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM session_chain_segments original
-                         JOIN session_chain_segments target ON target.chain_id=original.chain_id
-                         WHERE original.provider_name=?1 AND original.session_id=?2
-                           AND target.session_id=?3 AND target.ended_at IS NULL)",
-                    params![duty.provider_name, duty.provider_session, session],
-                    |row| row.get(0),
-                )
-                .map_err(custody_error)?;
-            if duty.provider_session == session || related_chain {
+    pub fn completed_turns_for_session(&self, session: &str) -> Result<Vec<String>, String> {
+        let mut ids = Vec::new();
+        for sql in [
+            "SELECT invocation_id FROM completed_turns INDEXED BY completed_turns_recovery_session
+             WHERE recovery_pending=1 AND recovery_provider_session=?1",
+            "SELECT c.invocation_id FROM session_chain_segments target
+             CROSS JOIN session_chain_segments original
+             CROSS JOIN completed_turns c INDEXED BY completed_turns_recovery_target
+             WHERE target.session_id=?1 AND target.ended_at IS NULL
+               AND original.chain_id=target.chain_id AND c.recovery_pending=1
+               AND c.recovery_provider_name=original.provider_name
+               AND c.recovery_provider_session=original.session_id",
+        ] {
+            let mut stmt = self.conn.prepare(sql).map_err(custody_error)?;
+            ids.extend(
+                stmt.query_map([session], |row| row.get::<_, i64>(0))
+                    .map_err(custody_error)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(custody_error)?,
+            );
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        let mut pending = Vec::with_capacity(ids.len());
+        for id in ids {
+            // Preserve the legacy list's permissive handling of a stale
+            // recovery projection. Refusal paths treat it as an error.
+            if let Some(duty) = self
+                .completed_turn_recovery_duties_at(id)?
+                .into_iter()
+                .next()
+            {
                 pending.push(format!("{}[{}]", duty.invocation_uuid, duty.phase));
             }
         }
         Ok(pending)
-    }
-
-    pub fn completed_turns_for_session(&self, session: &str) -> Result<Vec<String>, String> {
-        let duties = self.completed_turn_recovery_duties()?;
-        self.completed_turns_for_session_in(session, &duties)
     }
 
     /// A resolver's chain choice is narrower than a native session string.
@@ -813,17 +1000,36 @@ impl StateDb {
         &self,
         resolved: &ResolvedResume,
     ) -> Result<(), String> {
+        observe_recovery_read(
+            || {
+                recovery_span(
+                    self.path(),
+                    "completed_turn_resolved_resume_lookup",
+                    "completed_turn.recovery.resolved_lookup",
+                )
+                .with_hashed_correlation("chain_id", &resolved.chain_id)
+                .with_hashed_correlation("session_id", &resolved.active_session_id)
+                .with_hashed_correlation("provider_name", &resolved.active_provider)
+            },
+            || self.refuse_completed_turn_resolved_resume_unobserved(resolved),
+        )
+    }
+
+    fn refuse_completed_turn_resolved_resume_unobserved(
+        &self,
+        resolved: &ResolvedResume,
+    ) -> Result<(), String> {
         self.validate_resolved_resume_identity(resolved)?;
-        let mut pending = Vec::new();
-        for duty in self.completed_turn_recovery_duties()? {
-            if (duty.provider_name == resolved.active_provider
-                && duty.provider_session == resolved.active_session_id)
-                || self.duty_is_on_chain(&duty, &resolved.chain_id)?
-            {
-                pending.push(format!("{}[{}]", duty.invocation_uuid, duty.phase));
-            }
-        }
-        Self::refuse_pending_completed_turns(pending)
+        let duty = self.first_recovery_duty_for_target(
+            &resolved.active_provider,
+            Some(&resolved.active_session_id),
+            Some(&resolved.chain_id),
+        )?;
+        Self::refuse_pending_completed_turns(
+            duty.into_iter()
+                .map(|d| format!("{}[{}]", d.invocation_uuid, d.phase))
+                .collect(),
+        )
     }
 
     /// Recheck the identity that migration will actually materialize.  A
@@ -836,34 +1042,76 @@ impl StateDb {
         target_provider: &str,
         target_session: Option<&str>,
     ) -> Result<(), String> {
-        let duties = self.completed_turn_recovery_duties()?;
-        if duties.is_empty() {
-            return Ok(());
-        }
+        observe_recovery_read(
+            || {
+                let mut start = recovery_span(
+                    self.path(),
+                    "completed_turn_migration_target_lookup",
+                    "completed_turn.recovery.target_lookup",
+                )
+                .with_hashed_correlation("chain_id", &resolved.chain_id)
+                .with_hashed_correlation("provider_name", target_provider);
+                if let Some(session) = target_session {
+                    start = start.with_hashed_correlation("session_id", session);
+                }
+                start
+            },
+            || {
+                self.refuse_completed_turn_migration_target_unobserved(
+                    resolved,
+                    target_provider,
+                    target_session,
+                )
+            },
+        )
+    }
+
+    fn refuse_completed_turn_migration_target_unobserved(
+        &self,
+        resolved: &ResolvedResume,
+        target_provider: &str,
+        target_session: Option<&str>,
+    ) -> Result<(), String> {
         self.validate_resolved_resume_identity(resolved)?;
-        let mut conflicts = Vec::new();
-        for duty in duties {
-            let target_conflict = duty.provider_name == target_provider
-                && target_session.is_none_or(|session| duty.provider_session == session);
-            if target_conflict || self.duty_is_on_chain(&duty, &resolved.chain_id)? {
-                conflicts.push(format!("{}[{}]", duty.invocation_uuid, duty.phase));
-            }
-        }
-        if conflicts.is_empty() {
-            Ok(())
-        } else {
+        let duty = self.first_recovery_duty_for_target(
+            target_provider,
+            target_session,
+            Some(&resolved.chain_id),
+        )?;
+        if let Some(duty) = duty {
             Err(format!(
-                "completed_turn_target_pending: {}; target={}/{}; no transcript publication, segment rotation, external materialization, or provider execution",
-                conflicts.join(","),
+                "completed_turn_target_pending: {}[{}]; target={}/{}; no transcript publication, segment rotation, external materialization, or provider execution",
+                duty.invocation_uuid,
+                duty.phase,
                 target_provider,
                 target_session.unwrap_or("<provider-wide-before-execution>")
             ))
+        } else {
+            Ok(())
         }
     }
 
     pub fn refuse_completed_turn_resume(&self, session: &str) -> Result<(), String> {
-        let pending = self.completed_turns_for_session(session)?;
-        Self::refuse_pending_completed_turns(pending)
+        observe_recovery_read(
+            || {
+                recovery_span(
+                    self.path(),
+                    "completed_turn_resume_lookup",
+                    "completed_turn.recovery.session_lookup",
+                )
+                .with_hashed_correlation("session_id", session)
+            },
+            || self.refuse_completed_turn_resume_unobserved(session),
+        )
+    }
+
+    fn refuse_completed_turn_resume_unobserved(&self, session: &str) -> Result<(), String> {
+        let duty = self.first_recovery_duty_for_session(session)?;
+        Self::refuse_pending_completed_turns(
+            duty.into_iter()
+                .map(|d| format!("{}[{}]", d.invocation_uuid, d.phase))
+                .collect(),
+        )
     }
 
     fn refuse_pending_completed_turns(pending: Vec<String>) -> Result<(), String> {
@@ -908,72 +1156,324 @@ impl StateDb {
                 hook();
             }
         });
-        let _reservation =
-            sqlite::Transaction::new_unchecked(&self.conn, sqlite::TransactionBehavior::Immediate)
-                .map_err(custody_error)?;
-        #[cfg(test)]
-        tests::WITH_MANUAL_RESERVATION.with_borrow_mut(|hook| {
-            if let Some(hook) = hook.take() {
-                hook();
-            }
-        });
-        // This writer reservation is the manual State authority boundary.
-        // Scan once and use the same snapshot for refusal and retained-claim
-        // transport; do not perform a duplicate full retained-duty scan.
-        let duties = self.completed_turn_recovery_duties()?;
-        let pending = if let Some(resolved) = resolved {
-            self.validate_resolved_resume_identity(resolved)?;
-            let mut pending = Vec::new();
-            for duty in &duties {
-                if (duty.provider_name == resolved.active_provider
-                    && duty.provider_session == resolved.active_session_id)
-                    || self.duty_is_on_chain(duty, &resolved.chain_id)?
-                {
-                    pending.push(format!("{}[{}]", duty.invocation_uuid, duty.phase));
+        let start = recovery_span(
+            self.path(),
+            "completed_turn_manual_resume",
+            "completed_turn.manual_resume.state",
+        )
+        .with_sqlite_identity(
+            SqliteEventIdentity::new(
+                SqliteDatabaseRole::State,
+                if self.path() == Path::new(":memory:") {
+                    SqlitePathClass::Memory
+                } else {
+                    SqlitePathClass::ManagedFile
+                },
+                "completed_turn.manual_resume.state",
+            )
+            .with_transaction_mode(SqliteTransactionMode::Immediate),
+        )
+        .with_hashed_correlation("session_id", session);
+        recorder.with_deferred_requested_span(start, |state_span| {
+            let attempt = TransactionAttempt::start();
+            let reservation = match sqlite::Transaction::new_unchecked(
+                &self.conn,
+                sqlite::TransactionBehavior::Immediate,
+            ) {
+                Ok(tx) => tx,
+                Err(error) => {
+                    record_sqlite_failure(state_span, &error, attempt);
+                    record_unacquired_release(state_span);
+                    return Err(custody_error(error));
                 }
-            }
-            pending
-        } else {
-            // Legacy callers have no authenticated chain distinction. Preserve
-            // conservative session-scoped refusal rather than guessing one.
-            self.completed_turns_for_session_in(session, &duties)?
-        };
-        Self::refuse_pending_completed_turns(pending)?;
-        let retained_claims = duties
-            .into_iter()
-            .filter_map(|duty| {
-                duty.original_wake_claim
-                    .map(|claim_token| crate::mailbox::RetainedWakeClaim {
-                        invocation_uuid: duty.invocation_uuid,
-                        settlement_id: duty.settlement_id,
-                        claim_token,
-                        phase: duty.phase,
-                    })
-            })
-            .collect::<Vec<_>>();
-        let state_path = self
-            .completion_authority_state_path()
-            .ok_or("completed_turn_state_identity_unavailable")?;
-        let path = crate::mailbox::MailboxDb::path_for_state_db(state_path);
-        let authority = crate::mailbox::MailboxAuthorityFence::try_acquire(&path)
-            .map_err(|e| format!("manual_resume_authority_unavailable: {e}"))?;
-        let mut sidecar =
+            };
+            let mut state_phases = TransactionPhaseGuard::acquired(state_span, attempt);
+            #[cfg(test)]
+            tests::WITH_MANUAL_RESERVATION.with_borrow_mut(|hook| {
+                if let Some(hook) = hook.take() {
+                    hook();
+                }
+            });
+            let mut crossed_to_sidecar = false;
+            let result = (|| {
+                // This writer reservation is the manual State authority boundary.
+                // Refusal seeks the target projection; unrelated pending duties never
+                // lengthen the State -> sidecar crossing.
+                let lookup_started = std::time::Instant::now();
+                let pending_result = (|| {
+                    if let Some(resolved) = resolved {
+                        self.validate_resolved_resume_identity(resolved)?;
+                        self.first_recovery_duty_for_target(
+                            &resolved.active_provider,
+                            Some(&resolved.active_session_id),
+                            Some(&resolved.chain_id),
+                        )
+                    } else {
+                        // Legacy callers have no authenticated chain distinction.
+                        self.first_recovery_duty_for_session(session)
+                    }
+                })();
+                let lookup_elapsed = lookup_started.elapsed();
+                let lookup_evidence =
+                    SqlitePhaseEvidence::for_phase(SqliteTransactionPhase::StatementExecution)
+                        .with_execution(lookup_elapsed)
+                        .with_total_elapsed(lookup_elapsed)
+                        .with_gap(SqliteMeasurementGap::RowsExaminedNotExposed)
+                        .with_gap(SqliteMeasurementGap::CommitNotApplicable);
+                let lookup_observation = if pending_result.is_ok() {
+                    crate::diagnostic_recorder::PhaseObservation::terminal()
+                        .with_sqlite_evidence(lookup_evidence)
+                } else {
+                    crate::diagnostic_recorder::PhaseObservation::started_unknown()
+                        .with_cause("manual_resume_target_lookup_failed")
+                        .with_sqlite_evidence(lookup_evidence)
+                };
+                let _ = state_span.record_deferred_completed_child(
+                    recovery_span(
+                        self.path(),
+                        "completed_turn_manual_target_lookup",
+                        "completed_turn.recovery.manual_target_lookup",
+                    )
+                    .with_hashed_correlation("session_id", session),
+                    lookup_elapsed,
+                    if pending_result.is_ok() {
+                        DiagnosticPhase::Released
+                    } else {
+                        DiagnosticPhase::Failed
+                    },
+                    lookup_observation,
+                );
+                let pending = pending_result?;
+                Self::refuse_pending_completed_turns(
+                    pending
+                        .into_iter()
+                        .map(|duty| format!("{}[{}]", duty.invocation_uuid, duty.phase))
+                        .collect(),
+                )?;
+                let state_path = self
+                    .completion_authority_state_path()
+                    .ok_or("completed_turn_state_identity_unavailable")?;
+                let path = crate::mailbox::MailboxDb::path_for_state_db(state_path);
+                crossed_to_sidecar = true;
+                let sidecar_start =
+                    SpanStart::new("completed_turn_manual_resume_sidecar", "pid_mailbox_sqlite")
+                        .with_sqlite_identity(SqliteEventIdentity::new(
+                            SqliteDatabaseRole::PidMailbox,
+                            SqlitePathClass::ManagedFile,
+                            "completed_turn.manual_resume.sidecar_crossing",
+                        ))
+                        .with_diagnostic_id(state_span.diagnostic_id().clone())
+                        .with_parent_span_id(state_span.span_id().clone())
+                        .with_hashed_correlation("session_id", session);
+                state_span.with_deferred_requested_span(sidecar_start, |sidecar_span| {
+                    let crossing_started = std::time::Instant::now();
+                    let result = (|| {
+                        let authority =
+                            crate::mailbox::MailboxAuthorityFence::try_acquire(&path)
+                                .map_err(|e| format!("manual_resume_authority_unavailable: {e}"))?;
+                        let mut sidecar =
             crate::mailbox::MailboxDb::open_existing_for_completion_authority_deferred(
                 &authority, &recorder,
             )?;
-        sidecar.coordinate_manual_resume_without_wait(session, &retained_claims)
+                        // The sidecar has at most one claim for this session. Read its exact
+                        // identity, seek that completed turn by UUID, and require the sidecar
+                        // writer to recheck the identity before any release. A changed claim
+                        // is a retry, never an inferred absence of pending recovery.
+                        let expected_claim = sidecar.manual_wake_claim_identity(session)?;
+                        #[cfg(test)]
+                        tests::AFTER_MANUAL_CLAIM_PEEK.with_borrow_mut(|hook| {
+                            if let Some(hook) = hook.take() {
+                                hook();
+                            }
+                        });
+                        let exact_duty = expected_claim
+                            .as_ref()
+                            .and_then(|claim| claim.wake_invocation_uuid.as_deref())
+                            .map(|uuid| {
+                                let lookup_started = std::time::Instant::now();
+                                let duty = self.recovery_duty_for_uuid(uuid);
+                                let elapsed = lookup_started.elapsed();
+                                let evidence = SqlitePhaseEvidence::for_phase(
+                                    SqliteTransactionPhase::StatementExecution,
+                                )
+                                .with_execution(elapsed)
+                                .with_total_elapsed(elapsed)
+                                .with_gap(SqliteMeasurementGap::RowsExaminedNotExposed)
+                                .with_gap(SqliteMeasurementGap::CommitNotApplicable);
+                                let observation = if duty.is_ok() {
+                                    crate::diagnostic_recorder::PhaseObservation::terminal()
+                                        .with_sqlite_evidence(evidence)
+                                } else {
+                                    crate::diagnostic_recorder::PhaseObservation::started_unknown()
+                                        .with_cause("manual_resume_exact_claim_recheck_failed")
+                                        .with_sqlite_evidence(evidence)
+                                };
+                                let _ = state_span.record_deferred_completed_child(
+                                    recovery_span(
+                                        self.path(),
+                                        "completed_turn_manual_exact_claim_recheck",
+                                        "completed_turn.recovery.exact_claim_recheck",
+                                    )
+                                    .with_hashed_correlation("session_id", session)
+                                    .with_hashed_correlation("invocation_uuid", uuid),
+                                    elapsed,
+                                    if duty.is_ok() {
+                                        DiagnosticPhase::Released
+                                    } else {
+                                        DiagnosticPhase::Failed
+                                    },
+                                    observation,
+                                );
+                                duty
+                            })
+                            .transpose()?
+                            .flatten();
+                        let retained_claim = exact_duty.and_then(|duty| {
+                            let claim = expected_claim.as_ref()?;
+                            (duty.original_wake_claim.as_deref()
+                                == Some(claim.claim_token.as_str()))
+                            .then(|| crate::mailbox::RetainedWakeClaim {
+                                invocation_uuid: duty.invocation_uuid,
+                                settlement_id: duty.settlement_id,
+                                claim_token: claim.claim_token.clone(),
+                                phase: duty.phase,
+                            })
+                        });
+                        sidecar.coordinate_manual_resume_without_wait(
+                            session,
+                            &retained_claim.into_iter().collect::<Vec<_>>(),
+                            &expected_claim,
+                            sidecar_span,
+                        )
+                    })();
+                    let evidence = SqlitePhaseEvidence::for_phase(SqliteTransactionPhase::Released)
+                        .with_total_elapsed(crossing_started.elapsed())
+                        .with_gap(SqliteMeasurementGap::WriterWaitAndExecutionNotSeparable)
+                        .with_gap(SqliteMeasurementGap::ExecutionNotExposedByApi)
+                        .with_gap(SqliteMeasurementGap::CommitNotApplicable)
+                        .with_gap(SqliteMeasurementGap::RowsExaminedNotExposed);
+                    let observation = match &result {
+                        Ok(_) => crate::diagnostic_recorder::PhaseObservation::terminal()
+                            .with_sqlite_evidence(evidence),
+                        Err(_) => crate::diagnostic_recorder::PhaseObservation::started_unknown()
+                            .with_cause("manual_resume_sidecar_crossing_failed")
+                            .with_sqlite_evidence(evidence),
+                    };
+                    let _ = sidecar_span.record(
+                        if result.is_ok() {
+                            DiagnosticPhase::Released
+                        } else {
+                            DiagnosticPhase::Failed
+                        },
+                        observation,
+                    );
+                    result
+                })
+            })();
+            if result.is_err() && !crossed_to_sidecar {
+                state_phases.failed("manual_resume_state_refused");
+            }
+            drop(reservation);
+            state_phases.release_after_rollback();
+            result
+        })
     }
 
+    /// Compatibility read for small queues. Refuse to return a truncated list;
+    /// callers handling more than one page must use the explicit cursor API.
     pub fn completed_turn_identities(&self) -> Result<Vec<CompletedTurnRecoveryIdentity>, String> {
-        Ok(self
-            .completed_turn_recovery_duties()?
-            .into_iter()
-            .take(COMPLETED_TURN_RECOVERY_IDENTITY_LIMIT)
-            .map(|duty| CompletedTurnRecoveryIdentity {
-                invocation_uuid: duty.invocation_uuid,
-                phase: duty.phase,
-            })
-            .collect())
+        let page = self.completed_turn_identity_page(None, None)?;
+        if page.has_more {
+            return Err(
+                "completed_turn_recovery_page_required: pending work exceeds one page".into(),
+            );
+        }
+        Ok(page.items)
+    }
+
+    /// Read at most 100 pending index entries under a read snapshot. A later
+    /// page uses the first page's epoch. Finish the current pass on an epoch
+    /// change, then restart from the beginning to include an older admission.
+    pub fn completed_turn_identity_page(
+        &self,
+        after: Option<i64>,
+        expected_epoch: Option<i64>,
+    ) -> Result<CompletedTurnRecoveryPage, String> {
+        observe_recovery_read(
+            || {
+                recovery_span(
+                    self.path(),
+                    "completed_turn_recovery_page",
+                    "completed_turn.recovery.page",
+                )
+                .with_identifier("cursor_after_id", after.unwrap_or(0).to_string())
+                .with_identifier("expected_epoch", expected_epoch.unwrap_or(0).to_string())
+            },
+            || self.completed_turn_identity_page_unobserved(after, expected_epoch),
+        )
+    }
+
+    fn completed_turn_identity_page_unobserved(
+        &self,
+        after: Option<i64>,
+        expected_epoch: Option<i64>,
+    ) -> Result<CompletedTurnRecoveryPage, String> {
+        let after = after.unwrap_or(0);
+        if after < 0
+            || after > 0 && expected_epoch.is_none()
+            || after == 0 && expected_epoch.is_some()
+            || expected_epoch.is_some_and(|epoch| epoch < 0)
+        {
+            return Err("completed_turn_recovery_cursor_invalid".into());
+        }
+        let _snapshot =
+            sqlite::Transaction::new_unchecked(&self.conn, sqlite::TransactionBehavior::Deferred)
+                .map_err(custody_error)?;
+        let current_epoch: i64 = self
+            .conn
+            .query_row(
+                "SELECT epoch FROM completed_turn_recovery_epoch WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(custody_error)?;
+        let epoch = expected_epoch.unwrap_or(current_epoch);
+        let restart_required = epoch != current_epoch;
+        let mut stmt = self.conn.prepare(
+            "SELECT invocation_id FROM completed_turns INDEXED BY completed_turns_recovery_pending
+             WHERE recovery_pending=1 AND invocation_id>?1
+             ORDER BY invocation_id LIMIT ?2",
+        ).map_err(custody_error)?;
+        let ids = stmt
+            .query_map(
+                params![after, (COMPLETED_TURN_RECOVERY_IDENTITY_LIMIT + 1) as i64],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(custody_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(custody_error)?;
+        let has_more = ids.len() > COMPLETED_TURN_RECOVERY_IDENTITY_LIMIT;
+        let examined = &ids[..ids.len().min(COMPLETED_TURN_RECOVERY_IDENTITY_LIMIT)];
+        let mut items = Vec::with_capacity(examined.len());
+        for id in examined {
+            if let Some(duty) = self
+                .completed_turn_recovery_duties_at(*id)?
+                .into_iter()
+                .next()
+            {
+                items.push(CompletedTurnRecoveryIdentity {
+                    invocation_uuid: duty.invocation_uuid,
+                    phase: duty.phase,
+                });
+            }
+        }
+        Ok(CompletedTurnRecoveryPage {
+            items,
+            next_after: has_more.then(|| *examined.last().expect("full page has a last row")),
+            has_more,
+            epoch,
+            restart_required,
+        })
     }
 
     /// Settles only this admitted effect set. The retained fence never escapes
@@ -1123,12 +1623,14 @@ mod tests {
         SqliteMeasurementGap, SqliteTransactionPhase, with_test_process_recorder,
     };
     use crate::sqlite_observability::{SqliteObservationPolicy, with_test_process_policy};
+    use std::collections::HashSet;
     use std::sync::mpsc;
     use std::time::Duration;
 
     thread_local! {
         pub(super) static BEFORE_MANUAL_RESERVATION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
         pub(super) static WITH_MANUAL_RESERVATION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
+        pub(super) static AFTER_MANUAL_CLAIM_PEEK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
         pub(super) static WITH_COMPLETED_TURN_ADMISSION_FENCE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
     }
 
@@ -1343,7 +1845,7 @@ mod tests {
         let recorder = FlightRecorder::open(
             &recorder_root,
             RecorderConfig {
-                deferred_queue_capacity: 2,
+                deferred_queue_capacity: 64,
                 ..RecorderConfig::default()
             },
         )
@@ -1424,6 +1926,343 @@ mod tests {
             evidence
                 .measurement_gaps
                 .contains(&SqliteMeasurementGap::CommitNotApplicable)
+        );
+    }
+
+    #[test]
+    fn manual_resume_reports_state_and_sidecar_phases_after_exact_release() {
+        let (directory, state, uuid, effects) = fixture();
+        let mailbox = manual_fixture(&state, &effects, &uuid);
+        mailbox
+            .connection()
+            .execute(
+                "UPDATE session_wake_claim SET claim_token=?1 WHERE session_id='session'",
+                ["claim-secret-sentinel"],
+            )
+            .unwrap();
+        let recorder_root = directory.path().join("spans");
+        let recorder = FlightRecorder::open(&recorder_root, RecorderConfig::default()).unwrap();
+        with_test_process_recorder(recorder.clone(), || {
+            assert_eq!(
+                state.coordinate_manual_resume("session").unwrap(),
+                crate::mailbox::ManualWakeCoordination::Released
+            );
+        });
+        recorder.drain_deferred_for_test().unwrap();
+        let report = FlightRecorderReader::new(&recorder_root).inspect();
+        let events: Vec<_> = report.events.iter().map(|record| &record.event).collect();
+        let state_release = events
+            .iter()
+            .find(|event| {
+                event.operation == "completed_turn_manual_resume"
+                    && event.phase == DiagnosticPhase::Released
+            })
+            .unwrap();
+        let state_evidence = state_release.observation.sqlite.as_ref().unwrap();
+        assert!(state_evidence.writer_authority_acquisition_micros.is_some());
+        assert!(state_evidence.execution_micros.is_some());
+        assert!(
+            state_evidence
+                .measurement_gaps
+                .contains(&SqliteMeasurementGap::CommitNotApplicable)
+        );
+        let sidecar_commit = events
+            .iter()
+            .find(|event| {
+                event.operation == "completed_turn_manual_resume_sidecar_write"
+                    && event.phase == DiagnosticPhase::Committed
+            })
+            .unwrap();
+        assert_eq!(
+            sidecar_commit.sqlite.as_ref().unwrap().database_role,
+            SqliteDatabaseRole::PidMailbox
+        );
+        assert!(
+            sidecar_commit
+                .observation
+                .sqlite
+                .as_ref()
+                .unwrap()
+                .commit_micros
+                .is_some()
+        );
+        assert!(events.iter().any(|event| {
+            event.operation == "completed_turn_manual_resume_sidecar"
+                && event.phase == DiagnosticPhase::Released
+        }));
+        let sidecar_crossing = events
+            .iter()
+            .find(|event| {
+                event.operation == "completed_turn_manual_resume_sidecar"
+                    && event.phase == DiagnosticPhase::Released
+            })
+            .unwrap();
+        let sidecar_release = events
+            .iter()
+            .find(|event| {
+                event.operation == "completed_turn_manual_resume_sidecar_write"
+                    && event.phase == DiagnosticPhase::Released
+            })
+            .unwrap();
+        println!(
+            "manual-resume fixture state_begin_us={:?} state_body_us={:?} sidecar_crossing_us={:?} sidecar_begin_us={:?} sidecar_body_us={:?} sidecar_commit_us={:?}",
+            state_evidence.writer_authority_acquisition_micros,
+            state_evidence.execution_micros,
+            sidecar_crossing
+                .observation
+                .sqlite
+                .as_ref()
+                .unwrap()
+                .total_elapsed_micros,
+            sidecar_release
+                .observation
+                .sqlite
+                .as_ref()
+                .unwrap()
+                .writer_authority_acquisition_micros,
+            sidecar_release
+                .observation
+                .sqlite
+                .as_ref()
+                .unwrap()
+                .execution_micros,
+            sidecar_commit
+                .observation
+                .sqlite
+                .as_ref()
+                .unwrap()
+                .commit_micros,
+        );
+        assert!(
+            mailbox
+                .wake_session_reader()
+                .wake_claim("session")
+                .unwrap()
+                .is_none()
+        );
+        let encoded = serde_json::to_string(&events).unwrap();
+        assert!(!encoded.contains("claim-secret-sentinel"));
+    }
+
+    #[test]
+    fn manual_resume_held_state_writer_reports_contention_and_preserves_claim() {
+        let (directory, state, uuid, effects) = fixture();
+        let mailbox = manual_fixture(&state, &effects, &uuid);
+        state.conn.busy_timeout(Duration::ZERO).unwrap();
+        let holder = StateDb::open(state.path()).unwrap();
+        holder.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let recorder_root = directory.path().join("spans");
+        let recorder = FlightRecorder::open(&recorder_root, RecorderConfig::default()).unwrap();
+        with_test_process_recorder(recorder.clone(), || {
+            assert!(state.coordinate_manual_resume("session").is_err());
+        });
+        holder.conn.execute_batch("ROLLBACK").unwrap();
+        assert!(
+            mailbox
+                .wake_session_reader()
+                .wake_claim("session")
+                .unwrap()
+                .is_some()
+        );
+        with_test_process_recorder(recorder.clone(), || {
+            assert_eq!(
+                state.coordinate_manual_resume("session").unwrap(),
+                crate::mailbox::ManualWakeCoordination::Released
+            );
+        });
+        recorder.drain_deferred_for_test().unwrap();
+        let report = FlightRecorderReader::new(&recorder_root).inspect();
+        assert!(report.events.iter().any(|record| {
+            record.event.operation == "completed_turn_manual_resume"
+                && record.event.phase == DiagnosticPhase::Contention
+        }));
+        assert!(
+            mailbox
+                .wake_session_reader()
+                .wake_claim("session")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn manual_resume_held_sidecar_writer_and_missing_sink_preserve_retry() {
+        let (directory, state, uuid, effects) = fixture();
+        let mailbox = manual_fixture(&state, &effects, &uuid);
+        let path = crate::mailbox::MailboxDb::path_for_state_db(state.path());
+        let holder = sqlite::Connection::open(&path).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let recorder_root = directory.path().join("spans");
+        let recorder = FlightRecorder::open(&recorder_root, RecorderConfig::default()).unwrap();
+        with_test_process_recorder(recorder.clone(), || {
+            assert!(state.coordinate_manual_resume("session").is_err());
+        });
+        with_test_process_recorder(FlightRecorder::disabled(), || {
+            assert!(state.coordinate_manual_resume("session").is_err());
+        });
+        assert!(
+            mailbox
+                .wake_session_reader()
+                .wake_claim("session")
+                .unwrap()
+                .is_some()
+        );
+        recorder.drain_deferred_for_test().unwrap();
+        let report = FlightRecorderReader::new(&recorder_root).inspect();
+        assert!(report.events.iter().any(|record| {
+            record.event.operation == "completed_turn_manual_resume_sidecar_write"
+                && record.event.phase == DiagnosticPhase::Contention
+        }));
+        assert!(report.events.iter().any(|record| {
+            record.event.operation == "completed_turn_manual_resume"
+                && record.event.phase == DiagnosticPhase::Released
+        }));
+        holder.execute_batch("ROLLBACK").unwrap();
+        with_test_process_recorder(recorder.clone(), || {
+            assert_eq!(
+                state.coordinate_manual_resume("session").unwrap(),
+                crate::mailbox::ManualWakeCoordination::Released
+            );
+            assert_eq!(
+                state.coordinate_manual_resume("session").unwrap(),
+                crate::mailbox::ManualWakeCoordination::Absent
+            );
+        });
+        recorder.drain_deferred_for_test().unwrap();
+        assert!(
+            mailbox
+                .wake_session_reader()
+                .wake_claim("session")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn recovery_page_records_early_failure_and_optional_fast_sample() {
+        let (directory, state, _, _) = fixture();
+        let recorder_root = directory.path().join("spans");
+        let recorder = FlightRecorder::open(&recorder_root, RecorderConfig::default()).unwrap();
+        with_test_process_recorder(recorder.clone(), || {
+            with_test_process_policy(
+                SqliteObservationPolicy {
+                    slow_threshold: Duration::from_secs(60),
+                    ..SqliteObservationPolicy::default()
+                },
+                || {
+                    assert!(state.completed_turn_identity_page(Some(1), None).is_err());
+                    assert!(state.completed_turn_identity_page(None, None).is_ok());
+                },
+            );
+            with_test_process_policy(SqliteObservationPolicy::all(), || {
+                assert!(state.completed_turn_identity_page(None, None).is_ok());
+            });
+        });
+        recorder.drain_deferred_for_test().unwrap();
+        let report = FlightRecorderReader::new(&recorder_root).inspect();
+        let page_events: Vec<_> = report
+            .events
+            .iter()
+            .filter(|record| record.event.operation == "completed_turn_recovery_page")
+            .collect();
+        assert_eq!(page_events.len(), 2);
+        assert!(
+            page_events
+                .iter()
+                .any(|record| record.event.phase == DiagnosticPhase::Failed)
+        );
+        assert!(
+            page_events
+                .iter()
+                .any(|record| record.event.phase == DiagnosticPhase::Released)
+        );
+        assert!(page_events.iter().all(|record| {
+            record
+                .event
+                .observation
+                .sqlite
+                .as_ref()
+                .unwrap()
+                .rows_examined
+                .is_none()
+        }));
+    }
+
+    #[test]
+    fn exact_migration_recheck_retains_stage_and_target_provenance() {
+        let (directory, state, _, effects) = fixture();
+        let resolved = bind_for_migration(&state, &effects);
+        let recorder_root = directory.path().join("spans");
+        let recorder = FlightRecorder::open(&recorder_root, RecorderConfig::default()).unwrap();
+        with_test_process_recorder(recorder.clone(), || {
+            with_test_process_policy(SqliteObservationPolicy::all(), || {
+                let fence = state
+                    .begin_completed_turn_migration(
+                        &resolved,
+                        "external-target",
+                        None,
+                        CompletedTurnMigrationScope::ExternalProviderWide,
+                        CompletedTurnMigrationStage::ExternalBeforeProvider,
+                    )
+                    .unwrap();
+                state
+                    .recheck_completed_turn_migration_exact_target(
+                        &fence,
+                        "external-session",
+                        CompletedTurnMigrationStage::ExternalAfterProviderBeforeHostApply,
+                    )
+                    .unwrap();
+            });
+        });
+        recorder.drain_deferred_for_test().unwrap();
+        let report = FlightRecorderReader::new(&recorder_root).inspect();
+        let exact = report
+            .events
+            .iter()
+            .find(|record| {
+                record.event.operation == "completed_turn_migration_target_recheck"
+                    && record
+                        .event
+                        .correlations
+                        .get("migration_scope")
+                        .map(String::as_str)
+                        == Some("BuiltInExact")
+            })
+            .unwrap();
+        assert_eq!(exact.event.phase, DiagnosticPhase::Released);
+        assert_eq!(
+            exact
+                .event
+                .correlations
+                .get("migration_stage")
+                .map(String::as_str),
+            Some("ExternalAfterProviderBeforeHostApply")
+        );
+        assert!(
+            exact
+                .event
+                .correlations
+                .get("provider_name")
+                .unwrap()
+                .starts_with("sha256:")
+        );
+        assert!(
+            exact
+                .event
+                .correlations
+                .get("session_id")
+                .unwrap()
+                .starts_with("sha256:")
+        );
+        assert!(
+            exact
+                .event
+                .observation
+                .sqlite
+                .as_ref()
+                .unwrap()
+                .rows_examined
+                .is_none()
         );
     }
 
@@ -1604,12 +2443,12 @@ mod tests {
     fn completed_turn_recovery_plan_uses_only_the_pending_projection() {
         let directory = tempfile::tempdir().unwrap();
         let state = StateDb::open(&directory.path().join("state.db")).unwrap();
-        let query = format!("EXPLAIN QUERY PLAN {COMPLETED_TURN_RECOVERY_SQL}");
+        let query = format!("EXPLAIN QUERY PLAN {COMPLETED_TURN_RECOVERY_ROW_SQL}");
         let details = state
             .conn
             .prepare(&query)
             .unwrap()
-            .query_map([], |row| row.get::<_, String>(3))
+            .query_map([0], |row| row.get::<_, String>(3))
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
@@ -1627,6 +2466,363 @@ mod tests {
             "completed-turn recovery scanned terminal history: {details:?}"
         );
         assert!(state.completed_turn_identities().unwrap().is_empty());
+    }
+
+    fn seed_pending_recovery(
+        state: &StateDb,
+        original: &CompletedTurnEffects,
+        provider: &str,
+        session: &str,
+    ) -> (String, i64) {
+        let uuid = Uuid::new_v4().to_string();
+        let id = state
+            .start_invocation(&InvocationStart {
+                invocation_uuid: uuid.clone(),
+                model_name: "model".into(),
+                provider_name: provider.into(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        insert_pending_recovery(state, original, &uuid, id, session);
+        (uuid, id)
+    }
+
+    fn insert_pending_recovery(
+        state: &StateDb,
+        original: &CompletedTurnEffects,
+        uuid: &str,
+        id: i64,
+        session: &str,
+    ) {
+        let mut effects = original.clone();
+        effects.invocation_row_id = id;
+        effects.session_id = session.into();
+        effects.turn_generation_id = uuid.to_owned();
+        effects.returned_artifacts.clear();
+        let context = serde_json::json!({"provider_session":session});
+        let effects_json = encode(&effects).unwrap();
+        let context_json = encode(&context).unwrap();
+        let owner: Option<String> = None;
+        let digest = fingerprint(&owner, &effects_json, &context_json).unwrap();
+        state
+            .conn
+            .execute(
+                "INSERT INTO completed_turns
+             (invocation_id,invocation_uuid,settlement_id,owner_json,effects_json,
+              context_json,content_sha256,created_at,updated_at,retention_status)
+             VALUES (?1,?2,?3,NULL,?4,?5,?6,?7,?7,'pending')",
+                params![
+                    id,
+                    uuid,
+                    Uuid::new_v4().to_string(),
+                    effects_json,
+                    context_json,
+                    digest,
+                    chrono::Utc::now().to_rfc3339()
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn recovery_pages_progress_with_new_arrivals_and_restart_for_older_duty() {
+        let (_dir, state, _uuid, effects) = fixture();
+        let delayed = Uuid::new_v4().to_string();
+        let delayed_id = state
+            .start_invocation(&InvocationStart {
+                invocation_uuid: delayed.clone(),
+                model_name: "model".into(),
+                provider_name: "unrelated".into(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        let expected: Vec<_> = (0..205)
+            .map(|_| seed_pending_recovery(&state, &effects, "unrelated", "other").0)
+            .collect();
+        assert!(
+            state
+                .completed_turn_identities()
+                .unwrap_err()
+                .contains("page_required")
+        );
+        let page_plan = state
+            .conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT invocation_id FROM completed_turns
+             INDEXED BY completed_turns_recovery_pending
+             WHERE recovery_pending=1 AND invocation_id>?1
+             ORDER BY invocation_id LIMIT ?2",
+            )
+            .unwrap()
+            .query_map(params![0, 101], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            page_plan.iter().any(|part| {
+                part.contains("SEARCH completed_turns USING")
+                    && part.contains("completed_turns_recovery_pending")
+            }),
+            "{page_plan:?}"
+        );
+        let first = state.completed_turn_identity_page(None, None).unwrap();
+        assert_eq!(first.items.len(), 100);
+        assert!(first.has_more);
+        assert!(first.next_after.is_some());
+        assert!(!first.restart_required);
+        // Higher IDs and a target-only mutation cannot starve this pass.
+        let arrival = seed_pending_recovery(&state, &effects, "unrelated", "other").0;
+        state
+            .conn
+            .execute(
+                "UPDATE invocations SET provider_session_id='changed' WHERE invocation_uuid=?1",
+                [&expected[0]],
+            )
+            .unwrap();
+        let second = state
+            .completed_turn_identity_page(first.next_after, Some(first.epoch))
+            .unwrap();
+        assert_eq!(second.items.len(), 100);
+        assert!(!second.restart_required);
+        state
+            .conn
+            .execute(
+                "UPDATE completed_turns SET committed_at='2026-09-24T00:00:00Z',
+             closed_at='2026-09-24T00:00:00Z', recovery_pending=0,
+             tails_json=?1 WHERE invocation_uuid=?2",
+                params![
+                    serde_json::json!({
+                        "native":"complete_or_standalone", "delivery":"complete",
+                        "idle":"no_runtime", "wake":"no_mailbox"
+                    })
+                    .to_string(),
+                    expected[0]
+                ],
+            )
+            .unwrap();
+        // This completion uses an invocation ID older than the cursor. The
+        // current pass continues fairly, then explicitly requires a restart.
+        insert_pending_recovery(&state, &effects, &delayed, delayed_id, "other");
+        let third = state
+            .completed_turn_identity_page(second.next_after, Some(first.epoch))
+            .unwrap();
+        assert!(!third.has_more);
+        assert!(third.restart_required);
+        let mut found = HashSet::new();
+        for page in [&first, &second, &third] {
+            for identity in &page.items {
+                assert!(
+                    found.insert(identity.invocation_uuid.clone()),
+                    "duplicate recovery identity"
+                );
+                assert_eq!(identity.phase, "settlement_pending");
+            }
+        }
+        assert_eq!(found.len(), 206);
+        assert!(expected.iter().all(|uuid| found.contains(uuid)));
+        assert!(found.contains(&arrival));
+        assert!(!found.contains(&delayed));
+
+        let mut restart_found = HashSet::new();
+        let mut after = None;
+        let mut epoch = None;
+        let mut pages = 0;
+        loop {
+            let page = state.completed_turn_identity_page(after, epoch).unwrap();
+            pages += 1;
+            assert!(!page.restart_required);
+            for identity in page.items {
+                assert!(restart_found.insert(identity.invocation_uuid));
+            }
+            if !page.has_more {
+                break;
+            }
+            after = page.next_after;
+            epoch = Some(page.epoch);
+        }
+        assert_eq!(pages, 3);
+        assert_eq!(restart_found.len(), 206);
+        assert!(restart_found.contains(&delayed));
+        assert!(!restart_found.contains(&expected[0]));
+    }
+
+    #[test]
+    fn target_lookup_seeks_pending_projection_after_many_unrelated_duties() {
+        let (_dir, state, _uuid, effects) = fixture();
+        for _ in 0..160 {
+            seed_pending_recovery(&state, &effects, "unrelated", "other");
+        }
+        let (target, id) = seed_pending_recovery(&state, &effects, "fixture", "target");
+        let query = "EXPLAIN QUERY PLAN SELECT invocation_id FROM completed_turns
+            INDEXED BY completed_turns_recovery_target
+            WHERE recovery_pending=1 AND recovery_provider_name=?1
+              AND recovery_provider_session=?2 LIMIT 1";
+        let plan = state
+            .conn
+            .prepare(query)
+            .unwrap()
+            .query_map(params!["fixture", "target"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|part| part.contains("completed_turns_recovery_target")),
+            "{plan:?}"
+        );
+        let chain_plan = state
+            .conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT c.invocation_id FROM session_chain_segments s
+             CROSS JOIN completed_turns c INDEXED BY completed_turns_recovery_target
+             WHERE s.chain_id=?1 AND c.recovery_pending=1
+               AND c.recovery_provider_name=s.provider_name
+               AND c.recovery_provider_session=s.session_id LIMIT 1",
+            )
+            .unwrap()
+            .query_map(["chain"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            chain_plan.iter().any(|part| {
+                part.contains("SEARCH c USING") && part.contains("completed_turns_recovery_target")
+            }),
+            "{chain_plan:?}"
+        );
+        assert_eq!(
+            state.completed_turns_for_session("target").unwrap(),
+            vec![format!("{target}[settlement_pending]")]
+        );
+        assert!(
+            state
+                .refuse_completed_turn_resume("target")
+                .unwrap_err()
+                .contains(&target)
+        );
+        assert!(
+            state
+                .coordinate_manual_resume("target")
+                .unwrap_err()
+                .contains(&target)
+        );
+        state
+            .conn
+            .execute(
+                "UPDATE invocations SET provider_session_id='moved' WHERE id=?1",
+                [id],
+            )
+            .unwrap();
+        assert!(state.refuse_completed_turn_resume("target").is_ok());
+        assert!(
+            state
+                .refuse_completed_turn_resume("moved")
+                .unwrap_err()
+                .contains(&target)
+        );
+        let (tampered, _) = seed_pending_recovery(&state, &effects, "fixture", "tamper-old");
+        state
+            .conn
+            .execute(
+                "UPDATE completed_turns SET context_json=?1 WHERE invocation_uuid=?2",
+                params![
+                    serde_json::json!({"provider_session":"tamper-new"}).to_string(),
+                    tampered
+                ],
+            )
+            .unwrap();
+        assert!(
+            state
+                .refuse_completed_turn_resume("tamper-new")
+                .unwrap_err()
+                .contains("completed_turn_corrupt_admission")
+        );
+    }
+
+    #[test]
+    fn many_pending_duties_do_not_extend_sidecar_wait_under_state() {
+        let (_dir, state, uuid, effects) = fixture();
+        let mailbox = manual_fixture(&state, &effects, &uuid);
+        for _ in 0..160 {
+            seed_pending_recovery(&state, &effects, "unrelated", "other");
+        }
+        let holder = sqlite::Connection::open(mailbox.path()).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let started = std::time::Instant::now();
+        assert!(state.coordinate_manual_resume("session").is_err());
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "sidecar waited under State: {elapsed:?}"
+        );
+        let probe = sqlite::Connection::open(state.path()).unwrap();
+        probe.busy_timeout(Duration::ZERO).unwrap();
+        probe.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+        assert_eq!(
+            mailbox
+                .wake_session_reader()
+                .wake_claim("session")
+                .unwrap()
+                .unwrap()
+                .claim_token,
+            "old"
+        );
+        holder.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(
+            state.coordinate_manual_resume("session").unwrap(),
+            crate::mailbox::ManualWakeCoordination::Released
+        );
+        assert!(
+            mailbox
+                .wake_session_reader()
+                .wake_claim("session")
+                .unwrap()
+                .is_none()
+        );
+        println!(
+            "bounded manual State-to-sidecar lock test elapsed_us={}",
+            elapsed.as_micros()
+        );
+    }
+
+    #[test]
+    fn changed_sidecar_claim_after_exact_lookup_requires_retry() {
+        let (_dir, state, uuid, effects) = fixture();
+        let mailbox = manual_fixture(&state, &effects, &uuid);
+        let path = mailbox.path().to_path_buf();
+        AFTER_MANUAL_CLAIM_PEEK.with_borrow_mut(|hook| {
+            *hook = Some(Box::new(move || {
+                let writer = sqlite::Connection::open(path).unwrap();
+                writer
+                    .execute(
+                        "UPDATE session_wake_claim SET claimed_at='2001-01-01T00:00:00Z'
+                     WHERE session_id='session'",
+                        [],
+                    )
+                    .unwrap();
+            }));
+        });
+        let error = state.coordinate_manual_resume("session").unwrap_err();
+        assert!(
+            error.contains("manual_resume_claim_changed_retry"),
+            "{error}"
+        );
+        assert!(
+            mailbox
+                .wake_session_reader()
+                .wake_claim("session")
+                .unwrap()
+                .is_some()
+        );
+        let probe = sqlite::Connection::open(state.path()).unwrap();
+        probe.busy_timeout(Duration::ZERO).unwrap();
+        probe.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+        assert_eq!(
+            state.coordinate_manual_resume("session").unwrap(),
+            crate::mailbox::ManualWakeCoordination::Released
+        );
     }
 
     // Independent intent: completed-turn-retention-decisions.md. This fixture

@@ -72,6 +72,7 @@ fn ti_04_loader_level_idempotence_preserves_representative_rows() {
             "0025_completed_turns",
             "0026_live_history_barrier",
             "0027_record_timestamp_contract",
+            "0028_completed_turn_recovery_targets",
         ]
     );
 
