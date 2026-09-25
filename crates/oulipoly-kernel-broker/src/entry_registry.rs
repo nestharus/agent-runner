@@ -426,7 +426,9 @@ impl EntryRegistry {
     }
 
     pub fn has_unsettled_join(&self) -> bool {
-        self.records.iter().any(|record| record.join_consumed)
+        self.records
+            .iter()
+            .any(|record| record.join_consumed && record.joined_child.is_none())
     }
 }
 

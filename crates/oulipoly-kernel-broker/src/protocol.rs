@@ -566,6 +566,45 @@ pub fn private_fresh_account_effect_at(
     Ok(serde_json::from_str(value.trim_end())?)
 }
 
+/// Read the latest certified physical quota Q for this actor's exact candidate.
+/// `None` means the physical account has no quota Q yet. An uncertain response
+/// must not be converted into a new physical probe.
+#[cfg(feature = "age319-private-broker-fixture")]
+pub fn private_shared_quota_at(
+    path: &Path,
+    request: &FreshAccountEffectRequest,
+) -> io::Result<Option<FreshAccountEffectReadback>> {
+    let id = uuid::Uuid::parse_str(&request.d_key)
+        .map_err(|_| io::Error::other("invalid shared quota D key"))?;
+    if id.is_nil()
+        || id.to_string() != request.d_key
+        || request.kind != FreshAccountEffectKind::QuotaFirst
+    {
+        return Err(io::Error::other("invalid shared quota request"));
+    }
+    let mut stream = checked_connection(path)?;
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let mut frame = Vec::from([b'o']);
+    frame.extend_from_slice(&challenge);
+    frame.extend_from_slice(&serde_json::to_vec(request)?);
+    stream.write_all(&frame)?;
+    let mut answer = Vec::new();
+    stream.read_to_end(&mut answer)?;
+    if !answer.ends_with(b"\n") {
+        return Err(io::Error::other("shared quota response uncertain"));
+    }
+    let answer = std::str::from_utf8(&answer)
+        .map_err(|_| io::Error::other("shared quota response non-UTF8"))?;
+    if let Some(error) = answer.strip_prefix("error ") {
+        return Err(io::Error::other(error.trim_end().to_owned()));
+    }
+    let value = answer
+        .strip_prefix("fresh-shared-quota ")
+        .ok_or_else(|| io::Error::other("shared quota response invalid"))?;
+    Ok(serde_json::from_str(value.trim_end())?)
+}
+
 /// Q-gated output readback. The broker sends its verified regular files by
 /// descriptor; a text status without both descriptors is never a completion.
 #[cfg(feature = "age319-private-broker-fixture")]

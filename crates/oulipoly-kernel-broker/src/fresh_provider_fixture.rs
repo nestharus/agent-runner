@@ -9,7 +9,8 @@ fn main() -> std::io::Result<()> {
         .nth(1)
         .ok_or_else(|| std::io::Error::other("marker absent"))?;
     let fail = std::env::args().nth(2).as_deref() == Some("--fail");
-    let quota = std::env::args().nth(2).as_deref() == Some("--quota");
+    let single_process_quota = std::env::args().nth(2).as_deref() == Some("--quota-single");
+    let quota = std::env::args().nth(2).as_deref() == Some("--quota") || single_process_quota;
     let auth = std::env::args().nth(2).as_deref() == Some("--auth");
     let capacity = std::env::args().nth(2).as_deref() == Some("--capacity");
     let process = serde_json::json!({
@@ -35,19 +36,21 @@ fn main() -> std::io::Result<()> {
         .open(marker)?;
     file.write_all(b"one-provider-effect\n")?;
     file.sync_all()?;
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    if pid == 0 {
-        unsafe {
-            libc::setsid();
-            libc::clearenv();
-            if libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) != 0 {
-                libc::_exit(72);
-            }
-            loop {
-                libc::pause();
+    if !single_process_quota {
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if pid == 0 {
+            unsafe {
+                libc::setsid();
+                libc::clearenv();
+                if libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) != 0 {
+                    libc::_exit(72);
+                }
+                loop {
+                    libc::pause();
+                }
             }
         }
     }
