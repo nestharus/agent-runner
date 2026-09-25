@@ -65,6 +65,44 @@ fn assert_old_debt_and_no_f_ack(broker_state: &Path) {
     }
 }
 
+fn assert_pending_notify_without_delivery(broker_state: &Path) {
+    let fresh = rusqlite::Connection::open_with_flags(
+        broker_state.join("v30/sidecar/pid-identity.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    for (table, expected) in [
+        ("fresh_recipient_source", 1),
+        ("fresh_recipient_grant", 0),
+        ("fresh_recipient_ack_delegation", 0),
+    ] {
+        let count: i64 = fresh
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, expected, "unexpected {table} count");
+    }
+    let pending: i64 = fresh
+        .query_row(
+            "SELECT count(*) FROM mailbox WHERE delivered_at IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(pending, 1);
+    let old = rusqlite::Connection::open_with_flags(
+        broker_state.join("sidecar/pid-identity.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let old_pending: i64 = old.query_row(
+        "SELECT count(*) FROM mailbox WHERE session_id='old-pending' AND handle='old-unacked' AND delivered_at IS NULL",
+        [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(old_pending, 1);
+}
+
 struct SnapshotRestore {
     path: std::path::PathBuf,
     bytes: Vec<u8>,
@@ -81,6 +119,10 @@ fn inner() {
     let physical_mode = mode.starts_with("normal_model_provider_pty_physical");
     let resident_mode = mode.starts_with("normal_model_provider_pty_physical_resident_");
     let resident_bash = mode.starts_with("normal_model_provider_pty_physical_resident_bash_");
+    let resident_notify = resident_bash
+        && (mode.ends_with("_notify")
+            || mode.ends_with("_restart")
+            || mode.contains("_after_append"));
     let resident_failure = mode
         .strip_prefix("normal_model_provider_pty_physical_resident_")
         .filter(|case| *case != "tail" && !case.starts_with("bash_"));
@@ -331,7 +373,7 @@ fn inner() {
                 gate.join("bash-effect").display().to_string(),
                 data.display().to_string(),
             ];
-            if mode.ends_with("_notify") {
+            if resident_notify {
                 args.push("notify".into());
             }
             format!(
@@ -744,7 +786,7 @@ fn inner() {
                     .then_some(("AGE319_PRIVATE_PROVIDER_CAUSAL_BASH_V1", "1")),
             )
             .envs(
-                (mode.contains("_notify_") || mode.ends_with("_bash_notify"))
+                (mode.contains("_notify_") || resident_notify)
                     .then_some(("AGE319_PRIVATE_BASH_ORIGINAL_NOTIFY_V1", "1")),
             )
             .envs(
@@ -3313,7 +3355,7 @@ fn inner() {
                                     broker_state.join("v30/sidecar/pid-identity.db"),
                                 )
                                 .unwrap();
-                                let expected_pending = i64::from(mode.ends_with("_notify"));
+                                let expected_pending = i64::from(resident_notify);
                                 eventually(|| {
                                     side.query_row("SELECT count(*) FROM mailbox WHERE handle=?1 AND delivered_at IS NULL", [source["source_id"].as_str().unwrap()], |r| r.get::<_, i64>(0)).is_ok_and(|n| n == expected_pending)
                                 });
@@ -3509,7 +3551,7 @@ fn inner() {
                                         .count(),
                                     1
                                 );
-                                assert_old_debt_and_no_f_ack(&broker_state);
+                                assert_pending_notify_without_delivery(&broker_state);
                                 stop(&mut broker);
                                 return;
                             }
@@ -3533,8 +3575,10 @@ fn inner() {
                         );
                         assert!(
                             entry.wait().unwrap().success(),
-                            "resident root Q: {}; after-append broker: {}",
+                            "resident root Q: {}; W-restart broker: {}; after-append broker: {}",
                             fs::read_to_string(&err).unwrap_or_default(),
+                            fs::read_to_string(temp.path().join("resident-bash-restart.log"))
+                                .unwrap_or_default(),
                             fs::read_to_string(temp.path().join("after-append-restart.log"))
                                 .unwrap_or_default()
                         );
@@ -3595,8 +3639,24 @@ fn inner() {
                                 .count(),
                             1
                         );
+                        let pending: i64 = rusqlite::Connection::open(
+                            broker_state.join("v30/sidecar/pid-identity.db"),
+                        )
+                        .unwrap()
+                        .query_row(
+                            "SELECT count(*) FROM mailbox WHERE delivered_at IS NULL",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                        assert_eq!(pending, i64::from(resident_notify));
+                        if resident_notify {
+                            assert_pending_notify_without_delivery(&broker_state);
+                        } else {
+                            assert_old_debt_and_no_f_ack(&broker_state);
+                        }
                         eprintln!(
-                            "resident physical evidence: grant={grant_id} provider_host_pid={provider_pid} provider_local_pid={} pidns_ino={} native_session={} tail_token={} q_wait={} output_bytes={} output_sha256={}",
+                            "resident physical evidence: grant={grant_id} provider_host_pid={provider_pid} provider_local_pid={} pidns_ino={} native_session={} tail_token={} q_wait={} output_bytes={} output_sha256={} pending_f={pending}",
                             resident["provider_local_pid"],
                             resident["provider_pidns_ino"],
                             native["session_id"],
