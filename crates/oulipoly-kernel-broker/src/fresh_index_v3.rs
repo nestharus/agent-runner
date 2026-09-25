@@ -1,9 +1,30 @@
 //! Frozen v3 importer and a separate private, readback-only admission. The v2
-//! Index deliberately refuses this manifest. No v3 route or K writer exists.
+//! Index deliberately refuses this manifest. The keyed route facts below do
+//! not authorize a route or K writer.
 use super::*;
 use keyed_store::{Change, KeyedAccountStore};
 
 const V3: u32 = 3;
+
+/// One account-revision view for a future route writer. In particular, an
+/// absent or invalid quota observation is never interpreted as available.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RouteEligibility {
+    Eligible {
+        account_revision: u64,
+        quota_basis_points: Option<u32>,
+        observed_invocations: u64,
+    },
+    ProbeRequired,
+    Excluded,
+    Unknown,
+}
+
+fn typed<T: serde::de::DeserializeOwned>(value: Option<serde_json::Value>) -> Result<Option<T>> {
+    value
+        .map(|value| serde_json::from_value(value).map_err(|e| corrupt(e.to_string())))
+        .transpose()
+}
 
 #[derive(Debug)]
 pub(crate) struct KeyedGeneration {
@@ -108,6 +129,185 @@ impl KeyedGeneration {
             .get("pending", &format!("grant:{id}"))?
             .map(|value| serde_json::from_value(value).map_err(|error| corrupt(error.to_string())))
             .transpose()
+    }
+
+    /// Read exact physical account facts under one keyed account lock. The
+    /// source key must be derived from the candidate's command pair and the
+    /// verified effect environment; this method does not select a candidate
+    /// or publish a route receipt.
+    pub(crate) fn route_facts(
+        &self,
+        physical_key: &str,
+        source_key: Option<&SourceKey>,
+        model: &str,
+        config_sha256: &str,
+        now: i64,
+    ) -> Result<RouteEligibility> {
+        self.check_current()?;
+        if model.is_empty()
+            || config_sha256.is_empty()
+            || source_key.is_some_and(|key| !key.valid())
+        {
+            return Err(IndexError::Conflict("v3 route fact identity invalid"));
+        }
+        let source_digest = source_key.map(keyed).transpose()?.unwrap_or_default();
+        let capacity_key = keyed(&(model, config_sha256))?;
+        let store = self.account(physical_key)?;
+        let (revision, pending, mut values) = store.read_many(&[
+            ("account", "summary"),
+            ("source", &source_digest),
+            ("quota-marker", "account"),
+            ("auth-marker", "account"),
+            ("model-capacity", &capacity_key),
+        ])?;
+        let capacity: Option<MarkerHead> = typed(values.pop().unwrap())?;
+        let auth_marker: Option<MarkerHead> = typed(values.pop().unwrap())?;
+        let quota_marker: Option<MarkerHead> = typed(values.pop().unwrap())?;
+        let source: Option<SourceHead> = typed(values.pop().unwrap())?;
+        let summary = values
+            .pop()
+            .unwrap()
+            .ok_or(IndexError::RebuildRequired("v3 account summary absent"))?;
+        if summary["physical_key"].as_str() != Some(physical_key)
+            || summary["pending_count"].as_u64() != Some(pending)
+        {
+            return Err(corrupt("v3 route account summary differs"));
+        }
+        let invocations = summary["observed_invocations"]
+            .as_u64()
+            .ok_or_else(|| corrupt("v3 route invocation count absent"))?;
+        let unknown_scope = summary["unknown_marker_scope"]
+            .as_bool()
+            .ok_or_else(|| corrupt("v3 route marker scope absent"))?;
+        if pending != 0 || unknown_scope {
+            return Ok(RouteEligibility::Unknown);
+        }
+        for (marker, outcome) in [
+            (&quota_marker, "quota_rejected"),
+            (&auth_marker, "auth_rejected"),
+        ] {
+            if let Some(marker) = marker {
+                if marker.outcome != outcome {
+                    return Err(corrupt("v3 route account marker kind changed"));
+                }
+                marker.q.verify(&self.root)?;
+            }
+        }
+        if let Some(marker) = capacity {
+            if marker.outcome != "model_at_capacity"
+                || marker.model != model
+                || marker.config_sha256 != config_sha256
+            {
+                return Err(corrupt("v3 route capacity marker scope changed"));
+            }
+            marker.q.verify(&self.root)?;
+            // A fresh quota Q says nothing about model capacity. A later
+            // provider result must explicitly retire this marker.
+            return Ok(RouteEligibility::Excluded);
+        }
+        let Some(key) = source_key else {
+            if source.is_some() {
+                return Err(corrupt("v3 unmetered route has keyed source"));
+            }
+            if quota_marker.is_some() || auth_marker.is_some() {
+                return Ok(RouteEligibility::Excluded);
+            }
+            return Ok(RouteEligibility::Eligible {
+                account_revision: revision,
+                quota_basis_points: None,
+                observed_invocations: invocations,
+            });
+        };
+        let Some(source) = source else {
+            return Ok(RouteEligibility::ProbeRequired);
+        };
+        if source.source != *key {
+            return Err(corrupt("v3 route source identity changed"));
+        }
+        let Some(quota) = source.quota else {
+            return Ok(RouteEligibility::ProbeRequired);
+        };
+        quota.q.verify(&self.root)?;
+        let Some(result) = &quota.result else {
+            return Ok(RouteEligibility::Unknown);
+        };
+        result.require_present(&self.root)?;
+        if quota.origin_model.as_deref().is_none_or(str::is_empty)
+            || quota
+                .origin_config_sha256
+                .as_deref()
+                .is_none_or(str::is_empty)
+        {
+            return Ok(RouteEligibility::Unknown);
+        }
+        if quota.outcome == "unknown" {
+            return Ok(RouteEligibility::Unknown);
+        }
+        if quota.outcome != "valid_windows" || quota.windows.is_empty() {
+            return Ok(RouteEligibility::ProbeRequired);
+        }
+        let Some(completed) = quota.completed_unix_seconds else {
+            return Ok(RouteEligibility::Unknown);
+        };
+        if quota
+            .windows
+            .iter()
+            .any(|window| window.used_percent >= 100.0 || window.remaining == Some(0))
+        {
+            return Ok(RouteEligibility::Excluded);
+        }
+        if now < completed
+            || now
+                .checked_sub(completed)
+                .is_none_or(|age| age >= 5 * 60 * 60)
+        {
+            return Ok(RouteEligibility::ProbeRequired);
+        }
+        if quota_marker
+            .as_ref()
+            .is_some_and(|marker| marker.q.completed_unix_nanos >= quota.q.completed_unix_nanos)
+        {
+            return Ok(RouteEligibility::Excluded);
+        }
+        if let Some(marker) = auth_marker {
+            let Some(auth) = source.auth else {
+                return Ok(RouteEligibility::Excluded);
+            };
+            auth.q.verify(&self.root)?;
+            let Some(auth_result) = &auth.result else {
+                return Ok(RouteEligibility::Unknown);
+            };
+            auth_result.require_present(&self.root)?;
+            if auth.outcome != "refreshed"
+                || auth.origin_model.as_deref().is_none_or(str::is_empty)
+                || auth
+                    .origin_config_sha256
+                    .as_deref()
+                    .is_none_or(str::is_empty)
+                || auth.q.completed_unix_nanos <= marker.q.completed_unix_nanos
+            {
+                return Ok(RouteEligibility::Excluded);
+            }
+        }
+        let mut basis = u32::MAX;
+        for window in &quota.windows {
+            if !window.used_percent.is_finite()
+                || !(0.0..=100.0).contains(&window.used_percent)
+                || DateTime::parse_from_rfc3339(&window.resets_at)
+                    .map_or(true, |date| date.timestamp() != window.reset_unix_seconds)
+            {
+                return Err(corrupt("v3 route typed window invalid"));
+            }
+            if window.reset_unix_seconds <= now {
+                return Ok(RouteEligibility::ProbeRequired);
+            }
+            basis = basis.min(((100.0 - window.used_percent) * 100.0).round() as u32);
+        }
+        Ok(RouteEligibility::Eligible {
+            account_revision: revision,
+            quota_basis_points: Some(basis),
+            observed_invocations: invocations,
+        })
     }
 
     fn verify_retained(&self, source: &Path) -> Result<()> {
@@ -824,6 +1024,368 @@ fn rebuild_inner(
 mod tests {
     use super::*;
     use oulipoly_kernel_broker::protocol::{FreshAccountEffectReadback, FreshQuotaWindow};
+
+    fn route_summary(pending: u64) -> serde_json::Value {
+        serde_json::json!({
+            "physical_key": "physical", "pending_count": pending,
+            "observed_invocations": 3, "unknown_marker_scope": false
+        })
+    }
+
+    fn route_fixture(history: usize) -> (tempfile::TempDir, KeyedGeneration, SourceKey, u64) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let generation = uuid::Uuid::new_v4().to_string();
+        let storage = root.join("index-v1/generations").join(&generation);
+        let accounts = storage.join("keyed-accounts");
+        fs::create_dir_all(&accounts).unwrap();
+        write_new(
+            &root.join("index-v1/manifest.json"),
+            &Manifest {
+                version: V3,
+                generation: generation.clone(),
+                generation_dir: true,
+            },
+        )
+        .unwrap();
+        let store = KeyedAccountStore::create(
+            &accounts.join(keyed(&"physical").unwrap()),
+            &generation,
+            "physical",
+        )
+        .unwrap();
+        let k = artifact(&root, "route-k.json", b"K");
+        let q = artifact(&root, "route-q.json", b"Q");
+        let physical_q = PhysicalQ {
+            physical_k: k,
+            q,
+            terminal: None,
+            completed_unix_nanos: 1_800_000_000_000_000_000,
+        };
+        let result = artifact(&root, "route-result.json", b"typed-result");
+        let observation = ObservationHead {
+            q: physical_q,
+            result: Some(result.clone()),
+            outcome: "valid_windows".into(),
+            origin_model: Some("model-a".into()),
+            origin_config_sha256: Some("config".into()),
+            completed_unix_seconds: Some(1_800_000_000),
+            windows: vec![WindowHead {
+                used_percent: 20.0,
+                resets_at: "2099-01-01T00:00:00Z".into(),
+                reset_unix_seconds: 4_070_908_800,
+                remaining: Some(80),
+            }],
+        };
+        let key = SourceKey {
+            commands_sha256: "commands".into(),
+            environment_sha256: "environment".into(),
+        };
+        let mut revision = store
+            .commit(
+                0,
+                vec![change("account", "summary", &route_summary(0)).unwrap()],
+            )
+            .unwrap();
+        for n in 0..history {
+            let old = SourceKey {
+                commands_sha256: format!("old-{n}"),
+                environment_sha256: "environment".into(),
+            };
+            revision = store
+                .commit(
+                    revision,
+                    vec![
+                        change(
+                            "source",
+                            &keyed(&old).unwrap(),
+                            &SourceHead {
+                                source: old,
+                                quota: Some(observation.clone()),
+                                auth: None,
+                            },
+                        )
+                        .unwrap(),
+                    ],
+                )
+                .unwrap();
+        }
+        revision = store
+            .commit(
+                revision,
+                vec![
+                    change(
+                        "source",
+                        &keyed(&key).unwrap(),
+                        &SourceHead {
+                            source: key.clone(),
+                            quota: Some(observation),
+                            auth: None,
+                        },
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap();
+        (
+            temp,
+            KeyedGeneration {
+                generation,
+                root,
+                storage,
+            },
+            key,
+            revision,
+        )
+    }
+
+    #[test]
+    fn v3_route_facts_are_keyed_and_fail_closed_on_debt_invalid_q_and_markers() {
+        let (_small, small, source, _) = route_fixture(1);
+        let (_large, large, large_source, revision) = route_fixture(205);
+        let now = 1_800_000_100;
+        let small_guard = ReaderIoGuard::start("v3-route-facts-small");
+        let (small_result, small_io) = super::super::keyed_store::measured(|| {
+            small
+                .route_facts("physical", Some(&source), "model-a", "config", now)
+                .unwrap()
+        });
+        drop(small_guard);
+        let small_physical_io = last_reader_io().unwrap();
+        let large_guard = ReaderIoGuard::start("v3-route-facts-many");
+        let (large_result, large_io) = super::super::keyed_store::measured(|| {
+            large
+                .route_facts("physical", Some(&large_source), "model-a", "config", now)
+                .unwrap()
+        });
+        drop(large_guard);
+        let large_physical_io = last_reader_io().unwrap();
+        assert!(matches!(
+            small_result,
+            RouteEligibility::Eligible {
+                quota_basis_points: Some(8000),
+                ..
+            }
+        ));
+        assert_eq!(
+            large_result,
+            RouteEligibility::Eligible {
+                account_revision: revision,
+                quota_basis_points: Some(8000),
+                observed_invocations: 3
+            }
+        );
+        assert_eq!(small_io.open_attempts, large_io.open_attempts);
+        assert_eq!(small_io.opened, large_io.opened);
+        assert_eq!(small_io.directory_entries, 0);
+        assert_eq!(large_io.directory_entries, 0);
+        assert!(large_io.bytes_parsed <= small_io.bytes_parsed + 256);
+        assert_eq!(
+            small_physical_io.open_attempts,
+            large_physical_io.open_attempts
+        );
+        assert_eq!(small_physical_io.opened, large_physical_io.opened);
+        assert_eq!(small_physical_io.directory_entries, 0);
+        assert_eq!(large_physical_io.directory_entries, 0);
+        eprintln!("v3 route facts keyed 1/205 sources: {small_io:?} / {large_io:?}");
+        eprintln!(
+            "v3 route facts manifest/physical 1/205 sources: {small_physical_io:?} / {large_physical_io:?}"
+        );
+        assert_eq!(
+            large
+                .route_facts(
+                    "physical",
+                    Some(&large_source),
+                    "model-a",
+                    "config",
+                    now + 5 * 60 * 60
+                )
+                .unwrap(),
+            RouteEligibility::ProbeRequired
+        );
+
+        let store = large.account("physical").unwrap();
+        let mut revision = store
+            .commit(
+                revision,
+                vec![
+                    change(
+                        "pending",
+                        "effect:new",
+                        &serde_json::json!({"unresolved":"K"}),
+                    )
+                    .unwrap(),
+                    change("account", "summary", &route_summary(1)).unwrap(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            large
+                .route_facts("physical", Some(&large_source), "model-a", "config", now)
+                .unwrap(),
+            RouteEligibility::Unknown
+        );
+        revision = store
+            .commit(
+                revision,
+                vec![
+                    Change {
+                        class: "pending".into(),
+                        key: "effect:new".into(),
+                        value: None,
+                    },
+                    change("account", "summary", &route_summary(0)).unwrap(),
+                ],
+            )
+            .unwrap();
+        let mut source_head: SourceHead =
+            typed(store.get("source", &keyed(&large_source).unwrap()).unwrap())
+                .unwrap()
+                .unwrap();
+        source_head.quota.as_mut().unwrap().outcome = "invalid".into();
+        revision = store
+            .commit(
+                revision,
+                vec![change("source", &keyed(&large_source).unwrap(), &source_head).unwrap()],
+            )
+            .unwrap();
+        assert_eq!(
+            large
+                .route_facts("physical", Some(&large_source), "model-a", "config", now)
+                .unwrap(),
+            RouteEligibility::ProbeRequired
+        );
+        source_head.quota.as_mut().unwrap().outcome = "valid_windows".into();
+        source_head.quota.as_mut().unwrap().windows[0].used_percent = 100.0;
+        revision = store
+            .commit(
+                revision,
+                vec![change("source", &keyed(&large_source).unwrap(), &source_head).unwrap()],
+            )
+            .unwrap();
+        assert_eq!(
+            large
+                .route_facts("physical", Some(&large_source), "model-a", "config", now)
+                .unwrap(),
+            RouteEligibility::Excluded
+        );
+        source_head.quota.as_mut().unwrap().windows[0].used_percent = 20.0;
+        revision = store
+            .commit(
+                revision,
+                vec![change("source", &keyed(&large_source).unwrap(), &source_head).unwrap()],
+            )
+            .unwrap();
+        let capacity = MarkerHead {
+            q: source_head.quota.as_ref().unwrap().q.clone(),
+            model: "model-a".into(),
+            config_sha256: "config".into(),
+            outcome: "model_at_capacity".into(),
+        };
+        store
+            .commit(
+                revision,
+                vec![
+                    change(
+                        "model-capacity",
+                        &keyed(&("model-a", "config")).unwrap(),
+                        &capacity,
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            large
+                .route_facts("physical", Some(&large_source), "model-a", "config", now)
+                .unwrap(),
+            RouteEligibility::Excluded
+        );
+        assert!(matches!(
+            large
+                .route_facts("physical", Some(&large_source), "model-b", "config", now)
+                .unwrap(),
+            RouteEligibility::Eligible { .. }
+        ));
+    }
+
+    #[test]
+    fn v3_route_facts_require_newer_source_q_to_clear_account_markers() {
+        let (_temp, generation, key, mut revision) = route_fixture(0);
+        let store = generation.account("physical").unwrap();
+        let digest = keyed(&key).unwrap();
+        let now = 1_800_000_100;
+        let mut source: SourceHead = typed(store.get("source", &digest).unwrap())
+            .unwrap()
+            .unwrap();
+        let q = source.quota.as_ref().unwrap().q.clone();
+        let quota_marker = MarkerHead {
+            q: q.clone(),
+            model: "other-model".into(),
+            config_sha256: "other-config".into(),
+            outcome: "quota_rejected".into(),
+        };
+        revision = store
+            .commit(
+                revision,
+                vec![change("quota-marker", "account", &quota_marker).unwrap()],
+            )
+            .unwrap();
+        assert_eq!(
+            generation
+                .route_facts("physical", Some(&key), "model-a", "config", now)
+                .unwrap(),
+            RouteEligibility::Excluded
+        );
+        source.quota.as_mut().unwrap().q.completed_unix_nanos += 1;
+        revision = store
+            .commit(revision, vec![change("source", &digest, &source).unwrap()])
+            .unwrap();
+        assert!(matches!(
+            generation
+                .route_facts("physical", Some(&key), "model-a", "config", now)
+                .unwrap(),
+            RouteEligibility::Eligible { .. }
+        ));
+
+        let auth_marker = MarkerHead {
+            outcome: "auth_rejected".into(),
+            ..quota_marker
+        };
+        revision = store
+            .commit(
+                revision,
+                vec![change("auth-marker", "account", &auth_marker).unwrap()],
+            )
+            .unwrap();
+        assert_eq!(
+            generation
+                .route_facts("physical", Some(&key), "model-a", "config", now)
+                .unwrap(),
+            RouteEligibility::Excluded
+        );
+        source.auth = Some(ObservationHead {
+            q: PhysicalQ {
+                completed_unix_nanos: q.completed_unix_nanos + 2,
+                ..q
+            },
+            result: source.quota.as_ref().unwrap().result.clone(),
+            outcome: "refreshed".into(),
+            origin_model: Some("other-model".into()),
+            origin_config_sha256: Some("other-config".into()),
+            completed_unix_seconds: Some(now),
+            windows: Vec::new(),
+        });
+        store
+            .commit(revision, vec![change("source", &digest, &source).unwrap()])
+            .unwrap();
+        assert!(matches!(
+            generation
+                .route_facts("physical", Some(&key), "model-a", "config", now)
+                .unwrap(),
+            RouteEligibility::Eligible { .. }
+        ));
+    }
 
     fn artifact(root: &Path, name: &str, bytes: &[u8]) -> Artifact {
         fs::write(root.join(name), bytes).unwrap();

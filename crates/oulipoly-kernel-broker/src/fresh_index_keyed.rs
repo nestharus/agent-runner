@@ -436,6 +436,22 @@ impl KeyedAccountStore {
         let root = self.recover()?;
         self.get_unlocked(class, key, &root)
     }
+    /// Read all named facts and the pending count from one committed account
+    /// revision. A route must never combine quota from one revision with debt
+    /// or a terminal marker from another. The caller supplies exact keys;
+    /// settled history is not enumerated.
+    pub(crate) fn read_many(
+        &self,
+        keys: &[(&str, &str)],
+    ) -> Result<(u64, u64, Vec<Option<Value>>)> {
+        let _lock = self.lock()?;
+        let root = self.recover()?;
+        let values = keys
+            .iter()
+            .map(|(class, key)| self.get_unlocked(class, key, &root))
+            .collect::<Result<Vec<_>>>()?;
+        Ok((root.revision, root.pending_count, values))
+    }
     fn get_unlocked(&self, class: &str, key: &str, root: &Root) -> Result<Option<Value>> {
         let Some(pointer) = self.pointer(class, key, root)? else {
             return Ok(None);
