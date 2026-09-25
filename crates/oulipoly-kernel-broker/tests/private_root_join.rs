@@ -12,7 +12,7 @@ use oulipoly_state::mailbox::{
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -80,9 +80,10 @@ fn inner() {
     let mode = std::env::var("AGE319_PRIVATE_JOIN_MODE").unwrap_or_else(|_| "help".into());
     let physical_mode = mode.starts_with("normal_model_provider_pty_physical");
     let resident_mode = mode.starts_with("normal_model_provider_pty_physical_resident_");
+    let resident_bash = mode.starts_with("normal_model_provider_pty_physical_resident_bash_");
     let resident_failure = mode
         .strip_prefix("normal_model_provider_pty_physical_resident_")
-        .filter(|case| *case != "tail");
+        .filter(|case| *case != "tail" && !case.starts_with("bash_"));
     let physical_success = physical_mode
         && !matches!(
             mode.as_str(),
@@ -129,6 +130,15 @@ fn inner() {
             | "normal_model_provider_pty_physical_restart_after_k"
             | "normal_model_provider_pty_physical_root_exit"
             | "normal_model_provider_pty_physical_resident_tail"
+            | "normal_model_provider_pty_physical_resident_bash_notify"
+            | "normal_model_provider_pty_physical_resident_bash_response"
+            | "normal_model_provider_pty_physical_resident_bash_wrong_image"
+            | "normal_model_provider_pty_physical_resident_bash_absent_parent"
+            | "normal_model_provider_pty_physical_resident_bash_ambiguous_parent"
+            | "normal_model_provider_pty_physical_resident_bash_wrong_plan"
+            | "normal_model_provider_pty_physical_resident_bash_wrong_actor"
+            | "normal_model_provider_pty_physical_resident_bash_unconsumed_parent"
+            | "normal_model_provider_pty_physical_resident_bash_restart"
             | "normal_model_provider_pty_physical_resident_absent_socket"
             | "normal_model_provider_pty_physical_resident_replaced_socket"
             | "normal_model_provider_pty_physical_resident_wrong_account"
@@ -172,7 +182,8 @@ fn inner() {
     let runner =
         std::env::var("OULIPOLY_AGE319_RUNNER_IMAGE").expect("built Runner image required");
     let bash = (mode == "normal_handoff_bash_child"
-        || mode.starts_with("normal_model_provider_bash_causal"))
+        || mode.starts_with("normal_model_provider_bash_causal")
+        || mode.starts_with("normal_model_provider_pty_physical_resident_bash_"))
     .then(|| std::env::var("OULIPOLY_AGE319_BASH_IMAGE").expect("built Bash image required"));
     let bash_request = uuid::Uuid::new_v4().to_string();
     let provider_image = std::env::var("OULIPOLY_AGE319_PROVIDER_IMAGE").unwrap_or_default();
@@ -307,7 +318,24 @@ fn inner() {
         } else {
             marker.clone()
         };
-        let interactive_args = if mode.starts_with("normal_model_provider_pty_") {
+        let interactive_args = if resident_bash {
+            let mut args = vec![
+                "--interactive-only".to_string(),
+                gate.join("interactive-effect").display().to_string(),
+                bash.as_ref().unwrap().to_string(),
+                temp.path().join("v30.sock").display().to_string(),
+                bash_request.clone(),
+                gate.join("bash-effect").display().to_string(),
+                data.display().to_string(),
+            ];
+            if mode.ends_with("_notify") {
+                args.push("notify".into());
+            }
+            format!(
+                "interactive_args = {}\n",
+                serde_json::to_string(&args).unwrap()
+            )
+        } else if mode.starts_with("normal_model_provider_pty_") {
             format!(
                 "interactive_args = [\"--interactive-only\", {}]\n",
                 serde_json::to_string(gate.join("interactive-effect").to_str().unwrap()).unwrap()
@@ -701,11 +729,11 @@ fn inner() {
                 .then_some(("AGE319_PRIVATE_ROOT_TERMINAL_V1", "1")),
             )
             .envs(
-                mode.starts_with("normal_model_provider_bash_causal")
+                (mode.starts_with("normal_model_provider_bash_causal") || resident_bash)
                     .then_some(("AGE319_PRIVATE_PROVIDER_CAUSAL_BASH_V1", "1")),
             )
             .envs(
-                mode.contains("_notify_")
+                (mode.contains("_notify_") || mode.ends_with("_bash_notify"))
                     .then_some(("AGE319_PRIVATE_BASH_ORIGINAL_NOTIFY_V1", "1")),
             )
             .envs(
@@ -2019,6 +2047,15 @@ fn inner() {
                     | "normal_model_provider_pty_control"
                     | "normal_model_provider_pty_physical"
                     | "normal_model_provider_pty_physical_resident_tail"
+                    | "normal_model_provider_pty_physical_resident_bash_notify"
+                    | "normal_model_provider_pty_physical_resident_bash_response"
+                    | "normal_model_provider_pty_physical_resident_bash_wrong_image"
+                    | "normal_model_provider_pty_physical_resident_bash_absent_parent"
+                    | "normal_model_provider_pty_physical_resident_bash_ambiguous_parent"
+                    | "normal_model_provider_pty_physical_resident_bash_wrong_plan"
+                    | "normal_model_provider_pty_physical_resident_bash_wrong_actor"
+                    | "normal_model_provider_pty_physical_resident_bash_unconsumed_parent"
+                    | "normal_model_provider_pty_physical_resident_bash_restart"
                     | "normal_model_provider_pty_physical_resident_absent_socket"
                     | "normal_model_provider_pty_physical_resident_replaced_socket"
                     | "normal_model_provider_pty_physical_resident_wrong_account"
@@ -2332,6 +2369,16 @@ fn inner() {
                     .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
                     .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
                     .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
+                    .envs(bash.as_ref().map(|path| {
+                        (
+                            "OULIPOLY_KERNEL_BROKER_FIXTURE_BASH_V1",
+                            if mode.ends_with("_wrong_image") {
+                                Path::new("/bin/true")
+                            } else {
+                                Path::new(path)
+                            },
+                        )
+                    }))
                     .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
                     .envs((mode == "normal_model_provider_reply_loss").then_some((
                         "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_PROVIDER_K_REPLY_V1",
@@ -3014,8 +3061,361 @@ fn inner() {
                                 .join(format!("{}.interactive-q.json", receipt.handoff_id))
                                 .exists()
                         );
+                        if resident_bash {
+                            eventually(|| gate.join("causal-before-c").exists());
+                            let c_socket = socket.with_file_name("v30.sock");
+                            assert!(
+                                fs::symlink_metadata(&c_socket)
+                                    .unwrap()
+                                    .file_type()
+                                    .is_socket()
+                            );
+                            assert!(
+                                broker.try_wait().unwrap().is_none(),
+                                "C broker exited before request"
+                            );
+                            eprintln!(
+                                "resident Bash C broker_pid={} socket={}",
+                                broker.id(),
+                                c_socket.display()
+                            );
+                            let parent_path = provider_dir
+                                .join(format!("{}.interactive-k.json", receipt.handoff_id));
+                            let original_parent = fs::read(&parent_path).unwrap();
+                            let consumed_parent_path =
+                                provider_dir.join(format!("{grant_id}.consumed.json"));
+                            let original_consumed_parent = fs::read(&consumed_parent_path).unwrap();
+                            let ambiguous_path = provider_dir
+                                .join(format!("{}.fresh-grant.json", receipt.handoff_id));
+                            if mode.ends_with("_absent_parent") {
+                                fs::remove_file(&parent_path).unwrap();
+                            } else if mode.ends_with("_unconsumed_parent") {
+                                fs::remove_file(&consumed_parent_path).unwrap();
+                            } else if mode.ends_with("_ambiguous_parent") {
+                                let k: serde_json::Value =
+                                    serde_json::from_slice(&original_parent).unwrap();
+                                fs::write(
+                                    &ambiguous_path,
+                                    serde_json::to_vec(&k["grant"]).unwrap(),
+                                )
+                                .unwrap();
+                            } else if mode.ends_with("_wrong_plan")
+                                || mode.ends_with("_wrong_actor")
+                            {
+                                let mut changed: serde_json::Value =
+                                    serde_json::from_slice(&original_parent).unwrap();
+                                if mode.ends_with("_wrong_plan") {
+                                    changed["grant"]["plan_sha256"] =
+                                        serde_json::json!("0".repeat(64));
+                                } else {
+                                    changed["grant"]["binding"]["actor_starttime"] =
+                                        serde_json::json!(0);
+                                }
+                                fs::write(&parent_path, serde_json::to_vec(&changed).unwrap())
+                                    .unwrap();
+                            }
+                            fs::write(gate.join("causal-release-c"), b"go").unwrap();
+                            eventually(|| {
+                                gate.join("bash-causal-terminal-status").exists()
+                                    || entry.try_wait().unwrap().is_some()
+                            });
+                            let expected_refusal = if mode.ends_with("_wrong_image") {
+                                Some("Bash child image changed")
+                            } else if mode.ends_with("_absent_parent") {
+                                Some("consumed causal parent work grant absent")
+                            } else if mode.ends_with("_unconsumed_parent") {
+                                Some("causal parent K not consumed")
+                            } else if mode.ends_with("_ambiguous_parent") {
+                                Some("ambiguous causal parent K")
+                            } else if mode.ends_with("_wrong_plan")
+                                || mode.ends_with("_wrong_actor")
+                            {
+                                Some("interactive causal parent K or plan changed")
+                            } else {
+                                None
+                            };
+                            if let Some(reason) = expected_refusal {
+                                assert_eq!(
+                                    fs::read(gate.join("bash-causal-terminal-status"))
+                                        .unwrap_or_default(),
+                                    b"70"
+                                );
+                                assert!(
+                                    fs::read_to_string(gate.join("bash-causal-error"))
+                                        .unwrap_or_default()
+                                        .contains(reason),
+                                    "{}",
+                                    fs::read_to_string(gate.join("bash-causal-error"))
+                                        .unwrap_or_default()
+                                );
+                                let fresh =
+                                    rusqlite::Connection::open(broker_state.join("v30/state.db"))
+                                        .unwrap();
+                                assert_eq!(
+                                    fresh
+                                        .query_row(
+                                            "SELECT count(*) FROM fresh_bash_child",
+                                            [],
+                                            |r| r.get::<_, i64>(0)
+                                        )
+                                        .unwrap(),
+                                    0
+                                );
+                                assert_eq!(
+                                    fresh
+                                        .query_row(
+                                            "SELECT count(*) FROM fresh_lane_accepted_source",
+                                            [],
+                                            |r| r.get::<_, i64>(0)
+                                        )
+                                        .unwrap(),
+                                    0
+                                );
+                                assert!(!gate.join("bash-effect").exists());
+                                let side = rusqlite::Connection::open(
+                                    broker_state.join("v30/sidecar/pid-identity.db"),
+                                )
+                                .unwrap();
+                                assert_eq!(
+                                    side.query_row("SELECT count(*) FROM mailbox", [], |r| r
+                                        .get::<_, i64>(0))
+                                        .unwrap(),
+                                    0
+                                );
+                                let old = rusqlite::Connection::open(
+                                    broker_state.join("sidecar/pid-identity.db"),
+                                )
+                                .unwrap();
+                                assert_eq!(old.query_row("SELECT count(*) FROM mailbox WHERE session_id='old-pending' AND delivered_at IS NULL", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+                                if mode.ends_with("_absent_parent")
+                                    || mode.ends_with("_wrong_plan")
+                                    || mode.ends_with("_wrong_actor")
+                                {
+                                    fs::write(&parent_path, &original_parent).unwrap();
+                                }
+                                if mode.ends_with("_ambiguous_parent") {
+                                    fs::remove_file(&ambiguous_path).unwrap();
+                                }
+                                if mode.ends_with("_unconsumed_parent") {
+                                    fs::write(&consumed_parent_path, &original_consumed_parent)
+                                        .unwrap();
+                                }
+                            } else {
+                                assert_eq!(
+                                    fs::read(gate.join("bash-causal-terminal-status"))
+                                        .unwrap_or_default(),
+                                    b"0",
+                                    "bash: {}; root: {}; broker: {}",
+                                    fs::read_to_string(gate.join("bash-causal-error"))
+                                        .unwrap_or_default(),
+                                    fs::read_to_string(&err).unwrap_or_default(),
+                                    fs::read_to_string(&broker_log).unwrap_or_default(),
+                                );
+                                assert!(
+                                    entry.try_wait().unwrap().is_none(),
+                                    "root exited before Bash W"
+                                );
+                                assert!(
+                                    oulipoly_state::pid_identity::read_live_process_identity(
+                                        provider_pid
+                                    )
+                                    .unwrap()
+                                    .is_some()
+                                );
+                                let report: serde_json::Value = serde_json::from_slice(
+                                    &fs::read(gate.join("bash-causal-output")).unwrap(),
+                                )
+                                .unwrap();
+                                let child = &report["child"];
+                                let source = &report["fresh_source_w"];
+                                let child_grant = source["physical_grant_id"].as_str().unwrap();
+                                assert_eq!(child["root_id"], prepared.root_id);
+                                assert_eq!(child["root_handoff_id"], receipt.handoff_id);
+                                assert_eq!(
+                                    child["parent_invocation_uuid"],
+                                    receipt.invocation_uuid
+                                );
+                                assert_eq!(child["parent_work_grant_id"], grant_id);
+                                let parent_attach: serde_json::Value = serde_json::from_slice(
+                                    &fs::read(provider_dir.join(format!("{grant_id}.attach.json")))
+                                        .unwrap(),
+                                )
+                                .unwrap();
+                                assert_eq!(child["parent_work_id"], parent_attach["work_id"]);
+                                assert_ne!(child_grant, grant_id);
+                                assert_ne!(child["session"]["session_id"], session.session_id);
+                                assert_eq!(source["root_id"], prepared.root_id);
+                                assert_eq!(source["session_id"], child["session"]["session_id"]);
+                                assert_eq!(source["parent_work_grant_id"], grant_id);
+                                let selected_child: serde_json::Value =
+                                    serde_json::from_slice(
+                                        &fs::read(provider_dir.join(format!(
+                                            "{bash_request}.child-work-selection.json"
+                                        )))
+                                        .unwrap(),
+                                    )
+                                    .unwrap();
+                                assert_eq!(selected_child["role"], "bash-child-private-fixed-v1");
+                                assert_eq!(selected_child["child_request_id"], bash_request);
+                                assert_eq!(selected_child["child_d_key"], child["d_key"]);
+                                assert_eq!(
+                                    selected_child["binding"]["causal_parent"]["grant_id"],
+                                    grant_id
+                                );
+                                assert_eq!(
+                                    selected_child["binding"]["causal_parent"]["work_id"],
+                                    parent_attach["work_id"]
+                                );
+                                let child_k: serde_json::Value = serde_json::from_slice(
+                                    &fs::read(
+                                        provider_dir
+                                            .join(format!("{bash_request}.fresh-grant.json")),
+                                    )
+                                    .unwrap(),
+                                )
+                                .unwrap();
+                                assert_eq!(child_k["id"], child_grant);
+                                assert_eq!(child_k["plan_sha256"], selected_child["plan_sha256"]);
+                                assert_eq!(child_k["binding"], selected_child["binding"]);
+                                let fresh =
+                                    rusqlite::Connection::open(broker_state.join("v30/state.db"))
+                                        .unwrap();
+                                assert_eq!(
+                                    fresh
+                                        .query_row(
+                                            "SELECT count(*) FROM fresh_lane_accepted_source",
+                                            [],
+                                            |r| r.get::<_, i64>(0)
+                                        )
+                                        .unwrap(),
+                                    1
+                                );
+                                let side = rusqlite::Connection::open(
+                                    broker_state.join("v30/sidecar/pid-identity.db"),
+                                )
+                                .unwrap();
+                                let expected_pending = i64::from(mode.ends_with("_notify"));
+                                eventually(|| {
+                                    side.query_row("SELECT count(*) FROM mailbox WHERE handle=?1 AND delivered_at IS NULL", [source["source_id"].as_str().unwrap()], |r| r.get::<_, i64>(0)).is_ok_and(|n| n == expected_pending)
+                                });
+                                assert_eq!(
+                                    side.query_row(
+                                        "SELECT count(*) FROM mailbox WHERE delivered_at IS NULL",
+                                        [],
+                                        |r| r.get::<_, i64>(0)
+                                    )
+                                    .unwrap(),
+                                    expected_pending
+                                );
+                                assert_eq!(
+                                    side.query_row(
+                                        "SELECT count(*) FROM fresh_recipient_grant",
+                                        [],
+                                        |r| r.get::<_, i64>(0)
+                                    )
+                                    .unwrap(),
+                                    0
+                                );
+                                let old = rusqlite::Connection::open(
+                                    broker_state.join("sidecar/pid-identity.db"),
+                                )
+                                .unwrap();
+                                assert_eq!(old.query_row("SELECT count(*) FROM mailbox WHERE session_id='old-pending' AND handle='old-unacked' AND delivered_at IS NULL", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+                                if mode.ends_with("_restart") {
+                                    let accepted: oulipoly_state::mailbox::FreshBashSourceEvent =
+                                        serde_json::from_value(source.clone()).unwrap();
+                                    stop(&mut broker);
+                                    broker =
+                                        Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
+                                            .env(
+                                                "OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1",
+                                                &socket,
+                                            )
+                                            .env(
+                                                "OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1",
+                                                &broker_state,
+                                            )
+                                            .env(
+                                                "OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1",
+                                                &runner,
+                                            )
+                                            .env(
+                                                "OULIPOLY_KERNEL_BROKER_FIXTURE_BASH_V1",
+                                                bash.as_ref().unwrap(),
+                                            )
+                                            .env(
+                                                "OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1",
+                                                &gate,
+                                            )
+                                            .stderr(Stdio::from(
+                                                File::create(
+                                                    temp.path().join("resident-bash-restart.log"),
+                                                )
+                                                .unwrap(),
+                                            ))
+                                            .spawn()
+                                            .unwrap();
+                                    eventually(|| {
+                                        protocol::request_at(&socket, Operation::Classify).is_ok()
+                                    });
+                                    let lane = FreshV30Lane::open_at(&broker_state).unwrap();
+                                    lane.accept_private_bash_source(&accepted).unwrap();
+                                    assert_eq!(
+                                        fresh
+                                            .query_row(
+                                                "SELECT count(*) FROM fresh_bash_child",
+                                                [],
+                                                |r| r.get::<_, i64>(0)
+                                            )
+                                            .unwrap(),
+                                        1
+                                    );
+                                    assert_eq!(
+                                        fresh
+                                            .query_row(
+                                                "SELECT count(*) FROM fresh_lane_accepted_source",
+                                                [],
+                                                |r| r.get::<_, i64>(0)
+                                            )
+                                            .unwrap(),
+                                        1
+                                    );
+                                    assert_eq!(
+                                        fs::read_dir(&provider_dir)
+                                            .unwrap()
+                                            .filter_map(Result::ok)
+                                            .filter(|entry| entry
+                                                .file_name()
+                                                .to_string_lossy()
+                                                .ends_with(".consumed.json"))
+                                            .count(),
+                                        2
+                                    );
+                                    assert!(
+                                        entry.try_wait().unwrap().is_none(),
+                                        "root exited during W restart"
+                                    );
+                                }
+                            }
+                        }
                         fs::write(gate.join("interactive-resident-continue"), b"continue").unwrap();
-                        eventually(|| entry.try_wait().unwrap().is_some());
+                        let deadline = Instant::now() + Duration::from_secs(20);
+                        while entry.try_wait().unwrap().is_none() && Instant::now() < deadline {
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        assert!(
+                            entry.try_wait().unwrap().is_some(),
+                            "resident root Q wait: root={} broker={} restart={} artifacts={:?}",
+                            fs::read_to_string(&err).unwrap_or_default(),
+                            fs::read_to_string(&broker_log).unwrap_or_default(),
+                            fs::read_to_string(temp.path().join("resident-bash-restart.log"))
+                                .unwrap_or_default(),
+                            fs::read_dir(&provider_dir)
+                                .unwrap()
+                                .filter_map(Result::ok)
+                                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                                .collect::<Vec<_>>()
+                        );
                         assert!(
                             entry.wait().unwrap().success(),
                             "resident root Q: {}",
@@ -3034,6 +3434,20 @@ fn inner() {
                         assert_eq!(q["provider_exit"]["wait_status"], 0);
                         assert_eq!(q["tree_drain"]["zero_remaining"], true);
                         assert_eq!(q["pid1_wait"]["reaped"], true);
+                        if resident_bash
+                            && (mode.ends_with("_notify")
+                                || mode.ends_with("_response")
+                                || mode.ends_with("_restart"))
+                        {
+                            let report: serde_json::Value = serde_json::from_slice(
+                                &fs::read(gate.join("bash-causal-output")).unwrap(),
+                            )
+                            .unwrap();
+                            let event: oulipoly_state::mailbox::FreshBashSourceEvent =
+                                serde_json::from_value(report["fresh_source_w"].clone()).unwrap();
+                            let lane = FreshV30Lane::open_at(&broker_state).unwrap();
+                            lane.accept_private_bash_source(&event).unwrap();
+                        }
                         assert_eq!(
                             fs::read_dir(&provider_dir)
                                 .unwrap()
@@ -4243,7 +4657,10 @@ fn inner() {
                 } else {
                     assert_eq!(
                         fs::read_to_string(&out).unwrap(),
-                        format!("OULIPOLY_KERNEL_V30_CHILD_EFFECT={}\n", released.release_id)
+                        format!("OULIPOLY_KERNEL_V30_CHILD_EFFECT={}\n", released.release_id),
+                        "root: {}; broker: {}",
+                        fs::read_to_string(&err).unwrap_or_default(),
+                        fs::read_to_string(&broker_log).unwrap_or_default()
                     );
                 }
                 let projected = rusqlite::Connection::open_with_flags(
@@ -6072,6 +6489,14 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_model_provider_pty_control",
         "normal_model_provider_pty_physical",
         "normal_model_provider_pty_physical_resident_tail",
+        "normal_model_provider_pty_physical_resident_bash_notify",
+        "normal_model_provider_pty_physical_resident_bash_response",
+        "normal_model_provider_pty_physical_resident_bash_wrong_image",
+        "normal_model_provider_pty_physical_resident_bash_absent_parent",
+        "normal_model_provider_pty_physical_resident_bash_ambiguous_parent",
+        "normal_model_provider_pty_physical_resident_bash_wrong_plan",
+        "normal_model_provider_pty_physical_resident_bash_wrong_actor",
+        "normal_model_provider_pty_physical_resident_bash_unconsumed_parent",
         "normal_model_provider_pty_physical_resident_absent_socket",
         "normal_model_provider_pty_physical_resident_replaced_socket",
         "normal_model_provider_pty_physical_resident_wrong_account",
@@ -6155,6 +6580,7 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
         if mode == "normal_model_provider_pty_physical"
             || mode == "normal_model_provider_pty_physical_resident_tail"
+            || mode == "normal_model_provider_pty_physical_resident_bash_notify"
         {
             eprint!("{}", String::from_utf8_lossy(&output.stderr));
         }
@@ -6167,6 +6593,31 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
             break;
         }
     }
+}
+
+#[test]
+#[ignore = "live broker restart after W loses the broker-owned PTY output receipt before provider Q"]
+fn resident_bash_restart_after_w_retains_failing_signal() {
+    let output = Command::new("unshare")
+        .args(["-Urpfm", "--mount-proc"])
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "original_runner_joins_once_behind_persistent_root_pid1",
+            "--nocapture",
+        ])
+        .env("AGE319_PRIVATE_JOIN_INNER", "1")
+        .env(
+            "AGE319_PRIVATE_JOIN_MODE",
+            "normal_model_provider_pty_physical_resident_bash_restart",
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 
 const CAUSAL_BASH_INTERMEDIARY_DELAY: std::time::Duration = std::time::Duration::from_millis(80);
 
-fn causal_bash(args: &[String]) -> std::io::Result<()> {
+fn causal_bash(args: &[String], hold_survivor: bool, hold_start: bool) -> std::io::Result<()> {
     let marker = std::path::Path::new(&args[0]);
     let gate = marker
         .parent()
@@ -60,6 +60,16 @@ fn causal_bash(args: &[String]) -> std::io::Result<()> {
     std::thread::sleep(CAUSAL_BASH_INTERMEDIARY_DELAY);
     let outcome = (|| -> std::io::Result<()> {
         std::fs::write(gate.join("causal-intermediary-start"), b"started")?;
+        if hold_start {
+            std::fs::write(gate.join("causal-before-c"), b"ready")?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !gate.join("causal-release-c").exists() {
+                if std::time::Instant::now() >= deadline {
+                    return Err(std::io::Error::other("causal C release expired"));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
         let status = std::fs::read_to_string("/proc/self/status")?;
         let proc_pid = status
             .lines()
@@ -67,15 +77,17 @@ fn causal_bash(args: &[String]) -> std::io::Result<()> {
             .ok_or_else(|| std::io::Error::other("intermediary proc PID absent"))?
             .trim();
         std::fs::write(gate.join("causal-intermediary-proc-pid"), proc_pid)?;
-        let survivor = unsafe { libc::fork() };
-        if survivor < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        if survivor == 0 {
-            unsafe {
-                libc::signal(libc::SIGTERM, libc::SIG_IGN);
-                loop {
-                    libc::pause();
+        if hold_survivor {
+            let survivor = unsafe { libc::fork() };
+            if survivor < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if survivor == 0 {
+                unsafe {
+                    libc::signal(libc::SIGTERM, libc::SIG_IGN);
+                    loop {
+                        libc::pause();
+                    }
                 }
             }
         }
@@ -113,7 +125,7 @@ fn causal_bash(args: &[String]) -> std::io::Result<()> {
 fn main() -> std::io::Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.first().is_some_and(|arg| arg == "--interactive-only") {
-        if args.len() != 2 {
+        if args.len() != 2 && args.len() != 7 && args.len() != 8 {
             return Err(std::io::Error::other(
                 "interactive fixture arguments changed",
             ));
@@ -139,6 +151,9 @@ fn main() -> std::io::Result<()> {
                 .open(path)?;
             store.write_all(&serde_json::to_vec(&native)?)?;
             store.sync_all()?;
+        }
+        if args.len() >= 7 {
+            causal_bash(&args[1..], false, true)?;
         }
         std::io::stdout().write_all(b"interactive-ready\n")?;
         let mut input = String::new();
@@ -173,7 +188,7 @@ fn main() -> std::io::Result<()> {
     file.write_all(b"one-provider-effect\n")?;
     file.sync_all()?;
     if args.len() == 6 || args.len() == 7 {
-        return causal_bash(&args);
+        return causal_bash(&args, true, false);
     }
     if args.len() != 1
         && !(args.len() == 2 && matches!(args[1].as_str(), "--fail" | "--quota" | "--auth"))

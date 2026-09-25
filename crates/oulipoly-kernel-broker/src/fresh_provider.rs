@@ -3819,13 +3819,7 @@ pub(super) fn parent_for_bash(
     bash: &PinnedProcess,
     root: &PinnedProcess,
 ) -> io::Result<ParentWork> {
-    let Some(grant): Option<Grant> = exact_file(
-        directory,
-        &format!("{}.fresh-grant.json", release.handoff_id),
-    )?
-    else {
-        return Err(io::Error::other("consumed causal parent work grant absent"));
-    };
+    let grant = root_parent_grant(directory, &release.handoff_id)?;
     let b = &grant.binding;
     let prepared = &release.old_release.prepared;
     if grant.version != 3
@@ -3863,6 +3857,27 @@ pub(super) fn parent_for_bash(
         return Err(io::Error::other("causal parent work attach changed"));
     }
     let init = PinnedProcess::open(attach.pid1)?;
+    if let Some(identity) = root_interactive_identity(directory, &release.handoff_id, &grant)? {
+        let provider = PinnedProcess::open(attach.provider_pid)?;
+        if identity.version != 1
+            || identity.grant_id != grant.id
+            || identity.work_id != attach.work_id
+            || identity.provider_host_pid != provider.host_pid
+            || identity.provider_boot_id != provider.boot_id
+            || identity.provider_starttime_ticks != provider.starttime_ticks
+            || identity.provider_local_pid != attach.provider_local_pid
+            || (identity.provider_pidns_dev, identity.provider_pidns_ino)
+                != (provider.pidns_dev, provider.pidns_ino)
+            || identity.pid1_host_pid != init.host_pid
+            || identity.pid1_starttime_ticks != init.starttime_ticks
+            || !provider.direct_child_of(&init)?
+        {
+            return Err(io::Error::other(
+                "interactive causal provider identity changed",
+            ));
+        }
+        provider.verify()?;
+    }
     let fd = unsafe { libc::ioctl(init.namespace().as_raw_fd(), libc::NS_GET_PARENT) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
@@ -3894,6 +3909,60 @@ pub(super) fn parent_for_bash(
         },
         init,
     })
+}
+
+fn root_parent_grant(directory: &Path, handoff_id: &str) -> io::Result<Grant> {
+    let headless: Option<Grant> = exact_file(directory, &format!("{handoff_id}.fresh-grant.json"))?;
+    let interactive: Option<InteractiveK> =
+        exact_file(directory, &format!("{handoff_id}.interactive-k.json"))?;
+    match (headless, interactive) {
+        (Some(_), Some(_)) => Err(io::Error::other("ambiguous causal parent K")),
+        (Some(grant), None) => Ok(grant),
+        (None, Some(k)) => {
+            let selected: InteractiveDecision =
+                exact_file(directory, &interactive_decision_name(handoff_id))?
+                    .ok_or_else(|| io::Error::other("interactive causal selection absent"))?;
+            if k.version != 1
+                || k.state != "consumed-before-child-release"
+                || k.grant.version != 3
+                || k.grant.binding.handoff_id != handoff_id
+                || k.grant.binding.causal_parent.is_some()
+                || k.preparation.handoff.binding != k.grant.binding
+                || k.preparation.handoff.selection != selected.selection
+                || selected.binding != k.grant.binding
+                || selected.role != FreshPlanRole::Interactive
+                || k.grant.plan_sha256 != selected.selection.plan_sha256
+                || k.preparation.configured_program != k.grant.configured_program
+                || k.preparation.broker_resolved_path != k.grant.broker_resolved_path
+                || k.preparation.image_descriptor != k.grant.image_descriptor
+            {
+                return Err(io::Error::other(
+                    "interactive causal parent K or plan changed",
+                ));
+            }
+            Ok(k.grant)
+        }
+        (None, None) => Err(io::Error::other("consumed causal parent work grant absent")),
+    }
+}
+
+fn root_interactive_identity(
+    directory: &Path,
+    handoff_id: &str,
+    grant: &Grant,
+) -> io::Result<Option<InteractiveIdentity>> {
+    let interactive: Option<InteractiveK> =
+        exact_file(directory, &format!("{handoff_id}.interactive-k.json"))?;
+    match interactive {
+        Some(k) if k.grant == *grant => exact_file(
+            directory,
+            &format!("{}.interactive-identity.json", grant.id),
+        )?
+        .map(Some)
+        .ok_or_else(|| io::Error::other("interactive causal provider identity absent")),
+        Some(_) => Err(io::Error::other("interactive causal parent K changed")),
+        None => Ok(None),
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -4408,6 +4477,7 @@ fn launch_with_pty(
     }
     let parent_namespace = match &b.causal_parent {
         Some(parent) => {
+            let selected_parent = root_parent_grant(&prepared.directory, &b.handoff_id)?;
             let consumed: Grant = exact_file(
                 &prepared.directory,
                 &format!("{}.consumed.json", parent.grant_id),
@@ -4419,7 +4489,8 @@ fn launch_with_pty(
             )?
             .ok_or_else(|| io::Error::other("causal parent attach absent"))?;
             let pinned = PinnedProcess::open(parent.init_pid)?;
-            if consumed.id != parent.grant_id
+            if consumed != selected_parent
+                || consumed.id != parent.grant_id
                 || consumed.binding.causal_parent.is_some()
                 || consumed.binding.root_id != b.root_id
                 || consumed.binding.handoff_id != b.handoff_id
