@@ -349,6 +349,27 @@ pub fn private_fresh_pty_handoff_at(
     master: RawFd,
     slave: RawFd,
 ) -> io::Result<()> {
+    private_fresh_pty_request_at(path, request, b'^', &[master, slave])
+}
+
+/// Exact admission recheck for the selected interactive plan and live pair.
+/// A successful reply is still pre-K and grants no launch or Q authority.
+#[cfg(feature = "age319-private-broker-fixture")]
+pub fn private_fresh_interactive_k_preparation_at(
+    path: &Path,
+    request: &PrivateFreshPtyHandoff,
+    descriptors: [RawFd; 7],
+) -> io::Result<()> {
+    private_fresh_pty_request_at(path, request, b'{', &descriptors)
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_fresh_pty_request_at(
+    path: &Path,
+    request: &PrivateFreshPtyHandoff,
+    operation: u8,
+    descriptors: &[RawFd],
+) -> io::Result<()> {
     let id = uuid::Uuid::parse_str(&request.d_key)
         .map_err(|_| io::Error::other("invalid PTY handoff D key"))?;
     if id.is_nil() || id.to_string() != request.d_key {
@@ -362,10 +383,9 @@ pub fn private_fresh_pty_handoff_at(
     let mut challenge = [0u8; 16];
     stream.read_exact(&mut challenge)?;
     let mut frame = Vec::with_capacity(17 + body.len());
-    frame.push(b'^');
+    frame.push(operation);
     frame.extend_from_slice(&challenge);
     frame.extend_from_slice(&body);
-    let descriptors = [master, slave];
     let mut iov = libc::iovec {
         iov_base: frame.as_mut_ptr().cast(),
         iov_len: frame.len(),
@@ -376,13 +396,17 @@ pub fn private_fresh_pty_handoff_at(
     msg.msg_iovlen = 1;
     msg.msg_control = control.as_mut_ptr().cast();
     msg.msg_controllen =
-        unsafe { libc::CMSG_SPACE(std::mem::size_of_val(&descriptors) as _) } as usize;
+        unsafe { libc::CMSG_SPACE(std::mem::size_of_val(descriptors) as _) } as usize;
     unsafe {
         let header = libc::CMSG_FIRSTHDR(&msg);
         (*header).cmsg_level = libc::SOL_SOCKET;
         (*header).cmsg_type = libc::SCM_RIGHTS;
-        (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(&descriptors) as _) as usize;
-        std::ptr::copy_nonoverlapping(descriptors.as_ptr(), libc::CMSG_DATA(header).cast(), 2);
+        (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(descriptors) as _) as usize;
+        std::ptr::copy_nonoverlapping(
+            descriptors.as_ptr(),
+            libc::CMSG_DATA(header).cast(),
+            descriptors.len(),
+        );
     }
     if unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) }
         != frame.len() as isize
@@ -390,7 +414,12 @@ pub fn private_fresh_pty_handoff_at(
         return Err(io::Error::other("PTY handoff submission uncertain"));
     }
     let response = read_response(stream)?;
-    if response != "fresh-pty-handoff-pre-k\n" {
+    let expected = if operation == b'^' {
+        "fresh-pty-handoff-pre-k\n"
+    } else {
+        "fresh-interactive-k-preparation-pre-k\n"
+    };
+    if response != expected {
         return Err(io::Error::other(format!(
             "PTY handoff refused: {}",
             response.trim_end()

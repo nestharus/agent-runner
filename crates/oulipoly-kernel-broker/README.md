@@ -32,6 +32,15 @@ same live root. The artifact does not hold a descriptor or socket connection
 across restart and is never consumed by K, Q, runtime generation registration
 or F. Its stored stamps alone cannot certify PTY liveness.
 
+The private `{` admission request is a second, still nonactivating check from
+that same original root. It carries the selected interactive image, cwd,
+sealed input and recipe, pinned config directory, and live master/slave pair.
+The broker rechallenges the control server, rechecks role/account/plan and
+source bytes, compares image mount/inode and cwd identity with the selected
+candidate, then creates exact `interactive-k-preparation.json` readback.
+Restart and exact resubmission preserve those bytes. A headless recipe is
+refused. This preparation is not an interactive K grant or child settlement.
+
 The runtime and original Runner register the interactive argv/env/cwd/image
 plan through private `(`/`)` candidate and selection operations. The broker
 pins each candidate to the same D, actor, source/config, account and index as

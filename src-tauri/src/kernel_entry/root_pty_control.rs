@@ -137,6 +137,29 @@ impl RootPtyControl {
         self.ensure_live()
     }
 
+    pub(super) fn prepare_interactive_k(
+        &self,
+        broker: &Path,
+        plan_source: [i32; 5],
+    ) -> Result<(), String> {
+        self.ensure_live()?;
+        protocol::private_fresh_interactive_k_preparation_at(
+            broker,
+            &self._binding,
+            [
+                plan_source[0],
+                plan_source[1],
+                plan_source[2],
+                plan_source[3],
+                plan_source[4],
+                self.master.as_raw_fd(),
+                self._slave.as_raw_fd(),
+            ],
+        )
+        .map_err(|e| format!("interactive K preparation refused: {e}"))?;
+        self.ensure_live()
+    }
+
     pub(super) fn probe_wrong_bindings(
         &self,
         broker: &Path,

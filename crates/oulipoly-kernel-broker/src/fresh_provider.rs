@@ -1350,6 +1350,139 @@ struct PreKInteractivePtyHandoff {
     control_inode: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct InteractiveKPreparation {
+    version: u32,
+    state: String,
+    handoff: PreKInteractivePtyHandoff,
+    configured_program: String,
+    broker_resolved_path: PathBuf,
+    image_descriptor: ImageDescriptor,
+    cwd_device: u64,
+    cwd_inode: u64,
+}
+
+/// Recheck the independently selected interactive recipe against the pinned
+/// config and the original root's live PTY pair. This is admission only: no
+/// consumed K, child, generation, or Q can follow from this artifact.
+pub(super) fn prepare_interactive_k(
+    directory: &Path,
+    binding: &Binding,
+    actor: &PinnedProcess,
+    request: &PrivateFreshPtyHandoff,
+    image: File,
+    cwd: File,
+    input: File,
+    recipe: File,
+    config_dir: File,
+    master: File,
+    slave: File,
+) -> io::Result<()> {
+    attest_pre_k_interactive_pty(directory, binding, actor, request, &master, &slave)?;
+    let handoff: PreKInteractivePtyHandoff = exact_file(
+        directory,
+        &format!("{}.interactive-pty-pre-k.json", binding.handoff_id),
+    )?
+    .ok_or_else(|| io::Error::other("interactive PTY handoff absent"))?;
+    let decision: InteractiveDecision =
+        exact_file(directory, &interactive_decision_name(&binding.handoff_id))?
+            .ok_or_else(|| io::Error::other("interactive decision absent"))?;
+    let headless: RouteDecision = exact_file(directory, &decision_name(&binding.handoff_id))?
+        .ok_or_else(|| io::Error::other("headless decision absent"))?;
+    let candidate: InteractiveCandidate = exact_file(
+        directory,
+        &interactive_candidate_name(&binding.handoff_id, decision.selection.index),
+    )?
+    .ok_or_else(|| io::Error::other("interactive candidate absent"))?;
+    let headless_candidate: RouteCandidate = exact_file(
+        directory,
+        &candidate_name(&binding.handoff_id, decision.selection.index),
+    )?
+    .ok_or_else(|| io::Error::other("selected headless candidate absent"))?;
+    if handoff.version != 1
+        || handoff.state != "pre-k-nonactivating"
+        || handoff.binding != *binding
+        || decision.version != 1
+        || decision.role != FreshPlanRole::Interactive
+        || decision.binding != *binding
+        || headless.version != 1
+        || headless.binding != *binding
+        || decision.selection != handoff.selection
+        || decision.headless_plan_sha256 != headless.selection.plan_sha256
+        || headless.selection.account != decision.selection.account
+        || headless.selection.index != decision.selection.index
+        || candidate.version != 1
+        || candidate.binding != *binding
+        || candidate.role != FreshPlanRole::Interactive
+        || candidate.plan_sha256 != decision.selection.plan_sha256
+        || candidate.account != decision.selection.account
+        || candidate.model != decision.selection.model
+        || candidate.config_sha256 != decision.selection.config_sha256
+        || candidate.index != decision.selection.index
+        || candidate.total != headless.total
+        || candidate.pin != headless.pin
+        || headless_candidate.version != 2
+        || headless_candidate.role != FreshPlanRole::Headless
+        || headless_candidate.binding != *binding
+        || headless_candidate.model != candidate.model
+        || headless_candidate.config_sha256 != candidate.config_sha256
+        || headless_candidate.account != candidate.account
+        || headless_candidate.index != candidate.index
+        || headless_candidate.total != candidate.total
+        || headless_candidate.pin != candidate.pin
+        || headless_candidate.plan_sha256 != headless.selection.plan_sha256
+    {
+        return Err(io::Error::other(
+            "interactive K preparation selection changed",
+        ));
+    }
+    let source_request = FreshRouteRequest {
+        d_key: request.d_key.clone(),
+        model: candidate.model.clone(),
+        config_sha256: candidate.config_sha256.clone(),
+        account: Some(candidate.account.clone()),
+        index: Some(candidate.index),
+        total: candidate.total,
+        pin: candidate.pin.clone(),
+        quota_script: headless_candidate.quota_script,
+        auth_refresh_command: headless_candidate.auth_refresh_command,
+    };
+    validate_route_source(&config_dir, &source_request)?;
+    bind_route_source(directory, binding, &source_request, &config_dir, false)?;
+    let image_path = fs::read_link(format!("/proc/self/fd/{}", image.as_raw_fd()))?;
+    let plan = plan_from_descriptors(&image_path, image, cwd, input, recipe)?;
+    validate_interactive_plan_source(&config_dir, &source_request, &plan)?;
+    plan.verify()?;
+    if plan.role != FreshPlanRole::Interactive
+        || plan.digest != candidate.plan_sha256
+        || plan.configured_program != candidate.configured_program
+        || plan.broker_resolved_path != candidate.broker_resolved_path
+        || plan.image_descriptor != candidate.image_descriptor
+        || plan.cwd_device != candidate.cwd_device
+        || plan.cwd_inode != candidate.cwd_inode
+    {
+        return Err(io::Error::other("interactive K preparation plan changed"));
+    }
+    actor.verify()?;
+    let preparation = InteractiveKPreparation {
+        version: 1,
+        state: "pre-k-nonactivating".into(),
+        handoff,
+        configured_program: plan.configured_program,
+        broker_resolved_path: plan.broker_resolved_path,
+        image_descriptor: plan.image_descriptor,
+        cwd_device: plan.cwd_device,
+        cwd_inode: plan.cwd_inode,
+    };
+    let name = format!("{}.interactive-k-preparation.json", binding.handoff_id);
+    match exact_file::<InteractiveKPreparation>(directory, &name)? {
+        Some(existing) if existing == preparation => Ok(()),
+        Some(_) => Err(io::Error::other("interactive K preparation changed")),
+        None => durable_new(directory, &name, &preparation),
+    }
+}
+
 /// The inode stamp alone survives a dead root. Challenge the live listener
 /// and require the kernel-reported server PID to be the held original actor.
 fn attest_original_control(path: &Path, actor_pid: i32, master: &File) -> io::Result<(u64, u64)> {

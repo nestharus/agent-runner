@@ -464,7 +464,7 @@ fn recv_request(
         #[cfg(feature = "age319-private-broker-fixture")]
         b'h' | b'f' | b'(' | b')' | b'm' | b'n' => (18..=48 * 1024 + 17).contains(&read),
         #[cfg(feature = "age319-private-broker-fixture")]
-        b'^' => (18..=2048 + 17).contains(&read),
+        b'^' | b'{' => (18..=2048 + 17).contains(&read),
         b'F' => (18..=8192 + 17).contains(&read),
         b'O' => (18..=1024 + 17).contains(&read),
         b'U' => (18..=512 + 17).contains(&read),
@@ -492,6 +492,8 @@ fn recv_request(
             b'f' | b')' => descriptors.len() != 1,
             #[cfg(feature = "age319-private-broker-fixture")]
             b'^' => descriptors.len() != 2,
+            #[cfg(feature = "age319-private-broker-fixture")]
+            b'{' => descriptors.len() != 7,
             b'L' => !(1..=4).contains(&descriptors.len()),
             b'V' | b'S' | b's' | b'T' => descriptors.len() != 1,
             _ => !descriptors.is_empty(),
@@ -541,7 +543,7 @@ fn recv_request(
             descriptors,
         },
         #[cfg(feature = "age319-private-broker-fixture")]
-        b'^' => RequestPayload::FreshInteractivePtyHandoff {
+        b'^' | b'{' => RequestPayload::FreshInteractivePtyHandoff {
             request: serde_json::from_slice(&request[17..read as usize])?,
             descriptors,
         },
@@ -4612,7 +4614,7 @@ fn serve_fresh_v30_at(
                 }
                 #[cfg(feature = "age319-private-broker-fixture")]
                 b'5' | b'6' | b'7' | b'8' | b'9' | b'h' | b'f' | b'(' | b')' | b'm' | b'n'
-                | b'^' => {
+                | b'^' | b'{' => {
                     if !private_fixture() {
                         return Err(io::Error::other("fresh provider fixture route closed"));
                     }
@@ -4706,21 +4708,42 @@ fn serve_fresh_v30_at(
                         fresh_provider::binding_from_held(&receipt, &held, &actor, &root)?;
                     let directory = state_root.join("v30/fresh-provider");
                     if let Some(pty_request) = pty_request {
-                        if operation != b'^' || instance.is_closed() {
+                        if !matches!(operation, b'^' | b'{') || instance.is_closed() {
                             return Err(io::Error::other("fresh PTY handoff gate closed"));
                         }
-                        let [master, slave]: [File; 2] = descriptors.try_into().map_err(|_| {
-                            io::Error::other("fresh PTY handoff descriptors absent")
-                        })?;
-                        fresh_provider::attest_pre_k_interactive_pty(
+                        if operation == b'^' {
+                            let [master, slave]: [File; 2] =
+                                descriptors.try_into().map_err(|_| {
+                                    io::Error::other("fresh PTY handoff descriptors absent")
+                                })?;
+                            fresh_provider::attest_pre_k_interactive_pty(
+                                &directory,
+                                &binding,
+                                &actor,
+                                &pty_request,
+                                &master,
+                                &slave,
+                            )?;
+                            return Ok("fresh-pty-handoff-pre-k\n".into());
+                        }
+                        let [image, cwd, input, recipe, source, master, slave]: [File; 7] =
+                            descriptors.try_into().map_err(|_| {
+                                io::Error::other("fresh interactive preparation descriptors absent")
+                            })?;
+                        fresh_provider::prepare_interactive_k(
                             &directory,
                             &binding,
                             &actor,
                             &pty_request,
-                            &master,
-                            &slave,
+                            image,
+                            cwd,
+                            input,
+                            recipe,
+                            source,
+                            master,
+                            slave,
                         )?;
-                        return Ok("fresh-pty-handoff-pre-k\n".into());
+                        return Ok("fresh-interactive-k-preparation-pre-k\n".into());
                     }
                     if let Some(route_request) = route_request {
                         let expected_pin = match &held.intent {

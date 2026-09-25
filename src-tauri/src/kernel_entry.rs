@@ -1302,7 +1302,7 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
         )
         .map_err(|e| format!("selected interactive plan changed before ^: {e}"))?;
         selected_interactive = Some(interactive.clone());
-        Some(root_pty_control::RootPtyControl::offer(
+        let control = root_pty_control::RootPtyControl::offer(
             &socket,
             &authority.receipt.d_key,
             &authority.session.session_id,
@@ -1312,7 +1312,36 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
                 std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
                     .ok_or("private PTY control directory absent")?,
             ),
-        )?)
+        )?;
+        if std::env::var_os("AGE319_PRIVATE_ROOT_PTY_NEGATIVE_V1").is_some() {
+            let wrong_role = private_pin_plan(&local_interactive, FreshPlanRole::Headless)?;
+            if control
+                .prepare_interactive_k(
+                    &socket,
+                    [
+                        wrong_role.image.as_raw_fd(),
+                        wrong_role.cwd.as_raw_fd(),
+                        wrong_role.input.as_raw_fd(),
+                        wrong_role.recipe.as_raw_fd(),
+                        config_source.as_raw_fd(),
+                    ],
+                )
+                .is_ok()
+            {
+                return Err("headless recipe accepted as interactive K preparation".into());
+            }
+        }
+        control.prepare_interactive_k(
+            &socket,
+            [
+                local_pinned.image.as_raw_fd(),
+                local_pinned.cwd.as_raw_fd(),
+                local_pinned.input.as_raw_fd(),
+                local_pinned.recipe.as_raw_fd(),
+                config_source.as_raw_fd(),
+            ],
+        )?;
+        Some(control)
     } else {
         None
     };
@@ -1348,6 +1377,18 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
                 return Err("interactive selection changed after broker restart".into());
             }
             control.rechallenge(&socket)?;
+            let interactive = prepare_fresh_interactive(&pool.model, selected.index, &cwd)?;
+            let pinned = private_pin_plan(&interactive, FreshPlanRole::Interactive)?;
+            control.prepare_interactive_k(
+                &socket,
+                [
+                    pinned.image.as_raw_fd(),
+                    pinned.cwd.as_raw_fd(),
+                    pinned.input.as_raw_fd(),
+                    pinned.recipe.as_raw_fd(),
+                    config_source.as_raw_fd(),
+                ],
+            )?;
         }
     }
     let mut backend = PrivateFreshBroker {

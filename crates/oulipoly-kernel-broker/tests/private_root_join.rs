@@ -2452,6 +2452,14 @@ fn inner() {
                             )
                             .unwrap()
                         });
+                    let preparation_before =
+                        (mode == "normal_model_provider_pty_restart").then(|| {
+                            fs::read(broker_state.join("v30/fresh-provider").join(format!(
+                                "{}.interactive-k-preparation.json",
+                                receipt.handoff_id
+                            )))
+                            .unwrap()
+                        });
                     if mode == "normal_model_provider_pty_restart" {
                         let fresh_socket = socket.with_file_name("v30.sock");
                         stop(&mut broker);
@@ -2598,6 +2606,30 @@ fn inner() {
                             Some(fs::metadata(&provider_image).unwrap().ino())
                         );
                         assert!(candidate["cwd_inode"].as_u64().unwrap() > 0);
+                        let preparation_bytes = fs::read(provider_dir.join(format!(
+                            "{}.interactive-k-preparation.json",
+                            receipt.handoff_id
+                        )))
+                        .unwrap();
+                        if let Some(before) = &preparation_before {
+                            assert_eq!(
+                                &preparation_bytes, before,
+                                "broker restart changed interactive pre-K preparation"
+                            );
+                        }
+                        let preparation: serde_json::Value =
+                            serde_json::from_slice(&preparation_bytes).unwrap();
+                        assert_eq!(preparation["state"], "pre-k-nonactivating");
+                        assert_eq!(preparation["handoff"], record);
+                        assert_eq!(
+                            preparation["image_descriptor"],
+                            candidate["image_descriptor"]
+                        );
+                        assert_eq!(preparation["cwd_inode"], candidate["cwd_inode"]);
+                        assert_eq!(
+                            preparation["broker_resolved_path"],
+                            candidate["broker_resolved_path"]
+                        );
                         let path = Path::new(record["control_path"].as_str().unwrap());
                         assert!(path.exists(), "root control closed before provider Q");
                         assert!(
