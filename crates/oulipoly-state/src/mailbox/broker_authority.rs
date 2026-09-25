@@ -481,6 +481,51 @@ pub struct BrokerNativeGrantReadback {
     pub binding: super::NativeGrantBinding,
 }
 
+// Read every retained running owner, including copied v29 rows without a
+// broker marker. The broker's root ID is evidence only when it agrees with the
+// exact release provenance; a nullable legacy kernel_root_id is not a selector.
+fn running_broker_root_on(
+    conn: &Connection,
+    source_generation: &str,
+) -> Result<Option<String>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT owner.kernel_root_id,broker.root_id,published.root_id
+             FROM completion_continuation_owner owner
+             LEFT JOIN broker_completion_owner broker
+               ON broker.owner_generation=owner.generation
+              AND broker.source_generation=?1
+             LEFT JOIN broker_owner_release published
+               ON published.owner_generation=owner.generation
+              AND published.source_generation=?1
+             WHERE owner.phase='running' LIMIT 2",
+        )
+        .map_err(|error| error.to_string())?;
+    let mut rows = statement
+        .query([source_generation])
+        .map_err(|error| error.to_string())?;
+    let Some(row) = rows.next().map_err(|error| error.to_string())? else {
+        return Ok(None);
+    };
+    let owner_root: Option<String> = row.get(0).map_err(|error| error.to_string())?;
+    let broker_root: Option<String> = row.get(1).map_err(|error| error.to_string())?;
+    let release_root: Option<String> = row.get(2).map_err(|error| error.to_string())?;
+    if rows.next().map_err(|error| error.to_string())?.is_some() {
+        return Err("ambiguous retained completion owners: multiple running roots".into());
+    }
+    match (owner_root, broker_root, release_root) {
+        (Some(owner), Some(broker), Some(released))
+            if owner == broker
+                && owner == released
+                && uuid::Uuid::parse_str(&owner)
+                    .is_ok_and(|parsed| parsed.to_string() == owner) =>
+        {
+            Ok(Some(owner))
+        }
+        _ => Err("ambiguous retained completion owner: exact broker root release absent".into()),
+    }
+}
+
 impl BrokerSidecar {
     pub(super) fn bound_state(&self) -> Result<StateDb, String> {
         let source = self
@@ -1515,26 +1560,11 @@ impl BrokerSidecar {
     /// The retained completion schema has one running owner per domain. A
     /// second original root must not turn the first root's live evidence into
     /// `lost` merely to consume shared account facts in the independent v3
-    /// provider index. The broker checks this before opening a held J gate.
-    fn running_broker_root(
-        &self,
-        source_generation: &str,
-    ) -> Result<Option<Option<String>>, String> {
+    /// provider index. A copied v29 owner has no broker release and must be
+    /// refused explicitly, rather than disappearing through an inner join.
+    fn running_broker_root(&self, source_generation: &str) -> Result<Option<String>, String> {
         self.check_mailbox_read(source_generation)?;
-        let running: Option<Option<String>> = self
-            .mailbox
-            .conn
-            .query_row(
-                "SELECT owner.kernel_root_id FROM completion_continuation_owner owner
-                 JOIN broker_completion_owner broker
-                   ON broker.owner_generation=owner.generation
-                  AND broker.source_generation=?1
-                 WHERE owner.phase='running'",
-                [source_generation],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| e.to_string())?;
+        let running = running_broker_root_on(&self.mailbox.conn, source_generation)?;
         self.check_mailbox_read(source_generation)?;
         Ok(running)
     }
@@ -1556,7 +1586,7 @@ impl BrokerSidecar {
     ) -> Result<(), String> {
         if self
             .running_broker_root(source_generation)?
-            .is_some_and(|running| running.as_deref() != Some(root_id))
+            .is_some_and(|running| running != root_id)
         {
             return Err(
                 "concurrent original root refused: retained sidecar has one running owner".into(),
@@ -1608,6 +1638,13 @@ impl BrokerSidecar {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
+        if running_broker_root_on(&tx, &prepared.source_generation)?
+            .is_some_and(|running| running != prepared.root_id)
+        {
+            return Err(
+                "concurrent original root refused: retained sidecar has one running owner".into(),
+            );
+        }
         let guardian =
             serde_json::to_string(&owner.guardian_identity).map_err(|e| e.to_string())?;
         let driver = serde_json::to_string(&owner.driver_identity).map_err(|e| e.to_string())?;
@@ -3669,8 +3706,7 @@ mod tests {
             },
             endpoint: "/old/copied-owner".into(),
         };
-        db.publish_completion_owner_with_kernel_root(&old, Some(&uuid::Uuid::new_v4().to_string()))
-            .unwrap();
+        db.publish_completion_continuation_owner(&old).unwrap();
         drop(db);
         for artifact in [path.clone(), mailbox_authority_path(&path)] {
             fs::set_permissions(artifact, fs::Permissions::from_mode(0o600)).unwrap();
@@ -3678,6 +3714,28 @@ mod tests {
         let uid = unsafe { libc::geteuid() };
         let source_generation = activate_with_owner(&path, uid, root.path()).unwrap();
         let mut broker = open_with_owner(&path, uid, root.path()).unwrap();
+        assert!(
+            broker
+                .refuse_new_original_root(&source_generation)
+                .unwrap_err()
+                .contains("ambiguous retained completion owner")
+        );
+        assert!(
+            broker
+                .refuse_parallel_running_root(&source_generation, &old.owner_generation)
+                .unwrap_err()
+                .contains("ambiguous retained completion owner")
+        );
+        // A copied owner without an exact broker release cannot be inherited
+        // by a new root. Quiescence is an explicit test fixture transition.
+        broker
+            .mailbox
+            .conn
+            .execute(
+                "UPDATE completion_continuation_owner SET phase='closing' WHERE generation=?1",
+                [&old.owner_generation],
+            )
+            .unwrap();
         broker.refuse_new_original_root(&source_generation).unwrap();
         let boot_id = uuid::Uuid::new_v4().to_string();
         let stamp = |host_pid, pidns_ino| PreparedProcessStamp {

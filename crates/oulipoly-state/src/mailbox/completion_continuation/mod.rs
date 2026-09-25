@@ -239,7 +239,41 @@ impl MailboxDb {
         if domain_on(&self.conn)?.is_none() {
             return Ok(None);
         }
+        let running: i64 = self
+            .conn
+            .query_row(
+                "SELECT count(*) FROM completion_continuation_owner WHERE phase='running'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if running > 1 {
+            return Err("ambiguous completion owner: root-qualified read required".into());
+        }
         self.conn.query_row("SELECT domain_id,supervisor_authority_id,generation,guardian_identity,driver_identity,endpoint FROM completion_continuation_owner WHERE phase='running'", [], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?)))
+            .optional().map_err(|e| e.to_string())?.map(|(domain_id,supervisor_authority_id,owner_generation,guardian,driver,endpoint)| Ok(CompletionDomainOwner {
+                protocol: PROTOCOL.into(), domain_id, supervisor_authority_id, owner_generation,
+                guardian_identity: serde_json::from_str(&guardian).map_err(|e| e.to_string())?,
+                driver_identity: serde_json::from_str(&driver).map_err(|e| e.to_string())?, endpoint,
+            })).transpose()
+    }
+
+    /// Read an exact running owner after the caller has obtained its root ID
+    /// from the broker's original-root evidence. This lookup alone does not
+    /// authenticate a caller; the owner socket and broker grant must still be
+    /// checked before admitting work.
+    pub fn completion_continuation_owner_for_kernel_root(
+        &self,
+        root_id: &str,
+    ) -> Result<Option<CompletionDomainOwner>, String> {
+        let parsed = uuid::Uuid::parse_str(root_id).map_err(|_| "invalid kernel root ID")?;
+        if parsed.to_string() != root_id {
+            return Err("kernel root ID is not canonical".into());
+        }
+        if domain_on(&self.conn)?.is_none() {
+            return Ok(None);
+        }
+        self.conn.query_row("SELECT domain_id,supervisor_authority_id,generation,guardian_identity,driver_identity,endpoint FROM completion_continuation_owner WHERE phase='running' AND kernel_root_id=?1", [root_id], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?)))
             .optional().map_err(|e| e.to_string())?.map(|(domain_id,supervisor_authority_id,owner_generation,guardian,driver,endpoint)| Ok(CompletionDomainOwner {
                 protocol: PROTOCOL.into(), domain_id, supervisor_authority_id, owner_generation,
                 guardian_identity: serde_json::from_str(&guardian).map_err(|e| e.to_string())?,
@@ -1031,6 +1065,11 @@ mod tests {
                 .is_err()
         );
         assert_eq!(db.completion_continuation_owner().unwrap(), Some(owner));
+        assert_eq!(
+            db.completion_continuation_owner_for_kernel_root(&root_id)
+                .unwrap(),
+            None
+        );
         db.publish_completion_owner_with_kernel_root(&pinned, Some(&root_id))
             .unwrap();
         assert_eq!(
@@ -1041,6 +1080,16 @@ mod tests {
             db.completion_owner_kernel_root_id(&pinned.owner_generation)
                 .unwrap(),
             Some(root_id.clone())
+        );
+        assert_eq!(
+            db.completion_continuation_owner_for_kernel_root(&root_id)
+                .unwrap(),
+            Some(pinned.clone())
+        );
+        assert_eq!(
+            db.completion_continuation_owner_for_kernel_root(&uuid::Uuid::new_v4().to_string())
+                .unwrap(),
+            None
         );
         let mut replacement = pinned.clone();
         replacement.owner_generation = uuid::Uuid::new_v4().to_string();

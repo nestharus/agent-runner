@@ -188,16 +188,12 @@ pub(crate) fn child_entry() -> Option<ExitCode> {
         let guardian_pid: i64 = fields[3].parse().map_err(|_| "invalid guardian PID")?;
         let mailbox = MailboxDb::open_read_only(&MailboxDb::default_path()?)?;
         let owner = mailbox
-            .completion_continuation_owner()?
+            .completion_continuation_owner_for_kernel_root(fields[0])?
             .ok_or("missing child owner")?;
         if owner.protocol != oulipoly_state::completion_continuation::PROTOCOL
             || owner.domain_id != fields[1]
             || owner.supervisor_authority_id != fields[2]
             || owner.guardian_identity.pid != guardian_pid
-            || mailbox
-                .completion_owner_kernel_root_id(&owner.owner_generation)?
-                .as_deref()
-                != Some(fields[0])
         {
             return Err("child join does not match durable owner".into());
         }

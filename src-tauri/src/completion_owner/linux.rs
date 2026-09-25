@@ -642,15 +642,13 @@ pub(crate) fn verify_pinned_owner_ready(
     }
     let mailbox = MailboxDb::open_read_only(&MailboxDb::default_path()?)?;
     let owner = mailbox
-        .completion_continuation_owner()?
+        .completion_continuation_owner_for_kernel_root(&pin.root_id)?
         .ok_or("pinned completion owner was not published")?;
     if owner.protocol != PROTOCOL
         || owner.domain_id != pin.domain_id
         || owner.supervisor_authority_id != pin.supervisor_authority_id
         || owner.guardian_identity != expected_guardian
         || owner.driver_identity != identity(owner.driver_identity.pid)?
-        || mailbox.completion_owner_kernel_root_id(&owner.owner_generation)?
-            != Some(pin.root_id.clone())
     {
         return Err("durable completion owner does not match broker identities".into());
     }
@@ -797,11 +795,12 @@ fn guardian(
         socket.set_nonblocking(true).map_err(|e| e.to_string())?;
         contexts.retain_local(context, socket);
     }
-    if pinned.is_some() {
+    if let Some(pin) = pinned {
         let mailbox = MailboxDb::open(path)?;
-        if mailbox.completion_continuation_owner()?.as_ref() != Some(&owner)
-            || mailbox.completion_owner_kernel_root_id(&owner.owner_generation)?
-                != pinned.map(|pin| pin.root_id.clone())
+        if mailbox
+            .completion_continuation_owner_for_kernel_root(&pin.root_id)?
+            .as_ref()
+            != Some(&owner)
         {
             return Err("pinned completion owner changed before driver release".into());
         }
