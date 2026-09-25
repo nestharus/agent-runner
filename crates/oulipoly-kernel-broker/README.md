@@ -15,17 +15,21 @@ This source is not a deployable AGE-319 restoration.
 
 The private `^` request is a nonactivating interactive PTY handoff substrate.
 Its private client accepts read/write master and slave descriptors with the
-original released Runner's D key, session, selected account and plan digest.
+original released Runner's D key, session, selected account, plan digest and
+control socket path. The broker connects to that socket, requires a matching
+kernel peer PID and per-message responder credentials, challenges the live
+server and records its socket inode.
 The broker compares them with the released root and current headless broker route selection,
 uses `TIOCGPTN` and `TIOCGPTPEER` to verify the real PTY pair, and creates an
 exact `pre-k-nonactivating` artifact. Repeating the same pair is readback;
 presenting another pair or any request after a provider K grant refuses. The
-artifact does not hold a descriptor across restart and is never consumed by K,
+artifact does not hold a descriptor or socket connection across restart and is never consumed by K,
 Q, runtime generation registration or F. It cannot certify PTY liveness after
 the challenged request ends.
 
-The remaining work must first extend source-selected h/f plans to interactive
-provider mode. Physical interactive K must then transfer that verified slave
+The runtime now has a separate interactive argv plan builder, but h/f still
+select only headless plans. The remaining work must bind that separate plan
+through broker source selection. Physical interactive K must then transfer the verified slave
 into the broker's one-use selected launch, give the child a controlling
 terminal, keep the master and control server with the original root, and
 attest the broker's actual child incarnation into the fresh sidecar. The

@@ -4714,6 +4714,7 @@ fn serve_fresh_v30_at(
                         fresh_provider::attest_pre_k_interactive_pty(
                             &directory,
                             &binding,
+                            &actor,
                             &pty_request,
                             &master,
                             &slave,
@@ -6014,6 +6015,7 @@ assert s.send(message) == len(message)
             session_id: format!("v30:{}:{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4()),
             account: "selected".into(),
             plan_sha256: "a".repeat(64),
+            control_path: temp.path().join("control.sock"),
         };
         let expected_request = request.clone();
         let client_master = master.try_clone().unwrap();
@@ -6034,6 +6036,7 @@ assert s.send(message) == len(message)
             assert_eq!(request.session_id, expected_request.session_id);
             assert_eq!(request.account, expected_request.account);
             assert_eq!(request.plan_sha256, expected_request.plan_sha256);
+            assert_eq!(request.control_path, expected_request.control_path);
             assert_eq!(descriptors.len(), 2);
             assert_eq!(
                 descriptors[0].metadata().unwrap().ino(),

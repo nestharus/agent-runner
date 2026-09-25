@@ -1081,6 +1081,8 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
                     .map_err(|_| "private Bash request absent")?,
                 std::env::var("AGE319_PRIVATE_BASH_EFFECT_MARKER")
                     .map_err(|_| "private Bash marker absent")?,
+                std::env::var("OULIPOLY_DATA_DIR")
+                    .map_err(|_| "private Bash data directory absent")?,
             ]);
             if std::env::var_os("AGE319_PRIVATE_BASH_SOURCE_SUCCESS_V1").is_some() {
                 plan.plan.argv.push("no-cancel".into());

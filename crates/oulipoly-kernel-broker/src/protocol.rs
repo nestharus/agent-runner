@@ -317,6 +317,8 @@ pub struct PrivateFreshPtyHandoff {
     pub session_id: String,
     pub account: String,
     pub plan_sha256: String,
+    /// Live socket bound and served by the original released Runner process.
+    pub control_path: std::path::PathBuf,
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]

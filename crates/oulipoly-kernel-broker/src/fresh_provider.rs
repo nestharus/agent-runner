@@ -33,10 +33,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::ffi::CString;
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -1083,6 +1083,101 @@ struct PreKInteractivePtyHandoff {
     master: PtyHandoffStamp,
     slave: PtyHandoffStamp,
     pty_number: u32,
+    control_path: PathBuf,
+    control_device: u64,
+    control_inode: u64,
+}
+
+/// The inode stamp alone survives a dead root. Challenge the live listener
+/// and require the kernel-reported server PID to be the held original actor.
+fn attest_original_control(path: &Path, actor_pid: i32) -> io::Result<(u64, u64)> {
+    if !path.is_absolute() || actor_pid <= 0 {
+        return Err(io::Error::other("PTY control path or actor invalid"));
+    }
+    let before = fs::symlink_metadata(path)?;
+    if !before.file_type().is_socket() {
+        return Err(io::Error::other("PTY control endpoint is not a socket"));
+    }
+    let mut stream = UnixStream::connect(path)?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    let passcred: libc::c_int = 1;
+    if unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PASSCRED,
+            (&passcred as *const libc::c_int).cast(),
+            std::mem::size_of_val(&passcred) as libc::socklen_t,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let mut credential: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    if unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credential as *mut libc::ucred).cast(),
+            &mut length,
+        )
+    } != 0
+        || length as usize != std::mem::size_of::<libc::ucred>()
+        || credential.pid != actor_pid
+    {
+        return Err(io::Error::other(
+            "PTY control server is not original root actor",
+        ));
+    }
+    let challenge = *uuid::Uuid::new_v4().as_bytes();
+    stream.write_all(&challenge)?;
+    let mut reply = [0u8; 16];
+    let mut iov = libc::iovec {
+        iov_base: reply.as_mut_ptr().cast(),
+        iov_len: reply.len(),
+    };
+    let mut control = [0u8; 64];
+    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+    message.msg_iov = &mut iov;
+    message.msg_iovlen = 1;
+    message.msg_control = control.as_mut_ptr().cast();
+    message.msg_controllen = control.len();
+    let received = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut message, libc::MSG_WAITALL) };
+    if received != reply.len() as isize || message.msg_flags & libc::MSG_CTRUNC != 0 {
+        return Err(io::Error::other("PTY control response incomplete"));
+    }
+    let header = unsafe { libc::CMSG_FIRSTHDR(&message) };
+    if header.is_null()
+        || unsafe {
+            (*header).cmsg_level != libc::SOL_SOCKET
+                || (*header).cmsg_type != libc::SCM_CREDENTIALS
+                || (*header).cmsg_len
+                    < libc::CMSG_LEN(std::mem::size_of::<libc::ucred>() as _) as usize
+        }
+    {
+        return Err(io::Error::other("PTY control responder credentials absent"));
+    }
+    let responder = unsafe { *(libc::CMSG_DATA(header) as *const libc::ucred) };
+    if (responder.pid, responder.uid, responder.gid)
+        != (credential.pid, credential.uid, credential.gid)
+    {
+        return Err(io::Error::other(
+            "PTY control responder is not original root actor",
+        ));
+    }
+    let after = fs::symlink_metadata(path)?;
+    if reply != challenge
+        || !after.file_type().is_socket()
+        || (before.dev(), before.ino()) != (after.dev(), after.ino())
+    {
+        return Err(io::Error::other(
+            "PTY control challenge or socket inode changed",
+        ));
+    }
+    Ok((before.dev(), before.ino()))
 }
 
 /// Record a physical PTY pair presented by the original challenged Runner.
@@ -1092,11 +1187,17 @@ struct PreKInteractivePtyHandoff {
 pub(super) fn attest_pre_k_interactive_pty(
     directory: &Path,
     binding: &Binding,
+    actor: &PinnedProcess,
     request: &PrivateFreshPtyHandoff,
     master: &File,
     slave: &File,
 ) -> io::Result<()> {
+    actor.verify()?;
     if binding.causal_parent.is_some()
+        || actor.host_pid != binding.actor_pid
+        || actor.starttime_ticks != binding.actor_starttime
+        || actor.boot_id != binding.actor_boot_id
+        || (actor.pidns_dev, actor.pidns_ino) != (binding.actor_pidns_dev, binding.actor_pidns_ino)
         || request.session_id != binding.session_id
         || request.account.is_empty()
         || request.plan_sha256.len() != 64
@@ -1174,6 +1275,9 @@ pub(super) fn attest_pre_k_interactive_pty(
             "PTY handoff slave is not the master's peer",
         ));
     }
+    let (control_device, control_inode) =
+        attest_original_control(&request.control_path, binding.actor_pid)?;
+    actor.verify()?;
     let record = PreKInteractivePtyHandoff {
         version: 1,
         state: "pre-k-nonactivating".into(),
@@ -1182,6 +1286,9 @@ pub(super) fn attest_pre_k_interactive_pty(
         master: master_stamp,
         slave: slave_stamp,
         pty_number,
+        control_path: request.control_path.clone(),
+        control_device,
+        control_inode,
     };
     let name = format!("{}.interactive-pty-pre-k.json", binding.handoff_id);
     match exact_file::<PreKInteractivePtyHandoff>(directory, &name)? {
@@ -3849,6 +3956,7 @@ pub(super) fn cancel(dir: &Path, grant_id: &str) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
     use std::process::Command;
 
     fn wait_for_q(directory: &Path, grant: &str) -> (i32, Vec<u8>, Vec<u8>) {
@@ -4607,6 +4715,16 @@ mod tests {
     #[test]
     fn interactive_pty_handoff_binds_selected_root_session_and_real_pair_without_activation() {
         let temp = tempfile::tempdir().unwrap();
+        let control_path = temp.path().join("original-root-control.sock");
+        let listener = UnixListener::bind(&control_path).unwrap();
+        let control = std::thread::spawn(move || {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut challenge = [0u8; 16];
+                stream.read_exact(&mut challenge).unwrap();
+                stream.write_all(&challenge).unwrap();
+            }
+        });
         let process = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
         let binding = fixture_binding(&process, &process);
         let selection = FreshRouteSelection {
@@ -4658,15 +4776,27 @@ mod tests {
             session_id: binding.session_id.clone(),
             account: selection.account.clone(),
             plan_sha256: selection.plan_sha256.clone(),
+            control_path: control_path.clone(),
         };
         let (master, slave) = test_pty_pair();
         let (other_master, other_slave) = test_pty_pair();
         let attest = |request: &PrivateFreshPtyHandoff, master: &File, slave: &File| {
-            attest_pre_k_interactive_pty(temp.path(), &binding, request, master, slave)
+            attest_pre_k_interactive_pty(temp.path(), &binding, &process, request, master, slave)
         };
         assert!(attest(&request, &master, &other_slave).is_err());
         assert!(attest(&request, &File::open("/dev/null").unwrap(), &slave).is_err());
         assert!(attest(&request, &master, &File::open("/dev/null").unwrap()).is_err());
+        assert!(
+            attest(
+                &PrivateFreshPtyHandoff {
+                    control_path: temp.path().join("missing.sock"),
+                    ..request.clone()
+                },
+                &master,
+                &slave
+            )
+            .is_err()
+        );
         assert!(
             attest(
                 &PrivateFreshPtyHandoff {
@@ -4692,6 +4822,7 @@ mod tests {
         attest(&request, &master, &slave).unwrap();
         attest(&request, &master, &slave).unwrap();
         assert!(attest(&request, &other_master, &other_slave).is_err());
+        control.join().unwrap();
         let record: PreKInteractivePtyHandoff = exact_file(
             temp.path(),
             &format!("{}.interactive-pty-pre-k.json", binding.handoff_id),
@@ -4701,8 +4832,28 @@ mod tests {
         assert_eq!(record.state, "pre-k-nonactivating");
         assert_eq!(record.binding, binding);
         assert_eq!(record.selection, selection);
+        assert_eq!(record.control_path, control_path);
+        assert_eq!(
+            record.control_inode,
+            fs::symlink_metadata(&control_path).unwrap().ino()
+        );
         assert!(grant_for_binding(temp.path(), &binding).unwrap().is_none());
         assert!(!temp.path().join("result.json").exists());
+        let replacement_path = temp.path().join("replacement-control.sock");
+        let replacement = UnixListener::bind(&replacement_path).unwrap();
+        fs::rename(&replacement_path, &control_path).unwrap();
+        let replacement_server = std::thread::spawn(move || {
+            let (mut stream, _) = replacement.accept().unwrap();
+            let mut challenge = [0u8; 16];
+            stream.read_exact(&mut challenge).unwrap();
+            stream.write_all(&challenge).unwrap();
+        });
+        assert_ne!(
+            record.control_inode,
+            fs::symlink_metadata(&control_path).unwrap().ino()
+        );
+        assert!(attest(&request, &master, &slave).is_err());
+        replacement_server.join().unwrap();
         let input = temp.path().join("empty-input");
         std::fs::write(&input, []).unwrap();
         let prepared_plan = plan(
