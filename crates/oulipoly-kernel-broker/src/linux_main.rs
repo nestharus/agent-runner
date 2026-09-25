@@ -128,6 +128,81 @@ fn verify_native_f_readback(
     })
 }
 
+/// The private physical provider owns this native session file. A typed page
+/// supplied by the original root is corroborated against that file and the
+/// pinned live provider; a constructed F socket request alone is insufficient.
+#[cfg(feature = "age319-private-broker-fixture")]
+fn verify_private_native_f_source(
+    lane: &FreshV30Lane,
+    prepared: &FreshNativeFPreparation,
+    observed: &oulipoly_state::mailbox::FreshNativeFObservedTurn,
+) -> Result<(), String> {
+    if !private_fixture() {
+        return Err("native F provider source verifier unavailable; pending".into());
+    }
+    verify_native_f_readback(lane, prepared)?;
+    let gate = PathBuf::from(
+        std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+            .map_err(|_| "native F provider source gate absent")?,
+    );
+    let path = gate.join("provider-native-session.json");
+    let metadata = fs::symlink_metadata(&path).map_err(|_| "native F provider source absent")?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 4 * 1024 * 1024
+    {
+        return Err("native F provider source file invalid".into());
+    }
+    let native: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).map_err(|e| e.to_string())?)
+            .map_err(|_| "native F provider source malformed")?;
+    let source_turns = native["turns"]
+        .as_array()
+        .ok_or("native F provider turns absent")?;
+    if native["format"] != "age319-interactive-native-session/v1"
+        || native["session_id"] != prepared.provider_session_id
+        || native["controlling_tty"] != true
+        || source_turns.len() != 1
+        || observed.anchor_token
+            != format!(
+                "age319-native:{}:0",
+                native["store_nonce"]
+                    .as_str()
+                    .ok_or("native F store nonce absent")?
+            )
+        || source_turns[0]["turn_id"] != observed.turn_id
+        || source_turns[0]["body"] != observed.body
+        || source_turns[0]["nonce"] != observed.nonce
+        || source_turns[0]["session_id"] != prepared.provider_session_id
+        || source_turns[0]["payload_sha256"] != prepared.payload_sha256
+    {
+        return Err("native F provider-authored turn differs from typed page".into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn certify_native_f_with_source(
+    lane: &mut FreshV30Lane,
+    request: &str,
+    recipient: &FreshRecipientIdentity,
+    observed: &oulipoly_state::mailbox::FreshNativeFObservedTurn,
+) -> Result<oulipoly_state::mailbox::FreshNativeFReceipt, String> {
+    let prepared = lane
+        .read_native_f_preparation(request, recipient)?
+        .ok_or("native F preparation absent")?;
+    verify_private_native_f_source(lane, &prepared, observed)?;
+    lane.certify_native_f_receipt(request, recipient, observed)
+}
+
+#[cfg(not(feature = "age319-private-broker-fixture"))]
+fn certify_native_f_with_source(
+    _lane: &mut FreshV30Lane,
+    _request: &str,
+    _recipient: &FreshRecipientIdentity,
+    _observed: &oulipoly_state::mailbox::FreshNativeFObservedTurn,
+) -> Result<oulipoly_state::mailbox::FreshNativeFReceipt, String> {
+    Err("native F provider source verifier unavailable; pending".into())
+}
+
 #[cfg(feature = "age319-private-broker-fixture")]
 fn private_fixture() -> bool {
     (unsafe { libc::geteuid() }) == 0
@@ -5335,6 +5410,56 @@ fn serve_fresh_v30_at(
                                 .read_native_f_submission(&preparation_request_id, &recipient)
                                 .map_err(io::Error::other)?;
                             serde_json::json!({"kind":"native_f_submission_readback", "fence":fence})
+                        }
+                        FreshRecipientRequest::RecordNativeFTransport {
+                            preparation_request_id,
+                        } => {
+                            let transport = lane
+                                .record_native_f_transport(&preparation_request_id, &recipient)
+                                .map_err(io::Error::other)?;
+                            serde_json::json!({"kind":"native_f_transport", "transport":transport})
+                        }
+                        FreshRecipientRequest::ReadNativeFTransport {
+                            preparation_request_id,
+                        } => {
+                            let transport = lane
+                                .read_native_f_transport(&preparation_request_id, &recipient)
+                                .map_err(io::Error::other)?;
+                            serde_json::json!({"kind":"native_f_transport_readback", "transport":transport})
+                        }
+                        FreshRecipientRequest::CertifyNativeFReceipt {
+                            preparation_request_id,
+                            observed,
+                        } => {
+                            let receipt = certify_native_f_with_source(
+                                &mut lane,
+                                &preparation_request_id,
+                                &recipient,
+                                &observed,
+                            )
+                            .map_err(io::Error::other)?;
+                            serde_json::json!({"kind":"native_f_receipt", "receipt":receipt})
+                        }
+                        FreshRecipientRequest::ReadNativeFReceipt {
+                            preparation_request_id,
+                        } => {
+                            let receipt = lane
+                                .read_native_f_receipt(&preparation_request_id, &recipient)
+                                .map_err(io::Error::other)?;
+                            serde_json::json!({"kind":"native_f_receipt_readback", "receipt":receipt})
+                        }
+                        FreshRecipientRequest::AcknowledgeNativeFReceipt {
+                            preparation_request_id,
+                            delivery_token,
+                        } => {
+                            let grant = lane
+                                .acknowledge_native_f_receipt(
+                                    &preparation_request_id,
+                                    &delivery_token,
+                                    &recipient,
+                                )
+                                .map_err(io::Error::other)?;
+                            serde_json::json!({"kind":"native_f_auto_ack", "grant":grant})
                         }
                         FreshRecipientRequest::Acknowledge {
                             grant_id,

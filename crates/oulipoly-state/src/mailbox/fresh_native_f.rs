@@ -67,6 +67,54 @@ pub struct FreshNativeFSubmission {
     pub entered_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreshNativeFTransport {
+    pub preparation_request_id: String,
+    pub grant_id: String,
+    pub recipient_identity: FreshRecipientIdentity,
+    pub input_sha256: String,
+    pub input_byte_len: i64,
+    pub accepted_at: String,
+}
+
+/// Evidence from the selected adapter's complete post-Tail user page. The
+/// root supplies the typed page facts; State verifies exact immutable input,
+/// payload, nonce, session and grant lineage before recording a receipt.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreshNativeFObservedTurn {
+    pub provider_instance_id: String,
+    pub settings_id: String,
+    pub provider_session_id: String,
+    pub anchor_token: String,
+    pub snapshot_id: String,
+    pub page_digest: String,
+    pub page_index: u64,
+    pub page_start_sequence: u64,
+    pub page_turn_count: u64,
+    pub snapshot_complete: bool,
+    pub turn_id: String,
+    pub role: String,
+    pub nonce: String,
+    pub body: String,
+    pub canonical_text_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreshNativeFReceipt {
+    pub preparation_request_id: String,
+    pub grant_id: String,
+    pub recipient_identity: FreshRecipientIdentity,
+    pub provider_session_id: String,
+    pub turn_id: String,
+    pub envelope_sha256: String,
+    pub payload_sha256: String,
+    pub observation: FreshNativeFObservedTurn,
+    pub observed_at: String,
+}
+
 fn nonempty_bounded(name: &str, value: &str, max: usize) -> Result<(), String> {
     if value.is_empty() || value.len() > max || value.chars().any(char::is_control) {
         return Err(format!("invalid native F {name}"));
@@ -75,6 +123,194 @@ fn nonempty_bounded(name: &str, value: &str, max: usize) -> Result<(), String> {
 }
 
 impl FreshV30Lane {
+    pub fn read_native_f_transport(&self, request: &str, recipient: &FreshRecipientIdentity)
+        -> Result<Option<FreshNativeFTransport>, String> {
+        validate_request_id(request)?;
+        let json: Option<String> = self.sidecar.mailbox().conn.query_row(
+            "SELECT record_json FROM fresh_native_f_transport WHERE preparation_request_id=?1 AND recipient_identity=?2",
+            params![request, Self::recipient_identity_json(recipient)?], |r| r.get(0),
+        ).optional().map_err(|e| e.to_string())?;
+        json.map(|v| serde_json::from_str(&v).map_err(|e| e.to_string())).transpose()
+    }
+
+    pub fn record_native_f_transport(&mut self, request: &str, recipient: &FreshRecipientIdentity)
+        -> Result<FreshNativeFTransport, String> {
+        if self.read_native_f_transport(request, recipient)?.is_some() {
+            return Err("native F transport already recorded; no replay".into());
+        }
+        let fence = self.read_native_f_submission(request, recipient)?
+            .ok_or("native F transport fence absent")?;
+        let prepared = self.read_native_f_preparation(request, recipient)?
+            .ok_or("native F transport preparation absent")?;
+        if fence.grant_id != prepared.grant_id || fence.envelope_sha256 != prepared.envelope_sha256
+            || fence.runtime_generation_id != prepared.runtime_generation_id
+            || fence.input_sha256 != sha256_hex(format!("{}\n", prepared.envelope_text).as_bytes()) {
+            return Err("native F transport fence lineage changed".into());
+        }
+        let record = FreshNativeFTransport {
+            preparation_request_id: request.into(), grant_id: fence.grant_id,
+            recipient_identity: recipient.clone(), input_sha256: fence.input_sha256,
+            input_byte_len: fence.input_byte_len, accepted_at: Utc::now().to_rfc3339(),
+        };
+        self.sidecar.mailbox_mut().conn.execute(
+            "INSERT INTO fresh_native_f_transport VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![record.preparation_request_id, record.grant_id,
+                Self::recipient_identity_json(recipient)?, record.input_sha256,
+                record.input_byte_len, serde_json::to_string(&record).map_err(|e| e.to_string())?,
+                record.accepted_at],
+        ).map_err(|e| format!("native F transport already committed or changed: {e}"))?;
+        Ok(record)
+    }
+
+    pub fn read_native_f_receipt(&self, request: &str, recipient: &FreshRecipientIdentity)
+        -> Result<Option<FreshNativeFReceipt>, String> {
+        validate_request_id(request)?;
+        let json: Option<String> = self.sidecar.mailbox().conn.query_row(
+            "SELECT record_json FROM fresh_native_f_receipt WHERE preparation_request_id=?1 AND recipient_identity=?2",
+            params![request, Self::recipient_identity_json(recipient)?], |r| r.get(0),
+        ).optional().map_err(|e| e.to_string())?;
+        json.map(|v| serde_json::from_str(&v).map_err(|e| e.to_string())).transpose()
+    }
+
+    pub fn certify_native_f_receipt(&mut self, request: &str, recipient: &FreshRecipientIdentity,
+        observed: &FreshNativeFObservedTurn) -> Result<FreshNativeFReceipt, String> {
+        if self.read_native_f_receipt(request, recipient)?.is_some() {
+            return Err("native F receipt already certified".into());
+        }
+        let prepared = self.read_native_f_preparation(request, recipient)?
+            .ok_or("native F receipt preparation absent")?;
+        let transport = self.read_native_f_transport(request, recipient)?
+            .ok_or("native F receipt transport acceptance absent")?;
+        let grant = self.read_recipient_delivery(&prepared.grant_id, recipient)?
+            .ok_or("native F receipt grant absent")?;
+        let current_token: String = self.sidecar.mailbox().conn.query_row(
+            "SELECT delivery_token FROM fresh_recipient_grant WHERE grant_id=?1 AND recipient_identity=?2",
+            params![grant.grant_id, Self::recipient_identity_json(recipient)?], |r| r.get(0),
+        ).map_err(|_| "native F receipt original token absent")?;
+        if !matches!(grant.phase.as_str(), "unknown" | "submitted")
+            || grant.grant_id != transport.grant_id
+            || grant.session_id != prepared.session_id || grant.seq != prepared.seq
+            || grant.source_id != prepared.source_id || grant.attempt_id != prepared.attempt_id
+            || grant.payload_sha256 != prepared.payload_sha256
+            || grant.payload_byte_len != prepared.payload_byte_len
+            || sha256_hex(current_token.as_bytes()) != prepared.delivery_token_sha256
+            || transport.input_sha256 != sha256_hex(format!("{}\n", prepared.envelope_text).as_bytes())
+            || transport.input_byte_len != (prepared.envelope_text.len() + 1) as i64 {
+            return Err("native F receipt grant/source/payload/token or transport lineage changed".into());
+        }
+        let payload = self.lookup_payload(&prepared.lane_id, &prepared.session_id, prepared.seq)?;
+        let source_matches: bool = self.sidecar.mailbox().conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM fresh_recipient_row_source r
+             JOIN fresh_recipient_source s ON s.source_id=r.source_id
+             WHERE r.session_id=?1 AND r.seq=?2 AND r.source_id=?3 AND r.attempt_id=?4
+               AND r.payload_sha256=?5 AND r.payload_byte_len=?6
+               AND s.lane_id=?7 AND s.source_generation=?8
+               AND s.root_id=?9 AND s.owner_generation=?10)",
+            params![prepared.session_id,prepared.seq,prepared.source_id,prepared.attempt_id,
+                prepared.payload_sha256,prepared.payload_byte_len,prepared.lane_id,
+                prepared.source_generation,prepared.root_id,prepared.owner_generation],
+            |r| r.get(0),
+        ).map_err(|e| e.to_string())?;
+        if !source_matches || payload.len() as i64 != prepared.payload_byte_len
+            || sha256_hex(&payload) != prepared.payload_sha256 {
+            return Err("native F receipt retained W bytes changed".into());
+        }
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&payload);
+        if observed.provider_instance_id != prepared.provider_instance_id
+            || observed.settings_id != prepared.settings_id
+            || observed.provider_session_id != prepared.provider_session_id
+            || observed.anchor_token != prepared.tail_resume_token
+            || observed.snapshot_id.is_empty() || observed.page_digest.len() != 64
+            || observed.page_index != 0 || observed.page_start_sequence != 0
+            || observed.page_turn_count != 1 || !observed.snapshot_complete
+            || observed.turn_id.is_empty() || observed.role != "user"
+            || observed.nonce != prepared.envelope_nonce
+            || observed.body != prepared.envelope_text
+            || observed.canonical_text_sha256 != prepared.envelope_sha256
+            || !observed.body.contains(&format!("payload-base64: {encoded}\n"))
+            || !observed.body.contains(&format!("payload-sha256: {}\n", prepared.payload_sha256)) {
+            return Err("native F provider turn identity, body, nonce or payload changed".into());
+        }
+        let record = FreshNativeFReceipt {
+            preparation_request_id: request.into(), grant_id: prepared.grant_id,
+            recipient_identity: recipient.clone(), provider_session_id: observed.provider_session_id.clone(),
+            turn_id: observed.turn_id.clone(), envelope_sha256: prepared.envelope_sha256,
+            payload_sha256: prepared.payload_sha256, observation: observed.clone(),
+            observed_at: Utc::now().to_rfc3339(),
+        };
+        self.sidecar.mailbox_mut().conn.execute(
+            "INSERT INTO fresh_native_f_receipt VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![record.preparation_request_id, record.grant_id,
+                Self::recipient_identity_json(recipient)?, record.provider_session_id,
+                record.turn_id, record.envelope_sha256, record.payload_sha256,
+                serde_json::to_string(&record).map_err(|e| e.to_string())?, record.observed_at],
+        ).map_err(|e| format!("native F receipt already committed or changed: {e}"))?;
+        Ok(record)
+    }
+
+    pub fn acknowledge_native_f_receipt(&mut self, request: &str, token: &str,
+        recipient: &FreshRecipientIdentity) -> Result<FreshDeliveryReadback, String> {
+        validate_request_id(token)?;
+        let receipt = self.read_native_f_receipt(request, recipient)?
+            .ok_or("native F automatic ACK receipt absent")?;
+        let prepared = self.read_native_f_preparation(request, recipient)?
+            .ok_or("native F automatic ACK preparation absent")?;
+        let grant = self.read_recipient_delivery(&receipt.grant_id, recipient)?
+            .ok_or("native F automatic ACK grant absent")?;
+        let payload = self.lookup_payload(&prepared.lane_id, &prepared.session_id, prepared.seq)?;
+        let token_matches: bool = self.sidecar.mailbox().conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM fresh_recipient_grant WHERE grant_id=?1 AND delivery_token=?2 AND recipient_identity=?3)",
+            params![grant.grant_id, token, Self::recipient_identity_json(recipient)?], |r| r.get(0),
+        ).map_err(|e| e.to_string())?;
+        if !matches!(grant.phase.as_str(), "unknown" | "submitted")
+            || !token_matches
+            || prepared.delivery_token_sha256 != sha256_hex(token.as_bytes())
+            || receipt.grant_id != prepared.grant_id
+            || receipt.envelope_sha256 != prepared.envelope_sha256
+            || receipt.payload_sha256 != prepared.payload_sha256
+            || grant.session_id != prepared.session_id || grant.seq != prepared.seq
+            || grant.source_id != prepared.source_id || grant.attempt_id != prepared.attempt_id
+            || grant.payload_sha256 != prepared.payload_sha256
+            || grant.payload_byte_len != prepared.payload_byte_len
+            || payload.len() as i64 != prepared.payload_byte_len
+            || sha256_hex(&payload) != prepared.payload_sha256 {
+            return Err("native F automatic ACK receipt/grant/source/payload/token changed".into());
+        }
+        let identity = Self::recipient_identity_json(recipient)?;
+        let now = Utc::now().to_rfc3339();
+        let tx = self.sidecar.mailbox_mut().conn.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let changed = tx.execute(
+            "UPDATE mailbox SET delivered_at=?3,delivered_by_invocation_uuid=?4,
+             delivery_attempts=delivery_attempts+1,delivery_error=NULL
+             WHERE session_id=?1 AND seq=?2 AND delivered_at IS NULL
+               AND payload_sha256=?5 AND payload_byte_len=?6
+               AND EXISTS (SELECT 1 FROM fresh_recipient_row_source r
+                 WHERE r.session_id=?1 AND r.seq=?2 AND r.source_id=?7 AND r.attempt_id=?8
+                   AND r.payload_sha256=?5 AND r.payload_byte_len=?6)",
+            params![prepared.session_id, prepared.seq, now, grant.grant_id,
+                prepared.payload_sha256, prepared.payload_byte_len,
+                prepared.source_id, prepared.attempt_id],
+        ).map_err(|e| e.to_string())?;
+        if changed != 1 { return Err("native F automatic ACK row/source changed".into()); }
+        if tx.execute(
+            "UPDATE fresh_recipient_grant SET phase='acked',acknowledged_at=?2
+             WHERE grant_id=?1 AND delivery_token=?3 AND recipient_identity=?4
+               AND phase IN ('unknown','submitted')",
+            params![grant.grant_id, now, token, identity],
+        ).map_err(|e| e.to_string())? != 1 {
+            return Err("native F automatic ACK grant changed".into());
+        }
+        tx.execute(
+            "INSERT INTO fresh_native_f_auto_ack VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'native_f_receipt',?13)",
+            params![grant.grant_id, request, prepared.delivery_request_id,
+                prepared.delivery_token_sha256, prepared.session_id, prepared.seq,
+                prepared.source_id, prepared.attempt_id, identity,
+                prepared.payload_sha256, prepared.payload_byte_len, receipt.turn_id, now],
+        ).map_err(|e| format!("native F automatic ACK evidence absent or duplicate: {e}"))?;
+        tx.commit().map_err(|e| e.to_string())?;
+        self.read_recipient_delivery(&grant.grant_id, recipient)?.ok_or("native F ACK readback absent".into())
+    }
     /// Status-only readback after a lost reply or restart. It never confers
     /// permission to write again, including when the exact key is supplied.
     pub fn read_native_f_submission(

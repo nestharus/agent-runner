@@ -773,7 +773,44 @@ impl FreshV30Lane {
                     params![grant_id,session.session_id,seq,source,attempt,identity,sha,len,delivery_request],
                     |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
                 ).optional().map_err(|e| e.to_string())?;
-                let (basis, token_sha, token) = evidence.ok_or("terminal fresh ACK evidence absent or changed")?;
+                let (basis, token_sha, token) = if let Some(evidence) = evidence {
+                    evidence
+                } else {
+                    self.sidecar.mailbox().conn.query_row(
+                        "SELECT a.basis,a.delivery_token_sha256,g.delivery_token
+                         FROM fresh_native_f_auto_ack a
+                         JOIN fresh_native_f_receipt n ON n.preparation_request_id=a.preparation_request_id
+                         JOIN fresh_native_f_transport t ON t.preparation_request_id=n.preparation_request_id
+                         JOIN fresh_recipient_grant g ON g.grant_id=a.grant_id
+                         JOIN mailbox m ON m.session_id=a.session_id AND m.seq=a.seq
+                         JOIN fresh_recipient_row_source r ON r.session_id=a.session_id AND r.seq=a.seq
+                         WHERE a.grant_id=?1 AND a.session_id=?2 AND a.seq=?3
+                           AND a.source_id=?4 AND a.attempt_id=?5 AND a.recipient_identity=?6
+                           AND a.payload_sha256=?7 AND a.payload_byte_len=?8
+                           AND a.delivery_request_id=?9 AND g.phase='acked'
+                           AND g.acknowledged_at=a.acknowledged_at
+                           AND g.delivery_request_id=a.delivery_request_id
+                           AND g.session_id=a.session_id AND g.seq=a.seq
+                           AND g.source_id=a.source_id AND g.attempt_id=a.attempt_id
+                           AND g.recipient_identity=a.recipient_identity
+                           AND g.payload_sha256=a.payload_sha256
+                           AND g.payload_byte_len=a.payload_byte_len
+                           AND n.grant_id=a.grant_id AND n.turn_id=a.turn_id
+                           AND n.recipient_identity=a.recipient_identity
+                           AND n.provider_session_id=a.session_id
+                           AND n.payload_sha256=a.payload_sha256
+                           AND t.grant_id=a.grant_id
+                           AND t.recipient_identity=a.recipient_identity
+                           AND m.delivered_at=a.acknowledged_at
+                           AND m.delivered_by_invocation_uuid=a.grant_id
+                           AND m.payload_sha256=a.payload_sha256 AND m.payload_byte_len=a.payload_byte_len
+                           AND r.source_id=a.source_id AND r.attempt_id=a.attempt_id
+                           AND r.payload_sha256=a.payload_sha256 AND r.payload_byte_len=a.payload_byte_len",
+                        params![grant_id,session.session_id,seq,source,attempt,identity,sha,len,delivery_request],
+                        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+                    ).optional().map_err(|e| e.to_string())?
+                        .ok_or("terminal fresh ACK evidence absent or changed")?
+                };
                 if sha256_hex(token.as_bytes()) != token_sha {
                     return Err("terminal fresh ACK token conflict".into());
                 }

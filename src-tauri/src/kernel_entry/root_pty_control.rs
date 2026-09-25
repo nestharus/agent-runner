@@ -26,6 +26,7 @@ pub(super) struct RootPtyControl {
     alive: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     server: Option<JoinHandle<()>>,
+    native_f_attempted: bool,
     resident: Arc<
         Mutex<Option<oulipoly_runtime::executor::cli::pty_broker::PtyControlGenerationIdentity>>,
     >,
@@ -41,6 +42,40 @@ pub(super) struct RunningInteractive {
 }
 
 impl RootPtyControl {
+    /// One physical input attempt on the original root-held master. The
+    /// caller has already spent the durable fence. Any write error is unknown
+    /// and must never be retried, even if only a prefix reached the PTY.
+    pub(super) fn send_native_f_once(
+        &mut self,
+        broker: &Path,
+        fence: &oulipoly_state::mailbox::FreshNativeFSubmission,
+        input: &[u8],
+    ) -> Result<(), String> {
+        if self.native_f_attempted {
+            return Err("native F PTY attempt already spent; no replay".into());
+        }
+        self.native_f_attempted = true;
+        use sha2::Digest as _;
+        if fence.input_byte_len != input.len() as i64
+            || fence.input_sha256 != format!("{:x}", sha2::Sha256::digest(input))
+        {
+            return Err("native F physical input differs from durable fence; no replay".into());
+        }
+        if self.resident.lock().map_err(|e| e.to_string())?.is_none() {
+            return Err("native F selected resident generation absent".into());
+        }
+        self.broker_resident_readback(broker)?;
+        if std::env::var_os("AGE319_PRIVATE_NATIVE_F_PARTIAL_WRITE_V1").is_some() {
+            self.master
+                .write_all(&input[..input.len().min(8)])
+                .map_err(|e| format!("native F partial PTY write unknown: {e}"))?;
+            return Err("native F partial PTY write unknown; no replay".into());
+        }
+        self.master
+            .write_all(input)
+            .map_err(|e| format!("native F PTY write unknown; no replay: {e}"))
+    }
+
     pub(super) fn offer(
         broker: &Path,
         d_key: &str,
@@ -106,6 +141,7 @@ impl RootPtyControl {
                 alive,
                 stop,
                 server: Some(server),
+                native_f_attempted: false,
                 resident,
                 _binding: binding,
             };

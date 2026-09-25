@@ -133,7 +133,8 @@ fn main() -> std::io::Result<()> {
         let tty = unsafe { libc::isatty(0) } == 1
             && unsafe { libc::isatty(1) } == 1
             && unsafe { libc::tcgetsid(0) } == unsafe { libc::getsid(0) };
-        if let Ok(path) = std::env::var("AGE319_PRIVATE_NATIVE_STORE") {
+        let native_store = std::env::var("AGE319_PRIVATE_NATIVE_STORE").ok();
+        if let Some(path) = native_store.as_deref() {
             let session_id = std::env::var("AGE319_PRIVATE_NATIVE_SESSION")
                 .map_err(|_| std::io::Error::other("broker-minted native session absent"))?;
             let native = serde_json::json!({
@@ -158,6 +159,52 @@ fn main() -> std::io::Result<()> {
         std::io::stdout().write_all(b"interactive-ready\n")?;
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
+        if input == "[Oulipoly native F v1]\n" {
+            let mut envelope = input.clone();
+            loop {
+                let mut line = String::new();
+                if std::io::stdin().read_line(&mut line)? == 0 || envelope.len() > 256 * 1024 {
+                    return Err(std::io::Error::other("native F envelope incomplete"));
+                }
+                let end = line == "[/Oulipoly native F v1]\n";
+                envelope.push_str(&line);
+                if end {
+                    break;
+                }
+            }
+            let path = native_store.ok_or_else(|| std::io::Error::other("native store absent"))?;
+            let mut native: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+            let body = envelope.trim_end_matches('\n');
+            let field = |prefix: &str| -> std::io::Result<String> {
+                body.lines()
+                    .find_map(|line| line.strip_prefix(prefix))
+                    .map(str::to_owned)
+                    .ok_or_else(|| std::io::Error::other("native F field absent"))
+            };
+            let turn = serde_json::json!({
+                "turn_id": uuid::Uuid::new_v4().to_string(),
+                "body": body,
+                "nonce": field("nonce: ")?,
+                "session_id": field("session: ")?,
+                "payload_sha256": field("payload-sha256: ")?,
+                "payload_base64": field("payload-base64: ")?,
+            });
+            native["turns"]
+                .as_array_mut()
+                .ok_or_else(|| std::io::Error::other("native turns absent"))?
+                .push(turn);
+            let staged = format!("{path}.provider-staged");
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&staged)?;
+            file.write_all(&serde_json::to_vec(&native)?)?;
+            file.sync_all()?;
+            std::fs::rename(staged, &path)?;
+            input.clear();
+            std::io::stdin().read_line(&mut input)?;
+        }
         let evidence = serde_json::json!({
             "controlling_tty": tty,
             "input": input,

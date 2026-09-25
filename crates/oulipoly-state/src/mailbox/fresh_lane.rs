@@ -38,6 +38,8 @@ const FRESH_NATIVE_F_PREPARATION_SCHEMA: &str =
     include_str!("migrations/0040_fresh_native_f_preparation.sql");
 const FRESH_NATIVE_F_SUBMISSION_SCHEMA: &str =
     include_str!("migrations/0041_fresh_native_f_submission.sql");
+const FRESH_NATIVE_F_RECEIPT_SCHEMA: &str =
+    include_str!("migrations/0042_fresh_native_f_receipt.sql");
 const FRESH_RECIPIENT_STATE_SCHEMA: &str =
     include_str!("migrations/0030_fresh_recipient_state.sql");
 
@@ -644,6 +646,46 @@ impl FreshV30Lane {
                 "fresh_native_f_submission_no_delete",
             ],
         )?;
+        let receipt_objects: i64 = sidecar.mailbox().conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name IN
+             ('fresh_native_f_transport','fresh_native_f_transport_no_update','fresh_native_f_transport_no_delete',
+              'fresh_native_f_receipt','fresh_native_f_receipt_no_update','fresh_native_f_receipt_no_delete',
+              'fresh_native_f_auto_ack','fresh_native_f_auto_ack_no_update','fresh_native_f_auto_ack_no_delete')",
+            [], |r| r.get(0),
+        ).map_err(|e| e.to_string())?;
+        match receipt_objects {
+            0 => sidecar
+                .mailbox()
+                .conn
+                .execute_batch(FRESH_NATIVE_F_RECEIPT_SCHEMA)
+                .map_err(|e| e.to_string())?,
+            9 => {}
+            _ => return Err("fresh native F receipt schema is incomplete".into()),
+        }
+        for (table, update, delete) in [
+            (
+                "fresh_native_f_transport",
+                "fresh_native_f_transport_no_update",
+                "fresh_native_f_transport_no_delete",
+            ),
+            (
+                "fresh_native_f_receipt",
+                "fresh_native_f_receipt_no_update",
+                "fresh_native_f_receipt_no_delete",
+            ),
+            (
+                "fresh_native_f_auto_ack",
+                "fresh_native_f_auto_ack_no_update",
+                "fresh_native_f_auto_ack_no_delete",
+            ),
+        ] {
+            verify_fresh_sql_objects(
+                &sidecar.mailbox().conn,
+                FRESH_NATIVE_F_RECEIPT_SCHEMA,
+                table,
+                &[update, delete],
+            )?;
+        }
         let request_key_columns: i64 = sidecar
             .mailbox()
             .conn

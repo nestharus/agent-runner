@@ -6,7 +6,7 @@ use oulipoly_kernel_broker::protocol::{FreshRecipientRequest, fresh_recipient_re
 use oulipoly_runtime::executor::cli::pty_broker::PtyControlGenerationIdentity;
 use oulipoly_state::StateDb;
 use oulipoly_state::mailbox::{
-    BindRuntimeGenerationRunning, BrokerSidecar, CreateRuntimeGeneration,
+    BindRuntimeGenerationRunning, BrokerSidecar, CreateRuntimeGeneration, FreshNativeFObservedTurn,
     FreshNativeFPrepareRequest, FreshRecipientIdentity, FreshV30Lane, MailboxDb,
     RuntimeGenerationFence, RuntimeGenerationId,
 };
@@ -422,6 +422,64 @@ fn private_fresh_recipient_delivery_ack_collision_and_restart() {
             .unwrap(),
         1
     );
+    // Even a constructed original-recipient socket request that asserts a
+    // complete write cannot manufacture a provider-authored native turn.
+    let claimed_transport = fresh_recipient_request_at(
+        &socket,
+        &FreshRecipientRequest::RecordNativeFTransport {
+            preparation_request_id: preparation.preparation_request_id.clone(),
+        },
+    )
+    .unwrap();
+    assert_eq!(claimed_transport["kind"], "native_f_transport");
+    let claimed_turn = FreshNativeFObservedTurn {
+        provider_instance_id: "fixture-instance".into(),
+        settings_id: "fixture-settings".into(),
+        provider_session_id: session.session_id.clone(),
+        anchor_token: "typed-tail-token".into(),
+        snapshot_id: "constructed-snapshot".into(),
+        page_digest: "a".repeat(64),
+        page_index: 0,
+        page_start_sequence: 0,
+        page_turn_count: 1,
+        snapshot_complete: true,
+        turn_id: uuid::Uuid::new_v4().to_string(),
+        role: "user".into(),
+        nonce: preparation.envelope_nonce.clone(),
+        body: envelope.into(),
+        canonical_text_sha256: record["envelope_sha256"].as_str().unwrap().into(),
+    };
+    assert!(
+        fresh_recipient_request_at(
+            &socket,
+            &FreshRecipientRequest::CertifyNativeFReceipt {
+                preparation_request_id: preparation.preparation_request_id.clone(),
+                observed: claimed_turn,
+            }
+        )
+        .is_err(),
+        "constructed socket turn must not certify native receipt"
+    );
+    assert!(
+        fresh_recipient_request_at(
+            &socket,
+            &FreshRecipientRequest::AcknowledgeNativeFReceipt {
+                preparation_request_id: preparation.preparation_request_id.clone(),
+                delivery_token: first_token.clone(),
+            }
+        )
+        .is_err(),
+        "transport claim without provider-native receipt must not ACK"
+    );
+    for table in ["fresh_native_f_receipt", "fresh_native_f_auto_ack"] {
+        assert_eq!(
+            fresh
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
     assert_ne!(first_recovery["grant"]["phase"], "acked");
     assert!(
         fresh

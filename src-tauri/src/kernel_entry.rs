@@ -951,11 +951,16 @@ fn private_resident_fence_pending_f(
     cwd: &std::path::Path,
     generation_id: &str,
     gate: &std::path::Path,
+    physical_control: Option<&mut root_pty_control::RootPtyControl>,
 ) -> Result<(), String> {
     use base64::Engine as _;
     use oulipoly_kernel_broker::protocol::FreshRecipientRequest;
-    use oulipoly_runtime::session_provider::SessionProviderIdentity;
-    use oulipoly_state::mailbox::FreshDeliveryReadback;
+    use oulipoly_runtime::session_provider::{
+        SessionProviderIdentity, SessionProviderPageCursor, SessionProviderReadPageRequest,
+        SessionProviderTurnProjection, read_turn_page,
+    };
+    use oulipoly_state::mailbox::{FreshDeliveryReadback, FreshNativeFObservedTurn};
+    use sha2::{Digest as _, Sha256};
     let delivery_request_id = uuid::Uuid::new_v4().to_string();
     let request_path = gate.join("interactive-f-request-id");
     let mut durable_key = std::fs::OpenOptions::new()
@@ -1081,7 +1086,7 @@ fn private_resident_fence_pending_f(
     let readback = protocol::fresh_recipient_request_at(
         socket,
         &FreshRecipientRequest::ReadNativeFSubmission {
-            preparation_request_id,
+            preparation_request_id: preparation_request_id.clone(),
         },
     )
     .map_err(|e| e.to_string())?;
@@ -1096,6 +1101,194 @@ fn private_resident_fence_pending_f(
             "preparation":prepared,
             "fence":fence,
             "duplicate_error":duplicate.unwrap_err().to_string(),
+        }))
+        .map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    let Some(control) = physical_control else {
+        return Ok(());
+    };
+    let input = format!("{}\n", prepared.envelope_text);
+    let sent = control.send_native_f_once(socket, &fence, input.as_bytes());
+    if std::env::var_os("AGE319_PRIVATE_NATIVE_F_PARTIAL_WRITE_V1").is_some()
+        && sent.is_err()
+        && control
+            .send_native_f_once(socket, &fence, input.as_bytes())
+            .is_ok()
+    {
+        return Err("native F partial write replay accepted".into());
+    }
+    sent?;
+    if control
+        .send_native_f_once(socket, &fence, input.as_bytes())
+        .is_ok()
+    {
+        return Err("duplicate native F PTY send accepted".into());
+    }
+    let transport = protocol::fresh_recipient_request_at(
+        socket,
+        &FreshRecipientRequest::RecordNativeFTransport {
+            preparation_request_id: preparation_request_id.clone(),
+        },
+    )
+    .map_err(|e| format!("native F transport acceptance unknown: {e}"))?;
+    if transport["kind"] != "native_f_transport"
+        || transport["transport"]["input_sha256"] != fence.input_sha256
+    {
+        return Err("native F transport acceptance readback changed".into());
+    }
+    let identity = SessionProviderIdentity {
+        model_name: model.into(),
+        provider_name: account.into(),
+        provider_instance_id: Some(instance.into()),
+        settings_id: settings.into(),
+    };
+    let observation_nonce = format!("{:x}", Sha256::digest(prepared.envelope_nonce.as_bytes()));
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let page = loop {
+        let cancellation = oulipoly_provider::client::CancellationToken::new();
+        let page = read_turn_page(SessionProviderReadPageRequest {
+            registry,
+            identity: identity.clone(),
+            session_id,
+            effective_cwd: Some(cwd),
+            projection: SessionProviderTurnProjection::UserObservation,
+            expected_delivery_nonce: Some(&observation_nonce),
+            cursor: SessionProviderPageCursor::Beginning {
+                after_token: Some(prepared.tail_resume_token.clone()),
+            },
+            expected_page_index: 0,
+            expected_turn_sequence: 0,
+            max_turns: 64,
+            max_response_bytes: 256 * 1024,
+            max_source_bytes: 4 * 1024 * 1024,
+            max_inline_body_bytes: 64 * 1024,
+            cancellation: &cancellation,
+            timeout: std::time::Duration::from_secs(2),
+        })
+        .map_err(|e| format!("native F provider readback unknown: {e}"))?;
+        if !page.turns.is_empty() || std::time::Instant::now() >= until {
+            break page;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let turn = page
+        .turns
+        .first()
+        .ok_or("native F provider turn absent; pending")?;
+    let body = turn
+        .body
+        .as_ref()
+        .and_then(|chunks| chunks.as_array())
+        .and_then(|chunks| chunks.first())
+        .and_then(|chunk| chunk["text"].as_str())
+        .ok_or("native F provider body absent; pending")?;
+    if !turn.canonical_text_digest_verified {
+        return Err("native F provider canonical body unverified; pending".into());
+    }
+    let observed = FreshNativeFObservedTurn {
+        provider_instance_id: page.provider_instance_id,
+        settings_id: page.settings_id,
+        provider_session_id: page.session_id,
+        anchor_token: prepared.tail_resume_token.clone(),
+        snapshot_id: page.snapshot_id,
+        page_digest: page.page_digest,
+        page_index: page.page_index,
+        page_start_sequence: page.page_start_sequence,
+        page_turn_count: page.page_turn_count,
+        snapshot_complete: page.snapshot_complete,
+        turn_id: turn.turn_id.clone(),
+        role: turn.role.clone(),
+        nonce: body
+            .lines()
+            .find_map(|line| line.strip_prefix("nonce: "))
+            .unwrap_or_default()
+            .into(),
+        body: body.into(),
+        canonical_text_sha256: turn.canonical_text_sha256.clone().unwrap_or_default(),
+    };
+    for changed in ["tail", "turn", "session", "nonce", "body"] {
+        let mut wrong = observed.clone();
+        match changed {
+            "tail" => wrong.anchor_token = "wrong-tail".into(),
+            "turn" => wrong.turn_id = uuid::Uuid::new_v4().to_string(),
+            "session" => wrong.provider_session_id = uuid::Uuid::new_v4().to_string(),
+            "nonce" => wrong.nonce = uuid::Uuid::new_v4().to_string(),
+            "body" => wrong.body.push_str(" wrong-body"),
+            _ => unreachable!(),
+        }
+        if protocol::fresh_recipient_request_at(
+            socket,
+            &FreshRecipientRequest::CertifyNativeFReceipt {
+                preparation_request_id: preparation_request_id.clone(),
+                observed: wrong,
+            },
+        )
+        .is_ok()
+        {
+            return Err(format!("native F {changed} negative receipt was accepted"));
+        }
+    }
+    let receipt = protocol::fresh_recipient_request_at(
+        socket,
+        &FreshRecipientRequest::CertifyNativeFReceipt {
+            preparation_request_id: preparation_request_id.clone(),
+            observed: observed.clone(),
+        },
+    )
+    .map_err(|e| format!("native F receipt unknown; pending: {e}"))?;
+    if receipt["kind"] != "native_f_receipt" || receipt["receipt"]["grant_id"] != grant.grant_id {
+        return Err("native F receipt readback changed; pending".into());
+    }
+    if protocol::fresh_recipient_request_at(
+        socket,
+        &FreshRecipientRequest::CertifyNativeFReceipt {
+            preparation_request_id: preparation_request_id.clone(),
+            observed: observed.clone(),
+        },
+    )
+    .is_ok()
+    {
+        return Err("duplicate native F receipt accepted".into());
+    }
+    if protocol::fresh_recipient_request_at(
+        socket,
+        &FreshRecipientRequest::AcknowledgeNativeFReceipt {
+            preparation_request_id: preparation_request_id.clone(),
+            delivery_token: uuid::Uuid::new_v4().to_string(),
+        },
+    )
+    .is_ok()
+    {
+        return Err("native F wrong-token ACK accepted".into());
+    }
+    let ack = protocol::fresh_recipient_request_at(
+        socket,
+        &FreshRecipientRequest::AcknowledgeNativeFReceipt {
+            preparation_request_id: preparation_request_id.clone(),
+            delivery_token: token.into(),
+        },
+    )
+    .map_err(|e| format!("native F automatic ACK unknown: {e}"))?;
+    if ack["kind"] != "native_f_auto_ack" || ack["grant"]["phase"] != "acked" {
+        return Err("native F automatic ACK readback changed".into());
+    }
+    if protocol::fresh_recipient_request_at(
+        socket,
+        &FreshRecipientRequest::AcknowledgeNativeFReceipt {
+            preparation_request_id: preparation_request_id.clone(),
+            delivery_token: token.into(),
+        },
+    )
+    .is_ok()
+    {
+        return Err("duplicate native F automatic ACK accepted".into());
+    }
+    std::fs::write(
+        gate.join("interactive-f-physical.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "transport": transport["transport"], "receipt": receipt["receipt"],
+            "ack": ack["grant"],
         }))
         .map_err(|e| e.to_string())?,
     )
@@ -1835,6 +2028,13 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
                         &cwd,
                         challenge.generation_id.as_str(),
                         &gate,
+                        if std::env::var_os("AGE319_PRIVATE_ROOT_PTY_NATIVE_F_PHYSICAL_V1")
+                            .is_some()
+                        {
+                            Some(control)
+                        } else {
+                            None
+                        },
                     )?;
                 }
                 control.finish_interactive(&socket, running, b"fixture-input-through-pty\n")?

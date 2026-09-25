@@ -119,6 +119,7 @@ fn inner() {
     let physical_mode = mode.starts_with("normal_model_provider_pty_physical");
     let resident_mode = mode.starts_with("normal_model_provider_pty_physical_resident_");
     let resident_bash = mode.starts_with("normal_model_provider_pty_physical_resident_bash_");
+    let physical_f = mode.contains("_f_fenced_physical");
     let resident_notify = resident_bash
         && (mode.ends_with("_notify")
             || mode.contains("_f_fenced")
@@ -177,6 +178,10 @@ fn inner() {
             | "normal_model_provider_pty_physical_resident_bash_notify"
             | "normal_model_provider_pty_physical_resident_bash_f_fenced"
             | "normal_model_provider_pty_physical_resident_bash_f_fenced_restart"
+            | "normal_model_provider_pty_physical_resident_bash_f_fenced_physical"
+            | "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_restart"
+            | "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_partial"
+            | "normal_model_provider_pty_physical_resident_bash_f_fenced_adapter_unsupported"
             | "normal_model_provider_pty_physical_resident_bash_response"
             | "normal_model_provider_pty_physical_resident_bash_wrong_image"
             | "normal_model_provider_pty_physical_resident_bash_absent_parent"
@@ -712,6 +717,15 @@ fn inner() {
             .envs(
                 mode.contains("_f_fenced")
                     .then_some(("AGE319_PRIVATE_ROOT_PTY_NATIVE_F_FENCE_V1", "1")),
+            )
+            .envs(physical_f.then_some(("AGE319_PRIVATE_ROOT_PTY_NATIVE_F_PHYSICAL_V1", "1")))
+            .envs(
+                mode.ends_with("_physical_partial")
+                    .then_some(("AGE319_PRIVATE_NATIVE_F_PARTIAL_WRITE_V1", "1")),
+            )
+            .envs(
+                mode.ends_with("_adapter_unsupported")
+                    .then_some(("AGE319_PRIVATE_NATIVE_ADAPTER_UNSUPPORTED_V1", "1")),
             )
             .envs(resident_failure.map(|case| ("AGE319_PRIVATE_RESIDENT_FAILURE_V1", case)))
             .envs(
@@ -2110,6 +2124,10 @@ fn inner() {
                     | "normal_model_provider_pty_physical_resident_bash_notify"
                     | "normal_model_provider_pty_physical_resident_bash_f_fenced"
                     | "normal_model_provider_pty_physical_resident_bash_f_fenced_restart"
+                    | "normal_model_provider_pty_physical_resident_bash_f_fenced_physical"
+                    | "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_restart"
+                    | "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_partial"
+                    | "normal_model_provider_pty_physical_resident_bash_f_fenced_adapter_unsupported"
                     | "normal_model_provider_pty_physical_resident_bash_response"
                     | "normal_model_provider_pty_physical_resident_bash_wrong_image"
                     | "normal_model_provider_pty_physical_resident_bash_absent_parent"
@@ -2976,6 +2994,48 @@ fn inner() {
                         stop(&mut broker);
                         return;
                     }
+                    if mode.ends_with("_adapter_unsupported") {
+                        let until = Instant::now() + Duration::from_secs(20);
+                        while entry.try_wait().unwrap().is_none() && Instant::now() < until {
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        assert!(!entry.wait().unwrap().success());
+                        assert!(
+                            fs::read_to_string(&err)
+                                .unwrap_or_default()
+                                .contains("selected resident adapter lacks native pages before K")
+                        );
+                        assert_eq!(
+                            fs::read_dir(&provider_dir)
+                                .unwrap()
+                                .filter_map(Result::ok)
+                                .filter(|entry| entry
+                                    .file_name()
+                                    .to_string_lossy()
+                                    .ends_with(".interactive-k.json"))
+                                .count(),
+                            0
+                        );
+                        let side = rusqlite::Connection::open(
+                            broker_state.join("v30/sidecar/pid-identity.db"),
+                        )
+                        .unwrap();
+                        for table in [
+                            "fresh_native_f_submission",
+                            "fresh_native_f_transport",
+                            "fresh_native_f_receipt",
+                            "fresh_native_f_auto_ack",
+                        ] {
+                            assert_eq!(
+                                side.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                                    .get::<_, i64>(0))
+                                    .unwrap(),
+                                0
+                            );
+                        }
+                        stop(&mut broker);
+                        return;
+                    }
                     if resident_mode {
                         let readback_path = gate.join("interactive-resident-readback.json");
                         eventually(|| {
@@ -3116,7 +3176,10 @@ fn inner() {
                             readback["native_tail"]["resume_token"]
                                 .as_str()
                                 .unwrap()
-                                .ends_with(native["store_nonce"].as_str().unwrap())
+                                .ends_with(&format!(
+                                    "{}:0",
+                                    native["store_nonce"].as_str().unwrap()
+                                ))
                         );
                         let preparation_count: i64 = sidecar
                             .query_row(
@@ -3469,6 +3532,68 @@ fn inner() {
                             }
                         }
                         fs::write(gate.join("interactive-resident-continue"), b"continue").unwrap();
+                        if mode.ends_with("_physical_partial") {
+                            let until = Instant::now() + Duration::from_secs(20);
+                            while entry.try_wait().unwrap().is_none() && Instant::now() < until {
+                                std::thread::sleep(Duration::from_millis(20));
+                            }
+                            assert!(!entry.wait().unwrap().success());
+                            assert!(
+                                fs::read_to_string(&err)
+                                    .unwrap_or_default()
+                                    .contains("native F partial PTY write unknown; no replay")
+                            );
+                            assert!(gate.join("interactive-f-fenced.json").exists());
+                            let side = rusqlite::Connection::open(
+                                broker_state.join("v30/sidecar/pid-identity.db"),
+                            )
+                            .unwrap();
+                            for table in ["fresh_native_f_submission", "fresh_recipient_grant"] {
+                                assert_eq!(
+                                    side.query_row(
+                                        &format!("SELECT count(*) FROM {table}"),
+                                        [],
+                                        |r| r.get::<_, i64>(0)
+                                    )
+                                    .unwrap(),
+                                    1
+                                );
+                            }
+                            for table in [
+                                "fresh_native_f_transport",
+                                "fresh_native_f_receipt",
+                                "fresh_native_f_auto_ack",
+                            ] {
+                                assert_eq!(
+                                    side.query_row(
+                                        &format!("SELECT count(*) FROM {table}"),
+                                        [],
+                                        |r| r.get::<_, i64>(0)
+                                    )
+                                    .unwrap(),
+                                    0
+                                );
+                            }
+                            assert_eq!(
+                                side.query_row(
+                                    "SELECT count(*) FROM mailbox WHERE delivered_at IS NULL",
+                                    [],
+                                    |r| r.get::<_, i64>(0)
+                                )
+                                .unwrap(),
+                                1
+                            );
+                            assert!(
+                                !provider_dir
+                                    .join(format!("{}.interactive-q.json", receipt.handoff_id))
+                                    .exists()
+                            );
+                            let native: serde_json::Value =
+                                serde_json::from_slice(&fs::read(&native_store).unwrap()).unwrap();
+                            assert_eq!(native["turns"], serde_json::json!([]));
+                            stop(&mut broker);
+                            return;
+                        }
                         if mode.contains("_after_append") {
                             let raw = provider_dir.join(format!("{grant_id}.interactive-output"));
                             let output_receipt =
@@ -3658,7 +3783,7 @@ fn inner() {
                             |row| row.get(0),
                         )
                         .unwrap();
-                        assert_eq!(pending, i64::from(resident_notify));
+                        assert_eq!(pending, i64::from(resident_notify && !physical_f));
                         if mode.contains("_f_fenced") {
                             let fenced: serde_json::Value = serde_json::from_slice(
                                 &fs::read(gate.join("interactive-f-fenced.json")).unwrap(),
@@ -3746,7 +3871,62 @@ fn inner() {
                             assert_eq!(effect["input"], "fixture-input-through-pty\n");
                             let native_after_q: serde_json::Value =
                                 serde_json::from_slice(&fs::read(&native_store).unwrap()).unwrap();
-                            assert_eq!(native_after_q["turns"], serde_json::json!([]));
+                            if physical_f {
+                                let physical: serde_json::Value = serde_json::from_slice(
+                                    &fs::read(gate.join("interactive-f-physical.json")).unwrap(),
+                                )
+                                .unwrap();
+                                assert_eq!(native_after_q["turns"].as_array().unwrap().len(), 1);
+                                assert_eq!(native_after_q["turns"][0]["body"], envelope);
+                                assert_eq!(
+                                    native_after_q["turns"][0]["nonce"],
+                                    fenced["preparation"]["envelope_nonce"]
+                                );
+                                assert_eq!(
+                                    physical["receipt"]["turn_id"],
+                                    native_after_q["turns"][0]["turn_id"]
+                                );
+                                assert_eq!(
+                                    physical["receipt"]["payload_sha256"],
+                                    fenced["preparation"]["payload_sha256"]
+                                );
+                                assert_eq!(
+                                    physical["transport"]["input_sha256"],
+                                    fenced["fence"]["input_sha256"]
+                                );
+                                assert_eq!(physical["ack"]["phase"], "acked");
+                                for table in [
+                                    "fresh_native_f_transport",
+                                    "fresh_native_f_receipt",
+                                    "fresh_native_f_auto_ack",
+                                ] {
+                                    assert_eq!(
+                                        side.query_row(
+                                            &format!("SELECT count(*) FROM {table}"),
+                                            [],
+                                            |r| r.get::<_, i64>(0)
+                                        )
+                                        .unwrap(),
+                                        1
+                                    );
+                                }
+                                let lane = FreshV30Lane::open_at(&broker_state).unwrap();
+                                let (root, actor) =
+                                    lane.released_handoff_for_root(&prepared.root_id).unwrap();
+                                let root_session = lane.read_session(&root.d_key).unwrap().unwrap();
+                                let terminal = lane
+                                    .settle_private_root_terminal(&root, &actor, &root_session)
+                                    .unwrap();
+                                assert_eq!(terminal.notification_state, "acked");
+                                assert_eq!(terminal.ack_basis.as_deref(), Some("native_f_receipt"));
+                                let exact = format!(
+                                    "interactive-ready\r\n{}\r\nfixture-input-through-pty\r\ninteractive-output:fixture-input-through-pty\r\n",
+                                    envelope.replace('\n', "\r\n")
+                                );
+                                assert_eq!(transcript, exact.as_bytes());
+                            } else {
+                                assert_eq!(native_after_q["turns"], serde_json::json!([]));
+                            }
                         } else if resident_notify {
                             assert_pending_notify_without_delivery(&broker_state);
                         } else {
@@ -6787,6 +6967,10 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_model_provider_pty_physical_resident_bash_notify",
         "normal_model_provider_pty_physical_resident_bash_f_fenced",
         "normal_model_provider_pty_physical_resident_bash_f_fenced_restart",
+        "normal_model_provider_pty_physical_resident_bash_f_fenced_physical",
+        "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_restart",
+        "normal_model_provider_pty_physical_resident_bash_f_fenced_physical_partial",
+        "normal_model_provider_pty_physical_resident_bash_f_fenced_adapter_unsupported",
         "normal_model_provider_pty_physical_resident_bash_response",
         "normal_model_provider_pty_physical_resident_bash_wrong_image",
         "normal_model_provider_pty_physical_resident_bash_absent_parent",

@@ -1143,6 +1143,23 @@ pub enum FreshRecipientRequest {
     ReadNativeFSubmission {
         preparation_request_id: String,
     },
+    RecordNativeFTransport {
+        preparation_request_id: String,
+    },
+    ReadNativeFTransport {
+        preparation_request_id: String,
+    },
+    CertifyNativeFReceipt {
+        preparation_request_id: String,
+        observed: oulipoly_state::mailbox::FreshNativeFObservedTurn,
+    },
+    ReadNativeFReceipt {
+        preparation_request_id: String,
+    },
+    AcknowledgeNativeFReceipt {
+        preparation_request_id: String,
+        delivery_token: String,
+    },
     Acknowledge {
         grant_id: String,
         delivery_token: String,
