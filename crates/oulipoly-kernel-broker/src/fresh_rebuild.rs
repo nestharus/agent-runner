@@ -1215,6 +1215,120 @@ mod tests {
     }
 
     #[test]
+    fn v3_provider_readback_admission_is_exact_and_refuses_late_physical_changes() {
+        let fixture = Fixture::new();
+        fixture.prepared();
+        let wal = fixture.temp.path().join("state.db-wal");
+        std::fs::write(&wal, b"old WAL stays byte exact").unwrap();
+        fixture.ready();
+        rebuild_keyed_offline(&fixture.root, &fixture.socket, &fixture.source).unwrap();
+        let lease = broker_admission_lease(&fixture.root).unwrap();
+        let generation =
+            KeyedGeneration::admit_provider_readback(&fixture.root, &lease, &fixture.source)
+                .unwrap();
+        let (verified, keyed_io) = crate::linux_main::fresh_index::measure_keyed_io(|| {
+            let _physical_io =
+                crate::linux_main::fresh_index::ReaderIoGuard::start("v3-provider-readback");
+            require_v3_provider_binding(&generation, &fixture.root, &fixture.binding).unwrap()
+        });
+        let physical_io = crate::linux_main::fresh_index::last_reader_io().unwrap();
+        eprintln!("v3 exact provider readback keyed={keyed_io:?} physical={physical_io:?}");
+        assert_eq!(verified, fixture.grant.id);
+        assert_eq!(
+            keyed_io.directory_entries + physical_io.directory_entries,
+            0
+        );
+        assert_eq!(keyed_io.bytes_written + physical_io.bytes_written, 0);
+        assert_eq!(
+            require_v3_provider_binding(&generation, &fixture.root, &fixture.binding).unwrap(),
+            fixture.grant.id,
+        );
+        assert!(Index::open(&fixture.root).is_err());
+        assert_eq!(std::fs::read(&wal).unwrap(), b"old WAL stays byte exact");
+        // A previously held child may publish K after the frozen scan. The
+        // admitted generation cannot call that an empty or settled source.
+        durable_new(
+            &fixture.root,
+            &format!("{}.consumed.json", fixture.grant.id),
+            &fixture.grant,
+        )
+        .unwrap();
+        assert!(require_v3_provider_binding(&generation, &fixture.root, &fixture.binding).is_err());
+        assert!(
+            KeyedGeneration::admit_provider_readback(&fixture.root, &lease, &fixture.source)
+                .is_err()
+        );
+        drop(lease);
+        assert!(rebuild_keyed_offline(&fixture.root, &fixture.socket, &fixture.source).is_ok());
+        let lease = broker_admission_lease(&fixture.root).unwrap();
+        let generation =
+            KeyedGeneration::admit_provider_readback(&fixture.root, &lease, &fixture.source)
+                .unwrap();
+        assert_eq!(
+            require_v3_provider_binding(&generation, &fixture.root, &fixture.binding).unwrap(),
+            fixture.grant.id,
+        );
+        assert_eq!(std::fs::read(&wal).unwrap(), b"old WAL stays byte exact");
+    }
+
+    #[test]
+    fn v3_provider_readback_keeps_typed_capacity_and_late_q_unknown() {
+        let fixture = Fixture::new();
+        fixture.consumed();
+        fixture.certified_q(b"{\"type\":\"error\",\"error\":{\"code\":\"model_at_capacity\"}}\n");
+        fixture.ready();
+        rebuild_keyed_offline(&fixture.root, &fixture.socket, &fixture.source).unwrap();
+        let lease = broker_admission_lease(&fixture.root).unwrap();
+        let generation =
+            KeyedGeneration::admit_provider_readback(&fixture.root, &lease, &fixture.source)
+                .unwrap();
+        assert_eq!(
+            require_v3_provider_binding(&generation, &fixture.root, &fixture.binding).unwrap(),
+            fixture.grant.id,
+        );
+        let account = generation.account("physical-first").unwrap();
+        let marker = sha_text(&("work", fixture.candidate.config_sha256.as_str())).unwrap();
+        assert!(account.get("model-capacity", &marker).unwrap().is_some());
+        let q = fixture
+            .root
+            .join(format!("{}.drain.json", fixture.grant.id));
+        std::fs::write(q, b"changed Q").unwrap();
+        assert!(require_v3_provider_binding(&generation, &fixture.root, &fixture.binding).is_err());
+        assert!(
+            KeyedGeneration::admit_provider_readback(&fixture.root, &lease, &fixture.source)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn v3_provider_admission_requires_published_generation_and_accepts_empty_rebuild() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("v30/fresh-provider");
+        let source = temp.path().join("config");
+        let socket = temp.path().join("broker.sock");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir(&source).unwrap();
+        let lease = broker_admission_lease(&root).unwrap();
+        assert!(KeyedGeneration::admit_provider_readback(&root, &lease, &source).is_err());
+        drop(lease);
+        rebuild_keyed_offline(&root, &socket, &source).unwrap();
+        let lease = broker_admission_lease(&root).unwrap();
+        let generation = KeyedGeneration::admit_provider_readback(&root, &lease, &source).unwrap();
+        assert!(!generation.generation.is_empty());
+        assert!(Index::open(&root).is_err());
+
+        let fixture = Fixture::new();
+        fixture.prepared();
+        fixture.ready();
+        fixture.rebuild().unwrap();
+        let lease = broker_admission_lease(&fixture.root).unwrap();
+        assert!(
+            KeyedGeneration::admit_provider_readback(&fixture.root, &lease, &fixture.source)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn v3_pre_manifest_failure_keeps_v2_and_source_damage_refuses() {
         let fixture = Fixture::new();
         fixture.prepared();

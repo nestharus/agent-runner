@@ -3,6 +3,7 @@
 //! ordinary CLI route remains closed; a private typed runtime backend consumes
 //! its Q-gated readbacks without publishing terminal success.
 use super::work_launch;
+use crate::linux_main::fresh_index::KeyedGeneration;
 use crate::linux_main::fresh_index::{
     AccountUpdate, Artifact, CursorKey, Decision, EffectIntent, EffectKind, Index, PhysicalQ,
     ProviderGrant, ReaderIoGuard, SourceKey, TerminalMarkerKind,
@@ -705,6 +706,122 @@ pub(super) fn reconcile_indexed_provider_binding(
     }
     reconcile_indexed_provider_grant(index, &grant)?;
     Ok(())
+}
+
+/// Exact, read-only v3 provider seam. It can inspect an already rebuilt
+/// physical grant; it cannot announce one or turn a late Q into eligibility.
+/// A physical change after frozen rebuild is unknown until another rebuild.
+pub(super) fn require_v3_provider_binding(
+    generation: &KeyedGeneration,
+    directory: &Path,
+    binding: &Binding,
+) -> io::Result<String> {
+    let root = directory;
+    let indexed_decision = generation
+        .require_route(&binding.handoff_id)
+        .map_err(io::Error::other)?;
+    let decision: RouteDecision = exact_file(root, &decision_name(&binding.handoff_id))?
+        .ok_or_else(|| io::Error::other("v3 provider route receipt absent"))?;
+    let grant: Grant = exact_file(root, &format!("{}.fresh-grant.json", binding.handoff_id))?
+        .ok_or_else(|| io::Error::other("v3 provider grant absent"))?;
+    let candidate: RouteCandidate = exact_file(
+        root,
+        &candidate_name(&binding.handoff_id, decision.selection.index),
+    )?
+    .ok_or_else(|| io::Error::other("v3 provider candidate absent"))?;
+    if decision.binding != *binding
+        || grant.binding != *binding
+        || grant.version != 1
+        || candidate.version != 3
+        || candidate.binding != *binding
+        || candidate.account_identity != indexed_decision.candidate_identity
+        || candidate.index != indexed_decision.candidate_index
+        || candidate.model != indexed_decision.key.model
+        || candidate.config_sha256 != indexed_decision.key.config_sha256
+        || grant.plan_sha256 != candidate.plan_sha256
+        || grant.plan_sha256 != decision.selection.plan_sha256
+    {
+        return Err(io::Error::other("v3 provider binding changed"));
+    }
+    let account = &candidate.account_identity;
+    let indexed = generation
+        .provider_grant(account, &grant.id)
+        .map_err(io::Error::other)?
+        .ok_or_else(|| io::Error::other("v3 provider grant unannounced"))?;
+    if indexed.decision_handoff != binding.handoff_id
+        || indexed.grant
+            != provider_artifact(root, &format!("{}.fresh-grant.json", binding.handoff_id))?
+        || indexed.candidate.as_ref()
+            != Some(&provider_artifact(
+                root,
+                &candidate_name(&binding.handoff_id, candidate.index),
+            )?)
+    {
+        return Err(io::Error::other("v3 provider grant source changed"));
+    }
+    let k_name = format!("{}.consumed.json", grant.id);
+    let physical_k: Option<Grant> = exact_file(root, &k_name)?;
+    if physical_k
+        .as_ref()
+        .is_some_and(|physical| physical != &grant)
+    {
+        return Err(io::Error::other("v3 physical K identity changed"));
+    }
+    let k = physical_k
+        .map(|_| provider_artifact(root, &k_name))
+        .transpose()?;
+    if indexed.consumed_k != k {
+        return Err(io::Error::other("v3 physical K differs from keyed source"));
+    }
+    let q_name = format!("{}.drain.json", grant.id);
+    let terminal_name = format!("{}.terminal.json", grant.id);
+    let q = if root.join(&q_name).exists() {
+        Some(provider_artifact(root, &q_name)?)
+    } else {
+        None
+    };
+    let terminal: Option<TerminalRecord> = exact_file(root, &terminal_name)?;
+    match (&indexed.certified_q, &q, &terminal) {
+        (Some(certified), Some(q), Some(typed)) => {
+            if Some(&certified.physical_k) != k.as_ref()
+                || &certified.q != q
+                || certified.terminal.as_ref() != Some(&provider_artifact(root, &terminal_name)?)
+                || typed.version != 1
+                || typed.binding != *binding
+                || typed.selection != decision.selection
+                || typed.grant_id != grant.id
+                || typed.physical_q_sha256 != q.sha256
+                || i64::try_from(typed.physical_q_unix_nanos).ok()
+                    != Some(certified.completed_unix_nanos)
+            {
+                return Err(io::Error::other(
+                    "v3 typed provider Q differs from keyed source",
+                ));
+            }
+        }
+        (None, None, None) => {}
+        _ => {
+            return Err(io::Error::other(
+                "v3 provider Q or typed terminal is unjoined debt",
+            ));
+        }
+    }
+    let pending = generation
+        .provider_pending(account, &grant.id)
+        .map_err(io::Error::other)?;
+    if indexed.certified_q.is_some() {
+        if pending.is_some() {
+            return Err(io::Error::other("v3 settled provider still pending"));
+        }
+    } else if pending.as_ref().is_none_or(|pending| {
+        pending.announcement != indexed.grant
+            || pending.physical_k != k
+            || pending.decision_handoff != binding.handoff_id
+            || pending.kind != "provider"
+    }) {
+        return Err(io::Error::other("v3 provider pending record differs"));
+    }
+    Ok(grant.id)
 }
 
 fn durable_new<T: Serialize>(directory: &Path, name: &str, value: &T) -> io::Result<()> {
@@ -3933,6 +4050,17 @@ fn parent_namespace_pid(host_pid: i32) -> io::Result<i32> {
 }
 
 fn exact_file<T: for<'de> Deserialize<'de>>(dir: &Path, name: &str) -> io::Result<Option<T>> {
+    struct Counted<R> {
+        inner: R,
+        bytes: u64,
+    }
+    impl<R: Read> Read for Counted<R> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let read = self.inner.read(buf)?;
+            self.bytes += read as u64;
+            Ok(read)
+        }
+    }
     super::fresh_index::reader_open_attempt();
     match OpenOptions::new()
         .read(true)
@@ -3941,7 +4069,13 @@ fn exact_file<T: for<'de> Deserialize<'de>>(dir: &Path, name: &str) -> io::Resul
     {
         Ok(file) if file.metadata()?.is_file() => {
             super::fresh_index::reader_opened();
-            Ok(Some(serde_json::from_reader(file)?))
+            let mut counted = Counted {
+                inner: file,
+                bytes: 0,
+            };
+            let parsed = serde_json::from_reader(&mut counted);
+            super::fresh_index::reader_bytes_parsed(counted.bytes);
+            Ok(Some(parsed?))
         }
         Ok(_) => {
             super::fresh_index::reader_opened();

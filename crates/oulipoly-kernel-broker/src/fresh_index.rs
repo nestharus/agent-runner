@@ -26,14 +26,16 @@ use std::os::unix::net::UnixStream;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-// Candidate storage only. No live writer or selector calls this module yet.
+// The keyed generation has a separate private, provider-readback-only
+// admission. Route/effect/manual writers and physical K remain closed there.
 #[path = "fresh_index_keyed.rs"]
 #[allow(dead_code)]
 mod keyed_store;
+#[cfg(test)]
+pub(super) use keyed_store::measured as measure_keyed_io;
 #[path = "fresh_index_v3.rs"]
 #[allow(dead_code)]
 mod v3;
-#[cfg(test)]
 pub(super) use v3::KeyedGeneration;
 
 pub(super) fn rebuild_keyed_offline(root: &Path, socket: &Path, source: &Path) -> Result<()> {
@@ -102,7 +104,7 @@ pub(super) fn reader_directory_entry() {
         }
     });
 }
-fn reader_bytes_parsed(bytes: u64) {
+pub(super) fn reader_bytes_parsed(bytes: u64) {
     READER_IO.with(|cell| {
         if let Some(mut count) = cell.get() {
             count.bytes_parsed += bytes;

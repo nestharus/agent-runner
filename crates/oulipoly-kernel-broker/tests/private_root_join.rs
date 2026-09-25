@@ -65,6 +65,7 @@ fn inner() {
         mode.as_str(),
         "normal_model_provider_bad_config"
             | "normal_model_provider_unsupported"
+            | "normal_model_provider_v3_closed"
             | "normal_model_provider_quota"
             | "normal_model_provider_auth"
     );
@@ -90,6 +91,7 @@ fn inner() {
             | "normal_model_provider_restart"
             | "normal_model_provider_bad_config"
             | "normal_model_provider_unsupported"
+            | "normal_model_provider_v3_closed"
             | "normal_model_provider_quota"
             | "normal_model_provider_auth"
             | "normal_model_provider_auth_recovery"
@@ -404,6 +406,37 @@ fn inner() {
     if handoff_mode {
         FreshV30Lane::initialize_at(&broker_state).unwrap();
     }
+    if mode == "normal_model_provider_v3_closed" {
+        let mut bootstrap = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        eventually(|| {
+            broker_state
+                .join("v30/fresh-provider/index-v1/admission-protocol.json")
+                .exists()
+                || bootstrap.try_wait().unwrap().is_some()
+        });
+        assert!(bootstrap.try_wait().unwrap().is_none());
+        stop(&mut bootstrap);
+        let rebuilt = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
+            .arg("--offline-rebuild-fresh-index-v3")
+            .arg(config_home.join("oulipoly-agent-runner"))
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
+            .output()
+            .unwrap();
+        assert!(
+            rebuilt.status.success(),
+            "{}",
+            String::from_utf8_lossy(&rebuilt.stderr)
+        );
+    }
     let broker_log = temp.path().join("broker.log");
     let mut broker = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
@@ -414,6 +447,14 @@ fn inner() {
                 .map(|path| ("OULIPOLY_KERNEL_BROKER_FIXTURE_BASH_V1", path)),
         )
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+        .envs((mode == "normal_model_provider_v3_closed").then_some((
+            "OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_READBACK_V3_V1",
+            "1",
+        )))
+        .envs((mode == "normal_model_provider_v3_closed").then_some((
+            "OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_READBACK_V3_SOURCE_V1",
+            config_home.join("oulipoly-agent-runner").to_str().unwrap(),
+        )))
         .envs((mode == "normal_model_provider_reply_loss").then_some((
             "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_PROVIDER_K_REPLY_V1",
             "1",
@@ -441,9 +482,19 @@ fn inner() {
         .stderr(Stdio::from(File::create(&broker_log).unwrap()))
         .spawn()
         .unwrap();
-    eventually(|| socket.exists() || broker.try_wait().unwrap().is_some());
+    eventually(|| {
+        (if mode == "normal_model_provider_v3_closed" {
+            UnixStream::connect(&socket).is_ok()
+        } else {
+            socket.exists()
+        }) || broker.try_wait().unwrap().is_some()
+    });
     assert!(
-        socket.exists(),
+        if mode == "normal_model_provider_v3_closed" {
+            broker.try_wait().unwrap().is_none() && UnixStream::connect(&socket).is_ok()
+        } else {
+            socket.exists()
+        },
         "broker startup: {}",
         fs::read_to_string(&broker_log).unwrap()
     );
@@ -983,6 +1034,7 @@ fn inner() {
                     | "normal_model_provider_restart"
                     | "normal_model_provider_bad_config"
                     | "normal_model_provider_unsupported"
+                    | "normal_model_provider_v3_closed"
                     | "normal_model_provider_quota"
                     | "normal_model_provider_auth"
                     | "normal_model_provider_auth_recovery"
@@ -1275,6 +1327,14 @@ fn inner() {
                     .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
                     .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
                     .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+                    .envs((mode == "normal_model_provider_v3_closed").then_some((
+                        "OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_READBACK_V3_V1",
+                        "1",
+                    )))
+                    .envs((mode == "normal_model_provider_v3_closed").then_some((
+                        "OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_READBACK_V3_SOURCE_V1",
+                        config_home.join("oulipoly-agent-runner").to_str().unwrap(),
+                    )))
                     .envs((mode == "normal_model_provider_reply_loss").then_some((
                         "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_PROVIDER_K_REPLY_V1",
                         "1",
@@ -1342,6 +1402,9 @@ fn inner() {
                         "normal_model_provider_unsupported" => {
                             "fresh pool has incompatible prompt modes before K"
                         }
+                        "normal_model_provider_v3_closed" => {
+                            "v3 route, account effect, cancellation and physical K writers are closed"
+                        }
                         "normal_model_provider_quota" => {
                             "fresh route has no eligible account or pin"
                         }
@@ -1362,7 +1425,9 @@ fn inner() {
                     );
                     if !matches!(
                         mode.as_str(),
-                        "normal_model_provider_quota" | "normal_model_provider_auth"
+                        "normal_model_provider_quota"
+                            | "normal_model_provider_auth"
+                            | "normal_model_provider_v3_closed"
                     ) {
                         assert_eq!(
                             fs::read_dir(&provider_dir).unwrap().count(),
@@ -4046,6 +4111,7 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_model_provider_restart",
         "normal_model_provider_bad_config",
         "normal_model_provider_unsupported",
+        "normal_model_provider_v3_closed",
         "normal_model_provider_quota",
         "normal_model_provider_auth",
         "normal_model_provider_auth_recovery",

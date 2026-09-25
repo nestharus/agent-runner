@@ -1684,4 +1684,73 @@ mod tests {
             restarted.wait().unwrap();
         }
     }
+
+    #[test]
+    fn private_v3_socket_refuses_manual_usage_before_k() {
+        if std::env::var_os("AGE319_MANUAL_V3_SOCKET_INNER").is_none() {
+            let output = Command::new("unshare")
+                .args(["-Urpfm", "--mount-proc"])
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", "linux_main::manual_quota::tests::private_v3_socket_refuses_manual_usage_before_k", "--nocapture"])
+                .env("AGE319_MANUAL_V3_SOCKET_INNER", "1")
+                .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", "/tmp/age319-manual-v3-fixture")
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let f = Fixture::new("printf '{\"used_percent\":31}'");
+        let state = f._temp.path().join("state");
+        fs::create_dir_all(&state).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+        oulipoly_state::mailbox::FreshV30Lane::initialize_at(&state).unwrap();
+        let root = state.join("v30/fresh-provider");
+        drop(super::super::fresh_index::broker_admission_lease(&root).unwrap());
+        let socket = f._temp.path().join("v30.sock");
+        super::super::fresh_index::rebuild_keyed_offline(&root, &socket, &f.source).unwrap();
+        // This is the sole test in its isolated unshare subprocess; set the
+        // server's fixture mode before creating its thread.
+        unsafe {
+            std::env::set_var(
+                "OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_READBACK_V3_V1",
+                "1",
+            );
+            std::env::set_var(
+                "OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_READBACK_V3_SOURCE_V1",
+                &f.source,
+            );
+        }
+        let image = File::open(std::env::current_exe().unwrap()).unwrap();
+        let state_for_server = state.clone();
+        let socket_for_server = socket.clone();
+        std::thread::spawn(move || {
+            super::super::serve_fresh_v30_at(&state_for_server, &socket_for_server, image, None)
+                .unwrap();
+        });
+        for _ in 0..100 {
+            if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(std::os::unix::net::UnixStream::connect(&socket).is_ok());
+        let request = f.request("first");
+        let source = File::open(&f.source).unwrap();
+        assert!(
+            oulipoly_kernel_broker::protocol::private_manual_quota_at(
+                &socket,
+                &request,
+                true,
+                Some(source.as_raw_fd()),
+            )
+            .is_err()
+        );
+        assert!(!root.join("manual-quota").exists());
+        assert!(super::super::fresh_index::Index::open(&root).is_err());
+    }
 }

@@ -3845,14 +3845,46 @@ fn serve_fresh_v30_at(
     let admission = fresh_index::broker_admission_lease(&state_root.join("v30/fresh-provider"))
         .map_err(io::Error::other)?;
     #[cfg(feature = "age319-private-broker-fixture")]
+    let provider_readback_v3 = {
+        let root = state_root.join("v30/fresh-provider");
+        match std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_READBACK_V3_V1") {
+            Some(value) if value == "1" && private_fixture() => {
+                let source = std::env::var_os(
+                    "OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_READBACK_V3_SOURCE_V1",
+                )
+                .ok_or_else(|| io::Error::other("v3 admission config source absent"))?;
+                Some(
+                    fresh_index::KeyedGeneration::admit_provider_readback(
+                        &root,
+                        &admission,
+                        Path::new(&source),
+                    )
+                    .map_err(io::Error::other)?,
+                )
+            }
+            Some(_) => return Err(io::Error::other("v3 provider readback switch invalid")),
+            None => {
+                if std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_READBACK_V3_SOURCE_V1")
+                    .is_some()
+                {
+                    return Err(io::Error::other("v3 source without admission switch"));
+                }
+                None
+            }
+        }
+    };
+    #[cfg(feature = "age319-private-broker-fixture")]
     let route_index = {
         let root = state_root.join("v30/fresh-provider");
         match std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_ROUTE_INDEX_V1") {
-            Some(value) if value == "1" && private_fixture() => Some(
-                fresh_index::Index::admit_live_routes(&root, &admission)
-                    .map_err(io::Error::other)?,
-            ),
+            Some(value) if value == "1" && private_fixture() && provider_readback_v3.is_none() => {
+                Some(
+                    fresh_index::Index::admit_live_routes(&root, &admission)
+                        .map_err(io::Error::other)?,
+                )
+            }
             Some(_) => return Err(io::Error::other("route index fixture switch invalid")),
+            None if provider_readback_v3.is_some() => None,
             None => {
                 match fs::symlink_metadata(root.join("index-v1/manifest.json")) {
                     Ok(_) => {
@@ -3965,6 +3997,11 @@ fn serve_fresh_v30_at(
                 b'u' | b'v' => {
                     if !private_fixture() {
                         return Err(io::Error::other("manual quota fixture route closed"));
+                    }
+                    if provider_readback_v3.is_some() {
+                        return Err(io::Error::other(
+                            "v3 manual usage writer and reader are not joined",
+                        ));
                     }
                     let directory = state_root.join("v30/fresh-provider");
                     let result = if operation == b'u' {
@@ -4426,6 +4463,11 @@ fn serve_fresh_v30_at(
                     let binding =
                         fresh_provider::binding_from_held(&receipt, &held, &actor, &root)?;
                     let directory = state_root.join("v30/fresh-provider");
+                    if provider_readback_v3.is_some() && !matches!(operation, b'6' | b'8' | b'9') {
+                        return Err(io::Error::other(
+                            "v3 route, account effect, cancellation and physical K writers are closed",
+                        ));
+                    }
                     if let Some(route_request) = route_request {
                         let expected_pin = match &held.intent {
                             oulipoly_state::mailbox::FreshRootWorkIntent::NormalCli(args)
@@ -4650,6 +4692,13 @@ fn serve_fresh_v30_at(
                         fresh_provider::grant_for_binding(&directory, &binding)?
                             .ok_or_else(|| io::Error::other("fresh provider grant absent"))?
                     };
+                    if let Some(v3) = provider_readback_v3.as_ref() {
+                        let indexed =
+                            fresh_provider::require_v3_provider_binding(v3, &directory, &binding)?;
+                        if indexed != grant {
+                            return Err(io::Error::other("v3 provider plan/grant differs"));
+                        }
+                    }
                     if operation == b'7' {
                         fresh_provider::cancel(&directory, &grant)?;
                         return Ok(format!("fresh-provider-cancel {grant}\n"));

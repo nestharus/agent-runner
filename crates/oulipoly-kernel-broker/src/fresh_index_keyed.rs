@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 const MAX_ITEM_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) struct IoCount {
+pub(crate) struct IoCount {
     pub open_attempts: u64,
     pub opened: u64,
     pub directory_entries: u64,
@@ -38,7 +38,7 @@ fn count(f: impl FnOnce(&mut IoCount)) {
         }
     });
 }
-pub(super) fn measured<T>(run: impl FnOnce() -> T) -> (T, IoCount) {
+pub(crate) fn measured<T>(run: impl FnOnce() -> T) -> (T, IoCount) {
     IO.with(|cell| {
         assert!(cell.get().is_none(), "nested keyed I/O measurement");
         cell.set(Some(IoCount::default()));
@@ -400,6 +400,36 @@ impl KeyedAccountStore {
         let _lock = self.lock()?;
         let root = self.recover()?;
         Ok((root.revision, root.pending_count))
+    }
+    /// Full inventory is restricted to frozen service admission. Live reads
+    /// use exact keys and never enumerate this directory.
+    pub(crate) fn admission_keys(&self) -> Result<HashSet<(String, String)>> {
+        let _lock = self.lock()?;
+        let root = self.recover()?;
+        let mut keys = HashSet::new();
+        for entry in fs::read_dir(self.path.join("known"))? {
+            count(|io| io.directory_entries += 1);
+            let path = entry?.path();
+            let known: Known =
+                read(&path)?.ok_or_else(|| corrupt("keyed admission known marker absent"))?;
+            if known.generation != self.generation
+                || known.account != self.account
+                || known.birth_revision > root.revision
+                || path != self.key_path(&known.class, &known.key, "known")?
+                || !keys.insert((known.class.clone(), known.key.clone()))
+            {
+                return Err(corrupt("keyed admission known marker differs"));
+            }
+            let pointer = self
+                .pointer(&known.class, &known.key, &root)?
+                .ok_or_else(|| corrupt("keyed admission pointer absent"))?;
+            self.object(&PointerChange {
+                class: known.class,
+                key: known.key,
+                pointer,
+            })?;
+        }
+        Ok(keys)
     }
     pub(crate) fn get(&self, class: &str, key: &str) -> Result<Option<Value>> {
         let _lock = self.lock()?;

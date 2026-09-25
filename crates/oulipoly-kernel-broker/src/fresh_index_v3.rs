@@ -1,5 +1,5 @@
-//! Frozen, non-activating v3 importer. The v2 Index deliberately refuses its
-//! manifest; no live writer or selector opens these records.
+//! Frozen v3 importer and a separate private, readback-only admission. The v2
+//! Index deliberately refuses this manifest. No v3 route or K writer exists.
 use super::*;
 use keyed_store::{Change, KeyedAccountStore};
 
@@ -8,6 +8,7 @@ const V3: u32 = 3;
 #[derive(Debug)]
 pub(crate) struct KeyedGeneration {
     pub generation: String,
+    root: PathBuf,
     storage: PathBuf,
 }
 
@@ -27,6 +28,7 @@ impl KeyedGeneration {
         validate_storage(&storage, &manifest.generation)?;
         Ok(Self {
             generation: manifest.generation,
+            root: root.to_owned(),
             storage,
         })
     }
@@ -42,6 +44,350 @@ impl KeyedGeneration {
         let store = KeyedAccountStore::open(&path, &self.generation, physical_key)?;
         store.summary()?;
         Ok(store)
+    }
+
+    /// The broker holds this generation's lifetime lease before socket bind.
+    /// A fresh retained census is compared with every keyed live projection;
+    /// a late physical K/Q or an incompatible writer requires another frozen
+    /// rebuild. This mode does not authorize a new physical provider K.
+    pub(crate) fn admit_provider_readback(
+        root: &Path,
+        lease: &AdmissionLease,
+        source: &Path,
+    ) -> Result<Self> {
+        if lease.path != root.canonicalize()?.join("index-v1/admission.lock") {
+            return Err(IndexError::Conflict("v3 admission lease differs"));
+        }
+        let generation = Self::open(root)?;
+        generation.verify_retained(source)?;
+        Ok(generation)
+    }
+
+    fn check_current(&self) -> Result<()> {
+        let manifest: Manifest = read(&self.root.join("index-v1/manifest.json"))?
+            .ok_or(IndexError::RebuildRequired("v3 manifest disappeared"))?;
+        if manifest.version != V3
+            || manifest.generation != self.generation
+            || !manifest.generation_dir
+        {
+            return Err(IndexError::RebuildRequired("v3 generation changed"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn require_route(&self, handoff: &str) -> Result<Decision> {
+        self.check_current()?;
+        let index = Index {
+            root: self.root.clone(),
+            generation: self.generation.clone(),
+            storage: self.storage.clone(),
+            route_reader_probe: false,
+        };
+        let decision = index
+            .read_decision(handoff)?
+            .ok_or(IndexError::RebuildRequired("v3 provider decision absent"))?;
+        if !index.known("decisions", &handoff.to_owned())? {
+            return Err(corrupt("v3 provider decision known key absent"));
+        }
+        super::super::fresh_provider::validate_indexed_receipt(&self.root, &decision)
+            .map_err(|error| corrupt(format!("v3 provider route receipt: {error}")))?;
+        Ok(decision)
+    }
+
+    pub(crate) fn provider_grant(&self, account: &str, id: &str) -> Result<Option<ProviderGrant>> {
+        self.check_current()?;
+        self.account(account)?
+            .get("grant", id)?
+            .map(|value| serde_json::from_value(value).map_err(|error| corrupt(error.to_string())))
+            .transpose()
+    }
+
+    pub(crate) fn provider_pending(&self, account: &str, id: &str) -> Result<Option<PendingHead>> {
+        self.check_current()?;
+        self.account(account)?
+            .get("pending", &format!("grant:{id}"))?
+            .map(|value| serde_json::from_value(value).map_err(|error| corrupt(error.to_string())))
+            .transpose()
+    }
+
+    fn verify_retained(&self, source: &Path) -> Result<()> {
+        let source_before = source.metadata()?;
+        if !source_before.is_dir() {
+            return Err(corrupt("v3 admission config source not directory"));
+        }
+        let mut snapshot = super::super::fresh_provider::offline_snapshot_v3(&self.root, source)
+            .map_err(|error| corrupt(format!("v3 admission retained evidence: {error}")))?;
+        super::super::fresh_provider::complete_v3_effects(&self.root, &mut snapshot)
+            .map_err(|error| corrupt(format!("v3 admission effect evidence: {error}")))?;
+        let models: BTreeMap<String, String> = read(&self.storage.join("source-models.json"))?
+            .ok_or(IndexError::RebuildRequired("v3 source model ledger absent"))?;
+        if models != snapshot.source_models {
+            return Err(IndexError::RebuildRequired(
+                "v3 source model ledger differs",
+            ));
+        }
+        for (model, digest) in &models {
+            let pool = oulipoly_runtime::executor::cli::fresh_remote::load_fresh_headless_pool(
+                source, model,
+            )
+            .map_err(|error| corrupt(format!("v3 admission config readback: {error}")))?;
+            if &pool.config_sha256 != digest {
+                return Err(corrupt("v3 admission config source changed"));
+            }
+        }
+        let catalog: std::collections::HashSet<String> =
+            fs::read_dir(self.storage.join("account-catalog"))?
+                .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+                .collect::<io::Result<_>>()?;
+        let expected_catalog: std::collections::HashSet<String> = snapshot
+            .accounts
+            .keys()
+            .map(|key| keyed(key).map(|digest| format!("{digest}.json")))
+            .collect::<Result<_>>()?;
+        if catalog != expected_catalog {
+            return Err(IndexError::RebuildRequired(
+                "v3 retained account catalog differs",
+            ));
+        }
+        for decision in &snapshot.decisions {
+            let indexed = self.require_route(&decision.handoff)?;
+            if indexed.key != decision.key
+                || indexed.candidate_identity != decision.candidate_identity
+                || indexed.candidate_index != decision.candidate_index
+                || indexed.pin != decision.pin
+                || indexed.sequence != decision.sequence
+                || indexed.receipt.as_ref() != Some(&decision.receipt)
+            {
+                return Err(corrupt("v3 retained route decision differs"));
+            }
+        }
+        let decisions = fs::read_dir(self.storage.join("decisions"))?
+            .collect::<io::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|entry| {
+                entry.file_name().to_string_lossy().ends_with(".json")
+                    && !entry.file_name().to_string_lossy().ends_with(".known.json")
+            })
+            .count();
+        if decisions != snapshot.decisions.len() {
+            return Err(IndexError::RebuildRequired(
+                "v3 route decision count differs",
+            ));
+        }
+        let index = Index {
+            root: self.root.clone(),
+            generation: self.generation.clone(),
+            storage: self.storage.clone(),
+            route_reader_probe: false,
+        };
+        let mut expected_cursors = BTreeMap::<String, Cursor>::new();
+        let mut ordered = snapshot.decisions.clone();
+        ordered.sort_by_key(|decision| decision.sequence);
+        for decision in ordered {
+            let digest = keyed(&decision.key)?;
+            let cursor = expected_cursors.entry(digest).or_insert_with(|| Cursor {
+                generation: self.generation.clone(),
+                key: decision.key.clone(),
+                sequence: 0,
+                index: None,
+                last_handoff: None,
+            });
+            let published = index
+                .read_decision(&decision.handoff)?
+                .ok_or(IndexError::RebuildRequired("v3 route decision absent"))?;
+            *cursor = index.advanced(cursor, &published)?;
+        }
+        let cursor_files = fs::read_dir(self.storage.join("cursors"))?
+            .collect::<io::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|entry| {
+                entry.file_name().to_string_lossy().ends_with(".json")
+                    && !entry.file_name().to_string_lossy().ends_with(".known.json")
+            })
+            .count();
+        if cursor_files
+            != expected_cursors
+                .values()
+                .filter(|cursor| cursor.sequence != 0)
+                .count()
+        {
+            return Err(IndexError::RebuildRequired("v3 route cursor count differs"));
+        }
+        for cursor in expected_cursors
+            .values()
+            .filter(|cursor| cursor.sequence != 0)
+        {
+            if !index.known("cursors", &cursor.key)?
+                || index.cursor_unlocked(&cursor.key)? != *cursor
+            {
+                return Err(corrupt("v3 route cursor differs from retained decisions"));
+            }
+        }
+        for (key, mut account) in snapshot.accounts {
+            account.generation = self.generation.clone();
+            account.revision = account.revision.max(1);
+            let head = AccountHead::from_account_unbounded(&self.root, &account)?;
+            let store = self.account(&key)?;
+            let mut expected_keys =
+                std::collections::HashSet::from([("account".to_owned(), "summary".to_owned())]);
+            let (revision, pending_count) = store.summary()?;
+            let summary = store
+                .get("account", "summary")?
+                .ok_or(IndexError::RebuildRequired("v3 account summary absent"))?;
+            if revision == 0 || pending_count != head.pending.len() as u64 {
+                return Err(IndexError::RebuildRequired("v3 account summary differs"));
+            }
+            let mut failure_count = 0_u64;
+            for (id, grant) in &account.grants {
+                expected_keys.insert(("grant".to_owned(), id.clone()));
+                if store.get("grant", id)?
+                    != Some(serde_json::to_value(grant).map_err(|e| corrupt(e.to_string()))?)
+                {
+                    return Err(corrupt("v3 retained provider grant differs"));
+                }
+                let uncertain = grant
+                    .consumed_k
+                    .as_ref()
+                    .filter(|_| grant.certified_q.is_none())
+                    .map(|k| uncertain_q(&self.root, k, false))
+                    .transpose()?
+                    .flatten();
+                let expected = uncertain
+                    .as_ref()
+                    .map(|q| serde_json::to_value(q).map_err(|error| corrupt(error.to_string())))
+                    .transpose()?;
+                if expected.is_some() {
+                    expected_keys.insert(("uncertain-q".to_owned(), format!("grant:{id}")));
+                }
+                if store.get("uncertain-q", &format!("grant:{id}"))? != expected {
+                    return Err(corrupt("v3 retained provider Q debt differs"));
+                }
+                if let Some(q) = &grant.certified_q {
+                    let terminal = q
+                        .terminal
+                        .as_ref()
+                        .ok_or_else(|| corrupt("v3 provider terminal absent"))?;
+                    let value: serde_json::Value = terminal.read_json(&self.root)?;
+                    let outcome = value["outcome"]
+                        .as_str()
+                        .ok_or_else(|| corrupt("v3 provider terminal outcome absent"))?;
+                    if outcome != "clean" {
+                        failure_count = failure_count
+                            .checked_add(1)
+                            .ok_or(IndexError::Conflict("v3 failure count overflow"))?;
+                        expected_keys.insert(("failure".to_owned(), id.clone()));
+                        let expected = serde_json::json!({
+                            "q": q,
+                            "outcome": outcome,
+                            "completed_unix_nanos": q.completed_unix_nanos,
+                        });
+                        if store.get("failure", id)? != Some(expected) {
+                            return Err(corrupt("v3 retained provider failure differs"));
+                        }
+                    }
+                }
+            }
+            for (id, effect) in &account.effects {
+                let class = if matches!(effect.kind, EffectKind::ManualQuota) {
+                    "manual"
+                } else {
+                    "effect"
+                };
+                expected_keys.insert((class.to_owned(), id.clone()));
+                if store.get(class, id)?
+                    != Some(serde_json::to_value(effect).map_err(|e| corrupt(e.to_string()))?)
+                {
+                    return Err(corrupt("v3 retained account effect differs"));
+                }
+                let uncertain = effect
+                    .consumed_k
+                    .as_ref()
+                    .filter(|_| effect.certified_q.is_none())
+                    .map(|k| {
+                        uncertain_q(
+                            &self.root,
+                            k,
+                            matches!(effect.kind, EffectKind::ManualQuota),
+                        )
+                    })
+                    .transpose()?
+                    .flatten();
+                let expected = uncertain
+                    .as_ref()
+                    .map(|q| serde_json::to_value(q).map_err(|error| corrupt(error.to_string())))
+                    .transpose()?;
+                if expected.is_some() {
+                    expected_keys.insert(("uncertain-q".to_owned(), format!("effect:{id}")));
+                }
+                if store.get("uncertain-q", &format!("effect:{id}"))? != expected {
+                    return Err(corrupt("v3 retained account Q debt differs"));
+                }
+            }
+            for (id, pending) in &head.pending {
+                expected_keys.insert(("pending".to_owned(), id.clone()));
+                if store.get("pending", id)?
+                    != Some(serde_json::to_value(pending).map_err(|e| corrupt(e.to_string()))?)
+                {
+                    return Err(corrupt("v3 retained pending source differs"));
+                }
+            }
+            for (id, typed) in &head.sources {
+                expected_keys.insert(("source".to_owned(), id.clone()));
+                if store.get("source", id)?
+                    != Some(serde_json::to_value(typed).map_err(|e| corrupt(e.to_string()))?)
+                {
+                    return Err(corrupt("v3 retained typed source differs"));
+                }
+            }
+            for (class, marker) in [
+                ("quota-marker", &head.quota_rejection),
+                ("auth-marker", &head.auth_rejection),
+            ] {
+                let expected = marker
+                    .as_ref()
+                    .map(|marker| {
+                        serde_json::to_value(marker).map_err(|error| corrupt(error.to_string()))
+                    })
+                    .transpose()?;
+                if expected.is_some() {
+                    expected_keys.insert((class.to_owned(), "account".to_owned()));
+                }
+                if store.get(class, "account")? != expected {
+                    return Err(corrupt("v3 retained account marker differs"));
+                }
+            }
+            for (model, marker) in &head.model_capacity {
+                expected_keys.insert(("model-capacity".to_owned(), model.clone()));
+                if store.get("model-capacity", model)?
+                    != Some(serde_json::to_value(marker).map_err(|e| corrupt(e.to_string()))?)
+                {
+                    return Err(corrupt("v3 retained model marker differs"));
+                }
+            }
+            if store.admission_keys()? != expected_keys {
+                return Err(corrupt("v3 retained keyed inventory differs"));
+            }
+            let expected_summary = serde_json::json!({
+                "physical_key": key,
+                "observed_invocations": account.observed_invocations,
+                "marker_times": account.markers,
+                "failure_count": failure_count,
+                "unknown_marker_scope": head.unknown_marker_scope,
+                "grant_count": account.grants.len(),
+                "effect_count": account.effects.len(),
+                "pending_count": head.pending.len(),
+                "source_count": head.sources.len(),
+            });
+            if summary != expected_summary {
+                return Err(corrupt("v3 retained account summary differs"));
+            }
+        }
+        let source_after = source.metadata()?;
+        if (source_before.dev(), source_before.ino()) != (source_after.dev(), source_after.ino()) {
+            return Err(corrupt("v3 admission config directory changed"));
+        }
+        self.check_current()?;
+        Ok(())
     }
 }
 
@@ -711,6 +1057,42 @@ mod tests {
                 },
             );
         }
+        let small_storage = root.join("staged-small");
+        fs::create_dir(&small_storage).unwrap();
+        fs::create_dir(small_storage.join("keyed-accounts")).unwrap();
+        let small_staged = Index {
+            root: root.into(),
+            generation: generation.clone(),
+            storage: small_storage,
+            route_reader_probe: false,
+        };
+        let mut small = account.clone();
+        small.effects.clear();
+        small.observed_invocations = 0;
+        stage_account(root, &small_staged, "shared-physical", small).unwrap();
+        let small_store = KeyedAccountStore::open(
+            &small_staged
+                .base()
+                .join("keyed-accounts")
+                .join(keyed(&"shared-physical").unwrap()),
+            &generation,
+            "shared-physical",
+        )
+        .unwrap();
+        let (_, read_one) = keyed_store::measured(|| {
+            assert!(
+                small_store
+                    .get("grant", "pending-provider")
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                small_store
+                    .get("pending", "grant:pending-provider")
+                    .unwrap()
+                    .is_some()
+            );
+        });
         stage_account(root, &staged, "shared-physical", account).unwrap();
         let store = KeyedAccountStore::open(
             &staged
@@ -721,6 +1103,21 @@ mod tests {
             "shared-physical",
         )
         .unwrap();
+        let (_, read_many) = keyed_store::measured(|| {
+            assert!(store.get("grant", "pending-provider").unwrap().is_some());
+            assert!(
+                store
+                    .get("pending", "grant:pending-provider")
+                    .unwrap()
+                    .is_some()
+            );
+        });
+        eprintln!("v3 provider grant/pending keyed one/205 settled: {read_one:?} / {read_many:?}");
+        assert_eq!(read_one.open_attempts, read_many.open_attempts);
+        assert_eq!(read_one.directory_entries, 0);
+        assert_eq!(read_many.directory_entries, 0);
+        assert!(read_many.bytes_parsed <= read_one.bytes_parsed + 32);
+        assert_eq!(read_one.bytes_written + read_many.bytes_written, 0);
         assert_eq!(store.summary().unwrap().1, 3);
         assert!(store.get("manual", "pending-manual").unwrap().is_some());
         assert!(store.get("effect", "settled-204").unwrap().is_some());
