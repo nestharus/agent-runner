@@ -8787,6 +8787,9 @@ mod tests {
                 .index,
             0
         );
+        let mut changed_actor = binding.clone();
+        changed_actor.actor_pid += 1;
+        assert!(select_route_v3(&root, &changed_actor, &request, &generation).is_err());
         assert_eq!(
             generation
                 .route_index()
