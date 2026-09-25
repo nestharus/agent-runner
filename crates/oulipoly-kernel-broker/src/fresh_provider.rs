@@ -3506,7 +3506,9 @@ fn candidate_quota(
             )));
         }
         if auth.outcome.as_deref() != Some("refreshed") {
-            return Ok((None, Some(auth.artifact)));
+            // A drained failed refresh is a known rejection. Preserve unknown
+            // only for missing or unverified physical Q.
+            return Ok((None, None));
         }
         let retry_dir = effect_directory(
             directory,
@@ -3537,7 +3539,9 @@ fn candidate_quota(
         return Ok((None, Some(result.artifact)));
     }
     if result.outcome.as_deref() != Some("valid_windows") || result.windows.is_empty() {
-        return Ok((None, Some(result.artifact)));
+        // A settled invalid/failed quota observation makes this account
+        // ineligible. Only absent or physically unresolved Q is unknown.
+        return Ok((None, None));
     }
     let now = Utc::now().timestamp();
     if !quota_read_is_fresh(&result, now)? {

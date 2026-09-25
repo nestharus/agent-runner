@@ -18,6 +18,7 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[track_caller]
 fn eventually(mut condition: impl FnMut() -> bool) {
     let until = Instant::now() + Duration::from_secs(20);
     while !condition() {
