@@ -38,7 +38,7 @@ pub(super) use keyed_store::measured as measure_keyed_io;
 #[path = "fresh_index_v3.rs"]
 #[allow(dead_code)]
 mod v3;
-pub(super) use v3::KeyedGeneration;
+pub(super) use v3::{KeyedGeneration, RouteEligibility};
 
 pub(super) fn rebuild_keyed_offline(root: &Path, socket: &Path, source: &Path) -> Result<()> {
     v3::rebuild(root, socket, source).map(|_| ())
@@ -436,6 +436,7 @@ pub(super) struct Index {
     root: PathBuf,
     generation: String,
     storage: PathBuf,
+    version: u32,
     route_reader_probe: bool,
 }
 /// The caller must hold an admission freeze for this previously unused broker
@@ -534,6 +535,7 @@ impl Index {
             root: root.to_owned(),
             generation: manifest.generation,
             storage: base,
+            version: VERSION,
             route_reader_probe: false,
         })
     }
@@ -564,6 +566,7 @@ impl Index {
             root: root.to_owned(),
             generation: manifest.generation,
             storage,
+            version: VERSION,
             route_reader_probe: false,
         })
     }
@@ -578,8 +581,12 @@ impl Index {
         self.storage.clone()
     }
     fn check_generation(&self) -> Result<()> {
-        let current = Self::open(&self.root)?;
-        if current.generation != self.generation {
+        let manifest: Manifest = read(&self.root.join("index-v1/manifest.json"))?
+            .ok_or(IndexError::RebuildRequired("index manifest absent"))?;
+        if manifest.version != self.version
+            || manifest.generation != self.generation
+            || (self.version == 3 && !manifest.generation_dir)
+        {
             return Err(IndexError::RebuildRequired("index generation changed"));
         }
         Ok(())
@@ -971,6 +978,7 @@ impl Index {
             root: root.to_owned(),
             generation: generation.clone(),
             storage,
+            version: VERSION,
             route_reader_probe: false,
         };
         let mut cursors: BTreeMap<String, Cursor> = BTreeMap::new();
@@ -1119,6 +1127,13 @@ impl Index {
         self.check_generation()?;
         self.reconcile_pending()?;
         self.cursor_unlocked(key)
+    }
+    /// Repair only the one durable pending route transaction. A v3 broker
+    /// calls this before its retained admission comparison after a crash.
+    pub(super) fn reconcile_route_pending(&self) -> Result<()> {
+        let _lock = locked(&self.base().join("route.lock"))?;
+        self.check_generation()?;
+        self.reconcile_pending()
     }
     fn decision_path(&self, handoff: &str) -> Result<PathBuf> {
         self.key_path("decisions", &handoff)

@@ -3874,6 +3874,12 @@ fn serve_fresh_v30_at(
         }
     };
     #[cfg(feature = "age319-private-broker-fixture")]
+    let route_writer_v3 = match std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_ROUTE_V3_V1") {
+        Some(value) if value == "1" && private_fixture() && provider_readback_v3.is_some() => true,
+        None => false,
+        Some(_) => return Err(io::Error::other("v3 route writer switch invalid")),
+    };
+    #[cfg(feature = "age319-private-broker-fixture")]
     let route_index = {
         let root = state_root.join("v30/fresh-provider");
         match std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_ROUTE_INDEX_V1") {
@@ -3950,6 +3956,8 @@ fn serve_fresh_v30_at(
         let mut drop_provider_q_reply = false;
         #[cfg(feature = "age319-private-broker-fixture")]
         let mut drop_account_effect_reply = false;
+        #[cfg(feature = "age319-private-broker-fixture")]
+        let mut drop_route_reply = false;
         #[cfg(feature = "age319-private-broker-fixture")]
         let mut provider_output_files: Option<[File; 2]> = None;
         let answer = (|| -> io::Result<String> {
@@ -4464,7 +4472,8 @@ fn serve_fresh_v30_at(
                         fresh_provider::binding_from_held(&receipt, &held, &actor, &root)?;
                     let directory = state_root.join("v30/fresh-provider");
                     if provider_readback_v3.is_some()
-                        && !matches!(operation, b'6' | b'8' | b'9' | b'h' | b'm' | b'n')
+                        && !(matches!(operation, b'6' | b'8' | b'9' | b'h' | b'm' | b'n')
+                            || (route_writer_v3 && operation == b'f'))
                     {
                         return Err(io::Error::other(
                             "v3 route, auth/manual, cancellation and provider K writers are closed",
@@ -4502,6 +4511,11 @@ fn serve_fresh_v30_at(
                             if instance.is_closed() {
                                 return Err(io::Error::other("fresh route entry gate closed"));
                             }
+                            let _route_lock = if provider_readback_v3.is_some() {
+                                Some(fresh_provider::route_selection_lock(&directory)?)
+                            } else {
+                                None
+                            };
                             let [image_fd, cwd, input, recipe, config_dir]: [File; 5] = descriptors
                                 .try_into()
                                 .map_err(|_| io::Error::other("fresh route descriptors absent"))?;
@@ -4528,6 +4542,14 @@ fn serve_fresh_v30_at(
                                     &route_request,
                                 )?,
                             )?;
+                            if let Some(generation) = provider_readback_v3.as_ref() {
+                                generation
+                                    .record_route_model(
+                                        &route_request.model,
+                                        &route_request.config_sha256,
+                                    )
+                                    .map_err(io::Error::other)?;
+                            }
                             return Ok("fresh-route-registered\n".into());
                         }
                         let [config_dir]: [File; 1] = descriptors
@@ -4541,12 +4563,36 @@ fn serve_fresh_v30_at(
                             &config_dir,
                             false,
                         )?;
-                        let selection = fresh_provider::select_route_with_index(
-                            &directory,
-                            &binding,
-                            &route_request,
-                            route_index.as_ref(),
-                        )?;
+                        let selection = if route_writer_v3 {
+                            let generation = provider_readback_v3
+                                .as_ref()
+                                .ok_or_else(|| io::Error::other("v3 route admission absent"))?;
+                            fresh_provider::select_route_v3(
+                                &directory,
+                                &binding,
+                                &route_request,
+                                generation,
+                            )?
+                        } else {
+                            fresh_provider::select_route_with_index(
+                                &directory,
+                                &binding,
+                                &route_request,
+                                route_index.as_ref(),
+                            )?
+                        };
+                        if route_writer_v3
+                            && std::env::var_os(
+                                "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_ROUTE_V3_REPLY_V1",
+                            )
+                            .is_some()
+                            && std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                                .is_some_and(|gate| {
+                                    !Path::new(&gate).join("route-reply-dropped").exists()
+                                })
+                        {
+                            drop_route_reply = true;
+                        }
                         return Ok(format!(
                             "fresh-route-selected {}\n",
                             serde_json::to_string(&selection)?
@@ -4604,6 +4650,11 @@ fn serve_fresh_v30_at(
                             ));
                         }
                         let effect = if let Some(generation) = provider_readback_v3.as_ref() {
+                            // The route reader holds this lock through its
+                            // receipt/cursor publication. A quota/auth K or Q
+                            // cannot change any selected account revision in
+                            // that interval.
+                            let _route_lock = fresh_provider::route_selection_lock(&directory)?;
                             let boundary = if operation == b'm' {
                                 "v3-quota-begin"
                             } else {
@@ -4903,9 +4954,15 @@ fn serve_fresh_v30_at(
             }
         })();
         #[cfg(feature = "age319-private-broker-fixture")]
-        if drop_provider_k_reply || drop_provider_q_reply || drop_account_effect_reply {
+        if drop_provider_k_reply
+            || drop_provider_q_reply
+            || drop_account_effect_reply
+            || drop_route_reply
+        {
             if let Some(gate) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1") {
-                let marker = if drop_provider_k_reply {
+                let marker = if drop_route_reply {
+                    "route-reply-dropped"
+                } else if drop_provider_k_reply {
                     "provider-k-reply-dropped"
                 } else if drop_provider_q_reply {
                     "provider-q-reply-dropped"

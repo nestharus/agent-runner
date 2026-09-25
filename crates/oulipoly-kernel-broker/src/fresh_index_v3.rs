@@ -16,6 +16,7 @@ pub(crate) enum RouteEligibility {
         account_revision: u64,
         quota_basis_points: Option<u32>,
         observed_invocations: u64,
+        observed_failures: u64,
     },
     ProbeRequired,
     Excluded,
@@ -26,6 +27,35 @@ fn typed<T: serde::de::DeserializeOwned>(value: Option<serde_json::Value>) -> Re
     value
         .map(|value| serde_json::from_value(value).map_err(|e| corrupt(e.to_string())))
         .transpose()
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct LatestQuota {
+    source: SourceKey,
+    observation: ObservationHead,
+}
+
+fn latest_quota<'a>(heads: impl Iterator<Item = &'a SourceHead>) -> Option<LatestQuota> {
+    heads
+        .filter_map(|head| {
+            head.quota.as_ref().map(|observation| LatestQuota {
+                source: head.source.clone(),
+                observation: observation.clone(),
+            })
+        })
+        .max_by(|a, b| {
+            a.observation
+                .q
+                .completed_unix_nanos
+                .cmp(&b.observation.q.completed_unix_nanos)
+                .then_with(|| a.source.commands_sha256.cmp(&b.source.commands_sha256))
+                .then_with(|| {
+                    a.source
+                        .environment_sha256
+                        .cmp(&b.source.environment_sha256)
+                })
+        })
 }
 
 #[derive(Debug)]
@@ -84,6 +114,7 @@ impl KeyedGeneration {
             return Err(IndexError::Conflict("v3 admission lease differs"));
         }
         let mut generation = Self::open(root)?;
+        generation.route_projection().reconcile_route_pending()?;
         generation.verify_retained(source)?;
         generation.source = Some(source.canonicalize()?);
         Ok(generation)
@@ -95,8 +126,34 @@ impl KeyedGeneration {
             .ok_or(IndexError::Conflict("v3 live source was not admitted"))
     }
 
-    fn ensure_quota_account(&self, account: &str, model: &str, config: &str) -> Result<()> {
+    /// Only the admitted v3 broker may construct this projection. `Index::open`
+    /// still refuses a v3 manifest, so an old v2 writer cannot use it.
+    fn route_projection(&self) -> Index {
+        Index {
+            root: self.root.clone(),
+            generation: self.generation.clone(),
+            storage: self.storage.clone(),
+            version: V3,
+            route_reader_probe: false,
+        }
+    }
+
+    pub(crate) fn route_index(&self) -> Result<Index> {
         self.check_current()?;
+        self.admitted_source()?;
+        Ok(self.route_projection())
+    }
+
+    pub(crate) fn record_route_model(&self, model: &str, config: &str) -> Result<()> {
+        self.check_current()?;
+        let pool = oulipoly_runtime::executor::cli::fresh_remote::load_fresh_headless_pool(
+            self.admitted_source()?,
+            model,
+        )
+        .map_err(|error| corrupt(format!("v3 route model source: {error}")))?;
+        if pool.config_sha256 != config {
+            return Err(IndexError::Conflict("v3 route model config changed"));
+        }
         let ledger_path = self.storage.join("source-models.json");
         let mut ledger: BTreeMap<String, String> = read(&ledger_path)?
             .ok_or(IndexError::RebuildRequired("v3 source model ledger absent"))?;
@@ -107,6 +164,11 @@ impl KeyedGeneration {
             ledger.insert(model.to_owned(), config.to_owned());
             write_atomic(&ledger_path, &ledger)?;
         }
+        Ok(())
+    }
+
+    fn ensure_quota_account(&self, account: &str, model: &str, config: &str) -> Result<()> {
+        self.record_route_model(model, config)?;
         let digest = keyed(&account)?;
         let path = self.storage.join("keyed-accounts").join(&digest);
         let catalog = self
@@ -172,14 +234,12 @@ impl KeyedGeneration {
             root: self.root.clone(),
             generation: self.generation.clone(),
             storage: self.storage.clone(),
+            version: V3,
             route_reader_probe: false,
         };
         let decision = index
-            .read_decision(handoff)?
+            .decision(handoff)?
             .ok_or(IndexError::RebuildRequired("v3 provider decision absent"))?;
-        if !index.known("decisions", &handoff.to_owned())? {
-            return Err(corrupt("v3 provider decision known key absent"));
-        }
         super::super::fresh_provider::validate_indexed_receipt(&self.root, &decision)
             .map_err(|error| corrupt(format!("v3 provider route receipt: {error}")))?;
         Ok(decision)
@@ -863,7 +923,9 @@ impl KeyedGeneration {
             ("effect", id),
             ("pending", &format!("effect:{id}")),
             ("source", &digest),
+            ("latest-quota", "account"),
         ])?;
+        let prior_latest: Option<LatestQuota> = typed(values.pop().unwrap())?;
         let prior_source: Option<SourceHead> = typed(values.pop().unwrap())?;
         let pending: Option<PendingHead> = typed(values.pop().unwrap())?;
         let mut effect: EffectIntent = typed(values.pop().unwrap())?.ok_or(
@@ -943,6 +1005,33 @@ impl KeyedGeneration {
                 .ok_or(IndexError::Conflict("v3 quota source count overflow"))?
                 .into();
         }
+        let next_latest = if request.kind == FreshAccountEffectKind::AuthRefresh {
+            None
+        } else {
+            let observation = head
+                .quota
+                .clone()
+                .ok_or_else(|| corrupt("v3 settled quota source absent"))?;
+            let next = LatestQuota {
+                source: source_key.clone(),
+                observation,
+            };
+            if prior_latest.as_ref().is_none_or(|old| {
+                (
+                    old.observation.q.completed_unix_nanos,
+                    &old.source.commands_sha256,
+                    &old.source.environment_sha256,
+                ) <= (
+                    next.observation.q.completed_unix_nanos,
+                    &next.source.commands_sha256,
+                    &next.source.environment_sha256,
+                )
+            }) {
+                Some(next)
+            } else {
+                None
+            }
+        };
         store.commit(revision, {
             let mut changes = vec![
                 change("effect", id, &effect)?,
@@ -954,6 +1043,9 @@ impl KeyedGeneration {
                 change("source", &digest, &head)?,
                 change("account", "summary", &summary)?,
             ];
+            if let Some(latest) = next_latest {
+                changes.push(change("latest-quota", "account", &latest)?);
+            }
             if request.kind == FreshAccountEffectKind::AuthRefresh {
                 changes.push(Change {
                     class: "auth-flight".into(),
@@ -1149,6 +1241,37 @@ impl KeyedGeneration {
         }
         let source_digest = source_key.map(keyed).transpose()?.unwrap_or_default();
         let capacity_key = keyed(&(model, config_sha256))?;
+        let account_digest = keyed(&physical_key)?;
+        let account_path = self.storage.join("keyed-accounts").join(&account_digest);
+        let catalog_path = self
+            .storage
+            .join("account-catalog")
+            .join(format!("{account_digest}.json"));
+        let account_present = fs::symlink_metadata(&account_path);
+        let catalog_present = fs::symlink_metadata(&catalog_path);
+        match (account_present, catalog_present) {
+            (Err(account), Err(catalog))
+                if account.kind() == io::ErrorKind::NotFound
+                    && catalog.kind() == io::ErrorKind::NotFound =>
+            {
+                return Ok(if source_key.is_some() {
+                    RouteEligibility::ProbeRequired
+                } else {
+                    RouteEligibility::Eligible {
+                        account_revision: 0,
+                        quota_basis_points: None,
+                        observed_invocations: 0,
+                        observed_failures: 0,
+                    }
+                });
+            }
+            (Ok(_), Ok(_)) => {}
+            _ => {
+                return Err(IndexError::RebuildRequired(
+                    "v3 route account/catalog differs",
+                ));
+            }
+        }
         let store = self.account(physical_key)?;
         let (revision, pending, mut values) = store.read_many(&[
             ("account", "summary"),
@@ -1156,7 +1279,9 @@ impl KeyedGeneration {
             ("quota-marker", "account"),
             ("auth-marker", "account"),
             ("model-capacity", &capacity_key),
+            ("latest-quota", "account"),
         ])?;
+        let latest: Option<LatestQuota> = typed(values.pop().unwrap())?;
         let capacity: Option<MarkerHead> = typed(values.pop().unwrap())?;
         let auth_marker: Option<MarkerHead> = typed(values.pop().unwrap())?;
         let quota_marker: Option<MarkerHead> = typed(values.pop().unwrap())?;
@@ -1173,11 +1298,36 @@ impl KeyedGeneration {
         let invocations = summary["observed_invocations"]
             .as_u64()
             .ok_or_else(|| corrupt("v3 route invocation count absent"))?;
+        let failures = summary["failure_count"]
+            .as_u64()
+            .ok_or_else(|| corrupt("v3 route failure count absent"))?;
         let unknown_scope = summary["unknown_marker_scope"]
             .as_bool()
             .ok_or_else(|| corrupt("v3 route marker scope absent"))?;
         if pending != 0 || unknown_scope {
             return Ok(RouteEligibility::Unknown);
+        }
+        if let Some(latest) = &latest {
+            if !latest.source.valid() {
+                return Err(corrupt("v3 latest quota source invalid"));
+            }
+            latest.observation.q.verify(&self.root)?;
+            let Some(result) = &latest.observation.result else {
+                return Ok(RouteEligibility::Unknown);
+            };
+            result.require_present(&self.root)?;
+            if latest.observation.outcome == "unknown" {
+                return Ok(RouteEligibility::Unknown);
+            }
+            if latest.observation.outcome == "valid_windows"
+                && latest
+                    .observation
+                    .windows
+                    .iter()
+                    .any(|window| window.used_percent >= 100.0 || window.remaining == Some(0))
+            {
+                return Ok(RouteEligibility::Excluded);
+            }
         }
         for (marker, outcome) in [
             (&quota_marker, "quota_rejected"),
@@ -1209,10 +1359,14 @@ impl KeyedGeneration {
             if quota_marker.is_some() || auth_marker.is_some() {
                 return Ok(RouteEligibility::Excluded);
             }
+            if latest.is_some() {
+                return Ok(RouteEligibility::ProbeRequired);
+            }
             return Ok(RouteEligibility::Eligible {
                 account_revision: revision,
                 quota_basis_points: None,
                 observed_invocations: invocations,
+                observed_failures: failures,
             });
         };
         let Some(source) = source else {
@@ -1224,6 +1378,12 @@ impl KeyedGeneration {
         let Some(quota) = source.quota else {
             return Ok(RouteEligibility::ProbeRequired);
         };
+        let Some(latest) = latest else {
+            return Ok(RouteEligibility::Unknown);
+        };
+        if latest.source != *key || latest.observation != quota {
+            return Ok(RouteEligibility::ProbeRequired);
+        }
         quota.q.verify(&self.root)?;
         let Some(result) = &quota.result else {
             return Ok(RouteEligibility::Unknown);
@@ -1304,6 +1464,7 @@ impl KeyedGeneration {
             account_revision: revision,
             quota_basis_points: Some(basis),
             observed_invocations: invocations,
+            observed_failures: failures,
         })
     }
 
@@ -1375,6 +1536,7 @@ impl KeyedGeneration {
             root: self.root.clone(),
             generation: self.generation.clone(),
             storage: self.storage.clone(),
+            version: V3,
             route_reader_probe: false,
         };
         let mut expected_cursors = BTreeMap::<String, Cursor>::new();
@@ -1606,6 +1768,7 @@ impl KeyedGeneration {
                 }
                 expected_keys.insert(("pending".to_owned(), pending_key));
             }
+            let mut admitted_sources = Vec::new();
             for (id, typed) in &head.sources {
                 let actual: Option<SourceHead> = self::typed(store.get("source", id)?)?;
                 if actual.as_ref() != Some(typed) {
@@ -1631,9 +1794,17 @@ impl KeyedGeneration {
                         return Err(corrupt("v3 retained typed source differs"));
                     }
                 }
-                if actual.is_some() {
+                if let Some(actual) = actual {
                     expected_keys.insert(("source".to_owned(), id.clone()));
+                    admitted_sources.push(actual);
                 }
+            }
+            let expected_latest = latest_quota(admitted_sources.iter());
+            if expected_latest.is_some() {
+                expected_keys.insert(("latest-quota".to_owned(), "account".to_owned()));
+            }
+            if typed::<LatestQuota>(store.get("latest-quota", "account")?)? != expected_latest {
+                return Err(corrupt("v3 retained latest physical quota differs"));
             }
             for (class, marker) in [
                 ("quota-marker", &head.quota_rejection),
@@ -1884,6 +2055,13 @@ fn stage_account(root: &Path, staged: &Index, key: &str, mut account: Account) -
     for (source, typed) in &head.sources {
         insert_checked(&store, &mut revision, change("source", source, typed)?)?;
     }
+    if let Some(latest) = latest_quota(head.sources.values()) {
+        insert_checked(
+            &store,
+            &mut revision,
+            change("latest-quota", "account", &latest)?,
+        )?;
+    }
     for (class, marker) in [
         ("quota-marker", &head.quota_rejection),
         ("auth-marker", &head.auth_rejection),
@@ -2087,6 +2265,7 @@ fn rebuild_inner(
         root: root.to_owned(),
         generation: generation.clone(),
         storage,
+        version: V3,
         route_reader_probe: false,
     };
     stage_routes(&staged, snapshot.decisions)?;
@@ -2147,8 +2326,24 @@ mod tests {
     fn route_summary(pending: u64) -> serde_json::Value {
         serde_json::json!({
             "physical_key": "physical", "pending_count": pending,
-            "observed_invocations": 3, "unknown_marker_scope": false
+            "observed_invocations": 3, "failure_count": 0,
+            "unknown_marker_scope": false
         })
+    }
+
+    fn route_source_changes(key: &SourceKey, head: &SourceHead) -> Vec<Change> {
+        vec![
+            change("source", &keyed(key).unwrap(), head).unwrap(),
+            change(
+                "latest-quota",
+                "account",
+                &LatestQuota {
+                    source: key.clone(),
+                    observation: head.quota.clone().unwrap(),
+                },
+            )
+            .unwrap(),
+        ]
     }
 
     fn route_fixture(history: usize) -> (tempfile::TempDir, KeyedGeneration, SourceKey, u64) {
@@ -2158,6 +2353,18 @@ mod tests {
         let storage = root.join("index-v1/generations").join(&generation);
         let accounts = storage.join("keyed-accounts");
         fs::create_dir_all(&accounts).unwrap();
+        fs::create_dir_all(storage.join("cursors")).unwrap();
+        fs::create_dir_all(storage.join("decisions")).unwrap();
+        let catalog = storage.join("account-catalog");
+        fs::create_dir_all(&catalog).unwrap();
+        write_new(
+            &catalog.join(format!("{}.json", keyed(&"physical").unwrap())),
+            &KnownKey {
+                generation: generation.clone(),
+                key: "physical".to_owned(),
+            },
+        )
+        .unwrap();
         write_new(
             &root.join("index-v1/manifest.json"),
             &Manifest {
@@ -2238,8 +2445,17 @@ mod tests {
                         &keyed(&key).unwrap(),
                         &SourceHead {
                             source: key.clone(),
-                            quota: Some(observation),
+                            quota: Some(observation.clone()),
                             auth: None,
+                        },
+                    )
+                    .unwrap(),
+                    change(
+                        "latest-quota",
+                        "account",
+                        &LatestQuota {
+                            source: key.clone(),
+                            observation,
                         },
                     )
                     .unwrap(),
@@ -2292,7 +2508,8 @@ mod tests {
             RouteEligibility::Eligible {
                 account_revision: revision,
                 quota_basis_points: Some(8000),
-                observed_invocations: 3
+                observed_invocations: 3,
+                observed_failures: 0,
             }
         );
         assert_eq!(small_io.open_attempts, large_io.open_attempts);
@@ -2364,10 +2581,7 @@ mod tests {
                 .unwrap();
         source_head.quota.as_mut().unwrap().outcome = "invalid".into();
         revision = store
-            .commit(
-                revision,
-                vec![change("source", &keyed(&large_source).unwrap(), &source_head).unwrap()],
-            )
+            .commit(revision, route_source_changes(&large_source, &source_head))
             .unwrap();
         assert_eq!(
             large
@@ -2378,10 +2592,7 @@ mod tests {
         source_head.quota.as_mut().unwrap().outcome = "valid_windows".into();
         source_head.quota.as_mut().unwrap().windows[0].used_percent = 100.0;
         revision = store
-            .commit(
-                revision,
-                vec![change("source", &keyed(&large_source).unwrap(), &source_head).unwrap()],
-            )
+            .commit(revision, route_source_changes(&large_source, &source_head))
             .unwrap();
         assert_eq!(
             large
@@ -2391,10 +2602,7 @@ mod tests {
         );
         source_head.quota.as_mut().unwrap().windows[0].used_percent = 20.0;
         revision = store
-            .commit(
-                revision,
-                vec![change("source", &keyed(&large_source).unwrap(), &source_head).unwrap()],
-            )
+            .commit(revision, route_source_changes(&large_source, &source_head))
             .unwrap();
         let capacity = MarkerHead {
             q: source_head.quota.as_ref().unwrap().q.clone(),
@@ -2459,7 +2667,7 @@ mod tests {
         );
         source.quota.as_mut().unwrap().q.completed_unix_nanos += 1;
         revision = store
-            .commit(revision, vec![change("source", &digest, &source).unwrap()])
+            .commit(revision, route_source_changes(&key, &source))
             .unwrap();
         assert!(matches!(
             generation
@@ -2519,6 +2727,206 @@ mod tests {
         );
     }
 
+    #[test]
+    fn v3_route_facts_never_revive_older_source_after_newer_physical_q() {
+        let (_temp, generation, old, revision) = route_fixture(0);
+        let store = generation.account("physical").unwrap();
+        let old_head: SourceHead = typed(store.get("source", &keyed(&old).unwrap()).unwrap())
+            .unwrap()
+            .unwrap();
+        let new = SourceKey {
+            commands_sha256: old.commands_sha256.clone(),
+            environment_sha256: "changed-environment".into(),
+        };
+        let mut observation = old_head.quota.unwrap();
+        observation.q.completed_unix_nanos += 1;
+        observation.outcome = "invalid".into();
+        let mut revision = store
+            .commit(
+                revision,
+                vec![
+                    change(
+                        "source",
+                        &keyed(&new).unwrap(),
+                        &SourceHead {
+                            source: new.clone(),
+                            quota: Some(observation.clone()),
+                            auth: None,
+                        },
+                    )
+                    .unwrap(),
+                    change(
+                        "latest-quota",
+                        "account",
+                        &LatestQuota {
+                            source: new.clone(),
+                            observation: observation.clone(),
+                        },
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            generation
+                .route_facts("physical", Some(&old), "model-a", "config", 1_800_000_100)
+                .unwrap(),
+            RouteEligibility::ProbeRequired
+        );
+        observation.outcome = "valid_windows".into();
+        observation.windows[0].used_percent = 100.0;
+        revision = store
+            .commit(
+                revision,
+                vec![
+                    change(
+                        "source",
+                        &keyed(&new).unwrap(),
+                        &SourceHead {
+                            source: new.clone(),
+                            quota: Some(observation.clone()),
+                            auth: None,
+                        },
+                    )
+                    .unwrap(),
+                    change(
+                        "latest-quota",
+                        "account",
+                        &LatestQuota {
+                            source: new,
+                            observation,
+                        },
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap();
+        assert!(revision > 0);
+        assert_eq!(
+            generation
+                .route_facts("physical", Some(&old), "model-b", "config", 1_800_000_100)
+                .unwrap(),
+            RouteEligibility::Excluded
+        );
+    }
+
+    #[test]
+    fn v3_route_receipt_repairs_cursor_after_lost_commit_reply() {
+        let (temp, generation, _, _) = route_fixture(0);
+        let index = generation.route_projection();
+        let key = CursorKey {
+            model: "model-a".into(),
+            config_sha256: "config".into(),
+        };
+        let handoff = uuid::Uuid::new_v4().to_string();
+        let name = format!("{handoff}.route-selection.json");
+        let bytes = b"private-route-receipt\n";
+        let failure = index.commit_live_decision(
+            key.clone(),
+            handoff.clone(),
+            "physical".into(),
+            0,
+            false,
+            0,
+            name.clone(),
+            bytes,
+            || {
+                let path = temp.path().join(&name);
+                fs::write(&path, bytes)?;
+                File::open(&path)?.sync_all()?;
+                File::open(temp.path())?.sync_all()?;
+                Err(io::Error::other(
+                    "simulated lost commit reply after receipt fsync",
+                ))
+            },
+        );
+        assert!(failure.is_err());
+        assert!(generation.storage.join("pending.json").exists());
+        let reopened = KeyedGeneration::open(temp.path()).unwrap();
+        let index = reopened.route_projection();
+        index.reconcile_route_pending().unwrap();
+        assert!(!generation.storage.join("pending.json").exists());
+        assert_eq!(index.cursor(&key).unwrap().sequence, 1);
+        let decision = index.decision(&handoff).unwrap().unwrap();
+        assert_eq!(decision.sequence, 1);
+        assert_eq!(decision.candidate_identity, "physical");
+        assert_eq!(decision.receipt.unwrap().path, name);
+        index.reconcile_route_pending().unwrap();
+        assert_eq!(index.cursor(&key).unwrap().sequence, 1);
+    }
+
+    #[test]
+    fn v3_route_read_and_receipt_cursor_write_stay_bounded_with_hundreds_of_sources() {
+        fn one(history: usize) -> (keyed_store::IoCount, ReaderIo) {
+            let (temp, generation, source, _) = route_fixture(history);
+            let index = generation.route_projection();
+            let handoff = uuid::Uuid::new_v4().to_string();
+            let name = format!("{handoff}.route-selection.json");
+            let bytes = b"constructed-route-receipt\n";
+            let guard = ReaderIoGuard::start("v3-route-choice-and-write");
+            let (_, keyed_io) = keyed_store::measured(|| {
+                assert!(matches!(
+                    generation
+                        .route_facts(
+                            "physical",
+                            Some(&source),
+                            "model-a",
+                            "config",
+                            1_800_000_100,
+                        )
+                        .unwrap(),
+                    RouteEligibility::Eligible { .. }
+                ));
+                index
+                    .commit_live_decision(
+                        CursorKey {
+                            model: "model-a".into(),
+                            config_sha256: "config".into(),
+                        },
+                        handoff.clone(),
+                        "physical".into(),
+                        0,
+                        false,
+                        0,
+                        name.clone(),
+                        bytes,
+                        || {
+                            crate::linux_main::fresh_provider::durable_new_bytes(
+                                temp.path(),
+                                &name,
+                                bytes,
+                            )
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(index.decision(&handoff).unwrap().unwrap().sequence, 1);
+            });
+            drop(guard);
+            (keyed_io, last_reader_io().unwrap())
+        }
+        let small = one(1);
+        let many = one(205);
+        assert_eq!(small.0.open_attempts, many.0.open_attempts);
+        assert_eq!(small.0.opened, many.0.opened);
+        assert_eq!(small.0.directory_entries, 0);
+        assert_eq!(many.0.directory_entries, 0);
+        assert!(many.0.bytes_parsed <= small.0.bytes_parsed + 256);
+        assert_eq!(small.1.open_attempts, many.1.open_attempts);
+        assert_eq!(small.1.opened, many.1.opened);
+        assert_eq!(small.1.directory_entries, 0);
+        assert_eq!(many.1.directory_entries, 0);
+        assert!(many.1.bytes_parsed <= small.1.bytes_parsed + 256);
+        assert!(many.1.bytes_written <= small.1.bytes_written + 256);
+        eprintln!(
+            "v3 route read plus receipt/cursor write 1/205 keyed: {:?} / {:?}",
+            small.0, many.0
+        );
+        eprintln!(
+            "v3 route read plus receipt/cursor write 1/205 physical/index: {:?} / {:?}",
+            small.1, many.1
+        );
+    }
+
     fn artifact(root: &Path, name: &str, bytes: &[u8]) -> Artifact {
         fs::write(root.join(name), bytes).unwrap();
         Artifact::from_existing(root, Path::new(name)).unwrap()
@@ -2557,6 +2965,7 @@ mod tests {
             root: root.into(),
             generation: generation.clone(),
             storage,
+            version: V3,
             route_reader_probe: false,
         };
         let mut account = Account {
@@ -2648,6 +3057,7 @@ mod tests {
             root: root.into(),
             generation: generation.clone(),
             storage,
+            version: V3,
             route_reader_probe: false,
         };
         let mut account = Account {
@@ -2758,6 +3168,7 @@ mod tests {
             root: root.into(),
             generation: generation.clone(),
             storage: small_storage,
+            version: V3,
             route_reader_probe: false,
         };
         let mut small = account.clone();

@@ -114,6 +114,10 @@ pub struct FreshRouteRequest {
     pub pin: Option<String>,
     pub quota_script: Option<String>,
     pub auth_refresh_command: Option<String>,
+    /// The exact environment used by the private account-effect requests.
+    /// Required by the v3 route writer for a metered physical source.
+    #[serde(default)]
+    pub environment_sha256: Option<String>,
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]

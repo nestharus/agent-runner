@@ -1123,7 +1123,7 @@ fn durable_new<T: Serialize>(directory: &Path, name: &str, value: &T) -> io::Res
     durable_new_bytes(directory, name, &bytes)
 }
 
-fn durable_new_bytes(directory: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
+pub(super) fn durable_new_bytes(directory: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
     super::fresh_index::reader_open_attempt();
     let mut file = OpenOptions::new()
         .write(true)
@@ -1202,6 +1202,8 @@ struct RouteDecision {
     binding: Binding,
     total: usize,
     pin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    environment_sha256: Option<String>,
     #[serde(default)]
     sequence: u64,
     selection: FreshRouteSelection,
@@ -3411,7 +3413,7 @@ const FRESH_ROUTE_POLICY_VERSION: &str = "fresh-quota-account-v4";
 /// The fsynced decision files are the cursor. Serialize their scan and the
 /// next durable decision across broker threads and restarts, including roots
 /// that select before their provider K has begun.
-fn route_selection_lock(directory: &Path) -> io::Result<File> {
+pub(super) fn route_selection_lock(directory: &Path) -> io::Result<File> {
     super::fresh_index::reader_open_attempt();
     let file = OpenOptions::new()
         .read(true)
@@ -3643,6 +3645,7 @@ pub(super) fn select_route_with_index(
         binding: binding.clone(),
         total: request.total,
         pin: request.pin.clone(),
+        environment_sha256: None,
         sequence,
         selection: selection.clone(),
     };
@@ -3671,6 +3674,231 @@ pub(super) fn select_route_with_index(
     } else {
         durable_new(directory, &name, &receipt)?;
     }
+    Ok(selection)
+}
+
+/// The private v3 choice reads the current keyed physical-account facts. The
+/// broker holds the same route lock around quota/auth writes, so every account
+/// revision remains stable until the receipt and cursor are published.
+pub(super) fn select_route_v3(
+    directory: &Path,
+    binding: &Binding,
+    request: &FreshRouteRequest,
+    generation: &KeyedGeneration,
+) -> io::Result<FreshRouteSelection> {
+    use super::fresh_index::RouteEligibility;
+
+    route_request_valid(request, binding)?;
+    if request.account.is_some() || request.index.is_some() {
+        return Err(io::Error::other("v3 route selection includes candidate"));
+    }
+    let _lock = route_selection_lock(directory)?;
+    let candidates = route_candidates(directory, binding, request)?;
+    let index = generation.route_index().map_err(io::Error::other)?;
+    let key = CursorKey {
+        model: request.model.clone(),
+        config_sha256: request.config_sha256.clone(),
+    };
+    if let Some(existing) =
+        exact_file::<RouteDecision>(directory, &decision_name(&binding.handoff_id))?
+    {
+        if existing.version != 1
+            || existing.binding != *binding
+            || existing.total != request.total
+            || existing.pin != request.pin
+            || existing.environment_sha256 != request.environment_sha256
+            || existing.selection.model != request.model
+            || existing.selection.config_sha256 != request.config_sha256
+            || existing.selection.policy_version != FRESH_ROUTE_POLICY_VERSION
+            || candidates
+                .get(existing.selection.index)
+                .is_none_or(|candidate| {
+                    candidate.account != existing.selection.account
+                        || candidate.account_identity != existing.selection.account_identity
+                        || candidate.plan_sha256 != existing.selection.plan_sha256
+                })
+        {
+            return Err(io::Error::other("v3 route selection changed"));
+        }
+        generation
+            .require_route(&binding.handoff_id)
+            .map_err(io::Error::other)?;
+        return Ok(existing.selection);
+    }
+    if index
+        .decision(&binding.handoff_id)
+        .map_err(io::Error::other)?
+        .is_some()
+    {
+        return Err(io::Error::other("v3 route decision lacks receipt"));
+    }
+    let environment = request.environment_sha256.as_deref();
+    if environment
+        .is_some_and(|digest| digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return Err(io::Error::other("v3 route environment digest invalid"));
+    }
+    let mut eligible = Vec::new();
+    let mut unknown = false;
+    for candidate in candidates {
+        fresh_rebuild::validate_candidate(
+            directory,
+            generation.admitted_source().map_err(io::Error::other)?,
+            &candidate,
+        )?;
+        let source = if candidate.quota_script.is_some() {
+            let environment = environment
+                .ok_or_else(|| io::Error::other("v3 metered route environment absent"))?;
+            let source = SourceKey {
+                commands_sha256: format!(
+                    "{:x}",
+                    Sha256::digest(serde_json::to_vec(&(
+                        &candidate.quota_script,
+                        &candidate.auth_refresh_command,
+                    ))?)
+                ),
+                environment_sha256: environment.to_owned(),
+            };
+            let first = effect_directory(
+                directory,
+                binding,
+                &FreshAccountEffectRequest {
+                    d_key: request.d_key.clone(),
+                    model: request.model.clone(),
+                    config_sha256: request.config_sha256.clone(),
+                    account: candidate.account.clone(),
+                    index: candidate.index,
+                    kind: FreshAccountEffectKind::QuotaFirst,
+                    environment: Vec::new(),
+                },
+            );
+            if let Some(intent) = effect_intent(&first)? {
+                if intent.version != 1
+                    || intent.binding != *binding
+                    || intent.request.model != candidate.model
+                    || intent.request.config_sha256 != candidate.config_sha256
+                    || intent.request.account != candidate.account
+                    || intent.request.index != candidate.index
+                    || intent.request.kind != FreshAccountEffectKind::QuotaFirst
+                    || intent.environment_sha256 != environment
+                {
+                    return Err(io::Error::other("v3 route local quota source changed"));
+                }
+            }
+            Some(source)
+        } else {
+            None
+        };
+        let facts = generation
+            .route_facts(
+                &candidate.account_identity,
+                source.as_ref(),
+                &candidate.model,
+                &candidate.config_sha256,
+                Utc::now().timestamp(),
+            )
+            .map_err(io::Error::other)?;
+        match facts {
+            RouteEligibility::Eligible {
+                quota_basis_points,
+                observed_invocations,
+                observed_failures,
+                ..
+            } => {
+                eligible.push((
+                    candidate,
+                    quota_basis_points,
+                    observed_invocations,
+                    observed_failures,
+                ));
+            }
+            RouteEligibility::Unknown
+                if request
+                    .pin
+                    .as_deref()
+                    .is_none_or(|pin| pin == candidate.account) =>
+            {
+                unknown = true
+            }
+            RouteEligibility::Unknown
+            | RouteEligibility::ProbeRequired
+            | RouteEligibility::Excluded => {}
+        }
+    }
+    if unknown {
+        return Err(io::Error::other(
+            "v3 route has unknown physical-account debt",
+        ));
+    }
+    let eligible_accounts = eligible
+        .iter()
+        .map(|(candidate, _, _, _)| candidate.account.clone())
+        .collect::<Vec<_>>();
+    let cursor = index.cursor(&key).map_err(io::Error::other)?;
+    let (candidate, quota, invocations, failures) = eligible
+        .into_iter()
+        .filter(|(candidate, _, _, _)| {
+            request
+                .pin
+                .as_deref()
+                .is_none_or(|pin| pin == candidate.account)
+        })
+        .min_by_key(|(candidate, _, _, _)| {
+            cursor.index.map_or(candidate.index, |last| {
+                (candidate.index + request.total - (last + 1) % request.total) % request.total
+            })
+        })
+        .ok_or_else(|| io::Error::other("v3 route has no eligible account or pin"))?;
+    let sequence = if request.pin.is_some() {
+        0
+    } else {
+        cursor
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("v3 route cursor overflow"))?
+    };
+    let selection = FreshRouteSelection {
+        model: candidate.model,
+        config_sha256: candidate.config_sha256,
+        account: candidate.account,
+        account_identity: candidate.account_identity,
+        index: candidate.index,
+        plan_sha256: candidate.plan_sha256,
+        observed_live: 0,
+        observed_failures: failures,
+        observed_invocations: invocations,
+        policy_version: FRESH_ROUTE_POLICY_VERSION.into(),
+        eligible_accounts,
+        quota_remaining_basis_points: quota,
+    };
+    let receipt = RouteDecision {
+        version: 1,
+        binding: binding.clone(),
+        total: request.total,
+        pin: request.pin.clone(),
+        environment_sha256: request.environment_sha256.clone(),
+        sequence,
+        selection: selection.clone(),
+    };
+    let mut bytes = serde_json::to_vec(&receipt)?;
+    bytes.push(b'\n');
+    let name = decision_name(&binding.handoff_id);
+    index
+        .commit_live_decision(
+            key,
+            binding.handoff_id.clone(),
+            selection.account_identity.clone(),
+            selection.index,
+            request.pin.is_some(),
+            cursor.sequence,
+            name.clone(),
+            &bytes,
+            || durable_new_bytes(directory, &name, &bytes),
+        )
+        .map_err(io::Error::other)?;
+    generation
+        .require_route(&binding.handoff_id)
+        .map_err(io::Error::other)?;
     Ok(selection)
 }
 
@@ -4871,6 +5099,7 @@ mod tests {
             binding,
             total: 2,
             pin: None,
+            environment_sha256: None,
             sequence: 1,
             selection,
         };
@@ -5270,6 +5499,7 @@ mod tests {
             pin: None,
             quota_script: Some("printf ok".into()),
             auth_refresh_command: None,
+            environment_sha256: None,
         };
         validate_route_source(&source, &request).unwrap();
         let mut old_protocol = serde_json::to_value(&request).unwrap();
@@ -5409,6 +5639,7 @@ mod tests {
             pin: pin.map(str::to_owned),
             quota_script: None,
             auth_refresh_command: None,
+            environment_sha256: None,
         }
     }
 
@@ -6087,6 +6318,7 @@ mod tests {
             pin: None,
             quota_script: None,
             auth_refresh_command: None,
+            environment_sha256: None,
         };
         let second =
             select_route_with_index(&broker, &second_binding, &second_request, Some(&index))
@@ -6378,6 +6610,7 @@ mod tests {
             binding: binding.clone(),
             total: request.total,
             pin: None,
+            environment_sha256: None,
             sequence: 1,
             selection,
         };
@@ -6546,6 +6779,7 @@ mod tests {
                 binding: previous.clone(),
                 total: 1,
                 pin: None,
+                environment_sha256: None,
                 sequence: 1,
                 selection: FreshRouteSelection {
                     model: "model".into(),
@@ -6621,6 +6855,7 @@ mod tests {
             pin: None,
             quota_script: None,
             auth_refresh_command: None,
+            environment_sha256: None,
         };
         assert!(matches!(
             observe(temp.path(), &grant.id).unwrap(),
@@ -6753,6 +6988,7 @@ mod tests {
             pin: None,
             quota_script: None,
             auth_refresh_command: None,
+            environment_sha256: None,
         };
         let error = select_route(temp.path(), &binding, &request)
             .unwrap_err()
@@ -6898,6 +7134,7 @@ mod tests {
                 pin: pin.map(str::to_owned),
                 quota_script: None,
                 auth_refresh_command: None,
+                environment_sha256: None,
             };
         let make_plan = |index: usize| {
             plan(
@@ -6995,6 +7232,7 @@ mod tests {
                 binding: held_choice.clone(),
                 total: 2,
                 pin: Some("opencode-first".into()),
+                environment_sha256: None,
                 sequence: 0,
                 selection: first,
             },
@@ -7095,6 +7333,7 @@ mod tests {
                 pin: pin.map(str::to_owned),
                 quota_script: None,
                 auth_refresh_command: None,
+                environment_sha256: None,
             };
             register_route_candidate(
                 temporary.path(),
@@ -7275,6 +7514,7 @@ mod tests {
             pin: None,
             quota_script: None,
             auth_refresh_command: None,
+            environment_sha256: None,
         };
         assert!(
             select_route(temporary.path(), &second_binding, &changed_config).is_err(),
@@ -7425,6 +7665,7 @@ mod tests {
                 pin: None,
                 quota_script: Some(quota.into()),
                 auth_refresh_command: auth.map(str::to_owned),
+                environment_sha256: None,
             };
         let image = std::fs::canonicalize("/bin/true").unwrap();
         for (index, account, quota, auth) in [
@@ -7473,6 +7714,7 @@ mod tests {
                     pin: None,
                     quota_script: None,
                     auth_refresh_command: None,
+                    environment_sha256: None,
                 }
             )
             .unwrap_err()
@@ -8093,6 +8335,7 @@ mod tests {
                     pin: Some("exhausted".into()),
                     quota_script: None,
                     auth_refresh_command: None,
+                    environment_sha256: None,
                 }
             )
             .is_err(),
@@ -8113,6 +8356,7 @@ mod tests {
                 pin: None,
                 quota_script: None,
                 auth_refresh_command: None,
+                environment_sha256: None,
             },
         )
         .unwrap_err()
@@ -8139,6 +8383,7 @@ mod tests {
                 pin: None,
                 quota_script: None,
                 auth_refresh_command: None,
+                environment_sha256: None,
             },
         )
         .unwrap();
@@ -8167,6 +8412,7 @@ mod tests {
             index: Some(0), total: 1, pin: Some("slow".into()),
             quota_script: Some("printf '{\"used_percent\":10,\"resets_at\":\"2099-01-01T00:00:00Z\"}'; sleep 60 & wait".into()),
             auth_refresh_command: None,
+            environment_sha256: None,
         };
         register_route_candidate(
             temporary.path(),
@@ -8277,6 +8523,7 @@ mod tests {
                     index: None,
                     quota_script: None,
                     auth_refresh_command: None,
+                    environment_sha256: None,
                     ..unknown_route
                 }
             )
@@ -8430,5 +8677,127 @@ mod tests {
         );
         actor_child.kill().unwrap();
         actor_child.wait().unwrap();
+    }
+
+    #[test]
+    fn v3_route_writer_round_robin_receipt_survives_restart_without_provider_k() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("broker");
+        let source = temp.path().join("config");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir_all(source.join("models")).unwrap();
+        std::fs::write(source.join("providers.toml"),
+            "[first]\ncommand = '/bin/true'\nquota_account_id = 'physical-first'\n[second]\ncommand = '/bin/true'\nquota_account_id = 'physical-second'\n").unwrap();
+        std::fs::write(
+            source.join("models/pool.toml"),
+            "[[providers]]\nname = 'first'\n[[providers]]\nname = 'second'\n",
+        )
+        .unwrap();
+        drop(crate::linux_main::fresh_index::broker_admission_lease(&root).unwrap());
+        crate::linux_main::fresh_index::rebuild_keyed_offline(
+            &root,
+            &temp.path().join("absent.sock"),
+            &source,
+        )
+        .unwrap();
+        let lease = crate::linux_main::fresh_index::broker_admission_lease(&root).unwrap();
+        let generation = KeyedGeneration::admit_provider_readback(&root, &lease, &source).unwrap();
+        let pool = oulipoly_runtime::executor::cli::fresh_remote::load_fresh_headless_pool(
+            &source, "pool",
+        )
+        .unwrap();
+        let source_fd = File::open(&source).unwrap();
+        let process = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+        let image = std::fs::canonicalize("/bin/true").unwrap();
+        let input_path = temp.path().join("input");
+        std::fs::write(&input_path, b"").unwrap();
+        let input = File::open(&input_path).unwrap();
+        let mut first_binding = None;
+        let mut first_request = None;
+        for expected in [0, 1, 0] {
+            let binding = fixture_binding(&process, &process);
+            let mut choice = FreshRouteRequest {
+                protocol_version: 4,
+                d_key: uuid::Uuid::new_v4().to_string(),
+                model: "pool".into(),
+                config_sha256: pool.config_sha256.clone(),
+                account: None,
+                account_identity: None,
+                index: None,
+                total: 2,
+                pin: None,
+                quota_script: None,
+                auth_refresh_command: None,
+                environment_sha256: None,
+            };
+            for (n, account) in ["first", "second"].iter().enumerate() {
+                choice.account = Some((*account).into());
+                choice.account_identity = Some(format!("physical-{account}"));
+                choice.index = Some(n);
+                validate_route_source(&source_fd, &choice).unwrap();
+                bind_route_source(&root, &binding, &choice, &source_fd, true).unwrap();
+                register_route_candidate(
+                    &root,
+                    &binding,
+                    &choice,
+                    plan(
+                        &image,
+                        temp.path(),
+                        &input,
+                        vec![format!("--{account}")],
+                        vec![],
+                    )
+                    .unwrap(),
+                    terminal_recognizer_from_source(&source_fd, &choice).unwrap(),
+                )
+                .unwrap();
+                generation
+                    .record_route_model("pool", &pool.config_sha256)
+                    .unwrap();
+            }
+            choice.account = None;
+            choice.account_identity = None;
+            choice.index = None;
+            let selected = select_route_v3(&root, &binding, &choice, &generation).unwrap();
+            assert_eq!(selected.index, expected);
+            assert_eq!(
+                select_route_v3(&root, &binding, &choice, &generation).unwrap(),
+                selected,
+                "one D advanced the cursor twice"
+            );
+            assert!(
+                !root
+                    .join(format!("{}.fresh-grant.json", binding.handoff_id))
+                    .exists()
+            );
+            if expected == 0 && first_binding.is_none() {
+                first_binding = Some(binding);
+                first_request = Some(choice);
+            }
+        }
+        drop(generation);
+        drop(lease);
+        let lease = crate::linux_main::fresh_index::broker_admission_lease(&root).unwrap();
+        let generation = KeyedGeneration::admit_provider_readback(&root, &lease, &source).unwrap();
+        let binding = first_binding.unwrap();
+        let request = first_request.unwrap();
+        assert_eq!(
+            select_route_v3(&root, &binding, &request, &generation)
+                .unwrap()
+                .index,
+            0
+        );
+        assert_eq!(
+            generation
+                .route_index()
+                .unwrap()
+                .cursor(&CursorKey {
+                    model: "pool".into(),
+                    config_sha256: pool.config_sha256,
+                })
+                .unwrap()
+                .sequence,
+            3
+        );
     }
 }

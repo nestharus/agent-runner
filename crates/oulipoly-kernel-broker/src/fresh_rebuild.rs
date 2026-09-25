@@ -953,6 +953,7 @@ mod tests {
                     binding: self.binding.clone(),
                     total: 1,
                     pin: pin.then(|| "first".into()),
+                    environment_sha256: None,
                     sequence,
                     selection: FreshRouteSelection {
                         model: "work".into(),

@@ -166,23 +166,31 @@ fn inner() {
                     | "normal_model_provider_quota_restart"
             ) {
             let quota_bytes: &[u8] = match mode.as_str() {
-                "normal_model_provider_v3_quota_invalid" => b"invalid quota",
-                "normal_model_provider_v3_quota_full" => {
+                "normal_model_provider_v3_quota_invalid"
+                | "normal_model_provider_v3_quota_route_invalid"
+                | "normal_model_provider_v3_quota_route_auth_failed" => b"invalid quota",
+                "normal_model_provider_v3_quota_full"
+                | "normal_model_provider_v3_quota_route_full" => {
                     br#"{"used_percent":100,"resets_at":"2099-01-01T00:00:00Z"}"#
                 }
-                "normal_model_provider_v3_quota_stale" => {
+                "normal_model_provider_v3_quota_stale"
+                | "normal_model_provider_v3_quota_route_stale" => {
                     br#"{"used_percent":20,"resets_at":"2020-01-01T00:00:00Z"}"#
                 }
                 _ => br#"{"used_percent":20,"resets_at":"2099-01-01T00:00:00Z"}"#,
             };
             fs::write(gate.join("quota.json"), quota_bytes).unwrap();
-            if mode.starts_with("normal_model_provider_v3_quota_auth") {
+            if mode.starts_with("normal_model_provider_v3_quota_auth")
+                || mode == "normal_model_provider_v3_quota_route_auth_failed"
+            {
                 if mode == "normal_model_provider_v3_quota_auth_restart" {
                     format!(
                         "quota_script = 'if test -e {0}/auth-ok; then cat {0}/quota.json; else printf invalid; fi'\nauth_refresh_command = 'printf x > {0}/started-auth; while ! test -e {0}/finish-auth; do sleep 0.05; done; printf x >> {0}/auth-ok'\n",
                         gate.display()
                     )
-                } else if mode == "normal_model_provider_v3_quota_auth_failed" {
+                } else if mode == "normal_model_provider_v3_quota_auth_failed"
+                    || mode == "normal_model_provider_v3_quota_route_auth_failed"
+                {
                     format!("quota_script = 'printf invalid'\nauth_refresh_command = 'exit 9'\n")
                 } else {
                     format!(
@@ -496,6 +504,14 @@ fn inner() {
             "OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_READBACK_V3_SOURCE_V1",
             config_home.join("oulipoly-agent-runner").to_str().unwrap(),
         )))
+        .envs(
+            mode.starts_with("normal_model_provider_v3_quota_route")
+                .then_some(("OULIPOLY_KERNEL_BROKER_FIXTURE_ROUTE_V3_V1", "1")),
+        )
+        .envs(
+            (mode == "normal_model_provider_v3_quota_route_reply_loss")
+                .then_some(("OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_ROUTE_V3_REPLY_V1", "1")),
+        )
         .envs((mode == "normal_model_provider_reply_loss").then_some((
             "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_PROVIDER_K_REPLY_V1",
             "1",
@@ -1399,6 +1415,16 @@ fn inner() {
                         "OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_READBACK_V3_SOURCE_V1",
                         config_home.join("oulipoly-agent-runner").to_str().unwrap(),
                     )))
+                    .envs(
+                        mode.starts_with("normal_model_provider_v3_quota_route")
+                            .then_some(("OULIPOLY_KERNEL_BROKER_FIXTURE_ROUTE_V3_V1", "1")),
+                    )
+                    .envs(
+                        (mode == "normal_model_provider_v3_quota_route_reply_loss").then_some((
+                            "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_ROUTE_V3_REPLY_V1",
+                            "1",
+                        )),
+                    )
                     .envs((mode == "normal_model_provider_reply_loss").then_some((
                         "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_PROVIDER_K_REPLY_V1",
                         "1",
@@ -1553,6 +1579,44 @@ fn inner() {
                     )
                     .unwrap();
                 }
+                if mode == "normal_model_provider_v3_quota_route_reply_loss" {
+                    let route = broker_state
+                        .join("v30/fresh-provider")
+                        .join(format!("{}.route-selection.json", receipt.handoff_id));
+                    eventually(|| gate.join("route-reply-dropped").exists() && route.exists());
+                    let before = fs::read(&route).unwrap();
+                    stop(&mut broker);
+                    let restart_log = temp.path().join("v3-route-inflight-restart.log");
+                    broker = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
+                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
+                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
+                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+                        .env(
+                            "OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_READBACK_V3_V1",
+                            "1",
+                        )
+                        .env(
+                            "OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_READBACK_V3_SOURCE_V1",
+                            config_home.join("oulipoly-agent-runner"),
+                        )
+                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_ROUTE_V3_V1", "1")
+                        .stderr(Stdio::from(File::create(&restart_log).unwrap()))
+                        .spawn()
+                        .unwrap();
+                    let fresh_socket = socket.with_file_name("v30.sock");
+                    eventually(|| {
+                        protocol::request_at(&fresh_socket, Operation::ObserveEntryGate).is_ok()
+                            || broker.try_wait().unwrap().is_some()
+                    });
+                    assert!(
+                        protocol::request_at(&fresh_socket, Operation::ObserveEntryGate).is_ok(),
+                        "v3 route restart refused: {}",
+                        fs::read_to_string(&restart_log).unwrap()
+                    );
+                    assert_eq!(fs::read(&route).unwrap(), before);
+                    fs::write(gate.join("route-restarted"), b"yes").unwrap();
+                }
                 if provider_negative {
                     eventually(|| entry.try_wait().unwrap().is_some());
                     assert!(!entry.wait().unwrap().success());
@@ -1563,6 +1627,14 @@ fn inner() {
                             | "normal_model_provider_v3_quota_auth_post_k"
                     ) {
                         "fresh account effect unknown"
+                    } else if matches!(
+                        mode.as_str(),
+                        "normal_model_provider_v3_quota_route_invalid"
+                            | "normal_model_provider_v3_quota_route_full"
+                            | "normal_model_provider_v3_quota_route_stale"
+                            | "normal_model_provider_v3_quota_route_auth_failed"
+                    ) {
+                        "v3 route has no eligible account or pin"
                     } else if v3_quota {
                         "v3 route, auth/manual, cancellation and provider K writers are closed"
                     } else {
@@ -1595,6 +1667,28 @@ fn inner() {
                     assert!(!gate.join("provider-effect").exists());
                     assert!(!gate.join("provider-runtime-result").exists());
                     let provider_dir = broker_state.join("v30/fresh-provider");
+                    if matches!(
+                        mode.as_str(),
+                        "normal_model_provider_v3_quota_route"
+                            | "normal_model_provider_v3_quota_route_reply_loss"
+                    ) {
+                        let route: serde_json::Value = serde_json::from_slice(
+                            &fs::read(
+                                provider_dir
+                                    .join(format!("{}.route-selection.json", receipt.handoff_id)),
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap();
+                        assert_eq!(route["selection"]["account"], "local");
+                        assert_eq!(route["selection"]["index"], 1);
+                        assert_eq!(route["sequence"], 0, "pinned choice advanced RR");
+                        let actor_selection: serde_json::Value = serde_json::from_slice(
+                            &fs::read(gate.join("v3-route-selection.json")).unwrap(),
+                        )
+                        .unwrap();
+                        assert_eq!(actor_selection, route["selection"]);
+                    }
                     if v3_quota {
                         let effect_dir = provider_dir
                             .join("account-effects")
@@ -1612,6 +1706,8 @@ fn inner() {
                             assert_eq!(
                                 result["outcome"],
                                 if mode == "normal_model_provider_v3_quota_invalid"
+                                    || mode == "normal_model_provider_v3_quota_route_invalid"
+                                    || mode == "normal_model_provider_v3_quota_route_auth_failed"
                                     || mode.starts_with("normal_model_provider_v3_quota_auth")
                                 {
                                     "invalid"
@@ -1620,13 +1716,17 @@ fn inner() {
                                 }
                             );
                             assert_eq!(result["state"], "drained");
-                            if mode == "normal_model_provider_v3_quota_full" {
+                            if mode == "normal_model_provider_v3_quota_full"
+                                || mode == "normal_model_provider_v3_quota_route_full"
+                            {
                                 assert_eq!(
                                     result["windows"][0]["used_percent"].as_f64(),
                                     Some(100.0)
                                 );
                             }
-                            if mode == "normal_model_provider_v3_quota_stale" {
+                            if mode == "normal_model_provider_v3_quota_stale"
+                                || mode == "normal_model_provider_v3_quota_route_stale"
+                            {
                                 assert_eq!(
                                     result["windows"][0]["resets_at"],
                                     "2020-01-01T00:00:00Z"
@@ -1769,6 +1869,12 @@ fn inner() {
                                 | "normal_model_provider_v3_quota_invalid"
                                 | "normal_model_provider_v3_quota_full"
                                 | "normal_model_provider_v3_quota_stale"
+                                | "normal_model_provider_v3_quota_route"
+                                | "normal_model_provider_v3_quota_route_reply_loss"
+                                | "normal_model_provider_v3_quota_route_invalid"
+                                | "normal_model_provider_v3_quota_route_full"
+                                | "normal_model_provider_v3_quota_route_stale"
+                                | "normal_model_provider_v3_quota_route_auth_failed"
                                 | "normal_model_provider_v3_quota_auth"
                         )
                     {
@@ -1797,6 +1903,10 @@ fn inner() {
                             .env(
                                 "OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_READBACK_V3_SOURCE_V1",
                                 config_home.join("oulipoly-agent-runner"),
+                            )
+                            .envs(
+                                mode.starts_with("normal_model_provider_v3_quota_route")
+                                    .then_some(("OULIPOLY_KERNEL_BROKER_FIXTURE_ROUTE_V3_V1", "1")),
                             )
                             .stderr(Stdio::from(File::create(&restart_log).unwrap()))
                             .spawn()
@@ -2157,6 +2267,7 @@ fn inner() {
                                     .then(|| "local".into()),
                                 quota_script: None,
                                 auth_refresh_command: None,
+                                environment_sha256: None,
                             },
                             b'f',
                             &[std::fs::File::open("/").unwrap().as_raw_fd()],
@@ -4530,6 +4641,12 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_model_provider_v3_quota_auth_post_k",
         "normal_model_provider_v3_quota_auth_restart",
         "normal_model_provider_v3_quota_auth_failed",
+        "normal_model_provider_v3_quota_route",
+        "normal_model_provider_v3_quota_route_reply_loss",
+        "normal_model_provider_v3_quota_route_invalid",
+        "normal_model_provider_v3_quota_route_full",
+        "normal_model_provider_v3_quota_route_stale",
+        "normal_model_provider_v3_quota_route_auth_failed",
         "normal_model_provider_quota",
         "normal_model_provider_auth",
         "normal_model_provider_auth_recovery",

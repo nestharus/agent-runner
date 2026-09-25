@@ -976,6 +976,7 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
             pin: provider_pin.map(str::to_owned),
             quota_script: pool.account_effects[index].0.clone(),
             auth_refresh_command: pool.account_effects[index].1.clone(),
+            environment_sha256: None,
         };
         let pinned = private_pin_plan(&candidate.plan)?;
         let [image, cwd, input, recipe] = pinned.descriptors();
@@ -987,30 +988,37 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
         )
         .map_err(|e| format!("fresh route candidate refused before K: {e}"))?;
     }
+    let mut environment = Vec::new();
+    for (key, value) in std::env::vars_os() {
+        let key = key
+            .into_string()
+            .map_err(|_| "fresh effect environment key is not UTF-8")?;
+        if key.starts_with("LD_")
+            || key.starts_with("DYLD_")
+            || key.starts_with("OULIPOLY_KERNEL_")
+            || matches!(key.as_str(), "GLIBC_TUNABLES" | "GCONV_PATH")
+        {
+            continue;
+        }
+        let value = value
+            .into_string()
+            .map_err(|_| "fresh effect environment value is not UTF-8")?;
+        environment.push((key, value));
+    }
+    environment.sort();
+    let environment_sha256 = {
+        use sha2::{Digest, Sha256};
+        format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&environment).map_err(|e| e.to_string())?)
+        )
+    };
     let mut quota_receipts = Vec::new();
     let mut auth_receipts = Vec::new();
     for (index, (quota_script, auth_command)) in pool.account_effects.iter().enumerate() {
         if quota_script.is_none() {
             continue;
         }
-        let mut environment = Vec::new();
-        for (key, value) in std::env::vars_os() {
-            let key = key
-                .into_string()
-                .map_err(|_| "fresh effect environment key is not UTF-8")?;
-            if key.starts_with("LD_")
-                || key.starts_with("DYLD_")
-                || key.starts_with("OULIPOLY_KERNEL_")
-                || matches!(key.as_str(), "GLIBC_TUNABLES" | "GCONV_PATH")
-            {
-                continue;
-            }
-            let value = value
-                .into_string()
-                .map_err(|_| "fresh effect environment value is not UTF-8")?;
-            environment.push((key, value));
-        }
-        environment.sort();
         let mut effect = FreshAccountEffectRequest {
             d_key: authority.receipt.d_key.clone(),
             model: pool.model.name.clone(),
@@ -1018,7 +1026,7 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
             account: pool.model.providers[index].name.clone(),
             index,
             kind: FreshAccountEffectKind::QuotaFirst,
-            environment,
+            environment: environment.clone(),
         };
         let first = private_run_account_effect(&socket, &authority.receipt.handoff_id, &effect)?;
         quota_receipts.push((
@@ -1073,11 +1081,96 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
         pin: provider_pin.map(str::to_owned),
         quota_script: None,
         auth_refresh_command: None,
+        environment_sha256: Some(environment_sha256),
     };
-    let selected =
+    let route_mode = std::env::var("AGE319_PRIVATE_JOIN_MODE").unwrap_or_default();
+    let first =
+        protocol::private_fresh_route_at(&socket, &request, b'f', &[config_source.as_raw_fd()]);
+    let selected = if route_mode == "normal_model_provider_v3_quota_route_reply_loss" {
+        if first.is_ok() {
+            return Err("v3 route fixture did not lose first reply".into());
+        }
+        let gate = std::path::PathBuf::from(
+            std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                .map_err(|e| e.to_string())?,
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !gate.join("route-restarted").exists() {
+            if std::time::Instant::now() >= deadline {
+                return Err("v3 route restart fixture timed out".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         protocol::private_fresh_route_at(&socket, &request, b'f', &[config_source.as_raw_fd()])
+            .map_err(|e| format!("v3 route exact restart readback refused: {e}"))?
+            .ok_or("v3 route exact restart readback absent")?
+    } else {
+        first
             .map_err(|e| format!("fresh route selection refused before K: {e}"))?
-            .ok_or("fresh route selection absent before K")?;
+            .ok_or("fresh route selection absent before K")?
+    };
+    if route_mode.starts_with("normal_model_provider_v3_quota_route") {
+        let repeated =
+            protocol::private_fresh_route_at(&socket, &request, b'f', &[config_source.as_raw_fd()])
+                .map_err(|e| format!("v3 route exact readback refused: {e}"))?
+                .ok_or("v3 route exact readback absent")?;
+        if repeated != selected {
+            return Err("v3 route readback changed selection".into());
+        }
+        let mut changed_environment = request.clone();
+        changed_environment.environment_sha256 = Some("0".repeat(64));
+        if protocol::private_fresh_route_at(
+            &socket,
+            &changed_environment,
+            b'f',
+            &[config_source.as_raw_fd()],
+        )
+        .is_ok()
+        {
+            return Err("v3 route accepted changed environment".into());
+        }
+        let mut changed_account = request.clone();
+        changed_account.account = Some("unused".into());
+        changed_account.account_identity = Some("physical-unused".into());
+        changed_account.index = Some(0);
+        if protocol::private_fresh_route_at(
+            &socket,
+            &changed_account,
+            b'f',
+            &[config_source.as_raw_fd()],
+        )
+        .is_ok()
+        {
+            return Err("v3 route accepted changed account".into());
+        }
+        let gate = std::path::PathBuf::from(
+            std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                .map_err(|e| e.to_string())?,
+        );
+        let replacement = gate.join("replacement-config");
+        std::fs::create_dir_all(replacement.join("models")).map_err(|e| e.to_string())?;
+        std::fs::copy(
+            config_dir.join("providers.toml"),
+            replacement.join("providers.toml"),
+        )
+        .map_err(|e| e.to_string())?;
+        std::fs::copy(
+            config_dir.join("models/configured-model.toml"),
+            replacement.join("models/configured-model.toml"),
+        )
+        .map_err(|e| e.to_string())?;
+        let replacement_fd = File::open(&replacement).map_err(|e| e.to_string())?;
+        if protocol::private_fresh_route_at(&socket, &request, b'f', &[replacement_fd.as_raw_fd()])
+            .is_ok()
+        {
+            return Err("v3 route accepted changed source directory".into());
+        }
+        std::fs::write(
+            gate.join("v3-route-selection.json"),
+            serde_json::to_vec(&selected).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+    }
     if selected.model != pool.model.name
         || selected.config_sha256 != pool.config_sha256
         || selected.policy_version != "fresh-quota-account-v4"
