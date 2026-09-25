@@ -1069,6 +1069,39 @@ mod tests {
     }
 
     #[test]
+    fn v1_manifest_refuses_live_open_until_frozen_v2_rebuild() {
+        let fixture = Fixture::new();
+        fixture.prepared();
+        fixture.ready();
+        let first = fixture.rebuild().unwrap();
+        assert_eq!(
+            first
+                .compact_account("physical-first")
+                .unwrap()
+                .pending
+                .len(),
+            1
+        );
+        Index::downgrade_manifest_for_migration_test(&fixture.root).unwrap();
+        assert!(matches!(
+            Index::open(&fixture.root),
+            Err(crate::linux_main::fresh_index::IndexError::RebuildRequired(
+                _
+            ))
+        ));
+        let migrated = fixture.rebuild().unwrap();
+        assert_ne!(first.generation(), migrated.generation());
+        assert_eq!(
+            migrated
+                .compact_account("physical-first")
+                .unwrap()
+                .pending
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn consumed_k_without_q_and_q_arriving_after_scan_stay_unresolved() {
         let fixture = Fixture::new();
         fixture.consumed();

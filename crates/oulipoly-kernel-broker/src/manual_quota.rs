@@ -651,6 +651,24 @@ fn readback_intent(directory: &Path, intent: &Intent) -> io::Result<ManualQuotaR
     Ok(result)
 }
 
+/// Exact physical manual Q interpretation for the compact index projection.
+/// Rebuild calls this only after the retained intent has passed its census.
+pub(super) fn indexed_physical_readback(
+    directory: &Path,
+    operation_id: &str,
+) -> io::Result<ManualQuotaReadback> {
+    if !valid_id(operation_id) {
+        return Err(io::Error::other("manual projection operation ID invalid"));
+    }
+    let dir = operation_dir(directory, operation_id);
+    let intent: Intent = read_exact(&dir, "intent.json")?
+        .ok_or_else(|| io::Error::other("manual projection intent absent"))?;
+    if intent.request.operation_id != operation_id || intent.source_operation_id.is_some() {
+        return Err(io::Error::other("manual projection source mismatch"));
+    }
+    readback_intent(directory, &intent)
+}
+
 pub(super) fn physical_q_nanos(directory: &Path, operation_id: &str) -> io::Result<u128> {
     let dir = operation_dir(directory, operation_id);
     super::fresh_provider::file_unix_nanos(&dir.join("q.json"))
@@ -1200,7 +1218,7 @@ mod tests {
                 .route_reader_preflight("physical-first")
                 .unwrap_err()
                 .to_string()
-                .contains("unresolved effect or manual K/Q")
+                .contains("announced effect or manual debt")
         );
         let k_bytes = fs::read(dir.join("k.json")).unwrap();
         let first_revision = before.revision;
@@ -1223,7 +1241,7 @@ mod tests {
                 .route_reader_preflight("physical-first")
                 .unwrap_err()
                 .to_string()
-                .contains("typed quota projection")
+                .contains("atomic account revision join")
         );
         assert_eq!(settled.observed_invocations, 0);
         assert!(settled.revision > first_revision);

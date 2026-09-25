@@ -13,6 +13,7 @@
 //! `index-v1/route.lock` is distinct from the current live
 //! `route-selection.lock`; a future cutover must join their authority before
 //! either can admit a decision.
+use chrono::DateTime;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::cell::Cell;
@@ -25,9 +26,13 @@ use std::os::unix::net::UnixStream;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-const VERSION: u32 = 1;
+// v1 account records have no atomic compact head. They must be rebuilt offline.
+const VERSION: u32 = 2;
+const ADMISSION_PROTOCOL_VERSION: u32 = 1;
 const MAX_RECORD: u64 = 4 * 1024 * 1024;
 const MAX_RECENT_FAILURES: usize = 256;
+const MAX_HEAD_PENDING: usize = 128;
+const MAX_HEAD_SOURCES: usize = 128;
 
 /// Counts actual open attempts/successes and directory entries while an opt-in
 /// route decision or pre-K read is running on this thread. The guard is placed
@@ -331,11 +336,11 @@ pub(super) fn broker_admission_lease(root: &Path) -> Result<AdmissionLease> {
     let marker = base.join("admission-protocol.json");
     if marker.exists() {
         let version: u32 = read(&marker)?.ok_or_else(|| corrupt("admission marker absent"))?;
-        if version != VERSION {
+        if version != ADMISSION_PROTOCOL_VERSION {
             return Err(IndexError::RebuildRequired("admission protocol changed"));
         }
     } else {
-        write_new(&marker, &VERSION)?;
+        write_new(&marker, &ADMISSION_PROTOCOL_VERSION)?;
     }
     sync_dir(root)?;
     Ok(lease)
@@ -343,7 +348,7 @@ pub(super) fn broker_admission_lease(root: &Path) -> Result<AdmissionLease> {
 
 fn frozen_admission(root: &Path, socket: &Path) -> Result<AdmissionLease> {
     let base = root.join("index-v1");
-    if read::<u32>(&base.join("admission-protocol.json"))? != Some(VERSION) {
+    if read::<u32>(&base.join("admission-protocol.json"))? != Some(ADMISSION_PROTOCOL_VERSION) {
         return Err(IndexError::RebuildRequired(
             "no compatible broker admission freeze proof",
         ));
@@ -378,8 +383,8 @@ pub(super) enum GenesisAuthority {
     ConfirmedFreshEmptyDirectory,
 }
 impl Index {
-    /// The private reader probe is intentionally non-activating until the
-    /// index can authenticate newly visible source evidence at read time.
+    /// The private reader probe remains non-activating until revision-joined
+    /// choice and pre-K admission, plus the old-writer deployment guard.
     pub(super) fn enable_route_reader_probe(mut self) -> Self {
         self.route_reader_probe = true;
         self
@@ -388,34 +393,34 @@ impl Index {
         self.route_reader_probe
     }
     pub(super) fn route_reader_preflight(&self, physical_key: &str) -> Result<()> {
-        let _lock = locked(&self.key_path("accounts", &format!("lock:{physical_key}"))?)?;
-        self.check_generation()?;
-        let account = self.account_unlocked(physical_key)?;
-        if account
-            .grants
-            .values()
-            .any(|grant| grant.consumed_k.is_some() && grant.certified_q.is_none())
-        {
+        let head = self.compact_account(physical_key)?;
+        if head.pending.keys().any(|key| key.starts_with("grant:")) {
             return Err(IndexError::Conflict(
-                "indexed route reader has unresolved provider K/Q",
+                "indexed route reader has announced provider debt",
             ));
         }
-        if account
-            .effects
-            .values()
-            .any(|effect| effect.consumed_k.is_some() && effect.certified_q.is_none())
-        {
+        if !head.pending.is_empty() {
             return Err(IndexError::Conflict(
-                "indexed route reader has unresolved effect or manual K/Q",
+                "indexed route reader has announced effect or manual debt",
             ));
         }
-        // The record carries Q references and marker maxima, but neither a
-        // read-time census of unannounced source files nor the typed window
-        // result needed to authorize the current physical quota cache. A
-        // successful account read is therefore not an eligibility verdict.
+        // A typed read is still not an atomic route/pre-K revision join.
         Err(IndexError::RebuildRequired(
-            "route reader lacks read-time source census and typed quota projection",
+            "route reader lacks atomic account revision join",
         ))
+    }
+    pub(super) fn compact_account(&self, key: &str) -> Result<AccountHead> {
+        let _lock = locked(&self.key_path("accounts", &format!("lock:{key}"))?)?;
+        self.check_generation()?;
+        if !self.known("accounts", &key.to_owned())? {
+            return Err(IndexError::RebuildRequired(
+                "compact account has no known key",
+            ));
+        }
+        let head: AccountHead = read(&self.key_path("heads", &key)?)?
+            .ok_or(IndexError::RebuildRequired("compact account head absent"))?;
+        head.validate_current(&self.root, &self.generation, key)?;
+        Ok(head)
     }
     pub(super) fn evidence_root(&self) -> &Path {
         &self.root
@@ -450,10 +455,10 @@ impl Index {
                 ));
             }
         }
-        for name in ["cursors", "accounts", "decisions"] {
+        for name in ["cursors", "accounts", "heads", "decisions"] {
             fs::create_dir(base.join(name))?;
         }
-        for name in ["cursors", "accounts", "decisions"] {
+        for name in ["cursors", "accounts", "heads", "decisions"] {
             sync_dir(&base.join(name))?;
         }
         sync_dir(&base)?;
@@ -489,7 +494,7 @@ impl Index {
         } else {
             root.join("index-v1")
         };
-        for name in ["cursors", "accounts", "decisions"] {
+        for name in ["cursors", "accounts", "heads", "decisions"] {
             if !storage.join(name).is_dir() {
                 return Err(IndexError::RebuildRequired("index storage missing"));
             }
@@ -500,6 +505,13 @@ impl Index {
             storage,
             route_reader_probe: false,
         })
+    }
+    #[cfg(test)]
+    pub(super) fn downgrade_manifest_for_migration_test(root: &Path) -> Result<()> {
+        let path = root.join("index-v1/manifest.json");
+        let mut manifest: Manifest = read(&path)?.ok_or_else(|| corrupt("test manifest absent"))?;
+        manifest.version = 1;
+        write_atomic(&path, &manifest)
     }
     fn base(&self) -> PathBuf {
         self.storage.clone()
@@ -643,11 +655,13 @@ impl Index {
                     "pre-index broker evidence exists",
                 ));
             }
-            if read::<u32>(&base.join("admission-protocol.json"))? != Some(VERSION) {
+            if read::<u32>(&base.join("admission-protocol.json"))?
+                != Some(ADMISSION_PROTOCOL_VERSION)
+            {
                 return Err(IndexError::RebuildRequired("admission protocol changed"));
             }
             let _guard = locked(&base.join("genesis.lock"))?;
-            for name in ["cursors", "accounts", "decisions"] {
+            for name in ["cursors", "accounts", "heads", "decisions"] {
                 fs::create_dir(base.join(name))?;
                 sync_dir(&base.join(name))?;
             }
@@ -665,6 +679,9 @@ impl Index {
             Self::open(root)?
         };
         index.validate_live_routes()?;
+        for key in index.live_account_keys()? {
+            index.compact_account(&key)?;
+        }
         super::fresh_provider::reconcile_live_provider_accounts(&index)
             .map_err(|error| corrupt(format!("live provider account admission: {error}")))?;
         super::fresh_provider::reconcile_live_account_effects(&index)
@@ -885,7 +902,7 @@ impl Index {
         let generation = uuid::Uuid::new_v4().to_string();
         let storage = generations.join(&generation);
         fs::create_dir(&storage)?;
-        for class in ["cursors", "accounts", "decisions"] {
+        for class in ["cursors", "accounts", "heads", "decisions"] {
             fs::create_dir(storage.join(class))?;
         }
         sync_dir(&generations)?;
@@ -944,10 +961,14 @@ impl Index {
                 return Err(corrupt("offline account identity mismatch"));
             }
             account.generation = generation.clone();
+            account.revision = account.revision.max(1);
+            let head = AccountHead::from_account(root, &account)?;
+            head.validate_current(root, &generation, &key)?;
             staged.mark_known("accounts", &key)?;
             write_new(&staged.key_path("accounts", &key)?, &account)?;
+            write_new(&staged.key_path("heads", &key)?, &head)?;
         }
-        for class in ["cursors", "accounts", "decisions"] {
+        for class in ["cursors", "accounts", "heads", "decisions"] {
             sync_dir(&staged.base().join(class))?;
         }
         sync_dir(&staged.base())?;
@@ -1359,6 +1380,7 @@ impl Artifact {
         {
             return Err(corrupt("invalid artifact reference"));
         }
+        reader_open_attempt();
         let mut f = match OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
@@ -1368,6 +1390,7 @@ impl Artifact {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(e) => return Err(e.into()),
         };
+        reader_opened();
         let before = f.metadata()?;
         if !before.is_file() {
             return Err(corrupt("artifact is not regular"));
@@ -1383,6 +1406,27 @@ impl Artifact {
             return Err(corrupt("artifact digest mismatch"));
         }
         Ok(true)
+    }
+    fn read_json<T: DeserializeOwned>(&self, root: &Path) -> Result<T> {
+        self.validate()?;
+        let path = root.join(&self.path);
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)?;
+        let before = file.metadata()?;
+        if !before.is_file() || before.len() > MAX_RECORD {
+            return Err(corrupt("typed artifact invalid or oversize"));
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        let after = file.metadata()?;
+        if (before.dev(), before.ino(), before.len()) != (after.dev(), after.ino(), after.len())
+            || hash(&bytes) != self.sha256
+        {
+            return Err(corrupt("typed artifact digest changed"));
+        }
+        serde_json::from_slice(&bytes).map_err(|e| corrupt(format!("typed artifact: {e}")))
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1456,6 +1500,94 @@ pub(super) struct SourceQ {
     pub latest_quota_q: Option<PhysicalQ>,
     pub latest_auth_q: Option<PhysicalQ>,
 }
+/// Small, versioned read projection. The account audit record remains the
+/// writer's exact retained history; only this record is opened by a compact
+/// account read. Cardinality limits turn unusual fan-out into a refusal.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AccountHead {
+    pub generation: String,
+    pub physical_key: String,
+    pub revision: u64,
+    pub committed: bool,
+    pub pending: BTreeMap<String, PendingHead>,
+    pub sources: BTreeMap<String, SourceHead>,
+    pub quota_rejection: Option<MarkerHead>,
+    pub auth_rejection: Option<MarkerHead>,
+    pub model_capacity: BTreeMap<String, MarkerHead>,
+    pub marker_times: MarkerTimes,
+    /// Old or malformed marker evidence cannot be assigned a safe scope.
+    pub unknown_marker_scope: bool,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PendingHead {
+    pub announcement: Artifact,
+    pub candidate: Option<Artifact>,
+    pub physical_k: Option<Artifact>,
+    pub source: Option<SourceKey>,
+    pub model: Option<String>,
+    pub config_sha256: Option<String>,
+    pub decision_handoff: String,
+    pub kind: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SourceHead {
+    pub source: SourceKey,
+    pub quota: Option<ObservationHead>,
+    pub auth: Option<ObservationHead>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ObservationHead {
+    pub q: PhysicalQ,
+    pub result: Option<Artifact>,
+    pub outcome: String,
+    pub origin_model: Option<String>,
+    pub origin_config_sha256: Option<String>,
+    pub completed_unix_seconds: Option<i64>,
+    pub windows: Vec<WindowHead>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct WindowHead {
+    pub used_percent: f64,
+    pub resets_at: String,
+    pub reset_unix_seconds: i64,
+    pub remaining: Option<u64>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct MarkerHead {
+    pub q: PhysicalQ,
+    pub model: String,
+    pub config_sha256: String,
+    pub outcome: String,
+}
+impl ObservationHead {
+    /// Typed cache calculation only. This is not a route eligibility verdict.
+    pub(super) fn quota_basis_points_at(&self, now: i64) -> Option<u32> {
+        if self.outcome != "valid_windows" || self.windows.is_empty() {
+            return None;
+        }
+        let completed = self.completed_unix_seconds?;
+        if now < completed || now.checked_sub(completed)? >= 5 * 60 * 60 {
+            return None;
+        }
+        let mut binding = u32::MAX;
+        for window in &self.windows {
+            if window.reset_unix_seconds <= now
+                || window.used_percent >= 100.0
+                || window.remaining == Some(0)
+            {
+                return None;
+            }
+            binding = binding.min(((100.0 - window.used_percent) * 100.0).round() as u32);
+        }
+        Some(binding)
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Account {
@@ -1468,6 +1600,380 @@ pub(super) struct Account {
     pub markers: MarkerTimes,
     pub source_q: BTreeMap<String, SourceQ>,
     pub recent_failure_nanos: Vec<i64>,
+}
+impl AccountHead {
+    fn from_account(root: &Path, account: &Account) -> Result<Self> {
+        let mut head = Self {
+            generation: account.generation.clone(),
+            physical_key: account.physical_key.clone(),
+            revision: account.revision,
+            committed: true,
+            pending: BTreeMap::new(),
+            sources: BTreeMap::new(),
+            quota_rejection: None,
+            auth_rejection: None,
+            model_capacity: BTreeMap::new(),
+            marker_times: account.markers.clone(),
+            unknown_marker_scope: false,
+        };
+        for (id, grant) in &account.grants {
+            if let Some(q) = &grant.certified_q {
+                let Some(terminal) = &q.terminal else {
+                    return Err(corrupt("settled provider missing terminal"));
+                };
+                let record: serde_json::Value = match terminal.read_json(root) {
+                    Ok(record) => record,
+                    // Old opaque records can remain in the audit, but cannot
+                    // authorize a scoped marker in the compact projection.
+                    Err(_) => {
+                        head.unknown_marker_scope = true;
+                        continue;
+                    }
+                };
+                let selection = &record["selection"];
+                let model = selection["model"].as_str();
+                let config = selection["config_sha256"].as_str();
+                let physical = selection["account_identity"].as_str();
+                let outcome = record["outcome"].as_str();
+                if record["grant_id"].as_str() != Some(id)
+                    || record["physical_q_sha256"].as_str() != Some(&q.q.sha256)
+                    || record["physical_q_unix_nanos"].as_u64()
+                        != u64::try_from(q.completed_unix_nanos).ok()
+                    || physical != Some(account.physical_key.as_str())
+                    || model.is_none()
+                    || config.is_none()
+                    || outcome.is_none()
+                {
+                    head.unknown_marker_scope = true;
+                    continue;
+                }
+                let marker = MarkerHead {
+                    q: q.clone(),
+                    model: model.unwrap().to_owned(),
+                    config_sha256: config.unwrap().to_owned(),
+                    outcome: outcome.unwrap().to_owned(),
+                };
+                match marker.outcome.as_str() {
+                    "quota_rejected" => replace_newer_marker(&mut head.quota_rejection, marker),
+                    "auth_rejected" => replace_newer_marker(&mut head.auth_rejection, marker),
+                    "model_at_capacity" => {
+                        let key = keyed(&(&marker.model, &marker.config_sha256))?;
+                        match head.model_capacity.entry(key) {
+                            std::collections::btree_map::Entry::Vacant(entry) => {
+                                entry.insert(marker);
+                            }
+                            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                                if entry.get().q.completed_unix_nanos
+                                    <= marker.q.completed_unix_nanos
+                                {
+                                    entry.insert(marker);
+                                }
+                            }
+                        }
+                    }
+                    "clean"
+                    | "generic_failure"
+                    | "cancelled"
+                    | "unknown"
+                    | "maybe_quota"
+                    | "provider_unavailable"
+                    | "rate_limited"
+                    | "storage_contention" => {}
+                    _ => head.unknown_marker_scope = true,
+                }
+            } else {
+                let (model, config_sha256) = grant
+                    .candidate
+                    .as_ref()
+                    .map(|artifact| artifact_scope(root, artifact))
+                    .unwrap_or((None, None));
+                head.pending.insert(
+                    format!("grant:{id}"),
+                    PendingHead {
+                        announcement: grant.grant.clone(),
+                        candidate: grant.candidate.clone(),
+                        physical_k: grant.consumed_k.clone(),
+                        source: None,
+                        model,
+                        config_sha256,
+                        decision_handoff: grant.decision_handoff.clone(),
+                        kind: "provider".into(),
+                    },
+                );
+            }
+        }
+        for (id, effect) in &account.effects {
+            if effect.certified_q.is_none() || effect.result.is_none() {
+                if effect.reuse.is_none() && physical_effect(root, effect)? {
+                    let (model, config_sha256) = if matches!(effect.kind, EffectKind::ManualQuota) {
+                        let value = effect.intent.read_json::<serde_json::Value>(root).ok();
+                        (
+                            value
+                                .as_ref()
+                                .and_then(|v| v["request"]["model"].as_str())
+                                .map(str::to_owned),
+                            value
+                                .as_ref()
+                                .and_then(|v| v["request"]["config_sha256"].as_str())
+                                .map(str::to_owned),
+                        )
+                    } else {
+                        effect
+                            .candidate
+                            .as_ref()
+                            .map(|artifact| artifact_scope(root, artifact))
+                            .unwrap_or((None, None))
+                    };
+                    head.pending.insert(
+                        format!("effect:{id}"),
+                        PendingHead {
+                            announcement: effect.intent.clone(),
+                            candidate: effect.candidate.clone(),
+                            physical_k: effect.consumed_k.clone(),
+                            source: Some(effect.source.clone()),
+                            model,
+                            config_sha256,
+                            decision_handoff: effect.decision_handoff.clone(),
+                            kind: format!("{:?}", effect.kind),
+                        },
+                    );
+                }
+            }
+            let Some(q) = &effect.certified_q else {
+                continue;
+            };
+            let observation = typed_observation(root, &account.physical_key, id, effect, q)?;
+            let digest = keyed(&effect.source)?;
+            let source = head.sources.entry(digest).or_insert_with(|| SourceHead {
+                source: effect.source.clone(),
+                quota: None,
+                auth: None,
+            });
+            if source.source != effect.source {
+                return Err(corrupt("compact source collision"));
+            }
+            let target = match effect.kind {
+                EffectKind::Quota | EffectKind::ManualQuota => &mut source.quota,
+                EffectKind::Auth => &mut source.auth,
+            };
+            match target {
+                Some(old)
+                    if old.q.completed_unix_nanos == q.completed_unix_nanos && old.q != *q =>
+                {
+                    old.outcome = "unknown".into();
+                    old.windows.clear();
+                }
+                Some(old) if old.q.completed_unix_nanos > q.completed_unix_nanos => {}
+                _ => *target = Some(observation),
+            }
+        }
+        if account.markers.quota_rejection_nanos
+            != head
+                .quota_rejection
+                .as_ref()
+                .map(|m| m.q.completed_unix_nanos)
+            || account.markers.auth_rejection_nanos
+                != head
+                    .auth_rejection
+                    .as_ref()
+                    .map(|m| m.q.completed_unix_nanos)
+            || account.markers.model_capacity_nanos
+                != head
+                    .model_capacity
+                    .values()
+                    .map(|m| m.q.completed_unix_nanos)
+                    .max()
+        {
+            head.unknown_marker_scope = true;
+        }
+        if head.pending.len() > MAX_HEAD_PENDING
+            || head.sources.len() > MAX_HEAD_SOURCES
+            || head.model_capacity.len() > MAX_HEAD_SOURCES
+        {
+            return Err(IndexError::Conflict(
+                "compact account head cardinality exceeded",
+            ));
+        }
+        Ok(head)
+    }
+    fn validate_current(&self, root: &Path, generation: &str, key: &str) -> Result<()> {
+        if !self.committed
+            || self.generation != generation
+            || self.physical_key != key
+            || self.revision == 0
+            || self.pending.len() > MAX_HEAD_PENDING
+            || self.sources.len() > MAX_HEAD_SOURCES
+            || self.model_capacity.len() > MAX_HEAD_SOURCES
+        {
+            return Err(IndexError::RebuildRequired(
+                "compact account head incomplete",
+            ));
+        }
+        for pending in self.pending.values() {
+            pending.announcement.validate()?;
+            if let Some(candidate) = &pending.candidate {
+                candidate.require_present(root)?;
+            }
+            if let Some(k) = &pending.physical_k {
+                pending.announcement.require_present(root)?;
+                k.require_present(root)?;
+            }
+        }
+        for (digest, source) in &self.sources {
+            if !source.source.valid() || keyed(&source.source)? != *digest {
+                return Err(corrupt("compact source key mismatch"));
+            }
+            for observation in [&source.quota, &source.auth].into_iter().flatten() {
+                observation.q.verify(root)?;
+                if let Some(result) = &observation.result {
+                    result.require_present(root)?;
+                }
+                if observation.windows.len() > 64
+                    || observation.windows.iter().any(|w| {
+                        !w.used_percent.is_finite()
+                            || !(0.0..=100.0).contains(&w.used_percent)
+                            || DateTime::parse_from_rfc3339(&w.resets_at)
+                                .map_or(true, |d| d.timestamp() != w.reset_unix_seconds)
+                    })
+                {
+                    return Err(corrupt("compact typed window invalid"));
+                }
+            }
+        }
+        for marker in [&self.quota_rejection, &self.auth_rejection]
+            .into_iter()
+            .flatten()
+        {
+            marker.q.verify(root)?;
+        }
+        for marker in self.model_capacity.values() {
+            marker.q.verify(root)?;
+        }
+        Ok(())
+    }
+}
+fn replace_newer_marker(target: &mut Option<MarkerHead>, marker: MarkerHead) {
+    if target
+        .as_ref()
+        .is_none_or(|old| old.q.completed_unix_nanos <= marker.q.completed_unix_nanos)
+    {
+        *target = Some(marker);
+    }
+}
+fn artifact_scope(root: &Path, artifact: &Artifact) -> (Option<String>, Option<String>) {
+    let Ok(value) = artifact.read_json::<serde_json::Value>(root) else {
+        return (None, None);
+    };
+    (
+        value["model"].as_str().map(str::to_owned),
+        value["config_sha256"].as_str().map(str::to_owned),
+    )
+}
+fn physical_effect(root: &Path, effect: &EffectIntent) -> Result<bool> {
+    if !matches!(effect.kind, EffectKind::ManualQuota) {
+        return Ok(true);
+    }
+    let value: serde_json::Value = match effect.intent.read_json(root) {
+        Ok(value) => value,
+        Err(_) => return Ok(true), // unknown intent is debt
+    };
+    if !value.is_object()
+        || value.get("source_operation_id").is_none()
+        || value.get("quota_script").is_none()
+    {
+        return Ok(true);
+    }
+    Ok(value["source_operation_id"].is_null() && !value["quota_script"].is_null())
+}
+fn typed_observation(
+    root: &Path,
+    physical_key: &str,
+    id: &str,
+    effect: &EffectIntent,
+    q: &PhysicalQ,
+) -> Result<ObservationHead> {
+    let mut observation = ObservationHead {
+        q: q.clone(),
+        result: effect.result.clone(),
+        outcome: "unknown".into(),
+        origin_model: None,
+        origin_config_sha256: None,
+        completed_unix_seconds: None,
+        windows: Vec::new(),
+    };
+    if matches!(effect.kind, EffectKind::ManualQuota) {
+        if let Ok(value) = effect.intent.read_json::<serde_json::Value>(root) {
+            observation.origin_model = value["request"]["model"].as_str().map(str::to_owned);
+            observation.origin_config_sha256 = value["request"]["config_sha256"]
+                .as_str()
+                .map(str::to_owned);
+        }
+    } else if let Some(candidate) = &effect.candidate {
+        if let Ok(value) = candidate.read_json::<serde_json::Value>(root) {
+            observation.origin_model = value["model"].as_str().map(str::to_owned);
+            observation.origin_config_sha256 = value["config_sha256"].as_str().map(str::to_owned);
+        }
+    }
+    let Some(result) = &effect.result else {
+        return Ok(observation);
+    };
+    let (state, outcome, completed, windows) = if matches!(effect.kind, EffectKind::ManualQuota) {
+        let readback = super::manual_quota::indexed_physical_readback(root, id)?;
+        if readback.operation_id != id || readback.physical_account_id != physical_key {
+            return Err(corrupt("manual compact Q identity changed"));
+        }
+        (
+            readback.state,
+            readback.outcome,
+            readback.completed_unix_seconds,
+            readback.windows,
+        )
+    } else {
+        let readback: oulipoly_kernel_broker::protocol::FreshAccountEffectReadback =
+            match result.read_json(root) {
+                Ok(value) => value,
+                Err(_) => return Ok(observation),
+            };
+        if readback.effect_id != id {
+            return Err(corrupt("effect compact Q identity changed"));
+        }
+        (
+            readback.state,
+            readback.outcome,
+            readback.completed_unix_seconds,
+            readback.windows,
+        )
+    };
+    if state != "drained" {
+        return Ok(observation);
+    }
+    observation.outcome = outcome.unwrap_or_else(|| "unknown".into());
+    observation.completed_unix_seconds = completed;
+    if observation.outcome == "valid_windows" {
+        if windows.is_empty() || windows.len() > 64 {
+            observation.outcome = "invalid".into();
+            return Ok(observation);
+        }
+        for window in windows {
+            let Ok(reset) = DateTime::parse_from_rfc3339(&window.resets_at) else {
+                observation.outcome = "invalid".into();
+                observation.windows.clear();
+                return Ok(observation);
+            };
+            if !window.used_percent.is_finite() || !(0.0..=100.0).contains(&window.used_percent) {
+                observation.outcome = "invalid".into();
+                observation.windows.clear();
+                return Ok(observation);
+            }
+            observation.windows.push(WindowHead {
+                used_percent: window.used_percent,
+                resets_at: window.resets_at,
+                reset_unix_seconds: reset.timestamp(),
+                remaining: window.remaining,
+            });
+        }
+    }
+    Ok(observation)
 }
 impl Index {
     fn account_unlocked(&self, key: &str) -> Result<Account> {
@@ -1619,6 +2125,21 @@ impl Index {
         let _lock = locked(&self.key_path("accounts", &format!("lock:{key}"))?)?;
         self.check_generation()?;
         let mut a = self.account_unlocked(key)?;
+        let previous_head: Option<AccountHead> = read(&self.key_path("heads", &key)?)?;
+        if a.revision == 0 {
+            if previous_head.is_some() {
+                return Err(corrupt("compact head precedes account"));
+            }
+        } else if previous_head.as_ref().is_none_or(|h| {
+            !h.committed
+                || h.generation != self.generation
+                || h.physical_key != key
+                || h.revision != a.revision
+        }) {
+            return Err(IndexError::RebuildRequired(
+                "compact head/account CAS incomplete",
+            ));
+        }
         if a.revision != expected_revision {
             return Err(IndexError::Conflict("account CAS mismatch"));
         }
@@ -1759,7 +2280,9 @@ impl Index {
                     effect.certified_q = Some(q.clone());
                     effect.result = Some(result);
                 } else {
-                    a.effects.remove(&id);
+                    // Unknown typed result is retained as the newest Q and
+                    // remains debt. It cannot expose an older healthy source.
+                    a.effects.get_mut(&id).unwrap().certified_q = Some(q.clone());
                 }
                 if marker == Some(true) {
                     a.mark(&kind, q.completed_unix_nanos);
@@ -1796,8 +2319,13 @@ impl Index {
             .checked_add(1)
             .ok_or(IndexError::Conflict("account revision overflow"))?;
         self.check_generation()?;
+        let mut head = AccountHead::from_account(&self.root, &a)?;
+        head.committed = false;
+        write_atomic(&self.key_path("heads", &key)?, &head)?;
         self.mark_known("accounts", &key.to_owned())?;
         write_atomic(&self.key_path("accounts", &key)?, &a)?;
+        head.committed = true;
+        write_atomic(&self.key_path("heads", &key)?, &head)?;
         Ok(a)
     }
 }
@@ -2692,5 +3220,445 @@ mod tests {
                 .completed_unix_nanos,
             50
         );
+    }
+
+    #[test]
+    fn compact_typed_head_is_constant_over_settled_history_and_never_revives_old_q() {
+        let (temp, _genesis) = fresh();
+        let root = temp.path();
+        let wal = root.join("old-state.db-wal");
+        fs::write(&wal, b"old WAL sentinel").unwrap();
+        let source = SourceKey {
+            commands_sha256: "exact-command".into(),
+            environment_sha256: "exact-env".into(),
+        };
+        let mut account = Account {
+            generation: String::new(),
+            physical_key: "physical".into(),
+            revision: 0,
+            grants: BTreeMap::new(),
+            effects: BTreeMap::new(),
+            observed_invocations: 0,
+            markers: MarkerTimes::default(),
+            source_q: BTreeMap::new(),
+            recent_failure_nanos: Vec::new(),
+        };
+        fn add(
+            root: &Path,
+            account: &mut Account,
+            source: &SourceKey,
+            n: usize,
+            outcome: &str,
+            used: f64,
+            model: &str,
+        ) {
+            let id = format!("effect-{n:03}");
+            let intent = artifact(root, &format!("{id}.intent.json"), b"intent");
+            let k = artifact(root, &format!("{id}.k.json"), b"K");
+            let q = artifact(root, &format!("{id}.q.json"), b"Q");
+            let candidate_bytes =
+                serde_json::to_vec(&serde_json::json!({"model":model,"config_sha256":"config"}))
+                    .unwrap();
+            let candidate = artifact(root, &format!("{id}.candidate.json"), &candidate_bytes);
+            let windows = if outcome == "valid_windows" && used == 100.0 {
+                serde_json::json!([
+                    {"used_percent":20.0,"resets_at":"2099-01-01T00:00:00Z","remaining":50},
+                    {"used_percent":used,"resets_at":"2099-01-01T00:00:00Z","remaining":0}
+                ])
+            } else if outcome == "valid_windows" {
+                serde_json::json!([{"used_percent":used,"resets_at":"2099-01-01T00:00:00Z","remaining":50}])
+            } else {
+                serde_json::json!([])
+            };
+            let result_bytes = serde_json::to_vec(&serde_json::json!({
+                "effect_id":id,"state":"drained","outcome":outcome,"windows":windows,
+                "completed_unix_seconds":100,"artifact":"exact","peer_effect_id":null,"peer_artifact":null
+            })).unwrap();
+            let result = artifact(root, &format!("{id}.result.json"), &result_bytes);
+            account.effects.insert(
+                id,
+                EffectIntent {
+                    kind: EffectKind::Quota,
+                    source: source.clone(),
+                    decision_handoff: String::new(),
+                    route_source: None,
+                    candidate: Some(candidate),
+                    intent,
+                    reuse: None,
+                    consumed_k: Some(k.clone()),
+                    certified_q: Some(PhysicalQ {
+                        physical_k: k,
+                        q,
+                        terminal: None,
+                        completed_unix_nanos: n as i64,
+                    }),
+                    result: Some(result),
+                },
+            );
+        }
+        fn publish(root: &Path, account: &Account) -> Index {
+            let mut snapshot = OfflineSnapshot::default();
+            snapshot.accounts.insert("physical".into(), account.clone());
+            Index::publish_offline(root, snapshot).unwrap()
+        }
+        add(
+            root,
+            &mut account,
+            &source,
+            1,
+            "valid_windows",
+            20.0,
+            "model-a",
+        );
+        let one = publish(root, &account);
+        let (first, first_io) = {
+            let _guard = ReaderIoGuard::start("compact-one");
+            let head = one.compact_account("physical").unwrap();
+            drop(_guard);
+            (head, last_reader_io().unwrap())
+        };
+        let digest = keyed(&source).unwrap();
+        assert_eq!(
+            first.sources[&digest]
+                .quota
+                .as_ref()
+                .unwrap()
+                .quota_basis_points_at(100),
+            Some(8000)
+        );
+        assert_eq!(
+            first.sources[&digest]
+                .quota
+                .as_ref()
+                .unwrap()
+                .quota_basis_points_at(100 + 5 * 60 * 60),
+            None
+        );
+        for n in 2..317 {
+            add(
+                root,
+                &mut account,
+                &source,
+                n,
+                "valid_windows",
+                20.0,
+                "model-a",
+            );
+        }
+        add(root, &mut account, &source, 317, "failed", 0.0, "model-b");
+        let failed = publish(root, &account).compact_account("physical").unwrap();
+        assert_eq!(
+            failed.sources[&digest].quota.as_ref().unwrap().outcome,
+            "failed"
+        );
+        assert_eq!(
+            failed.sources[&digest]
+                .quota
+                .as_ref()
+                .unwrap()
+                .quota_basis_points_at(100),
+            None
+        );
+        add(root, &mut account, &source, 318, "empty", 0.0, "model-b");
+        let empty = publish(root, &account).compact_account("physical").unwrap();
+        assert_eq!(
+            empty.sources[&digest].quota.as_ref().unwrap().outcome,
+            "empty"
+        );
+        assert_eq!(
+            empty.sources[&digest]
+                .quota
+                .as_ref()
+                .unwrap()
+                .quota_basis_points_at(100),
+            None
+        );
+        add(
+            root,
+            &mut account,
+            &source,
+            319,
+            "valid_windows",
+            100.0,
+            "model-b",
+        );
+        let exhausted = publish(root, &account).compact_account("physical").unwrap();
+        let q = exhausted.sources[&digest].quota.as_ref().unwrap();
+        assert_eq!(q.origin_model.as_deref(), Some("model-b"));
+        assert_eq!(
+            q.quota_basis_points_at(100),
+            None,
+            "any full window excludes immediately"
+        );
+        add(root, &mut account, &source, 320, "invalid", 0.0, "model-b");
+        let many = publish(root, &account);
+        let (latest, many_io) = {
+            let _guard = ReaderIoGuard::start("compact-many");
+            let head = many.compact_account("physical").unwrap();
+            drop(_guard);
+            (head, last_reader_io().unwrap())
+        };
+        let q = latest.sources[&digest].quota.as_ref().unwrap();
+        assert_eq!(q.q.completed_unix_nanos, 320);
+        assert_eq!(q.outcome, "invalid");
+        assert_eq!(q.quota_basis_points_at(100), None);
+        assert_eq!(
+            many_io, first_io,
+            "compact read must not reopen settled history"
+        );
+        assert_eq!(many_io.directory_entries, 0);
+        assert!(many_io.opened > 0);
+        assert_eq!(fs::read(&wal).unwrap(), b"old WAL sentinel");
+        assert_eq!(
+            Index::open(root)
+                .unwrap()
+                .compact_account("physical")
+                .unwrap()
+                .revision,
+            latest.revision
+        );
+        assert!(matches!(
+            one.compact_account("physical"),
+            Err(IndexError::RebuildRequired(_))
+        ));
+        let intent = artifact(root, "effect-321.intent", b"pending");
+        many.update_account(
+            "physical",
+            latest.revision,
+            AccountUpdate::AnnounceEffect {
+                id: "effect-321".into(),
+                effect: EffectIntent {
+                    kind: EffectKind::Quota,
+                    source: source.clone(),
+                    decision_handoff: String::new(),
+                    route_source: None,
+                    candidate: None,
+                    intent,
+                    reuse: None,
+                    consumed_k: None,
+                    certified_q: None,
+                    result: None,
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(many.compact_account("physical").unwrap().pending.len(), 1);
+        assert!(matches!(
+            many.route_reader_preflight("physical"),
+            Err(IndexError::Conflict(_))
+        ));
+        fs::remove_file(many.key_path("heads", &"physical").unwrap()).unwrap();
+        assert!(matches!(
+            many.compact_account("physical"),
+            Err(IndexError::RebuildRequired(_))
+        ));
+    }
+
+    #[test]
+    fn compact_head_announcements_are_debt_before_and_after_k() {
+        let (temp, index) = fresh();
+        let grant = artifact(temp.path(), "grant.json", b"grant");
+        let account = index
+            .update_account(
+                "physical",
+                0,
+                AccountUpdate::AnnounceGrant {
+                    id: "grant".into(),
+                    grant: ProviderGrant {
+                        decision_handoff: "decision".into(),
+                        grant,
+                        candidate: None,
+                        consumed_k: None,
+                        certified_q: None,
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(index.compact_account("physical").unwrap().pending.len(), 1);
+        assert!(matches!(
+            index.route_reader_preflight("physical"),
+            Err(IndexError::Conflict(_))
+        ));
+        let k = artifact(temp.path(), "grant.k.json", b"K");
+        index
+            .update_account(
+                "physical",
+                account.revision,
+                AccountUpdate::ConsumeGrant {
+                    id: "grant".into(),
+                    k,
+                },
+            )
+            .unwrap();
+        assert_eq!(index.compact_account("physical").unwrap().pending.len(), 1);
+        let intent = artifact(temp.path(), "effect.intent.json", b"intent");
+        let account = index.account("physical").unwrap();
+        index
+            .update_account(
+                "physical",
+                account.revision,
+                AccountUpdate::AnnounceEffect {
+                    id: "effect".into(),
+                    effect: EffectIntent {
+                        kind: EffectKind::Quota,
+                        source: SourceKey {
+                            commands_sha256: "command".into(),
+                            environment_sha256: "env".into(),
+                        },
+                        decision_handoff: String::new(),
+                        route_source: None,
+                        candidate: None,
+                        intent,
+                        reuse: None,
+                        consumed_k: None,
+                        certified_q: None,
+                        result: None,
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(index.compact_account("physical").unwrap().pending.len(), 2);
+        let manual_intent = artifact(
+            temp.path(),
+            "manual.intent.json",
+            br#"{"source_operation_id":null,"quota_script":"quota"}"#,
+        );
+        let account = index.account("physical").unwrap();
+        index
+            .update_account(
+                "physical",
+                account.revision,
+                AccountUpdate::AnnounceEffect {
+                    id: "manual".into(),
+                    effect: EffectIntent {
+                        kind: EffectKind::ManualQuota,
+                        source: SourceKey {
+                            commands_sha256: "manual-command".into(),
+                            environment_sha256: "manual-env".into(),
+                        },
+                        decision_handoff: String::new(),
+                        route_source: None,
+                        candidate: None,
+                        intent: manual_intent,
+                        reuse: None,
+                        consumed_k: None,
+                        certified_q: None,
+                        result: None,
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(index.compact_account("physical").unwrap().pending.len(), 3);
+        let manual_k = artifact(temp.path(), "manual.k.json", b"K");
+        let account = index.account("physical").unwrap();
+        index
+            .update_account(
+                "physical",
+                account.revision,
+                AccountUpdate::ConsumeEffect {
+                    id: "manual".into(),
+                    k: manual_k,
+                },
+            )
+            .unwrap();
+        assert_eq!(index.compact_account("physical").unwrap().pending.len(), 3);
+        let mut pending = index.compact_account("physical").unwrap();
+        pending.committed = false;
+        write_atomic(&index.key_path("heads", &"physical").unwrap(), &pending).unwrap();
+        assert!(matches!(
+            index.compact_account("physical"),
+            Err(IndexError::RebuildRequired(_))
+        ));
+        assert!(matches!(
+            index.update_account(
+                "physical",
+                5,
+                AccountUpdate::PruneFailures { before_nanos: 0 }
+            ),
+            Err(IndexError::RebuildRequired(_))
+        ));
+    }
+
+    #[test]
+    fn compact_markers_keep_account_rejection_separate_from_model_capacity() {
+        let (temp, _index) = fresh();
+        let root = temp.path();
+        let mut account = Account {
+            generation: String::new(),
+            physical_key: "physical".into(),
+            revision: 0,
+            grants: BTreeMap::new(),
+            effects: BTreeMap::new(),
+            observed_invocations: 3,
+            markers: MarkerTimes {
+                quota_rejection_nanos: Some(20),
+                auth_rejection_nanos: Some(30),
+                model_capacity_nanos: Some(10),
+            },
+            source_q: BTreeMap::new(),
+            recent_failure_nanos: Vec::new(),
+        };
+        for (id, model, outcome, nanos) in [
+            ("capacity", "model-a", "model_at_capacity", 10),
+            ("quota", "model-b", "quota_rejected", 20),
+            ("auth", "model-c", "auth_rejected", 30),
+        ] {
+            let grant = artifact(root, &format!("{id}.grant"), b"grant");
+            let k = artifact(root, &format!("{id}.k"), b"K");
+            let q = artifact(root, &format!("{id}.q"), b"Q");
+            let terminal_bytes = serde_json::to_vec(&serde_json::json!({
+                "grant_id":id,"selection":{"account_identity":"physical","model":model,"config_sha256":"config"},
+                "physical_q_sha256":q.sha256,"physical_q_unix_nanos":nanos,"outcome":outcome
+            })).unwrap();
+            let terminal = artifact(root, &format!("{id}.terminal"), &terminal_bytes);
+            account.grants.insert(
+                id.into(),
+                ProviderGrant {
+                    decision_handoff: id.into(),
+                    grant,
+                    candidate: None,
+                    consumed_k: Some(k.clone()),
+                    certified_q: Some(PhysicalQ {
+                        physical_k: k,
+                        q,
+                        terminal: Some(terminal),
+                        completed_unix_nanos: nanos,
+                    }),
+                },
+            );
+        }
+        let mut snapshot = OfflineSnapshot::default();
+        snapshot.accounts.insert("physical".into(), account);
+        let head = Index::publish_offline(root, snapshot)
+            .unwrap()
+            .compact_account("physical")
+            .unwrap();
+        assert!(!head.unknown_marker_scope);
+        assert_eq!(head.quota_rejection.as_ref().unwrap().model, "model-b");
+        assert_eq!(head.auth_rejection.as_ref().unwrap().model, "model-c");
+        assert_eq!(head.model_capacity.len(), 1);
+        assert_eq!(
+            head.model_capacity.values().next().unwrap().model,
+            "model-a"
+        );
+        assert_eq!(head.marker_times.quota_rejection_nanos, Some(20));
+    }
+
+    #[test]
+    fn old_index_schema_requires_offline_rebuild() {
+        let (temp, index) = fresh();
+        let mut manifest: Manifest = read(&temp.path().join("index-v1/manifest.json"))
+            .unwrap()
+            .unwrap();
+        manifest.version = 1;
+        write_atomic(&temp.path().join("index-v1/manifest.json"), &manifest).unwrap();
+        assert!(matches!(
+            Index::open(temp.path()),
+            Err(IndexError::RebuildRequired(_))
+        ));
+        assert!(matches!(
+            index.route_reader_preflight("physical"),
+            Err(IndexError::RebuildRequired(_))
+        ));
     }
 }

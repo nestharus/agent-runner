@@ -5180,11 +5180,17 @@ mod tests {
                 .count(),
             1
         );
-        reconcile_indexed_account_effect(&f.index, &dir, &intent).unwrap();
+        assert!(reconcile_indexed_account_effect(&f.index, &dir, &intent).is_err());
+        assert!(matches!(
+            f.index.compact_account("physical-first"),
+            Err(crate::linux_main::fresh_index::IndexError::RebuildRequired(
+                _
+            ))
+        ));
         assert!(
             f.index.account("physical-first").unwrap().effects[&intent.id]
                 .consumed_k
-                .is_some()
+                .is_none()
         );
     }
 
@@ -5201,7 +5207,7 @@ mod tests {
                 .route_reader_preflight("physical-first")
                 .unwrap_err()
                 .to_string()
-                .contains("unresolved effect or manual K/Q")
+                .contains("announced effect or manual debt")
         );
         let work = IndexedEffectFixture::physical_q_before_wait(
             &dir,
@@ -5255,7 +5261,7 @@ mod tests {
                 .route_reader_preflight("physical-first")
                 .unwrap_err()
                 .to_string()
-                .contains("typed quota projection")
+                .contains("atomic account revision join")
         );
         let result: FreshAccountEffectReadback = exact_file(&dir, "result.json").unwrap().unwrap();
         assert_eq!(result.outcome.as_deref(), Some("valid_windows"));
@@ -5313,7 +5319,7 @@ mod tests {
             select_route_with_index(&broker, &baseline_binding, &baseline_request, Some(&probe))
                 .unwrap_err()
                 .to_string()
-                .contains("source census")
+                .contains("compact account has no known key")
         );
         let baseline_io = last_reader_io().unwrap();
         let input_path = temp.path().join("input");
@@ -5331,7 +5337,7 @@ mod tests {
             require_selected_plan_indexed(&broker, &chosen_binding, &selected_plan, Some(&probe))
                 .unwrap_err()
                 .to_string()
-                .contains("source census")
+                .contains("compact account has no known key")
         );
         let baseline_pre_k_io = last_reader_io().unwrap();
         let effect_parent = broker.join("account-effects");
@@ -5345,8 +5351,8 @@ mod tests {
             std::fs::write(effect.join("intent.json"), b"old").unwrap();
             std::fs::write(manual_parent.join(format!("old-{n}.json")), b"old").unwrap();
         }
-        // A source artifact not announced by the index must not be read as
-        // healthy merely because the account record itself is well formed.
+        // These deliberately bypass the compatible writer protocol. They
+        // measure refusal-path I/O; restart admission rejects their source.
         std::fs::write(broker.join("unannounced.consumed.json"), b"new K").unwrap();
         std::fs::write(broker.join("unannounced.drain.json"), b"new Q").unwrap();
         std::fs::write(broker.join("unannounced.terminal.json"), b"new marker").unwrap();
@@ -5360,7 +5366,10 @@ mod tests {
             select_route_with_index(&broker, &next_binding, &next_request, Some(&probe))
                 .unwrap_err()
                 .to_string();
-        assert!(choice_error.contains("source census"), "{choice_error}");
+        assert!(
+            choice_error.contains("compact account has no known key"),
+            "{choice_error}"
+        );
         let choice_io = last_reader_io().unwrap();
         assert_eq!(choice_io, baseline_io);
         assert_eq!(choice_io.directory_entries, 0);
@@ -5369,7 +5378,10 @@ mod tests {
             require_selected_plan_indexed(&broker, &chosen_binding, &selected_plan, Some(&probe))
                 .unwrap_err()
                 .to_string();
-        assert!(pre_k_error.contains("source census"), "{pre_k_error}");
+        assert!(
+            pre_k_error.contains("compact account has no known key"),
+            "{pre_k_error}"
+        );
         let pre_k_io = last_reader_io().unwrap();
         assert_eq!(pre_k_io, baseline_pre_k_io);
         assert_eq!(pre_k_io.directory_entries, 0);
@@ -5393,7 +5405,7 @@ mod tests {
             require_selected_plan_indexed(&broker, &chosen_binding, &selected_plan, Some(&probe))
                 .unwrap_err()
                 .to_string();
-        assert!(k_error.contains("unresolved provider K/Q"), "{k_error}");
+        assert!(k_error.contains("announced provider debt"), "{k_error}");
         assert_eq!(last_reader_io().unwrap().directory_entries, 0);
         assert_eq!(std::fs::read(&wal).unwrap(), b"old WAL");
         assert!(Index::admit_live_routes(&broker, &lease).is_err());
