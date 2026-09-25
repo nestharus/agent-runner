@@ -246,6 +246,11 @@ fn assert_success_with_stdout(code: i32, stdout: &str, stderr: &str) {
     );
 }
 
+fn assert_incomplete_with_stdout(code: i32, stdout: &str, stderr: &str) {
+    assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(!stdout.trim().is_empty());
+}
+
 fn assert_contains_all(haystack: &str, needles: &[&str]) {
     for needle in needles {
         assert!(
@@ -798,8 +803,410 @@ fn usage_renders_no_usage_api_row_for_provider_without_quota_script() {
 }
 
 #[test]
-fn usage_renders_in_flight_row_state_when_refresh_outcome_is_in_flight_with_exit_zero_and_no_cache_write()
- {
+fn usage_probes_one_provider_account_once_across_models() {
+    let fixture = Fixture::new();
+    let log = fixture.marker_dir.join("quota.log");
+    let script = fixture.write_quota_script(
+        "shared.sh",
+        &quota_script_json(
+            &log,
+            r#"{"windows":[{"used_percent":24,"resets_at":"2099-01-01T00:00:00Z"}]}"#,
+        ),
+    );
+    fixture.write_model("first", &["shared"]);
+    fixture.write_model("second", &["shared"]);
+    fixture.write_providers(&[ProviderFixture::with_script("shared", "claude", &script)]);
+
+    let (code, stdout, stderr) = run_usage(&fixture);
+    assert_success_with_stdout(code, &stdout, &stderr);
+    assert_eq!(fs::read_to_string(log).unwrap(), "ran");
+    assert_eq!(stdout.matches("shared").count(), 1, "{stdout}");
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+#[test]
+fn usage_private_manual_requires_broker_and_never_runs_legacy_script() {
+    let fixture = Fixture::new();
+    let log = fixture.marker_dir.join("quota.log");
+    let script = fixture.write_quota_script(
+        "private.sh",
+        &quota_script_json(
+            &log,
+            r#"{"windows":[{"used_percent":24,"resets_at":"2099-01-01T00:00:00Z"}]}"#,
+        ),
+    );
+    fixture.write_model("fixture", &["shared", "unmetered"]);
+    fixture.write_providers(&[
+        ProviderFixture::with_script("shared", "/bin/true", &script),
+        ProviderFixture::no_usage("unmetered", "/bin/true"),
+    ]);
+    let path = fixture.app_config_dir.join("providers.toml");
+    let providers = fs::read_to_string(&path).unwrap();
+    fs::write(
+        &path,
+        providers
+            .replace("prompt_mode = \"arg\"", "prompt_mode = \"stdin\"")
+            .replace(
+                "[shared]\n",
+                "[shared]\nquota_account_id = 'physical-shared'\n",
+            )
+            .replace(
+                "[unmetered]\n",
+                "[unmetered]\nquota_account_id = 'physical-unmetered'\n",
+            ),
+    )
+    .unwrap();
+    let output = fixture
+        .usage_command()
+        .env("AGE319_PRIVATE_FRESH_PROVIDER_V1", "1")
+        .env("SENTINEL_SECRET", "private-token")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("error:"));
+    assert!(!log.exists());
+    let journals = fixture
+        .data_home
+        .join("oulipoly-agent-runner/manual-quota-operations");
+    for entry in fs::read_dir(journals).unwrap() {
+        assert!(
+            !fs::read_to_string(entry.unwrap().path())
+                .unwrap()
+                .contains("private-token")
+        );
+    }
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+#[test]
+fn usage_private_v3_manual_reaches_broker_and_forces_new_physical_q() {
+    let Some(broker_image) = std::env::var_os("OULIPOLY_AGE319_BROKER_IMAGE") else {
+        return;
+    };
+    if std::env::var_os("AGE319_MANUAL_CLI_INNER").is_none() {
+        let output = Command::new("unshare")
+            .args(["-Urpfm", "--mount-proc"])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "usage_private_v3_manual_reaches_broker_and_forces_new_physical_q",
+                "--nocapture",
+            ])
+            .env("AGE319_MANUAL_CLI_INNER", "1")
+            .env("OULIPOLY_AGE319_BROKER_IMAGE", broker_image)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let fixture = Fixture::new();
+    let log = fixture.marker_dir.join("manual.log");
+    let script = fixture.write_quota_script(
+        "manual.sh",
+        &quota_script_json(
+            &log,
+            r#"{"windows":[{"used_percent":24,"resets_at":"2099-01-01T00:00:00Z"}]}"#,
+        )
+        .replace(
+            "set -euo pipefail\n",
+            "set -euo pipefail\ntest \"$QUOTA_PROBE_TOKEN\" = configured-token\n",
+        ),
+    );
+    fixture.write_model("fixture", &["shared", "unmetered"]);
+    fixture.write_model("alias", &["shared"]);
+    fixture.write_providers(&[
+        ProviderFixture::with_script("shared", "/bin/true", &script),
+        ProviderFixture::no_usage("unmetered", "/bin/true"),
+    ]);
+    let providers_path = fixture.app_config_dir.join("providers.toml");
+    let providers = fs::read_to_string(&providers_path).unwrap();
+    fs::write(
+        &providers_path,
+        providers
+            .replace("prompt_mode = \"arg\"", "prompt_mode = \"stdin\"")
+            .replace(
+                "[shared]\n",
+                "[shared]\nquota_account_id = 'physical-shared'\nenvironment = { QUOTA_PROBE_TOKEN = 'configured-token' }\n",
+            )
+            .replace(
+                "[unmetered]\n",
+                "[unmetered]\nquota_account_id = 'physical-unmetered'\n",
+            ),
+    )
+    .unwrap();
+    let broker_state = fixture._dir.path().join("broker-state");
+    fs::create_dir_all(&broker_state).unwrap();
+    fs::set_permissions(&broker_state, fs::Permissions::from_mode(0o700)).unwrap();
+    oulipoly_state::mailbox::FreshV30Lane::initialize_at(&broker_state).unwrap();
+    let socket = fixture._dir.path().join("v30.sock");
+    let legacy_db = fixture.db_path();
+    fs::create_dir_all(legacy_db.parent().unwrap()).unwrap();
+    fs::write(&legacy_db, b"old State DB must not be opened by v3 manual").unwrap();
+    let legacy_wal = legacy_db.with_file_name("state.db-wal");
+    fs::write(&legacy_wal, b"old WAL bytes stay fixed").unwrap();
+    let mut bootstrap = Command::new(&broker_image)
+        .arg("--serve-fresh-v30")
+        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
+        .env(
+            "OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1",
+            env!("CARGO_BIN_EXE_oulipoly-agent-runner"),
+        )
+        .spawn()
+        .unwrap();
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(socket.exists(), "bootstrap broker did not bind");
+    bootstrap.kill().unwrap();
+    bootstrap.wait().unwrap();
+    let rebuild = Command::new(&broker_image)
+        .arg("--offline-rebuild-fresh-index-v3")
+        .arg(&fixture.app_config_dir)
+        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
+        .output()
+        .unwrap();
+    assert!(
+        rebuild.status.success(),
+        "v3 rebuild: {}",
+        String::from_utf8_lossy(&rebuild.stderr)
+    );
+    let spawn_broker = |post_k_failure: bool| {
+        let mut command = Command::new(&broker_image);
+        command
+            .arg("--serve-fresh-v30")
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
+            .env(
+                "OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1",
+                env!("CARGO_BIN_EXE_oulipoly-agent-runner"),
+            )
+            .env(
+                "OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_READBACK_V3_V1",
+                "1",
+            )
+            .env(
+                "OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_READBACK_V3_SOURCE_V1",
+                &fixture.app_config_dir,
+            )
+            .env(
+                "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_MANUAL_BEGIN_REPLY_V3_V1",
+                "1",
+            )
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(
+                fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(fixture._dir.path().join("broker.log"))
+                    .unwrap(),
+            ));
+        if post_k_failure {
+            command.env(
+                "OULIPOLY_KERNEL_BROKER_FIXTURE_FAIL_MANUAL_POST_K_CAS_V3_V1",
+                "1",
+            );
+        }
+        command.spawn().unwrap()
+    };
+    let mut broker = spawn_broker(false);
+    for _ in 0..100 {
+        if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+            break;
+        }
+        if broker.try_wait().unwrap().is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        std::os::unix::net::UnixStream::connect(&socket).is_ok(),
+        "broker did not start: {}",
+        fs::read_to_string(fixture._dir.path().join("broker.log")).unwrap()
+    );
+    for (expected_count, expected_runs) in [(1, "ran"), (2, "ranran")] {
+        let output = fixture
+            .usage_command()
+            .env("AGE319_PRIVATE_FRESH_PROVIDER_V1", "1")
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}\nbroker: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+            fs::read_to_string(fixture._dir.path().join("broker.log")).unwrap()
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("physical-shared") && stdout.contains("24%"),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains("physical-unmetered") && stdout.contains("(unmetered)"),
+            "{stdout}"
+        );
+        assert_eq!(fs::read_to_string(&log).unwrap(), expected_runs);
+        assert_eq!(
+            fs::read(&legacy_db).unwrap(),
+            b"old State DB must not be opened by v3 manual"
+        );
+        assert_eq!(fs::read(&legacy_wal).unwrap(), b"old WAL bytes stay fixed");
+        let operations = broker_state.join("v30/fresh-provider/manual-quota");
+        let physical_q_count = fs::read_dir(operations)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.path().join("k.json").exists() && entry.path().join("q.json").exists()
+            })
+            .count();
+        assert_eq!(physical_q_count, expected_count);
+    }
+    write_executable(&script, "#!/bin/sh\nprintf 'invalid quota'\n");
+    let invalid = fixture
+        .usage_command()
+        .env("AGE319_PRIVATE_FRESH_PROVIDER_V1", "1")
+        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+        .output()
+        .unwrap();
+    assert!(!invalid.status.success());
+    assert!(String::from_utf8_lossy(&invalid.stdout).contains("(error: invalid)"));
+    write_executable(
+        &script,
+        "#!/bin/sh\nprintf '{\"used_percent\":100,\"resets_at\":\"2099-01-01T00:00:00Z\"}'\n",
+    );
+    let full = fixture
+        .usage_command()
+        .env("AGE319_PRIVATE_FRESH_PROVIDER_V1", "1")
+        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+        .output()
+        .unwrap();
+    assert!(
+        full.status.success(),
+        "{}",
+        String::from_utf8_lossy(&full.stdout)
+    );
+    assert!(String::from_utf8_lossy(&full.stdout).contains("100%"));
+    write_executable(&script, "#!/bin/sh\nexit 7\n");
+    let failed = fixture
+        .usage_command()
+        .env("AGE319_PRIVATE_FRESH_PROVIDER_V1", "1")
+        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+        .output()
+        .unwrap();
+    assert!(!failed.status.success());
+    assert!(String::from_utf8_lossy(&failed.stdout).contains("(error: failed)"));
+    assert_eq!(fs::read_to_string(&log).unwrap(), "ranran");
+    assert_eq!(
+        fs::read(&legacy_db).unwrap(),
+        b"old State DB must not be opened by v3 manual"
+    );
+    assert_eq!(fs::read(&legacy_wal).unwrap(), b"old WAL bytes stay fixed");
+    let operations = broker_state.join("v30/fresh-provider/manual-quota");
+    let k_count = || {
+        fs::read_dir(&operations)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().join("k.json").exists())
+            .count()
+    };
+    let settled_k = k_count();
+    let pinned_providers = fs::read_to_string(&providers_path).unwrap();
+    fs::write(
+        &providers_path,
+        pinned_providers.replace("configured-token", "changed-token"),
+    )
+    .unwrap();
+    let changed_source = fixture
+        .usage_command()
+        .env("AGE319_PRIVATE_FRESH_PROVIDER_V1", "1")
+        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+        .output()
+        .unwrap();
+    assert!(!changed_source.status.success());
+    assert_eq!(k_count(), settled_k);
+    fs::write(&providers_path, pinned_providers).unwrap();
+    broker.kill().unwrap();
+    broker.wait().unwrap();
+    broker = spawn_broker(true);
+    for _ in 0..100 {
+        if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let unknown = fixture
+        .usage_command()
+        .env("AGE319_PRIVATE_FRESH_PROVIDER_V1", "1")
+        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+        .output()
+        .unwrap();
+    assert!(!unknown.status.success());
+    assert!(String::from_utf8_lossy(&unknown.stdout).contains("unknown Q"));
+    assert_eq!(k_count(), settled_k + 1);
+    broker.kill().unwrap();
+    broker.wait().unwrap();
+    broker = spawn_broker(false);
+    for _ in 0..100 {
+        if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let after_restart = fixture
+        .usage_command()
+        .env("AGE319_PRIVATE_FRESH_PROVIDER_V1", "1")
+        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+        .output()
+        .unwrap();
+    assert!(!after_restart.status.success());
+    assert!(String::from_utf8_lossy(&after_restart.stdout).contains("unknown Q"));
+    assert_eq!(k_count(), settled_k + 1);
+    assert_eq!(
+        fs::read(&legacy_db).unwrap(),
+        b"old State DB must not be opened by v3 manual"
+    );
+    assert_eq!(fs::read(&legacy_wal).unwrap(), b"old WAL bytes stay fixed");
+    broker.kill().unwrap();
+    broker.wait().unwrap();
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+#[test]
+fn usage_legacy_refresh_is_annotated_when_private_feature_is_built() {
+    let fixture = Fixture::new();
+    let log = fixture.marker_dir.join("quota.log");
+    let script = fixture.write_quota_script(
+        "legacy.sh",
+        &quota_script_json(
+            &log,
+            r#"{"windows":[{"used_percent":24,"resets_at":"2099-01-01T00:00:00Z"}]}"#,
+        ),
+    );
+    fixture.write_model("fixture", &["shared"]);
+    fixture.write_providers(&[ProviderFixture::with_script("shared", "claude", &script)]);
+    let (code, stdout, stderr) = run_usage(&fixture);
+    assert_success_with_stdout(code, &stdout, &stderr);
+    assert!(
+        stderr.contains("private broker quota Q was not refreshed"),
+        "{stderr}"
+    );
+    assert_eq!(fs::read_to_string(log).unwrap(), "ran");
+    assert_eq!(quota_window_count(&fixture.db_path(), "shared"), 1);
+}
+
+#[test]
+fn usage_renders_in_flight_row_state_with_nonzero_exit_and_no_cache_write() {
     let fixture = Fixture::new();
     let started = fixture.marker_dir.join("started");
     let release = fixture.marker_dir.join("release");
@@ -832,7 +1239,7 @@ fn usage_renders_in_flight_row_state_when_refresh_outcome_is_in_flight_with_exit
     let second_stdout = String::from_utf8_lossy(&second_output.stdout);
     let second_stderr = String::from_utf8_lossy(&second_output.stderr);
     assert!(
-        second_output.status.success(),
+        !second_output.status.success(),
         "stdout:\n{second_stdout}\nstderr:\n{second_stderr}"
     );
     assert_contains_all(&second_stdout, &["claude", "(in flight)"]);
@@ -854,8 +1261,7 @@ fn usage_renders_in_flight_row_state_when_refresh_outcome_is_in_flight_with_exit
 }
 
 #[test]
-fn usage_renders_error_row_for_any_failed_outcome_variant_with_exit_zero_and_no_fresh_sample_rendered()
- {
+fn usage_renders_error_row_for_failed_outcome_with_nonzero_exit_and_no_fresh_sample_rendered() {
     let script_fail = Fixture::new();
     script_fail.write_model("fixture", &["script-fail"]);
     let failing_script = script_fail.write_quota_script(
@@ -868,7 +1274,7 @@ fn usage_renders_error_row_for_any_failed_outcome_variant_with_exit_zero_and_no_
         &failing_script,
     )]);
     let (code, stdout, stderr) = run_usage(&script_fail);
-    assert_success_with_stdout(code, &stdout, &stderr);
+    assert_incomplete_with_stdout(code, &stdout, &stderr);
     assert_contains_all(&stdout, &["script-fail", "(error:", "provider exploded"]);
     assert_not_contains_any(&stdout, &["weekly", "42% / 100%"]);
     assert_eq!(quota_window_count(&script_fail.db_path(), "script-fail"), 0);
@@ -889,7 +1295,7 @@ fn usage_renders_error_row_for_any_failed_outcome_variant_with_exit_zero_and_no_
     )]);
     make_quota_window_cache_unwritable(&cache_fail.db_path());
     let (code, stdout, stderr) = run_usage(&cache_fail);
-    assert_success_with_stdout(code, &stdout, &stderr);
+    assert_incomplete_with_stdout(code, &stdout, &stderr);
     // Root storage decision 1 supersedes only the cache-suppression oracle.
     // Preserve this historical ID and the genuine script/auth failure controls.
     assert_contains_all(
@@ -921,7 +1327,7 @@ fn usage_renders_error_row_for_any_failed_outcome_variant_with_exit_zero_and_no_
         &auth_script,
     )]);
     let (code, stdout, stderr) = run_usage(&auth_fail);
-    assert_success_with_stdout(code, &stdout, &stderr);
+    assert_incomplete_with_stdout(code, &stdout, &stderr);
     assert_contains_all(&stdout, &["auth-fail", "(error:", "login required"]);
 }
 
@@ -956,7 +1362,7 @@ fn usage_renders_error_row_when_refresh_outcome_failed_due_to_auth_refresh_comma
 
     let (code, stdout, stderr) = run_usage(&fixture);
 
-    assert_success_with_stdout(code, &stdout, &stderr);
+    assert_incomplete_with_stdout(code, &stdout, &stderr);
     assert_contains_all(
         &stdout,
         &[
@@ -1081,7 +1487,7 @@ fn mark_provider_turn_count_caught_up(db: &StateDb, provider_name: &str, session
 }
 
 #[test]
-fn usage_renders_no_windows_row_for_refresh_outcome_success_with_zero_windows_and_exit_zero() {
+fn usage_renders_no_windows_row_for_refresh_outcome_with_nonzero_exit() {
     let fixture = Fixture::new();
     fixture.write_model("fixture", &["claude"]);
     let quota_script = fixture.write_quota_script(
@@ -1096,7 +1502,7 @@ fn usage_renders_no_windows_row_for_refresh_outcome_success_with_zero_windows_an
 
     let (code, stdout, stderr) = run_usage(&fixture);
 
-    assert_success_with_stdout(code, &stdout, &stderr);
+    assert_incomplete_with_stdout(code, &stdout, &stderr);
     assert_contains_all(&stdout, &["claude", "(no windows)"]);
     assert_eq!(quota_window_count(&fixture.db_path(), "claude"), 0);
 }
@@ -1198,7 +1604,7 @@ fn usage_rich_fields_survive_script_to_mapper_path() {
 }
 
 #[test]
-fn usage_partial_provider_failure_exits_zero() {
+fn usage_partial_provider_failure_exits_nonzero() {
     let fixture = Fixture::new();
     fixture.write_model("fixture", &["bad", "good"]);
     let bad_script = fixture.write_quota_script(
@@ -1219,7 +1625,7 @@ fn usage_partial_provider_failure_exits_zero() {
 
     let (code, stdout, stderr) = run_usage(&fixture);
 
-    assert_success_with_stdout(code, &stdout, &stderr);
+    assert_incomplete_with_stdout(code, &stdout, &stderr);
     assert_contains_all(
         &stdout,
         &["bad", "(error:", "upstream timeout", "good", "weekly"],
@@ -1285,7 +1691,7 @@ fn usage_warn_and_skips_when_model_references_provider_missing_from_providers_to
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stderr_lower = stderr.to_lowercase();
 
-    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(
         stdout.contains("claude-present"),
         "present provider must render in stdout:\nstdout:\n{stdout}"
@@ -1308,7 +1714,7 @@ fn usage_warn_and_skips_when_model_references_provider_missing_from_providers_to
 }
 
 #[test]
-fn usage_exits_zero_when_a_refresh_outcome_failed_due_to_cache_write_with_error_row_rendered() {
+fn usage_exits_nonzero_when_cache_write_failed_with_warning_row_rendered() {
     let fixture = Fixture::new();
     fixture.write_model("fixture", &["cache-fail"]);
     let quota_script = fixture.write_quota_script(
@@ -1327,7 +1733,7 @@ fn usage_exits_zero_when_a_refresh_outcome_failed_due_to_cache_write_with_error_
 
     let (code, stdout, stderr) = run_usage(&fixture);
 
-    assert_success_with_stdout(code, &stdout, &stderr);
+    assert_incomplete_with_stdout(code, &stdout, &stderr);
     // Storage Act1 decision 1 supersedes this ID's historical suppression
     // oracle: valid provider observations survive an uncommitted cache write.
     assert_contains_all(

@@ -114,15 +114,23 @@ pub struct FreshRootEffectRequest {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FreshRouteRequest {
+    /// Required so pre-identity clients cannot silently register a candidate.
+    pub protocol_version: u32,
     pub d_key: String,
     pub model: String,
     pub config_sha256: String,
     pub account: Option<String>,
+    /// Explicit physical account identity asserted against providers.toml.
+    pub account_identity: Option<String>,
     pub index: Option<usize>,
     pub total: usize,
     pub pin: Option<String>,
     pub quota_script: Option<String>,
     pub auth_refresh_command: Option<String>,
+    /// The exact environment used by the private account-effect requests.
+    /// Required by the v3 route writer for a metered physical source.
+    #[serde(default)]
+    pub environment_sha256: Option<String>,
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]
@@ -170,6 +178,143 @@ pub struct FreshAccountEffectReadback {
 pub struct FreshQuotaWindow {
     pub used_percent: f64,
     pub resets_at: String,
+    #[serde(default)]
+    pub remaining: Option<u64>,
+}
+
+/// A local manual request names an idempotency key, never a script or a K.
+/// The broker resolves the account and physical identity from the pinned
+/// config descriptor and mints the one-use K itself.
+#[cfg(feature = "age319-private-broker-fixture")]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ManualQuotaRequest {
+    pub operation_id: String,
+    pub model: String,
+    pub account: String,
+    pub config_sha256: String,
+    pub environment: Vec<(String, String)>,
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManualQuotaObserveRequest {
+    pub operation_id: String,
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManualQuotaReadback {
+    pub operation_id: String,
+    pub physical_account_id: String,
+    pub effect_id: Option<String>,
+    pub state: String,
+    pub outcome: Option<String>,
+    pub windows: Vec<FreshQuotaWindow>,
+    pub completed_unix_seconds: Option<i64>,
+    pub artifact: String,
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+pub fn private_manual_quota_at(
+    path: &Path,
+    request: &ManualQuotaRequest,
+    begin: bool,
+    config_dir: Option<RawFd>,
+) -> io::Result<ManualQuotaReadback> {
+    if begin != config_dir.is_some() {
+        return Err(io::Error::other(
+            "manual quota source descriptor shape invalid",
+        ));
+    }
+    let id = uuid::Uuid::parse_str(&request.operation_id)
+        .map_err(|_| io::Error::other("invalid manual quota operation ID"))?;
+    if id.is_nil() || id.to_string() != request.operation_id {
+        return Err(io::Error::other("noncanonical manual quota operation ID"));
+    }
+    if !begin {
+        return private_manual_quota_observe_at(path, &request.operation_id);
+    }
+    // u/v are ordinary Bash sync publication frames on this socket.
+    manual_quota_frame_at(path, b'w', &serde_json::to_vec(request)?, config_dir)
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+pub fn private_manual_quota_observe_at(
+    path: &Path,
+    operation_id: &str,
+) -> io::Result<ManualQuotaReadback> {
+    let id = uuid::Uuid::parse_str(operation_id)
+        .map_err(|_| io::Error::other("invalid manual quota operation ID"))?;
+    if id.is_nil() || id.to_string() != operation_id {
+        return Err(io::Error::other("noncanonical manual quota operation ID"));
+    }
+    manual_quota_frame_at(
+        path,
+        b'r',
+        &serde_json::to_vec(&ManualQuotaObserveRequest {
+            operation_id: operation_id.into(),
+        })?,
+        None,
+    )
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn manual_quota_frame_at(
+    path: &Path,
+    operation: u8,
+    body: &[u8],
+    config_dir: Option<RawFd>,
+) -> io::Result<ManualQuotaReadback> {
+    let mut stream = checked_connection(path)?;
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let mut frame = Vec::with_capacity(17 + body.len());
+    frame.push(operation);
+    frame.extend_from_slice(&challenge);
+    frame.extend_from_slice(&body);
+    if let Some(fd) = config_dir {
+        let mut iov = libc::iovec {
+            iov_base: frame.as_mut_ptr().cast(),
+            iov_len: frame.len(),
+        };
+        let mut control = [0u8; 64];
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr().cast();
+        msg.msg_controllen =
+            unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as _) } as usize;
+        unsafe {
+            let header = libc::CMSG_FIRSTHDR(&msg);
+            (*header).cmsg_level = libc::SOL_SOCKET;
+            (*header).cmsg_type = libc::SCM_RIGHTS;
+            (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as _) as usize;
+            *(libc::CMSG_DATA(header) as *mut RawFd) = fd;
+        }
+        if unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) }
+            != frame.len() as isize
+        {
+            return Err(io::Error::other("manual quota begin uncertain"));
+        }
+    } else {
+        stream.write_all(&frame)?;
+    }
+    let mut response = Vec::new();
+    stream.take(64 * 1024 + 1).read_to_end(&mut response)?;
+    if response.len() > 64 * 1024 || !response.ends_with(b"\n") {
+        return Err(io::Error::other("manual quota response uncertain"));
+    }
+    let response = std::str::from_utf8(&response).map_err(io::Error::other)?;
+    if let Some(error) = response.strip_prefix("error ") {
+        return Err(io::Error::other(error.trim_end().to_owned()));
+    }
+    let value = response
+        .strip_prefix("manual-quota ")
+        .ok_or_else(|| io::Error::other("manual quota response invalid"))?;
+    serde_json::from_str(value.trim_end()).map_err(io::Error::other)
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]
@@ -179,6 +324,7 @@ pub struct FreshRouteSelection {
     pub model: String,
     pub config_sha256: String,
     pub account: String,
+    pub account_identity: String,
     pub index: usize,
     pub plan_sha256: String,
     pub observed_live: u64,

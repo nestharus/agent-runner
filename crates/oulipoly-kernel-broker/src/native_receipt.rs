@@ -391,6 +391,7 @@ mod tests {
             join_consumed: true,
             joined_child: Some(stamp.clone()),
             prepared_driver: None,
+            terminal_settlement: None,
         };
         fs::write(
             registry_dir.join("entries").join(format!("{root}.json")),

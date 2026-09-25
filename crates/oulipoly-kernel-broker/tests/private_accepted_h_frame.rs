@@ -407,6 +407,7 @@ fn inner(kill_case: bool, lost_reply_case: bool, cancel_case: bool, helper_probe
             join_consumed: true,
             joined_child: Some(ProcessStamp::from(&source)),
             prepared_driver: None,
+            terminal_settlement: None,
         })
         .unwrap(),
     )

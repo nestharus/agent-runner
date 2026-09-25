@@ -471,13 +471,34 @@ fn main() -> std::io::Result<()> {
         std::env::args().nth(2).as_deref(),
         Some("--fail" | "--fail-clean")
     );
-    let quota = std::env::args().nth(2).as_deref() == Some("--quota");
+    let quota = matches!(
+        std::env::args().nth(2).as_deref(),
+        Some("--quota" | "--quota-clean")
+    );
     let auth = std::env::args().nth(2).as_deref() == Some("--auth");
     let binary = std::env::args().nth(2).as_deref() == Some("--binary");
     let clean = matches!(
         std::env::args().nth(2).as_deref(),
-        Some("--clean" | "--fail-clean")
+        Some("--clean" | "--fail-clean" | "--quota-clean" | "--capacity-clean")
     );
+    let capacity = matches!(
+        std::env::args().nth(2).as_deref(),
+        Some("--capacity" | "--capacity-clean")
+    );
+    let process = serde_json::json!({
+        "argv": std::env::args().skip(1).collect::<Vec<_>>(),
+        "cwd": std::env::current_dir()?,
+        "selected_account": std::env::var("AGE319_SELECTED_ACCOUNT").ok(),
+        "env": std::env::vars().collect::<std::collections::BTreeMap<_, _>>(),
+        "uid": unsafe { libc::getuid() },
+        "no_new_privs": unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) },
+        "seccomp": unsafe { libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0) },
+        "forbidden_environment": std::env::vars().any(|(key, _)| key.starts_with("OULIPOLY_KERNEL_") || key.starts_with("LD_") || key.starts_with("DYLD_")),
+    });
+    std::fs::write(
+        format!("{marker}.process.json"),
+        serde_json::to_vec(&process)?,
+    )?;
     let mut input = Vec::new();
     std::io::stdin().read_to_end(&mut input)?;
     let mut file = OpenOptions::new()
@@ -494,16 +515,18 @@ fn main() -> std::io::Result<()> {
         && !(args.len() == 2
             && matches!(
                 args[1].as_str(),
-                "--fail" | "--quota" | "--auth" | "--binary" | "--clean" | "--fail-clean"
+                "--fail"
+                    | "--quota"
+                    | "--auth"
+                    | "--binary"
+                    | "--clean"
+                    | "--fail-clean"
+                    | "--capacity"
+                    | "--quota-clean"
+                    | "--capacity-clean"
             ))
     {
         return Err(std::io::Error::other("provider fixture arguments changed"));
-    }
-    if quota {
-        std::io::stderr().write_all(
-            br#"{"type":"error","error":{"data":{"message":"quota exhausted for account"}}}"#,
-        )?;
-        std::process::exit(1);
     }
     if !clean && !binary {
         let pid = unsafe { libc::fork() };
@@ -523,10 +546,22 @@ fn main() -> std::io::Result<()> {
             }
         }
     }
+    if quota {
+        std::io::stderr().write_all(
+            br#"{"type":"error","error":{"data":{"message":"quota exhausted for account"}}}"#,
+        )?;
+        std::process::exit(1);
+    }
     if binary {
         std::io::stdout().write_all(b"\0\xffstdout\n")?;
         std::io::stderr().write_all(b"err\0\xfestderr")?;
         return Ok(());
+    }
+    if capacity {
+        std::io::stderr().write_all(
+            br#"{"type":"error","error":{"data":{"code":"model_at_capacity","message":"model busy"}}}"#,
+        )?;
+        std::process::exit(1);
     }
     std::io::stdout().write_all(b"provider-stdout:")?;
     std::io::stdout().write_all(&input)?;

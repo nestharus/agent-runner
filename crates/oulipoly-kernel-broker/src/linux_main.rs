@@ -20,6 +20,15 @@ const SYNC_STREAM_VERIFY_BUFFER_BYTES: usize = 64 * 1024;
 #[cfg(feature = "age319-private-broker-fixture")]
 #[path = "fresh_provider.rs"]
 mod fresh_provider;
+// Opt-in AGE-319 route and original-provider writer index. Account/effect/manual
+// eligibility readers still use retained evidence; this is not activation.
+#[cfg(feature = "age319-private-broker-fixture")]
+#[path = "fresh_index.rs"]
+#[allow(dead_code)]
+mod fresh_index;
+#[cfg(feature = "age319-private-broker-fixture")]
+#[path = "manual_quota.rs"]
+mod manual_quota;
 #[path = "native_work.rs"]
 mod native_work;
 #[cfg(feature = "age319-private-broker-fixture")]
@@ -36,7 +45,9 @@ mod work_launch;
 use base64::Engine as _;
 use oulipoly_kernel_broker::accepted_grant::GrantRegistry;
 use oulipoly_kernel_broker::cutover_gate::EntryGate;
-use oulipoly_kernel_broker::entry_registry::{EntryRegistry, ProcessStamp};
+use oulipoly_kernel_broker::entry_registry::{
+    EntryRegistry, EntryTerminalSettlement, ProcessStamp,
+};
 use oulipoly_kernel_broker::identity::{
     PeerIdentity, PinnedProcess, host_proc_file, host_proc_uid, install_detached_host_proc,
 };
@@ -57,8 +68,9 @@ use oulipoly_kernel_broker::source_physical::{SourceObservation, SourcePhysicalR
 use oulipoly_kernel_broker::work_registry::{Scope, WorkRegistry, classify_scope};
 use oulipoly_state::mailbox::{
     BrokerReleaseEvidence, BrokerSidecar, BrokerSourceEffectGrant, FreshBashListenerPolicy,
-    FreshDeliverySubmission, FreshRecipientIdentity, FreshReleasedHandoff, FreshV30Lane,
-    FreshV30LaneIdentity, PreparedBrokerOwner, PreparedProcessStamp,
+    FreshDeliverySubmission, FreshRecipientIdentity, FreshReleasedHandoff,
+    FreshRootTerminalReadback, FreshV30Lane, FreshV30LaneIdentity, PreparedBrokerOwner,
+    PreparedProcessStamp,
 };
 #[cfg(feature = "age319-private-broker-fixture")]
 use sha2::{Digest, Sha256};
@@ -256,6 +268,15 @@ enum RequestPayload {
     #[cfg(feature = "age319-private-broker-fixture")]
     FreshAccountEffectRequest {
         request: oulipoly_kernel_broker::protocol::FreshAccountEffectRequest,
+    },
+    #[cfg(feature = "age319-private-broker-fixture")]
+    ManualQuotaRequest {
+        request: oulipoly_kernel_broker::protocol::ManualQuotaRequest,
+        descriptors: Vec<File>,
+    },
+    #[cfg(feature = "age319-private-broker-fixture")]
+    ManualQuotaObserve {
+        operation_id: String,
     },
     FreshRecipientRequest {
         request: FreshRecipientRequest,
@@ -465,7 +486,9 @@ fn recv_request(
         #[cfg(feature = "age319-private-broker-fixture")]
         b'X' => read == 34,
         #[cfg(feature = "age319-private-broker-fixture")]
-        b'%' | b'!' | b'v' | b'u' => read == 33,
+        b'%' | b'!' => read == 33,
+        #[cfg(feature = "age319-private-broker-fixture")]
+        b'u' | b'v' => read == 33,
         #[cfg(feature = "age319-private-broker-fixture")]
         b'^' => read == 65,
         // Legacy E has no body; fresh Bash E carries a request UUID on its
@@ -481,7 +504,7 @@ fn recv_request(
         #[cfg(feature = "age319-private-broker-fixture")]
         b'5' | b'6' | b'7' | b'8' | b'9' => (18..=2048 + 17).contains(&read),
         #[cfg(feature = "age319-private-broker-fixture")]
-        b'h' | b'f' | b'm' | b'n' => (18..=48 * 1024 + 17).contains(&read),
+        b'h' | b'f' | b'm' | b'n' | b'w' | b'r' => (18..=48 * 1024 + 17).contains(&read),
         b'F' => (18..=8192 + 17).contains(&read),
         b'O' => (18..=1024 + 17).contains(&read),
         b'U' => (18..=512 + 17).contains(&read),
@@ -509,6 +532,8 @@ fn recv_request(
             b'X' | b'^' => descriptors.len() != 1,
             #[cfg(feature = "age319-private-broker-fixture")]
             b'f' => descriptors.len() != 1,
+            #[cfg(feature = "age319-private-broker-fixture")]
+            b'w' => descriptors.len() != 1,
             b'L' => !(1..=4).contains(&descriptors.len()),
             b'V' | b'S' | b's' | b'T' => descriptors.len() != 1,
             _ => !descriptors.is_empty(),
@@ -560,6 +585,18 @@ fn recv_request(
         #[cfg(feature = "age319-private-broker-fixture")]
         b'm' | b'n' => RequestPayload::FreshAccountEffectRequest {
             request: serde_json::from_slice(&request[17..read as usize])?,
+        },
+        #[cfg(feature = "age319-private-broker-fixture")]
+        b'w' => RequestPayload::ManualQuotaRequest {
+            request: serde_json::from_slice(&request[17..read as usize])?,
+            descriptors,
+        },
+        #[cfg(feature = "age319-private-broker-fixture")]
+        b'r' => RequestPayload::ManualQuotaObserve {
+            operation_id: serde_json::from_slice::<
+                oulipoly_kernel_broker::protocol::ManualQuotaObserveRequest,
+            >(&request[17..read as usize])?
+            .operation_id,
         },
         b'D' | b'd' => RequestPayload::FreshSessionRequest {
             request_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
@@ -2559,6 +2596,62 @@ struct FreshHandoffBridgeRequest {
     reply: SyncSender<io::Result<FreshReleasedHandoff>>,
 }
 
+struct FreshTerminalBridgeRequest {
+    root_id: String,
+    settlement: EntryTerminalSettlement,
+    reply: SyncSender<io::Result<()>>,
+}
+
+fn settle_entry_from_terminal(
+    bridge: &SyncSender<FreshTerminalBridgeRequest>,
+    read: &FreshRootTerminalReadback,
+) -> io::Result<()> {
+    let execution = read
+        .execution
+        .as_ref()
+        .ok_or_else(|| io::Error::other("root terminal execution absent"))?;
+    if read.execution_state == "unknown"
+        || !read.unresolved_child_request_ids.is_empty()
+        || read.publication_state != "unknown"
+        || read.publication_sha256.is_none()
+        || execution.root_id != read.root_id
+        || execution.handoff_id != read.handoff_id
+        || execution.d_key != read.d_key
+        || execution.invocation_uuid != read.invocation_uuid
+        || execution.session_id != read.session_id
+        || execution.actor != read.actor
+    {
+        return Err(io::Error::other(
+            "root terminal or publication remains unresolved",
+        ));
+    }
+    let (reply, answer) = mpsc::sync_channel(1);
+    bridge
+        .send(FreshTerminalBridgeRequest {
+            root_id: read.root_id.clone(),
+            settlement: EntryTerminalSettlement {
+                d_key: read.d_key.clone(),
+                handoff_id: read.handoff_id.clone(),
+                invocation_uuid: read.invocation_uuid.clone(),
+                session_id: read.session_id.clone(),
+                actor: ProcessStamp {
+                    host_pid: read.actor.host_pid,
+                    boot_id: read.actor.boot_id.clone(),
+                    starttime_ticks: read.actor.starttime_ticks,
+                    pidns_dev: read.actor.pidns_dev,
+                    pidns_ino: read.actor.pidns_ino,
+                },
+                parent_grant_id: execution.parent.grant_id.clone(),
+                publication_sha256: read.publication_sha256.clone().unwrap(),
+            },
+            reply,
+        })
+        .map_err(|_| io::Error::other("terminal entry authority unavailable"))?;
+    answer
+        .recv_timeout(RELEASED_HANDOFF_REPLY_TIMEOUT)
+        .map_err(|_| io::Error::other("terminal entry settlement response uncertain"))?
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "old gate and fresh identity are separate authorities"
@@ -2942,6 +3035,10 @@ fn serve() -> io::Result<()> {
         SyncSender<FreshHandoffBridgeRequest>,
         Receiver<FreshHandoffBridgeRequest>,
     ) = mpsc::sync_channel(FRESH_HANDOFF_QUEUE_CAPACITY);
+    let (terminal_tx, terminal_rx): (
+        SyncSender<FreshTerminalBridgeRequest>,
+        Receiver<FreshTerminalBridgeRequest>,
+    ) = mpsc::sync_channel(FRESH_HANDOFF_QUEUE_CAPACITY);
     // The old loop alone owns the release gate and mutable kernel registries.
     // Fresh storage stays on another thread and is opened only at the fixed
     // broker-owned v30 directory. Neither handler can wait on the other's
@@ -2951,6 +3048,7 @@ fn serve() -> io::Result<()> {
         let fresh_state_root = PathBuf::from(&state);
         let fresh_runner_image = runner_image.try_clone()?;
         let fresh_handoff_tx = handoff_tx.clone();
+        let fresh_terminal_tx = terminal_tx.clone();
         let fresh_socket = if fixture {
             Path::new(&socket).with_file_name("v30.sock")
         } else {
@@ -2964,12 +3062,17 @@ fn serve() -> io::Result<()> {
                     &fresh_socket,
                     fresh_runner_image,
                     Some(fresh_handoff_tx),
+                    Some(fresh_terminal_tx),
                 ) {
                     eprintln!("fresh v30 lane closed: {error}");
                 }
             })?;
     }
     loop {
+        if let Ok(request) = terminal_rx.try_recv() {
+            let result = entries.settle_join(&request.root_id, request.settlement);
+            let _ = request.reply.send(result);
+        }
         if let Ok(request) = handoff_rx.try_recv() {
             released_child_handoff(
                 request,
@@ -3920,6 +4023,7 @@ fn serve_fresh_v30() -> io::Result<()> {
         Path::new(&socket),
         File::open(&runner)?,
         None,
+        None,
     )
 }
 
@@ -4075,6 +4179,7 @@ fn serve_fresh_v30_at(
     socket: &Path,
     runner_image: File,
     handoff_tx: Option<SyncSender<FreshHandoffBridgeRequest>>,
+    terminal_tx: Option<SyncSender<FreshTerminalBridgeRequest>>,
 ) -> io::Result<()> {
     // A missing or incomplete publication cannot bind the new endpoint.
     let mut lane = FreshV30Lane::open_at(state_root).map_err(io::Error::other)?;
@@ -4093,6 +4198,104 @@ fn serve_fresh_v30_at(
             eprintln!("fresh Bash notification repair remains pending: {error}");
         }
     }
+    // The lease spans all broker requests, including route, grant, provider K,
+    // quota/auth/manual intent and K, and their readback paths. Offline index
+    // rebuild takes the exclusive side before reading any retained evidence.
+    #[cfg(feature = "age319-private-broker-fixture")]
+    let admission = fresh_index::broker_admission_lease(&state_root.join("v30/fresh-provider"))
+        .map_err(io::Error::other)?;
+    #[cfg(feature = "age319-private-broker-fixture")]
+    let provider_readback_v3 = {
+        let root = state_root.join("v30/fresh-provider");
+        match std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_READBACK_V3_V1") {
+            Some(value) if value == "1" && private_fixture() => {
+                let source = std::env::var_os(
+                    "OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_READBACK_V3_SOURCE_V1",
+                )
+                .ok_or_else(|| io::Error::other("v3 admission config source absent"))?;
+                let provider_writer_requested =
+                    std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_K_V3_V1")
+                        .is_some_and(|value| value == "1")
+                        && std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_ROUTE_V3_V1")
+                            .is_some_and(|value| value == "1");
+                Some(
+                    if provider_writer_requested {
+                        fresh_index::KeyedGeneration::admit_provider_writer(
+                            &root,
+                            &admission,
+                            Path::new(&source),
+                        )
+                    } else {
+                        fresh_index::KeyedGeneration::admit_provider_readback(
+                            &root,
+                            &admission,
+                            Path::new(&source),
+                        )
+                    }
+                    .map_err(io::Error::other)?,
+                )
+            }
+            Some(_) => return Err(io::Error::other("v3 provider readback switch invalid")),
+            None => {
+                if std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_READBACK_V3_SOURCE_V1")
+                    .is_some()
+                {
+                    return Err(io::Error::other("v3 source without admission switch"));
+                }
+                None
+            }
+        }
+    };
+    #[cfg(feature = "age319-private-broker-fixture")]
+    let route_writer_v3 = match std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_ROUTE_V3_V1") {
+        Some(value) if value == "1" && private_fixture() && provider_readback_v3.is_some() => true,
+        None => false,
+        Some(_) => return Err(io::Error::other("v3 route writer switch invalid")),
+    };
+    #[cfg(feature = "age319-private-broker-fixture")]
+    let provider_writer_v3 =
+        match std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_K_V3_V1") {
+            Some(value) if value == "1" && route_writer_v3 && private_fixture() => true,
+            None => false,
+            Some(_) => return Err(io::Error::other("v3 provider writer switch invalid")),
+        };
+    #[cfg(feature = "age319-private-broker-fixture")]
+    let route_index = {
+        let root = state_root.join("v30/fresh-provider");
+        match std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_ROUTE_INDEX_V1") {
+            Some(value) if value == "1" && private_fixture() && provider_readback_v3.is_none() => {
+                Some(
+                    fresh_index::Index::admit_live_routes(&root, &admission)
+                        .map_err(io::Error::other)?,
+                )
+            }
+            Some(_) => return Err(io::Error::other("route index fixture switch invalid")),
+            None if provider_readback_v3.is_some() => None,
+            None => {
+                match fs::symlink_metadata(root.join("index-v1/manifest.json")) {
+                    Ok(_) => {
+                        return Err(io::Error::other(
+                            "indexed route root requires indexed writer admission",
+                        ));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+                None
+            }
+        }
+    };
+    #[cfg(feature = "age319-private-broker-fixture")]
+    let route_index = match std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_ROUTE_READER_PROBE_V1")
+    {
+        Some(value) if value == "1" && private_fixture() => Some(
+            route_index
+                .ok_or_else(|| io::Error::other("route reader probe requires indexed writer"))?
+                .enable_route_reader_probe(),
+        ),
+        Some(_) => return Err(io::Error::other("route reader probe switch invalid")),
+        None => route_index,
+    };
     let instance = EntryGate::open(&state_root.join("v30"))?;
     // An installed Bash child must match the package's pinned digest. Private
     // fixtures supply their built source binary only at broker startup.
@@ -4154,6 +4357,8 @@ fn serve_fresh_v30_at(
         #[cfg(feature = "age319-private-broker-fixture")]
         let mut drop_account_effect_reply = false;
         #[cfg(feature = "age319-private-broker-fixture")]
+        let mut drop_route_reply = false;
+        #[cfg(feature = "age319-private-broker-fixture")]
         let mut provider_output_files: Option<[File; 2]> = None;
         let mut diagnostic_opcode = b'?';
         let mut diagnostic_stage = "request_decode";
@@ -4204,6 +4409,81 @@ fn serve_fresh_v30_at(
                 pidns_ino: peer.process.pidns_ino,
             };
             match operation {
+                #[cfg(feature = "age319-private-broker-fixture")]
+                b'w' | b'r' => {
+                    if !private_fixture() {
+                        return Err(io::Error::other("manual quota fixture route closed"));
+                    }
+                    let directory = state_root.join("v30/fresh-provider");
+                    let _route_lock = if provider_readback_v3.is_some() {
+                        Some(fresh_provider::route_selection_lock(&directory)?)
+                    } else {
+                        None
+                    };
+                    let result = if operation == b'w' {
+                        let RequestPayload::ManualQuotaRequest {
+                            request,
+                            descriptors,
+                        } = payload
+                        else {
+                            return Err(io::Error::other("manual quota begin request absent"));
+                        };
+                        if instance.is_closed() {
+                            return Err(io::Error::other("manual quota entry gate closed"));
+                        }
+                        let [source]: [File; 1] = descriptors
+                            .try_into()
+                            .map_err(|_| io::Error::other("manual quota config source absent"))?;
+                        if let Some(generation) = provider_readback_v3.as_ref() {
+                            manual_quota::begin_v3(
+                                &directory, &source, &request, peer.uid, peer.gid, generation,
+                            )?
+                        } else {
+                            manual_quota::begin_indexed(
+                                &directory,
+                                &source,
+                                &request,
+                                peer.uid,
+                                peer.gid,
+                                route_index.as_ref(),
+                            )?
+                        }
+                    } else {
+                        let RequestPayload::ManualQuotaObserve { operation_id } = payload else {
+                            return Err(io::Error::other("manual quota observation absent"));
+                        };
+                        if let Some(generation) = provider_readback_v3.as_ref() {
+                            manual_quota::readback_id_v3(
+                                &directory,
+                                &operation_id,
+                                peer.uid,
+                                peer.gid,
+                                generation,
+                            )?
+                        } else {
+                            manual_quota::readback_id_indexed(
+                                &directory,
+                                &operation_id,
+                                peer.uid,
+                                peer.gid,
+                                route_index.as_ref(),
+                            )?
+                        }
+                    };
+                    if operation == b'w'
+                        && provider_readback_v3.is_some()
+                        && std::env::var_os(
+                            "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_MANUAL_BEGIN_REPLY_V3_V1",
+                        )
+                        .is_some()
+                    {
+                        return Ok(String::new());
+                    }
+                    return Ok(format!(
+                        "manual-quota {}\n",
+                        serde_json::to_string(&result)?
+                    ));
+                }
                 b'I' if matches!(payload, RequestPayload::None) => Ok(format!(
                     "fresh-v30-route {} {} {}\n",
                     lane.identity().lane_id,
@@ -4611,7 +4891,12 @@ fn serve_fresh_v30_at(
                                 )?;
                                 let prepared = fresh_provider::prepare(&directory, binding, plan)?;
                                 let grant = fresh_provider::launch(
-                                    prepared, &root_init, &actor, peer.uid, peer.gid,
+                                    prepared,
+                                    &root_init,
+                                    &actor,
+                                    peer.uid,
+                                    peer.gid,
+                                    route_index.as_ref(),
                                 )?;
                                 if ordinary {
                                     ordinary_completion_tx
@@ -4955,6 +5240,15 @@ fn serve_fresh_v30_at(
                     let binding =
                         fresh_provider::binding_from_held(&receipt, &held, &actor, &root)?;
                     let directory = state_root.join("v30/fresh-provider");
+                    if provider_readback_v3.is_some()
+                        && !(matches!(operation, b'6' | b'8' | b'9' | b'h' | b'm' | b'n')
+                            || (route_writer_v3 && operation == b'f'))
+                        && !(provider_writer_v3 && matches!(operation, b'5' | b'7'))
+                    {
+                        return Err(io::Error::other(
+                            "v3 route, cancellation and provider K writers are closed",
+                        ));
+                    }
                     if let Some(route_request) = route_request {
                         let expected_pin = match &held.intent {
                             oulipoly_state::mailbox::FreshRootWorkIntent::NormalCli(args)
@@ -4987,6 +5281,11 @@ fn serve_fresh_v30_at(
                             if instance.is_closed() {
                                 return Err(io::Error::other("fresh route entry gate closed"));
                             }
+                            let _route_lock = if provider_readback_v3.is_some() {
+                                Some(fresh_provider::route_selection_lock(&directory)?)
+                            } else {
+                                None
+                            };
                             let [image_fd, cwd, input, recipe, config_dir]: [File; 5] = descriptors
                                 .try_into()
                                 .map_err(|_| io::Error::other("fresh route descriptors absent"))?;
@@ -5013,6 +5312,14 @@ fn serve_fresh_v30_at(
                                     &route_request,
                                 )?,
                             )?;
+                            if let Some(generation) = provider_readback_v3.as_ref() {
+                                generation
+                                    .record_route_model(
+                                        &route_request.model,
+                                        &route_request.config_sha256,
+                                    )
+                                    .map_err(io::Error::other)?;
+                            }
                             return Ok("fresh-route-registered\n".into());
                         }
                         let [config_dir]: [File; 1] = descriptors
@@ -5026,14 +5333,62 @@ fn serve_fresh_v30_at(
                             &config_dir,
                             false,
                         )?;
-                        let selection =
-                            fresh_provider::select_route(&directory, &binding, &route_request)?;
+                        let selection = if route_writer_v3 {
+                            let generation = provider_readback_v3
+                                .as_ref()
+                                .ok_or_else(|| io::Error::other("v3 route admission absent"))?;
+                            fresh_provider::select_route_v3(
+                                &directory,
+                                &binding,
+                                &route_request,
+                                generation,
+                            )?
+                        } else {
+                            fresh_provider::select_route_with_index(
+                                &directory,
+                                &binding,
+                                &route_request,
+                                route_index.as_ref(),
+                            )?
+                        };
+                        if route_writer_v3
+                            && std::env::var_os(
+                                "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_ROUTE_V3_REPLY_V1",
+                            )
+                            .is_some()
+                            && std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                                .is_some_and(|gate| {
+                                    !Path::new(&gate).join("route-reply-dropped").exists()
+                                })
+                        {
+                            drop_route_reply = true;
+                        }
                         return Ok(format!(
                             "fresh-route-selected {}\n",
                             serde_json::to_string(&selection)?
                         ));
                     }
                     if let Some(effect_request) = effect_request {
+                        if operation == b'm' {
+                            if let Some(index) = route_index.as_ref() {
+                                let receipt = directory
+                                    .join(format!("{}.route-selection.json", binding.handoff_id));
+                                let receipt_present = match fs::symlink_metadata(receipt) {
+                                    Ok(_) => true,
+                                    Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                                    Err(error) => return Err(error),
+                                };
+                                let decision_present = index
+                                    .decision(&binding.handoff_id)
+                                    .map_err(io::Error::other)?
+                                    .is_some();
+                                if receipt_present || decision_present {
+                                    index
+                                        .require_live_route(&binding.handoff_id)
+                                        .map_err(io::Error::other)?;
+                                }
+                            }
+                        }
                         if instance.is_closed() && operation == b'm' {
                             return Err(io::Error::other("fresh account effect entry gate closed"));
                         }
@@ -5064,8 +5419,43 @@ fn serve_fresh_v30_at(
                                 "fresh effect account differs from held pin",
                             ));
                         }
-                        let effect = if operation == b'm' {
-                            fresh_provider::begin_account_effect(
+                        let effect = if let Some(generation) = provider_readback_v3.as_ref() {
+                            // The route reader holds this lock through its
+                            // receipt/cursor publication. A quota/auth K or Q
+                            // cannot change any selected account revision in
+                            // that interval.
+                            let _route_lock = fresh_provider::route_selection_lock(&directory)?;
+                            let boundary = if operation == b'm' {
+                                "v3-quota-begin"
+                            } else {
+                                "v3-quota-observe"
+                            };
+                            let (effect, keyed_io) = fresh_index::measure_keyed_io(|| {
+                                let _physical_io = fresh_index::ReaderIoGuard::start(boundary);
+                                if operation == b'm' {
+                                    fresh_provider::begin_quota_effect_v3(
+                                        &directory,
+                                        generation,
+                                        &binding,
+                                        &effect_request,
+                                        &root,
+                                        &actor,
+                                        actor_uid,
+                                        actor_gid,
+                                    )
+                                } else {
+                                    fresh_provider::observe_quota_effect_v3(
+                                        &directory,
+                                        generation,
+                                        &binding,
+                                        &effect_request,
+                                    )
+                                }
+                            });
+                            eprintln!("age319 v3 quota {boundary} keyed I/O: {keyed_io:?}");
+                            effect?
+                        } else if operation == b'm' {
+                            fresh_provider::begin_account_effect_indexed(
                                 &directory,
                                 &binding,
                                 &effect_request,
@@ -5073,19 +5463,22 @@ fn serve_fresh_v30_at(
                                 &actor,
                                 actor_uid,
                                 actor_gid,
+                                route_index.as_ref(),
                             )?
                         } else {
-                            fresh_provider::observe_account_effect(
+                            fresh_provider::observe_account_effect_indexed(
                                 &directory,
                                 &binding,
                                 &effect_request,
+                                route_index.as_ref(),
                             )?
                         };
                         if operation == b'm'
-                            && std::env::var_os(
+                            && (std::env::var_os(
                                 "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_ACCOUNT_EFFECT_REPLY_V1",
-                            )
-                            .is_some()
+                            ).is_some()
+                                || (effect_request.kind == oulipoly_kernel_broker::protocol::FreshAccountEffectKind::AuthRefresh
+                                    && std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_AUTH_EFFECT_REPLY_V3_V1").is_some()))
                         {
                             drop_account_effect_reply = true;
                         }
@@ -5098,6 +5491,11 @@ fn serve_fresh_v30_at(
                         if instance.is_closed() {
                             return Err(io::Error::other("fresh provider K entry gate closed"));
                         }
+                        let _v3_route_lock = if provider_writer_v3 {
+                            Some(fresh_provider::route_selection_lock(&directory)?)
+                        } else {
+                            None
+                        };
                         let [image_fd, cwd, input, recipe]: [File; 4] = descriptors
                             .try_into()
                             .map_err(|_| io::Error::other("fresh provider descriptors absent"))?;
@@ -5106,10 +5504,67 @@ fn serve_fresh_v30_at(
                         let plan = fresh_provider::plan_from_descriptors(
                             &image, image_fd, cwd, input, recipe,
                         )?;
-                        fresh_provider::require_selected_plan(&directory, &binding, &plan)?;
-                        let prepared = fresh_provider::prepare(&directory, binding, plan)?;
-                        let grant =
-                            fresh_provider::launch(prepared, &root, &actor, actor_uid, actor_gid)?;
+                        let v3_selected = if provider_writer_v3 {
+                            let generation = provider_readback_v3
+                                .as_ref()
+                                .ok_or_else(|| io::Error::other("v3 provider generation absent"))?;
+                            if fresh_provider::grant_for_binding(&directory, &binding)?.is_some() {
+                                return Err(io::Error::other(
+                                    "v3 provider grant already announced; observe exact D",
+                                ));
+                            }
+                            Some(fresh_provider::require_selected_plan_v3(
+                                &directory, &binding, &plan, generation,
+                            )?)
+                        } else {
+                            fresh_provider::require_selected_plan_indexed(
+                                &directory,
+                                &binding,
+                                &plan,
+                                route_index.as_ref(),
+                            )?;
+                            None
+                        };
+                        if let Some(index) = route_index.as_ref() {
+                            index
+                                .require_live_route(&binding.handoff_id)
+                                .map_err(io::Error::other)?;
+                        }
+                        let mut prepared = fresh_provider::prepare(&directory, binding, plan)?;
+                        let v3_revision = if let Some((account, revision)) = v3_selected.as_ref() {
+                            Some(fresh_provider::announce_provider_v3(
+                                &prepared,
+                                provider_readback_v3.as_ref().unwrap(),
+                                account,
+                                *revision,
+                            )?)
+                        } else {
+                            None
+                        };
+                        if let Some(index) = route_index.as_ref() {
+                            prepared.announce_indexed_grant(index)?;
+                        }
+                        let grant = if let Some((account, _)) = v3_selected {
+                            fresh_provider::launch_v3_provider(
+                                prepared,
+                                &root,
+                                &actor,
+                                actor_uid,
+                                actor_gid,
+                                provider_readback_v3.as_ref().unwrap(),
+                                &account,
+                                v3_revision.unwrap(),
+                            )?
+                        } else {
+                            fresh_provider::launch(
+                                prepared,
+                                &root,
+                                &actor,
+                                actor_uid,
+                                actor_gid,
+                                route_index.as_ref(),
+                            )?
+                        };
                         if std::env::var_os(
                             "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_PROVIDER_K_REPLY_V1",
                         )
@@ -5134,9 +5589,37 @@ fn serve_fresh_v30_at(
                         fresh_provider::grant_for_binding(&directory, &binding)?
                             .ok_or_else(|| io::Error::other("fresh provider grant absent"))?
                     };
+                    if let Some(v3) = provider_readback_v3.as_ref() {
+                        if provider_writer_v3 {
+                            fresh_provider::settle_v3_provider(v3, &directory, &binding, &grant)?;
+                            // A physical drain file precedes the PID1 wait and
+                            // keyed Q/terminal CAS. This is still pending work,
+                            // never a certified Q or permission to replay K.
+                            if operation == b'6'
+                                && directory.join(format!("{grant}.drain.json")).exists()
+                                && matches!(
+                                    fresh_provider::observe(&directory, &grant)?,
+                                    fresh_provider::Observation::Pending
+                                        | fresh_provider::Observation::ProviderExited(_)
+                                )
+                            {
+                                return Ok(format!("fresh-provider-pending {grant}\n"));
+                            }
+                        }
+                        let indexed =
+                            fresh_provider::require_v3_provider_binding(v3, &directory, &binding)?;
+                        if indexed != grant {
+                            return Err(io::Error::other("v3 provider plan/grant differs"));
+                        }
+                    }
                     if operation == b'7' {
                         fresh_provider::cancel(&directory, &grant)?;
                         return Ok(format!("fresh-provider-cancel {grant}\n"));
+                    }
+                    if let Some(index) = route_index.as_ref() {
+                        fresh_provider::reconcile_indexed_provider_binding(
+                            index, &directory, &binding,
+                        )?;
                     }
                     let result = match fresh_provider::observe(&directory, &grant)? {
                         fresh_provider::Observation::Unknown => {
@@ -5234,6 +5717,24 @@ fn serve_fresh_v30_at(
                                 _ => unreachable!(),
                             }
                             .map_err(io::Error::other)?;
+                            if matches!(
+                                &request,
+                                FreshRecipientRequest::BeginRootCallerResult { .. }
+                            ) {
+                                #[cfg(feature = "age319-private-broker-fixture")]
+                                if provider_writer_v3 {
+                                    fresh_provider::require_v3_terminal_publication(
+                                        provider_readback_v3.as_ref().ok_or_else(|| {
+                                            io::Error::other("v3 terminal generation absent")
+                                        })?,
+                                        &state_root.join("v30/fresh-provider"),
+                                        &read,
+                                    )?;
+                                }
+                                if let Some(bridge) = terminal_tx.as_ref() {
+                                    settle_entry_from_terminal(bridge, &read)?;
+                                }
+                            }
                             serde_json::json!({"kind":"root_terminal_readback", "terminal":read})
                         }
                         FreshRecipientRequest::ActivateBashSource { request_id } => {
@@ -5353,9 +5854,15 @@ fn serve_fresh_v30_at(
             }
         })();
         #[cfg(feature = "age319-private-broker-fixture")]
-        if drop_provider_k_reply || drop_provider_q_reply || drop_account_effect_reply {
+        if drop_provider_k_reply
+            || drop_provider_q_reply
+            || drop_account_effect_reply
+            || drop_route_reply
+        {
             if let Some(gate) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1") {
-                let marker = if drop_provider_k_reply {
+                let marker = if drop_route_reply {
+                    "route-reply-dropped"
+                } else if drop_provider_k_reply {
                     "provider-k-reply-dropped"
                 } else if drop_provider_q_reply {
                     "provider-q-reply-dropped"
@@ -5472,6 +5979,76 @@ pub fn run() {
                 })
                 .map_err(io::Error::other)
         }
+        #[cfg(feature = "age319-private-broker-fixture")]
+        [_, mode, source]
+            if mode == "--offline-rebuild-fresh-index"
+                || mode == "--offline-rebuild-fresh-index-v3" =>
+        {
+            let state = if private_fixture() {
+                std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1")
+                    .ok_or_else(|| io::Error::other("offline fixture state absent"))
+                    .map(PathBuf::from)
+            } else {
+                Ok(PathBuf::from(STATE))
+            };
+            let socket = if private_fixture() {
+                std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1")
+                    .ok_or_else(|| io::Error::other("offline fixture socket absent"))
+                    .map(PathBuf::from)
+            } else {
+                Ok(PathBuf::from(FRESH_SOCKET))
+            };
+            state.and_then(|state| {
+                socket.and_then(|socket| {
+                    if mode == "--offline-rebuild-fresh-index-v3" {
+                        fresh_index::rebuild_keyed_offline(
+                            &state.join("v30/fresh-provider"),
+                            &socket,
+                            Path::new(source),
+                        )
+                    } else {
+                        fresh_index::Index::rebuild_offline(
+                            &state.join("v30/fresh-provider"),
+                            &socket,
+                            Path::new(source),
+                        )
+                        .map(|_| ())
+                    }
+                    .map_err(io::Error::other)
+                })
+            })
+        }
+        #[cfg(feature = "age319-private-broker-fixture")]
+        [_, mode, source, account] if mode == "--offline-reconcile-fresh-index" => {
+            let state = if private_fixture() {
+                std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1")
+                    .ok_or_else(|| io::Error::other("offline fixture state absent"))
+                    .map(PathBuf::from)
+            } else {
+                Ok(PathBuf::from(STATE))
+            };
+            let socket = if private_fixture() {
+                std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1")
+                    .ok_or_else(|| io::Error::other("offline fixture socket absent"))
+                    .map(PathBuf::from)
+            } else {
+                Ok(PathBuf::from(FRESH_SOCKET))
+            };
+            state.and_then(|state| {
+                socket.and_then(|socket| {
+                    let index = fresh_index::Index::open(&state.join("v30/fresh-provider"))
+                        .map_err(io::Error::other)?;
+                    index
+                        .reconcile_offline_account_frozen(
+                            &socket,
+                            &account.to_string_lossy(),
+                            Path::new(source),
+                        )
+                        .map(|_| ())
+                        .map_err(io::Error::other)
+                })
+            })
+        }
         [_, mode] if mode == "--serve-fresh-v30" => {
             #[cfg(feature = "age319-private-broker-fixture")]
             if private_fixture() {
@@ -5483,6 +6060,10 @@ pub fn run() {
             Err(io::Error::other(
                 "separate fresh broker authority retired; use the single broker service",
             ))
+        }
+        #[cfg(feature = "age319-private-broker-fixture")]
+        [_, mode, path] if mode == "--manual-quota-worker" && private_fixture() => {
+            manual_quota::worker(Path::new(path))
         }
         _ => {
             eprintln!("unknown broker mode");

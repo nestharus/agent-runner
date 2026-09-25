@@ -1,7 +1,7 @@
 //! Private first provider K: the broker, not a Runner worker, forks the pinned
 //! executable. Private socket opcodes carry descriptor-backed plans; the
 //! ordinary CLI route remains closed; a private typed runtime backend consumes
-//! its Q-gated readbacks without publishing terminal success.
+//! Q-gated readbacks and an exact caller path can settle the State terminal.
 
 const CANCELLATION_ESCALATION_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 const PID1_REAP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
@@ -16,6 +16,11 @@ const STORAGE_CONTENTION_RELEASE_WAIT: std::time::Duration = std::time::Duration
 const RATE_LIMITED_RELEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 use super::work_launch;
+use crate::linux_main::fresh_index::KeyedGeneration;
+use crate::linux_main::fresh_index::{
+    AccountUpdate, Artifact, CursorKey, Decision, EffectIntent, EffectKind, Index, PhysicalQ,
+    ProviderGrant, ReaderIoGuard, SourceKey, TerminalMarkerKind,
+};
 use chrono::{DateTime, Utc};
 use oulipoly_kernel_broker::identity::{PinnedProcess, host_proc_file, observed_incarnation_gone};
 use oulipoly_kernel_broker::json_artifact;
@@ -27,7 +32,7 @@ use oulipoly_runtime::executor::cli::fresh_remote::FreshTerminalRecognizer;
 use oulipoly_runtime::executor::terminal_signal::TerminalSignalKind;
 use oulipoly_state::mailbox::{
     FreshBashChild, FreshBashSourceEvent, FreshNormalWorkPreparation, FreshReleasedHandoff,
-    FreshRootWorkIntent,
+    FreshRootTerminalReadback, FreshRootWorkIntent,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -45,6 +50,317 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+#[path = "fresh_rebuild.rs"]
+mod fresh_rebuild;
+
+pub(super) fn complete_v3_effects(
+    root: &Path,
+    snapshot: &mut super::fresh_index::OfflineSnapshot,
+) -> io::Result<()> {
+    fresh_rebuild::complete_v3_effects(root, snapshot)
+}
+
+pub(super) fn offline_snapshot_v3(
+    root: &Path,
+    source: &Path,
+) -> io::Result<super::fresh_index::OfflineSnapshot> {
+    fresh_rebuild::offline_snapshot_v3(root, source)
+}
+
+/// Exact, read-only physical proof for a previously imported v3 account
+/// effect. This deliberately cannot announce an intent or grant a K.
+pub(super) fn v3_effect_physical_readback(
+    directory: &Path,
+    source: &Path,
+    binding: &Binding,
+    request: &FreshAccountEffectRequest,
+    effect_id: &str,
+) -> io::Result<(
+    FreshAccountEffectReadback,
+    SourceKey,
+    String,
+    Artifact,
+    Option<String>,
+)> {
+    let candidate = effect_candidate(directory, binding, request)?;
+    fresh_rebuild::validate_candidate(directory, source, &candidate)?;
+    let dir = effect_directory(directory, binding, request);
+    let intent =
+        effect_intent(&dir)?.ok_or_else(|| io::Error::other("v3 effect physical intent absent"))?;
+    if intent.version != 1
+        || intent.id != effect_id
+        || intent.binding != *binding
+        || intent.request != redacted_effect_request(request)
+        || intent.environment_sha256 != environment_digest(request)?
+        || intent.auth_source.is_some()
+        || dir.join("reuse.json").exists()
+        || dir.join("manual-reuse.json").exists()
+    {
+        return Err(io::Error::other(
+            "v3 effect physical source changed or reused",
+        ));
+    }
+    let source_key = SourceKey {
+        commands_sha256: format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&(
+                &candidate.quota_script,
+                &candidate.auth_refresh_command
+            ))?)
+        ),
+        environment_sha256: intent.environment_sha256.clone(),
+    };
+    let readback = effect_readback_from_dir_mode(&dir, &intent, false)?;
+    let artifact = effect_artifact(directory, &dir.join("intent.json"))?;
+    let grant = grant_for_binding(&dir, binding)?;
+    if let Some(grant_id) = &grant {
+        let physical: Grant =
+            exact_file(&dir, &format!("{}.fresh-grant.json", binding.handoff_id))?
+                .ok_or_else(|| io::Error::other("v3 effect physical grant absent"))?;
+        if physical.id != *grant_id || physical.plan_sha256 != intent.plan_sha256 {
+            return Err(io::Error::other("v3 effect physical grant/plan changed"));
+        }
+        if let Some(consumed) = exact_file::<Grant>(&dir, &format!("{grant_id}.consumed.json"))?
+            && consumed != physical
+        {
+            return Err(io::Error::other("v3 effect physical K differs from grant"));
+        }
+    }
+    Ok((
+        readback,
+        source_key,
+        candidate.account_identity,
+        artifact,
+        grant,
+    ))
+}
+
+fn v3_source_key(
+    candidate: &RouteCandidate,
+    request: &FreshAccountEffectRequest,
+) -> io::Result<SourceKey> {
+    Ok(SourceKey {
+        commands_sha256: format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&(
+                &candidate.quota_script,
+                &candidate.auth_refresh_command
+            ))?)
+        ),
+        environment_sha256: environment_digest(request)?,
+    })
+}
+
+/// A follower has its own exact intent but no physical K. The v2 physical
+/// reader verifies the referenced source account, commands and environment.
+pub(super) fn v3_auth_alias_readback(
+    directory: &Path,
+    source: &Path,
+    binding: &Binding,
+    request: &FreshAccountEffectRequest,
+    id: &str,
+) -> io::Result<(FreshAccountEffectReadback, SourceKey, String, Artifact)> {
+    if request.kind != FreshAccountEffectKind::AuthRefresh {
+        return Err(io::Error::other("v3 auth alias kind changed"));
+    }
+    let candidate = effect_candidate(directory, binding, request)?;
+    fresh_rebuild::validate_candidate(directory, source, &candidate)?;
+    let dir = effect_directory(directory, binding, request);
+    let intent =
+        effect_intent(&dir)?.ok_or_else(|| io::Error::other("v3 auth alias intent absent"))?;
+    if intent.version != 1
+        || intent.id != id
+        || intent.binding != *binding
+        || intent.request != redacted_effect_request(request)
+        || intent.environment_sha256 != environment_digest(request)?
+        || intent.auth_source.is_none()
+        || dir.join("reuse.json").exists()
+        || dir.join("manual-reuse.json").exists()
+    {
+        return Err(io::Error::other("v3 auth alias source changed"));
+    }
+    let result = effect_readback_from_dir_mode(&dir, &intent, false)?;
+    Ok((
+        result,
+        v3_source_key(&candidate, request)?,
+        candidate.account_identity,
+        effect_artifact(directory, &dir.join("intent.json"))?,
+    ))
+}
+
+pub(super) fn v3_materialize_quota_result(
+    directory: &Path,
+    binding: &Binding,
+    request: &FreshAccountEffectRequest,
+    id: &str,
+) -> io::Result<()> {
+    let dir = effect_directory(directory, binding, request);
+    let intent = effect_intent(&dir)?.ok_or_else(|| io::Error::other("v3 quota intent absent"))?;
+    if intent.id != id
+        || intent.binding != *binding
+        || intent.request != redacted_effect_request(request)
+        || intent.environment_sha256 != environment_digest(request)?
+    {
+        return Err(io::Error::other("v3 quota result source changed"));
+    }
+    let _ = effect_readback_from_dir_mode(&dir, &intent, true)?;
+    Ok(())
+}
+
+/// One private physical quota or auth-refresh effect. The caller has already passed the
+/// original D/held-root/peer challenge in the broker socket handler. This
+/// path has no retained-history scan and cannot launch manual
+/// effects. The keyed announcement is durable before the one-use physical K.
+pub(super) fn begin_quota_effect_v3(
+    directory: &Path,
+    generation: &KeyedGeneration,
+    binding: &Binding,
+    request: &FreshAccountEffectRequest,
+    root: &PinnedProcess,
+    actor: &PinnedProcess,
+    uid: u32,
+    gid: u32,
+) -> io::Result<FreshAccountEffectReadback> {
+    let candidate = effect_candidate(directory, binding, request)?;
+    fresh_rebuild::validate_candidate(
+        directory,
+        generation.admitted_source().map_err(io::Error::other)?,
+        &candidate,
+    )?;
+    let command = effect_command(&candidate, request.kind)?;
+    let _account_lock = auth_admission_lock(directory, &candidate.account_identity)?;
+    let dir = effect_directory(directory, binding, request);
+    if dir.exists() {
+        return Err(io::Error::other(
+            "v3 quota effect already begun; observe exact effect",
+        ));
+    }
+    if request.kind == FreshAccountEffectKind::AuthRefresh {
+        let source_key = v3_source_key(&candidate, request)?;
+        if let Some(peer_intent) = generation
+            .auth_peer_intent(&candidate.account_identity, &source_key)
+            .map_err(io::Error::other)?
+        {
+            let peer_dir = directory
+                .join(&peer_intent.path)
+                .parent()
+                .ok_or_else(|| io::Error::other("v3 auth peer directory absent"))?
+                .to_owned();
+            let peer = effect_intent(&peer_dir)?
+                .ok_or_else(|| io::Error::other("v3 auth peer intent absent"))?;
+            if peer.version != 1
+                || peer.request.kind != FreshAccountEffectKind::AuthRefresh
+                || peer.auth_source.is_some()
+                || peer.environment_sha256 != source_key.environment_sha256
+                || !same_physical_effect_source(directory, &candidate, &peer)?
+            {
+                return Err(io::Error::other("v3 auth peer provenance changed"));
+            }
+            let parent = directory.join("account-effects");
+            std::fs::create_dir(&dir)?;
+            File::open(&parent)?.sync_all()?;
+            let intent = AccountEffectIntent {
+                version: 1,
+                id: uuid::Uuid::new_v4().to_string(),
+                binding: binding.clone(),
+                request: redacted_effect_request(request),
+                environment_sha256: source_key.environment_sha256,
+                plan_sha256: format!("coalesced:{}", peer.id),
+                auth_source: Some(AuthReuse {
+                    source_directory: peer_dir
+                        .file_name()
+                        .ok_or_else(|| io::Error::other("v3 auth peer filename absent"))?
+                        .to_string_lossy()
+                        .into_owned(),
+                    source_effect_id: peer.id,
+                }),
+            };
+            durable_new(&dir, "intent.json", &intent)?;
+            generation
+                .announce_auth_alias(binding, request, &intent.id)
+                .map_err(io::Error::other)?;
+            return generation
+                .observe_auth_alias(binding, request, &intent.id)
+                .map_err(io::Error::other);
+        }
+        generation
+            .require_auth_source(&candidate.account_identity, &source_key)
+            .map_err(io::Error::other)?;
+    }
+    let cwd = std::fs::read_link(format!("/proc/{}/cwd", actor.host_pid))?;
+    let shell = std::fs::canonicalize("/bin/sh")?;
+    let input_fd =
+        unsafe { libc::memfd_create(c"fresh-account-empty-stdin".as_ptr(), libc::MFD_CLOEXEC) };
+    if input_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let input = unsafe { File::from_raw_fd(input_fd) };
+    let plan = plan(
+        &shell,
+        &cwd,
+        &input,
+        vec!["-c".into(), command.into()],
+        request.environment.clone(),
+    )?;
+    let parent = directory.join("account-effects");
+    std::fs::create_dir_all(&parent)?;
+    File::open(directory)?.sync_all()?;
+    std::fs::create_dir(&dir)?;
+    File::open(&parent)?.sync_all()?;
+    let intent = AccountEffectIntent {
+        version: 1,
+        id: uuid::Uuid::new_v4().to_string(),
+        binding: binding.clone(),
+        request: redacted_effect_request(request),
+        environment_sha256: environment_digest(request)?,
+        plan_sha256: plan.digest.clone(),
+        auth_source: None,
+    };
+    durable_new(&dir, "intent.json", &intent)?;
+    let revision = generation
+        .announce_quota_effect(binding, request, &intent.id)
+        .map_err(io::Error::other)?;
+    let prepared = prepare(&dir, binding.clone(), plan)?;
+    launch_v3_quota(
+        prepared, root, actor, uid, gid, generation, &intent, request, revision,
+    )?;
+    observe_quota_effect_v3(directory, generation, binding, request)
+}
+
+pub(super) fn observe_quota_effect_v3(
+    directory: &Path,
+    generation: &KeyedGeneration,
+    binding: &Binding,
+    request: &FreshAccountEffectRequest,
+) -> io::Result<FreshAccountEffectReadback> {
+    let candidate = effect_candidate(directory, binding, request)?;
+    fresh_rebuild::validate_candidate(
+        directory,
+        generation.admitted_source().map_err(io::Error::other)?,
+        &candidate,
+    )?;
+    let dir = effect_directory(directory, binding, request);
+    let intent =
+        effect_intent(&dir)?.ok_or_else(|| io::Error::other("v3 quota effect intent absent"))?;
+    if intent.binding != *binding
+        || intent.request != redacted_effect_request(request)
+        || intent.environment_sha256 != environment_digest(request)?
+    {
+        return Err(io::Error::other("v3 quota effect source changed"));
+    }
+    if intent.auth_source.is_some() {
+        return generation
+            .observe_auth_alias(binding, request, &intent.id)
+            .map_err(io::Error::other);
+    }
+    let result = effect_readback_from_dir_mode(&dir, &intent, false)?;
+    let settled = generation
+        .settle_quota_effect(binding, request, &intent.id)
+        .map_err(io::Error::other)?;
+    Ok(settled.unwrap_or(result))
+}
+pub(super) use fresh_rebuild::{offline_snapshot, reconcile_offline_account};
+
 static CANCEL: AtomicBool = AtomicBool::new(false);
 extern "C" fn request_cancel(_: libc::c_int) {
     CANCEL.store(true, Ordering::Relaxed);
@@ -54,7 +370,7 @@ extern "C" fn request_cancel(_: libc::c_int) {
 #[serde(deny_unknown_fields)]
 pub(super) struct Binding {
     root_id: String,
-    handoff_id: String,
+    pub(super) handoff_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     grant_key: Option<String>,
     invocation_uuid: String,
@@ -261,6 +577,29 @@ pub(super) struct Plan {
     digest: String,
     cwd_device: u64,
     cwd_inode: u64,
+}
+
+fn plan_environment_sha256(plan: &Plan) -> io::Result<String> {
+    let len: usize = plan
+        .recipe
+        .metadata()?
+        .len()
+        .try_into()
+        .map_err(|_| io::Error::other("fresh recipe length overflow"))?;
+    let mut bytes = vec![0; len];
+    let mut offset = 0;
+    while offset < len {
+        let read = plan.recipe.read_at(&mut bytes[offset..], offset as u64)?;
+        if read == 0 {
+            return Err(io::Error::other("fresh recipe truncated"));
+        }
+        offset += read;
+    }
+    let recipe: Recipe = serde_json::from_slice(&bytes)?;
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&recipe.env)?)
+    ))
 }
 
 impl Plan {
@@ -718,10 +1057,7 @@ pub(super) fn plan_from_descriptors(
                 || key.contains(['=', '\0'])
                 || value.contains('\0')
                 || !keys.insert(key)
-                || key.starts_with("LD_")
-                || key.starts_with("DYLD_")
-                || key.starts_with("OULIPOLY_KERNEL_")
-                || matches!(key.as_str(), "GLIBC_TUNABLES" | "GCONV_PATH")
+                || oulipoly_runtime::executor::cli::fresh_remote::forbidden_fresh_environment(key)
         })
     {
         return Err(io::Error::other("unsupported fresh provider recipe"));
@@ -783,10 +1119,692 @@ pub(super) struct Prepared {
     grant: Grant,
     plan: Plan,
     directory: PathBuf,
+    indexed_account: Option<String>,
+    indexed_effect: Option<AccountEffectIntent>,
+}
+
+impl Prepared {
+    pub(super) fn require_indexed_route(&self, index: &Index) -> io::Result<()> {
+        index
+            .require_live_route(&self.grant.binding.handoff_id)
+            .map_err(io::Error::other)
+    }
+
+    pub(super) fn announce_indexed_grant(&mut self, index: &Index) -> io::Result<()> {
+        self.require_indexed_route(index)?;
+        let account = reconcile_indexed_provider_grant(index, &self.grant)?;
+        let indexed = index.account(&account).map_err(io::Error::other)?;
+        let grant = indexed
+            .grants
+            .get(&self.grant.id)
+            .ok_or_else(|| io::Error::other("indexed provider grant announcement absent"))?;
+        if grant.consumed_k.is_some() || grant.certified_q.is_some() {
+            return Err(io::Error::other("indexed provider grant already consumed"));
+        }
+        self.indexed_account = Some(account);
+        Ok(())
+    }
+}
+
+/// Recheck the selected account against current physical quota/auth and
+/// model-capacity facts before announcing K. The caller holds route.lock.
+pub(super) fn require_selected_plan_v3(
+    directory: &Path,
+    binding: &Binding,
+    plan: &Plan,
+    generation: &KeyedGeneration,
+) -> io::Result<(String, u64)> {
+    use super::fresh_index::RouteEligibility;
+    let indexed = generation
+        .require_route(&binding.handoff_id)
+        .map_err(io::Error::other)?;
+    let decision: RouteDecision = exact_file(directory, &decision_name(&binding.handoff_id))?
+        .ok_or_else(|| io::Error::other("v3 provider route receipt absent"))?;
+    let candidate: RouteCandidate = exact_file(
+        directory,
+        &candidate_name(&binding.handoff_id, decision.selection.index),
+    )?
+    .ok_or_else(|| io::Error::other("v3 provider selected candidate absent"))?;
+    if decision.version != 1
+        || decision.binding != *binding
+        || decision.selection.plan_sha256 != plan.digest
+        || indexed.candidate_identity != decision.selection.account_identity
+        || indexed.candidate_index != decision.selection.index
+        || indexed.key.model != decision.selection.model
+        || indexed.key.config_sha256 != decision.selection.config_sha256
+        || candidate.version != 3
+        || candidate.binding != *binding
+        || candidate.account != decision.selection.account
+        || candidate.account_identity != decision.selection.account_identity
+        || candidate.model != decision.selection.model
+        || candidate.config_sha256 != decision.selection.config_sha256
+        || candidate.plan_sha256 != plan.digest
+        || candidate.environment_sha256 != plan_environment_sha256(plan)?
+    {
+        return Err(io::Error::other(
+            "v3 provider K differs from selected route",
+        ));
+    }
+    fresh_rebuild::validate_candidate(
+        directory,
+        generation.admitted_source().map_err(io::Error::other)?,
+        &candidate,
+    )?;
+    generation
+        .ensure_provider_account(
+            &candidate.account_identity,
+            &candidate.model,
+            &candidate.config_sha256,
+        )
+        .map_err(io::Error::other)?;
+    let source = if candidate.quota_script.is_some() {
+        let environment = &candidate.environment_sha256;
+        if environment.len() != 64 || !environment.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(io::Error::other("v3 provider environment digest invalid"));
+        }
+        Some(SourceKey {
+            commands_sha256: format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&(
+                    &candidate.quota_script,
+                    &candidate.auth_refresh_command
+                ))?)
+            ),
+            environment_sha256: environment.clone(),
+        })
+    } else {
+        None
+    };
+    let facts = generation
+        .route_facts(
+            &candidate.account_identity,
+            source.as_ref(),
+            &candidate.model,
+            &candidate.config_sha256,
+            Utc::now().timestamp(),
+        )
+        .map_err(io::Error::other)?;
+    let RouteEligibility::Eligible {
+        account_revision,
+        quota_basis_points,
+        ..
+    } = facts
+    else {
+        return Err(io::Error::other(
+            "v3 provider selected account no longer eligible before K",
+        ));
+    };
+    if quota_basis_points != decision.selection.quota_remaining_basis_points {
+        return Err(io::Error::other(
+            "v3 provider selected quota fact changed before K",
+        ));
+    }
+    Ok((candidate.account_identity, account_revision))
+}
+
+pub(super) fn announce_provider_v3(
+    prepared: &Prepared,
+    generation: &KeyedGeneration,
+    account: &str,
+    revision: u64,
+) -> io::Result<u64> {
+    let decision: RouteDecision = exact_file(
+        &prepared.directory,
+        &decision_name(&prepared.grant.binding.handoff_id),
+    )?
+    .ok_or_else(|| io::Error::other("v3 provider route receipt absent"))?;
+    let candidate_name =
+        candidate_name(&prepared.grant.binding.handoff_id, decision.selection.index);
+    let grant = ProviderGrant {
+        decision_handoff: prepared.grant.binding.handoff_id.clone(),
+        grant: provider_artifact(
+            &prepared.directory,
+            &format!("{}.fresh-grant.json", prepared.grant.binding.handoff_id),
+        )?,
+        candidate: Some(provider_artifact(&prepared.directory, &candidate_name)?),
+        consumed_k: None,
+        certified_q: None,
+    };
+    generation
+        .announce_provider(
+            account,
+            &prepared.grant.id,
+            grant,
+            &decision.selection.model,
+            &decision.selection.config_sha256,
+            revision,
+        )
+        .map_err(io::Error::other)
+}
+
+pub(super) fn launch_v3_provider(
+    prepared: Prepared,
+    root: &PinnedProcess,
+    actor: &PinnedProcess,
+    uid: u32,
+    gid: u32,
+    generation: &KeyedGeneration,
+    account: &str,
+    revision: u64,
+) -> io::Result<String> {
+    launch_inner(
+        prepared,
+        root,
+        actor,
+        uid,
+        gid,
+        None,
+        None,
+        Some((generation, account, revision)),
+    )
+}
+
+fn provider_artifact(root: &Path, name: &str) -> io::Result<Artifact> {
+    Artifact::from_existing(root, Path::new(name)).map_err(io::Error::other)
+}
+
+/// Reconcile only an original root grant. The exact route receipt fixes the
+/// physical account across models; effect and manual grants live elsewhere.
+fn reconcile_indexed_provider_grant(index: &Index, grant: &Grant) -> io::Result<String> {
+    let root = index.evidence_root();
+    index
+        .require_live_route(&grant.binding.handoff_id)
+        .map_err(io::Error::other)?;
+    let decision: RouteDecision = exact_file(root, &decision_name(&grant.binding.handoff_id))?
+        .ok_or_else(|| io::Error::other("indexed provider decision absent"))?;
+    let candidate: RouteCandidate = exact_file(
+        root,
+        &candidate_name(&grant.binding.handoff_id, decision.selection.index),
+    )?
+    .ok_or_else(|| io::Error::other("indexed provider candidate absent"))?;
+    if grant.version != 3
+        || grant.binding != decision.binding
+        || grant.plan_sha256 != decision.selection.plan_sha256
+        || candidate.version != 3
+        || candidate.binding != decision.binding
+        || candidate.account_identity != decision.selection.account_identity
+        || candidate.account != decision.selection.account
+        || candidate.model != decision.selection.model
+        || candidate.config_sha256 != decision.selection.config_sha256
+        || candidate.plan_sha256 != grant.plan_sha256
+    {
+        return Err(io::Error::other(
+            "indexed provider grant/intent/account changed",
+        ));
+    }
+    let key = candidate.account_identity.clone();
+    let grant_name = format!("{}.fresh-grant.json", grant.binding.handoff_id);
+    let retained: Grant = exact_file(root, &grant_name)?
+        .ok_or_else(|| io::Error::other("physical provider grant absent"))?;
+    if retained != *grant {
+        return Err(io::Error::other("physical provider grant changed"));
+    }
+    let grant_artifact = provider_artifact(root, &grant_name)?;
+    let candidate_artifact = provider_artifact(
+        root,
+        &candidate_name(&grant.binding.handoff_id, decision.selection.index),
+    )?;
+    let k_name = format!("{}.consumed.json", grant.id);
+    let k = exact_file::<Grant>(root, &k_name)?;
+    if k.as_ref().is_some_and(|k| k != grant) {
+        return Err(io::Error::other("physical provider K differs from grant"));
+    }
+    let mut account = index.account(&key).map_err(io::Error::other)?;
+    if let Some(existing) = account.grants.get(&grant.id) {
+        if existing.decision_handoff != grant.binding.handoff_id
+            || existing.grant != grant_artifact
+            || existing.candidate.as_ref() != Some(&candidate_artifact)
+        {
+            return Err(io::Error::other("indexed provider grant identity changed"));
+        }
+    } else {
+        if k.is_some() {
+            return Err(io::Error::other(
+                "physical provider K lacks indexed announcement",
+            ));
+        }
+        let announced = ProviderGrant {
+            decision_handoff: grant.binding.handoff_id.clone(),
+            grant: grant_artifact.clone(),
+            candidate: Some(candidate_artifact),
+            consumed_k: None,
+            certified_q: None,
+        };
+        let update = AccountUpdate::AnnounceGrant {
+            id: grant.id.clone(),
+            grant: announced.clone(),
+        };
+        let result = index.update_account(&key, account.revision, update);
+        account = index.account(&key).map_err(io::Error::other)?;
+        if account.grants.get(&grant.id) != Some(&announced) {
+            return Err(io::Error::other(format!(
+                "indexed provider grant publication failed: {result:?}"
+            )));
+        }
+    }
+    if k.is_some() {
+        let k_artifact = provider_artifact(root, &k_name)?;
+        let indexed = account.grants.get(&grant.id).unwrap();
+        match &indexed.consumed_k {
+            Some(old) if old != &k_artifact => {
+                return Err(io::Error::other("indexed provider K changed"));
+            }
+            None => {
+                let result = index.update_account(
+                    &key,
+                    account.revision,
+                    AccountUpdate::ConsumeGrant {
+                        id: grant.id.clone(),
+                        k: k_artifact.clone(),
+                    },
+                );
+                account = index.account(&key).map_err(io::Error::other)?;
+                if account
+                    .grants
+                    .get(&grant.id)
+                    .and_then(|g| g.consumed_k.as_ref())
+                    != Some(&k_artifact)
+                {
+                    return Err(io::Error::other(format!(
+                        "indexed provider K publication failed: {result:?}"
+                    )));
+                }
+            }
+            Some(_) => {}
+        }
+        let q_name = format!("{}.drain.json", grant.id);
+        if root.join(&q_name).exists() {
+            let Observation::Drained {
+                status,
+                stdout,
+                stderr,
+                cancelled,
+                ..
+            } = observe(root, &grant.id)?
+            else {
+                return Err(io::Error::other(
+                    "indexed provider Q lacks physical certification",
+                ));
+            };
+            let terminal = terminal_record(
+                root, &decision, &candidate, grant, status, stdout, stderr, cancelled,
+            )?;
+            let q = PhysicalQ {
+                physical_k: k_artifact,
+                q: provider_artifact(root, &q_name)?,
+                terminal: Some(provider_artifact(
+                    root,
+                    &format!("{}.terminal.json", grant.id),
+                )?),
+                completed_unix_nanos: i64::try_from(terminal.physical_q_unix_nanos)
+                    .map_err(io::Error::other)?,
+            };
+            let indexed = account.grants.get(&grant.id).unwrap();
+            if let Some(old) = &indexed.certified_q {
+                if old != &q {
+                    return Err(io::Error::other("indexed provider Q/terminal changed"));
+                }
+            } else {
+                let marker = match terminal.outcome {
+                    TerminalOutcome::QuotaRejected => Some(TerminalMarkerKind::Quota),
+                    TerminalOutcome::AuthRejected => Some(TerminalMarkerKind::Auth),
+                    TerminalOutcome::ModelAtCapacity => Some(TerminalMarkerKind::ModelCapacity),
+                    _ => None,
+                };
+                let result = index.update_account(
+                    &key,
+                    account.revision,
+                    AccountUpdate::SettleGrant {
+                        id: grant.id.clone(),
+                        q: q.clone(),
+                        failed: status != 0
+                            && file_age_less_than(
+                                &root.join(&q_name),
+                                Duration::from_secs(30 * 60),
+                            )?,
+                        marker,
+                    },
+                );
+                account = index.account(&key).map_err(io::Error::other)?;
+                if account
+                    .grants
+                    .get(&grant.id)
+                    .and_then(|g| g.certified_q.as_ref())
+                    != Some(&q)
+                {
+                    return Err(io::Error::other(format!(
+                        "indexed provider Q publication failed: {result:?}"
+                    )));
+                }
+            }
+        } else if account
+            .grants
+            .get(&grant.id)
+            .and_then(|g| g.certified_q.as_ref())
+            .is_some()
+            || root.join(format!("{}.terminal.json", grant.id)).exists()
+        {
+            return Err(io::Error::other("indexed provider terminal without Q"));
+        }
+    } else if root.join(format!("{}.drain.json", grant.id)).exists() {
+        return Err(io::Error::other("physical provider Q precedes K"));
+    }
+    Ok(key)
+}
+
+pub(super) fn reconcile_live_provider_accounts(index: &Index) -> io::Result<()> {
+    let root = index.evidence_root();
+    for key in index.live_account_keys().map_err(io::Error::other)? {
+        let account = index.account(&key).map_err(io::Error::other)?;
+        for grant in account.grants.values() {
+            if !root
+                .join(format!("{}.fresh-grant.json", grant.decision_handoff))
+                .exists()
+            {
+                return Err(io::Error::other("indexed provider grant artifact absent"));
+            }
+        }
+    }
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(handoff) = name
+            .to_str()
+            .and_then(|n| n.strip_suffix(".fresh-grant.json"))
+        else {
+            continue;
+        };
+        let grant: Grant = exact_file(root, &format!("{handoff}.fresh-grant.json"))?
+            .ok_or_else(|| io::Error::other("physical provider grant disappeared"))?;
+        if grant.binding.handoff_id != handoff {
+            return Err(io::Error::other("physical provider grant filename changed"));
+        }
+        reconcile_indexed_provider_grant(index, &grant)?;
+    }
+    Ok(())
+}
+
+pub(super) fn reconcile_indexed_provider_binding(
+    index: &Index,
+    root: &Path,
+    binding: &Binding,
+) -> io::Result<()> {
+    let grant: Grant = exact_file(root, &format!("{}.fresh-grant.json", binding.handoff_id))?
+        .ok_or_else(|| io::Error::other("physical provider grant absent"))?;
+    if grant.binding != *binding {
+        return Err(io::Error::other(
+            "physical provider readback binding changed",
+        ));
+    }
+    reconcile_indexed_provider_grant(index, &grant)?;
+    Ok(())
+}
+
+/// Exact v3 provider readback. Physical K/Q must match the keyed grant and
+/// terminal source; this function does not announce or settle either.
+pub(super) fn require_v3_provider_binding(
+    generation: &KeyedGeneration,
+    directory: &Path,
+    binding: &Binding,
+) -> io::Result<String> {
+    let root = directory;
+    let indexed_decision = generation
+        .require_route(&binding.handoff_id)
+        .map_err(io::Error::other)?;
+    let decision: RouteDecision = exact_file(root, &decision_name(&binding.handoff_id))?
+        .ok_or_else(|| io::Error::other("v3 provider route receipt absent"))?;
+    let grant: Grant = exact_file(root, &format!("{}.fresh-grant.json", binding.handoff_id))?
+        .ok_or_else(|| io::Error::other("v3 provider grant absent"))?;
+    let candidate: RouteCandidate = exact_file(
+        root,
+        &candidate_name(&binding.handoff_id, decision.selection.index),
+    )?
+    .ok_or_else(|| io::Error::other("v3 provider candidate absent"))?;
+    if decision.binding != *binding
+        || grant.binding != *binding
+        || grant.version != 3
+        || candidate.version != 3
+        || candidate.binding != *binding
+        || candidate.account_identity != indexed_decision.candidate_identity
+        || candidate.index != indexed_decision.candidate_index
+        || candidate.model != indexed_decision.key.model
+        || candidate.config_sha256 != indexed_decision.key.config_sha256
+        || grant.plan_sha256 != candidate.plan_sha256
+        || grant.plan_sha256 != decision.selection.plan_sha256
+    {
+        return Err(io::Error::other("v3 provider binding changed"));
+    }
+    let account = &candidate.account_identity;
+    let indexed = generation
+        .provider_grant(account, &grant.id)
+        .map_err(io::Error::other)?
+        .ok_or_else(|| io::Error::other("v3 provider grant unannounced"))?;
+    if indexed.decision_handoff != binding.handoff_id
+        || indexed.grant
+            != provider_artifact(root, &format!("{}.fresh-grant.json", binding.handoff_id))?
+        || indexed.candidate.as_ref()
+            != Some(&provider_artifact(
+                root,
+                &candidate_name(&binding.handoff_id, candidate.index),
+            )?)
+    {
+        return Err(io::Error::other("v3 provider grant source changed"));
+    }
+    let k_name = format!("{}.consumed.json", grant.id);
+    let physical_k: Option<Grant> = exact_file(root, &k_name)?;
+    if physical_k
+        .as_ref()
+        .is_some_and(|physical| physical != &grant)
+    {
+        return Err(io::Error::other("v3 physical K identity changed"));
+    }
+    let k = physical_k
+        .map(|_| provider_artifact(root, &k_name))
+        .transpose()?;
+    if indexed.consumed_k != k {
+        return Err(io::Error::other("v3 physical K differs from keyed source"));
+    }
+    let q_name = format!("{}.drain.json", grant.id);
+    let terminal_name = format!("{}.terminal.json", grant.id);
+    let q = if root.join(&q_name).exists() {
+        Some(provider_artifact(root, &q_name)?)
+    } else {
+        None
+    };
+    let terminal: Option<TerminalRecord> = exact_file(root, &terminal_name)?;
+    match (&indexed.certified_q, &q, &terminal) {
+        (Some(certified), Some(q), Some(typed)) => {
+            if Some(&certified.physical_k) != k.as_ref()
+                || &certified.q != q
+                || certified.terminal.as_ref() != Some(&provider_artifact(root, &terminal_name)?)
+                || typed.version != 1
+                || typed.binding != *binding
+                || typed.selection != decision.selection
+                || typed.grant_id != grant.id
+                || typed.physical_q_sha256 != q.sha256
+                || i64::try_from(typed.physical_q_unix_nanos).ok()
+                    != Some(certified.completed_unix_nanos)
+            {
+                return Err(io::Error::other(
+                    "v3 typed provider Q differs from keyed source",
+                ));
+            }
+        }
+        (None, None, None) => {}
+        _ => {
+            return Err(io::Error::other(
+                "v3 provider Q or typed terminal is unjoined debt",
+            ));
+        }
+    }
+    let pending = generation
+        .provider_pending(account, &grant.id)
+        .map_err(io::Error::other)?;
+    if indexed.certified_q.is_some() {
+        if pending.is_some() {
+            return Err(io::Error::other("v3 settled provider still pending"));
+        }
+    } else if pending.as_ref().is_none_or(|pending| {
+        pending.announcement != indexed.grant
+            || pending.physical_k != k
+            || pending.decision_handoff != binding.handoff_id
+            || pending.kind != "provider"
+    }) {
+        return Err(io::Error::other("v3 provider pending record differs"));
+    }
+    Ok(grant.id)
+}
+
+/// A State terminal may be read independently of the keyed provider writer.
+/// Releasing the original entry also requires this exact v3 K/Q/typed source.
+pub(super) fn require_v3_terminal_publication(
+    generation: &KeyedGeneration,
+    directory: &Path,
+    terminal: &FreshRootTerminalReadback,
+) -> io::Result<()> {
+    let execution = terminal
+        .execution
+        .as_ref()
+        .ok_or_else(|| io::Error::other("v3 terminal execution absent"))?;
+    let grant: Grant = exact_file(
+        directory,
+        &format!("{}.fresh-grant.json", terminal.handoff_id),
+    )?
+    .ok_or_else(|| io::Error::other("v3 terminal provider grant absent"))?;
+    let binding = &grant.binding;
+    if grant.id != execution.parent.grant_id
+        || binding.root_id != terminal.root_id
+        || binding.handoff_id != terminal.handoff_id
+        || binding.invocation_uuid != terminal.invocation_uuid
+        || binding.session_id != terminal.session_id
+        || binding.owner_generation != terminal.owner_generation
+        || binding.actor_pid != terminal.actor.host_pid
+        || binding.actor_starttime != terminal.actor.starttime_ticks
+        || binding.actor_boot_id != terminal.actor.boot_id
+        || binding.actor_pidns_dev != terminal.actor.pidns_dev
+        || binding.actor_pidns_ino != terminal.actor.pidns_ino
+        || binding.causal_parent.is_some()
+    {
+        return Err(io::Error::other(
+            "v3 terminal root/D/actor differs from provider K",
+        ));
+    }
+    let id = require_v3_provider_binding(generation, directory, binding)?;
+    if id != grant.id {
+        return Err(io::Error::other("v3 terminal provider grant changed"));
+    }
+    let decision: RouteDecision = exact_file(directory, &decision_name(&binding.handoff_id))?
+        .ok_or_else(|| io::Error::other("v3 terminal route receipt absent"))?;
+    let indexed = generation
+        .provider_grant(&decision.selection.account_identity, &id)
+        .map_err(io::Error::other)?
+        .ok_or_else(|| io::Error::other("v3 terminal indexed provider absent"))?;
+    if indexed.certified_q.is_none() {
+        return Err(io::Error::other("v3 terminal provider Q remains unjoined"));
+    }
+    Ok(())
+}
+
+/// Materialize only a witnessed physical Q. Missing drain/tree closure leaves
+/// the exact K pending; a later readback can finish this same grant.
+pub(super) fn settle_v3_provider(
+    generation: &KeyedGeneration,
+    directory: &Path,
+    binding: &Binding,
+    grant_id: &str,
+) -> io::Result<()> {
+    let decision: RouteDecision = exact_file(directory, &decision_name(&binding.handoff_id))?
+        .ok_or_else(|| io::Error::other("v3 provider route receipt absent"))?;
+    let grant: Grant = exact_file(
+        directory,
+        &format!("{}.fresh-grant.json", binding.handoff_id),
+    )?
+    .ok_or_else(|| io::Error::other("v3 provider grant absent"))?;
+    let candidate: RouteCandidate = exact_file(
+        directory,
+        &candidate_name(&binding.handoff_id, decision.selection.index),
+    )?
+    .ok_or_else(|| io::Error::other("v3 provider candidate absent"))?;
+    if decision.binding != *binding
+        || grant.binding != *binding
+        || grant.id != grant_id
+        || grant.plan_sha256 != candidate.plan_sha256
+        || candidate.account_identity != decision.selection.account_identity
+    {
+        return Err(io::Error::other("v3 provider settlement binding changed"));
+    }
+    let indexed = generation
+        .provider_grant(&candidate.account_identity, grant_id)
+        .map_err(io::Error::other)?
+        .ok_or_else(|| io::Error::other("v3 provider grant unannounced"))?;
+    if indexed.certified_q.is_some() {
+        require_v3_provider_binding(generation, directory, binding)?;
+        return Ok(());
+    }
+    let Observation::Drained {
+        status,
+        stdout,
+        stderr,
+        cancelled,
+        ..
+    } = observe(directory, grant_id)?
+    else {
+        return Ok(());
+    };
+    let k = provider_artifact(directory, &format!("{grant_id}.consumed.json"))?;
+    if indexed.consumed_k.as_ref() != Some(&k) {
+        return Err(io::Error::other("v3 provider K was not recorded before Q"));
+    }
+    let terminal = terminal_record(
+        directory, &decision, &candidate, &grant, status, stdout, stderr, cancelled,
+    )?;
+    let q = PhysicalQ {
+        physical_k: k,
+        q: provider_artifact(directory, &format!("{grant_id}.drain.json"))?,
+        terminal: Some(provider_artifact(
+            directory,
+            &format!("{grant_id}.terminal.json"),
+        )?),
+        completed_unix_nanos: i64::try_from(terminal.physical_q_unix_nanos)
+            .map_err(io::Error::other)?,
+    };
+    let outcome = serde_json::to_value(terminal.outcome)?;
+    let outcome = outcome
+        .as_str()
+        .ok_or_else(|| io::Error::other("v3 terminal outcome invalid"))?;
+    generation
+        .settle_provider(
+            &candidate.account_identity,
+            grant_id,
+            q,
+            outcome,
+            &candidate.model,
+            &candidate.config_sha256,
+        )
+        .map_err(io::Error::other)?;
+    require_v3_provider_binding(generation, directory, binding)?;
+    Ok(())
 }
 
 fn durable_new<T: Serialize>(directory: &Path, name: &str, value: &T) -> io::Result<()> {
     json_artifact::create_new(directory, name, value)
+}
+
+pub(super) fn durable_new_bytes(directory: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
+    super::fresh_index::reader_open_attempt();
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(directory.join(name))?;
+    super::fresh_index::reader_opened();
+    file.write_all(bytes)?;
+    super::fresh_index::reader_bytes_written(bytes.len() as u64);
+    file.sync_all()?;
+    super::fresh_index::reader_open_attempt();
+    let parent = File::open(directory)?;
+    super::fresh_index::reader_opened();
+    parent.sync_all()
 }
 
 fn durable_result<T: Serialize>(directory: &Path, value: &T) -> io::Result<()> {
@@ -797,15 +1815,18 @@ fn durable_result<T: Serialize>(directory: &Path, value: &T) -> io::Result<()> {
 #[serde(deny_unknown_fields)]
 struct RouteCandidate {
     // v2 freezes the config-selected terminal recognizer with the exact plan.
+    // v3 also freezes the source-owned physical account identity.
     version: u32,
     binding: Binding,
     model: String,
     config_sha256: String,
     account: String,
+    account_identity: String,
     index: usize,
     total: usize,
     pin: Option<String>,
     plan_sha256: String,
+    environment_sha256: String,
     quota_script: Option<String>,
     auth_refresh_command: Option<String>,
     terminal_recognizer: FreshTerminalRecognizer,
@@ -847,6 +1868,10 @@ struct RouteDecision {
     binding: Binding,
     total: usize,
     pin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    environment_sha256: Option<String>,
+    #[serde(default)]
+    sequence: u64,
     selection: FreshRouteSelection,
 }
 
@@ -1439,6 +2464,49 @@ fn require_captured_child_work_selection(
     Ok(())
 }
 
+pub(super) fn validate_indexed_receipt(directory: &Path, indexed: &Decision) -> io::Result<()> {
+    let decision: RouteDecision = exact_file(directory, &decision_name(&indexed.handoff))?
+        .ok_or_else(|| io::Error::other("indexed route receipt absent"))?;
+    if decision.version != 1
+        || decision.binding.handoff_id != indexed.handoff
+        || decision.selection.policy_version != FRESH_ROUTE_POLICY_VERSION
+        || decision.selection.model != indexed.key.model
+        || decision.selection.config_sha256 != indexed.key.config_sha256
+        || decision.selection.account_identity != indexed.candidate_identity
+        || decision.selection.index != indexed.candidate_index
+        || decision.pin.is_some() != indexed.pin
+        || decision.sequence != indexed.sequence
+        || decision.pin.is_some() != (decision.sequence == 0)
+        || decision.total == 0
+        || decision.selection.index >= decision.total
+        || !decision
+            .selection
+            .eligible_accounts
+            .contains(&decision.selection.account)
+    {
+        return Err(io::Error::other("indexed route receipt identity changed"));
+    }
+    let candidate: RouteCandidate = exact_file(
+        directory,
+        &candidate_name(&indexed.handoff, indexed.candidate_index),
+    )?
+    .ok_or_else(|| io::Error::other("indexed route candidate absent"))?;
+    if candidate.version != 3
+        || candidate.binding != decision.binding
+        || candidate.total != decision.total
+        || candidate.index != decision.selection.index
+        || candidate.pin != decision.pin
+        || candidate.model != decision.selection.model
+        || candidate.config_sha256 != decision.selection.config_sha256
+        || candidate.account_identity != decision.selection.account_identity
+        || candidate.account != decision.selection.account
+        || candidate.plan_sha256 != decision.selection.plan_sha256
+    {
+        return Err(io::Error::other("indexed route candidate changed"));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct RouteSource {
@@ -1450,9 +2518,15 @@ struct RouteSource {
 }
 
 fn route_request_valid(request: &FreshRouteRequest, binding: &Binding) -> io::Result<()> {
-    if request.d_key.is_empty()
+    if request.protocol_version != 4
+        || request.d_key.is_empty()
         || request.model.is_empty()
         || request.account.as_deref().is_some_and(str::is_empty)
+        || request
+            .account_identity
+            .as_deref()
+            .is_some_and(str::is_empty)
+        || request.account.is_some() != request.account_identity.is_some()
         || request.config_sha256.len() != 64
         || !request.config_sha256.bytes().all(|c| c.is_ascii_hexdigit())
         || request.total == 0
@@ -1499,6 +2573,8 @@ pub(super) fn validate_route_source(
             .get(index)
             .ok_or_else(|| io::Error::other("fresh config source account effect absent"))?;
         if request.account.as_deref() != Some(member.name.as_str())
+            || request.account_identity.as_deref() != pool.account_identities[index].as_deref()
+            || request.account_identity.is_none()
             || request.quota_script != effect.0
             || request.auth_refresh_command != effect.1
         {
@@ -1507,6 +2583,7 @@ pub(super) fn validate_route_source(
             ));
         }
     } else if request.account.is_some()
+        || request.account_identity.is_some()
         || request.quota_script.is_some()
         || request.auth_refresh_command.is_some()
     {
@@ -1574,6 +2651,13 @@ struct QuotaReuse {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+struct ManualQuotaReuse {
+    operation_id: String,
+    source_effect_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 struct AuthReuse {
     source_directory: String,
     source_effect_id: String,
@@ -1618,7 +2702,7 @@ fn effect_candidate(
         &candidate_name(&binding.handoff_id, request.index),
     )?
     .ok_or_else(|| io::Error::other("fresh account effect candidate absent"))?;
-    if candidate.version != 2
+    if candidate.version != 3
         || candidate.binding != *binding
         || candidate.model != request.model
         || candidate.config_sha256 != request.config_sha256
@@ -1628,6 +2712,321 @@ fn effect_candidate(
         return Err(io::Error::other("fresh account effect candidate changed"));
     }
     Ok(candidate)
+}
+
+fn effect_artifact(root: &Path, path: &Path) -> io::Result<Artifact> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| io::Error::other("effect artifact outside broker root"))?;
+    Artifact::from_existing(root, relative).map_err(io::Error::other)
+}
+
+/// Mirror one exact retained effect into its source-selected physical account.
+/// The announcement is read back before K; a lost CAS reply after K is debt,
+/// never a reason to create another process.
+fn reconcile_indexed_account_effect(
+    index: &Index,
+    dir: &Path,
+    intent: &AccountEffectIntent,
+) -> io::Result<String> {
+    let root = index.evidence_root();
+    if index
+        .decision(&intent.binding.handoff_id)
+        .map_err(io::Error::other)?
+        .is_some()
+        || root
+            .join(decision_name(&intent.binding.handoff_id))
+            .exists()
+    {
+        index
+            .require_live_route(&intent.binding.handoff_id)
+            .map_err(io::Error::other)?;
+    }
+    let candidate = effect_candidate(root, &intent.binding, &intent.request)?;
+    let source_name = format!("{}.route-source.json", intent.binding.handoff_id);
+    let registered: RouteSource = exact_file(root, &source_name)?
+        .ok_or_else(|| io::Error::other("indexed effect route source absent"))?;
+    if intent.version != 1
+        || intent.plan_sha256.is_empty()
+        || intent.id.is_empty()
+        || intent.environment_sha256.len() != 64
+        || !intent
+            .environment_sha256
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit())
+        || registered.version != 1
+        || registered.binding != intent.binding
+        || registered.config_sha256 != candidate.config_sha256
+        || candidate.total == 0
+        || candidate.index >= candidate.total
+        || effect_directory(root, &intent.binding, &intent.request) != dir
+        || effect_intent(dir)?.as_ref() != Some(intent)
+    {
+        return Err(io::Error::other("indexed effect route or intent changed"));
+    }
+    let key = candidate.account_identity.clone();
+    if dir.join("reuse.json").exists() && dir.join("manual-reuse.json").exists() {
+        return Err(io::Error::other("indexed effect has conflicting reuse"));
+    }
+    let reuse_path = ["reuse.json", "manual-reuse.json"]
+        .into_iter()
+        .find(|name| dir.join(name).exists());
+    let reuse_path = if intent.auth_source.is_some() {
+        Some("intent.json")
+    } else {
+        reuse_path
+    };
+    let reuse = reuse_path
+        .map(|name| effect_artifact(root, &dir.join(name)))
+        .transpose()?;
+    if reuse.is_none()
+        && (intent.plan_sha256.starts_with("reused:")
+            || intent.plan_sha256.starts_with("manual:")
+            || intent.plan_sha256.starts_with("coalesced:"))
+    {
+        return Err(io::Error::other("indexed effect reuse reference absent"));
+    }
+    let intent_artifact = effect_artifact(root, &dir.join("intent.json"))?;
+    let candidate_artifact = effect_artifact(
+        root,
+        &root.join(candidate_name(&intent.binding.handoff_id, candidate.index)),
+    )?;
+    let source = SourceKey {
+        commands_sha256: format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&(
+                &candidate.quota_script,
+                &candidate.auth_refresh_command
+            ))?)
+        ),
+        environment_sha256: intent.environment_sha256.clone(),
+    };
+    let kind = match intent.request.kind {
+        FreshAccountEffectKind::AuthRefresh => EffectKind::Auth,
+        FreshAccountEffectKind::QuotaFirst | FreshAccountEffectKind::QuotaRetry => {
+            EffectKind::Quota
+        }
+    };
+    let announced = EffectIntent {
+        kind,
+        source,
+        decision_handoff: intent.binding.handoff_id.clone(),
+        route_source: Some(effect_artifact(root, &root.join(source_name))?),
+        candidate: Some(candidate_artifact),
+        intent: intent_artifact,
+        reuse,
+        consumed_k: None,
+        certified_q: None,
+        result: None,
+    };
+    let grant = grant_for_binding(dir, &intent.binding)?;
+    let retained_grant = grant
+        .as_ref()
+        .map(|_| {
+            exact_file::<Grant>(
+                dir,
+                &format!("{}.fresh-grant.json", intent.binding.handoff_id),
+            )
+        })
+        .transpose()?
+        .flatten();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if let Some(id) = name.strip_suffix(".consumed.json")
+            && grant.as_deref() != Some(id)
+        {
+            return Err(io::Error::other("indexed effect K lacks exact grant"));
+        }
+    }
+    let k = grant
+        .as_ref()
+        .map(|id| exact_file::<Grant>(dir, &format!("{id}.consumed.json")))
+        .transpose()?
+        .flatten();
+    if let Some(ref k) = k {
+        if Some(k) != retained_grant.as_ref() || k.plan_sha256 != intent.plan_sha256 {
+            return Err(io::Error::other("indexed effect physical K changed"));
+        }
+    }
+    let mut account = index.account(&key).map_err(io::Error::other)?;
+    if let Some(existing) = account.effects.get(&intent.id) {
+        if existing.kind != announced.kind
+            || existing.source != announced.source
+            || existing.decision_handoff != announced.decision_handoff
+            || existing.route_source != announced.route_source
+            || existing.candidate != announced.candidate
+            || existing.intent != announced.intent
+            || existing.reuse != announced.reuse
+        {
+            return Err(io::Error::other("indexed effect announcement changed"));
+        }
+    } else {
+        if k.is_some() {
+            return Err(io::Error::other(
+                "physical effect K lacks indexed announcement",
+            ));
+        }
+        let update = index.update_account(
+            &key,
+            account.revision,
+            AccountUpdate::AnnounceEffect {
+                id: intent.id.clone(),
+                effect: announced.clone(),
+            },
+        );
+        account = index.account(&key).map_err(io::Error::other)?;
+        if account.effects.get(&intent.id) != Some(&announced) {
+            return Err(io::Error::other(format!(
+                "indexed effect announcement failed: {update:?}"
+            )));
+        }
+    }
+    if announced.reuse.is_some() {
+        if k.is_some() || account.effects[&intent.id].consumed_k.is_some() {
+            return Err(io::Error::other("reused effect has physical K"));
+        }
+        return Ok(key);
+    }
+    if let Some(k) = k {
+        let grant_id = k.id.clone();
+        let k_artifact = effect_artifact(root, &dir.join(format!("{grant_id}.consumed.json")))?;
+        if account.effects[&intent.id].consumed_k.as_ref() != Some(&k_artifact) {
+            if account.effects[&intent.id].consumed_k.is_some() {
+                return Err(io::Error::other("indexed effect K changed"));
+            }
+            let update = index.update_account(
+                &key,
+                account.revision,
+                AccountUpdate::ConsumeEffect {
+                    id: intent.id.clone(),
+                    k: k_artifact.clone(),
+                },
+            );
+            account = index.account(&key).map_err(io::Error::other)?;
+            if account.effects[&intent.id].consumed_k.as_ref() != Some(&k_artifact) {
+                return Err(io::Error::other(format!(
+                    "indexed effect K publication failed: {update:?}"
+                )));
+            }
+        }
+        let result = effect_readback_from_dir(dir, intent)?;
+        if result.state == "drained" {
+            let q_path = dir.join(format!("{grant_id}.drain.json"));
+            let q = PhysicalQ {
+                physical_k: k_artifact,
+                q: effect_artifact(root, &q_path)?,
+                terminal: None,
+                completed_unix_nanos: i64::try_from(file_unix_nanos(&q_path)?)
+                    .map_err(io::Error::other)?,
+            };
+            let result_artifact = effect_artifact(root, &dir.join("result.json"))?;
+            let indexed = &account.effects[&intent.id];
+            if indexed.certified_q.as_ref() != Some(&q)
+                || indexed.result.as_ref() != Some(&result_artifact)
+            {
+                if indexed.certified_q.is_some() || indexed.result.is_some() {
+                    return Err(io::Error::other("indexed effect Q/result changed"));
+                }
+                let marker = match result.outcome.as_deref() {
+                    Some("valid_windows" | "refreshed") => Some(false),
+                    _ => None,
+                };
+                let update = index.update_account(
+                    &key,
+                    account.revision,
+                    AccountUpdate::SettleEffect {
+                        id: intent.id.clone(),
+                        q: q.clone(),
+                        result: Some(result_artifact.clone()),
+                        marker,
+                    },
+                );
+                account = index.account(&key).map_err(io::Error::other)?;
+                let indexed = &account.effects[&intent.id];
+                if indexed.certified_q.as_ref() != Some(&q)
+                    || indexed.result.as_ref() != Some(&result_artifact)
+                {
+                    return Err(io::Error::other(format!(
+                        "indexed effect Q/result publication failed: {update:?}"
+                    )));
+                }
+            }
+        } else if account.effects[&intent.id].certified_q.is_some() {
+            return Err(io::Error::other(
+                "indexed effect settlement lost physical Q",
+            ));
+        }
+    } else if account.effects[&intent.id].consumed_k.is_some() {
+        return Err(io::Error::other("indexed effect K lost physical reference"));
+    } else if announced.reuse.is_none() {
+        if dir.join("result.json").exists() {
+            return Err(io::Error::other("indexed effect result precedes K"));
+        }
+        for entry in std::fs::read_dir(dir)? {
+            if entry?
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".drain.json")
+            {
+                return Err(io::Error::other("indexed effect Q precedes K"));
+            }
+        }
+    }
+    Ok(key)
+}
+
+pub(super) fn reconcile_live_account_effects(index: &Index) -> io::Result<()> {
+    let parent = index.evidence_root().join("account-effects");
+    let entries = match std::fs::read_dir(&parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !entry.file_type()?.is_dir() {
+            if name.ends_with("-quota-first")
+                || name.ends_with("-quota-retry")
+                || name.ends_with("-auth-refresh")
+            {
+                return Err(io::Error::other("indexed effect directory is not physical"));
+            }
+            continue;
+        }
+        let dir = entry.path();
+        if let Some(intent) = effect_intent(&dir)? {
+            reconcile_indexed_account_effect(index, &dir, &intent)?;
+        } else {
+            for artifact in std::fs::read_dir(&dir)? {
+                let name = artifact?.file_name();
+                let name = name.to_string_lossy();
+                if name.ends_with(".consumed.json")
+                    || name.ends_with(".drain.json")
+                    || name == "result.json"
+                {
+                    return Err(io::Error::other("physical effect evidence without intent"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The identity is source-owned, and the source command must agree too. A
+/// matching label, model name, or member index is never quota authority.
+fn same_physical_effect_source(
+    directory: &Path,
+    target: &RouteCandidate,
+    source: &AccountEffectIntent,
+) -> io::Result<bool> {
+    let prior = effect_candidate(directory, &source.binding, &source.request)?;
+    Ok(prior.account_identity == target.account_identity
+        && prior.quota_script == target.quota_script
+        && prior.auth_refresh_command == target.auth_refresh_command)
 }
 
 fn effect_command<'a>(
@@ -1651,7 +3050,7 @@ fn effect_intent(dir: &Path) -> io::Result<Option<AccountEffectIntent>> {
 
 fn latest_terminal_marker_time(
     directory: &Path,
-    request: &FreshAccountEffectRequest,
+    candidate: &RouteCandidate,
 ) -> io::Result<Option<u128>> {
     let mut latest = None;
     for entry in std::fs::read_dir(directory)? {
@@ -1663,14 +3062,24 @@ fn latest_terminal_marker_time(
         {
             continue;
         }
-        let record: TerminalRecord =
-            json_artifact::read(&entry.path(), "terminal_marker_readback")?;
+        let record: TerminalRecord = serde_json::from_reader(File::open(entry.path())?)?;
         if record.version != 1 {
             return Err(io::Error::other("fresh terminal ledger version changed"));
         }
-        if record.selection.model == request.model
-            && record.selection.config_sha256 == request.config_sha256
-            && record.selection.account == request.account
+        let source: RouteCandidate = exact_file(
+            directory,
+            &candidate_name(&record.binding.handoff_id, record.selection.index),
+        )?
+        .ok_or_else(|| io::Error::other("fresh terminal source candidate absent"))?;
+        if source.version != 3
+            || source.binding != record.binding
+            || source.account_identity != record.selection.account_identity
+            || source.account != record.selection.account
+            || source.plan_sha256 != record.selection.plan_sha256
+        {
+            return Err(io::Error::other("fresh terminal source identity changed"));
+        }
+        if record.selection.account_identity == candidate.account_identity
             && record.outcome.is_marker()
         {
             latest = Some(latest.map_or(record.physical_q_unix_nanos, |prior: u128| {
@@ -1686,13 +3095,14 @@ fn reusable_quota_source(
     binding: &Binding,
     request: &FreshAccountEffectRequest,
 ) -> io::Result<Option<(String, AccountEffectIntent)>> {
-    let marker_q = latest_terminal_marker_time(directory, request)?;
+    let candidate = effect_candidate(directory, binding, request)?;
+    let marker_q = latest_terminal_marker_time(directory, &candidate)?;
     let parent = directory.join("account-effects");
     let mut names = std::fs::read_dir(&parent)?
         .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
         .collect::<io::Result<Vec<_>>>()?;
     names.sort();
-    let mut fresh = None;
+    let mut latest = None;
     let mut unresolved = None;
     for name in names {
         if !name.ends_with("-quota-first") && !name.ends_with("-quota-retry") {
@@ -1704,40 +3114,45 @@ fn reusable_quota_source(
         };
         if intent.version != 1
             || intent.binding == *binding
-            || intent.request.model != request.model
-            || intent.request.config_sha256 != request.config_sha256
-            || intent.request.account != request.account
-            || intent.request.index != request.index
+            || !same_physical_effect_source(directory, &candidate, &intent)?
             || intent.environment_sha256 != environment_digest(request)?
             || source_dir.join("reuse.json").exists()
+            || source_dir.join("manual-reuse.json").exists()
         {
             continue;
         }
         let readback = effect_readback_from_dir(&source_dir, &intent)?;
-        if readback.state == "drained" && readback.outcome.as_deref() == Some("valid_windows") {
-            let after_marker = match marker_q {
-                Some(marker_q) => effect_physical_q_nanos(&source_dir, &intent)? > marker_q,
-                None => true,
-            };
-            if quota_remaining(&readback, Utc::now().timestamp())?.is_some() && after_marker {
-                if fresh
-                    .as_ref()
-                    .is_none_or(|(_, _, prior_time)| readback.completed_unix_seconds > *prior_time)
-                {
-                    fresh = Some((name, intent, readback.completed_unix_seconds));
-                }
-            }
-        } else if readback.state != "drained" && unresolved.is_none() {
+        if readback.state != "drained" && unresolved.is_none() {
             unresolved = Some((name, intent));
+        } else if readback.state == "drained" {
+            let q = effect_physical_q_nanos(&source_dir, &intent)?;
+            if latest.as_ref().is_none_or(|(_, _, prior_q)| q > *prior_q) {
+                latest = Some((name, intent, q));
+            }
         }
     }
-    Ok(unresolved.or_else(|| fresh.map(|(name, intent, _)| (name, intent))))
+    if unresolved.is_some() {
+        return Ok(unresolved);
+    }
+    let Some((name, intent, q)) = latest else {
+        return Ok(None);
+    };
+    let source_dir = parent.join(&name);
+    let readback = effect_readback_from_dir(&source_dir, &intent)?;
+    if readback.outcome.as_deref() == Some("valid_windows")
+        && quota_read_is_fresh(&readback, Utc::now().timestamp())?
+        && marker_q.is_none_or(|marker| q > marker)
+    {
+        Ok(Some((name, intent)))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Serialize the scan and durable auth intent across broker threads and
 /// incarnations. The lock protects the decision only; an already started K is
 /// represented by the fsynced intent and must be observed, never launched again.
-fn auth_admission_lock(directory: &Path, account: &str) -> io::Result<File> {
+pub(super) fn auth_admission_lock(directory: &Path, account: &str) -> io::Result<File> {
     let parent = directory.join("account-effects");
     std::fs::create_dir_all(&parent)?;
     let name = format!("auth-{:x}.lock", Sha256::digest(account.as_bytes()));
@@ -1758,12 +3173,46 @@ fn auth_admission_lock(directory: &Path, account: &str) -> io::Result<File> {
     }
 }
 
+/// Manual K admission shares this lock with every account effect kind. An
+/// unresolved route K/Q is returned as an exact artifact, never replaced by
+/// a second manual probe.
+pub(super) fn unresolved_account_effect_for_physical(
+    directory: &Path,
+    physical_id: &str,
+) -> io::Result<Option<String>> {
+    let entries = match std::fs::read_dir(directory.join("account-effects")) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let dir = entry.path();
+        let Some(intent) = effect_intent(&dir)? else {
+            continue;
+        };
+        let candidate = effect_candidate(directory, &intent.binding, &intent.request)?;
+        if candidate.account_identity != physical_id {
+            continue;
+        }
+        let result = effect_readback_from_dir(&dir, &intent)?;
+        if result.state != "drained" {
+            return Ok(Some(result.artifact));
+        }
+    }
+    Ok(None)
+}
+
 fn coalescible_auth_source(
     directory: &Path,
     binding: &Binding,
     request: &FreshAccountEffectRequest,
 ) -> io::Result<Option<(String, AccountEffectIntent)>> {
-    let marker_q = latest_terminal_marker_time(directory, request)?;
+    let candidate = effect_candidate(directory, binding, request)?;
+    let marker_q = latest_terminal_marker_time(directory, &candidate)?;
     let parent = directory.join("account-effects");
     let entries = match std::fs::read_dir(&parent) {
         Ok(entries) => entries,
@@ -1786,7 +3235,9 @@ fn coalescible_auth_source(
         if intent.auth_source.is_some() {
             continue;
         }
-        if intent.binding == *binding || intent.request.account != request.account {
+        if intent.binding == *binding
+            || !same_physical_effect_source(directory, &candidate, &intent)?
+        {
             continue;
         }
         let prior = effect_readback_from_dir(&source_dir, &intent)?;
@@ -1804,9 +3255,6 @@ fn coalescible_auth_source(
         {
             if intent.version != 1
                 || intent.request.kind != FreshAccountEffectKind::AuthRefresh
-                || intent.request.model != request.model
-                || intent.request.config_sha256 != request.config_sha256
-                || intent.request.index != request.index
                 || intent.environment_sha256 != environment_digest(request)?
             {
                 return Err(io::Error::other(format!(
@@ -1824,7 +3272,50 @@ fn effect_readback_from_dir(
     dir: &Path,
     intent: &AccountEffectIntent,
 ) -> io::Result<FreshAccountEffectReadback> {
+    effect_readback_from_dir_mode(dir, intent, true)
+}
+
+fn effect_readback_from_dir_mode(
+    dir: &Path,
+    intent: &AccountEffectIntent,
+    materialize: bool,
+) -> io::Result<FreshAccountEffectReadback> {
     let artifact = dir.display().to_string();
+    let broker_directory = dir
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| io::Error::other("fresh effect broker directory absent"))?;
+    let candidate = effect_candidate(broker_directory, &intent.binding, &intent.request)?;
+    if let Some(reuse) = exact_file::<ManualQuotaReuse>(dir, "manual-reuse.json")? {
+        if intent.request.kind != FreshAccountEffectKind::QuotaFirst
+            || intent.plan_sha256 != format!("manual:{}", reuse.source_effect_id)
+        {
+            return Err(io::Error::other("fresh manual quota reuse intent changed"));
+        }
+        let script = candidate
+            .quota_script
+            .as_deref()
+            .ok_or_else(|| io::Error::other("manual quota reuse has no source"))?;
+        let readback = super::manual_quota::source_readback(
+            broker_directory,
+            &reuse.operation_id,
+            &candidate.account_identity,
+            script,
+            candidate.auth_refresh_command.as_deref(),
+            &intent.environment_sha256,
+            &reuse.source_effect_id,
+        )?;
+        return Ok(FreshAccountEffectReadback {
+            effect_id: intent.id.clone(),
+            state: readback.state,
+            outcome: readback.outcome,
+            windows: readback.windows,
+            completed_unix_seconds: readback.completed_unix_seconds,
+            artifact: format!("{artifact} -> {}", readback.artifact),
+            peer_effect_id: Some(reuse.source_effect_id),
+            peer_artifact: Some(readback.artifact),
+        });
+    }
     if let Some(reuse) = &intent.auth_source {
         if intent.request.kind != FreshAccountEffectKind::AuthRefresh
             || reuse.source_directory.contains('/')
@@ -1848,15 +3339,12 @@ fn effect_readback_from_dir(
             || intent.plan_sha256 != format!("coalesced:{}", source.id)
             || source.binding == intent.binding
             || source.request.kind != FreshAccountEffectKind::AuthRefresh
-            || source.request.model != intent.request.model
-            || source.request.config_sha256 != intent.request.config_sha256
-            || source.request.account != intent.request.account
-            || source.request.index != intent.request.index
+            || !same_physical_effect_source(broker_directory, &candidate, &source)?
             || source.environment_sha256 != intent.environment_sha256
         {
             return Err(io::Error::other("fresh auth reuse provenance changed"));
         }
-        let mut peer = effect_readback_from_dir(&source_dir, &source)?;
+        let mut peer = effect_readback_from_dir_mode(&source_dir, &source, materialize)?;
         peer.peer_effect_id = Some(peer.effect_id.clone());
         peer.peer_artifact = Some(peer.artifact.clone());
         peer.effect_id = intent.id.clone();
@@ -1882,15 +3370,12 @@ fn effect_readback_from_dir(
             .ok_or_else(|| io::Error::other("fresh quota reuse intent absent"))?;
         if source.id != reuse.source_effect_id
             || source.version != 1
-            || source.request.model != intent.request.model
-            || source.request.config_sha256 != intent.request.config_sha256
-            || source.request.account != intent.request.account
-            || source.request.index != intent.request.index
+            || !same_physical_effect_source(broker_directory, &candidate, &source)?
             || source.environment_sha256 != intent.environment_sha256
         {
             return Err(io::Error::other("fresh quota reuse provenance changed"));
         }
-        let mut readback = effect_readback_from_dir(&source_dir, &source)?;
+        let mut readback = effect_readback_from_dir_mode(&source_dir, &source, materialize)?;
         readback.effect_id = intent.id.clone();
         readback.artifact = format!("{artifact} -> {}", readback.artifact);
         return Ok(readback);
@@ -1927,6 +3412,7 @@ fn effect_readback_from_dir(
             } else {
                 let mut raw = String::new();
                 stdout.read_to_string(&mut raw)?;
+                super::fresh_index::reader_bytes_parsed(raw.len() as u64);
                 match parse_effect_windows(&raw) {
                     Ok(windows) if !windows.is_empty() => ("valid_windows".into(), windows),
                     Ok(_) => ("empty".into(), Vec::new()),
@@ -1947,7 +3433,7 @@ fn effect_readback_from_dir(
                 if serde_json::to_value(&existing)? != serde_json::to_value(&receipt)? {
                     return Err(io::Error::other("fresh account effect result changed"));
                 }
-            } else {
+            } else if materialize {
                 durable_result(dir, &receipt)?;
             }
             Ok(receipt)
@@ -1959,15 +3445,19 @@ fn effect_readback_from_dir(
 struct RawEffectWindow {
     used_percent: f64,
     resets_at: String,
+    #[serde(default)]
+    remaining: Option<u64>,
 }
 #[derive(Deserialize)]
 struct RawEffectOutput {
     windows: Option<Vec<RawEffectWindow>>,
     used_percent: Option<f64>,
     resets_at: Option<String>,
+    #[serde(default)]
+    remaining: Option<u64>,
 }
 
-fn parse_effect_windows(raw: &str) -> io::Result<Vec<FreshQuotaWindow>> {
+pub(super) fn parse_effect_windows(raw: &str) -> io::Result<Vec<FreshQuotaWindow>> {
     let value: RawEffectOutput = serde_json::from_str(raw)?;
     let windows = if let Some(windows) = value.windows {
         windows
@@ -1979,6 +3469,7 @@ fn parse_effect_windows(raw: &str) -> io::Result<Vec<FreshQuotaWindow>> {
             resets_at: value
                 .resets_at
                 .ok_or_else(|| io::Error::other("quota resets_at absent"))?,
+            remaining: value.remaining,
         }]
     };
     windows
@@ -1993,15 +3484,26 @@ fn parse_effect_windows(raw: &str) -> io::Result<Vec<FreshQuotaWindow>> {
             Ok(FreshQuotaWindow {
                 used_percent: window.used_percent,
                 resets_at: window.resets_at,
+                remaining: window.remaining,
             })
         })
         .collect()
 }
 
+#[cfg(test)]
 pub(super) fn observe_account_effect(
     directory: &Path,
     binding: &Binding,
     request: &FreshAccountEffectRequest,
+) -> io::Result<FreshAccountEffectReadback> {
+    observe_account_effect_indexed(directory, binding, request, None)
+}
+
+pub(super) fn observe_account_effect_indexed(
+    directory: &Path,
+    binding: &Binding,
+    request: &FreshAccountEffectRequest,
+    index: Option<&Index>,
 ) -> io::Result<FreshAccountEffectReadback> {
     effect_candidate(directory, binding, request)?;
     let dir = effect_directory(directory, binding, request);
@@ -2014,11 +3516,16 @@ pub(super) fn observe_account_effect(
     {
         return Err(io::Error::other("fresh account effect readback mismatch"));
     }
-    effect_readback_from_dir(&dir, &intent)
+    let result = effect_readback_from_dir(&dir, &intent)?;
+    if let Some(index) = index {
+        reconcile_indexed_account_effect(index, &dir, &intent)?;
+    }
+    Ok(result)
 }
 
 /// The intent is fsynced before a separate one-use K. Any failure after that
 /// point is unknown, and a second begin can only be observed, never launched.
+#[cfg(test)]
 pub(super) fn begin_account_effect(
     directory: &Path,
     binding: &Binding,
@@ -2027,6 +3534,19 @@ pub(super) fn begin_account_effect(
     actor: &PinnedProcess,
     uid: u32,
     gid: u32,
+) -> io::Result<FreshAccountEffectReadback> {
+    begin_account_effect_indexed(directory, binding, request, root, actor, uid, gid, None)
+}
+
+pub(super) fn begin_account_effect_indexed(
+    directory: &Path,
+    binding: &Binding,
+    request: &FreshAccountEffectRequest,
+    root: &PinnedProcess,
+    actor: &PinnedProcess,
+    uid: u32,
+    gid: u32,
+    index: Option<&Index>,
 ) -> io::Result<FreshAccountEffectReadback> {
     let candidate = effect_candidate(directory, binding, request)?;
     let command = effect_command(&candidate, request.kind)?;
@@ -2038,9 +3558,11 @@ pub(super) fn begin_account_effect(
     }
     let _auth_lock = if matches!(
         request.kind,
-        FreshAccountEffectKind::AuthRefresh | FreshAccountEffectKind::QuotaFirst
+        FreshAccountEffectKind::AuthRefresh
+            | FreshAccountEffectKind::QuotaFirst
+            | FreshAccountEffectKind::QuotaRetry
     ) {
-        Some(auth_admission_lock(directory, &request.account)?)
+        Some(auth_admission_lock(directory, &candidate.account_identity)?)
     } else {
         None
     };
@@ -2049,12 +3571,19 @@ pub(super) fn begin_account_effect(
             "fresh account effect already begun; observe exact effect",
         ));
     }
+    if let Some(artifact) =
+        super::manual_quota::unresolved_for_physical(directory, &candidate.account_identity)?
+    {
+        return Err(io::Error::other(format!(
+            "manual quota prior K/Q unknown: {artifact}"
+        )));
+    }
     let first_request = FreshAccountEffectRequest {
         kind: FreshAccountEffectKind::QuotaFirst,
         ..request.clone()
     };
     if request.kind != FreshAccountEffectKind::QuotaFirst {
-        let first = observe_account_effect(directory, binding, &first_request)?;
+        let first = observe_account_effect_indexed(directory, binding, &first_request, index)?;
         // The provider can reject expired credentials while quota still
         // reports healthy. Require its exact typed, physical Q before auth.
         let provider_auth_rejection = if first.outcome.as_deref() == Some("valid_windows") {
@@ -2079,13 +3608,14 @@ pub(super) fn begin_account_effect(
             ));
         }
         if request.kind == FreshAccountEffectKind::QuotaRetry {
-            let auth = observe_account_effect(
+            let auth = observe_account_effect_indexed(
                 directory,
                 binding,
                 &FreshAccountEffectRequest {
                     kind: FreshAccountEffectKind::AuthRefresh,
                     ..request.clone()
                 },
+                index,
             )?;
             if auth.state != "drained" || auth.outcome.as_deref() != Some("refreshed") {
                 return Err(io::Error::other(format!(
@@ -2129,8 +3659,79 @@ pub(super) fn begin_account_effect(
         // A pre-rejection healthy Q must never masquerade as verification.
         route_evidence(directory, &candidate)?;
         let parent = directory.join("account-effects");
-        if let Some((source_directory, source)) =
-            reusable_quota_source(directory, binding, request)?
+        let manual = candidate
+            .quota_script
+            .as_deref()
+            .map(|script| {
+                super::manual_quota::latest(
+                    directory,
+                    &candidate.account_identity,
+                    script,
+                    candidate.auth_refresh_command.as_deref(),
+                    &environment_digest(request)?,
+                )
+            })
+            .transpose()?
+            .flatten();
+        if let Some((source, result)) = &manual {
+            if result.state != "drained" {
+                return Err(io::Error::other(format!(
+                    "manual quota prior K/Q unknown: {}",
+                    result.artifact
+                )));
+            }
+            if result.outcome.as_deref() == Some("valid_windows")
+                && quota_read_is_fresh(
+                    &FreshAccountEffectReadback {
+                        effect_id: source.effect_id.clone().unwrap_or_default(),
+                        state: result.state.clone(),
+                        outcome: result.outcome.clone(),
+                        windows: result.windows.clone(),
+                        completed_unix_seconds: result.completed_unix_seconds,
+                        artifact: result.artifact.clone(),
+                        peer_effect_id: None,
+                        peer_artifact: None,
+                    },
+                    Utc::now().timestamp(),
+                )?
+                && latest_terminal_marker_time(directory, &candidate)?.is_none_or(|marker| {
+                    super::manual_quota::physical_q_nanos(directory, &source.operation_id)
+                        .is_ok_and(|q| q > marker)
+                })
+            {
+                let effect_id = source
+                    .effect_id
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("manual quota effect ID absent"))?;
+                std::fs::create_dir(&dir)?;
+                File::open(&parent)?.sync_all()?;
+                let intent = AccountEffectIntent {
+                    version: 1,
+                    id: uuid::Uuid::new_v4().to_string(),
+                    binding: binding.clone(),
+                    request: redacted_effect_request(request),
+                    environment_sha256: environment_digest(request)?,
+                    plan_sha256: format!("manual:{effect_id}"),
+                    auth_source: None,
+                };
+                durable_new(&dir, "intent.json", &intent)?;
+                durable_new(
+                    &dir,
+                    "manual-reuse.json",
+                    &ManualQuotaReuse {
+                        operation_id: source.operation_id.clone(),
+                        source_effect_id: effect_id.clone(),
+                    },
+                )?;
+                if let Some(index) = index {
+                    reconcile_indexed_account_effect(index, &dir, &intent)?;
+                }
+                return effect_readback_from_dir(&dir, &intent);
+            }
+        }
+        if manual.is_none()
+            && let Some((source_directory, source)) =
+                reusable_quota_source(directory, binding, request)?
         {
             std::fs::create_dir(&dir)?;
             File::open(&parent)?.sync_all()?;
@@ -2152,6 +3753,9 @@ pub(super) fn begin_account_effect(
                     source_effect_id: source.id,
                 },
             )?;
+            if let Some(index) = index {
+                reconcile_indexed_account_effect(index, &dir, &intent)?;
+            }
             return effect_readback_from_dir(&dir, &intent);
         }
     }
@@ -2185,9 +3789,17 @@ pub(super) fn begin_account_effect(
         auth_source: None,
     };
     durable_new(&dir, "intent.json", &intent)?;
-    let prepared = prepare(&dir, binding.clone(), plan)?;
-    launch(prepared, root, actor, uid, gid)?;
-    effect_readback_from_dir(&dir, &intent)
+    let mut prepared = prepare(&dir, binding.clone(), plan)?;
+    if let Some(index) = index {
+        prepared.indexed_account = Some(reconcile_indexed_account_effect(index, &dir, &intent)?);
+        prepared.indexed_effect = Some(intent.clone());
+    }
+    launch(prepared, root, actor, uid, gid, index)?;
+    let result = effect_readback_from_dir(&dir, &intent)?;
+    if let Some(index) = index {
+        reconcile_indexed_account_effect(index, &dir, &intent)?;
+    }
+    Ok(result)
 }
 
 /// A candidate is a broker-pinned exact provider plan. It is durable before
@@ -2208,15 +3820,20 @@ pub(super) fn register_route_candidate(
         .as_ref()
         .ok_or_else(|| io::Error::other("fresh route account absent"))?;
     let candidate = RouteCandidate {
-        version: 2,
+        version: 3,
         binding: binding.clone(),
         model: request.model.clone(),
         config_sha256: request.config_sha256.clone(),
         account: account.clone(),
+        account_identity: request
+            .account_identity
+            .clone()
+            .ok_or_else(|| io::Error::other("fresh physical account identity absent"))?,
         index,
         total: request.total,
         pin: request.pin.clone(),
         plan_sha256: plan.digest.clone(),
+        environment_sha256: plan_environment_sha256(&plan)?,
         quota_script: request.quota_script.clone(),
         auth_refresh_command: request.auth_refresh_command.clone(),
         terminal_recognizer,
@@ -2239,20 +3856,27 @@ fn route_candidates(
 ) -> io::Result<Vec<RouteCandidate>> {
     let mut candidates = Vec::new();
     let mut names = HashSet::new();
+    let mut identities = HashSet::new();
     for index in 0..request.total {
         let candidate: RouteCandidate =
             exact_file(directory, &candidate_name(&binding.handoff_id, index))?
                 .ok_or_else(|| io::Error::other("fresh route candidate set incomplete"))?;
-        if candidate.version != 2
+        if candidate.version != 3
             || candidate.binding != *binding
             || candidate.model != request.model
             || candidate.config_sha256 != request.config_sha256
             || candidate.index != index
             || candidate.total != request.total
             || candidate.pin != request.pin
+            || candidate.environment_sha256.len() != 64
+            || !candidate
+                .environment_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
             || request.quota_script.is_some()
             || request.auth_refresh_command.is_some()
             || !names.insert(candidate.account.clone())
+            || !identities.insert(candidate.account_identity.clone())
         {
             return Err(io::Error::other("fresh route candidate set changed"));
         }
@@ -2269,6 +3893,7 @@ enum TerminalOutcome {
     Cancelled,
     Unknown,
     QuotaRejected,
+    ModelAtCapacity,
     MaybeQuota,
     AuthRejected,
     ProviderUnavailable,
@@ -2280,7 +3905,11 @@ impl TerminalOutcome {
     fn is_marker(self) -> bool {
         !matches!(
             self,
-            Self::Clean | Self::GenericFailure | Self::Cancelled | Self::Unknown
+            Self::Clean
+                | Self::GenericFailure
+                | Self::Cancelled
+                | Self::Unknown
+                | Self::ModelAtCapacity
         )
     }
 
@@ -2307,7 +3936,7 @@ struct TerminalRecord {
     outcome: TerminalOutcome,
 }
 
-fn file_unix_nanos(path: &Path) -> io::Result<u128> {
+pub(super) fn file_unix_nanos(path: &Path) -> io::Result<u128> {
     Ok(std::fs::metadata(path)?
         .modified()?
         .duration_since(std::time::UNIX_EPOCH)
@@ -2317,10 +3946,17 @@ fn file_unix_nanos(path: &Path) -> io::Result<u128> {
 
 fn classify_terminal_outcome(
     kind: TerminalSignalKind,
+    stdout: &[u8],
     stderr: &[u8],
     status: i32,
     cancelled: bool,
 ) -> TerminalOutcome {
+    if [stdout, stderr]
+        .iter()
+        .any(|stream| structured_model_capacity(stream))
+    {
+        return TerminalOutcome::ModelAtCapacity;
+    }
     // A cleanup cancellation may drain adopted descendants after the provider
     // itself has already emitted a typed rejection. Keep that provider result.
     match kind {
@@ -2351,6 +3987,11 @@ fn classify_terminal_outcome(
     }) {
         return TerminalOutcome::AuthRejected;
     }
+    // The provider's own nonzero wait preceded descendant cleanup. That
+    // failure remains typed even when the tree drain required cancellation.
+    if kind == TerminalSignalKind::NonzeroExit {
+        return TerminalOutcome::GenericFailure;
+    }
     if cancelled {
         return TerminalOutcome::Cancelled;
     }
@@ -2369,6 +4010,22 @@ fn classify_terminal_outcome(
     }
 }
 
+/// A structured provider error code is required. Free text such as "quota"
+/// in a model capacity explanation cannot turn this into account exhaustion.
+fn structured_model_capacity(stream: &[u8]) -> bool {
+    stream.split(|byte| *byte == b'\n').any(|line| {
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
+            return false;
+        };
+        if value.get("type").and_then(serde_json::Value::as_str) != Some("error") {
+            return false;
+        }
+        ["/error/code", "/error/data/code"].iter().any(|path| {
+            value.pointer(path).and_then(serde_json::Value::as_str) == Some("model_at_capacity")
+        })
+    })
+}
+
 fn terminal_record(
     directory: &Path,
     decision: &RouteDecision,
@@ -2379,9 +4036,10 @@ fn terminal_record(
     mut stderr: File,
     cancelled: bool,
 ) -> io::Result<TerminalRecord> {
-    if candidate.version != 2
+    if candidate.version != 3
         || candidate.binding != decision.binding
         || candidate.account != decision.selection.account
+        || candidate.account_identity != decision.selection.account_identity
         || candidate.model != decision.selection.model
         || candidate.config_sha256 != decision.selection.config_sha256
         || candidate.index != decision.selection.index
@@ -2404,7 +4062,13 @@ fn terminal_record(
         &stderr_bytes,
         status,
     );
-    let outcome = classify_terminal_outcome(signal.kind, &stderr_bytes, status, cancelled);
+    let outcome =
+        classify_terminal_outcome(signal.kind, &stdout_bytes, &stderr_bytes, status, cancelled);
+    let signal_kind = if outcome == TerminalOutcome::ModelAtCapacity {
+        "ModelAtCapacity".to_string()
+    } else {
+        format!("{:?}", signal.kind)
+    };
     let name = format!("{}.terminal.json", grant.id);
     if let Some(existing) = exact_file::<TerminalRecord>(directory, &name)? {
         if existing.version != 1
@@ -2412,7 +4076,7 @@ fn terminal_record(
             || existing.selection != decision.selection
             || existing.grant_id != grant.id
             || existing.physical_q_sha256 != q_sha
-            || existing.signal_kind != format!("{:?}", signal.kind)
+            || existing.signal_kind != signal_kind
             || existing.outcome != outcome
         {
             return Err(io::Error::other("fresh terminal ledger changed"));
@@ -2426,7 +4090,7 @@ fn terminal_record(
         grant_id: grant.id.clone(),
         physical_q_sha256: q_sha,
         physical_q_unix_nanos: file_unix_nanos(&q_path)?,
-        signal_kind: format!("{:?}", signal.kind),
+        signal_kind,
         outcome,
     };
     match durable_new(directory, &name, &record) {
@@ -2461,18 +4125,40 @@ fn route_evidence_excluding(
     let mut markers = Vec::new();
     for entry in std::fs::read_dir(directory)? {
         let entry = entry?;
+        super::fresh_index::reader_directory_entry();
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if !name.ends_with(".route-selection.json") {
             continue;
         }
-        let previous: RouteDecision =
-            json_artifact::read(&entry.path(), "route_selection_readback")?;
-        if previous.version != 1
-            || previous.selection.model != candidate.model
-            || previous.selection.config_sha256 != candidate.config_sha256
-            || previous.selection.account != candidate.account
+        let previous: RouteDecision = serde_json::from_reader(File::open(entry.path())?)?;
+        if previous.version != 1 || previous.selection.policy_version != FRESH_ROUTE_POLICY_VERSION
         {
+            return Err(io::Error::other(
+                "fresh route history policy is incompatible",
+            ));
+        }
+        if previous.selection.account_identity != candidate.account_identity {
+            continue;
+        }
+        let prior_candidate: RouteCandidate = exact_file(
+            directory,
+            &candidate_name(&previous.binding.handoff_id, previous.selection.index),
+        )?
+        .ok_or_else(|| io::Error::other("fresh route history candidate absent"))?;
+        if prior_candidate.version != 3
+            || prior_candidate.binding != previous.binding
+            || prior_candidate.account_identity != previous.selection.account_identity
+            || prior_candidate.account != previous.selection.account
+            || prior_candidate.plan_sha256 != previous.selection.plan_sha256
+        {
+            return Err(io::Error::other(
+                "fresh route history account identity changed",
+            ));
+        }
+        // The selected route is durably recorded before its first provider K.
+        // During that one pre-K check, its prepared grant is not history.
+        if pre_k_handoff == Some(previous.binding.handoff_id.as_str()) {
             continue;
         }
         // The selected route is durably recorded before its first provider K.
@@ -2555,17 +4241,17 @@ fn file_age_less_than(path: &Path, window: Duration) -> io::Result<bool> {
         .is_ok_and(|age| age < window))
 }
 
-fn recent_failure_admitted(failures: u64, has_unsuppressed: bool, pinned: bool) -> bool {
-    pinned || !has_unsuppressed || failures < 3
-}
-
+// The ordinary route still treats a settled invalid/failed quota result as
+// ineligible. The v3 source checks below are exercised by keyed-route tests;
+// live v3 route choice reads the keyed account head in select_route_v3.
 fn candidate_quota(
     directory: &Path,
     binding: &Binding,
     candidate: &RouteCandidate,
-) -> io::Result<(Option<(u32, Option<u128>)>, Option<String>)> {
+    enforce_v3_source: bool,
+) -> io::Result<(Option<(Option<u32>, Option<u128>)>, Option<String>)> {
     if candidate.quota_script.is_none() {
-        return Ok((Some((0, None)), None)); // no configured quota source, invocation fallback
+        return Ok((Some((None, None)), None)); // explicit unmetered account
     }
     let request = FreshAccountEffectRequest {
         d_key: String::new(),
@@ -2578,7 +4264,10 @@ fn candidate_quota(
     };
     let first_dir = effect_directory(directory, binding, &request);
     let Some(first_intent) = effect_intent(&first_dir)? else {
-        return Ok((None, None));
+        return Ok((
+            None,
+            Some(format!("quota effect absent: {}", first_dir.display())),
+        ));
     };
     if first_intent.version != 1
         || first_intent.binding != *binding
@@ -2631,7 +4320,7 @@ fn candidate_quota(
             )));
         }
         if auth.outcome.as_deref() != Some("refreshed") {
-            return Ok((None, None));
+            return Ok((None, enforce_v3_source.then_some(auth.artifact)));
         }
         let retry_dir = effect_directory(
             directory,
@@ -2642,7 +4331,7 @@ fn candidate_quota(
             },
         );
         let Some(retry_intent) = effect_intent(&retry_dir)? else {
-            return Ok((None, None));
+            return Ok((None, Some(retry_dir.display().to_string())));
         };
         if retry_intent.version != 1
             || retry_intent.binding != *binding
@@ -2662,22 +4351,122 @@ fn candidate_quota(
         return Ok((None, Some(result.artifact)));
     }
     if result.outcome.as_deref() != Some("valid_windows") || result.windows.is_empty() {
-        return Ok((None, None));
+        return Ok((None, enforce_v3_source.then_some(result.artifact)));
     }
-    let Some(remaining) = quota_remaining(&result, Utc::now().timestamp())? else {
+    let now = Utc::now().timestamp();
+    if enforce_v3_source && !quota_read_is_fresh(&result, now)? {
+        return Ok((None, Some(format!("stale quota read: {}", result.artifact))));
+    }
+    let Some(remaining) = quota_remaining(&result, now)? else {
         return Ok((None, None));
     };
-    Ok((
-        Some((
-            remaining,
-            Some(effect_physical_q_nanos(&verified_dir, &verified_intent)?),
-        )),
-        None,
-    ))
+    let physical_q = effect_physical_q_nanos(&verified_dir, &verified_intent)?;
+    if enforce_v3_source {
+        if let Some(artifact) =
+            newer_quota_effect(directory, candidate, &verified_intent, physical_q)?
+        {
+            return Ok((None, Some(artifact)));
+        }
+    }
+    Ok((Some((Some(remaining), Some(physical_q))), None))
+}
+
+/// The source Q used by this root must still be the newest resolved account
+/// observation. A different root may begin a new K after this root created
+/// its reuse receipt; that unresolved effect blocks selection and the pre-K
+/// recheck rather than allowing the older healthy reading through.
+fn newer_quota_effect(
+    directory: &Path,
+    candidate: &RouteCandidate,
+    source: &AccountEffectIntent,
+    source_q: u128,
+) -> io::Result<Option<String>> {
+    if let Some(artifact) =
+        super::manual_quota::unresolved_for_physical(directory, &candidate.account_identity)?
+    {
+        return Ok(Some(format!("manual quota effect unknown: {artifact}")));
+    }
+    if let Some(script) = candidate.quota_script.as_deref()
+        && let Some((manual, result)) = super::manual_quota::latest(
+            directory,
+            &candidate.account_identity,
+            script,
+            candidate.auth_refresh_command.as_deref(),
+            &source.environment_sha256,
+        )?
+    {
+        if result.state != "drained" {
+            return Ok(Some(format!(
+                "manual quota effect unknown: {}",
+                result.artifact
+            )));
+        }
+        if super::manual_quota::physical_q_nanos(directory, &manual.operation_id)? > source_q {
+            return Ok(Some(format!(
+                "newer manual quota effect: {}",
+                result.artifact
+            )));
+        }
+    }
+    for entry in std::fs::read_dir(directory.join("account-effects"))? {
+        let entry = entry?;
+        super::fresh_index::reader_directory_entry();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.ends_with("-quota-first") && !name.ends_with("-quota-retry") {
+            continue;
+        }
+        let dir = entry.path();
+        let Some(intent) = effect_intent(&dir)? else {
+            continue;
+        };
+        if !same_physical_effect_source(directory, candidate, &intent)?
+            || intent.environment_sha256 != source.environment_sha256
+            || dir.join("reuse.json").exists()
+            || dir.join("manual-reuse.json").exists()
+        {
+            continue;
+        }
+        if intent.version != 1 {
+            return Err(io::Error::other("newer quota effect provenance changed"));
+        }
+        let readback = effect_readback_from_dir(&dir, &intent)?;
+        if readback.state != "drained" || effect_physical_q_nanos(&dir, &intent)? > source_q {
+            return Ok(Some(format!(
+                "newer or unresolved quota effect: {}",
+                dir.display()
+            )));
+        }
+    }
+    Ok(None)
 }
 
 /// Return the physical source Q time, never the time of a reused readback.
 fn effect_physical_q_nanos(dir: &Path, intent: &AccountEffectIntent) -> io::Result<u128> {
+    let broker_directory = dir
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| io::Error::other("fresh effect broker directory absent"))?;
+    let candidate = effect_candidate(broker_directory, &intent.binding, &intent.request)?;
+    if let Some(reuse) = exact_file::<ManualQuotaReuse>(dir, "manual-reuse.json")? {
+        let script = candidate
+            .quota_script
+            .as_deref()
+            .ok_or_else(|| io::Error::other("manual quota source absent"))?;
+        let result = super::manual_quota::source_readback(
+            broker_directory,
+            &reuse.operation_id,
+            &candidate.account_identity,
+            script,
+            candidate.auth_refresh_command.as_deref(),
+            &intent.environment_sha256,
+            &reuse.source_effect_id,
+        )?;
+        if result.state != "drained" {
+            return Err(io::Error::other("manual quota physical Q not drained"));
+        }
+        return super::manual_quota::physical_q_nanos(broker_directory, &reuse.operation_id);
+    }
     let (physical_dir, physical_intent) = if let Some(reuse) = &intent.auth_source {
         if intent.request.kind != FreshAccountEffectKind::AuthRefresh
             || reuse.source_directory.contains('/')
@@ -2697,10 +4486,7 @@ fn effect_physical_q_nanos(dir: &Path, intent: &AccountEffectIntent) -> io::Resu
             || source.auth_source.is_some()
             || source.binding == intent.binding
             || source.request.kind != FreshAccountEffectKind::AuthRefresh
-            || source.request.model != intent.request.model
-            || source.request.config_sha256 != intent.request.config_sha256
-            || source.request.account != intent.request.account
-            || source.request.index != intent.request.index
+            || !same_physical_effect_source(broker_directory, &candidate, &source)?
             || source.environment_sha256 != intent.environment_sha256
             || intent.plan_sha256 != format!("coalesced:{}", source.id)
         {
@@ -2722,10 +4508,7 @@ fn effect_physical_q_nanos(dir: &Path, intent: &AccountEffectIntent) -> io::Resu
         let source = effect_intent(&source_dir)?
             .ok_or_else(|| io::Error::other("quota source intent absent"))?;
         if source.id != reuse.source_effect_id
-            || source.request.model != intent.request.model
-            || source.request.config_sha256 != intent.request.config_sha256
-            || source.request.account != intent.request.account
-            || source.request.index != intent.request.index
+            || !same_physical_effect_source(broker_directory, &candidate, &source)?
             || source.environment_sha256 != intent.environment_sha256
             || source_dir.join("reuse.json").exists()
         {
@@ -2801,11 +4584,7 @@ fn auth_verified_after_marker(
         let Some(intent) = effect_intent(&dir)? else {
             continue;
         };
-        if intent.request.model != candidate.model
-            || intent.request.config_sha256 != candidate.config_sha256
-            || intent.request.account != candidate.account
-            || intent.request.index != candidate.index
-        {
+        if !same_physical_effect_source(directory, candidate, &intent)? {
             continue;
         }
         if intent.version != 1 || intent.request.kind != FreshAccountEffectKind::AuthRefresh {
@@ -2851,36 +4630,20 @@ fn single_marker_allows_candidate(
     marker: &TerminalRecord,
     quota_q_nanos: Option<u128>,
 ) -> io::Result<bool> {
-    if marker.version != 1
-        || marker.selection.model != candidate.model
-        || marker.selection.config_sha256 != candidate.config_sha256
-        || marker.selection.account != candidate.account
-        || marker.selection.index != candidate.index
-    {
+    if marker.version != 1 || marker.selection.account_identity != candidate.account_identity {
         return Err(io::Error::other("fresh terminal marker candidate mismatch"));
     }
     let newer_healthy_quota = quota_q_nanos.is_some_and(|q| q > marker.physical_q_unix_nanos);
     match marker.outcome {
-        TerminalOutcome::QuotaRejected | TerminalOutcome::MaybeQuota => Ok(newer_healthy_quota),
+        TerminalOutcome::QuotaRejected => Ok(newer_healthy_quota),
         TerminalOutcome::AuthRejected => {
             auth_verified_after_marker(directory, binding, candidate, marker)
         }
-        TerminalOutcome::ProviderUnavailable
+        TerminalOutcome::ModelAtCapacity
+        | TerminalOutcome::MaybeQuota
+        | TerminalOutcome::ProviderUnavailable
         | TerminalOutcome::RateLimited
-        | TerminalOutcome::StorageContention => {
-            let release = marker
-                .outcome
-                .release_after()
-                .expect("availability interval");
-            let release_nanos = marker
-                .physical_q_unix_nanos
-                .saturating_add(release.as_nanos());
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(io::Error::other)?
-                .as_nanos();
-            Ok(newer_healthy_quota || now >= release_nanos)
-        }
+        | TerminalOutcome::StorageContention => Ok(true),
         TerminalOutcome::Clean
         | TerminalOutcome::GenericFailure
         | TerminalOutcome::Cancelled
@@ -2889,10 +4652,7 @@ fn single_marker_allows_candidate(
 }
 
 fn quota_remaining(result: &FreshAccountEffectReadback, now: i64) -> io::Result<Option<u32>> {
-    let completed = result
-        .completed_unix_seconds
-        .ok_or_else(|| io::Error::other("fresh quota completion time absent"))?;
-    if now < completed || now - completed >= 30 {
+    if !quota_read_is_fresh(result, now)? {
         return Ok(None);
     }
     let mut binding_remaining = u32::MAX;
@@ -2900,29 +4660,161 @@ fn quota_remaining(result: &FreshAccountEffectReadback, now: i64) -> io::Result<
         let reset = DateTime::parse_from_rfc3339(&window.resets_at)
             .map_err(io::Error::other)?
             .timestamp();
-        if reset <= now {
-            return Ok(None);
-        }
-        if window.used_percent >= 100.0 {
+        // A reset timestamp is evidence about the old window, not a fresh
+        // account reading. Wait for a new authoritative Q.
+        if reset <= now || window.used_percent >= 100.0 || window.remaining == Some(0) {
             return Ok(None);
         }
         binding_remaining =
             binding_remaining.min(((100.0 - window.used_percent) * 100.0).round() as u32);
     }
-    Ok(Some(binding_remaining))
+    Ok((!result.windows.is_empty()).then_some(binding_remaining))
+}
+
+const QUOTA_CACHE_TTL_SECONDS: i64 = 5 * 60 * 60;
+
+fn quota_read_is_fresh(result: &FreshAccountEffectReadback, now: i64) -> io::Result<bool> {
+    let completed = result
+        .completed_unix_seconds
+        .ok_or_else(|| io::Error::other("fresh quota completion time absent"))?;
+    if now < completed || now - completed >= QUOTA_CACHE_TTL_SECONDS || result.windows.is_empty() {
+        return Ok(false);
+    }
+    for window in &result.windows {
+        if DateTime::parse_from_rfc3339(&window.resets_at)
+            .map_err(io::Error::other)?
+            .timestamp()
+            <= now
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+const FRESH_ROUTE_POLICY_VERSION: &str = "fresh-quota-account-v4";
+
+/// The fsynced decision files are the cursor. Serialize their scan and the
+/// next durable decision across broker threads and restarts, including roots
+/// that select before their provider K has begun.
+pub(super) fn route_selection_lock(directory: &Path) -> io::Result<File> {
+    super::fresh_index::reader_open_attempt();
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .open(directory.join("route-selection.lock"))?;
+    super::fresh_index::reader_opened();
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(file);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+fn last_route_cursor(
+    directory: &Path,
+    model: &str,
+    config: &str,
+) -> io::Result<(u64, Option<usize>)> {
+    let mut last = (0, None);
+    let mut sequences = HashSet::new();
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        super::fresh_index::reader_directory_entry();
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".route-selection.json")
+        {
+            continue;
+        }
+        let decision: RouteDecision = serde_json::from_reader(File::open(entry.path())?)?;
+        if decision.selection.model != model || decision.selection.config_sha256 != config {
+            continue;
+        }
+        if decision.version != 1 || decision.selection.policy_version != FRESH_ROUTE_POLICY_VERSION
+        {
+            return Err(io::Error::other(
+                "fresh route cursor contains incompatible policy decision",
+            ));
+        }
+        let source: RouteCandidate = exact_file(
+            directory,
+            &candidate_name(&decision.binding.handoff_id, decision.selection.index),
+        )?
+        .ok_or_else(|| io::Error::other("fresh route cursor candidate absent"))?;
+        if source.version != 3
+            || source.binding != decision.binding
+            || source.account_identity != decision.selection.account_identity
+            || source.account != decision.selection.account
+            || source.plan_sha256 != decision.selection.plan_sha256
+        {
+            return Err(io::Error::other("fresh route cursor identity changed"));
+        }
+        if decision.pin.is_none() {
+            if decision.sequence == 0 || !sequences.insert(decision.sequence) {
+                return Err(io::Error::other(
+                    "fresh route cursor sequence missing or repeated",
+                ));
+            }
+            if decision.sequence > last.0 {
+                last = (decision.sequence, Some(decision.selection.index));
+            }
+        } else if decision.sequence != 0 {
+            return Err(io::Error::other("pinned route changed round-robin cursor"));
+        }
+    }
+    if u64::try_from(sequences.len()).ok() != Some(last.0) {
+        return Err(io::Error::other(
+            "fresh route cursor has a missing decision",
+        ));
+    }
+    Ok(last)
 }
 
 /// One fsynced choice for this held J. Selection has no provider effect.
 /// Cached Q and live K are measured only from this fresh broker directory.
+#[cfg(test)]
+// Preserve the strict source assertions in direct route unit fixtures. Live
+// ordinary calls use the compatibility path; live v3 uses select_route_v3.
 pub(super) fn select_route(
     directory: &Path,
     binding: &Binding,
     request: &FreshRouteRequest,
 ) -> io::Result<FreshRouteSelection> {
+    select_route_with_index_mode(directory, binding, request, None, true)
+}
+
+pub(super) fn select_route_with_index(
+    directory: &Path,
+    binding: &Binding,
+    request: &FreshRouteRequest,
+    index: Option<&Index>,
+) -> io::Result<FreshRouteSelection> {
+    select_route_with_index_mode(directory, binding, request, index, false)
+}
+
+fn select_route_with_index_mode(
+    directory: &Path,
+    binding: &Binding,
+    request: &FreshRouteRequest,
+    index: Option<&Index>,
+    enforce_v3_source: bool,
+) -> io::Result<FreshRouteSelection> {
     route_request_valid(request, binding)?;
     if request.account.is_some() || request.index.is_some() {
         return Err(io::Error::other("fresh route selection includes candidate"));
     }
+    let _reader_io = index
+        .filter(|index| index.route_reader_probe())
+        .map(|_| ReaderIoGuard::start("route-choice"));
+    let _cursor_lock = route_selection_lock(directory)?;
     let candidates = route_candidates(directory, binding, request)?;
     let name = decision_name(&binding.handoff_id);
     if let Some(existing) = exact_file::<RouteDecision>(directory, &name)? {
@@ -2932,7 +4824,10 @@ pub(super) fn select_route(
             || existing.pin != request.pin
             || existing.selection.model != request.model
             || existing.selection.config_sha256 != request.config_sha256
-            || existing.selection.policy_version != "fresh-account-effects-v2"
+            || candidates
+                .get(existing.selection.index)
+                .is_none_or(|c| c.account_identity != existing.selection.account_identity)
+            || existing.selection.policy_version != FRESH_ROUTE_POLICY_VERSION
             || !existing
                 .selection
                 .eligible_accounts
@@ -2944,13 +4839,28 @@ pub(super) fn select_route(
         {
             return Err(io::Error::other("fresh route selection changed"));
         }
+        if let Some(index) = index {
+            index
+                .require_live_route(&binding.handoff_id)
+                .map_err(io::Error::other)?;
+            if index.route_reader_probe() {
+                index
+                    .route_reader_preflight(&existing.selection.account_identity)
+                    .map_err(io::Error::other)?;
+            }
+        }
         return Ok(existing.selection);
     }
     let mut eligible = Vec::new();
     let mut unknown_artifact = None;
     for candidate in candidates {
+        if let Some(index) = index.filter(|index| index.route_reader_probe()) {
+            index
+                .route_reader_preflight(&candidate.account_identity)
+                .map_err(io::Error::other)?;
+        }
         let (live, failures, invocations, markers) = route_evidence(directory, &candidate)?;
-        let (quota, unknown) = candidate_quota(directory, binding, &candidate)?;
+        let (quota, unknown) = candidate_quota(directory, binding, &candidate, enforce_v3_source)?;
         if unknown.is_some()
             && request
                 .pin
@@ -2972,84 +4882,339 @@ pub(super) fn select_route(
             "fresh quota effect unknown: {artifact}"
         )));
     }
-    let all_metered = eligible
-        .iter()
-        .all(|(candidate, _, _)| candidate.quota_script.is_some());
     let eligible_accounts: Vec<String> = eligible
         .iter()
         .map(|(candidate, _, _)| candidate.account.clone())
         .collect();
-    let observations = eligible;
-    let has_unsuppressed = observations.iter().any(|(candidate, _, (_, failures, _))| {
-        request
-            .pin
-            .as_deref()
-            .is_none_or(|pin| pin == candidate.account)
-            && *failures < 3
-    });
-    let mut best: Option<((u64, u32, u64, usize), FreshRouteSelection)> = None;
-    for (candidate, quota_remaining, (live, failures, invocations)) in observations {
-        if request
-            .pin
-            .as_deref()
-            .is_some_and(|pin| pin != candidate.account)
-            || !recent_failure_admitted(failures, has_unsuppressed, request.pin.is_some())
-        {
-            continue;
-        }
-        let score = (
-            live,
-            if all_metered && has_unsuppressed {
-                u32::MAX - quota_remaining
-            } else {
-                0
-            },
-            invocations.saturating_add(if !all_metered && has_unsuppressed {
-                failures.saturating_mul(10)
-            } else {
-                0
-            }),
-            candidate.index,
-        );
-        let selection = FreshRouteSelection {
-            model: candidate.model,
-            config_sha256: candidate.config_sha256,
-            account: candidate.account,
-            index: candidate.index,
-            plan_sha256: candidate.plan_sha256,
-            observed_live: live,
-            observed_failures: failures,
-            observed_invocations: invocations,
-            policy_version: "fresh-account-effects-v2".into(),
-            eligible_accounts: eligible_accounts.clone(),
-            quota_remaining_basis_points: candidate.quota_script.as_ref().map(|_| quota_remaining),
-        };
-        if best.as_ref().is_none_or(|(old, _)| score < *old) {
-            best = Some((score, selection));
+    let (previous_sequence, previous_index) =
+        last_route_cursor(directory, &request.model, &request.config_sha256)?;
+    if let Some(index) = index {
+        let cursor = index
+            .cursor(&CursorKey {
+                model: request.model.clone(),
+                config_sha256: request.config_sha256.clone(),
+            })
+            .map_err(io::Error::other)?;
+        if (cursor.sequence, cursor.index) != (previous_sequence, previous_index) {
+            return Err(io::Error::other(
+                "fresh route index cursor differs from broker receipts",
+            ));
         }
     }
-    let selection = best
-        .ok_or_else(|| io::Error::other("fresh route has no eligible account or pin"))?
-        .1;
-    durable_new(
-        directory,
-        &name,
-        &RouteDecision {
-            version: 1,
-            binding: binding.clone(),
-            total: request.total,
-            pin: request.pin.clone(),
-            selection: selection.clone(),
-        },
-    )?;
+    let (candidate, quota_remaining, (live, failures, invocations)) = eligible
+        .into_iter()
+        .filter(|(candidate, _, _)| {
+            request
+                .pin
+                .as_deref()
+                .is_none_or(|pin| pin == candidate.account)
+        })
+        .min_by_key(|(candidate, _, _)| {
+            previous_index.map_or(candidate.index, |last| {
+                (candidate.index + request.total - (last + 1) % request.total) % request.total
+            })
+        })
+        .ok_or_else(|| io::Error::other("fresh route has no eligible account or pin"))?;
+    let sequence = if request.pin.is_some() {
+        0
+    } else {
+        previous_sequence
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("fresh route cursor overflow"))?
+    };
+    let selection = FreshRouteSelection {
+        model: candidate.model,
+        config_sha256: candidate.config_sha256,
+        account: candidate.account,
+        account_identity: candidate.account_identity,
+        index: candidate.index,
+        plan_sha256: candidate.plan_sha256,
+        observed_live: live,
+        observed_failures: failures,
+        observed_invocations: invocations,
+        policy_version: FRESH_ROUTE_POLICY_VERSION.into(),
+        eligible_accounts: eligible_accounts.clone(),
+        quota_remaining_basis_points: quota_remaining,
+    };
+    let receipt = RouteDecision {
+        version: 1,
+        binding: binding.clone(),
+        total: request.total,
+        pin: request.pin.clone(),
+        environment_sha256: None,
+        sequence,
+        selection: selection.clone(),
+    };
+    if let Some(index) = index {
+        let mut bytes = serde_json::to_vec(&receipt)?;
+        bytes.push(b'\n');
+        index
+            .commit_live_decision(
+                CursorKey {
+                    model: request.model.clone(),
+                    config_sha256: request.config_sha256.clone(),
+                },
+                binding.handoff_id.clone(),
+                selection.account_identity.clone(),
+                selection.index,
+                request.pin.is_some(),
+                previous_sequence,
+                name.clone(),
+                &bytes,
+                || durable_new_bytes(directory, &name, &bytes),
+            )
+            .map_err(io::Error::other)?;
+        index
+            .require_live_route(&binding.handoff_id)
+            .map_err(io::Error::other)?;
+    } else {
+        durable_new(directory, &name, &receipt)?;
+    }
     Ok(selection)
 }
 
+/// The private v3 choice reads the current keyed physical-account facts. The
+/// broker holds the same route lock around quota/auth writes, so every account
+/// revision remains stable until the receipt and cursor are published.
+pub(super) fn select_route_v3(
+    directory: &Path,
+    binding: &Binding,
+    request: &FreshRouteRequest,
+    generation: &KeyedGeneration,
+) -> io::Result<FreshRouteSelection> {
+    use super::fresh_index::RouteEligibility;
+
+    route_request_valid(request, binding)?;
+    if request.account.is_some() || request.index.is_some() {
+        return Err(io::Error::other("v3 route selection includes candidate"));
+    }
+    let _lock = route_selection_lock(directory)?;
+    let candidates = route_candidates(directory, binding, request)?;
+    let index = generation.route_index().map_err(io::Error::other)?;
+    let key = CursorKey {
+        model: request.model.clone(),
+        config_sha256: request.config_sha256.clone(),
+    };
+    if let Some(existing) =
+        exact_file::<RouteDecision>(directory, &decision_name(&binding.handoff_id))?
+    {
+        if existing.version != 1
+            || existing.binding != *binding
+            || existing.total != request.total
+            || existing.pin != request.pin
+            || existing.environment_sha256 != request.environment_sha256
+            || existing.selection.model != request.model
+            || existing.selection.config_sha256 != request.config_sha256
+            || existing.selection.policy_version != FRESH_ROUTE_POLICY_VERSION
+            || candidates
+                .get(existing.selection.index)
+                .is_none_or(|candidate| {
+                    candidate.account != existing.selection.account
+                        || candidate.account_identity != existing.selection.account_identity
+                        || candidate.plan_sha256 != existing.selection.plan_sha256
+                })
+        {
+            return Err(io::Error::other("v3 route selection changed"));
+        }
+        generation
+            .require_route(&binding.handoff_id)
+            .map_err(io::Error::other)?;
+        return Ok(existing.selection);
+    }
+    if index
+        .decision(&binding.handoff_id)
+        .map_err(io::Error::other)?
+        .is_some()
+    {
+        return Err(io::Error::other("v3 route decision lacks receipt"));
+    }
+    let environment = request.environment_sha256.as_deref();
+    if environment
+        .is_some_and(|digest| digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return Err(io::Error::other("v3 route environment digest invalid"));
+    }
+    let mut eligible = Vec::new();
+    let mut unknown = false;
+    for candidate in candidates {
+        fresh_rebuild::validate_candidate(
+            directory,
+            generation.admitted_source().map_err(io::Error::other)?,
+            &candidate,
+        )?;
+        let source = if candidate.quota_script.is_some() {
+            let environment = candidate.environment_sha256.as_str();
+            let source = SourceKey {
+                commands_sha256: format!(
+                    "{:x}",
+                    Sha256::digest(serde_json::to_vec(&(
+                        &candidate.quota_script,
+                        &candidate.auth_refresh_command,
+                    ))?)
+                ),
+                environment_sha256: environment.to_owned(),
+            };
+            let first = effect_directory(
+                directory,
+                binding,
+                &FreshAccountEffectRequest {
+                    d_key: request.d_key.clone(),
+                    model: request.model.clone(),
+                    config_sha256: request.config_sha256.clone(),
+                    account: candidate.account.clone(),
+                    index: candidate.index,
+                    kind: FreshAccountEffectKind::QuotaFirst,
+                    environment: Vec::new(),
+                },
+            );
+            if let Some(intent) = effect_intent(&first)? {
+                if intent.version != 1
+                    || intent.binding != *binding
+                    || intent.request.model != candidate.model
+                    || intent.request.config_sha256 != candidate.config_sha256
+                    || intent.request.account != candidate.account
+                    || intent.request.index != candidate.index
+                    || intent.request.kind != FreshAccountEffectKind::QuotaFirst
+                    || intent.environment_sha256 != environment
+                {
+                    return Err(io::Error::other("v3 route local quota source changed"));
+                }
+            }
+            Some(source)
+        } else {
+            None
+        };
+        let facts = generation
+            .route_facts(
+                &candidate.account_identity,
+                source.as_ref(),
+                &candidate.model,
+                &candidate.config_sha256,
+                Utc::now().timestamp(),
+            )
+            .map_err(io::Error::other)?;
+        match facts {
+            RouteEligibility::Eligible {
+                quota_basis_points,
+                observed_invocations,
+                observed_failures,
+                ..
+            } => {
+                eligible.push((
+                    candidate,
+                    quota_basis_points,
+                    observed_invocations,
+                    observed_failures,
+                ));
+            }
+            RouteEligibility::Unknown
+                if request
+                    .pin
+                    .as_deref()
+                    .is_none_or(|pin| pin == candidate.account) =>
+            {
+                unknown = true
+            }
+            RouteEligibility::Unknown
+            | RouteEligibility::ProbeRequired
+            | RouteEligibility::Excluded => {}
+        }
+    }
+    if unknown {
+        return Err(io::Error::other(
+            "v3 route has unknown physical-account debt",
+        ));
+    }
+    let eligible_accounts = eligible
+        .iter()
+        .map(|(candidate, _, _, _)| candidate.account.clone())
+        .collect::<Vec<_>>();
+    let cursor = index.cursor(&key).map_err(io::Error::other)?;
+    let (candidate, quota, invocations, failures) = eligible
+        .into_iter()
+        .filter(|(candidate, _, _, _)| {
+            request
+                .pin
+                .as_deref()
+                .is_none_or(|pin| pin == candidate.account)
+        })
+        .min_by_key(|(candidate, _, _, _)| {
+            cursor.index.map_or(candidate.index, |last| {
+                (candidate.index + request.total - (last + 1) % request.total) % request.total
+            })
+        })
+        .ok_or_else(|| io::Error::other("v3 route has no eligible account or pin"))?;
+    let sequence = if request.pin.is_some() {
+        0
+    } else {
+        cursor
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("v3 route cursor overflow"))?
+    };
+    let selection = FreshRouteSelection {
+        model: candidate.model,
+        config_sha256: candidate.config_sha256,
+        account: candidate.account,
+        account_identity: candidate.account_identity,
+        index: candidate.index,
+        plan_sha256: candidate.plan_sha256,
+        observed_live: 0,
+        observed_failures: failures,
+        observed_invocations: invocations,
+        policy_version: FRESH_ROUTE_POLICY_VERSION.into(),
+        eligible_accounts,
+        quota_remaining_basis_points: quota,
+    };
+    let receipt = RouteDecision {
+        version: 1,
+        binding: binding.clone(),
+        total: request.total,
+        pin: request.pin.clone(),
+        environment_sha256: request.environment_sha256.clone(),
+        sequence,
+        selection: selection.clone(),
+    };
+    let mut bytes = serde_json::to_vec(&receipt)?;
+    bytes.push(b'\n');
+    let name = decision_name(&binding.handoff_id);
+    index
+        .commit_live_decision(
+            key,
+            binding.handoff_id.clone(),
+            selection.account_identity.clone(),
+            selection.index,
+            request.pin.is_some(),
+            cursor.sequence,
+            name.clone(),
+            &bytes,
+            || durable_new_bytes(directory, &name, &bytes),
+        )
+        .map_err(io::Error::other)?;
+    generation
+        .require_route(&binding.handoff_id)
+        .map_err(io::Error::other)?;
+    Ok(selection)
+}
+
+#[cfg(test)]
 pub(super) fn require_selected_plan(
     directory: &Path,
     binding: &Binding,
     plan: &Plan,
 ) -> io::Result<()> {
+    require_selected_plan_indexed(directory, binding, plan, None)
+}
+
+pub(super) fn require_selected_plan_indexed(
+    directory: &Path,
+    binding: &Binding,
+    plan: &Plan,
+    index: Option<&Index>,
+) -> io::Result<()> {
+    let _reader_io = index
+        .filter(|index| index.route_reader_probe())
+        .map(|_| ReaderIoGuard::start("pre-K"));
     let decision: RouteDecision = exact_file(directory, &decision_name(&binding.handoff_id))?
         .ok_or_else(|| io::Error::other("fresh route selection absent before K"))?;
     if decision.version != 1
@@ -3067,23 +5232,29 @@ pub(super) fn require_selected_plan(
         &candidate_name(&binding.handoff_id, decision.selection.index),
     )?
     .ok_or_else(|| io::Error::other("fresh provider selected candidate absent"))?;
-    if candidate.version != 2
+    if candidate.version != 3
         || candidate.binding != *binding
         || candidate.model != decision.selection.model
         || candidate.config_sha256 != decision.selection.config_sha256
         || candidate.account != decision.selection.account
+        || candidate.account_identity != decision.selection.account_identity
         || candidate.plan_sha256 != plan.digest
     {
         return Err(io::Error::other(
             "fresh provider selected candidate changed",
         ));
     }
+    if let Some(index) = index.filter(|index| index.route_reader_probe()) {
+        index
+            .route_reader_preflight(&candidate.account_identity)
+            .map_err(io::Error::other)?;
+    }
     let (_, _, _, markers) =
         route_evidence_excluding(directory, &candidate, Some(&binding.handoff_id))?;
-    let (quota, unknown) = candidate_quota(directory, binding, &candidate)?;
+    let (quota, unknown) = candidate_quota(directory, binding, &candidate, false)?;
     if unknown.is_some()
         || quota.is_none()
-        || candidate.quota_script.as_ref().map(|_| quota.unwrap().0)
+        || quota.and_then(|(remaining, _)| remaining)
             != decision.selection.quota_remaining_basis_points
         || !marker_allows_candidate(
             directory,
@@ -3165,6 +5336,8 @@ pub(super) fn prepare(directory: &Path, binding: Binding, plan: Plan) -> io::Res
         grant,
         plan,
         directory: directory.to_owned(),
+        indexed_account: None,
+        indexed_effect: None,
     })
 }
 
@@ -3760,6 +5933,48 @@ pub(super) fn launch(
     actor: &PinnedProcess,
     uid: u32,
     gid: u32,
+    index: Option<&Index>,
+) -> io::Result<String> {
+    launch_inner(prepared, root, actor, uid, gid, index, None, None)
+}
+
+fn launch_v3_quota(
+    prepared: Prepared,
+    root: &PinnedProcess,
+    actor: &PinnedProcess,
+    uid: u32,
+    gid: u32,
+    generation: &KeyedGeneration,
+    intent: &AccountEffectIntent,
+    request: &FreshAccountEffectRequest,
+    revision: u64,
+) -> io::Result<String> {
+    launch_inner(
+        prepared,
+        root,
+        actor,
+        uid,
+        gid,
+        None,
+        Some((generation, intent, request, revision)),
+        None,
+    )
+}
+
+fn launch_inner(
+    prepared: Prepared,
+    root: &PinnedProcess,
+    actor: &PinnedProcess,
+    uid: u32,
+    gid: u32,
+    index: Option<&Index>,
+    v3_quota: Option<(
+        &KeyedGeneration,
+        &AccountEffectIntent,
+        &FreshAccountEffectRequest,
+        u64,
+    )>,
+    v3_provider: Option<(&KeyedGeneration, &str, u64)>,
 ) -> io::Result<String> {
     root.verify()?;
     actor.verify()?;
@@ -3829,18 +6044,70 @@ pub(super) fn launch(
     }
     if b.causal_parent.is_some() {
         require_child_work_plan(&prepared.directory, b, &prepared.plan)?;
-    } else if prepared
-        .directory
-        .join(decision_name(&b.handoff_id))
-        .exists()
+    }
+    if let Some(index) = index {
+        if let Some(intent) = &prepared.indexed_effect {
+            let account = reconcile_indexed_account_effect(index, &prepared.directory, intent)?;
+            if prepared.indexed_account.as_deref() != Some(account.as_str())
+                || index.account(&account).map_err(io::Error::other)?.effects[&intent.id]
+                    .consumed_k
+                    .is_some()
+            {
+                return Err(io::Error::other("indexed effect account changed before K"));
+            }
+        } else {
+            prepared.require_indexed_route(index)?;
+            if prepared.indexed_account.as_deref()
+                != Some(reconcile_indexed_provider_grant(index, &prepared.grant)?.as_str())
+            {
+                return Err(io::Error::other(
+                    "indexed provider account changed before K",
+                ));
+            }
+        }
+    }
+    if let Some((generation, intent, request, revision)) = v3_quota {
+        generation
+            .require_quota_pre_k(&intent.binding, request, &intent.id, revision)
+            .map_err(io::Error::other)?;
+    }
+    if b.causal_parent.is_none()
+        && v3_provider.is_none()
+        && prepared
+            .directory
+            .join(decision_name(&b.handoff_id))
+            .exists()
     {
-        require_selected_plan(&prepared.directory, b, &prepared.plan)?;
+        require_selected_plan_indexed(&prepared.directory, b, &prepared.plan, index)?;
     }
     durable_new(
         &prepared.directory,
         &format!("{}.consumed.json", prepared.grant.id),
         &prepared.grant,
     )?;
+    if let Some((generation, intent, request, revision)) = v3_quota {
+        generation
+            .record_quota_k(&intent.binding, request, &intent.id, Some(revision))
+            .map_err(io::Error::other)?;
+    }
+    if let Some((generation, account, revision)) = v3_provider {
+        let k = provider_artifact(
+            &prepared.directory,
+            &format!("{}.consumed.json", prepared.grant.id),
+        )?;
+        generation
+            .record_provider_k(account, &prepared.grant.id, k, revision)
+            .map_err(io::Error::other)?;
+    }
+    if let Some(index) = index {
+        // The provider child has not been created. A failed publication leaves
+        // one-use K debt, but cannot release the executable.
+        if let Some(intent) = &prepared.indexed_effect {
+            reconcile_indexed_account_effect(index, &prepared.directory, intent)?;
+        } else {
+            reconcile_indexed_provider_grant(index, &prepared.grant)?;
+        }
+    }
     let stdout = OpenOptions::new()
         .read(true)
         .write(true)
@@ -3967,6 +6234,18 @@ fn parent_namespace_pid(host_pid: i32) -> io::Result<i32> {
 }
 
 fn exact_file<T: for<'de> Deserialize<'de>>(dir: &Path, name: &str) -> io::Result<Option<T>> {
+    struct Counted<R> {
+        inner: R,
+        bytes: u64,
+    }
+    impl<R: Read> Read for Counted<R> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let read = self.inner.read(buf)?;
+            self.bytes += read as u64;
+            Ok(read)
+        }
+    }
+    super::fresh_index::reader_open_attempt();
     match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
@@ -3990,10 +6269,12 @@ fn exact_file<T: for<'de> Deserialize<'de>>(dir: &Path, name: &str) -> io::Resul
 }
 
 fn verified_output(dir: &Path, name: &str, expected: &Output) -> io::Result<File> {
+    super::fresh_index::reader_open_attempt();
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(dir.join(name))?;
+    super::fresh_index::reader_opened();
     let meta = file.metadata()?;
     if !meta.is_file() || meta.dev() != expected.device || meta.ino() != expected.inode {
         return Err(io::Error::other("provider output inode changed"));
@@ -4006,6 +6287,7 @@ fn verified_output(dir: &Path, name: &str, expected: &Output) -> io::Result<File
         if n == 0 {
             break;
         }
+        super::fresh_index::reader_bytes_parsed(n as u64);
         hash.update(&buf[..n]);
         offset = offset
             .checked_add(n as u64)
@@ -4262,6 +6544,27 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
 
+    fn fixture_grant(binding: Binding, plan_sha256: String) -> Grant {
+        let path = Path::new("/bin/true");
+        let image = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH)
+            .open(path)
+            .unwrap();
+        Grant {
+            version: 3,
+            id: uuid::Uuid::new_v4().to_string(),
+            binding,
+            plan_sha256,
+            configured_program: path.display().to_string(),
+            broker_resolved_path: path.to_path_buf(),
+            image_descriptor: ImageDescriptor::of(&image).unwrap(),
+            preflight_image: ImagePreflight::observe(&image, path).unwrap(),
+            path_at_k: None,
+            path_execution: false,
+        }
+    }
+
     fn wait_for_q(directory: &Path, grant: &str) -> (i32, Vec<u8>, Vec<u8>) {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
@@ -4383,7 +6686,7 @@ mod tests {
                 .unwrap(),
             prepared.grant.id
         );
-        let grant = launch(prepared, &root, &actor, 0, 0).unwrap();
+        let grant = launch(prepared, &root, &actor, 0, 0, None).unwrap();
         let (status, stdout, _) = wait_for_q(temporary.path(), &grant);
         assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
         assert_eq!(stdout, b"after");
@@ -4412,7 +6715,7 @@ mod tests {
             )
             .is_err()
         );
-        let held_grant = launch(held, &root, &actor, 0, 0).unwrap();
+        let held_grant = launch(held, &root, &actor, 0, 0, None).unwrap();
         assert_eq!(wait_for_q(temporary.path(), &held_grant).1, b"original");
 
         let prefix = temporary.path().join("prefix-target");
@@ -4445,6 +6748,7 @@ mod tests {
             &actor,
             0,
             0,
+            None,
         )
         .unwrap();
         let (status, stdout, _) = wait_for_q(temporary.path(), &prefix_grant);
@@ -4462,6 +6766,7 @@ mod tests {
             &actor,
             0,
             0,
+            None,
         )
         .unwrap();
         let (status, _, _) = wait_for_q(temporary.path(), &setid_grant);
@@ -4488,6 +6793,7 @@ mod tests {
             &actor,
             0,
             0,
+            None,
         )
         .unwrap();
         let (status, _, _) = wait_for_q(temporary.path(), &cap_grant);
@@ -4504,7 +6810,7 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&refused, std::fs::Permissions::from_mode(0o000)).unwrap();
         prepared.plan.verify().unwrap();
-        let refused_grant = launch(prepared, &root, &actor, 0, 0).unwrap();
+        let refused_grant = launch(prepared, &root, &actor, 0, 0, None).unwrap();
         let (status, stdout, stderr) = wait_for_q(temporary.path(), &refused_grant);
         assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 126);
         assert!(stdout.is_empty());
@@ -4544,6 +6850,7 @@ mod tests {
             model: "work".into(),
             config_sha256: "c".repeat(64),
             account: "opencode-one".into(),
+            account_identity: "opencode-one".into(),
             index: 0,
             plan_sha256: grant.plan_sha256.clone(),
             observed_live: 0,
@@ -4554,15 +6861,17 @@ mod tests {
             quota_remaining_basis_points: Some(8000),
         };
         let candidate = RouteCandidate {
-            version: 2,
+            version: 3,
             binding: binding.clone(),
             model: selection.model.clone(),
             config_sha256: selection.config_sha256.clone(),
             account: selection.account.clone(),
+            account_identity: selection.account_identity.clone(),
             index: 0,
             total: 2,
             pin: None,
             plan_sha256: grant.plan_sha256.clone(),
+            environment_sha256: "0".repeat(64),
             quota_script: Some("quota source".into()),
             auth_refresh_command: None,
             terminal_recognizer: FreshTerminalRecognizer::OpenCode,
@@ -4579,6 +6888,8 @@ mod tests {
             binding,
             total: 2,
             pin: None,
+            environment_sha256: Some("0".repeat(64)),
+            sequence: 0,
             selection,
         };
         let q_path = broker.join(format!("{}.drain.json", grant.id));
@@ -4642,6 +6953,7 @@ mod tests {
         );
         let mut other = candidate.clone();
         other.account = "second".into();
+        other.account_identity = "second".into();
         other.index = 1;
         assert!(marker_allows_candidate(&broker, &decision.binding, &other, &[], None).unwrap());
         assert!(
@@ -4723,12 +7035,13 @@ mod tests {
         let generic = provider.classify("first", b"", b"plain failure", 1 << 8);
         assert_eq!(generic.kind, TerminalSignalKind::NonzeroExit);
         assert_eq!(
-            classify_terminal_outcome(generic.kind, b"plain failure", 1 << 8, false),
+            classify_terminal_outcome(generic.kind, b"", b"plain failure", 1 << 8, false),
             TerminalOutcome::GenericFailure,
         );
         assert_eq!(
             classify_terminal_outcome(
                 generic.kind,
+                b"",
                 b"authentication failed: token expired",
                 1 << 8,
                 false
@@ -4738,6 +7051,7 @@ mod tests {
         assert_eq!(
             classify_terminal_outcome(
                 TerminalSignalKind::QuotaExhaustedInband,
+                b"",
                 b"quota exhausted",
                 0,
                 true
@@ -4745,11 +7059,11 @@ mod tests {
             TerminalOutcome::QuotaRejected,
         );
         assert_eq!(
-            classify_terminal_outcome(generic.kind, b"plain failure", 1 << 8, true),
-            TerminalOutcome::Cancelled,
+            classify_terminal_outcome(generic.kind, b"", b"plain failure", 1 << 8, true),
+            TerminalOutcome::GenericFailure,
         );
         assert_eq!(
-            classify_terminal_outcome(TerminalSignalKind::Unknown, b"", -1, false),
+            classify_terminal_outcome(TerminalSignalKind::Unknown, b"", b"", -1, false),
             TerminalOutcome::Unknown,
         );
         let contention = FreshTerminalRecognizer::OpenCode.classify(
@@ -4763,13 +7077,235 @@ mod tests {
             TerminalSignalKind::ProviderStorageContention
         );
         assert_eq!(
-            classify_terminal_outcome(contention.kind, b"", 0, false),
+            classify_terminal_outcome(contention.kind, b"", b"", 0, false),
             TerminalOutcome::StorageContention,
         );
     }
 
     #[test]
-    fn recent_failure_window_threshold_fallback_and_pin() {
+    fn manual_physical_q_is_reused_by_route_and_new_exhausted_q_excludes() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config");
+        let broker = temp.path().join("fresh-provider");
+        std::fs::create_dir_all(config.join("models")).unwrap();
+        std::fs::create_dir(&broker).unwrap();
+        let healthy = r#"printf '{"used_percent":20,"resets_at":"2099-01-01T00:00:00Z"}'"#;
+        std::fs::write(config.join("providers.toml"), format!(
+            "[first]\ncommand = '/bin/true'\nquota_account_id = 'physical-first'\nquota_script = {}\n",
+            serde_json::to_string(healthy).unwrap(),
+        )).unwrap();
+        std::fs::write(
+            config.join("models/work.toml"),
+            "[[providers]]\nname = 'first'\n",
+        )
+        .unwrap();
+        let pool = oulipoly_runtime::executor::cli::fresh_remote::load_fresh_headless_pool(
+            &config, "work",
+        )
+        .unwrap();
+        let environment = vec![("PATH".into(), "/usr/bin:/bin".into())];
+        let first = oulipoly_kernel_broker::protocol::ManualQuotaRequest {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            model: "work".into(),
+            account: "first".into(),
+            config_sha256: pool.config_sha256.clone(),
+            environment: environment.clone(),
+        };
+        super::super::manual_quota::begin(
+            &broker,
+            &File::open(&config).unwrap(),
+            &first,
+            unsafe { libc::getuid() },
+            unsafe { libc::getgid() },
+        )
+        .unwrap();
+        let process = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+        let binding = fixture_binding(&process, &process);
+        let candidate = RouteCandidate {
+            version: 3,
+            binding: binding.clone(),
+            model: "work".into(),
+            config_sha256: pool.config_sha256.clone(),
+            account: "first".into(),
+            account_identity: "physical-first".into(),
+            index: 0,
+            total: 1,
+            pin: None,
+            plan_sha256: "p".repeat(64),
+            environment_sha256: "0".repeat(64),
+            quota_script: Some(healthy.into()),
+            auth_refresh_command: None,
+            terminal_recognizer: FreshTerminalRecognizer::OpenAiCompat,
+        };
+        durable_new(&broker, &candidate_name(&binding.handoff_id, 0), &candidate).unwrap();
+        let effect = FreshAccountEffectRequest {
+            d_key: uuid::Uuid::new_v4().to_string(),
+            model: "work".into(),
+            config_sha256: pool.config_sha256.clone(),
+            account: "first".into(),
+            index: 0,
+            kind: FreshAccountEffectKind::QuotaFirst,
+            environment: environment.clone(),
+        };
+        assert!(
+            begin_account_effect(
+                &broker,
+                &binding,
+                &effect,
+                &process,
+                &process,
+                unsafe { libc::getuid() },
+                unsafe { libc::getgid() },
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("manual quota prior K/Q unknown")
+        );
+        assert!(!effect_directory(&broker, &binding, &effect).exists());
+        super::super::manual_quota::worker_with_environment(
+            &broker.join("manual-quota").join(&first.operation_id),
+            &first.environment,
+        )
+        .unwrap();
+        let readback = begin_account_effect(
+            &broker,
+            &binding,
+            &effect,
+            &process,
+            &process,
+            unsafe { libc::getuid() },
+            unsafe { libc::getgid() },
+        )
+        .unwrap();
+        assert_eq!(readback.outcome.as_deref(), Some("valid_windows"));
+        assert!(
+            effect_directory(&broker, &binding, &effect)
+                .join("manual-reuse.json")
+                .exists()
+        );
+        assert_eq!(
+            candidate_quota(&broker, &binding, &candidate, true)
+                .unwrap()
+                .0
+                .unwrap()
+                .0,
+            Some(8000)
+        );
+
+        let exhausted = r#"printf '{"used_percent":100,"resets_at":"2099-01-01T00:00:00Z"}'"#;
+        std::fs::write(config.join("providers.toml"), format!(
+            "[first]\ncommand = '/bin/true'\nquota_account_id = 'physical-first'\nquota_script = {}\n",
+            serde_json::to_string(exhausted).unwrap(),
+        )).unwrap();
+        let changed = oulipoly_runtime::executor::cli::fresh_remote::load_fresh_headless_pool(
+            &config, "work",
+        )
+        .unwrap();
+        let forced = oulipoly_kernel_broker::protocol::ManualQuotaRequest {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            config_sha256: changed.config_sha256,
+            ..first.clone()
+        };
+        super::super::manual_quota::begin(
+            &broker,
+            &File::open(&config).unwrap(),
+            &forced,
+            unsafe { libc::getuid() },
+            unsafe { libc::getgid() },
+        )
+        .unwrap();
+        super::super::manual_quota::worker_with_environment(
+            &broker.join("manual-quota").join(&forced.operation_id),
+            &forced.environment,
+        )
+        .unwrap();
+        let new_binding = fixture_binding(&process, &process);
+        let new_candidate = RouteCandidate {
+            binding: new_binding.clone(),
+            quota_script: Some(exhausted.into()),
+            config_sha256: forced.config_sha256.clone(),
+            ..candidate
+        };
+        durable_new(
+            &broker,
+            &candidate_name(&new_binding.handoff_id, 0),
+            &new_candidate,
+        )
+        .unwrap();
+        let new_effect = FreshAccountEffectRequest {
+            config_sha256: forced.config_sha256.clone(),
+            ..effect
+        };
+        let new_readback = begin_account_effect(
+            &broker,
+            &new_binding,
+            &new_effect,
+            &process,
+            &process,
+            unsafe { libc::getuid() },
+            unsafe { libc::getgid() },
+        )
+        .unwrap();
+        assert_eq!(new_readback.windows[0].used_percent, 100.0);
+        assert!(
+            candidate_quota(&broker, &new_binding, &new_candidate, true)
+                .unwrap()
+                .0
+                .is_none()
+        );
+        let unresolved_binding = fixture_binding(&process, &process);
+        let unresolved_candidate = RouteCandidate {
+            binding: unresolved_binding.clone(),
+            ..new_candidate.clone()
+        };
+        durable_new(
+            &broker,
+            &candidate_name(&unresolved_binding.handoff_id, 0),
+            &unresolved_candidate,
+        )
+        .unwrap();
+        let unknown_dir = effect_directory(&broker, &unresolved_binding, &new_effect);
+        std::fs::create_dir(&unknown_dir).unwrap();
+        durable_new(
+            &unknown_dir,
+            "intent.json",
+            &AccountEffectIntent {
+                version: 1,
+                id: uuid::Uuid::new_v4().to_string(),
+                binding: unresolved_binding,
+                request: redacted_effect_request(&new_effect),
+                environment_sha256: environment_digest(&new_effect).unwrap(),
+                plan_sha256: "pending-plan".into(),
+                auth_source: None,
+            },
+        )
+        .unwrap();
+        let later = oulipoly_kernel_broker::protocol::ManualQuotaRequest {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            ..forced
+        };
+        assert!(
+            super::super::manual_quota::begin(
+                &broker,
+                &File::open(&config).unwrap(),
+                &later,
+                unsafe { libc::getuid() },
+                unsafe { libc::getgid() },
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("prior route K/Q unknown")
+        );
+        assert!(
+            !broker
+                .join("manual-quota")
+                .join(later.operation_id)
+                .exists()
+        );
+    }
+
+    #[test]
+    fn recent_failure_observation_is_recorded_without_ranking() {
         let temp = tempfile::tempdir().unwrap();
         let receipt = temp.path().join("drain.json");
         let file = File::create(&receipt).unwrap();
@@ -4780,10 +7316,6 @@ mod tests {
         )
         .unwrap();
         assert!(!file_age_less_than(&receipt, Duration::from_secs(30 * 60)).unwrap());
-        assert!(recent_failure_admitted(2, true, false));
-        assert!(!recent_failure_admitted(3, true, false));
-        assert!(recent_failure_admitted(3, false, false));
-        assert!(recent_failure_admitted(3, true, true));
     }
 
     #[test]
@@ -4823,6 +7355,29 @@ mod tests {
             kind: FreshAccountEffectKind::AuthRefresh,
             environment: vec![("PATH".into(), "/usr/bin:/bin".into())],
         };
+        for binding in [&source_binding, &follower_binding] {
+            durable_new(
+                temp.path(),
+                &candidate_name(&binding.handoff_id, 0),
+                &RouteCandidate {
+                    version: 3,
+                    binding: binding.clone(),
+                    model: request.model.clone(),
+                    config_sha256: request.config_sha256.clone(),
+                    account: request.account.clone(),
+                    account_identity: "physical-shared".into(),
+                    index: 0,
+                    total: 1,
+                    pin: None,
+                    plan_sha256: "p".repeat(64),
+                    environment_sha256: "0".repeat(64),
+                    quota_script: Some("quota-script".into()),
+                    auth_refresh_command: Some("auth-command".into()),
+                    terminal_recognizer: FreshTerminalRecognizer::OpenAiCompat,
+                },
+            )
+            .unwrap();
+        }
         let source_dir = effect_directory(temp.path(), &source_binding, &request);
         std::fs::create_dir(&source_dir).unwrap();
         let source = AccountEffectIntent {
@@ -4835,6 +7390,36 @@ mod tests {
             auth_source: None,
         };
         durable_new(&source_dir, "intent.json", &source).unwrap();
+        let source_candidate: RouteCandidate =
+            exact_file(temp.path(), &candidate_name(&source_binding.handoff_id, 0))
+                .unwrap()
+                .unwrap();
+        for (identity, expected_peer) in [("physical-shared", true), ("other-physical", false)] {
+            let mut alias_binding = fixture_binding(&process, &process);
+            alias_binding.handoff_id = uuid::Uuid::new_v4().to_string();
+            let mut alias_candidate = source_candidate.clone();
+            alias_candidate.binding = alias_binding.clone();
+            alias_candidate.model = "other-model".into();
+            alias_candidate.config_sha256 = "b".repeat(64);
+            alias_candidate.account = "alias".into();
+            alias_candidate.account_identity = identity.into();
+            durable_new(
+                temp.path(),
+                &candidate_name(&alias_binding.handoff_id, 0),
+                &alias_candidate,
+            )
+            .unwrap();
+            let mut alias_request = request.clone();
+            alias_request.model = alias_candidate.model;
+            alias_request.config_sha256 = alias_candidate.config_sha256;
+            alias_request.account = alias_candidate.account;
+            assert_eq!(
+                coalescible_auth_source(temp.path(), &alias_binding, &alias_request)
+                    .unwrap()
+                    .is_some(),
+                expected_peer,
+            );
+        }
         let (source_name, found) =
             coalescible_auth_source(temp.path(), &follower_binding, &request)
                 .unwrap()
@@ -4843,10 +7428,8 @@ mod tests {
         let mut different = request.clone();
         different.config_sha256 = "b".repeat(64);
         assert!(
-            coalescible_auth_source(temp.path(), &follower_binding, &different)
-                .unwrap_err()
-                .to_string()
-                .contains(&source.id)
+            coalescible_auth_source(temp.path(), &follower_binding, &different).is_err(),
+            "changed config must fail before a peer auth K is reused"
         );
         different = request.clone();
         different.environment.push(("CHANGED".into(), "1".into()));
@@ -4854,9 +7437,8 @@ mod tests {
         different = request.clone();
         different.account = "other-account".into();
         assert!(
-            coalescible_auth_source(temp.path(), &follower_binding, &different)
-                .unwrap()
-                .is_none()
+            coalescible_auth_source(temp.path(), &follower_binding, &different).is_err(),
+            "changed account must fail before a peer auth K is reused"
         );
         assert!(
             coalescible_auth_source(temp.path(), &source_binding, &request)
@@ -4908,7 +7490,7 @@ mod tests {
         std::fs::create_dir(temp.path().join("models")).unwrap();
         std::fs::write(
             temp.path().join("providers.toml"),
-            "[first]\ncommand = \"/bin/true\"\nquota_script = \"printf ok\"\n[second]\ncommand = \"/bin/true\"\n",
+            "[first]\ncommand = \"/bin/true\"\nquota_account_id = \"physical-first\"\nquota_script = \"printf ok\"\n[second]\ncommand = \"/bin/true\"\nquota_account_id = \"physical-second\"\n",
         )
         .unwrap();
         let model_path = temp.path().join("models/pool.toml");
@@ -4924,17 +7506,35 @@ mod tests {
         )
         .unwrap();
         let mut request = FreshRouteRequest {
+            protocol_version: 4,
             d_key: uuid::Uuid::new_v4().to_string(),
             model: "pool".into(),
             config_sha256: pool.config_sha256.clone(),
             account: Some("first".into()),
+            account_identity: Some("physical-first".into()),
             index: Some(0),
             total: 2,
             pin: None,
             quota_script: Some("printf ok".into()),
             auth_refresh_command: None,
+            environment_sha256: None,
         };
         validate_route_source(&source, &request).unwrap();
+        let mut old_protocol = serde_json::to_value(&request).unwrap();
+        old_protocol
+            .as_object_mut()
+            .unwrap()
+            .remove("protocol_version");
+        old_protocol
+            .as_object_mut()
+            .unwrap()
+            .remove("account_identity");
+        assert!(serde_json::from_value::<FreshRouteRequest>(old_protocol).is_err());
+        request.account_identity = None;
+        assert!(validate_route_source(&source, &request).is_err());
+        request.account_identity = Some("physical-second".into());
+        assert!(validate_route_source(&source, &request).is_err());
+        request.account_identity = Some("physical-first".into());
         request.account = Some("second".into());
         assert!(validate_route_source(&source, &request).is_err());
         request.account = Some("first".into());
@@ -4948,6 +7548,7 @@ mod tests {
         assert!(validate_route_source(&source, &request).is_err());
         request.config_sha256 = pool.config_sha256;
         request.account = None;
+        request.account_identity = None;
         request.index = None;
         request.quota_script = None;
         validate_route_source(&source, &request).unwrap();
@@ -4968,6 +7569,27 @@ mod tests {
         let duplicate = File::open(&duplicate_dir).unwrap();
         validate_route_source(&duplicate, &request).unwrap();
         assert!(bind_route_source(&broker_dir, &binding, &request, &duplicate, false).is_err());
+        let missing_dir = temp.path().join("missing-identity");
+        std::fs::create_dir_all(missing_dir.join("models")).unwrap();
+        let without_identity = std::fs::read_to_string(temp.path().join("providers.toml"))
+            .unwrap()
+            .replace("quota_account_id = \"physical-first\"\n", "");
+        std::fs::write(missing_dir.join("providers.toml"), without_identity).unwrap();
+        std::fs::copy(&model_path, missing_dir.join("models/pool.toml")).unwrap();
+        let missing_pool = oulipoly_runtime::executor::cli::fresh_remote::load_fresh_headless_pool(
+            &missing_dir,
+            "pool",
+        )
+        .unwrap();
+        let mut missing_request = request.clone();
+        missing_request.config_sha256 = missing_pool.config_sha256;
+        missing_request.account = Some("first".into());
+        missing_request.account_identity = Some("physical-first".into());
+        missing_request.index = Some(0);
+        missing_request.quota_script = Some("printf ok".into());
+        assert!(
+            validate_route_source(&File::open(&missing_dir).unwrap(), &missing_request).is_err()
+        );
         std::fs::write(
             &model_path,
             "[[providers]]\nname = \"second\"\n[[providers]]\nname = \"first\"\n",
@@ -4995,6 +7617,1130 @@ mod tests {
             root_pidns_ino: root.pidns_ino,
             causal_parent: None,
         }
+    }
+
+    fn register_unmetered_route(
+        directory: &Path,
+        binding: &Binding,
+        pin: Option<&str>,
+    ) -> FreshRouteRequest {
+        let config_sha256 = "c".repeat(64);
+        for (index, account) in ["first", "second", "third"].iter().enumerate() {
+            durable_new(
+                directory,
+                &candidate_name(&binding.handoff_id, index),
+                &RouteCandidate {
+                    version: 3,
+                    binding: binding.clone(),
+                    model: "fair".into(),
+                    config_sha256: config_sha256.clone(),
+                    account: (*account).into(),
+                    account_identity: (*account).into(),
+                    index,
+                    total: 3,
+                    pin: pin.map(str::to_owned),
+                    plan_sha256: format!("{index:064x}"),
+                    environment_sha256: "0".repeat(64),
+                    quota_script: None,
+                    auth_refresh_command: None,
+                    terminal_recognizer: FreshTerminalRecognizer::OpenCode,
+                },
+            )
+            .unwrap();
+        }
+        FreshRouteRequest {
+            protocol_version: 4,
+            d_key: uuid::Uuid::new_v4().to_string(),
+            model: "fair".into(),
+            config_sha256,
+            account: None,
+            account_identity: None,
+            index: None,
+            total: 3,
+            pin: pin.map(str::to_owned),
+            quota_script: None,
+            auth_refresh_command: None,
+            environment_sha256: None,
+        }
+    }
+
+    struct IndexedEffectFixture {
+        temp: tempfile::TempDir,
+        index: Index,
+        binding: Binding,
+    }
+
+    impl IndexedEffectFixture {
+        fn new() -> Self {
+            use crate::linux_main::fresh_index::broker_admission_lease;
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("broker");
+            std::fs::create_dir(&root).unwrap();
+            let lease = broker_admission_lease(&root).unwrap();
+            let index = Index::admit_live_routes(&root, &lease).unwrap();
+            let process = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+            let binding = fixture_binding(&process, &process);
+            let source_dir = temp.path().join("source");
+            std::fs::create_dir(&source_dir).unwrap();
+            let source = File::open(&source_dir).unwrap();
+            let source_meta = source.metadata().unwrap();
+            durable_new(
+                &root,
+                &format!("{}.route-source.json", binding.handoff_id),
+                &RouteSource {
+                    version: 1,
+                    binding: binding.clone(),
+                    config_sha256: "c".repeat(64),
+                    directory_device: source_meta.dev(),
+                    directory_inode: source_meta.ino(),
+                },
+            )
+            .unwrap();
+            for (i, physical) in ["physical-first", "physical-second"].iter().enumerate() {
+                durable_new(
+                    &root,
+                    &candidate_name(&binding.handoff_id, i),
+                    &RouteCandidate {
+                        version: 3,
+                        binding: binding.clone(),
+                        model: "work".into(),
+                        config_sha256: "c".repeat(64),
+                        account: format!("account-{i}"),
+                        account_identity: (*physical).into(),
+                        index: i,
+                        total: 2,
+                        pin: None,
+                        plan_sha256: "a".repeat(64),
+                        environment_sha256: "0".repeat(64),
+                        quota_script: Some("printf ok".into()),
+                        auth_refresh_command: Some("true".into()),
+                        terminal_recognizer: FreshTerminalRecognizer::OpenAiCompat,
+                    },
+                )
+                .unwrap();
+            }
+            Self {
+                temp,
+                index,
+                binding,
+            }
+        }
+
+        fn root(&self) -> PathBuf {
+            self.temp.path().join("broker")
+        }
+
+        fn effect(&self, member: usize) -> (PathBuf, AccountEffectIntent, Grant) {
+            let request = FreshAccountEffectRequest {
+                d_key: uuid::Uuid::new_v4().to_string(),
+                model: "work".into(),
+                config_sha256: "c".repeat(64),
+                account: format!("account-{member}"),
+                index: member,
+                kind: FreshAccountEffectKind::QuotaFirst,
+                environment: Vec::new(),
+            };
+            let dir = effect_directory(&self.root(), &self.binding, &request);
+            std::fs::create_dir_all(&dir).unwrap();
+            let intent = AccountEffectIntent {
+                version: 1,
+                id: uuid::Uuid::new_v4().to_string(),
+                binding: self.binding.clone(),
+                request: redacted_effect_request(&request),
+                environment_sha256: environment_digest(&request).unwrap(),
+                plan_sha256: "b".repeat(64),
+                auth_source: None,
+            };
+            durable_new(&dir, "intent.json", &intent).unwrap();
+            let grant = fixture_grant(self.binding.clone(), intent.plan_sha256.clone());
+            durable_new(
+                &dir,
+                &format!("{}.fresh-grant.json", self.binding.handoff_id),
+                &grant,
+            )
+            .unwrap();
+            (dir, intent, grant)
+        }
+
+        fn physical_q_before_wait(dir: &Path, grant: &Grant, stdout_bytes: &[u8]) -> String {
+            let work = uuid::Uuid::new_v4().to_string();
+            durable_new(
+                dir,
+                &format!("{}.attach.json", grant.id),
+                &Attach {
+                    version: 1,
+                    grant_id: grant.id.clone(),
+                    work_id: work.clone(),
+                    pid1: 999_999_999,
+                    pid1_starttime: 1,
+                    pidns_dev: 0,
+                    pidns_ino: 0,
+                    pid1_parent_namespace_pid: 999_999_999,
+                    provider_pid: 999_999_999,
+                    provider_starttime: 1,
+                    provider_local_pid: 2,
+                },
+            )
+            .unwrap();
+            let stdout_path = dir.join(format!("{}.stdout", grant.id));
+            let stderr_path = dir.join(format!("{}.stderr", grant.id));
+            std::fs::write(&stdout_path, stdout_bytes).unwrap();
+            std::fs::write(&stderr_path, b"").unwrap();
+            durable_new(
+                dir,
+                &format!("{}.drain.json", grant.id),
+                &Drain {
+                    version: 1,
+                    grant_id: grant.id.clone(),
+                    work_id: work.clone(),
+                    stdout: output(&File::open(stdout_path).unwrap()).unwrap(),
+                    stderr: output(&File::open(stderr_path).unwrap()).unwrap(),
+                    cancelled: false,
+                    zero_remaining: true,
+                },
+            )
+            .unwrap();
+            work
+        }
+
+        fn physical_exit_and_wait(dir: &Path, grant: &Grant, work: String) {
+            durable_new(
+                dir,
+                &format!("{}.exit.json", grant.id),
+                &ProviderExit {
+                    version: 1,
+                    grant_id: grant.id.clone(),
+                    work_id: work.clone(),
+                    provider_local_pid: 2,
+                    wait_status: 0,
+                },
+            )
+            .unwrap();
+            durable_new(
+                dir,
+                &format!("{}.pid1-wait.json", grant.id),
+                &Pid1Wait {
+                    version: 1,
+                    grant_id: grant.id.clone(),
+                    work_id: work,
+                    pid1_parent_namespace_pid: 999_999_999,
+                    wait_status: 0,
+                    reaped: true,
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn indexed_effect_intent_precedes_k_and_restart_reads_exact_physical_debt() {
+        let f = IndexedEffectFixture::new();
+        let wal = f.temp.path().join("state.db-wal");
+        std::fs::write(&wal, b"old WAL stays exact").unwrap();
+        let (dir, intent, grant) = f.effect(0);
+        assert_eq!(
+            reconcile_indexed_account_effect(&f.index, &dir, &intent).unwrap(),
+            "physical-first"
+        );
+        let announced = f.index.account("physical-first").unwrap();
+        let record = &announced.effects[&intent.id];
+        assert_eq!(record.decision_handoff, f.binding.handoff_id);
+        assert!(record.route_source.is_some() && record.candidate.is_some());
+        assert!(record.consumed_k.is_none());
+        assert!(!dir.join(format!("{}.consumed.json", grant.id)).exists());
+        durable_new(&dir, &format!("{}.consumed.json", grant.id), &grant).unwrap();
+        reconcile_indexed_account_effect(&f.index, &dir, &intent).unwrap();
+        let debt = f.index.account("physical-first").unwrap();
+        assert!(debt.effects[&intent.id].consumed_k.is_some());
+        assert!(debt.effects[&intent.id].certified_q.is_none());
+        let restarted = Index::open(&f.root()).unwrap();
+        reconcile_indexed_account_effect(&restarted, &dir, &intent).unwrap();
+        assert_eq!(restarted.account("physical-first").unwrap(), debt);
+        assert_eq!(std::fs::read(wal).unwrap(), b"old WAL stays exact");
+        let (other_dir, other_intent, _) = f.effect(1);
+        reconcile_indexed_account_effect(&restarted, &other_dir, &other_intent).unwrap();
+        assert!(
+            restarted.account("physical-second").unwrap().effects[&other_intent.id]
+                .consumed_k
+                .is_none()
+        );
+        assert_eq!(restarted.account("physical-first").unwrap(), debt);
+    }
+
+    #[test]
+    fn indexed_effect_failed_announcement_and_damaged_generation_leave_no_k() {
+        let f = IndexedEffectFixture::new();
+        let (dir, intent, grant) = f.effect(0);
+        let manifest = f.root().join("index-v1/manifest.json");
+        let original = std::fs::read(&manifest).unwrap();
+        std::fs::write(&manifest, b"damaged generation").unwrap();
+        assert!(reconcile_indexed_account_effect(&f.index, &dir, &intent).is_err());
+        assert!(!dir.join(format!("{}.consumed.json", grant.id)).exists());
+        std::fs::write(manifest, original).unwrap();
+        reconcile_indexed_account_effect(&f.index, &dir, &intent).unwrap();
+        assert!(
+            f.index.account("physical-first").unwrap().effects[&intent.id]
+                .consumed_k
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn indexed_effect_k_persisted_before_failed_cas_is_never_re_effected() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = IndexedEffectFixture::new();
+        let (dir, intent, grant) = f.effect(0);
+        reconcile_indexed_account_effect(&f.index, &dir, &intent).unwrap();
+        durable_new(&dir, &format!("{}.consumed.json", grant.id), &grant).unwrap();
+        let accounts = f.root().join("index-v1/accounts");
+        std::fs::set_permissions(&accounts, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let failed = reconcile_indexed_account_effect(&f.index, &dir, &intent);
+        std::fs::set_permissions(&accounts, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(failed.is_err(), "CAS unexpectedly persisted: {failed:?}");
+        assert!(
+            f.index.account("physical-first").unwrap().effects[&intent.id]
+                .consumed_k
+                .is_none()
+        );
+        let process = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+        assert!(
+            begin_account_effect_indexed(
+                &f.root(),
+                &f.binding,
+                &intent.request,
+                &process,
+                &process,
+                0,
+                0,
+                Some(&f.index)
+            )
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .filter(|entry| entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".consumed.json"))
+                .count(),
+            1
+        );
+        assert!(reconcile_indexed_account_effect(&f.index, &dir, &intent).is_err());
+        assert!(matches!(
+            f.index.compact_account("physical-first"),
+            Err(crate::linux_main::fresh_index::IndexError::RebuildRequired(
+                _
+            ))
+        ));
+        assert!(
+            f.index.account("physical-first").unwrap().effects[&intent.id]
+                .consumed_k
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn indexed_effect_q_waits_for_physical_certification_and_keeps_result_on_restart() {
+        use crate::linux_main::fresh_index::broker_admission_lease;
+        let f = IndexedEffectFixture::new();
+        let (dir, intent, grant) = f.effect(0);
+        reconcile_indexed_account_effect(&f.index, &dir, &intent).unwrap();
+        durable_new(&dir, &format!("{}.consumed.json", grant.id), &grant).unwrap();
+        reconcile_indexed_account_effect(&f.index, &dir, &intent).unwrap();
+        assert!(
+            f.index
+                .route_reader_preflight("physical-first")
+                .unwrap_err()
+                .to_string()
+                .contains("announced effect or manual debt")
+        );
+        let work = IndexedEffectFixture::physical_q_before_wait(
+            &dir,
+            &grant,
+            br#"{"used_percent":20,"resets_at":"2099-01-01T00:00:00Z"}"#,
+        );
+        reconcile_indexed_account_effect(&f.index, &dir, &intent).unwrap();
+        assert!(
+            f.index.account("physical-first").unwrap().effects[&intent.id]
+                .certified_q
+                .is_none()
+        );
+        durable_new(
+            &dir,
+            &format!("{}.exit.json", grant.id),
+            &ProviderExit {
+                version: 1,
+                grant_id: grant.id.clone(),
+                work_id: work.clone(),
+                provider_local_pid: 2,
+                wait_status: 0,
+            },
+        )
+        .unwrap();
+        reconcile_indexed_account_effect(&f.index, &dir, &intent).unwrap();
+        assert!(
+            f.index.account("physical-first").unwrap().effects[&intent.id]
+                .certified_q
+                .is_none()
+        );
+        durable_new(
+            &dir,
+            &format!("{}.pid1-wait.json", grant.id),
+            &Pid1Wait {
+                version: 1,
+                grant_id: grant.id.clone(),
+                work_id: work,
+                pid1_parent_namespace_pid: 999_999_999,
+                wait_status: 0,
+                reaped: true,
+            },
+        )
+        .unwrap();
+        reconcile_indexed_account_effect(&f.index, &dir, &intent).unwrap();
+        let settled = f.index.account("physical-first").unwrap();
+        let effect = &settled.effects[&intent.id];
+        assert!(effect.certified_q.is_some() && effect.result.is_some());
+        assert_eq!(settled.source_q.len(), 1);
+        assert!(
+            f.index
+                .route_reader_preflight("physical-first")
+                .unwrap_err()
+                .to_string()
+                .contains("atomic account revision join")
+        );
+        let result: FreshAccountEffectReadback = exact_file(&dir, "result.json").unwrap().unwrap();
+        assert_eq!(result.outcome.as_deref(), Some("valid_windows"));
+        let lease = broker_admission_lease(&f.root()).unwrap();
+        let restarted = Index::admit_live_routes(&f.root(), &lease).unwrap();
+        assert_eq!(restarted.account("physical-first").unwrap(), settled);
+        assert!(!dir.join(format!("{}.terminal.json", grant.id)).exists());
+    }
+
+    #[test]
+    fn indexed_effect_typed_invalid_result_stays_local_without_quota_authority() {
+        let f = IndexedEffectFixture::new();
+        let (other_dir, other_intent, _) = f.effect(0);
+        reconcile_indexed_account_effect(&f.index, &other_dir, &other_intent).unwrap();
+        let before = f.index.account("physical-first").unwrap();
+        let (dir, intent, grant) = f.effect(1);
+        reconcile_indexed_account_effect(&f.index, &dir, &intent).unwrap();
+        durable_new(&dir, &format!("{}.consumed.json", grant.id), &grant).unwrap();
+        let work = IndexedEffectFixture::physical_q_before_wait(&dir, &grant, b"invalid quota");
+        IndexedEffectFixture::physical_exit_and_wait(&dir, &grant, work);
+        reconcile_indexed_account_effect(&f.index, &dir, &intent).unwrap();
+        let account = f.index.account("physical-second").unwrap();
+        assert!(account.effects[&intent.id].result.is_some());
+        assert!(account.markers.quota_rejection_nanos.is_none());
+        assert!(account.source_q.is_empty());
+        assert_eq!(f.index.account("physical-first").unwrap(), before);
+    }
+
+    #[test]
+    fn indexed_reader_probe_counts_real_choice_and_pre_k_reads_then_refuses_gap() {
+        use crate::linux_main::fresh_index::{Index, broker_admission_lease, last_reader_io};
+        let temp = tempfile::tempdir().unwrap();
+        let broker = temp.path().join("broker");
+        std::fs::create_dir(&broker).unwrap();
+        let wal = temp.path().join("state.db-wal");
+        std::fs::write(&wal, b"old WAL").unwrap();
+        let lease = broker_admission_lease(&broker).unwrap();
+        let index = Index::admit_live_routes(&broker, &lease).unwrap();
+        let process = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+        let chosen_binding = fixture_binding(&process, &process);
+        let chosen_request = register_unmetered_route(&broker, &chosen_binding, None);
+        let chosen =
+            select_route_with_index(&broker, &chosen_binding, &chosen_request, Some(&index))
+                .unwrap();
+        for _ in 0..220 {
+            let previous = fixture_binding(&process, &process);
+            let request = register_unmetered_route(&broker, &previous, None);
+            select_route_with_index(&broker, &previous, &request, Some(&index)).unwrap();
+        }
+        Index::admit_live_routes(&broker, &lease).unwrap();
+        let probe = index.clone().enable_route_reader_probe();
+        let baseline_binding = fixture_binding(&process, &process);
+        let baseline_request = register_unmetered_route(&broker, &baseline_binding, None);
+        assert!(
+            select_route_with_index(&broker, &baseline_binding, &baseline_request, Some(&probe))
+                .unwrap_err()
+                .to_string()
+                .contains("compact account has no known key")
+        );
+        let baseline_io = last_reader_io().unwrap();
+        let input_path = temp.path().join("input");
+        std::fs::write(&input_path, b"").unwrap();
+        let mut selected_plan = plan(
+            &Path::new("/bin/true").canonicalize().unwrap(),
+            temp.path(),
+            &File::open(&input_path).unwrap(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        selected_plan.digest = chosen.plan_sha256.clone();
+        assert!(
+            require_selected_plan_indexed(&broker, &chosen_binding, &selected_plan, Some(&probe))
+                .unwrap_err()
+                .to_string()
+                .contains("compact account has no known key")
+        );
+        let baseline_pre_k_io = last_reader_io().unwrap();
+        let effect_parent = broker.join("account-effects");
+        std::fs::create_dir(&effect_parent).unwrap();
+        let manual_parent = broker.join("manual-quota");
+        std::fs::create_dir(&manual_parent).unwrap();
+        for n in 0..300 {
+            std::fs::write(broker.join(format!("old-{n}.route-selection.json")), b"old").unwrap();
+            let effect = effect_parent.join(format!("old-{n}-quota-first"));
+            std::fs::create_dir(&effect).unwrap();
+            std::fs::write(effect.join("intent.json"), b"old").unwrap();
+            std::fs::write(manual_parent.join(format!("old-{n}.json")), b"old").unwrap();
+        }
+        // These deliberately bypass the compatible writer protocol. They
+        // measure refusal-path I/O; restart admission rejects their source.
+        std::fs::write(broker.join("unannounced.consumed.json"), b"new K").unwrap();
+        std::fs::write(broker.join("unannounced.drain.json"), b"new Q").unwrap();
+        std::fs::write(broker.join("unannounced.terminal.json"), b"new marker").unwrap();
+        let pending_effect = effect_parent.join("pending-quota-first");
+        std::fs::create_dir(&pending_effect).unwrap();
+        std::fs::write(pending_effect.join("new.consumed.json"), b"new effect K").unwrap();
+        std::fs::write(pending_effect.join("new.drain.json"), b"new effect Q").unwrap();
+        let next_binding = fixture_binding(&process, &process);
+        let next_request = register_unmetered_route(&broker, &next_binding, None);
+        let choice_error =
+            select_route_with_index(&broker, &next_binding, &next_request, Some(&probe))
+                .unwrap_err()
+                .to_string();
+        assert!(
+            choice_error.contains("compact account has no known key"),
+            "{choice_error}"
+        );
+        let choice_io = last_reader_io().unwrap();
+        assert_eq!(choice_io.open_attempts, baseline_io.open_attempts);
+        assert_eq!(choice_io.opened, baseline_io.opened);
+        assert_eq!(choice_io.directory_entries, 0);
+
+        let pre_k_error =
+            require_selected_plan_indexed(&broker, &chosen_binding, &selected_plan, Some(&probe))
+                .unwrap_err()
+                .to_string();
+        assert!(
+            pre_k_error.contains("compact account has no known key"),
+            "{pre_k_error}"
+        );
+        let pre_k_io = last_reader_io().unwrap();
+        assert_eq!(pre_k_io.open_attempts, baseline_pre_k_io.open_attempts);
+        assert_eq!(pre_k_io.opened, baseline_pre_k_io.opened);
+        assert_eq!(pre_k_io.directory_entries, 0);
+
+        let grant = fixture_grant(chosen_binding.clone(), chosen.plan_sha256);
+        durable_new(
+            &broker,
+            &format!("{}.fresh-grant.json", chosen_binding.handoff_id),
+            &grant,
+        )
+        .unwrap();
+        reconcile_indexed_provider_grant(&index, &grant).unwrap();
+        durable_new(&broker, &format!("{}.consumed.json", grant.id), &grant).unwrap();
+        reconcile_indexed_provider_grant(&index, &grant).unwrap();
+        let k_error =
+            require_selected_plan_indexed(&broker, &chosen_binding, &selected_plan, Some(&probe))
+                .unwrap_err()
+                .to_string();
+        assert!(k_error.contains("announced provider debt"), "{k_error}");
+        assert_eq!(last_reader_io().unwrap().directory_entries, 0);
+        assert_eq!(std::fs::read(&wal).unwrap(), b"old WAL");
+        assert!(Index::admit_live_routes(&broker, &lease).is_err());
+        std::fs::remove_file(broker.join("index-v1/manifest.json")).unwrap();
+        let damaged = probe
+            .route_reader_preflight("first")
+            .unwrap_err()
+            .to_string();
+        assert!(damaged.contains("manifest absent"), "{damaged}");
+    }
+
+    #[test]
+    fn indexed_provider_grant_announced_before_k_and_recovered_after_lost_reply() {
+        use crate::linux_main::fresh_index::{Index, broker_admission_lease};
+        let temp = tempfile::tempdir().unwrap();
+        let broker = temp.path().join("broker");
+        std::fs::create_dir(&broker).unwrap();
+        let wal = temp.path().join("state.db-wal");
+        std::fs::write(&wal, b"old WAL").unwrap();
+        let lease = broker_admission_lease(&broker).unwrap();
+        let index = Index::admit_live_routes(&broker, &lease).unwrap();
+        let process = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+        let binding = fixture_binding(&process, &process);
+        let request = register_unmetered_route(&broker, &binding, None);
+        let selected = select_route_with_index(&broker, &binding, &request, Some(&index)).unwrap();
+        let grant = fixture_grant(binding.clone(), selected.plan_sha256);
+        durable_new(
+            &broker,
+            &format!("{}.fresh-grant.json", binding.handoff_id),
+            &grant,
+        )
+        .unwrap();
+        assert_eq!(
+            reconcile_indexed_provider_grant(&index, &grant).unwrap(),
+            "first"
+        );
+        let before = index.account("first").unwrap();
+        assert!(before.grants[&grant.id].consumed_k.is_none());
+        assert!(!broker.join(format!("{}.consumed.json", grant.id)).exists());
+        durable_new(&broker, &format!("{}.consumed.json", grant.id), &grant).unwrap();
+        // Simulate a lost publication reply: the next readback accepts only
+        // this exact K and cannot count the invocation twice.
+        reconcile_indexed_provider_grant(&index, &grant).unwrap();
+        reconcile_indexed_provider_grant(&index, &grant).unwrap();
+        assert_eq!(index.account("first").unwrap().observed_invocations, 1);
+        let restarted = Index::admit_live_routes(&broker, &lease).unwrap();
+        assert_eq!(restarted.account("first").unwrap().observed_invocations, 1);
+        assert!(
+            restarted.account("first").unwrap().grants[&grant.id]
+                .certified_q
+                .is_none()
+        );
+        assert_eq!(std::fs::read(wal).unwrap(), b"old WAL");
+        let candidate = broker.join(candidate_name(&binding.handoff_id, 0));
+        std::fs::write(&candidate, b"changed source candidate").unwrap();
+        assert!(reconcile_indexed_provider_grant(&restarted, &grant).is_err());
+        assert!(Index::admit_live_routes(&broker, &lease).is_err());
+    }
+
+    #[test]
+    fn indexed_provider_failed_announcement_blocks_k_and_accounts_stay_isolated() {
+        use crate::linux_main::fresh_index::{Index, broker_admission_lease};
+        let temp = tempfile::tempdir().unwrap();
+        let broker = temp.path().join("broker");
+        std::fs::create_dir(&broker).unwrap();
+        let lease = broker_admission_lease(&broker).unwrap();
+        let index = Index::admit_live_routes(&broker, &lease).unwrap();
+        let process = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+        let first_binding = fixture_binding(&process, &process);
+        let first_request = register_unmetered_route(&broker, &first_binding, None);
+        let first =
+            select_route_with_index(&broker, &first_binding, &first_request, Some(&index)).unwrap();
+        let second_binding = fixture_binding(&process, &process);
+        let second_request = register_unmetered_route(&broker, &second_binding, Some("second"));
+        let second =
+            select_route_with_index(&broker, &second_binding, &second_request, Some(&index))
+                .unwrap();
+        assert_eq!(second.account_identity, "second");
+        let first_grant = fixture_grant(first_binding.clone(), first.plan_sha256);
+        durable_new(
+            &broker,
+            &format!("{}.fresh-grant.json", first_binding.handoff_id),
+            &first_grant,
+        )
+        .unwrap();
+        reconcile_indexed_provider_grant(&index, &first_grant).unwrap();
+        durable_new(
+            &broker,
+            &format!("{}.consumed.json", first_grant.id),
+            &first_grant,
+        )
+        .unwrap();
+        reconcile_indexed_provider_grant(&index, &first_grant).unwrap();
+
+        let second_grant = fixture_grant(second_binding.clone(), second.plan_sha256);
+        durable_new(
+            &broker,
+            &format!("{}.fresh-grant.json", second_binding.handoff_id),
+            &second_grant,
+        )
+        .unwrap();
+        // A damaged generation manifest makes publication fail. The caller never
+        // reaches K, and the other physical account remains independently 1.
+        let manifest = broker.join("index-v1/manifest.json");
+        let original = std::fs::read(&manifest).unwrap();
+        std::fs::write(&manifest, b"broken").unwrap();
+        assert!(reconcile_indexed_provider_grant(&index, &second_grant).is_err());
+        assert!(
+            !broker
+                .join(format!("{}.consumed.json", second_grant.id))
+                .exists()
+        );
+        std::fs::write(&manifest, original).unwrap();
+        assert_eq!(index.account("first").unwrap().observed_invocations, 1);
+        assert_eq!(index.account("second").unwrap().observed_invocations, 0);
+    }
+
+    #[test]
+    fn indexed_provider_account_key_is_shared_across_models() {
+        use crate::linux_main::fresh_index::{Index, broker_admission_lease};
+        let temp = tempfile::tempdir().unwrap();
+        let broker = temp.path().join("broker");
+        std::fs::create_dir(&broker).unwrap();
+        let lease = broker_admission_lease(&broker).unwrap();
+        let index = Index::admit_live_routes(&broker, &lease).unwrap();
+        let process = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+        let first_binding = fixture_binding(&process, &process);
+        let first_request = register_unmetered_route(&broker, &first_binding, None);
+        let first =
+            select_route_with_index(&broker, &first_binding, &first_request, Some(&index)).unwrap();
+        let second_binding = fixture_binding(&process, &process);
+        let second_candidate = RouteCandidate {
+            version: 3,
+            binding: second_binding.clone(),
+            model: "other-model".into(),
+            config_sha256: "d".repeat(64),
+            account: "alias".into(),
+            account_identity: "first".into(),
+            index: 0,
+            total: 1,
+            pin: None,
+            plan_sha256: "e".repeat(64),
+            environment_sha256: "0".repeat(64),
+            quota_script: None,
+            auth_refresh_command: None,
+            terminal_recognizer: FreshTerminalRecognizer::OpenCode,
+        };
+        durable_new(
+            &broker,
+            &candidate_name(&second_binding.handoff_id, 0),
+            &second_candidate,
+        )
+        .unwrap();
+        let second_request = FreshRouteRequest {
+            protocol_version: 4,
+            d_key: uuid::Uuid::new_v4().to_string(),
+            model: "other-model".into(),
+            config_sha256: "d".repeat(64),
+            account: None,
+            account_identity: None,
+            index: None,
+            total: 1,
+            pin: None,
+            quota_script: None,
+            auth_refresh_command: None,
+            environment_sha256: None,
+        };
+        let second =
+            select_route_with_index(&broker, &second_binding, &second_request, Some(&index))
+                .unwrap();
+        assert_eq!(second.account_identity, first.account_identity);
+        for (binding, selected) in [(&first_binding, first), (&second_binding, second)] {
+            let grant = fixture_grant(binding.clone(), selected.plan_sha256);
+            durable_new(
+                &broker,
+                &format!("{}.fresh-grant.json", binding.handoff_id),
+                &grant,
+            )
+            .unwrap();
+            assert_eq!(
+                reconcile_indexed_provider_grant(&index, &grant).unwrap(),
+                "first"
+            );
+            durable_new(&broker, &format!("{}.consumed.json", grant.id), &grant).unwrap();
+            reconcile_indexed_provider_grant(&index, &grant).unwrap();
+        }
+        let account = index.account("first").unwrap();
+        assert_eq!(account.observed_invocations, 2);
+        assert_eq!(account.grants.len(), 2);
+    }
+
+    #[test]
+    fn indexed_provider_uncertified_q_retains_exact_k_without_terminal() {
+        use crate::linux_main::fresh_index::{Index, broker_admission_lease};
+        let temp = tempfile::tempdir().unwrap();
+        let broker = temp.path().join("broker");
+        std::fs::create_dir(&broker).unwrap();
+        let lease = broker_admission_lease(&broker).unwrap();
+        let index = Index::admit_live_routes(&broker, &lease).unwrap();
+        let process = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+        let binding = fixture_binding(&process, &process);
+        let request = register_unmetered_route(&broker, &binding, None);
+        let selected = select_route_with_index(&broker, &binding, &request, Some(&index)).unwrap();
+        let grant = fixture_grant(binding.clone(), selected.plan_sha256);
+        durable_new(
+            &broker,
+            &format!("{}.fresh-grant.json", binding.handoff_id),
+            &grant,
+        )
+        .unwrap();
+        reconcile_indexed_provider_grant(&index, &grant).unwrap();
+        durable_new(&broker, &format!("{}.consumed.json", grant.id), &grant).unwrap();
+        reconcile_indexed_provider_grant(&index, &grant).unwrap();
+        std::fs::write(
+            broker.join(format!("{}.drain.json", grant.id)),
+            b"unverified Q",
+        )
+        .unwrap();
+        assert!(reconcile_indexed_provider_grant(&index, &grant).is_err());
+        let retained = index.account("first").unwrap();
+        assert!(retained.grants[&grant.id].consumed_k.is_some());
+        assert!(retained.grants[&grant.id].certified_q.is_none());
+        assert!(!broker.join(format!("{}.terminal.json", grant.id)).exists());
+        assert!(Index::admit_live_routes(&broker, &lease).is_err());
+    }
+
+    #[test]
+    fn indexed_provider_q_waits_for_drain_witness_then_records_typed_terminal_once() {
+        use crate::linux_main::fresh_index::{Index, broker_admission_lease};
+        let temp = tempfile::tempdir().unwrap();
+        let broker = temp.path().join("broker");
+        std::fs::create_dir(&broker).unwrap();
+        let lease = broker_admission_lease(&broker).unwrap();
+        let index = Index::admit_live_routes(&broker, &lease).unwrap();
+        let process = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+        let binding = fixture_binding(&process, &process);
+        let request = register_unmetered_route(&broker, &binding, None);
+        let selected = select_route_with_index(&broker, &binding, &request, Some(&index)).unwrap();
+        let grant = fixture_grant(binding.clone(), selected.plan_sha256);
+        durable_new(
+            &broker,
+            &format!("{}.fresh-grant.json", binding.handoff_id),
+            &grant,
+        )
+        .unwrap();
+        reconcile_indexed_provider_grant(&index, &grant).unwrap();
+        durable_new(&broker, &format!("{}.consumed.json", grant.id), &grant).unwrap();
+        reconcile_indexed_provider_grant(&index, &grant).unwrap();
+
+        // Synthetic immutable PID1 receipts exercise the same independent
+        // observe() validator used for actual drains; no terminal is authored
+        // by the test before that validator succeeds.
+        let work_id = uuid::Uuid::new_v4().to_string();
+        let missing_pid = 999_999_999;
+        durable_new(
+            &broker,
+            &format!("{}.attach.json", grant.id),
+            &Attach {
+                version: 1,
+                grant_id: grant.id.clone(),
+                work_id: work_id.clone(),
+                pid1: missing_pid,
+                pid1_starttime: 1,
+                pidns_dev: 0,
+                pidns_ino: 0,
+                pid1_parent_namespace_pid: missing_pid,
+                provider_pid: missing_pid,
+                provider_starttime: 1,
+                provider_local_pid: 2,
+            },
+        )
+        .unwrap();
+        std::fs::write(broker.join(format!("{}.stdout", grant.id)), b"").unwrap();
+        std::fs::write(
+            broker.join(format!("{}.stderr", grant.id)),
+            br#"{"type":"error","error":{"data":{"message":"quota exhausted for account"}}}"#,
+        )
+        .unwrap();
+        let stdout =
+            output(&File::open(broker.join(format!("{}.stdout", grant.id))).unwrap()).unwrap();
+        let stderr =
+            output(&File::open(broker.join(format!("{}.stderr", grant.id))).unwrap()).unwrap();
+        durable_new(
+            &broker,
+            &format!("{}.drain.json", grant.id),
+            &Drain {
+                version: 1,
+                grant_id: grant.id.clone(),
+                work_id: work_id.clone(),
+                stdout,
+                stderr,
+                cancelled: false,
+                zero_remaining: true,
+            },
+        )
+        .unwrap();
+        assert!(reconcile_indexed_provider_grant(&index, &grant).is_err());
+        assert!(
+            index.account("first").unwrap().grants[&grant.id]
+                .certified_q
+                .is_none()
+        );
+        assert!(!broker.join(format!("{}.terminal.json", grant.id)).exists());
+        durable_new(
+            &broker,
+            &format!("{}.exit.json", grant.id),
+            &ProviderExit {
+                version: 1,
+                grant_id: grant.id.clone(),
+                work_id: work_id.clone(),
+                provider_local_pid: 2,
+                wait_status: 0,
+            },
+        )
+        .unwrap();
+        durable_new(
+            &broker,
+            &format!("{}.pid1-wait.json", grant.id),
+            &Pid1Wait {
+                version: 1,
+                grant_id: grant.id.clone(),
+                work_id,
+                pid1_parent_namespace_pid: missing_pid,
+                wait_status: 0,
+                reaped: true,
+            },
+        )
+        .unwrap();
+        reconcile_indexed_provider_grant(&index, &grant).unwrap();
+        let settled = index.account("first").unwrap();
+        assert!(settled.grants[&grant.id].certified_q.is_some());
+        assert!(settled.markers.quota_rejection_nanos.is_some());
+        assert!(settled.recent_failure_nanos.is_empty()); // typed quota on exit 0 is not a failed process
+        let terminal: TerminalRecord = exact_file(&broker, &format!("{}.terminal.json", grant.id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal.outcome, TerminalOutcome::QuotaRejected);
+        let restarted = Index::admit_live_routes(&broker, &lease).unwrap();
+        assert_eq!(restarted.account("first").unwrap(), settled);
+    }
+
+    #[test]
+    fn indexed_route_writer_admission_readback_and_receipt_damage() {
+        use crate::linux_main::fresh_index::{Index, broker_admission_lease};
+        let temp = tempfile::tempdir().unwrap();
+        let broker = temp.path().join("broker");
+        std::fs::create_dir(&broker).unwrap();
+        let wal = temp.path().join("state.db-wal");
+        std::fs::write(&wal, b"old WAL sentinel").unwrap();
+        let lease = broker_admission_lease(&broker).unwrap();
+        let index = Index::admit_live_routes(&broker, &lease).unwrap();
+        let generation = index.generation().to_owned();
+        let process = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+        let binding = fixture_binding(&process, &process);
+        let request = register_unmetered_route(&broker, &binding, None);
+        let selected = select_route_with_index(&broker, &binding, &request, Some(&index)).unwrap();
+        assert_eq!(selected.index, 0);
+        let name = decision_name(&binding.handoff_id);
+        let exact = std::fs::read(broker.join(&name)).unwrap();
+        assert_eq!(
+            select_route_with_index(&broker, &binding, &request, Some(&index)).unwrap(),
+            selected
+        );
+        assert_eq!(
+            index
+                .cursor(&CursorKey {
+                    model: request.model.clone(),
+                    config_sha256: request.config_sha256.clone()
+                })
+                .unwrap()
+                .sequence,
+            1
+        );
+        assert_eq!(
+            Index::admit_live_routes(&broker, &lease)
+                .unwrap()
+                .generation(),
+            generation
+        );
+        assert_eq!(std::fs::read(&wal).unwrap(), b"old WAL sentinel");
+
+        let cursor_path = std::fs::read_dir(broker.join("index-v1/cursors"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.extension().is_some_and(|ext| ext == "json")
+                    && !path.to_string_lossy().contains(".known.")
+            })
+            .unwrap();
+        let cursor_bytes = std::fs::read(&cursor_path).unwrap();
+        std::fs::remove_file(&cursor_path).unwrap();
+        assert!(index.require_live_route(&binding.handoff_id).is_err());
+        std::fs::write(&cursor_path, cursor_bytes).unwrap();
+        index.require_live_route(&binding.handoff_id).unwrap();
+
+        std::fs::remove_file(broker.join(&name)).unwrap();
+        assert!(index.require_live_route(&binding.handoff_id).is_err());
+        assert!(Index::admit_live_routes(&broker, &lease).is_err());
+        std::fs::write(broker.join(&name), &exact).unwrap();
+        assert!(Index::admit_live_routes(&broker, &lease).is_ok());
+        std::fs::write(broker.join(&name), b"changed route receipt").unwrap();
+        assert!(index.require_live_route(&binding.handoff_id).is_err());
+        assert!(Index::admit_live_routes(&broker, &lease).is_err());
+        std::fs::write(broker.join(&name), &exact).unwrap();
+        std::fs::write(broker.join("orphan.route-selection.json"), &exact).unwrap();
+        assert!(Index::admit_live_routes(&broker, &lease).is_err());
+    }
+
+    #[test]
+    fn indexed_route_receipt_crash_before_index_commit_recovers_at_admission() {
+        use crate::linux_main::fresh_index::{Index, broker_admission_lease};
+        let temp = tempfile::tempdir().unwrap();
+        let broker = temp.path().join("broker");
+        std::fs::create_dir(&broker).unwrap();
+        let lease = broker_admission_lease(&broker).unwrap();
+        let index = Index::admit_live_routes(&broker, &lease).unwrap();
+        let process = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+        let binding = fixture_binding(&process, &process);
+        let request = register_unmetered_route(&broker, &binding, None);
+        let candidate: RouteCandidate =
+            exact_file(&broker, &candidate_name(&binding.handoff_id, 0))
+                .unwrap()
+                .unwrap();
+        let selection = FreshRouteSelection {
+            model: request.model.clone(),
+            config_sha256: request.config_sha256.clone(),
+            account: candidate.account.clone(),
+            account_identity: candidate.account_identity.clone(),
+            index: 0,
+            plan_sha256: candidate.plan_sha256.clone(),
+            observed_live: 0,
+            observed_failures: 0,
+            observed_invocations: 0,
+            policy_version: FRESH_ROUTE_POLICY_VERSION.into(),
+            eligible_accounts: vec![candidate.account.clone()],
+            quota_remaining_basis_points: None,
+        };
+        let receipt = RouteDecision {
+            version: 1,
+            binding: binding.clone(),
+            total: request.total,
+            pin: None,
+            environment_sha256: None,
+            sequence: 1,
+            selection,
+        };
+        let name = decision_name(&binding.handoff_id);
+        let mut bytes = serde_json::to_vec(&receipt).unwrap();
+        bytes.push(b'\n');
+        let result = index.commit_live_decision(
+            CursorKey {
+                model: request.model.clone(),
+                config_sha256: request.config_sha256.clone(),
+            },
+            binding.handoff_id.clone(),
+            candidate.account_identity.clone(),
+            0,
+            false,
+            0,
+            name.clone(),
+            &bytes,
+            || {
+                durable_new_bytes(&broker, &name, &bytes)?;
+                Err(io::Error::other(
+                    "simulated interruption after receipt fsync",
+                ))
+            },
+        );
+        assert!(result.is_err());
+        assert!(broker.join("index-v1/pending.json").exists());
+        drop(index);
+        drop(lease);
+        let lease = broker_admission_lease(&broker).unwrap();
+        let reopened = Index::admit_live_routes(&broker, &lease).unwrap();
+        assert!(!broker.join("index-v1/pending.json").exists());
+        reopened.require_live_route(&binding.handoff_id).unwrap();
+        assert_eq!(
+            reopened
+                .cursor(&CursorKey {
+                    model: request.model,
+                    config_sha256: request.config_sha256
+                })
+                .unwrap()
+                .sequence,
+            1
+        );
+    }
+
+    #[test]
+    fn one_pool_cannot_weight_one_physical_account_twice() {
+        let temp = tempfile::tempdir().unwrap();
+        let process = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+        let binding = fixture_binding(&process, &process);
+        let request = register_unmetered_route(temp.path(), &binding, None);
+        let second_name = candidate_name(&binding.handoff_id, 1);
+        let mut second: RouteCandidate = exact_file(temp.path(), &second_name).unwrap().unwrap();
+        second.account_identity = "first".into();
+        std::fs::write(
+            temp.path().join(second_name),
+            serde_json::to_vec(&second).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            select_route(temp.path(), &binding, &request)
+                .unwrap_err()
+                .to_string()
+                .contains("candidate set changed")
+        );
+        assert!(
+            !temp
+                .path()
+                .join(decision_name(&binding.handoff_id))
+                .exists()
+        );
+    }
+
+    #[test]
+    fn unmetered_round_robin_is_durable_across_roots_restart_and_concurrent_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let process = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+        let roots: Vec<_> = (0..12)
+            .map(|_| fixture_binding(&process, &process))
+            .collect();
+        let requests: Vec<_> = roots
+            .iter()
+            .map(|binding| register_unmetered_route(temp.path(), binding, None))
+            .collect();
+        let directory = temp.path();
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = roots
+                .iter()
+                .zip(&requests)
+                .map(|(binding, request)| {
+                    scope.spawn(move || select_route(directory, binding, request).unwrap())
+                })
+                .collect();
+            for handle in handles {
+                let choice = handle.join().unwrap();
+                assert_eq!(choice.policy_version, FRESH_ROUTE_POLICY_VERSION);
+                assert_eq!(choice.quota_remaining_basis_points, None);
+            }
+        });
+        let mut by_sequence = Vec::new();
+        for binding in &roots {
+            let decision: RouteDecision =
+                exact_file(temp.path(), &decision_name(&binding.handoff_id))
+                    .unwrap()
+                    .unwrap();
+            by_sequence.push((decision.sequence, decision.selection.index));
+        }
+        by_sequence.sort();
+        assert_eq!(
+            by_sequence,
+            (1..=12)
+                .map(|sequence| (sequence, ((sequence - 1) % 3) as usize))
+                .collect::<Vec<_>>()
+        );
+
+        // A new broker incarnation reads the same fsynced selection files.
+        let pinned = fixture_binding(&process, &process);
+        let pinned_request = register_unmetered_route(temp.path(), &pinned, Some("third"));
+        assert_eq!(
+            select_route(temp.path(), &pinned, &pinned_request)
+                .unwrap()
+                .index,
+            2
+        );
+        let resumed = fixture_binding(&process, &process);
+        let request = register_unmetered_route(temp.path(), &resumed, None);
+        assert_eq!(
+            select_route(temp.path(), &resumed, &request).unwrap().index,
+            0
+        );
+        let decision: RouteDecision = exact_file(temp.path(), &decision_name(&resumed.handoff_id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(decision.sequence, 13);
+        std::fs::copy(
+            temp.path().join(decision_name(&resumed.handoff_id)),
+            temp.path().join("duplicate.route-selection.json"),
+        )
+        .unwrap();
+        let corrupt = fixture_binding(&process, &process);
+        let corrupt_request = register_unmetered_route(temp.path(), &corrupt, None);
+        assert!(
+            select_route(temp.path(), &corrupt, &corrupt_request)
+                .unwrap_err()
+                .to_string()
+                .contains("cursor sequence missing or repeated")
+        );
     }
 
     #[test]
@@ -5203,16 +8949,19 @@ mod tests {
                 binding: previous.clone(),
                 total: 1,
                 pin: None,
+                environment_sha256: None,
+                sequence: 1,
                 selection: FreshRouteSelection {
                     model: "model".into(),
                     config_sha256: "a".repeat(64),
                     account: "first".into(),
+                    account_identity: "first".into(),
                     index: 0,
                     plan_sha256: grant.plan_sha256.clone(),
                     observed_live: 0,
                     observed_failures: 0,
                     observed_invocations: 0,
-                    policy_version: "fresh-account-effects-v2".into(),
+                    policy_version: FRESH_ROUTE_POLICY_VERSION.into(),
                     eligible_accounts: vec!["first".into()],
                     quota_remaining_basis_points: None,
                 },
@@ -5235,15 +8984,17 @@ mod tests {
         .unwrap();
         let current = fixture_binding(&process, &process);
         let candidate = RouteCandidate {
-            version: 2,
+            version: 3,
             binding: current.clone(),
             model: "model".into(),
             config_sha256: "a".repeat(64),
             account: "first".into(),
+            account_identity: "first".into(),
             index: 0,
             total: 1,
             pin: None,
             plan_sha256: "c".repeat(64),
+            environment_sha256: "0".repeat(64),
             quota_script: None,
             auth_refresh_command: None,
             terminal_recognizer: FreshTerminalRecognizer::OpenAiCompat,
@@ -5254,16 +9005,28 @@ mod tests {
             &candidate,
         )
         .unwrap();
+        let mut previous_candidate = candidate.clone();
+        previous_candidate.binding = previous.clone();
+        previous_candidate.plan_sha256 = grant.plan_sha256.clone();
+        durable_new(
+            temp.path(),
+            &candidate_name(&previous.handoff_id, 0),
+            &previous_candidate,
+        )
+        .unwrap();
         let request = FreshRouteRequest {
+            protocol_version: 4,
             d_key: uuid::Uuid::new_v4().to_string(),
             model: candidate.model.clone(),
             config_sha256: candidate.config_sha256.clone(),
             account: None,
+            account_identity: None,
             index: None,
             total: 1,
             pin: None,
             quota_script: None,
             auth_refresh_command: None,
+            environment_sha256: None,
         };
         assert!(matches!(
             observe(temp.path(), &grant.id).unwrap(),
@@ -5342,15 +9105,17 @@ mod tests {
                 temp.path(),
                 &candidate_name(&binding.handoff_id, index),
                 &RouteCandidate {
-                    version: 2,
+                    version: 3,
                     binding: binding.clone(),
                     model: "model".into(),
                     config_sha256: "a".repeat(64),
                     account: account.into(),
+                    account_identity: account.into(),
                     index,
                     total: 2,
                     pin: None,
                     plan_sha256: "b".repeat(64),
+                    environment_sha256: "0".repeat(64),
                     quota_script: quota_script.map(str::to_owned),
                     auth_refresh_command: None,
                     terminal_recognizer: FreshTerminalRecognizer::OpenAiCompat,
@@ -5384,15 +9149,18 @@ mod tests {
         )
         .unwrap();
         let request = FreshRouteRequest {
+            protocol_version: 4,
             d_key: effect.d_key,
             model: effect.model,
             config_sha256: effect.config_sha256,
             account: None,
+            account_identity: None,
             index: None,
             total: 2,
             pin: None,
             quota_script: None,
             auth_refresh_command: None,
+            environment_sha256: None,
         };
         let error = select_route(temp.path(), &binding, &request)
             .unwrap_err()
@@ -5423,6 +9191,7 @@ mod tests {
             windows: vec![FreshQuotaWindow {
                 used_percent: 25.0,
                 resets_at: "2099-01-01T00:00:00Z".into(),
+                remaining: None,
             }],
             completed_unix_seconds: Some(now),
             artifact: "/fresh/effect".into(),
@@ -5430,12 +9199,63 @@ mod tests {
             peer_artifact: None,
         };
         assert_eq!(quota_remaining(&result, now).unwrap(), Some(7500));
-        assert_eq!(quota_remaining(&result, now + 30).unwrap(), None);
+        assert_eq!(quota_remaining(&result, now + 30).unwrap(), Some(7500));
+        assert_eq!(
+            quota_remaining(&result, now + QUOTA_CACHE_TTL_SECONDS - 1).unwrap(),
+            Some(7500)
+        );
+        assert_eq!(
+            quota_remaining(&result, now + QUOTA_CACHE_TTL_SECONDS).unwrap(),
+            None
+        );
+        result.windows.push(FreshQuotaWindow {
+            used_percent: 100.0,
+            resets_at: "2099-01-01T00:00:00Z".into(),
+            remaining: None,
+        });
+        assert_eq!(quota_remaining(&result, now).unwrap(), None);
+        result.windows.pop();
+        result.windows[0].remaining = Some(0);
+        assert_eq!(quota_remaining(&result, now).unwrap(), None);
+        result.windows[0].remaining = None;
         result.windows[0].used_percent = 100.0;
         assert_eq!(quota_remaining(&result, now).unwrap(), None);
         result.windows[0].used_percent = 0.0;
         result.windows[0].resets_at = "2020-01-01T00:00:00Z".into();
         assert_eq!(quota_remaining(&result, now).unwrap(), None);
+        let parsed = parse_effect_windows(
+            r#"{"windows":[{"used_percent":12,"remaining":0,"resets_at":"2099-01-01T00:00:00Z"},{"used_percent":7,"resets_at":"2099-01-01T00:00:00Z"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed[0].remaining, Some(0));
+        result.windows = parsed;
+        assert_eq!(quota_remaining(&result, now).unwrap(), None);
+    }
+
+    #[test]
+    fn structured_model_capacity_never_becomes_account_quota_marker() {
+        let event = br#"{"type":"error","error":{"data":{"code":"model_at_capacity","message":"quota exhausted for this model"}}}"#;
+        assert_eq!(
+            classify_terminal_outcome(
+                TerminalSignalKind::QuotaExhaustedInband,
+                event,
+                b"",
+                1 << 8,
+                false
+            ),
+            TerminalOutcome::ModelAtCapacity,
+        );
+        assert!(!TerminalOutcome::ModelAtCapacity.is_marker());
+        assert_eq!(
+            classify_terminal_outcome(
+                TerminalSignalKind::QuotaExhaustedInband,
+                b"quota exhausted",
+                b"",
+                1 << 8,
+                false
+            ),
+            TerminalOutcome::QuotaRejected,
+        );
     }
 
     #[test]
@@ -5473,16 +9293,20 @@ mod tests {
         let mut binding = fixture_binding(&root, &actor);
         let request =
             |_binding: &Binding, index: Option<usize>, pin: Option<&str>| FreshRouteRequest {
+                protocol_version: 4,
                 d_key: uuid::Uuid::new_v4().to_string(),
                 model: "work".into(),
                 config_sha256: "c".repeat(64),
                 account: index
+                    .map(|i| if i == 0 { "opencode-first" } else { "second" }.to_string()),
+                account_identity: index
                     .map(|i| if i == 0 { "opencode-first" } else { "second" }.to_string()),
                 index,
                 total: 2,
                 pin: pin.map(str::to_owned),
                 quota_script: None,
                 auth_refresh_command: None,
+                environment_sha256: None,
             };
         let make_plan = |index: usize| {
             plan(
@@ -5495,7 +9319,12 @@ mod tests {
                         .join(format!("effect-{index}"))
                         .display()
                         .to_string(),
-                    if index == 0 { "--quota" } else { "--success" }.into(),
+                    if index == 0 {
+                        "--quota-clean"
+                    } else {
+                        "--success"
+                    }
+                    .into(),
                 ],
                 vec![("PATH".into(), "/usr/bin:/bin".into())],
             )
@@ -5527,6 +9356,7 @@ mod tests {
             &actor,
             0,
             0,
+            None,
         )
         .unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -5579,6 +9409,8 @@ mod tests {
                 binding: held_choice.clone(),
                 total: 2,
                 pin: Some("opencode-first".into()),
+                environment_sha256: None,
+                sequence: 0,
                 selection: first,
             },
         )
@@ -5596,6 +9428,7 @@ mod tests {
                 &actor,
                 0,
                 0,
+                None,
             )
             .is_err(),
             "stale held choice consumed provider K"
@@ -5666,15 +9499,18 @@ mod tests {
         };
         let route = |binding: &Binding, pin: Option<&str>| {
             let request = |index: Option<usize>, account: Option<&str>| FreshRouteRequest {
+                protocol_version: 4,
                 d_key: uuid::Uuid::new_v4().to_string(),
                 model: "configured-model".into(),
                 config_sha256: "a".repeat(64),
                 account: account.map(str::to_owned),
+                account_identity: account.map(str::to_owned),
                 index,
                 total: 2,
                 pin: pin.map(str::to_owned),
                 quota_script: None,
                 auth_refresh_command: None,
+                environment_sha256: None,
             };
             register_route_candidate(
                 temporary.path(),
@@ -5762,7 +9598,7 @@ mod tests {
         let mut wrong_child = Command::new("sleep").arg("60").spawn().unwrap();
         let wrong_actor = PinnedProcess::open(wrong_child.id() as i32).unwrap();
         assert!(
-            launch(wrong_prepared, &root, &wrong_actor, 0, 0).is_err(),
+            launch(wrong_prepared, &root, &wrong_actor, 0, 0, None).is_err(),
             "wrong actor consumed fresh provider K"
         );
         wrong_child.kill().unwrap();
@@ -5775,7 +9611,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(same.grant.id, prepared.grant.id);
-        let id = launch(prepared, &root, &actor, 0, 0).unwrap();
+        let id = launch(prepared, &root, &actor, 0, 0, None).unwrap();
         assert_eq!(id, same.grant.id);
         assert_eq!(
             grant_for_matching_plan(
@@ -5796,7 +9632,7 @@ mod tests {
             "changed plan recovered a consumed K"
         );
         assert!(
-            launch(same, &root, &actor, 0, 0).is_err(),
+            launch(same, &root, &actor, 0, 0, None).is_err(),
             "second K succeeded"
         );
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -5845,15 +9681,18 @@ mod tests {
             "uncertain K changed the held root's durable choice"
         );
         let mut changed_config = FreshRouteRequest {
+            protocol_version: 4,
             d_key: uuid::Uuid::new_v4().to_string(),
             model: "configured-model".into(),
             config_sha256: "b".repeat(64),
             account: None,
+            account_identity: None,
             index: None,
             total: 2,
             pin: None,
             quota_script: None,
             auth_refresh_command: None,
+            environment_sha256: None,
         };
         assert!(
             select_route(temporary.path(), &second_binding, &changed_config).is_err(),
@@ -5936,7 +9775,11 @@ mod tests {
         ));
         let mut third_binding = binding.clone();
         third_binding.handoff_id = uuid::Uuid::new_v4().to_string();
-        assert_eq!(route(&third_binding, None).account, "second");
+        assert_eq!(
+            route(&third_binding, None).account,
+            "first",
+            "recent failure history must not override the durable round-robin cursor"
+        );
         let mut pinned_binding = binding.clone();
         pinned_binding.handoff_id = uuid::Uuid::new_v4().to_string();
         assert_eq!(
@@ -5989,15 +9832,18 @@ mod tests {
         );
         let request =
             |index: usize, account: &str, quota: &str, auth: Option<&str>| FreshRouteRequest {
+                protocol_version: 4,
                 d_key: uuid::Uuid::new_v4().to_string(),
                 model: "model".into(),
                 config_sha256: "a".repeat(64),
                 account: Some(account.into()),
+                account_identity: Some(account.into()),
                 index: Some(index),
                 total: 2,
                 pin: None,
                 quota_script: Some(quota.into()),
                 auth_refresh_command: auth.map(str::to_owned),
+                environment_sha256: None,
             };
         let image = std::fs::canonicalize("/bin/true").unwrap();
         for (index, account, quota, auth) in [
@@ -6035,21 +9881,24 @@ mod tests {
                 temporary.path(),
                 &binding,
                 &FreshRouteRequest {
+                    protocol_version: 4,
                     d_key: uuid::Uuid::new_v4().to_string(),
                     model: "model".into(),
                     config_sha256: "a".repeat(64),
                     account: None,
+                    account_identity: None,
                     index: None,
                     total: 2,
                     pin: None,
                     quota_script: None,
                     auth_refresh_command: None,
+                    environment_sha256: None,
                 }
             )
             .unwrap_err()
             .to_string()
-            .contains("fresh route has no eligible account or pin"),
-            "missing quota evidence was treated as available"
+            .contains("fresh quota effect unknown"),
+            "missing quota evidence was not reported as unknown"
         );
         let effect_d_key = uuid::Uuid::new_v4().to_string();
         let effect = |index: usize, account: &str, kind| FreshAccountEffectRequest {
@@ -6219,12 +10068,13 @@ mod tests {
                 model: follower_candidate.model.clone(),
                 config_sha256: follower_candidate.config_sha256.clone(),
                 account: follower_candidate.account.clone(),
+                account_identity: follower_candidate.account_identity.clone(),
                 index: 0,
                 plan_sha256: follower_candidate.plan_sha256.clone(),
                 observed_live: 0,
                 observed_failures: 0,
                 observed_invocations: 0,
-                policy_version: "fresh-account-effects-v2".into(),
+                policy_version: FRESH_ROUTE_POLICY_VERSION.into(),
                 eligible_accounts: vec![follower_candidate.account.clone()],
                 quota_remaining_basis_points: Some(8000),
             },
@@ -6411,6 +10261,107 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reused.outcome.as_deref(), Some("valid_windows"));
+        // A second model may reuse the exact physical Q only when its
+        // source-owned account identity and effect commands agree.
+        let mut cross_model_binding = fixture_binding(&root, &actor);
+        cross_model_binding.handoff_id = uuid::Uuid::new_v4().to_string();
+        let mut cross_model_route = request(0, "alias", &shell_script, Some(&auth_script));
+        cross_model_route.model = "other-model".into();
+        cross_model_route.config_sha256 = "b".repeat(64);
+        cross_model_route.account_identity = Some("recovering".into());
+        register_route_candidate(
+            temporary.path(),
+            &cross_model_binding,
+            &cross_model_route,
+            plan(
+                &image,
+                temporary.path(),
+                &File::open(&input).unwrap(),
+                vec!["--alias".into()],
+                vec![],
+            )
+            .unwrap(),
+            FreshTerminalRecognizer::OpenAiCompat,
+        )
+        .unwrap();
+        let mut cross_model_effect = sibling_first.clone();
+        cross_model_effect.model = cross_model_route.model.clone();
+        cross_model_effect.config_sha256 = cross_model_route.config_sha256.clone();
+        cross_model_effect.account = "alias".into();
+        let cross_model_q = begin_account_effect(
+            temporary.path(),
+            &cross_model_binding,
+            &cross_model_effect,
+            &root,
+            &actor,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(cross_model_q.outcome.as_deref(), Some("valid_windows"));
+        assert!(
+            grant_for_binding(
+                &effect_directory(temporary.path(), &cross_model_binding, &cross_model_effect),
+                &cross_model_binding,
+            )
+            .unwrap()
+            .is_none(),
+            "cross-model reuse launched a second quota K"
+        );
+
+        // The same display label with a distinct explicit identity cannot
+        // borrow that Q, even if the script text happens to match.
+        let mut collision_binding = fixture_binding(&root, &actor);
+        collision_binding.handoff_id = uuid::Uuid::new_v4().to_string();
+        let mut collision_route = request(0, "recovering", &shell_script, Some(&auth_script));
+        collision_route.account_identity = Some("another-physical-account".into());
+        register_route_candidate(
+            temporary.path(),
+            &collision_binding,
+            &collision_route,
+            plan(
+                &image,
+                temporary.path(),
+                &File::open(&input).unwrap(),
+                vec!["--collision".into()],
+                vec![],
+            )
+            .unwrap(),
+            FreshTerminalRecognizer::OpenAiCompat,
+        )
+        .unwrap();
+        let collision_effect = FreshAccountEffectRequest {
+            d_key: uuid::Uuid::new_v4().to_string(),
+            ..first.clone()
+        };
+        begin_account_effect(
+            temporary.path(),
+            &collision_binding,
+            &collision_effect,
+            &root,
+            &actor,
+            0,
+            0,
+        )
+        .unwrap();
+        assert!(
+            grant_for_binding(
+                &effect_directory(temporary.path(), &collision_binding, &collision_effect),
+                &collision_binding,
+            )
+            .unwrap()
+            .is_some(),
+            "different physical identity borrowed another account Q"
+        );
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while observe_account_effect(temporary.path(), &collision_binding, &collision_effect)
+            .unwrap()
+            .state
+            != "drained"
+        {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let sibling_candidate: RouteCandidate = exact_file(
             temporary.path(),
             &candidate_name(&sibling_binding.handoff_id, 0),
@@ -6451,6 +10402,17 @@ mod tests {
         );
         let mut pending_binding = binding.clone();
         pending_binding.handoff_id = uuid::Uuid::new_v4().to_string();
+        let mut pending_candidate: RouteCandidate =
+            exact_file(temporary.path(), &candidate_name(&binding.handoff_id, 0))
+                .unwrap()
+                .unwrap();
+        pending_candidate.binding = pending_binding.clone();
+        durable_new(
+            temporary.path(),
+            &candidate_name(&pending_binding.handoff_id, 0),
+            &pending_candidate,
+        )
+        .unwrap();
         let pending_dir = effect_directory(temporary.path(), &pending_binding, &first);
         std::fs::create_dir(&pending_dir).unwrap();
         let pending_intent = AccountEffectIntent {
@@ -6518,44 +10480,88 @@ mod tests {
         assert_eq!(wait(&negative).outcome.as_deref(), Some("valid_windows"));
         let mut exhausted_sibling = binding.clone();
         exhausted_sibling.handoff_id = uuid::Uuid::new_v4().to_string();
+        let mut exhausted_candidate: RouteCandidate =
+            exact_file(temporary.path(), &candidate_name(&binding.handoff_id, 1))
+                .unwrap()
+                .unwrap();
+        exhausted_candidate.binding = exhausted_sibling.clone();
+        durable_new(
+            temporary.path(),
+            &candidate_name(&exhausted_sibling.handoff_id, 1),
+            &exhausted_candidate,
+        )
+        .unwrap();
         assert!(
             reusable_quota_source(temporary.path(), &exhausted_sibling, &negative)
                 .unwrap()
-                .is_none(),
-            "an exhausted physical Q was reused instead of allowing a new quota probe"
+                .is_some(),
+            "an authoritative exhausted Q should remain cached until a fresh probe is due"
         );
         assert!(
             select_route(
                 temporary.path(),
                 &binding,
                 &FreshRouteRequest {
+                    protocol_version: 4,
                     d_key: uuid::Uuid::new_v4().to_string(),
                     model: "model".into(),
                     config_sha256: "a".repeat(64),
                     account: None,
+                    account_identity: None,
                     index: None,
                     total: 2,
                     pin: Some("exhausted".into()),
                     quota_script: None,
                     auth_refresh_command: None,
+                    environment_sha256: None,
                 }
             )
             .is_err(),
             "an exhausted explicit pin was launched"
         );
-        let selection = select_route(
+        let unresolved = select_route(
             temporary.path(),
             &binding,
             &FreshRouteRequest {
+                protocol_version: 4,
                 d_key: uuid::Uuid::new_v4().to_string(),
                 model: "model".into(),
                 config_sha256: "a".repeat(64),
                 account: None,
+                account_identity: None,
                 index: None,
                 total: 2,
                 pin: None,
                 quota_script: None,
                 auth_refresh_command: None,
+                environment_sha256: None,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            unresolved.contains("newer or unresolved quota effect"),
+            "{unresolved}"
+        );
+        // This pending intent was synthesized above without a real K; remove
+        // only that test artifact to exercise the settled branch below.
+        std::fs::remove_dir_all(&pending_dir).unwrap();
+        let selection = select_route(
+            temporary.path(),
+            &binding,
+            &FreshRouteRequest {
+                protocol_version: 4,
+                d_key: uuid::Uuid::new_v4().to_string(),
+                model: "model".into(),
+                config_sha256: "a".repeat(64),
+                account: None,
+                account_identity: None,
+                index: None,
+                total: 2,
+                pin: None,
+                quota_script: None,
+                auth_refresh_command: None,
+                environment_sha256: None,
             },
         )
         .unwrap();
@@ -6577,11 +10583,14 @@ mod tests {
         let mut uncertain_binding = binding.clone();
         uncertain_binding.handoff_id = uuid::Uuid::new_v4().to_string();
         let unknown_route = FreshRouteRequest {
+            protocol_version: 4,
             d_key: uuid::Uuid::new_v4().to_string(), model: "model".into(),
             config_sha256: "a".repeat(64), account: Some("slow".into()),
+            account_identity: Some("slow".into()),
             index: Some(0), total: 1, pin: Some("slow".into()),
             quota_script: Some("printf '{\"used_percent\":10,\"resets_at\":\"2099-01-01T00:00:00Z\"}'; sleep 60 & wait".into()),
             auth_refresh_command: None,
+            environment_sha256: None,
         };
         register_route_candidate(
             temporary.path(),
@@ -6686,10 +10695,13 @@ mod tests {
                 temporary.path(),
                 &uncertain_binding,
                 &FreshRouteRequest {
+                    protocol_version: 4,
                     account: None,
+                    account_identity: None,
                     index: None,
                     quota_script: None,
                     auth_refresh_command: None,
+                    environment_sha256: None,
                     ..unknown_route
                 }
             )
@@ -6718,10 +10730,8 @@ mod tests {
                 .as_deref(),
             Some("failed")
         );
-        // The synthetic pending intent above deliberately has no K. Remove
-        // that fixture-only artifact and its dependent reuse before testing
-        // a settled post-rejection quota verification.
-        std::fs::remove_dir_all(&pending_dir).unwrap();
+        // The synthetic pending intent was removed before the settled route
+        // check; remove its dependent reuse for the marker comparison.
         std::fs::remove_dir_all(effect_directory(temporary.path(), &another_binding, &first))
             .unwrap();
         let retry_dir = effect_directory(temporary.path(), &binding, &retry);
@@ -6739,12 +10749,13 @@ mod tests {
                 model: "model".into(),
                 config_sha256: "a".repeat(64),
                 account: "recovering".into(),
+                account_identity: "recovering".into(),
                 index: 0,
                 plan_sha256: selected_candidate.plan_sha256.clone(),
                 observed_live: 0,
                 observed_failures: 0,
                 observed_invocations: 1,
-                policy_version: "fresh-account-effects-v2".into(),
+                policy_version: FRESH_ROUTE_POLICY_VERSION.into(),
                 eligible_accounts: vec!["recovering".into()],
                 quota_remaining_basis_points: Some(8000),
             },
@@ -6760,6 +10771,23 @@ mod tests {
             &terminal_marker,
         )
         .unwrap();
+        let cross_model_candidate: RouteCandidate = exact_file(
+            temporary.path(),
+            &candidate_name(&cross_model_binding.handoff_id, 0),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            !marker_allows_candidate(
+                temporary.path(),
+                &cross_model_binding,
+                &cross_model_candidate,
+                std::slice::from_ref(&terminal_marker),
+                Some(old_healthy_q),
+            )
+            .unwrap(),
+            "another model accepted a pre-rejection Q for the same physical account"
+        );
         let mut verification_binding = binding.clone();
         verification_binding.handoff_id = uuid::Uuid::new_v4().to_string();
         register_route_candidate(
@@ -6827,5 +10855,130 @@ mod tests {
         );
         actor_child.kill().unwrap();
         actor_child.wait().unwrap();
+    }
+
+    #[test]
+    fn v3_route_writer_round_robin_receipt_survives_restart_without_provider_k() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("broker");
+        let source = temp.path().join("config");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir_all(source.join("models")).unwrap();
+        std::fs::write(source.join("providers.toml"),
+            "[first]\ncommand = '/bin/true'\nquota_account_id = 'physical-first'\n[second]\ncommand = '/bin/true'\nquota_account_id = 'physical-second'\n").unwrap();
+        std::fs::write(
+            source.join("models/pool.toml"),
+            "[[providers]]\nname = 'first'\n[[providers]]\nname = 'second'\n",
+        )
+        .unwrap();
+        drop(crate::linux_main::fresh_index::broker_admission_lease(&root).unwrap());
+        crate::linux_main::fresh_index::rebuild_keyed_offline(
+            &root,
+            &temp.path().join("absent.sock"),
+            &source,
+        )
+        .unwrap();
+        let lease = crate::linux_main::fresh_index::broker_admission_lease(&root).unwrap();
+        let generation = KeyedGeneration::admit_provider_readback(&root, &lease, &source).unwrap();
+        let pool = oulipoly_runtime::executor::cli::fresh_remote::load_fresh_headless_pool(
+            &source, "pool",
+        )
+        .unwrap();
+        let source_fd = File::open(&source).unwrap();
+        let process = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+        let image = std::fs::canonicalize("/bin/true").unwrap();
+        let input_path = temp.path().join("input");
+        std::fs::write(&input_path, b"").unwrap();
+        let input = File::open(&input_path).unwrap();
+        let mut first_binding = None;
+        let mut first_request = None;
+        for expected in [0, 1, 0] {
+            let binding = fixture_binding(&process, &process);
+            let mut choice = FreshRouteRequest {
+                protocol_version: 4,
+                d_key: uuid::Uuid::new_v4().to_string(),
+                model: "pool".into(),
+                config_sha256: pool.config_sha256.clone(),
+                account: None,
+                account_identity: None,
+                index: None,
+                total: 2,
+                pin: None,
+                quota_script: None,
+                auth_refresh_command: None,
+                environment_sha256: None,
+            };
+            for (n, account) in ["first", "second"].iter().enumerate() {
+                choice.account = Some((*account).into());
+                choice.account_identity = Some(format!("physical-{account}"));
+                choice.index = Some(n);
+                validate_route_source(&source_fd, &choice).unwrap();
+                bind_route_source(&root, &binding, &choice, &source_fd, true).unwrap();
+                register_route_candidate(
+                    &root,
+                    &binding,
+                    &choice,
+                    plan(
+                        &image,
+                        temp.path(),
+                        &input,
+                        vec![format!("--{account}")],
+                        vec![],
+                    )
+                    .unwrap(),
+                    terminal_recognizer_from_source(&source_fd, &choice).unwrap(),
+                )
+                .unwrap();
+                generation
+                    .record_route_model("pool", &pool.config_sha256)
+                    .unwrap();
+            }
+            choice.account = None;
+            choice.account_identity = None;
+            choice.index = None;
+            let selected = select_route_v3(&root, &binding, &choice, &generation).unwrap();
+            assert_eq!(selected.index, expected);
+            assert_eq!(
+                select_route_v3(&root, &binding, &choice, &generation).unwrap(),
+                selected,
+                "one D advanced the cursor twice"
+            );
+            assert!(
+                !root
+                    .join(format!("{}.fresh-grant.json", binding.handoff_id))
+                    .exists()
+            );
+            if expected == 0 && first_binding.is_none() {
+                first_binding = Some(binding);
+                first_request = Some(choice);
+            }
+        }
+        drop(generation);
+        drop(lease);
+        let lease = crate::linux_main::fresh_index::broker_admission_lease(&root).unwrap();
+        let generation = KeyedGeneration::admit_provider_readback(&root, &lease, &source).unwrap();
+        let binding = first_binding.unwrap();
+        let request = first_request.unwrap();
+        assert_eq!(
+            select_route_v3(&root, &binding, &request, &generation)
+                .unwrap()
+                .index,
+            0
+        );
+        let mut changed_actor = binding.clone();
+        changed_actor.actor_pid += 1;
+        assert!(select_route_v3(&root, &changed_actor, &request, &generation).is_err());
+        assert_eq!(
+            generation
+                .route_index()
+                .unwrap()
+                .cursor(&CursorKey {
+                    model: "pool".into(),
+                    config_sha256: pool.config_sha256,
+                })
+                .unwrap()
+                .sequence,
+            3
+        );
     }
 }

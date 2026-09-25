@@ -1,6 +1,6 @@
 //! Durable, one-use host entry reservation. A reservation is not permission to
 //! launch a Runner: the guardian must bind it before any future child gate can
-//! be opened. Records are retained as debt until a settlement protocol exists.
+//! be opened. Records remain debt until exact State terminal/publication settlement.
 use crate::identity::{PinnedProcess, boot_id};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -63,6 +63,22 @@ pub struct EntryRecord {
     /// Bound once after held J and before v30 prepared State publication.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prepared_driver: Option<ProcessStamp>,
+    /// The exact State terminal/publication identity that released this
+    /// one-use entry. An unknown caller presentation remains in State.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_settlement: Option<EntryTerminalSettlement>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EntryTerminalSettlement {
+    pub d_key: String,
+    pub handoff_id: String,
+    pub invocation_uuid: String,
+    pub session_id: String,
+    pub actor: ProcessStamp,
+    pub parent_grant_id: String,
+    pub publication_sha256: String,
 }
 
 pub struct EntryRegistry {
@@ -92,6 +108,19 @@ impl EntryRegistry {
                 || record.join_consumed && record.guardian.is_none()
                 || record.joined_child.is_some() && !record.join_consumed
                 || record.prepared_driver.is_some() && record.joined_child.is_none()
+                || record.terminal_settlement.is_some() && record.joined_child.is_none()
+                || record
+                    .terminal_settlement
+                    .as_ref()
+                    .is_some_and(|settlement| {
+                        settlement.handoff_id.is_empty()
+                            || settlement.d_key.is_empty()
+                            || settlement.invocation_uuid.is_empty()
+                            || settlement.session_id.is_empty()
+                            || settlement.parent_grant_id.is_empty()
+                            || settlement.publication_sha256.len() != 64
+                            || record.joined_child.as_ref() != Some(&settlement.actor)
+                    })
                 || record
                     .domain_id
                     .as_ref()
@@ -141,6 +170,7 @@ impl EntryRegistry {
             join_consumed: false,
             joined_child: None,
             prepared_driver: None,
+            terminal_settlement: None,
         };
         let path = self.directory.join(format!("{root_id}.json"));
         let result = (|| {
@@ -358,6 +388,47 @@ impl EntryRegistry {
         Ok(stamp)
     }
 
+    pub fn settle_join(
+        &mut self,
+        root_id: &str,
+        settlement: EntryTerminalSettlement,
+    ) -> io::Result<()> {
+        let index = self
+            .records
+            .iter()
+            .position(|record| record.root_id == root_id)
+            .ok_or_else(|| io::Error::other("terminal entry absent"))?;
+        let current = &self.records[index];
+        if !current.join_consumed
+            || current.joined_child.as_ref() != Some(&settlement.actor)
+            || current
+                .terminal_settlement
+                .as_ref()
+                .is_some_and(|prior| prior != &settlement)
+        {
+            return Err(io::Error::other("terminal entry identity changed"));
+        }
+        if current.terminal_settlement.is_some() {
+            return Ok(());
+        }
+        let entry = PinnedProcess::open(current.entry.host_pid)?;
+        let guardian = PinnedProcess::open(
+            current
+                .guardian
+                .as_ref()
+                .ok_or_else(|| io::Error::other("terminal guardian absent"))?
+                .host_pid,
+        )?;
+        if !current.entry.matches(&entry)?
+            || !current.guardian.as_ref().unwrap().matches(&guardian)?
+        {
+            return Err(io::Error::other("terminal entry process changed"));
+        }
+        let mut settled = current.clone();
+        settled.terminal_settlement = Some(settlement);
+        self.replace(index, settled, &entry, &guardian)
+    }
+
     fn replace(
         &mut self,
         index: usize,
@@ -404,29 +475,35 @@ impl EntryRegistry {
 
     pub fn has_debt(&self) -> bool {
         self.poisoned
-            || self.records.iter().any(|r| {
-                boot_id().ok().as_deref() != Some(r.entry.boot_id.as_str())
-                    || PinnedProcess::open(r.entry.host_pid)
-                        .and_then(|p| r.entry.matches(&p))
-                        .ok()
-                        != Some(true)
-                    || r.prepared_guardian.as_ref().is_some_and(|stamp| {
-                        PinnedProcess::open(stamp.host_pid)
-                            .and_then(|p| stamp.matches(&p))
+            || self
+                .records
+                .iter()
+                .filter(|r| r.terminal_settlement.is_none())
+                .any(|r| {
+                    boot_id().ok().as_deref() != Some(r.entry.boot_id.as_str())
+                        || PinnedProcess::open(r.entry.host_pid)
+                            .and_then(|p| r.entry.matches(&p))
                             .ok()
                             != Some(true)
-                    })
-                    || r.prepared_driver.as_ref().is_some_and(|stamp| {
-                        PinnedProcess::open(stamp.host_pid)
-                            .and_then(|p| stamp.matches(&p))
-                            .ok()
-                            != Some(true)
-                    })
-            })
+                        || r.prepared_guardian.as_ref().is_some_and(|stamp| {
+                            PinnedProcess::open(stamp.host_pid)
+                                .and_then(|p| stamp.matches(&p))
+                                .ok()
+                                != Some(true)
+                        })
+                        || r.prepared_driver.as_ref().is_some_and(|stamp| {
+                            PinnedProcess::open(stamp.host_pid)
+                                .and_then(|p| stamp.matches(&p))
+                                .ok()
+                                != Some(true)
+                        })
+                })
     }
 
     pub fn has_unsettled_join(&self) -> bool {
-        self.records.iter().any(|record| record.join_consumed)
+        self.records
+            .iter()
+            .any(|record| record.join_consumed && record.terminal_settlement.is_none())
     }
 }
 

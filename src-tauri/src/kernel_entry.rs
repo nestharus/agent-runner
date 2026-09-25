@@ -1111,15 +1111,22 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
     }
     for (index, candidate) in prepared.iter().enumerate() {
         let request = FreshRouteRequest {
+            protocol_version: 4,
             d_key: authority.receipt.d_key.clone(),
             model: pool.model.name.clone(),
             config_sha256: pool.config_sha256.clone(),
             account: Some(pool.model.providers[index].name.clone()),
+            account_identity: Some(
+                pool.account_identities[index]
+                    .clone()
+                    .ok_or("private fresh account requires quota_account_id in providers.toml")?,
+            ),
             index: Some(index),
             total,
             pin: provider_pin.map(str::to_owned),
             quota_script: pool.account_effects[index].0.clone(),
             auth_refresh_command: pool.account_effects[index].1.clone(),
+            environment_sha256: None,
         };
         let pinned = private_pin_plan(&candidate.plan)?;
         let [image, cwd, input, recipe] = pinned.descriptors();
@@ -1131,30 +1138,42 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
         )
         .map_err(|e| format!("fresh route candidate refused before K: {e}"))?;
     }
+    let mut environment = Vec::new();
+    for (key, value) in std::env::vars_os() {
+        let key = key
+            .into_string()
+            .map_err(|_| "fresh effect environment key is not UTF-8")?;
+        if oulipoly_runtime::executor::cli::fresh_remote::forbidden_fresh_environment(&key) {
+            continue;
+        }
+        let value = value
+            .into_string()
+            .map_err(|_| "fresh effect environment value is not UTF-8")?;
+        environment.push((key, value));
+    }
+    environment.sort();
+    let environment_sha256 = {
+        use sha2::{Digest, Sha256};
+        format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&environment).map_err(|e| e.to_string())?)
+        )
+    };
     let mut quota_receipts = Vec::new();
     let mut auth_receipts = Vec::new();
+    // The private manual/route join exercises a second original-root actor
+    // against an already settled physical account Q. Route admission itself
+    // decides whether that Q is usable; starting QuotaFirst here would spend
+    // a duplicate K before the decision could inspect the manual fact.
+    let route_mode = std::env::var("AGE319_PRIVATE_JOIN_MODE").unwrap_or_default();
+    let manual_route = route_mode.starts_with("normal_model_provider_v3_quota_route_manual");
     for (index, (quota_script, auth_command)) in pool.account_effects.iter().enumerate() {
+        if manual_route {
+            continue;
+        }
         if quota_script.is_none() {
             continue;
         }
-        let mut environment = Vec::new();
-        for (key, value) in std::env::vars_os() {
-            let key = key
-                .into_string()
-                .map_err(|_| "fresh effect environment key is not UTF-8")?;
-            if key.starts_with("LD_")
-                || key.starts_with("DYLD_")
-                || key.starts_with("OULIPOLY_KERNEL_")
-                || matches!(key.as_str(), "GLIBC_TUNABLES" | "GCONV_PATH")
-            {
-                continue;
-            }
-            let value = value
-                .into_string()
-                .map_err(|_| "fresh effect environment value is not UTF-8")?;
-            environment.push((key, value));
-        }
-        environment.sort();
         let mut effect = FreshAccountEffectRequest {
             d_key: authority.receipt.d_key.clone(),
             model: pool.model.name.clone(),
@@ -1162,7 +1181,7 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
             account: pool.model.providers[index].name.clone(),
             index,
             kind: FreshAccountEffectKind::QuotaFirst,
-            environment,
+            environment: prepared[index].plan.environment.clone(),
         };
         let first = private_run_account_effect(&socket, &authority.receipt.handoff_id, &effect)?;
         quota_receipts.push((
@@ -1173,6 +1192,29 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
         if first.outcome.as_deref() != Some("valid_windows") && auth_command.is_some() {
             effect.kind = FreshAccountEffectKind::AuthRefresh;
             let auth = private_run_account_effect(&socket, &authority.receipt.handoff_id, &effect)?;
+            if std::env::var("AGE319_PRIVATE_JOIN_MODE")
+                .ok()
+                .as_deref()
+                .is_some_and(|mode| mode.starts_with("normal_model_provider_v3_quota_auth"))
+            {
+                let mut changed_env = effect.clone();
+                changed_env
+                    .environment
+                    .push(("AGE319_CHANGED_ENV".into(), "1".into()));
+                if protocol::private_fresh_account_effect_at(&socket, &changed_env, false).is_ok() {
+                    return Err("v3 auth accepted changed environment readback".into());
+                }
+                let mut changed_account = effect.clone();
+                changed_account.account = "different".into();
+                if protocol::private_fresh_account_effect_at(&socket, &changed_account, false)
+                    .is_ok()
+                {
+                    return Err("v3 auth accepted changed account readback".into());
+                }
+                if protocol::private_fresh_account_effect_at(&socket, &effect, true).is_ok() {
+                    return Err("v3 auth began a second physical effect".into());
+                }
+            }
             auth_receipts.push((effect.clone(), auth.effect_id.clone(), auth.outcome.clone()));
             if auth.outcome.as_deref() == Some("refreshed") {
                 effect.kind = FreshAccountEffectKind::QuotaRetry;
@@ -1183,23 +1225,119 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
         }
     }
     let request = FreshRouteRequest {
+        protocol_version: 4,
         d_key: authority.receipt.d_key.clone(),
         model: pool.model.name.clone(),
         config_sha256: pool.config_sha256.clone(),
         account: None,
+        account_identity: None,
         index: None,
         total,
         pin: provider_pin.map(str::to_owned),
         quota_script: None,
         auth_refresh_command: None,
+        environment_sha256: Some(environment_sha256),
     };
-    let selected =
+    let first =
+        protocol::private_fresh_route_at(&socket, &request, b'f', &[config_source.as_raw_fd()]);
+    let selected = if matches!(
+        route_mode.as_str(),
+        "normal_model_provider_v3_quota_route_reply_loss"
+            | "normal_model_provider_v3_quota_route_manual_route_reply_loss"
+            | "normal_model_provider_v3_quota_route_manual_physical_route_reply_loss"
+    ) {
+        if first.is_ok() {
+            return Err("v3 route fixture did not lose first reply".into());
+        }
+        let gate = std::path::PathBuf::from(
+            std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                .map_err(|e| e.to_string())?,
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !gate.join("route-restarted").exists() {
+            if std::time::Instant::now() >= deadline {
+                return Err("v3 route restart fixture timed out".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         protocol::private_fresh_route_at(&socket, &request, b'f', &[config_source.as_raw_fd()])
+            .map_err(|e| format!("v3 route exact restart readback refused: {e}"))?
+            .ok_or("v3 route exact restart readback absent")?
+    } else {
+        first
             .map_err(|e| format!("fresh route selection refused before K: {e}"))?
-            .ok_or("fresh route selection absent before K")?;
+            .ok_or("fresh route selection absent before K")?
+    };
+    if route_mode.starts_with("normal_model_provider_v3_quota_route") {
+        let repeated =
+            protocol::private_fresh_route_at(&socket, &request, b'f', &[config_source.as_raw_fd()])
+                .map_err(|e| format!("v3 route exact readback refused: {e}"))?
+                .ok_or("v3 route exact readback absent")?;
+        if repeated != selected {
+            return Err("v3 route readback changed selection".into());
+        }
+        let mut changed_environment = request.clone();
+        changed_environment.environment_sha256 = Some("0".repeat(64));
+        if protocol::private_fresh_route_at(
+            &socket,
+            &changed_environment,
+            b'f',
+            &[config_source.as_raw_fd()],
+        )
+        .is_ok()
+        {
+            return Err("v3 route accepted changed environment".into());
+        }
+        let mut changed_account = request.clone();
+        changed_account.account = Some("unused".into());
+        changed_account.account_identity = Some("physical-unused".into());
+        changed_account.index = Some(0);
+        if protocol::private_fresh_route_at(
+            &socket,
+            &changed_account,
+            b'f',
+            &[config_source.as_raw_fd()],
+        )
+        .is_ok()
+        {
+            return Err("v3 route accepted changed account".into());
+        }
+        let gate = std::path::PathBuf::from(
+            std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                .map_err(|e| e.to_string())?,
+        );
+        let replacement = gate.join("replacement-config");
+        std::fs::create_dir_all(replacement.join("models")).map_err(|e| e.to_string())?;
+        std::fs::copy(
+            config_dir.join("providers.toml"),
+            replacement.join("providers.toml"),
+        )
+        .map_err(|e| e.to_string())?;
+        std::fs::copy(
+            config_dir.join("models/configured-model.toml"),
+            replacement.join("models/configured-model.toml"),
+        )
+        .map_err(|e| e.to_string())?;
+        let replacement_fd = File::open(&replacement).map_err(|e| e.to_string())?;
+        if protocol::private_fresh_route_at(&socket, &request, b'f', &[replacement_fd.as_raw_fd()])
+            .is_ok()
+        {
+            return Err("v3 route accepted changed source directory".into());
+        }
+        std::fs::write(
+            gate.join("v3-route-selection.json"),
+            serde_json::to_vec(&selected).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+    }
     if selected.model != pool.model.name
         || selected.config_sha256 != pool.config_sha256
-        || selected.policy_version != "fresh-account-effects-v2"
+        || selected.policy_version != "fresh-quota-account-v4"
+        || pool
+            .account_identities
+            .get(selected.index)
+            .and_then(Option::as_deref)
+            != Some(selected.account_identity.as_str())
         || !selected.eligible_accounts.contains(&selected.account)
         || selected.eligible_accounts.iter().any(|account| {
             !pool
@@ -1218,7 +1356,92 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
     {
         return Err("fresh route readback differs from configured pool before K".into());
     }
-    let selected_plan = prepared.swap_remove(selected.index);
+    if matches!(
+        route_mode.as_str(),
+        "normal_model_provider_v3_quota_route_manual_physical_capacity_terminal"
+            | "normal_model_provider_v3_quota_route_manual_physical_account_quota_terminal"
+    ) {
+        let gate = std::path::PathBuf::from(
+            std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                .map_err(|e| e.to_string())?,
+        );
+        if gate.join("v3-stop-after-route").exists() {
+            std::fs::write(
+                gate.join("v3-second-route-selection.json"),
+                serde_json::to_vec(&selected).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+            return Err("v3 second actor stopped after route before provider K".into());
+        }
+    }
+    let mut selected_plan = prepared.swap_remove(selected.index);
+    if route_mode.starts_with("normal_model_provider_v3_quota_route_physical")
+        || route_mode.starts_with("normal_model_provider_v3_quota_route_manual_physical")
+    {
+        let gate = std::path::PathBuf::from(
+            std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                .map_err(|e| e.to_string())?,
+        );
+        let expected = serde_json::json!({
+            "argv": selected_plan.plan.argv,
+            "cwd": selected_plan.plan.cwd,
+            "env": selected_plan.plan.environment.iter().cloned().collect::<std::collections::BTreeMap<_, _>>(),
+            "account_identity": selected.account_identity,
+        });
+        std::fs::write(
+            gate.join("v3-provider-expected-plan.json"),
+            serde_json::to_vec(&expected).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    if route_mode.ends_with("physical_bad_plan") {
+        selected_plan
+            .plan
+            .argv
+            .push("--changed-after-selection".into());
+    }
+    if route_mode.ends_with("physical_bad_actor") {
+        let pinned = private_pin_plan(&selected_plan.plan)?;
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return Err(format!(
+                "v3 bad actor fixture fork: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if pid == 0 {
+            let refused = protocol::private_fresh_provider_at(
+                &socket,
+                &authority.receipt.d_key,
+                b'5',
+                Some(pinned.descriptors()),
+            )
+            .is_err();
+            unsafe { libc::_exit(if refused { 0 } else { 1 }) };
+        }
+        let mut status = 0;
+        if unsafe { libc::waitpid(pid, &mut status, 0) } != pid
+            || !libc::WIFEXITED(status)
+            || libc::WEXITSTATUS(status) != 0
+        {
+            return Err("v3 changed actor was admitted to provider K".into());
+        }
+        return Err("v3 changed actor correctly refused before provider K".into());
+    }
+    if route_mode.ends_with("physical_source_changed") {
+        let gate = std::path::PathBuf::from(
+            std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                .map_err(|e| e.to_string())?,
+        );
+        std::fs::write(gate.join("v3-provider-ready"), b"yes").map_err(|e| e.to_string())?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !gate.join("v3-provider-continue").exists() {
+            if std::time::Instant::now() >= deadline {
+                return Err("v3 provider source gate expired".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
     let mut backend = PrivateFreshBroker {
         authority,
         grant_id: None,
@@ -1504,30 +1727,63 @@ fn private_run_account_effect(
     request: &oulipoly_kernel_broker::protocol::FreshAccountEffectRequest,
 ) -> Result<oulipoly_kernel_broker::protocol::FreshAccountEffectReadback, String> {
     use oulipoly_kernel_broker::protocol;
-    let started = protocol::private_fresh_account_effect_at(socket, request, true)
-        .or_else(|_| protocol::private_fresh_account_effect_at(socket, request, false))
-        .map_err(|e| {
-            private_account_effect_unknown(
-                handoff_id,
-                request,
-                None,
-                "begin/readback",
-                &e.to_string(),
-            )
-        })?;
-    let mut effect = started;
-    while effect.state == "pending" {
-        std::thread::sleep(PRIVATE_ACCOUNT_EFFECT_POLL);
-        effect =
+    let restart_probe = matches!(
+        std::env::var("AGE319_PRIVATE_JOIN_MODE").ok().as_deref(),
+        Some(
+            "normal_model_provider_v3_quota_restart"
+                | "normal_model_provider_v3_quota_auth_restart"
+        )
+    );
+    let restart_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let started = match protocol::private_fresh_account_effect_at(socket, request, true) {
+        Ok(started) => started,
+        Err(_) if restart_probe => loop {
+            match protocol::private_fresh_account_effect_at(socket, request, false) {
+                Ok(observed) => break observed,
+                Err(_) if std::time::Instant::now() < restart_deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Err(e) => {
+                    return Err(private_account_effect_unknown(
+                        handoff_id,
+                        request,
+                        None,
+                        "begin/readback",
+                        &e.to_string(),
+                    ));
+                }
+            }
+        },
+        Err(_) => {
             protocol::private_fresh_account_effect_at(socket, request, false).map_err(|e| {
                 private_account_effect_unknown(
                     handoff_id,
                     request,
-                    Some(&effect),
-                    "Q readback",
+                    None,
+                    "begin/readback",
                     &e.to_string(),
                 )
-            })?;
+            })?
+        }
+    };
+    let mut effect = started;
+    while effect.state == "pending" {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        effect = match protocol::private_fresh_account_effect_at(socket, request, false) {
+            Ok(observed) => observed,
+            Err(_) if restart_probe && std::time::Instant::now() < restart_deadline => continue,
+            Err(e) => {
+                return Err({
+                    private_account_effect_unknown(
+                        handoff_id,
+                        request,
+                        Some(&effect),
+                        "Q readback",
+                        &e.to_string(),
+                    )
+                });
+            }
+        };
     }
     if effect.state != "drained" {
         return Err(private_account_effect_unknown(

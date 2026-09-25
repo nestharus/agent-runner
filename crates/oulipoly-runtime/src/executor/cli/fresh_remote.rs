@@ -102,6 +102,7 @@ pub struct FreshConfiguredPool {
     pub model: ModelConfig,
     pub config_sha256: String,
     pub account_effects: Vec<(Option<String>, Option<String>)>,
+    pub account_identities: Vec<Option<String>>,
 }
 
 /// The two source files are identified as bytes before any provider plan is
@@ -145,6 +146,7 @@ pub fn load_fresh_headless_pool(
     let mut members = HashSet::new();
     let mut prompt_mode = None;
     let mut account_effects = Vec::new();
+    let mut account_identities = Vec::new();
     for member in &mut model.providers {
         if !members.insert(member.name.clone()) {
             return Err("fresh model has duplicate provider accounts before K".into());
@@ -156,6 +158,7 @@ pub fn load_fresh_headless_pool(
             .map(|(quota, auth)| (Some(quota), auth))
             .unwrap_or((None, account.auth_refresh_command.clone()));
         account_effects.push(effect);
+        account_identities.push(account.quota_account_id.clone());
         let (effective, mode) = providers
             .effective_provider(member)
             .map_err(|e| format!("fresh provider config invalid before K: {e}"))?;
@@ -178,6 +181,7 @@ pub fn load_fresh_headless_pool(
         model,
         config_sha256: format!("{:x}", hash.finalize()),
         account_effects,
+        account_identities,
     })
 }
 
@@ -194,12 +198,13 @@ pub fn execute_fresh_headless(
     run_prepared_fresh_headless(prepared, backend)
 }
 
-pub fn prepare_fresh_headless(
+/// Structural preflight shared by the original Runner plan and the broker's
+/// source-owned manual quota probe. It does not read inherited process env.
+pub fn validate_fresh_headless_shape(
     model: &ModelConfig,
     provider_index: usize,
-    prompt: &str,
     working_dir: &Path,
-) -> Result<PreparedFreshHeadless, String> {
+) -> Result<(), String> {
     let provider = provider_for_index(model, provider_index)?;
     if model.prompt_mode != PromptMode::Stdin
         || !model.inputs.is_empty()
@@ -219,7 +224,6 @@ pub fn prepare_fresh_headless(
     if parts.is_empty() {
         return Err("fresh broker command has no first executable before K".into());
     }
-    let input_args = resolve_input_flags(model, &HashMap::new())?;
     if provider
         .environment
         .keys()
@@ -227,6 +231,19 @@ pub fn prepare_fresh_headless(
     {
         return Err("fresh broker provider environment unsupported before K".into());
     }
+    Ok(())
+}
+
+pub fn prepare_fresh_headless(
+    model: &ModelConfig,
+    provider_index: usize,
+    prompt: &str,
+    working_dir: &Path,
+) -> Result<PreparedFreshHeadless, String> {
+    validate_fresh_headless_shape(model, provider_index, working_dir)?;
+    let provider = provider_for_index(model, provider_index)?;
+    let parts = super::shell_split(&provider.command);
+    let input_args = resolve_input_flags(model, &HashMap::new())?;
     let mut launch = assemble_provider_launch(
         ProviderLaunchRequest {
             provider,
@@ -408,10 +425,11 @@ pub fn run_prepared_fresh_headless(
     ))
 }
 
-fn forbidden_fresh_environment(key: &str) -> bool {
+pub fn forbidden_fresh_environment(key: &str) -> bool {
     key.starts_with("LD_")
         || key.starts_with("DYLD_")
         || key.starts_with("OULIPOLY_KERNEL_")
+        || key == "OULIPOLY_ROOT_AUTHORITY_V1"
         || matches!(key, "GLIBC_TUNABLES" | "GCONV_PATH")
 }
 
@@ -466,7 +484,7 @@ mod tests {
         .unwrap();
         fs::write(
             root.path().join("providers.toml"),
-            "[other]\ncommand = '/bin/false'\n[chosen]\ncommand = '/bin/true'\nargs = ['--account-option']\n",
+            "[other]\ncommand = '/bin/false'\nquota_account_id = 'physical-other'\n[chosen]\ncommand = '/bin/true'\nquota_account_id = 'physical-chosen'\nargs = ['--account-option']\n",
         )
         .unwrap();
         let pool = load_fresh_headless_pool(root.path(), "work").unwrap();
@@ -474,6 +492,10 @@ mod tests {
         assert_eq!(pool.model.providers[1].name, "chosen");
         assert_eq!(pool.model.providers[1].command, "/bin/true");
         assert_eq!(pool.config_sha256.len(), 64);
+        assert_eq!(
+            pool.account_identities[1].as_deref(),
+            Some("physical-chosen")
+        );
         assert_eq!(
             pool.model.providers[1].args,
             ["--account-option", "--model-option"]
@@ -500,6 +522,7 @@ mod tests {
             metered.account_effects[1].0.as_deref(),
             Some("must-not-run")
         );
+        assert!(metered.account_identities[1].is_none());
     }
 
     #[test]

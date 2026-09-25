@@ -365,6 +365,7 @@ Create `$OULIPOLY_CONFIG_HOME/oulipoly-agent-runner/providers.toml` with one ent
 
 ```toml
 [claude]
+quota_account_id     = "anthropic:personal"
 quota_script         = "anthropic-usage ~/.claude/.credentials.json"
 auth_refresh_command = "claude auth status"
 command              = "claude"
@@ -379,6 +380,7 @@ kind = "flag"
 flag = "--resume"
 
 [claude2]
+quota_account_id     = "anthropic:second"
 quota_script         = "anthropic-usage ~/.claude2/.credentials.json"
 auth_refresh_command = "claude auth status"
 command              = "env"
@@ -453,7 +455,9 @@ If you already ran `migrate-config` from `98e692c` or the script-storage migrati
 
 Scripts have a 30-second timeout and run via `sh -c`, so `~` expansion and pipelines work. During CLI routing, an explicit `quota_script` is refreshed with a 30-second routing TTL; if it is absent but Claude/Codex `session_storage` or `sessions.toml` roots are present, the runner derives the standard bundled `anthropic-usage` / `chatgpt-usage` adapter from those roots. Providers without an explicit or derived quota adapter fall back to invocation-count scoring.
 
-`oulipoly-agent-runner --usage` enumerates provider accounts referenced by the active model pool, runs each configured `quota_script`, refreshes the local quota cache, and prints account, vendor, window, used/limit, and remaining columns. Providers without a usage adapter appear as `(no usage api)`; provider/script failures appear as row errors and do not fail the command unless local config or state cannot be opened.
+The private fresh broker route requires `quota_account_id` on every referenced account. Give the same stable value to entries that use the same physical provider account, including entries in different models; give distinct values to different physical accounts even when their display labels match. A model member that switches credentials through its arguments or environment needs its own provider account entry and distinct quota identity. The broker verifies the value against its pinned `providers.toml` source and also requires matching quota and auth commands before sharing a physical Q. Existing private route requests without protocol version 4 are refused. This private selector remains closed to ordinary CLI routing.
+
+`oulipoly-agent-runner --usage` enumerates each provider account referenced by the active model pool once, runs its configured `quota_script`, refreshes the legacy local quota cache, and prints account, vendor, window, used/limit, and remaining columns. Providers without a usage adapter appear as `(no usage api)`. Failed, empty, in-flight, or uncommitted refreshes appear in the table and return a nonzero exit status. A private-feature build also states that this legacy command did not refresh broker quota Q. The private fresh provider fixture flag routes `--usage` through broker-owned manual quota K/Q instead; this selector remains closed to ordinary production traffic.
 
 **Auth refresh.** Provider OAuth tokens (Claude, Codex) expire and the upstream APIs return errors, which the bundled scripts surface as a non-zero exit. When that happens — or when a script returns an empty `windows: []` on a provider that previously had non-empty windows — the runner shells out to the optional `auth_refresh_command`, lets the CLI's own auth code refresh the token, then retries `quota_script` once. The runner does not implement OAuth itself; it delegates to whichever command the CLI exposes (`claude auth status`, `codex login status`, etc.). The refresh command runs with closed stdin, a 15-second timeout, and stdout discarded; only its exit code matters. If both the refresh and the retry fail, the failure is recorded in the resulting `RefreshOutcome` so it surfaces in diagnostics.
 

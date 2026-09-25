@@ -20,6 +20,7 @@ pub(crate) struct UsageRow {
 pub(crate) enum RowState {
     HasWindows,
     NoUsageApi,
+    Unmetered,
     Error(String),
     InFlight,
     NoWindows,
