@@ -1,5 +1,6 @@
-//! Frozen v3 importer and private keyed account-effect and route admission.
-//! The v2 Index deliberately refuses this manifest. Provider K remains closed.
+//! Frozen v3 importer and private keyed admission. The v2 Index deliberately
+//! refuses this manifest. Physical writers require the admitted generation,
+//! a selected route receipt, and their separate private broker switches.
 use super::*;
 use chrono::Utc;
 use keyed_store::{Change, KeyedAccountStore};
@@ -63,6 +64,7 @@ pub(crate) struct KeyedGeneration {
     root: PathBuf,
     storage: PathBuf,
     source: Option<PathBuf>,
+    provider_k_lag_allowed: bool,
 }
 
 impl KeyedGeneration {
@@ -84,6 +86,7 @@ impl KeyedGeneration {
             root: root.to_owned(),
             storage,
             source: None,
+            provider_k_lag_allowed: false,
         })
     }
 
@@ -103,16 +106,35 @@ impl KeyedGeneration {
     /// The broker holds this generation's lifetime lease before socket bind.
     /// A fresh retained census is compared with every keyed live projection;
     /// a late physical K/Q or an incompatible writer requires another frozen
-    /// rebuild. This mode does not authorize a new physical provider K.
+    /// rebuild. This readback mode does not authorize a provider K.
     pub(crate) fn admit_provider_readback(
         root: &Path,
         lease: &AdmissionLease,
         source: &Path,
     ) -> Result<Self> {
+        Self::admit_with_provider_k_lag(root, lease, source, false)
+    }
+
+    #[cfg(feature = "age319-private-broker-fixture")]
+    pub(crate) fn admit_provider_writer(
+        root: &Path,
+        lease: &AdmissionLease,
+        source: &Path,
+    ) -> Result<Self> {
+        Self::admit_with_provider_k_lag(root, lease, source, true)
+    }
+
+    fn admit_with_provider_k_lag(
+        root: &Path,
+        lease: &AdmissionLease,
+        source: &Path,
+        allow_k_lag: bool,
+    ) -> Result<Self> {
         if lease.path != root.canonicalize()?.join("index-v1/admission.lock") {
             return Err(IndexError::Conflict("v3 admission lease differs"));
         }
         let mut generation = Self::open(root)?;
+        generation.provider_k_lag_allowed = allow_k_lag;
         generation.route_projection().reconcile_route_pending()?;
         generation.verify_retained(source)?;
         generation.source = Some(source.canonicalize()?);
@@ -694,6 +716,271 @@ impl KeyedGeneration {
             .get("pending", &format!("grant:{id}"))?
             .map(|value| serde_json::from_value(value).map_err(|error| corrupt(error.to_string())))
             .transpose()
+    }
+
+    pub(crate) fn ensure_provider_account(
+        &self,
+        account: &str,
+        model: &str,
+        config: &str,
+    ) -> Result<()> {
+        self.ensure_quota_account(account, model, config)
+    }
+
+    /// The route lock is held by the broker from eligibility recheck through
+    /// the physical K. Pending debt is published in the same account revision
+    /// as the grant, before the child can be created.
+    pub(crate) fn announce_provider(
+        &self,
+        account: &str,
+        id: &str,
+        grant: ProviderGrant,
+        model: &str,
+        config: &str,
+        expected_revision: u64,
+    ) -> Result<u64> {
+        self.check_current()?;
+        let store = self.account(account)?;
+        let (revision, pending_count, mut values) =
+            store.read_many(&[("account", "summary"), ("grant", id)])?;
+        if values.pop().unwrap().is_some() || revision != expected_revision || pending_count != 0 {
+            return Err(IndexError::Conflict(
+                "v3 provider account changed before announcement",
+            ));
+        }
+        let mut summary = values
+            .pop()
+            .unwrap()
+            .ok_or(IndexError::RebuildRequired("v3 provider summary absent"))?;
+        if summary["physical_key"].as_str() != Some(account)
+            || summary["pending_count"].as_u64() != Some(0)
+            || summary["unknown_marker_scope"].as_bool() != Some(false)
+            || grant.consumed_k.is_some()
+            || grant.certified_q.is_some()
+        {
+            return Err(IndexError::Conflict(
+                "v3 provider announcement has debt or invalid scope",
+            ));
+        }
+        let candidate = grant
+            .candidate
+            .clone()
+            .ok_or(IndexError::Conflict("v3 provider candidate absent"))?;
+        grant.grant.require_present(&self.root)?;
+        candidate.require_present(&self.root)?;
+        let pending = PendingHead {
+            announcement: grant.grant.clone(),
+            candidate: Some(candidate),
+            physical_k: None,
+            source: None,
+            model: Some(model.into()),
+            config_sha256: Some(config.into()),
+            decision_handoff: grant.decision_handoff.clone(),
+            kind: "provider".into(),
+        };
+        summary["grant_count"] = summary["grant_count"]
+            .as_u64()
+            .ok_or_else(|| corrupt("v3 grant count absent"))?
+            .checked_add(1)
+            .ok_or(IndexError::Conflict("v3 grant count overflow"))?
+            .into();
+        summary["pending_count"] = 1.into();
+        let next = store.commit(
+            revision,
+            vec![
+                change("grant", id, &grant)?,
+                change("pending", &format!("grant:{id}"), &pending)?,
+                change("account", "summary", &summary)?,
+            ],
+        )?;
+        if store.summary()? != (next, 1) {
+            return Err(corrupt("v3 provider announcement readback differs"));
+        }
+        self.check_current()?;
+        Ok(next)
+    }
+
+    pub(crate) fn record_provider_k(
+        &self,
+        account: &str,
+        id: &str,
+        k: Artifact,
+        expected_revision: u64,
+    ) -> Result<()> {
+        self.check_current()?;
+        let store = self.account(account)?;
+        let (revision, pending_count, mut values) =
+            store.read_many(&[("grant", id), ("pending", &format!("grant:{id}"))])?;
+        let mut pending: PendingHead = typed(values.pop().unwrap())?
+            .ok_or(IndexError::Conflict("v3 provider pending debt absent"))?;
+        let mut grant: ProviderGrant = typed(values.pop().unwrap())?
+            .ok_or(IndexError::Conflict("v3 provider grant absent"))?;
+        if revision != expected_revision
+            || pending_count == 0
+            || pending.announcement != grant.grant
+            || pending.kind != "provider"
+            || grant.consumed_k.is_some()
+            || pending.physical_k.is_some()
+            || grant.certified_q.is_some()
+        {
+            return Err(IndexError::Conflict(
+                "v3 provider K revision or debt changed",
+            ));
+        }
+        k.require_present(&self.root)?;
+        #[cfg(feature = "age319-private-broker-fixture")]
+        if std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_FAIL_PROVIDER_POST_K_CAS_V3_V1")
+            .is_some()
+        {
+            return Err(IndexError::Conflict(
+                "fixture v3 provider post-K CAS failure",
+            ));
+        }
+        grant.consumed_k = Some(k.clone());
+        pending.physical_k = Some(k);
+        let mut summary = store
+            .get("account", "summary")?
+            .ok_or(IndexError::RebuildRequired("v3 provider summary absent"))?;
+        summary["observed_invocations"] = summary["observed_invocations"]
+            .as_u64()
+            .ok_or_else(|| corrupt("v3 invocation count absent"))?
+            .checked_add(1)
+            .ok_or(IndexError::Conflict("v3 invocation count overflow"))?
+            .into();
+        store.commit(
+            revision,
+            vec![
+                change("grant", id, &grant)?,
+                change("pending", &format!("grant:{id}"), &pending)?,
+                change("account", "summary", &summary)?,
+            ],
+        )?;
+        self.check_current()?;
+        Ok(())
+    }
+
+    pub(crate) fn settle_provider(
+        &self,
+        account: &str,
+        id: &str,
+        q: PhysicalQ,
+        outcome: &str,
+        model: &str,
+        config: &str,
+    ) -> Result<()> {
+        self.check_current()?;
+        q.verify(&self.root)?;
+        let terminal = q
+            .terminal
+            .as_ref()
+            .ok_or(IndexError::Conflict("v3 provider terminal absent"))?;
+        let terminal_value: serde_json::Value = terminal.read_json(&self.root)?;
+        if terminal_value["grant_id"].as_str() != Some(id)
+            || terminal_value["selection"]["account_identity"].as_str() != Some(account)
+            || terminal_value["selection"]["model"].as_str() != Some(model)
+            || terminal_value["selection"]["config_sha256"].as_str() != Some(config)
+            || terminal_value["physical_q_sha256"].as_str() != Some(q.q.sha256.as_str())
+            || terminal_value["physical_q_unix_nanos"].as_u64()
+                != u64::try_from(q.completed_unix_nanos).ok()
+            || terminal_value["outcome"].as_str() != Some(outcome)
+        {
+            return Err(corrupt(
+                "v3 provider typed terminal differs from Q or scope",
+            ));
+        }
+        let store = self.account(account)?;
+        let capacity_key = keyed(&(model, config))?;
+        let (revision, pending_count, mut values) = store.read_many(&[
+            ("account", "summary"),
+            ("grant", id),
+            ("pending", &format!("grant:{id}")),
+            ("quota-marker", "account"),
+            ("auth-marker", "account"),
+            ("model-capacity", &capacity_key),
+        ])?;
+        let capacity: Option<MarkerHead> = typed(values.pop().unwrap())?;
+        let auth: Option<MarkerHead> = typed(values.pop().unwrap())?;
+        let quota: Option<MarkerHead> = typed(values.pop().unwrap())?;
+        let pending: Option<PendingHead> = typed(values.pop().unwrap())?;
+        let mut grant: ProviderGrant = typed(values.pop().unwrap())?
+            .ok_or(IndexError::Conflict("v3 provider grant absent"))?;
+        let mut summary = values
+            .pop()
+            .unwrap()
+            .ok_or(IndexError::RebuildRequired("v3 provider summary absent"))?;
+        if grant.certified_q.as_ref() == Some(&q) && pending.is_none() {
+            return Ok(());
+        }
+        if grant.certified_q.is_some()
+            || grant.consumed_k.as_ref() != Some(&q.physical_k)
+            || pending.as_ref().is_none_or(|p| {
+                p.announcement != grant.grant
+                    || p.physical_k.as_ref() != Some(&q.physical_k)
+                    || p.model.as_deref() != Some(model)
+                    || p.config_sha256.as_deref() != Some(config)
+                    || p.kind != "provider"
+            })
+            || pending_count == 0
+            || summary["pending_count"].as_u64() != Some(pending_count)
+            || summary["physical_key"].as_str() != Some(account)
+        {
+            return Err(IndexError::Conflict("v3 provider Q/K/debt changed"));
+        }
+        grant.certified_q = Some(q.clone());
+        summary["pending_count"] = (pending_count - 1).into();
+        let mut changes = vec![
+            change("grant", id, &grant)?,
+            Change {
+                class: "pending".into(),
+                key: format!("grant:{id}"),
+                value: None,
+            },
+        ];
+        if outcome != "clean" {
+            summary["failure_count"] = summary["failure_count"]
+                .as_u64()
+                .ok_or_else(|| corrupt("v3 failure count absent"))?
+                .checked_add(1)
+                .ok_or(IndexError::Conflict("v3 failure count overflow"))?
+                .into();
+            changes.push(change("failure", id, &serde_json::json!({"q": q, "outcome": outcome, "completed_unix_nanos": q.completed_unix_nanos}))?);
+        }
+        let marker = MarkerHead {
+            q: q.clone(),
+            model: model.into(),
+            config_sha256: config.into(),
+            outcome: outcome.into(),
+        };
+        for (class, old, matches) in [
+            ("quota-marker", quota, outcome == "quota_rejected"),
+            ("auth-marker", auth, outcome == "auth_rejected"),
+            ("model-capacity", capacity, outcome == "model_at_capacity"),
+        ] {
+            if matches
+                && old
+                    .as_ref()
+                    .is_none_or(|m| m.q.completed_unix_nanos <= q.completed_unix_nanos)
+            {
+                let key = if class == "model-capacity" {
+                    capacity_key.as_str()
+                } else {
+                    "account"
+                };
+                changes.push(change(class, key, &marker)?);
+                let times = &mut summary["marker_times"];
+                let field = match class {
+                    "quota-marker" => "quota_rejection_nanos",
+                    "auth-marker" => "auth_rejection_nanos",
+                    _ => "model_capacity_nanos",
+                };
+                let prior = times[field].as_i64().unwrap_or(i64::MIN);
+                times[field] = prior.max(q.completed_unix_nanos).into();
+            }
+        }
+        changes.push(change("account", "summary", &summary)?);
+        store.commit(revision, changes)?;
+        self.check_current()?;
+        Ok(())
     }
 
     /// Find a settled auth source by the physical account and command/env
@@ -2035,12 +2322,32 @@ impl KeyedGeneration {
                 return Err(IndexError::RebuildRequired("v3 account summary differs"));
             }
             let mut failure_count = 0_u64;
+            let mut lagging_provider_k = std::collections::HashSet::<String>::new();
             for (id, grant) in &account.grants {
                 expected_keys.insert(("grant".to_owned(), id.clone()));
-                if store.get("grant", id)?
-                    != Some(serde_json::to_value(grant).map_err(|e| corrupt(e.to_string()))?)
-                {
-                    return Err(corrupt("v3 retained provider grant differs"));
+                let actual: ProviderGrant = typed(store.get("grant", id)?)?
+                    .ok_or_else(|| corrupt("v3 retained provider grant absent"))?;
+                if actual != *grant {
+                    // A physical K whose keyed CAS failed cannot have released
+                    // a child. Keep its earlier announcement and pending debt
+                    // on restart; never infer a second K from this lag.
+                    if !self.provider_k_lag_allowed
+                        || actual.decision_handoff != grant.decision_handoff
+                        || actual.grant != grant.grant
+                        || actual.candidate != grant.candidate
+                        || actual.consumed_k.is_some()
+                        || actual.certified_q.is_some()
+                        || grant.consumed_k.is_none()
+                        || grant.certified_q.is_some()
+                    {
+                        return Err(corrupt("v3 retained provider grant differs"));
+                    }
+                    grant
+                        .consumed_k
+                        .as_ref()
+                        .unwrap()
+                        .require_present(&self.root)?;
+                    lagging_provider_k.insert(id.clone());
                 }
                 let uncertain = grant
                     .consumed_k
@@ -2150,8 +2457,26 @@ impl KeyedGeneration {
                     continue;
                 }
                 expected_keys.insert(("pending".to_owned(), id.clone()));
-                if store.get("pending", id)?
-                    != Some(serde_json::to_value(pending).map_err(|e| corrupt(e.to_string()))?)
+                let actual: PendingHead = typed(store.get("pending", id)?)?
+                    .ok_or_else(|| corrupt("v3 retained pending source absent"))?;
+                if id
+                    .strip_prefix("grant:")
+                    .is_some_and(|grant| lagging_provider_k.contains(grant))
+                {
+                    if actual.announcement != pending.announcement
+                        || actual.candidate != pending.candidate
+                        || actual.physical_k.is_some()
+                        || pending.physical_k.is_none()
+                        || actual.source != pending.source
+                        || actual.model != pending.model
+                        || actual.config_sha256 != pending.config_sha256
+                        || actual.decision_handoff != pending.decision_handoff
+                        || actual.kind != pending.kind
+                    {
+                        return Err(corrupt("v3 lagging provider K pending debt differs"));
+                    }
+                } else if serde_json::to_value(&actual).map_err(|e| corrupt(e.to_string()))?
+                    != serde_json::to_value(pending).map_err(|e| corrupt(e.to_string()))?
                 {
                     return Err(corrupt("v3 retained pending source differs"));
                 }
@@ -2312,7 +2637,8 @@ impl KeyedGeneration {
             }
             let expected_summary = serde_json::json!({
                 "physical_key": key,
-                "observed_invocations": account.observed_invocations,
+                "observed_invocations": account.observed_invocations.checked_sub(lagging_provider_k.len() as u64)
+                    .ok_or_else(|| corrupt("v3 lagging provider invocation count underflow"))?,
                 "marker_times": account.markers,
                 "failure_count": failure_count,
                 "unknown_marker_scope": head.unknown_marker_scope,
@@ -2804,7 +3130,9 @@ mod tests {
         serde_json::json!({
             "physical_key": "physical", "pending_count": pending,
             "observed_invocations": 3, "failure_count": 0,
-            "unknown_marker_scope": false
+            "unknown_marker_scope": false, "grant_count": 0,
+            "effect_count": 0, "source_count": 0,
+            "marker_times": MarkerTimes::default()
         })
     }
 
@@ -2939,6 +3267,14 @@ mod tests {
                 ],
             )
             .unwrap();
+        let mut summary = route_summary(0);
+        summary["source_count"] = (history as u64 + 1).into();
+        revision = store
+            .commit(
+                revision,
+                vec![change("account", "summary", &summary).unwrap()],
+            )
+            .unwrap();
         (
             temp,
             KeyedGeneration {
@@ -2946,6 +3282,7 @@ mod tests {
                 root,
                 storage,
                 source: None,
+                provider_k_lag_allowed: false,
             },
             key,
             revision,
@@ -3407,6 +3744,180 @@ mod tests {
     fn artifact(root: &Path, name: &str, bytes: &[u8]) -> Artifact {
         fs::write(root.join(name), bytes).unwrap();
         Artifact::from_existing(root, Path::new(name)).unwrap()
+    }
+
+    #[test]
+    fn v3_provider_route_grant_k_q_io_stays_exact_with_hundreds_of_sources() {
+        let run = |history, outcome: &str| {
+            let (_temp, generation, source, _) = route_fixture(history);
+            let root = generation.root.as_path();
+            let store = generation.account("physical").unwrap();
+            let measure = |label, f: &mut dyn FnMut()| {
+                let guard = ReaderIoGuard::start(label);
+                let (_, keyed) = super::super::keyed_store::measured(f);
+                drop(guard);
+                (keyed, last_reader_io().unwrap())
+            };
+            let route = measure("provider-route-read", &mut || {
+                assert!(matches!(
+                    generation
+                        .route_facts(
+                            "physical",
+                            Some(&source),
+                            "model-a",
+                            "config",
+                            1_800_000_100
+                        )
+                        .unwrap(),
+                    RouteEligibility::Eligible { .. }
+                ));
+            });
+            let revision = store.summary().unwrap().0;
+            let mut announced = 0;
+            let announce = measure("provider-announcement", &mut || {
+                crate::linux_main::fresh_provider::durable_new_bytes(
+                    root,
+                    "provider-grant.json",
+                    b"grant",
+                )
+                .unwrap();
+                crate::linux_main::fresh_provider::durable_new_bytes(
+                    root,
+                    "provider-candidate.json",
+                    b"candidate",
+                )
+                .unwrap();
+                let grant = ProviderGrant {
+                    decision_handoff: "handoff".into(),
+                    grant: Artifact::from_existing(root, Path::new("provider-grant.json")).unwrap(),
+                    candidate: Some(
+                        Artifact::from_existing(root, Path::new("provider-candidate.json"))
+                            .unwrap(),
+                    ),
+                    consumed_k: None,
+                    certified_q: None,
+                };
+                announced = generation
+                    .announce_provider(
+                        "physical",
+                        "new-provider",
+                        grant,
+                        "model-a",
+                        "config",
+                        revision,
+                    )
+                    .unwrap();
+            });
+            assert_eq!(store.summary().unwrap().1, 1);
+            let mut k_artifact = None;
+            let k = measure("provider-K-CAS", &mut || {
+                crate::linux_main::fresh_provider::durable_new_bytes(root, "provider-k.json", b"K")
+                    .unwrap();
+                let physical_k =
+                    Artifact::from_existing(root, Path::new("provider-k.json")).unwrap();
+                generation
+                    .record_provider_k("physical", "new-provider", physical_k.clone(), announced)
+                    .unwrap();
+                k_artifact = Some(physical_k);
+            });
+            let settled = measure("provider-Q-terminal", &mut || {
+                crate::linux_main::fresh_provider::durable_new_bytes(root, "provider-q.json", b"Q")
+                    .unwrap();
+                let q_artifact =
+                    Artifact::from_existing(root, Path::new("provider-q.json")).unwrap();
+                let terminal_bytes = serde_json::to_vec(&serde_json::json!({
+                    "grant_id": "new-provider", "selection": {"account_identity": "physical", "model": "model-a", "config_sha256": "config"},
+                    "physical_q_sha256": q_artifact.sha256, "physical_q_unix_nanos": 1_800_000_000_000_000_000u64,
+                    "outcome": outcome,
+                })).unwrap();
+                crate::linux_main::fresh_provider::durable_new_bytes(
+                    root,
+                    "provider-terminal.json",
+                    &terminal_bytes,
+                )
+                .unwrap();
+                let q = PhysicalQ {
+                    physical_k: k_artifact.clone().unwrap(),
+                    q: q_artifact,
+                    terminal: Some(
+                        Artifact::from_existing(root, Path::new("provider-terminal.json")).unwrap(),
+                    ),
+                    completed_unix_nanos: 1_800_000_000_000_000_000,
+                };
+                generation
+                    .settle_provider("physical", "new-provider", q, outcome, "model-a", "config")
+                    .unwrap();
+            });
+            assert_eq!(store.summary().unwrap().1, 0);
+            assert_eq!(
+                generation
+                    .route_facts(
+                        "physical",
+                        Some(&source),
+                        "model-a",
+                        "config",
+                        1_800_000_100
+                    )
+                    .unwrap(),
+                RouteEligibility::Excluded
+            );
+            if outcome == "model_at_capacity" {
+                assert!(matches!(
+                    generation
+                        .route_facts(
+                            "physical",
+                            Some(&source),
+                            "model-b",
+                            "config",
+                            1_800_000_100
+                        )
+                        .unwrap(),
+                    RouteEligibility::Eligible { .. }
+                ));
+                assert!(
+                    store
+                        .get("model-capacity", &keyed(&("model-a", "config")).unwrap())
+                        .unwrap()
+                        .is_some()
+                );
+            } else {
+                assert_eq!(
+                    generation
+                        .route_facts(
+                            "physical",
+                            Some(&source),
+                            "model-b",
+                            "config",
+                            1_800_000_100
+                        )
+                        .unwrap(),
+                    RouteEligibility::Excluded
+                );
+            }
+            (route, announce, k, settled)
+        };
+        let one = run(1, "model_at_capacity");
+        let many = run(205, "model_at_capacity");
+        for (name, a, b) in [
+            ("route", &one.0, &many.0),
+            ("announce", &one.1, &many.1),
+            ("K", &one.2, &many.2),
+            ("Q", &one.3, &many.3),
+        ] {
+            eprintln!("v3 provider {name} keyed/physical 1={a:?} 205={b:?}");
+            assert_eq!(a.0.open_attempts, b.0.open_attempts);
+            assert_eq!(a.1.open_attempts, b.1.open_attempts);
+            assert_eq!(
+                a.0.directory_entries
+                    + a.1.directory_entries
+                    + b.0.directory_entries
+                    + b.1.directory_entries,
+                0
+            );
+            assert!(b.0.bytes_parsed <= a.0.bytes_parsed + 256);
+            assert!(b.0.bytes_written <= a.0.bytes_written + 256);
+        }
+        run(1, "quota_rejected");
     }
 
     #[test]

@@ -53,6 +53,7 @@ pub(super) fn validate_candidate(
         || candidate.account.is_empty()
         || candidate.account_identity.is_empty()
         || !hash_shape(&candidate.plan_sha256)
+        || !hash_shape(&candidate.environment_sha256)
         || !hash_shape(&candidate.config_sha256)
         || candidate.total == 0
         || candidate.index >= candidate.total
@@ -886,6 +887,7 @@ mod tests {
                 total: 1,
                 pin: None,
                 plan_sha256: "a".repeat(64),
+                environment_sha256: "0".repeat(64),
                 quota_script: pool.account_effects[0].0.clone(),
                 auth_refresh_command: pool.account_effects[0].1.clone(),
                 terminal_recognizer: FreshTerminalRecognizer::for_provider(

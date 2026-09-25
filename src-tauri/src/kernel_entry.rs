@@ -1031,7 +1031,7 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
             account: pool.model.providers[index].name.clone(),
             index,
             kind: FreshAccountEffectKind::QuotaFirst,
-            environment: environment.clone(),
+            environment: prepared[index].plan.environment.clone(),
         };
         let first = private_run_account_effect(&socket, &authority.receipt.handoff_id, &effect)?;
         quota_receipts.push((
@@ -1094,6 +1094,7 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
         route_mode.as_str(),
         "normal_model_provider_v3_quota_route_reply_loss"
             | "normal_model_provider_v3_quota_route_manual_route_reply_loss"
+            | "normal_model_provider_v3_quota_route_manual_physical_route_reply_loss"
     ) {
         if first.is_ok() {
             return Err("v3 route fixture did not lose first reply".into());
@@ -1205,7 +1206,74 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
     {
         return Err("fresh route readback differs from configured pool before K".into());
     }
-    let selected_plan = prepared.swap_remove(selected.index);
+    let mut selected_plan = prepared.swap_remove(selected.index);
+    if route_mode.starts_with("normal_model_provider_v3_quota_route_physical")
+        || route_mode.starts_with("normal_model_provider_v3_quota_route_manual_physical")
+    {
+        let gate = std::path::PathBuf::from(
+            std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                .map_err(|e| e.to_string())?,
+        );
+        let expected = serde_json::json!({
+            "argv": selected_plan.plan.argv,
+            "cwd": selected_plan.plan.cwd,
+            "env": selected_plan.plan.environment.iter().cloned().collect::<std::collections::BTreeMap<_, _>>(),
+            "account_identity": selected.account_identity,
+        });
+        std::fs::write(
+            gate.join("v3-provider-expected-plan.json"),
+            serde_json::to_vec(&expected).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    if route_mode.ends_with("physical_bad_plan") {
+        selected_plan
+            .plan
+            .argv
+            .push("--changed-after-selection".into());
+    }
+    if route_mode.ends_with("physical_bad_actor") {
+        let pinned = private_pin_plan(&selected_plan.plan)?;
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return Err(format!(
+                "v3 bad actor fixture fork: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if pid == 0 {
+            let refused = protocol::private_fresh_provider_at(
+                &socket,
+                &authority.receipt.d_key,
+                b'5',
+                Some(pinned.descriptors()),
+            )
+            .is_err();
+            unsafe { libc::_exit(if refused { 0 } else { 1 }) };
+        }
+        let mut status = 0;
+        if unsafe { libc::waitpid(pid, &mut status, 0) } != pid
+            || !libc::WIFEXITED(status)
+            || libc::WEXITSTATUS(status) != 0
+        {
+            return Err("v3 changed actor was admitted to provider K".into());
+        }
+        return Err("v3 changed actor correctly refused before provider K".into());
+    }
+    if route_mode.ends_with("physical_source_changed") {
+        let gate = std::path::PathBuf::from(
+            std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                .map_err(|e| e.to_string())?,
+        );
+        std::fs::write(gate.join("v3-provider-ready"), b"yes").map_err(|e| e.to_string())?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !gate.join("v3-provider-continue").exists() {
+            if std::time::Instant::now() >= deadline {
+                return Err("v3 provider source gate expired".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
     let mut backend = PrivateFreshBroker {
         authority,
         grant_id: None,
