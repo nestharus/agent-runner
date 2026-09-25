@@ -14,6 +14,8 @@ const FRESH_HANDOFF_QUEUE_CAPACITY: usize = 8;
 const RELEASED_HANDOFF_REPLY_CAPACITY: usize = 1;
 
 const REQUEST_RECEIVE_BUFFER_BYTES: usize = 64 * 1024;
+#[cfg(feature = "age319-private-broker-fixture")]
+const SYNC_STREAM_VERIFY_BUFFER_BYTES: usize = 64 * 1024;
 
 #[cfg(feature = "age319-private-broker-fixture")]
 #[path = "fresh_provider.rs"]
@@ -66,6 +68,8 @@ use std::io::{self, Write};
 #[cfg(feature = "age319-private-broker-fixture")]
 use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(feature = "age319-private-broker-fixture")]
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -84,6 +88,41 @@ fn private_fixture() -> bool {
             .ok()
             .is_some_and(|map| map.split_ascii_whitespace().nth(2) == Some("1"))
         && std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1").is_some()
+}
+#[cfg(feature = "age319-private-broker-fixture")]
+fn open_exact_sync_stream(
+    directory: &Path,
+    grant: &str,
+    suffix: &str,
+    len: u64,
+    hash: &str,
+) -> io::Result<File> {
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(directory.join(format!("{grant}.{suffix}")))?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.uid() != 0 || meta.nlink() != 1 || meta.len() != len {
+        return Err(io::Error::other("sync stream custody changed"));
+    }
+    let mut digest = Sha256::new();
+    let mut count = 0u64;
+    let mut buffer = [0u8; SYNC_STREAM_VERIFY_BUFFER_BYTES];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        count = count
+            .checked_add(read as u64)
+            .ok_or_else(|| io::Error::other("sync stream length overflow"))?;
+        digest.update(&buffer[..read]);
+    }
+    if count != len || format!("{:x}", digest.finalize()) != hash || file.metadata()?.len() != len {
+        return Err(io::Error::other("sync stream hash changed"));
+    }
+    file.seek(SeekFrom::Start(0))?;
+    Ok(file)
 }
 #[cfg(not(feature = "age319-private-broker-fixture"))]
 fn private_fixture() -> bool {
@@ -426,7 +465,7 @@ fn recv_request(
         #[cfg(feature = "age319-private-broker-fixture")]
         b'X' => read == 34,
         #[cfg(feature = "age319-private-broker-fixture")]
-        b'%' | b'!' => read == 33,
+        b'%' | b'!' | b'v' | b'u' => read == 33,
         #[cfg(feature = "age319-private-broker-fixture")]
         b'^' => read == 65,
         // Legacy E has no body; fresh Bash E carries a request UUID on its
@@ -559,7 +598,7 @@ fn recv_request(
             ordinary_k_digest: None,
         },
         #[cfg(feature = "age319-private-broker-fixture")]
-        b'%' | b'!' | b'8' | b'9' => RequestPayload::FreshBashChildRequest {
+        b'%' | b'!' | b'8' | b'9' | b'v' | b'u' => RequestPayload::FreshBashChildRequest {
             request_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
             listener_policy: None,
             ordinary_command: None,
@@ -4235,11 +4274,12 @@ fn serve_fresh_v30_at(
                     ))
                 }
                 #[cfg(not(feature = "age319-private-broker-fixture"))]
-                b'C' | b'X' | b'c' | b'E' | b'O' | b'^' => Err(io::Error::other(
+                b'C' | b'X' | b'c' | b'E' | b'O' | b'^' | b'v' | b'u' => Err(io::Error::other(
                     "fresh Bash child/work/result closed until normal root grant and physical result custody",
                 )),
                 #[cfg(feature = "age319-private-broker-fixture")]
-                b'C' | b'X' | b'c' | b'E' | b'O' | b'%' | b'!' | b'8' | b'9' | b'^'
+                b'C' | b'X' | b'c' | b'E' | b'O' | b'%' | b'!' | b'8' | b'9' | b'^' | b'v'
+                | b'u'
                     if !matches!(operation, b'8' | b'9')
                         || matches!(&payload, RequestPayload::FreshBashChildRequest { .. }) =>
                 {
@@ -4341,6 +4381,47 @@ fn serve_fresh_v30_at(
                         }
                     }
                     match operation {
+                        b'v' | b'u' => {
+                            diagnostic_stage = "bash_sync_publication";
+                            let (receipt, first) = if operation == b'v' {
+                                lane.begin_private_bash_sync_publication(&request_id, &recipient)
+                                    .map_err(io::Error::other)?
+                            } else {
+                                (
+                                    lane.read_private_bash_sync_publication(
+                                        &request_id,
+                                        &recipient,
+                                    )
+                                    .map_err(io::Error::other)?
+                                    .ok_or_else(|| {
+                                        io::Error::other("sync publication reservation absent")
+                                    })?,
+                                    false,
+                                )
+                            };
+                            if first {
+                                let stdout = open_exact_sync_stream(
+                                    &directory,
+                                    &receipt.event.physical_grant_id,
+                                    "stdout",
+                                    receipt.event.stdout_len,
+                                    &receipt.event.stdout_sha256,
+                                )?;
+                                let stderr = open_exact_sync_stream(
+                                    &directory,
+                                    &receipt.event.physical_grant_id,
+                                    "stderr",
+                                    receipt.event.stderr_len,
+                                    &receipt.event.stderr_sha256,
+                                )?;
+                                provider_output_files = Some([stdout, stderr]);
+                            }
+                            Ok(format!(
+                                "fresh-bash-sync-{} {}\n",
+                                if first { "begin" } else { "unknown" },
+                                serde_json::to_string(&receipt)?
+                            ))
+                        }
                         b'C' | b'X' | b'c' => {
                             if matches!(operation, b'C' | b'X') {
                                 diagnostic_stage = "bash_child_selection";
@@ -5304,6 +5385,14 @@ fn serve_fresh_v30_at(
             format!("error {wire}\n")
         });
         #[cfg(feature = "age319-private-broker-fixture")]
+        if diagnostic_opcode == b'v'
+            && provider_output_files.is_some()
+            && std::env::var_os("AGE319_PRIVATE_SYNC_PARTIAL_SOCKET_REPLY_V1").is_some()
+        {
+            let _ = stream.write_all(&response.as_bytes()[..response.len().min(16)]);
+            continue;
+        }
+        #[cfg(feature = "age319-private-broker-fixture")]
         if let Some(files) = provider_output_files {
             let fds = [files[0].as_raw_fd(), files[1].as_raw_fd()];
             let mut iov = libc::iovec {
@@ -5323,7 +5412,13 @@ fn serve_fresh_v30_at(
                 (*header).cmsg_type = libc::SCM_RIGHTS;
                 (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(&fds) as _) as usize;
                 std::ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(header).cast(), 2);
-                libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL);
+                let sent = libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL);
+                if sent != response.len() as isize {
+                    eprintln!(
+                        "oulipoly broker descriptor reply incomplete: opcode={} sent={sent}",
+                        diagnostic_opcode as char
+                    );
+                }
             }
             continue;
         }

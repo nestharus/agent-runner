@@ -60,7 +60,7 @@ pub use broker_authority::{
 #[cfg(target_os = "linux")]
 pub use fresh_lane::{
     FreshAckDelegation, FreshBashChild, FreshBashListenerPolicy, FreshBashPrivateResult,
-    FreshBashSourceEvent, FreshDeliveryReadback, FreshDeliverySubmission,
+    FreshBashSourceEvent, FreshBashSyncPublication, FreshDeliveryReadback, FreshDeliverySubmission,
     FreshNormalWorkPreparation, FreshPhysicalTerminal, FreshRecipientIdentity,
     FreshReleasedHandoff, FreshRootCallerResult, FreshRootEffect, FreshRootEffectState,
     FreshRootTerminalExecution, FreshRootTerminalReadback, FreshRootWorkIntent, FreshV30Lane,

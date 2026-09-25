@@ -79,7 +79,8 @@ impl Drop for SnapshotRestore {
 fn inner() {
     let mode = std::env::var("AGE319_PRIVATE_JOIN_MODE").unwrap_or_else(|_| "help".into());
     let provider_mode = mode.starts_with("normal_model_provider");
-    let caller_mode = mode.starts_with("normal_model_provider_caller_");
+    let caller_mode = mode.starts_with("normal_model_provider_caller_")
+        || mode == "normal_model_provider_bash_ordinary_sync_parent_output";
     let path_mode = matches!(
         mode.as_str(),
         "normal_model_provider_path" | "normal_model_provider_prefix"
@@ -121,6 +122,7 @@ fn inner() {
             | "normal_model_provider_bash_causal_notify_debt"
             | "normal_model_provider_bash_causal_notify_row_debt"
             | "normal_model_provider_bash_ordinary_sync"
+            | "normal_model_provider_bash_ordinary_sync_parent_output"
             | "normal_model_provider_bash_ordinary_async"
             | "normal_model_provider_bash_ordinary_refuse"
             | "normal_model_provider_bash_ordinary_loss"
@@ -130,6 +132,16 @@ fn inner() {
             | "normal_model_provider_bash_ordinary_failure"
             | "normal_model_provider_bash_ordinary_cancel"
             | "normal_model_provider_bash_ordinary_parent_tamper"
+            | "normal_model_provider_bash_ordinary_sync_reply_loss"
+            | "normal_model_provider_bash_ordinary_sync_partial"
+            | "normal_model_provider_bash_ordinary_sync_repeat"
+            | "normal_model_provider_bash_ordinary_sync_large"
+            | "normal_model_provider_bash_ordinary_sync_signal"
+            | "normal_model_provider_bash_ordinary_sync_tamper"
+            | "normal_model_provider_bash_ordinary_sync_w_debt"
+            | "normal_model_provider_bash_ordinary_sync_socket_partial"
+            | "normal_model_provider_bash_ordinary_sync_post_tamper"
+            | "normal_model_provider_bash_ordinary_sync_encode_tamper"
             | "normal_model_provider_reply_loss"
             | "normal_model_provider_q_reply_loss"
             | "normal_model_provider_restart"
@@ -282,7 +294,7 @@ fn inner() {
             format!("{marker}, \"--binary\"")
         } else if mode == "normal_model_provider_caller_nonzero" {
             format!("{marker}, \"--fail-clean\"")
-        } else if caller_mode {
+        } else if caller_mode && mode != "normal_model_provider_bash_ordinary_sync_parent_output" {
             format!("{marker}, \"--clean\"")
         } else {
             marker.clone()
@@ -499,8 +511,13 @@ fn inner() {
         )
         .envs(
             (mode == "normal_model_provider_bash_causal_w_debt"
-                || mode == "normal_model_provider_bash_causal_notify_w_debt")
+                || mode == "normal_model_provider_bash_causal_notify_w_debt"
+                || mode == "normal_model_provider_bash_ordinary_sync_w_debt")
                 .then_some(("AGE319_PRIVATE_SOURCE_W_CAPTURE_ONLY_V1", "1")),
+        )
+        .envs(
+            (mode == "normal_model_provider_bash_ordinary_sync_socket_partial")
+                .then_some(("AGE319_PRIVATE_SYNC_PARTIAL_SOCKET_REPLY_V1", "1")),
         )
         .envs(
             (mode == "normal_model_provider_bash_causal_notify_debt")
@@ -610,6 +627,7 @@ fn inner() {
                         | "normal_model_provider_caller_nonzero"
                         | "normal_model_provider_caller_partial"
                         | "normal_model_provider_caller_lost"
+                        | "normal_model_provider_bash_ordinary_sync_parent_output"
                         | "normal_model_provider_bash_causal"
                         | "normal_model_provider_bash_causal_success"
                         | "normal_model_provider_bash_causal_notify_ack"
@@ -668,6 +686,13 @@ fn inner() {
                             .then_some(("AGE319_PRIVATE_BASH_ORDINARY_MODE_V1", "ordinary-loss"))
                     })
                     .or_else(|| {
+                        (mode == "normal_model_provider_bash_ordinary_sync_parent_output")
+                            .then_some((
+                                "AGE319_PRIVATE_BASH_ORDINARY_MODE_V1",
+                                "ordinary-sync-parent-output",
+                            ))
+                    })
+                    .or_else(|| {
                         (mode == "normal_model_provider_bash_ordinary_sync")
                             .then_some(("AGE319_PRIVATE_BASH_ORDINARY_MODE_V1", "ordinary-sync"))
                             .or_else(|| {
@@ -676,6 +701,25 @@ fn inner() {
                                     "ordinary-async",
                                 ))
                             })
+                    })
+                    .or_else(|| {
+                        [
+                            ("sync_reply_loss", "ordinary-sync-reply-loss"),
+                            ("sync_partial", "ordinary-sync-partial"),
+                            ("sync_repeat", "ordinary-sync-repeat"),
+                            ("sync_large", "ordinary-sync-large"),
+                            ("sync_signal", "ordinary-sync-signal"),
+                            ("sync_tamper", "ordinary-sync-tamper"),
+                            ("sync_w_debt", "ordinary-sync-w-debt"),
+                            ("sync_socket_partial", "ordinary-sync-socket-partial"),
+                            ("sync_post_tamper", "ordinary-sync-post-tamper"),
+                            ("sync_encode_tamper", "ordinary-sync-encode-tamper"),
+                        ]
+                        .into_iter()
+                        .find_map(|(suffix, value)| {
+                            (mode == format!("normal_model_provider_bash_ordinary_{suffix}"))
+                                .then_some(("AGE319_PRIVATE_BASH_ORDINARY_MODE_V1", value))
+                        })
                     }),
             )
             .envs(
@@ -1053,10 +1097,104 @@ fn inner() {
                 }
                 let asynchronous = mode.ends_with("_async") || mode.ends_with("_restart");
                 fs::write(gate.join("child-effect"), b"yes").unwrap();
+                if mode.ends_with("_sync_tamper")
+                    || mode.ends_with("_sync_post_tamper")
+                    || mode.ends_with("_sync_encode_tamper")
+                {
+                    let post = mode.ends_with("_sync_post_tamper");
+                    let encode = mode.ends_with("_sync_encode_tamper");
+                    let marker = if post {
+                        "sync-begin-paused"
+                    } else if encode {
+                        "sync-verify-paused"
+                    } else {
+                        "sync-paused"
+                    };
+                    eventually(|| gate.join(marker).exists());
+                    let request_id = fs::read_to_string(gate.join(marker)).unwrap();
+                    let fresh =
+                        rusqlite::Connection::open(broker_state.join("v30/state.db")).unwrap();
+                    let event_json: String = fresh.query_row(
+                        "SELECT receipt_json FROM fresh_bash_selected_event WHERE request_id=?1",
+                        [&request_id], |r| r.get(0),
+                    ).unwrap();
+                    let event: oulipoly_state::mailbox::FreshBashSourceEvent =
+                        serde_json::from_str(&event_json).unwrap();
+                    fs::write(
+                        broker_state
+                            .join("v30/fresh-provider")
+                            .join(format!("{}.stdout", event.physical_grant_id)),
+                        if encode {
+                            &b"changedbyts"[..]
+                        } else {
+                            &b"changedbytes"[..]
+                        },
+                    )
+                    .unwrap();
+                    fs::write(
+                        gate.join(if post {
+                            "sync-begin-release"
+                        } else if encode {
+                            "sync-verify-release"
+                        } else {
+                            "sync-release"
+                        }),
+                        b"yes",
+                    )
+                    .unwrap();
+                }
                 eventually(|| {
                     gate.join("ordinary-bash-status").exists()
                         || entry.try_wait().unwrap().is_some()
                 });
+                if mode.ends_with("_sync_partial")
+                    || mode.ends_with("_sync_tamper")
+                    || mode.ends_with("_sync_post_tamper")
+                    || mode.ends_with("_sync_encode_tamper")
+                    || mode.ends_with("_sync_w_debt")
+                {
+                    assert_ne!(
+                        fs::read_to_string(gate.join("ordinary-bash-status")).unwrap(),
+                        "0"
+                    );
+                    let fresh =
+                        rusqlite::Connection::open(broker_state.join("v30/state.db")).unwrap();
+                    let reserved: i64 = fresh
+                        .query_row(
+                            "SELECT count(*) FROM fresh_bash_sync_publication",
+                            [],
+                            |r| r.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        reserved,
+                        if mode.ends_with("_sync_partial")
+                            || mode.ends_with("_sync_post_tamper")
+                            || mode.ends_with("_sync_encode_tamper")
+                        {
+                            1
+                        } else {
+                            0
+                        }
+                    );
+                    if mode.ends_with("_sync_partial") || mode.ends_with("_sync_encode_tamper") {
+                        assert!(
+                            fs::read(gate.join("bash-causal-output"))
+                                .unwrap()
+                                .starts_with(b"{\"schema_version\":31,")
+                        );
+                    } else {
+                        assert!(
+                            fs::read(gate.join("bash-causal-output"))
+                                .unwrap()
+                                .is_empty()
+                        );
+                    }
+                    fs::write(gate.join("provider-cancel"), b"yes").unwrap();
+                    eventually(|| entry.try_wait().unwrap().is_some());
+                    stop(&mut broker);
+                    return;
+                }
                 assert_eq!(
                     fs::read_to_string(gate.join("ordinary-bash-status")).unwrap_or_default(),
                     "0",
@@ -1068,16 +1206,103 @@ fn inner() {
                 let report: serde_json::Value =
                     serde_json::from_slice(&fs::read(gate.join("bash-causal-output")).unwrap())
                         .unwrap();
-                let request_id = report["request_id"].as_str().unwrap();
-                let grant = report["physical_grant_id"].as_str().unwrap();
-                assert_eq!(
-                    report["delivery_mode"],
-                    if asynchronous { "async" } else { "sync" }
-                );
-                assert_eq!(report["completion_policy"], "tree");
-                assert!(report["handle"].as_str().unwrap().starts_with("ab30_"));
-                assert_eq!(report["effects_possible"], true);
+                let request_id = if asynchronous {
+                    report["request_id"].as_str().unwrap()
+                } else {
+                    report["publication"]["child"]["request_id"]
+                        .as_str()
+                        .unwrap()
+                };
+                let grant = if asynchronous {
+                    report["physical_grant_id"].as_str().unwrap()
+                } else {
+                    report["publication"]["event"]["physical_grant_id"]
+                        .as_str()
+                        .unwrap()
+                };
+                if asynchronous {
+                    assert_eq!(report["delivery_mode"], "async");
+                    assert_eq!(report["completion_policy"], "tree");
+                    assert!(report["handle"].as_str().unwrap().starts_with("ab30_"));
+                    assert_eq!(report["effects_possible"], true);
+                } else {
+                    assert_eq!(report["schema_version"], 31);
+                    assert_eq!(
+                        report["dispatch_state"],
+                        if mode.ends_with("_sync_reply_loss")
+                            || mode.ends_with("_sync_socket_partial")
+                        {
+                            "sync-publication-unknown"
+                        } else {
+                            "sync-child-result"
+                        }
+                    );
+                    assert_eq!(report["publication"]["phase"], "unknown");
+                    if mode.ends_with("_sync_reply_loss") || mode.ends_with("_sync_socket_partial")
+                    {
+                        assert!(report.get("stdout_base64").is_none());
+                        assert!(report.get("stderr_base64").is_none());
+                    } else {
+                        assert_eq!(report["stdout_encoding"], "base64");
+                        assert_eq!(report["stderr_encoding"], "base64");
+                    }
+                    if !mode.ends_with("_cancel")
+                        && !mode.ends_with("_sync_reply_loss")
+                        && !mode.ends_with("_sync_socket_partial")
+                        && !mode.ends_with("_sync_large")
+                    {
+                        assert_eq!(report["stdout_base64"], "Af9vcmRpbmFyeQA=");
+                        assert_eq!(report["stderr_base64"], "ZXJyAP4=");
+                    }
+                    if mode.ends_with("_sync_large") {
+                        use base64::Engine as _;
+                        let decoded = base64::engine::general_purpose::STANDARD
+                            .decode(report["stdout_base64"].as_str().unwrap())
+                            .unwrap();
+                        assert_eq!(decoded.len(), 200011);
+                        assert_eq!(&decoded[..11], b"\x01\xffordinary\x00");
+                        assert!(decoded[11..].iter().all(|byte| *byte == 0));
+                    }
+                    if report["dispatch_state"] == "sync-child-result" {
+                        use base64::Engine as _;
+                        for stream in ["stdout", "stderr"] {
+                            let decoded = base64::engine::general_purpose::STANDARD
+                                .decode(report[format!("{stream}_base64")].as_str().unwrap())
+                                .unwrap();
+                            assert_eq!(
+                                decoded.len() as u64,
+                                report["publication"]["event"][format!("{stream}_len")]
+                                    .as_u64()
+                                    .unwrap()
+                            );
+                            assert_eq!(
+                                format!("{:x}", Sha256::digest(&decoded)),
+                                report["publication"]["event"][format!("{stream}_sha256")]
+                            );
+                        }
+                    }
+                    if mode.ends_with("_failure") {
+                        assert_eq!(report["publication"]["outcome"], "exited");
+                        assert_eq!(report["publication"]["exit_code"], 37);
+                    } else if mode.ends_with("_sync_signal") {
+                        assert_eq!(report["publication"]["outcome"], "signaled");
+                        assert_eq!(report["publication"]["signal"], libc::SIGTERM);
+                    } else if mode.ends_with("_cancel") {
+                        assert_eq!(report["publication"]["outcome"], "cancelled");
+                    }
+                }
                 let directory = broker_state.join("v30/fresh-provider");
+                if !asynchronous && !mode.ends_with("_sync_parent_output") {
+                    let parent_grant = report["publication"]["child"]["parent_work_grant_id"]
+                        .as_str()
+                        .unwrap();
+                    assert!(
+                        !directory
+                            .join(format!("{parent_grant}.drain.json"))
+                            .exists(),
+                        "sync child response waited for parent Q"
+                    );
+                }
                 let selected: serde_json::Value = serde_json::from_slice(
                     &fs::read(directory.join(format!("{request_id}.child-work-selection.json")))
                         .unwrap(),
@@ -1202,11 +1427,34 @@ fn inner() {
                         "restart created a second K"
                     );
                 }
-                eventually(|| {
-                    directory
-                        .join(format!("{grant}.source-event.json"))
-                        .exists()
-                });
+                let source_event_path = directory.join(format!("{grant}.source-event.json"));
+                let source_deadline = Instant::now() + Duration::from_secs(20);
+                while !source_event_path.exists() && Instant::now() < source_deadline {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                let artifact_links = fs::read_dir(&directory)
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .filter_map(|entry| {
+                        use std::os::unix::fs::MetadataExt;
+                        let meta = entry.metadata().ok()?;
+                        Some((
+                            entry.file_name().to_string_lossy().into_owned(),
+                            meta.ino(),
+                            meta.nlink(),
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                assert!(
+                    source_event_path.exists(),
+                    "ordinary W absent: entry={} bash_status={} bash_error={} broker_before={} broker_after={} artifact_links={artifact_links:?}",
+                    fs::read_to_string(&err).unwrap_or_default(),
+                    fs::read_to_string(gate.join("ordinary-bash-status")).unwrap_or_default(),
+                    fs::read_to_string(gate.join("bash-causal-error")).unwrap_or_default(),
+                    fs::read_to_string(&broker_log).unwrap_or_default(),
+                    fs::read_to_string(temp.path().join("ordinary-broker-restart.log"))
+                        .unwrap_or_default(),
+                );
                 let event: oulipoly_state::mailbox::FreshBashSourceEvent = serde_json::from_slice(
                     &fs::read(directory.join(format!("{grant}.source-event.json"))).unwrap(),
                 )
@@ -1220,10 +1468,19 @@ fn inner() {
                     assert!(!gate.join("ordinary-background").exists());
                 } else {
                     assert!(!event.cancelled);
-                    assert_eq!(
-                        fs::read(directory.join(format!("{grant}.stdout"))).unwrap(),
-                        b"\x01\xffordinary\x00"
-                    );
+                    if mode.ends_with("_sync_large") {
+                        assert_eq!(
+                            fs::metadata(directory.join(format!("{grant}.stdout")))
+                                .unwrap()
+                                .len(),
+                            200011
+                        );
+                    } else {
+                        assert_eq!(
+                            fs::read(directory.join(format!("{grant}.stdout"))).unwrap(),
+                            b"\x01\xffordinary\x00"
+                        );
+                    }
                     assert_eq!(
                         fs::read(directory.join(format!("{grant}.stderr"))).unwrap(),
                         b"err\x00\xfe"
@@ -1260,6 +1517,44 @@ fn inner() {
                     })
                     .unwrap();
                 assert_eq!(notify_count, if asynchronous { 1 } else { 0 });
+                let sync_publications: i64 = fresh
+                    .query_row(
+                        "SELECT count(*) FROM fresh_bash_sync_publication",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(sync_publications, if asynchronous { 0 } else { 1 });
+                if !asynchronous {
+                    let stored: String = fresh.query_row(
+                        "SELECT receipt_json FROM fresh_bash_sync_publication WHERE request_id=?1",
+                        [request_id], |r| r.get(0),
+                    ).unwrap();
+                    let stored: serde_json::Value = serde_json::from_str(&stored).unwrap();
+                    assert_eq!(stored, report["publication"]);
+                    let consumed = fs::read_dir(&directory)
+                        .unwrap()
+                        .filter_map(Result::ok)
+                        .filter(|entry| {
+                            entry
+                                .file_name()
+                                .to_string_lossy()
+                                .ends_with(".consumed.json")
+                        })
+                        .count();
+                    assert_eq!(consumed, 2, "sync response created a second K");
+                    let root_publications: i64 = fresh
+                        .query_row("SELECT count(*) FROM fresh_root_publication", [], |r| {
+                            r.get(0)
+                        })
+                        .unwrap();
+                    if !mode.ends_with("_sync_parent_output") {
+                        assert_eq!(
+                            root_publications, 0,
+                            "child response created root publication"
+                        );
+                    }
+                }
                 if mode.ends_with("_copy") {
                     eventually(|| gate.join("ordinary-copy-status").exists());
                     assert_eq!(
@@ -1302,7 +1597,7 @@ fn inner() {
                 }
                 fs::write(gate.join("provider-cancel"), b"yes").unwrap();
                 eventually(|| entry.try_wait().unwrap().is_some());
-                if mode.ends_with("_sync") {
+                if mode.ends_with("_sync") || mode.ends_with("_sync_parent_output") {
                     let lane = FreshV30Lane::open_at(&broker_state).unwrap();
                     let (root, actor) = lane.released_handoff_for_root(&prepared.root_id).unwrap();
                     let session = lane.read_session(&root.d_key).unwrap().unwrap();
@@ -1311,10 +1606,34 @@ fn inner() {
                         .unwrap();
                     assert_eq!(
                         terminal.execution.as_ref().unwrap().child_event,
-                        Some(event)
+                        Some(event.clone())
                     );
-                    assert_eq!(terminal.publication_state, "not_started");
+                    assert_eq!(
+                        terminal.publication_state,
+                        if caller_mode {
+                            "unknown"
+                        } else {
+                            "not_started"
+                        },
+                        "parent caller error: {}; broker: {}",
+                        fs::read_to_string(&err).unwrap_or_default(),
+                        fs::read_to_string(&broker_log).unwrap_or_default()
+                    );
                     let parent = &terminal.execution.as_ref().unwrap().parent;
+                    if caller_mode {
+                        assert!(gate.join("caller-control-stdout").exists());
+                        assert!(gate.join("caller-control-stderr").exists());
+                        assert_eq!(
+                            fs::read(&out).unwrap(),
+                            fs::read(directory.join(format!("{}.stdout", parent.grant_id)))
+                                .unwrap()
+                        );
+                        assert_eq!(
+                            fs::read(&err).unwrap(),
+                            fs::read(directory.join(format!("{}.stderr", parent.grant_id)))
+                                .unwrap()
+                        );
+                    }
                     let offered = oulipoly_state::mailbox::FreshRootCallerResult {
                         parent_grant_id: parent.grant_id.clone(),
                         wait_status: parent.wait_status,
@@ -1323,16 +1642,63 @@ fn inner() {
                         stderr_sha256: parent.stderr_sha256.clone(),
                         stderr_len: parent.stderr_len,
                     };
-                    assert_eq!(
-                        lane.begin_private_root_caller_result(&root, &actor, &session, &offered)
+                    assert_ne!(offered.stdout_sha256, event.stdout_sha256);
+                    if !caller_mode {
+                        assert_eq!(
+                            lane.begin_private_root_caller_result(
+                                &root, &actor, &session, &offered
+                            )
                             .unwrap_err(),
-                        "child C result lacks original sync response endpoint"
+                            "caller result terminal was cancelled"
+                        );
+                        stop(&mut broker);
+                        return;
+                    }
+                    let parent_publication = lane
+                        .begin_private_root_caller_result(&root, &actor, &session, &offered)
+                        .unwrap();
+                    assert_eq!(parent_publication.publication_state, "unknown");
+                    assert_eq!(
+                        parent_publication.execution.as_ref().unwrap().child_event,
+                        Some(event.clone())
+                    );
+                    let fresh =
+                        rusqlite::Connection::open(broker_state.join("v30/state.db")).unwrap();
+                    let child_phase: String = fresh
+                        .query_row(
+                            "SELECT json_extract(receipt_json, '$.phase') FROM fresh_bash_sync_publication WHERE request_id=?1",
+                            [request_id],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    let parent_phase: String = fresh
+                        .query_row(
+                            "SELECT phase FROM fresh_root_publication WHERE handoff_id=?1",
+                            [&root.handoff_id],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        (child_phase.as_str(), parent_phase.as_str()),
+                        ("unknown", "unknown")
+                    );
+                    let mut child_as_parent = offered.clone();
+                    child_as_parent.stdout_sha256 = event.stdout_sha256.clone();
+                    assert_eq!(
+                        lane.begin_private_root_caller_result(
+                            &root,
+                            &actor,
+                            &session,
+                            &child_as_parent
+                        )
+                        .unwrap_err(),
+                        "caller result differs from verified parent Q"
                     );
                     assert_eq!(
                         lane.read_private_root_terminal(&root, &actor, &session)
                             .unwrap()
                             .publication_state,
-                        "not_started"
+                        "unknown"
                     );
                 }
                 stop(&mut broker);
@@ -5614,6 +5980,7 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_model_provider_bash_causal_notify_debt",
         "normal_model_provider_bash_causal_notify_row_debt",
         "normal_model_provider_bash_ordinary_sync",
+        "normal_model_provider_bash_ordinary_sync_parent_output",
         "normal_model_provider_bash_ordinary_async",
         "normal_model_provider_bash_ordinary_refuse",
         "normal_model_provider_bash_ordinary_loss",
@@ -5623,6 +5990,16 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_model_provider_bash_ordinary_failure",
         "normal_model_provider_bash_ordinary_cancel",
         "normal_model_provider_bash_ordinary_parent_tamper",
+        "normal_model_provider_bash_ordinary_sync_reply_loss",
+        "normal_model_provider_bash_ordinary_sync_partial",
+        "normal_model_provider_bash_ordinary_sync_repeat",
+        "normal_model_provider_bash_ordinary_sync_large",
+        "normal_model_provider_bash_ordinary_sync_signal",
+        "normal_model_provider_bash_ordinary_sync_tamper",
+        "normal_model_provider_bash_ordinary_sync_w_debt",
+        "normal_model_provider_bash_ordinary_sync_socket_partial",
+        "normal_model_provider_bash_ordinary_sync_post_tamper",
+        "normal_model_provider_bash_ordinary_sync_encode_tamper",
         "normal_model_provider_reply_loss",
         "normal_model_provider_q_reply_loss",
         "normal_model_provider_restart",

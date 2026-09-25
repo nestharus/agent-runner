@@ -3969,6 +3969,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("sidecar");
         fs::create_dir(&directory).unwrap();
+        // Establish the exposed-directory case under restrictive test umasks.
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
         let path = directory.join("pid-identity.db");
         fs::write(&path, b"not sqlite").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
@@ -4110,6 +4112,8 @@ mod tests {
         pin_v29_fixture(&source);
         let broker_root = root.path().join("broker");
         fs::create_dir(&broker_root).unwrap();
+        // This first attempt intentionally uses an exposed broker directory.
+        fs::set_permissions(&broker_root, fs::Permissions::from_mode(0o755)).unwrap();
         let uid = unsafe { libc::geteuid() };
         assert!(stage_with_owner(&source, uid, &broker_root, uid).is_err());
         fs::set_permissions(&broker_root, fs::Permissions::from_mode(0o700)).unwrap();

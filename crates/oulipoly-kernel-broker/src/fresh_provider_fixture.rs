@@ -67,15 +67,17 @@ fn causal_bash(args: &[String]) -> std::io::Result<()> {
             .ok_or_else(|| std::io::Error::other("intermediary proc PID absent"))?
             .trim();
         std::fs::write(gate.join("causal-intermediary-proc-pid"), proc_pid)?;
-        let survivor = unsafe { libc::fork() };
-        if survivor < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        if survivor == 0 {
-            unsafe {
-                libc::signal(libc::SIGTERM, libc::SIG_IGN);
-                loop {
-                    libc::pause();
+        if args.get(5).map(String::as_str) != Some("ordinary-sync-parent-output") {
+            let survivor = unsafe { libc::fork() };
+            if survivor < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if survivor == 0 {
+                unsafe {
+                    libc::signal(libc::SIGTERM, libc::SIG_IGN);
+                    loop {
+                        libc::pause();
+                    }
                 }
             }
         }
@@ -212,6 +214,10 @@ fn causal_bash(args: &[String]) -> std::io::Result<()> {
                 };
                 let ending = if args[5] == "ordinary-failure" {
                     "exit 37"
+                } else if args[5] == "ordinary-sync-signal" {
+                    "kill -TERM $$"
+                } else if args[5] == "ordinary-sync-large" {
+                    "head -c 200000 /dev/zero"
                 } else {
                     ":"
                 };
@@ -247,50 +253,79 @@ fn causal_bash(args: &[String]) -> std::io::Result<()> {
                 } else {
                     command.args(["sh", "-c", script.as_str(), "sh"]);
                 }
-                let mut child = command
-                    .arg(gate.join("ordinary-effect"))
-                    .arg(gate.join("ordinary-background"))
-                    .arg("")
-                    .env_clear()
-                    .env("PATH", "/usr/bin:/bin")
-                    .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &args[2])
-                    .env("AGE319_ORDINARY_EFFECTIVE_ENV", "original-value")
-                    .env(
-                        "AGE319_ORDINARY_SECRET_SENTINEL",
-                        "age319-secret-must-stay-in-memfd-319",
-                    )
-                    .envs(
-                        (args[5] == "ordinary-loss")
-                            .then_some(("AGE319_PRIVATE_ORDINARY_DROP_C_REPLY_V1", "1")),
-                    )
-                    .envs(
-                        (args[5] == "ordinary-loss")
-                            .then_some(("AGE319_PRIVATE_ORDINARY_DROP_K_REPLY_V1", "1")),
-                    )
-                    .envs(
-                        (args[5] == "ordinary-loss")
-                            .then_some(("AGE319_PRIVATE_ORDINARY_DROP_Q_REPLY_V1", "1")),
-                    )
-                    .envs(
-                        (args[5] == "ordinary-loss")
-                            .then_some(("AGE319_PRIVATE_ORDINARY_DROP_W_REPLY_V1", "1")),
-                    )
-                    .envs(
-                        (args[5] == "ordinary-cancel")
-                            .then_some(("AGE319_PRIVATE_ORDINARY_CANCEL_AFTER_K_V1", "1")),
-                    )
-                    .envs((args[5] == "ordinary-parent-tamper").then_some((
-                        "AGE319_PRIVATE_ORDINARY_PAUSE_AFTER_C_DIR_V1",
-                        gate.as_os_str(),
-                    )))
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::from(std::fs::File::create(
-                        gate.join("bash-causal-output"),
-                    )?))
-                    .stderr(Stdio::from(std::fs::File::create(
-                        gate.join("bash-causal-error"),
-                    )?))
-                    .spawn()?;
+                let mut child =
+                    command
+                        .arg(gate.join("ordinary-effect"))
+                        .arg(gate.join("ordinary-background"))
+                        .arg("")
+                        .env_clear()
+                        .env("PATH", "/usr/bin:/bin")
+                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &args[2])
+                        .env("AGE319_ORDINARY_EFFECTIVE_ENV", "original-value")
+                        .env(
+                            "AGE319_ORDINARY_SECRET_SENTINEL",
+                            "age319-secret-must-stay-in-memfd-319",
+                        )
+                        .envs(
+                            (args[5] == "ordinary-loss")
+                                .then_some(("AGE319_PRIVATE_ORDINARY_DROP_C_REPLY_V1", "1")),
+                        )
+                        .envs(
+                            (args[5] == "ordinary-loss")
+                                .then_some(("AGE319_PRIVATE_ORDINARY_DROP_K_REPLY_V1", "1")),
+                        )
+                        .envs(
+                            (args[5] == "ordinary-loss")
+                                .then_some(("AGE319_PRIVATE_ORDINARY_DROP_Q_REPLY_V1", "1")),
+                        )
+                        .envs(
+                            (args[5] == "ordinary-loss")
+                                .then_some(("AGE319_PRIVATE_ORDINARY_DROP_W_REPLY_V1", "1")),
+                        )
+                        .envs(
+                            (args[5] == "ordinary-cancel")
+                                .then_some(("AGE319_PRIVATE_ORDINARY_CANCEL_AFTER_K_V1", "1")),
+                        )
+                        .envs(
+                            (args[5] == "ordinary-async")
+                                .then_some(("AGE319_PRIVATE_ASYNC_PROBE_SYNC_REFUSAL_V1", "1")),
+                        )
+                        .envs(
+                            (args[5] == "ordinary-sync-reply-loss")
+                                .then_some(("AGE319_PRIVATE_SYNC_DROP_BEGIN_REPLY_V1", "1")),
+                        )
+                        .envs(
+                            (args[5] == "ordinary-sync-partial")
+                                .then_some(("AGE319_PRIVATE_SYNC_PARTIAL_CALLER_WRITE_V1", "1")),
+                        )
+                        .envs(
+                            (args[5] == "ordinary-sync-repeat")
+                                .then_some(("AGE319_PRIVATE_SYNC_REPEAT_BEGIN_V1", "1")),
+                        )
+                        .envs((args[5] == "ordinary-sync-tamper").then_some((
+                            "AGE319_PRIVATE_SYNC_PAUSE_AFTER_W_DIR_V1",
+                            gate.as_os_str(),
+                        )))
+                        .envs((args[5] == "ordinary-sync-post-tamper").then_some((
+                            "AGE319_PRIVATE_SYNC_PAUSE_AFTER_BEGIN_DIR_V1",
+                            gate.as_os_str(),
+                        )))
+                        .envs((args[5] == "ordinary-sync-encode-tamper").then_some((
+                            "AGE319_PRIVATE_SYNC_PAUSE_AFTER_VERIFY_DIR_V1",
+                            gate.as_os_str(),
+                        )))
+                        .envs((args[5] == "ordinary-parent-tamper").then_some((
+                            "AGE319_PRIVATE_ORDINARY_PAUSE_AFTER_C_DIR_V1",
+                            gate.as_os_str(),
+                        )))
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::from(std::fs::File::create(
+                            gate.join("bash-causal-output"),
+                        )?))
+                        .stderr(Stdio::from(std::fs::File::create(
+                            gate.join("bash-causal-error"),
+                        )?))
+                        .spawn()?;
                 std::fs::write(gate.join("causal-bash-pid"), child.id().to_string())?;
                 let status = child.wait()?;
                 std::fs::write(
@@ -300,9 +335,11 @@ fn causal_bash(args: &[String]) -> std::io::Result<()> {
                 if args[5] == "ordinary-copy" && status.success() {
                     let report: serde_json::Value =
                         serde_json::from_slice(&std::fs::read(gate.join("bash-causal-output"))?)?;
-                    let copied = report["request_id"].as_str().ok_or_else(|| {
-                        std::io::Error::other("ordinary copied request id absent")
-                    })?;
+                    let copied = report["publication"]["child"]["request_id"]
+                        .as_str()
+                        .ok_or_else(|| {
+                            std::io::Error::other("ordinary copied request id absent")
+                        })?;
                     let sibling = Command::new(&args[1])
                         .args(["__age319-private-probe-sibling-read-v1", &args[2], copied])
                         .env_clear()

@@ -129,10 +129,7 @@ fn private_broker_has_distinct_fresh_route_while_old_wal_writer_survives() {
     assert!(!request(&old_socket, b'I').starts_with("fresh-v30-route "));
     assert!(request(&old_socket, b'U').contains("error"));
     assert!(request_with_id(&old_socket, b'D', uuid::Uuid::new_v4(), true).contains("error"));
-    assert_eq!(
-        request(&socket, b'v'),
-        "error fresh v30 effects closed pending source/recipient/K/Q/Runner-result/ACK lineage\n"
-    );
+    assert_eq!(request(&socket, b'v'), "error invalid challenged request\n");
     assert_eq!(request(&socket, b'i'), "entry-gate-v1 fresh-v30-closed\n");
     assert_eq!(
         request(&socket, b'I'),

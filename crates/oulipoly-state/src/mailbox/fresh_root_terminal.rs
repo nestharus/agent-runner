@@ -170,9 +170,6 @@ impl FreshV30Lane {
             return Err("root terminal execution unknown".into());
         }
         let execution = read.execution.ok_or("root terminal execution absent")?;
-        if execution.child_event.is_some() {
-            return Err("child C result lacks original sync response endpoint".into());
-        }
         let parent = &execution.parent;
         if parent.cancelled {
             return Err("caller result terminal was cancelled".into());
@@ -340,12 +337,16 @@ impl FreshV30Lane {
     fn root_child_requests(&self, root_id: &str) -> Result<(Option<String>, Vec<String>), String> {
         let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let mut rows = state
-            .prepare("SELECT c.request_id, e.request_id IS NOT NULL FROM fresh_bash_child c
+            .prepare(
+                "SELECT c.request_id, e.request_id IS NOT NULL FROM fresh_bash_child c
                       LEFT JOIN fresh_bash_selected_event e ON e.request_id=c.request_id
-                      WHERE c.root_id=?1 ORDER BY c.request_id")
+                      WHERE c.root_id=?1 ORDER BY c.request_id",
+            )
             .map_err(|e| e.to_string())?;
         let ids = rows
-            .query_map([root_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?)))
+            .query_map([root_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?))
+            })
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
@@ -354,8 +355,10 @@ impl FreshV30Lane {
             return Err("multiple accepted child W rows under root".into());
         }
         let selected_id = selected.first().map(|(id, _)| id.clone());
-        let unresolved = ids.into_iter().filter_map(|(id, _)|
-            (Some(&id) != selected_id.as_ref()).then_some(id)).collect();
+        let unresolved = ids
+            .into_iter()
+            .filter_map(|(id, _)| (Some(&id) != selected_id.as_ref()).then_some(id))
+            .collect();
         Ok((selected_id, unresolved))
     }
 
@@ -428,7 +431,10 @@ impl FreshV30Lane {
         for id in selected.iter().chain(unresolved.iter()) {
             self.repair_captured_private_bash_source(id)?;
         }
-        if let Some(id) = self.root_child_requests(&root.old_release.prepared.root_id)?.0 {
+        if let Some(id) = self
+            .root_child_requests(&root.old_release.prepared.root_id)?
+            .0
+        {
             let child = self.require_complete_bash_child(&id)?;
             if self.require_private_bash_listener(&child, None)? == FreshBashListenerPolicy::Notify
             {

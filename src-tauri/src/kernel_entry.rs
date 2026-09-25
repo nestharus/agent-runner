@@ -1388,9 +1388,6 @@ fn private_publish_caller_result(
         .execution
         .as_ref()
         .ok_or("caller result terminal execution absent")?;
-    if execution.child_event.is_some() {
-        return Err("caller result gap: child C requires original response endpoint".into());
-    }
     if terminal.publication_state != "not_started" {
         return Err(
             "caller result publication already unknown; automatic output replay refused".into(),

@@ -253,6 +253,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let marker = directory.path().join("entry-gate.v1");
         fs::write(&marker, CLOSED).unwrap();
+        // The test must create an unsafe marker even under a 0077 umask.
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(EntryGate::open(directory.path()).is_err());
         fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
         fs::hard_link(&marker, directory.path().join("copy")).unwrap();
