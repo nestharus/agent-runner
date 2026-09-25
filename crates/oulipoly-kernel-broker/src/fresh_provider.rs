@@ -760,6 +760,161 @@ impl Prepared {
     }
 }
 
+/// Recheck the selected account against current physical quota/auth and
+/// model-capacity facts before announcing K. The caller holds route.lock.
+pub(super) fn require_selected_plan_v3(
+    directory: &Path,
+    binding: &Binding,
+    plan: &Plan,
+    generation: &KeyedGeneration,
+) -> io::Result<(String, u64)> {
+    use super::fresh_index::RouteEligibility;
+    let indexed = generation
+        .require_route(&binding.handoff_id)
+        .map_err(io::Error::other)?;
+    let decision: RouteDecision = exact_file(directory, &decision_name(&binding.handoff_id))?
+        .ok_or_else(|| io::Error::other("v3 provider route receipt absent"))?;
+    let candidate: RouteCandidate = exact_file(
+        directory,
+        &candidate_name(&binding.handoff_id, decision.selection.index),
+    )?
+    .ok_or_else(|| io::Error::other("v3 provider selected candidate absent"))?;
+    if decision.version != 1
+        || decision.binding != *binding
+        || decision.selection.plan_sha256 != plan.digest
+        || indexed.candidate_identity != decision.selection.account_identity
+        || indexed.candidate_index != decision.selection.index
+        || indexed.key.model != decision.selection.model
+        || indexed.key.config_sha256 != decision.selection.config_sha256
+        || candidate.version != 3
+        || candidate.binding != *binding
+        || candidate.account != decision.selection.account
+        || candidate.account_identity != decision.selection.account_identity
+        || candidate.model != decision.selection.model
+        || candidate.config_sha256 != decision.selection.config_sha256
+        || candidate.plan_sha256 != plan.digest
+    {
+        return Err(io::Error::other(
+            "v3 provider K differs from selected route",
+        ));
+    }
+    fresh_rebuild::validate_candidate(
+        directory,
+        generation.admitted_source().map_err(io::Error::other)?,
+        &candidate,
+    )?;
+    generation
+        .ensure_provider_account(
+            &candidate.account_identity,
+            &candidate.model,
+            &candidate.config_sha256,
+        )
+        .map_err(io::Error::other)?;
+    let source = if candidate.quota_script.is_some() {
+        let environment = decision
+            .environment_sha256
+            .as_ref()
+            .ok_or_else(|| io::Error::other("v3 provider metered environment absent"))?;
+        if environment.len() != 64 || !environment.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(io::Error::other("v3 provider environment digest invalid"));
+        }
+        Some(SourceKey {
+            commands_sha256: format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&(
+                    &candidate.quota_script,
+                    &candidate.auth_refresh_command
+                ))?)
+            ),
+            environment_sha256: environment.clone(),
+        })
+    } else {
+        None
+    };
+    let facts = generation
+        .route_facts(
+            &candidate.account_identity,
+            source.as_ref(),
+            &candidate.model,
+            &candidate.config_sha256,
+            Utc::now().timestamp(),
+        )
+        .map_err(io::Error::other)?;
+    let RouteEligibility::Eligible {
+        account_revision,
+        quota_basis_points,
+        ..
+    } = facts
+    else {
+        return Err(io::Error::other(
+            "v3 provider selected account no longer eligible before K",
+        ));
+    };
+    if quota_basis_points != decision.selection.quota_remaining_basis_points {
+        return Err(io::Error::other(
+            "v3 provider selected quota fact changed before K",
+        ));
+    }
+    Ok((candidate.account_identity, account_revision))
+}
+
+pub(super) fn announce_provider_v3(
+    prepared: &Prepared,
+    generation: &KeyedGeneration,
+    account: &str,
+    revision: u64,
+) -> io::Result<u64> {
+    let decision: RouteDecision = exact_file(
+        &prepared.directory,
+        &decision_name(&prepared.grant.binding.handoff_id),
+    )?
+    .ok_or_else(|| io::Error::other("v3 provider route receipt absent"))?;
+    let candidate_name =
+        candidate_name(&prepared.grant.binding.handoff_id, decision.selection.index);
+    let grant = ProviderGrant {
+        decision_handoff: prepared.grant.binding.handoff_id.clone(),
+        grant: provider_artifact(
+            &prepared.directory,
+            &format!("{}.fresh-grant.json", prepared.grant.binding.handoff_id),
+        )?,
+        candidate: Some(provider_artifact(&prepared.directory, &candidate_name)?),
+        consumed_k: None,
+        certified_q: None,
+    };
+    generation
+        .announce_provider(
+            account,
+            &prepared.grant.id,
+            grant,
+            &decision.selection.model,
+            &decision.selection.config_sha256,
+            revision,
+        )
+        .map_err(io::Error::other)
+}
+
+pub(super) fn launch_v3_provider(
+    prepared: Prepared,
+    root: &PinnedProcess,
+    actor: &PinnedProcess,
+    uid: u32,
+    gid: u32,
+    generation: &KeyedGeneration,
+    account: &str,
+    revision: u64,
+) -> io::Result<String> {
+    launch_inner(
+        prepared,
+        root,
+        actor,
+        uid,
+        gid,
+        None,
+        None,
+        Some((generation, account, revision)),
+    )
+}
+
 fn provider_artifact(root: &Path, name: &str) -> io::Result<Artifact> {
     Artifact::from_existing(root, Path::new(name)).map_err(io::Error::other)
 }
@@ -1001,9 +1156,8 @@ pub(super) fn reconcile_indexed_provider_binding(
     Ok(())
 }
 
-/// Exact, read-only v3 provider seam. It can inspect an already rebuilt
-/// physical grant; it cannot announce one or turn a late Q into eligibility.
-/// A physical change after frozen rebuild is unknown until another rebuild.
+/// Exact v3 provider readback. Physical K/Q must match the keyed grant and
+/// terminal source; this function does not announce or settle either.
 pub(super) fn require_v3_provider_binding(
     generation: &KeyedGeneration,
     directory: &Path,
@@ -1115,6 +1269,87 @@ pub(super) fn require_v3_provider_binding(
         return Err(io::Error::other("v3 provider pending record differs"));
     }
     Ok(grant.id)
+}
+
+/// Materialize only a witnessed physical Q. Missing drain/tree closure leaves
+/// the exact K pending; a later readback can finish this same grant.
+pub(super) fn settle_v3_provider(
+    generation: &KeyedGeneration,
+    directory: &Path,
+    binding: &Binding,
+    grant_id: &str,
+) -> io::Result<()> {
+    let decision: RouteDecision = exact_file(directory, &decision_name(&binding.handoff_id))?
+        .ok_or_else(|| io::Error::other("v3 provider route receipt absent"))?;
+    let grant: Grant = exact_file(
+        directory,
+        &format!("{}.fresh-grant.json", binding.handoff_id),
+    )?
+    .ok_or_else(|| io::Error::other("v3 provider grant absent"))?;
+    let candidate: RouteCandidate = exact_file(
+        directory,
+        &candidate_name(&binding.handoff_id, decision.selection.index),
+    )?
+    .ok_or_else(|| io::Error::other("v3 provider candidate absent"))?;
+    if decision.binding != *binding
+        || grant.binding != *binding
+        || grant.id != grant_id
+        || grant.plan_sha256 != candidate.plan_sha256
+        || candidate.account_identity != decision.selection.account_identity
+    {
+        return Err(io::Error::other("v3 provider settlement binding changed"));
+    }
+    let indexed = generation
+        .provider_grant(&candidate.account_identity, grant_id)
+        .map_err(io::Error::other)?
+        .ok_or_else(|| io::Error::other("v3 provider grant unannounced"))?;
+    if indexed.certified_q.is_some() {
+        require_v3_provider_binding(generation, directory, binding)?;
+        return Ok(());
+    }
+    let Observation::Drained {
+        status,
+        stdout,
+        stderr,
+        cancelled,
+        ..
+    } = observe(directory, grant_id)?
+    else {
+        return Ok(());
+    };
+    let k = provider_artifact(directory, &format!("{grant_id}.consumed.json"))?;
+    if indexed.consumed_k.as_ref() != Some(&k) {
+        return Err(io::Error::other("v3 provider K was not recorded before Q"));
+    }
+    let terminal = terminal_record(
+        directory, &decision, &candidate, &grant, status, stdout, stderr, cancelled,
+    )?;
+    let q = PhysicalQ {
+        physical_k: k,
+        q: provider_artifact(directory, &format!("{grant_id}.drain.json"))?,
+        terminal: Some(provider_artifact(
+            directory,
+            &format!("{grant_id}.terminal.json"),
+        )?),
+        completed_unix_nanos: i64::try_from(terminal.physical_q_unix_nanos)
+            .map_err(io::Error::other)?,
+    };
+    let outcome = serde_json::to_value(terminal.outcome)?;
+    let outcome = outcome
+        .as_str()
+        .ok_or_else(|| io::Error::other("v3 terminal outcome invalid"))?;
+    generation
+        .settle_provider(
+            &candidate.account_identity,
+            grant_id,
+            q,
+            outcome,
+            &candidate.model,
+            &candidate.config_sha256,
+        )
+        .map_err(io::Error::other)?;
+    require_v3_provider_binding(generation, directory, binding)?;
+    Ok(())
 }
 
 fn durable_new<T: Serialize>(directory: &Path, name: &str, value: &T) -> io::Result<()> {
@@ -2719,6 +2954,11 @@ fn classify_terminal_outcome(
         diagnosis.category == oulipoly_runtime::diagnostics::ErrorCategory::AuthExpired
     }) {
         return TerminalOutcome::AuthRejected;
+    }
+    // The provider's own nonzero wait preceded descendant cleanup. That
+    // failure remains typed even when the tree drain required cancellation.
+    if kind == TerminalSignalKind::NonzeroExit {
+        return TerminalOutcome::GenericFailure;
     }
     if cancelled {
         return TerminalOutcome::Cancelled;
@@ -4386,7 +4626,7 @@ pub(super) fn launch(
     gid: u32,
     index: Option<&Index>,
 ) -> io::Result<String> {
-    launch_inner(prepared, root, actor, uid, gid, index, None)
+    launch_inner(prepared, root, actor, uid, gid, index, None, None)
 }
 
 fn launch_v3_quota(
@@ -4408,6 +4648,7 @@ fn launch_v3_quota(
         gid,
         None,
         Some((generation, intent, request, revision)),
+        None,
     )
 }
 
@@ -4424,6 +4665,7 @@ fn launch_inner(
         &FreshAccountEffectRequest,
         u64,
     )>,
+    v3_provider: Option<(&KeyedGeneration, &str, u64)>,
 ) -> io::Result<String> {
     root.verify()?;
     actor.verify()?;
@@ -4475,10 +4717,11 @@ fn launch_inner(
             .require_quota_pre_k(&intent.binding, request, &intent.id, revision)
             .map_err(io::Error::other)?;
     }
-    if prepared
-        .directory
-        .join(decision_name(&b.handoff_id))
-        .exists()
+    if v3_provider.is_none()
+        && prepared
+            .directory
+            .join(decision_name(&b.handoff_id))
+            .exists()
     {
         require_selected_plan_indexed(&prepared.directory, b, &prepared.plan, index)?;
     }
@@ -4490,6 +4733,15 @@ fn launch_inner(
     if let Some((generation, intent, request, revision)) = v3_quota {
         generation
             .record_quota_k(&intent.binding, request, &intent.id, Some(revision))
+            .map_err(io::Error::other)?;
+    }
+    if let Some((generation, account, revision)) = v3_provider {
+        let k = provider_artifact(
+            &prepared.directory,
+            &format!("{}.consumed.json", prepared.grant.id),
+        )?;
+        generation
+            .record_provider_k(account, &prepared.grant.id, k, revision)
             .map_err(io::Error::other)?;
     }
     if let Some(index) = index {
@@ -5271,7 +5523,7 @@ mod tests {
         );
         assert_eq!(
             classify_terminal_outcome(generic.kind, b"", b"plain failure", 1 << 8, true),
-            TerminalOutcome::Cancelled,
+            TerminalOutcome::GenericFailure,
         );
         assert_eq!(
             classify_terminal_outcome(TerminalSignalKind::Unknown, b"", b"", -1, false),

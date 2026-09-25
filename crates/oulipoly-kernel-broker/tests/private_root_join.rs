@@ -61,9 +61,24 @@ impl Drop for SnapshotRestore {
 fn inner() {
     let mode = std::env::var("AGE319_PRIVATE_JOIN_MODE").unwrap_or_else(|_| "help".into());
     let v3_quota = mode.starts_with("normal_model_provider_v3_quota");
+    // Keep the K switch enabled for the invalid-quota route refusal too.
+    let v3_physical = mode.starts_with("normal_model_provider_v3_quota_route_physical")
+        || mode == "normal_model_provider_v3_quota_route_invalid";
+    let provider_option = if mode == "normal_model_provider_auth_after_healthy" {
+        Some("--auth")
+    } else if mode.ends_with("physical_nonzero") {
+        Some("--fail")
+    } else if mode.ends_with("physical_capacity") {
+        Some("--capacity")
+    } else if mode.ends_with("physical_account_quota") {
+        Some("--quota")
+    } else {
+        None
+    };
     let v3_mode = mode == "normal_model_provider_v3_closed" || v3_quota;
     let provider_mode = mode.starts_with("normal_model_provider");
-    let provider_negative = v3_quota
+    let provider_negative = (v3_quota && !v3_physical)
+        || mode == "normal_model_provider_v3_quota_route_invalid"
         || matches!(
             mode.as_str(),
             "normal_model_provider_bad_config"
@@ -144,7 +159,14 @@ fn inner() {
     if provider_mode {
         let config_dir = config_home.join("oulipoly-agent-runner");
         fs::create_dir_all(config_dir.join("models")).unwrap();
-        let provider_command = serde_json::to_string(&provider_image).unwrap();
+        let selected_image = if mode.ends_with("physical_account_quota") {
+            let path = gate.join("opencode-fixture");
+            fs::copy(&provider_image, &path).unwrap();
+            path.to_string_lossy().into_owned()
+        } else {
+            provider_image.clone()
+        };
+        let provider_command = serde_json::to_string(&selected_image).unwrap();
         let marker = serde_json::to_string(gate.join("provider-effect").to_str().unwrap()).unwrap();
         let unused_marker =
             serde_json::to_string(gate.join("provider-effect-unused").to_str().unwrap()).unwrap();
@@ -254,15 +276,19 @@ fn inner() {
         } else {
             String::new()
         };
-        let local_args = if mode == "normal_model_provider_auth_after_healthy" {
-            format!("{marker}, \"--auth\"")
+        let local_args = provider_option.map_or_else(
+            || marker.clone(),
+            |option| format!("{marker}, \"{option}\""),
+        );
+        let selected_env = if v3_physical {
+            "environment = { AGE319_SELECTED_ACCOUNT = 'physical-local' }\n"
         } else {
-            marker.clone()
+            ""
         };
         fs::write(
             config_dir.join("providers.toml"),
             format!(
-                "[unused]\ncommand = {provider_command}\nargs = [{unused_marker}]\nquota_account_id = 'physical-unused'\n[{provider_name}]\ncommand = {provider_command}\nargs = [{local_args}]\nquota_account_id = 'physical-local'\n{prompt_mode}{quota}"
+                "[unused]\ncommand = {provider_command}\nargs = [{unused_marker}]\nquota_account_id = 'physical-unused'\n[{provider_name}]\ncommand = {provider_command}\nargs = [{local_args}]\nquota_account_id = 'physical-local'\n{selected_env}{prompt_mode}{quota}"
             ),
         )
         .unwrap();
@@ -508,6 +534,7 @@ fn inner() {
             mode.starts_with("normal_model_provider_v3_quota_route")
                 .then_some(("OULIPOLY_KERNEL_BROKER_FIXTURE_ROUTE_V3_V1", "1")),
         )
+        .envs(v3_physical.then_some(("OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_K_V3_V1", "1")))
         .envs(
             (mode == "normal_model_provider_v3_quota_route_reply_loss")
                 .then_some(("OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_ROUTE_V3_REPLY_V1", "1")),
@@ -516,6 +543,18 @@ fn inner() {
             "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_PROVIDER_K_REPLY_V1",
             "1",
         )))
+        .envs(
+            (mode == "normal_model_provider_v3_quota_route_physical_reply_loss").then_some((
+                "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_PROVIDER_K_REPLY_V1",
+                "1",
+            )),
+        )
+        .envs(
+            (mode == "normal_model_provider_v3_quota_route_physical_post_k").then_some((
+                "OULIPOLY_KERNEL_BROKER_FIXTURE_FAIL_PROVIDER_POST_K_CAS_V3_V1",
+                "1",
+            )),
+        )
         .envs(
             matches!(
                 mode.as_str(),
@@ -1420,6 +1459,10 @@ fn inner() {
                             .then_some(("OULIPOLY_KERNEL_BROKER_FIXTURE_ROUTE_V3_V1", "1")),
                     )
                     .envs(
+                        v3_physical
+                            .then_some(("OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_K_V3_V1", "1")),
+                    )
+                    .envs(
                         (mode == "normal_model_provider_v3_quota_route_reply_loss").then_some((
                             "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_ROUTE_V3_REPLY_V1",
                             "1",
@@ -1429,6 +1472,21 @@ fn inner() {
                         "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_PROVIDER_K_REPLY_V1",
                         "1",
                     )))
+                    .envs(
+                        (mode == "normal_model_provider_v3_quota_route_physical_reply_loss")
+                            .then_some((
+                                "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_PROVIDER_K_REPLY_V1",
+                                "1",
+                            )),
+                    )
+                    .envs(
+                        (mode == "normal_model_provider_v3_quota_route_physical_post_k").then_some(
+                            (
+                                "OULIPOLY_KERNEL_BROKER_FIXTURE_FAIL_PROVIDER_POST_K_CAS_V3_V1",
+                                "1",
+                            ),
+                        ),
+                    )
                     .envs(
                         matches!(
                             mode.as_str(),
@@ -1616,6 +1674,35 @@ fn inner() {
                     );
                     assert_eq!(fs::read(&route).unwrap(), before);
                     fs::write(gate.join("route-restarted"), b"yes").unwrap();
+                }
+                if mode == "normal_model_provider_v3_quota_route_physical_source_changed" {
+                    eventually(|| gate.join("v3-provider-ready").exists());
+                    fs::write(
+                        config_home.join("oulipoly-agent-runner/models/configured-model.toml"),
+                        "[[providers]]\nname = \"local\"\n",
+                    )
+                    .unwrap();
+                    fs::write(gate.join("v3-provider-continue"), b"yes").unwrap();
+                }
+                if matches!(
+                    mode.as_str(),
+                    "normal_model_provider_v3_quota_route_physical_bad_plan"
+                        | "normal_model_provider_v3_quota_route_physical_bad_actor"
+                        | "normal_model_provider_v3_quota_route_physical_source_changed"
+                ) {
+                    eventually(|| entry.try_wait().unwrap().is_some());
+                    assert!(!entry.wait().unwrap().success());
+                    let provider_dir = broker_state.join("v30/fresh-provider");
+                    assert!(
+                        !provider_dir
+                            .join(format!("{}.fresh-grant.json", receipt.handoff_id))
+                            .exists()
+                    );
+                    assert!(!gate.join("provider-effect").exists());
+                    assert_eq!(fs::read(&old_state_path).unwrap(), old_state_before);
+                    assert_eq!(fs::read(&old_wal_path).ok(), old_wal_before);
+                    stop(&mut broker);
+                    return;
                 }
                 if provider_negative {
                     eventually(|| entry.try_wait().unwrap().is_some());
@@ -1955,6 +2042,58 @@ fn inner() {
                             );
                         }
                     }
+                    stop(&mut broker);
+                    return;
+                }
+                if mode == "normal_model_provider_v3_quota_route_physical_post_k" {
+                    eventually(|| entry.try_wait().unwrap().is_some());
+                    assert!(!entry.wait().unwrap().success());
+                    let provider_dir = broker_state.join("v30/fresh-provider");
+                    let grant: serde_json::Value = serde_json::from_slice(
+                        &fs::read(
+                            provider_dir.join(format!("{}.fresh-grant.json", receipt.handoff_id)),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    let id = grant["id"].as_str().unwrap();
+                    assert!(provider_dir.join(format!("{id}.consumed.json")).exists());
+                    assert!(!provider_dir.join(format!("{id}.attach.json")).exists());
+                    assert!(!provider_dir.join(format!("{id}.drain.json")).exists());
+                    assert!(!gate.join("provider-effect").exists());
+                    assert_eq!(fs::read(&old_wal_path).ok(), old_wal_before);
+                    stop(&mut broker);
+                    let restart_log = temp.path().join("v3-provider-post-k-restart.log");
+                    broker = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
+                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
+                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
+                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+                        .env(
+                            "OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_READBACK_V3_V1",
+                            "1",
+                        )
+                        .env(
+                            "OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_READBACK_V3_SOURCE_V1",
+                            config_home.join("oulipoly-agent-runner"),
+                        )
+                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_ROUTE_V3_V1", "1")
+                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_K_V3_V1", "1")
+                        .stderr(Stdio::from(File::create(&restart_log).unwrap()))
+                        .spawn()
+                        .unwrap();
+                    let fresh_socket = socket.with_file_name("v30.sock");
+                    eventually(|| {
+                        protocol::request_at(&fresh_socket, Operation::ObserveEntryGate).is_ok()
+                            || broker.try_wait().unwrap().is_some()
+                    });
+                    assert!(
+                        protocol::request_at(&fresh_socket, Operation::ObserveEntryGate).is_ok(),
+                        "post-K debt restart refused: {}",
+                        fs::read_to_string(&restart_log).unwrap()
+                    );
+                    assert!(provider_dir.join(format!("{id}.consumed.json")).exists());
+                    assert!(!provider_dir.join(format!("{id}.drain.json")).exists());
                     stop(&mut broker);
                     return;
                 }
@@ -2298,6 +2437,7 @@ fn inner() {
                         "normal_model_provider_restart"
                             | "normal_model_provider_quota_restart"
                             | "normal_model_provider_auth_restart"
+                            | "normal_model_provider_v3_quota_route_physical_restart"
                     ) {
                         let fresh_socket = socket.with_file_name("v30.sock");
                         stop(&mut broker);
@@ -2310,6 +2450,22 @@ fn inner() {
                             .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
                             .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
                             .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+                            .envs(v3_physical.then_some((
+                                "OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_READBACK_V3_V1",
+                                "1",
+                            )))
+                            .envs(v3_physical.then_some((
+                                "OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_READBACK_V3_SOURCE_V1",
+                                config_home.join("oulipoly-agent-runner").to_str().unwrap(),
+                            )))
+                            .envs(
+                                v3_physical
+                                    .then_some(("OULIPOLY_KERNEL_BROKER_FIXTURE_ROUTE_V3_V1", "1")),
+                            )
+                            .envs(v3_physical.then_some((
+                                "OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_K_V3_V1",
+                                "1",
+                            )))
                             .stdout(Stdio::null())
                             .stderr(Stdio::from(
                                 File::create(temp.path().join("broker-restart.log")).unwrap(),
@@ -2347,7 +2503,9 @@ fn inner() {
                             fs::read_to_string(temp.path().join("broker-restart.log")).unwrap()
                         );
                     }
-                    if mode == "normal_model_provider_q_reply_loss" {
+                    if mode == "normal_model_provider_q_reply_loss"
+                        || mode == "normal_model_provider_v3_quota_route_physical_q_reply_loss"
+                    {
                         fs::write(gate.join("provider-drop-q-reply"), b"yes").unwrap();
                     }
                     fs::write(gate.join("provider-cancel"), b"yes").unwrap();
@@ -2356,7 +2514,9 @@ fn inner() {
                         !entry.wait().unwrap().success(),
                         "private provider fixture became ordinary CLI success"
                     );
-                    if mode == "normal_model_provider_q_reply_loss" {
+                    if mode == "normal_model_provider_q_reply_loss"
+                        || mode == "normal_model_provider_v3_quota_route_physical_q_reply_loss"
+                    {
                         let stderr = fs::read_to_string(&err).unwrap();
                         assert!(stderr.contains("fresh provider unknown:"), "{stderr}");
                         assert!(gate.join("provider-q-reply-dropped").exists());
@@ -2405,7 +2565,18 @@ fn inner() {
                             "quota result was not read back through restarted broker"
                         );
                     }
-                    assert_eq!(mapped["exit_code"], 0);
+                    assert_eq!(
+                        mapped["exit_code"],
+                        if mode.ends_with("physical_nonzero") {
+                            9
+                        } else if mode.ends_with("physical_capacity")
+                            || mode.ends_with("physical_account_quota")
+                        {
+                            1
+                        } else {
+                            0
+                        }
+                    );
                     assert_eq!(
                         mapped["provider_index"],
                         if mode == "normal_model_provider_no_pin" {
@@ -2425,7 +2596,9 @@ fn inner() {
                     );
                     assert_eq!(mapped["route_observed_live"], 0);
                     assert_eq!(mapped["route_observed_invocations"], 0);
-                    if mode == "normal_model_provider_reply_loss" {
+                    if mode == "normal_model_provider_reply_loss"
+                        || mode == "normal_model_provider_v3_quota_route_physical_reply_loss"
+                    {
                         assert!(gate.join("provider-k-reply-dropped").exists());
                         assert_eq!(
                             fs::read_dir(&provider_dir)
@@ -2440,16 +2613,81 @@ fn inner() {
                             "lost K reply caused duplicate provider launch"
                         );
                     }
-                    assert_eq!(mapped["stdout"], "provider-stdout:hello fixture");
-                    assert_eq!(mapped["stderr"], "provider-stderr\n");
-                    assert_eq!(
-                        fs::read(provider_dir.join(format!("{grant_id}.stdout"))).unwrap(),
-                        b"provider-stdout:hello fixture"
-                    );
-                    assert_eq!(
-                        fs::read(provider_dir.join(format!("{grant_id}.stderr"))).unwrap(),
-                        b"provider-stderr\n"
-                    );
+                    let short_output = mode.ends_with("physical_capacity")
+                        || mode.ends_with("physical_account_quota");
+                    if !short_output {
+                        assert_eq!(mapped["stdout"], "provider-stdout:hello fixture");
+                    }
+                    if !v3_physical || !(short_output) {
+                        assert_eq!(mapped["stderr"], "provider-stderr\n");
+                    }
+                    if v3_physical {
+                        let process: serde_json::Value = serde_json::from_slice(
+                            &fs::read(gate.join("provider-effect.process.json")).unwrap(),
+                        )
+                        .unwrap();
+                        let expected: serde_json::Value = serde_json::from_slice(
+                            &fs::read(gate.join("v3-provider-expected-plan.json")).unwrap(),
+                        )
+                        .unwrap();
+                        assert_eq!(expected["account_identity"], "physical-local");
+                        assert_eq!(process["argv"], expected["argv"]);
+                        assert_eq!(process["cwd"], expected["cwd"]);
+                        assert_eq!(process["env"], expected["env"]);
+                        let mut expected_argv =
+                            vec![gate.join("provider-effect").to_string_lossy().into_owned()];
+                        if let Some(option) = provider_option {
+                            expected_argv.push(option.into());
+                        }
+                        assert_eq!(process["argv"], serde_json::json!(expected_argv));
+                        assert_eq!(
+                            process["cwd"],
+                            serde_json::json!(std::env::current_dir().unwrap())
+                        );
+                        assert_eq!(process["selected_account"], "physical-local");
+                        assert_eq!(process["uid"], serde_json::json!(unsafe { libc::getuid() }));
+                        assert_eq!(process["no_new_privs"], 0);
+                        assert_eq!(process["seccomp"], 0);
+                        assert_eq!(process["forbidden_environment"], false);
+                        let terminal: serde_json::Value = serde_json::from_slice(
+                            &fs::read(provider_dir.join(format!("{grant_id}.terminal.json")))
+                                .unwrap(),
+                        )
+                        .unwrap();
+                        let expected_outcome = if mode.ends_with("physical_nonzero") {
+                            "generic_failure"
+                        } else if mode.ends_with("physical_capacity") {
+                            "model_at_capacity"
+                        } else if mode.ends_with("physical_account_quota") {
+                            "quota_rejected"
+                        } else {
+                            "cancelled"
+                        };
+                        assert_eq!(terminal["outcome"], expected_outcome);
+                        assert_eq!(terminal["selection"]["account_identity"], "physical-local");
+                        assert_eq!(terminal["grant_id"], grant_id);
+                        assert_eq!(
+                            fs::read_dir(&provider_dir)
+                                .unwrap()
+                                .filter_map(Result::ok)
+                                .filter(|entry| entry
+                                    .file_name()
+                                    .to_string_lossy()
+                                    .ends_with(".consumed.json"))
+                                .count(),
+                            1
+                        );
+                    }
+                    if !short_output {
+                        assert_eq!(
+                            fs::read(provider_dir.join(format!("{grant_id}.stdout"))).unwrap(),
+                            b"provider-stdout:hello fixture"
+                        );
+                        assert_eq!(
+                            fs::read(provider_dir.join(format!("{grant_id}.stderr"))).unwrap(),
+                            b"provider-stderr\n"
+                        );
+                    }
                     for suffix in [
                         "consumed.json",
                         "attach.json",
@@ -4647,6 +4885,17 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_model_provider_v3_quota_route_full",
         "normal_model_provider_v3_quota_route_stale",
         "normal_model_provider_v3_quota_route_auth_failed",
+        "normal_model_provider_v3_quota_route_physical",
+        "normal_model_provider_v3_quota_route_physical_reply_loss",
+        "normal_model_provider_v3_quota_route_physical_post_k",
+        "normal_model_provider_v3_quota_route_physical_restart",
+        "normal_model_provider_v3_quota_route_physical_q_reply_loss",
+        "normal_model_provider_v3_quota_route_physical_nonzero",
+        "normal_model_provider_v3_quota_route_physical_capacity",
+        "normal_model_provider_v3_quota_route_physical_account_quota",
+        "normal_model_provider_v3_quota_route_physical_bad_plan",
+        "normal_model_provider_v3_quota_route_physical_bad_actor",
+        "normal_model_provider_v3_quota_route_physical_source_changed",
         "normal_model_provider_quota",
         "normal_model_provider_auth",
         "normal_model_provider_auth_recovery",

@@ -3853,12 +3853,25 @@ fn serve_fresh_v30_at(
                     "OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_READBACK_V3_SOURCE_V1",
                 )
                 .ok_or_else(|| io::Error::other("v3 admission config source absent"))?;
+                let provider_writer_requested =
+                    std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_K_V3_V1")
+                        .is_some_and(|value| value == "1")
+                        && std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_ROUTE_V3_V1")
+                            .is_some_and(|value| value == "1");
                 Some(
-                    fresh_index::KeyedGeneration::admit_provider_readback(
-                        &root,
-                        &admission,
-                        Path::new(&source),
-                    )
+                    if provider_writer_requested {
+                        fresh_index::KeyedGeneration::admit_provider_writer(
+                            &root,
+                            &admission,
+                            Path::new(&source),
+                        )
+                    } else {
+                        fresh_index::KeyedGeneration::admit_provider_readback(
+                            &root,
+                            &admission,
+                            Path::new(&source),
+                        )
+                    }
                     .map_err(io::Error::other)?,
                 )
             }
@@ -3879,6 +3892,13 @@ fn serve_fresh_v30_at(
         None => false,
         Some(_) => return Err(io::Error::other("v3 route writer switch invalid")),
     };
+    #[cfg(feature = "age319-private-broker-fixture")]
+    let provider_writer_v3 =
+        match std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_K_V3_V1") {
+            Some(value) if value == "1" && route_writer_v3 && private_fixture() => true,
+            None => false,
+            Some(_) => return Err(io::Error::other("v3 provider writer switch invalid")),
+        };
     #[cfg(feature = "age319-private-broker-fixture")]
     let route_index = {
         let root = state_root.join("v30/fresh-provider");
@@ -4474,6 +4494,7 @@ fn serve_fresh_v30_at(
                     if provider_readback_v3.is_some()
                         && !(matches!(operation, b'6' | b'8' | b'9' | b'h' | b'm' | b'n')
                             || (route_writer_v3 && operation == b'f'))
+                        && !(provider_writer_v3 && matches!(operation, b'5' | b'7'))
                     {
                         return Err(io::Error::other(
                             "v3 route, auth/manual, cancellation and provider K writers are closed",
@@ -4721,6 +4742,11 @@ fn serve_fresh_v30_at(
                         if instance.is_closed() {
                             return Err(io::Error::other("fresh provider K entry gate closed"));
                         }
+                        let _v3_route_lock = if provider_writer_v3 {
+                            Some(fresh_provider::route_selection_lock(&directory)?)
+                        } else {
+                            None
+                        };
                         let [image_fd, cwd, input, recipe]: [File; 4] = descriptors
                             .try_into()
                             .map_err(|_| io::Error::other("fresh provider descriptors absent"))?;
@@ -4729,29 +4755,67 @@ fn serve_fresh_v30_at(
                         let plan = fresh_provider::plan_from_descriptors(
                             &image, image_fd, cwd, input, recipe,
                         )?;
-                        fresh_provider::require_selected_plan_indexed(
-                            &directory,
-                            &binding,
-                            &plan,
-                            route_index.as_ref(),
-                        )?;
+                        let v3_selected = if provider_writer_v3 {
+                            let generation = provider_readback_v3
+                                .as_ref()
+                                .ok_or_else(|| io::Error::other("v3 provider generation absent"))?;
+                            if fresh_provider::grant_for_binding(&directory, &binding)?.is_some() {
+                                return Err(io::Error::other(
+                                    "v3 provider grant already announced; observe exact D",
+                                ));
+                            }
+                            Some(fresh_provider::require_selected_plan_v3(
+                                &directory, &binding, &plan, generation,
+                            )?)
+                        } else {
+                            fresh_provider::require_selected_plan_indexed(
+                                &directory,
+                                &binding,
+                                &plan,
+                                route_index.as_ref(),
+                            )?;
+                            None
+                        };
                         if let Some(index) = route_index.as_ref() {
                             index
                                 .require_live_route(&binding.handoff_id)
                                 .map_err(io::Error::other)?;
                         }
                         let mut prepared = fresh_provider::prepare(&directory, binding, plan)?;
+                        let v3_revision = if let Some((account, revision)) = v3_selected.as_ref() {
+                            Some(fresh_provider::announce_provider_v3(
+                                &prepared,
+                                provider_readback_v3.as_ref().unwrap(),
+                                account,
+                                *revision,
+                            )?)
+                        } else {
+                            None
+                        };
                         if let Some(index) = route_index.as_ref() {
                             prepared.announce_indexed_grant(index)?;
                         }
-                        let grant = fresh_provider::launch(
-                            prepared,
-                            &root,
-                            &actor,
-                            actor_uid,
-                            actor_gid,
-                            route_index.as_ref(),
-                        )?;
+                        let grant = if let Some((account, _)) = v3_selected {
+                            fresh_provider::launch_v3_provider(
+                                prepared,
+                                &root,
+                                &actor,
+                                actor_uid,
+                                actor_gid,
+                                provider_readback_v3.as_ref().unwrap(),
+                                &account,
+                                v3_revision.unwrap(),
+                            )?
+                        } else {
+                            fresh_provider::launch(
+                                prepared,
+                                &root,
+                                &actor,
+                                actor_uid,
+                                actor_gid,
+                                route_index.as_ref(),
+                            )?
+                        };
                         if std::env::var_os(
                             "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_PROVIDER_K_REPLY_V1",
                         )
@@ -4777,6 +4841,9 @@ fn serve_fresh_v30_at(
                             .ok_or_else(|| io::Error::other("fresh provider grant absent"))?
                     };
                     if let Some(v3) = provider_readback_v3.as_ref() {
+                        if provider_writer_v3 {
+                            fresh_provider::settle_v3_provider(v3, &directory, &binding, &grant)?;
+                        }
                         let indexed =
                             fresh_provider::require_v3_provider_binding(v3, &directory, &binding)?;
                         if indexed != grant {
