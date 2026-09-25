@@ -12,7 +12,7 @@ use oulipoly_state::mailbox::{
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -270,10 +270,15 @@ fn inner() {
         } else {
             marker.clone()
         };
+        let interactive_args = if mode.starts_with("normal_model_provider_pty_") {
+            "interactive_args = [\"--interactive-only\"]\n"
+        } else {
+            ""
+        };
         fs::write(
             config_dir.join("providers.toml"),
             format!(
-                "[unused]\ncommand = {provider_command}\nargs = [{unused_marker}]\n{provider_environment}[{provider_name}]\ncommand = {provider_command}\nargs = [{local_args}]\n{provider_environment}{prompt_mode}{quota}"
+                "[unused]\ncommand = {provider_command}\nargs = [{unused_marker}]\n{interactive_args}{provider_environment}[{provider_name}]\ncommand = {provider_command}\nargs = [{local_args}]\n{interactive_args}{provider_environment}{prompt_mode}{quota}"
             ),
         )
         .unwrap();
@@ -592,6 +597,10 @@ fn inner() {
             .envs(
                 (mode == "normal_model_provider_pty_control")
                     .then_some(("AGE319_PRIVATE_ROOT_PTY_REPLAY_V1", "1")),
+            )
+            .envs(
+                (mode == "normal_model_provider_pty_control")
+                    .then_some(("AGE319_PRIVATE_ROOT_PTY_NEGATIVE_V1", "1")),
             )
             .envs(
                 (mode == "normal_model_provider_pty_restart")
@@ -2543,10 +2552,52 @@ fn inner() {
                             route["binding"]["session_id"]
                         );
                         assert_eq!(record["selection"]["account"], "local");
+                        let interactive: serde_json::Value = serde_json::from_slice(
+                            &fs::read(provider_dir.join(format!(
+                                "{}.interactive-route-selection.json",
+                                receipt.handoff_id
+                            )))
+                            .unwrap(),
+                        )
+                        .unwrap();
+                        assert_eq!(interactive["role"], "interactive");
+                        assert_eq!(interactive["selection"]["role"], "interactive");
                         assert_eq!(
-                            record["selection"]["plan_sha256"],
+                            interactive["selection"]["account"],
+                            route["selection"]["account"]
+                        );
+                        assert_ne!(
+                            interactive["selection"]["plan_sha256"],
                             route["selection"]["plan_sha256"]
                         );
+                        assert_eq!(
+                            record["selection"]["plan_sha256"],
+                            interactive["selection"]["plan_sha256"]
+                        );
+                        let candidate: serde_json::Value =
+                            serde_json::from_slice(
+                                &fs::read(provider_dir.join(format!(
+                                    "{}.interactive-route-1.json",
+                                    receipt.handoff_id
+                                )))
+                                .unwrap(),
+                            )
+                            .unwrap();
+                        assert_eq!(candidate["role"], "interactive");
+                        assert_eq!(candidate["account"], "local");
+                        assert_eq!(
+                            candidate["plan_sha256"],
+                            interactive["selection"]["plan_sha256"]
+                        );
+                        assert_eq!(
+                            candidate["broker_resolved_path"].as_str(),
+                            Some(provider_image.as_str())
+                        );
+                        assert_eq!(
+                            candidate["image_descriptor"]["inode"].as_u64(),
+                            Some(fs::metadata(&provider_image).unwrap().ino())
+                        );
+                        assert!(candidate["cwd_inode"].as_u64().unwrap() > 0);
                         let path = Path::new(record["control_path"].as_str().unwrap());
                         assert!(path.exists(), "root control closed before provider Q");
                         assert!(
@@ -2581,8 +2632,9 @@ fn inner() {
                             let request = protocol::PrivateFreshPtyHandoff {
                                 d_key: receipt.d_key.clone(),
                                 session_id: route["binding"]["session_id"].as_str().unwrap().into(),
+                                role: protocol::FreshPlanRole::Interactive,
                                 account: "local".into(),
-                                plan_sha256: route["selection"]["plan_sha256"]
+                                plan_sha256: interactive["selection"]["plan_sha256"]
                                     .as_str()
                                     .unwrap()
                                     .into(),

@@ -21,7 +21,8 @@ use oulipoly_kernel_broker::identity::{PinnedProcess, host_proc_file, observed_i
 use oulipoly_kernel_broker::json_artifact;
 use oulipoly_kernel_broker::protocol::{
     FreshAccountEffectKind, FreshAccountEffectReadback, FreshAccountEffectRequest,
-    FreshQuotaWindow, FreshRouteRequest, FreshRouteSelection, PrivateFreshPtyHandoff,
+    FreshInteractivePlanSelection, FreshPlanRole, FreshQuotaWindow, FreshRouteRequest,
+    FreshRouteSelection, PrivateFreshPtyHandoff,
 };
 use oulipoly_runtime::executor::cli::fresh_remote::FreshTerminalRecognizer;
 use oulipoly_runtime::executor::terminal_signal::TerminalSignalKind;
@@ -243,9 +244,11 @@ struct Recipe {
     configured_program: String,
     argv: Vec<String>,
     env: Vec<(String, String)>,
+    role: FreshPlanRole,
 }
 
 pub(super) struct Plan {
+    role: FreshPlanRole,
     image: File,
     configured_program: String,
     broker_resolved_path: PathBuf,
@@ -584,6 +587,7 @@ pub(super) fn plan(
             configured_program: image_path.to_string_lossy().into_owned(),
             argv,
             env,
+            role: FreshPlanRole::Headless,
         },
     )?;
     let seals = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
@@ -608,6 +612,7 @@ pub(super) fn plan(
         ))?)
     );
     Ok(Plan {
+        role: FreshPlanRole::Headless,
         image,
         configured_program: image_path.to_string_lossy().into_owned(),
         broker_resolved_path: image_path.to_owned(),
@@ -692,6 +697,7 @@ pub(super) fn plan_from_descriptors(
         ))?)
     );
     Ok(Plan {
+        role: parsed.role,
         image: resolved,
         configured_program: parsed.configured_program,
         broker_resolved_path: resolved_image.to_owned(),
@@ -739,6 +745,7 @@ fn durable_result<T: Serialize>(directory: &Path, value: &T) -> io::Result<()> {
 struct RouteCandidate {
     // v2 freezes the config-selected terminal recognizer with the exact plan.
     version: u32,
+    role: FreshPlanRole,
     binding: Binding,
     model: String,
     config_sha256: String,
@@ -789,6 +796,218 @@ struct RouteDecision {
     total: usize,
     pin: Option<String>,
     selection: FreshRouteSelection,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct InteractiveCandidate {
+    version: u32,
+    role: FreshPlanRole,
+    binding: Binding,
+    model: String,
+    config_sha256: String,
+    account: String,
+    index: usize,
+    total: usize,
+    pin: Option<String>,
+    plan_sha256: String,
+    configured_program: String,
+    broker_resolved_path: PathBuf,
+    image_descriptor: ImageDescriptor,
+    cwd_device: u64,
+    cwd_inode: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct InteractiveDecision {
+    version: u32,
+    role: FreshPlanRole,
+    binding: Binding,
+    headless_plan_sha256: String,
+    selection: FreshInteractivePlanSelection,
+}
+
+fn interactive_candidate_name(handoff: &str, index: usize) -> String {
+    format!("{handoff}.interactive-route-{index}.json")
+}
+
+fn interactive_decision_name(handoff: &str) -> String {
+    format!("{handoff}.interactive-route-selection.json")
+}
+
+fn checked_interactive_candidate(
+    directory: &Path,
+    binding: &Binding,
+    request: &FreshRouteRequest,
+    index: usize,
+) -> io::Result<InteractiveCandidate> {
+    let headless: RouteCandidate =
+        exact_file(directory, &candidate_name(&binding.handoff_id, index))?
+            .ok_or_else(|| io::Error::other("headless route candidate absent"))?;
+    let candidate: InteractiveCandidate = exact_file(
+        directory,
+        &interactive_candidate_name(&binding.handoff_id, index),
+    )?
+    .ok_or_else(|| io::Error::other("interactive route candidate absent"))?;
+    if headless.version != 2
+        || headless.role != FreshPlanRole::Headless
+        || headless.binding != *binding
+        || headless.model != request.model
+        || headless.config_sha256 != request.config_sha256
+        || headless.index != index
+        || headless.total != request.total
+        || headless.pin != request.pin
+        || candidate.version != 1
+        || candidate.role != FreshPlanRole::Interactive
+        || candidate.binding != *binding
+        || candidate.model != headless.model
+        || candidate.config_sha256 != headless.config_sha256
+        || candidate.account != headless.account
+        || candidate.index != headless.index
+        || candidate.total != headless.total
+        || candidate.pin != headless.pin
+        || candidate.plan_sha256 == headless.plan_sha256
+    {
+        return Err(io::Error::other(
+            "interactive route candidate differs from held pool",
+        ));
+    }
+    Ok(candidate)
+}
+
+pub(super) fn register_interactive_candidate(
+    directory: &Path,
+    binding: &Binding,
+    request: &FreshRouteRequest,
+    plan: Plan,
+) -> io::Result<()> {
+    route_request_valid(request, binding)?;
+    if plan.role != FreshPlanRole::Interactive || grant_for_binding(directory, binding)?.is_some() {
+        return Err(io::Error::other(
+            "interactive candidate role or pre-K state invalid",
+        ));
+    }
+    let index = request
+        .index
+        .ok_or_else(|| io::Error::other("interactive index absent"))?;
+    let headless: RouteCandidate =
+        exact_file(directory, &candidate_name(&binding.handoff_id, index))?.ok_or_else(|| {
+            io::Error::other("headless candidate absent before interactive registration")
+        })?;
+    if headless.version != 2
+        || headless.role != FreshPlanRole::Headless
+        || headless.binding != *binding
+        || headless.model != request.model
+        || headless.config_sha256 != request.config_sha256
+        || headless.account.as_str() != request.account.as_deref().unwrap_or_default()
+        || headless.index != index
+        || headless.total != request.total
+        || headless.pin != request.pin
+        || headless.quota_script != request.quota_script
+        || headless.auth_refresh_command != request.auth_refresh_command
+        || headless.plan_sha256 == plan.digest
+    {
+        return Err(io::Error::other(
+            "interactive registration differs from headless account",
+        ));
+    }
+    let candidate = InteractiveCandidate {
+        version: 1,
+        role: FreshPlanRole::Interactive,
+        binding: binding.clone(),
+        model: request.model.clone(),
+        config_sha256: request.config_sha256.clone(),
+        account: headless.account,
+        index,
+        total: request.total,
+        pin: request.pin.clone(),
+        plan_sha256: plan.digest,
+        configured_program: plan.configured_program,
+        broker_resolved_path: plan.broker_resolved_path,
+        image_descriptor: plan.image_descriptor,
+        cwd_device: plan.cwd_device,
+        cwd_inode: plan.cwd_inode,
+    };
+    let name = interactive_candidate_name(&binding.handoff_id, index);
+    match exact_file::<InteractiveCandidate>(directory, &name)? {
+        Some(existing) if existing == candidate => Ok(()),
+        Some(_) => Err(io::Error::other("interactive route candidate changed")),
+        None if exact_file::<InteractiveDecision>(
+            directory,
+            &interactive_decision_name(&binding.handoff_id),
+        )?
+        .is_some() =>
+        {
+            Err(io::Error::other(
+                "interactive candidate absent after selection",
+            ))
+        }
+        None => durable_new(directory, &name, &candidate),
+    }
+}
+
+pub(super) fn select_interactive_plan(
+    directory: &Path,
+    binding: &Binding,
+    request: &FreshRouteRequest,
+) -> io::Result<FreshInteractivePlanSelection> {
+    route_request_valid(request, binding)?;
+    if request.account.is_some() || request.index.is_some() {
+        return Err(io::Error::other("interactive selection carries candidate"));
+    }
+    if grant_for_binding(directory, binding)?.is_some() {
+        return Err(io::Error::other("interactive selection after provider K"));
+    }
+    let headless: RouteDecision = exact_file(directory, &decision_name(&binding.handoff_id))?
+        .ok_or_else(|| io::Error::other("headless account selection absent"))?;
+    if headless.version != 1
+        || headless.binding != *binding
+        || headless.total != request.total
+        || headless.pin != request.pin
+        || headless.selection.model != request.model
+        || headless.selection.config_sha256 != request.config_sha256
+    {
+        return Err(io::Error::other(
+            "interactive account source differs from headless choice",
+        ));
+    }
+    let mut selected = None;
+    for index in 0..request.total {
+        let candidate = checked_interactive_candidate(directory, binding, request, index)?;
+        if index == headless.selection.index {
+            if candidate.account != headless.selection.account {
+                return Err(io::Error::other("interactive selected account changed"));
+            }
+            selected = Some(candidate);
+        }
+    }
+    let candidate =
+        selected.ok_or_else(|| io::Error::other("interactive selected candidate absent"))?;
+    let selection = FreshInteractivePlanSelection {
+        role: FreshPlanRole::Interactive,
+        model: candidate.model,
+        config_sha256: candidate.config_sha256,
+        account: candidate.account,
+        index: candidate.index,
+        plan_sha256: candidate.plan_sha256,
+    };
+    let decision = InteractiveDecision {
+        version: 1,
+        role: FreshPlanRole::Interactive,
+        binding: binding.clone(),
+        headless_plan_sha256: headless.selection.plan_sha256,
+        selection: selection.clone(),
+    };
+    let name = interactive_decision_name(&binding.handoff_id);
+    match exact_file::<InteractiveDecision>(directory, &name)? {
+        Some(existing) if existing == decision => Ok(selection),
+        Some(_) => Err(io::Error::other("interactive selection changed")),
+        None => {
+            durable_new(directory, &name, &decision)?;
+            Ok(selection)
+        }
+    }
 }
 
 /// A Bash child selects work independently of the root provider route. Only
@@ -1016,6 +1235,49 @@ pub(super) fn validate_route_source(
     Ok(())
 }
 
+/// The role byte in the sealed recipe is necessary but not sufficient: a
+/// caller must not label the headless argv as an interactive candidate. The
+/// broker builds the expected interactive argv from its own read of the same
+/// pinned source. The caller's inherited environment remains pinned verbatim
+/// in the plan digest and is not replaced by the broker's environment.
+pub(super) fn validate_interactive_plan_source(
+    config_dir: &File,
+    request: &FreshRouteRequest,
+    plan: &Plan,
+) -> io::Result<()> {
+    let index = request
+        .index
+        .ok_or_else(|| io::Error::other("interactive source index absent"))?;
+    let config_path = PathBuf::from(format!("/proc/self/fd/{}", config_dir.as_raw_fd()));
+    let pool = oulipoly_runtime::executor::cli::fresh_remote::load_fresh_headless_pool(
+        &config_path,
+        &request.model,
+    )
+    .map_err(io::Error::other)?;
+    if pool.config_sha256 != request.config_sha256 {
+        return Err(io::Error::other("interactive source config changed"));
+    }
+    let (program, argv) =
+        oulipoly_runtime::executor::cli::fresh_remote::expected_fresh_interactive_command(
+            &pool.model,
+            index,
+        )
+        .map_err(io::Error::other)?;
+    let mut recipe = plan.recipe.try_clone()?;
+    recipe.seek(SeekFrom::Start(0))?;
+    let actual: Recipe = serde_json::from_reader(recipe)?;
+    if actual.role != FreshPlanRole::Interactive
+        || actual.configured_program != program
+        || actual.argv != argv
+        || plan.input.metadata()?.len() != 0
+    {
+        return Err(io::Error::other(
+            "interactive recipe differs from pinned config",
+        ));
+    }
+    Ok(())
+}
+
 /// Bind every candidate and the final choice to the same directory inode.
 /// A source with identical bytes at another path is a different snapshot
 /// origin and cannot replace this held root's already registered source.
@@ -1079,7 +1341,7 @@ struct PreKInteractivePtyHandoff {
     version: u32,
     state: String,
     binding: Binding,
-    selection: FreshRouteSelection,
+    selection: FreshInteractivePlanSelection,
     master: PtyHandoffStamp,
     slave: PtyHandoffStamp,
     pty_number: u32,
@@ -1251,6 +1513,7 @@ pub(super) fn attest_pre_k_interactive_pty(
         || actor.boot_id != binding.actor_boot_id
         || (actor.pidns_dev, actor.pidns_ino) != (binding.actor_pidns_dev, binding.actor_pidns_ino)
         || request.session_id != binding.session_id
+        || request.role != FreshPlanRole::Interactive
         || request.account.is_empty()
         || request.plan_sha256.len() != 64
         || !request.plan_sha256.bytes().all(|b| b.is_ascii_hexdigit())
@@ -1264,13 +1527,22 @@ pub(super) fn attest_pre_k_interactive_pty(
             "PTY handoff is after provider K preparation",
         ));
     }
-    let decision: RouteDecision = exact_file(directory, &decision_name(&binding.handoff_id))?
-        .ok_or_else(|| io::Error::other("PTY handoff has no broker route selection"))?;
+    let headless: RouteDecision = exact_file(directory, &decision_name(&binding.handoff_id))?
+        .ok_or_else(|| io::Error::other("PTY handoff has no account selection"))?;
+    let decision: InteractiveDecision =
+        exact_file(directory, &interactive_decision_name(&binding.handoff_id))?
+            .ok_or_else(|| io::Error::other("PTY handoff has no interactive selection"))?;
     if decision.version != 1
+        || decision.role != FreshPlanRole::Interactive
         || decision.binding != *binding
+        || decision.headless_plan_sha256 != headless.selection.plan_sha256
+        || headless.binding != *binding
+        || headless.selection.account != decision.selection.account
+        || headless.selection.index != decision.selection.index
+        || decision.selection.role != FreshPlanRole::Interactive
         || decision.selection.account != request.account
         || decision.selection.plan_sha256 != request.plan_sha256
-        || !decision
+        || !headless
             .selection
             .eligible_accounts
             .contains(&decision.selection.account)
@@ -1279,12 +1551,13 @@ pub(super) fn attest_pre_k_interactive_pty(
             "PTY handoff differs from selected account or plan",
         ));
     }
-    let candidate: RouteCandidate = exact_file(
+    let candidate: InteractiveCandidate = exact_file(
         directory,
-        &candidate_name(&binding.handoff_id, decision.selection.index),
+        &interactive_candidate_name(&binding.handoff_id, decision.selection.index),
     )?
     .ok_or_else(|| io::Error::other("PTY handoff selected candidate absent"))?;
-    if candidate.version != 2
+    if candidate.version != 1
+        || candidate.role != FreshPlanRole::Interactive
         || candidate.binding != *binding
         || candidate.model != decision.selection.model
         || candidate.config_sha256 != decision.selection.config_sha256
@@ -2009,6 +2282,7 @@ pub(super) fn register_route_candidate(
         .ok_or_else(|| io::Error::other("fresh route account absent"))?;
     let candidate = RouteCandidate {
         version: 2,
+        role: FreshPlanRole::Headless,
         binding: binding.clone(),
         model: request.model.clone(),
         config_sha256: request.config_sha256.clone(),
@@ -2022,6 +2296,11 @@ pub(super) fn register_route_candidate(
         terminal_recognizer,
     };
     let name = candidate_name(&binding.handoff_id, index);
+    if plan.role != FreshPlanRole::Headless {
+        return Err(io::Error::other(
+            "interactive plan offered as headless route",
+        ));
+    }
     if let Some(existing) = exact_file::<RouteCandidate>(directory, &name)? {
         if existing != candidate {
             return Err(io::Error::other("fresh route candidate changed"));
@@ -2044,6 +2323,7 @@ fn route_candidates(
             exact_file(directory, &candidate_name(&binding.handoff_id, index))?
                 .ok_or_else(|| io::Error::other("fresh route candidate set incomplete"))?;
         if candidate.version != 2
+            || candidate.role != FreshPlanRole::Headless
             || candidate.binding != *binding
             || candidate.model != request.model
             || candidate.config_sha256 != request.config_sha256
@@ -2855,6 +3135,7 @@ pub(super) fn require_selected_plan(
     if decision.version != 1
         || decision.binding != *binding
         || decision.selection.plan_sha256 != plan.digest
+        || plan.role != FreshPlanRole::Headless
     {
         return Err(io::Error::other(
             "fresh provider K differs from selected route",
@@ -2868,6 +3149,7 @@ pub(super) fn require_selected_plan(
     )?
     .ok_or_else(|| io::Error::other("fresh provider selected candidate absent"))?;
     if candidate.version != 2
+        || candidate.role != FreshPlanRole::Headless
         || candidate.binding != *binding
         || candidate.model != decision.selection.model
         || candidate.config_sha256 != decision.selection.config_sha256
@@ -4302,6 +4584,7 @@ mod tests {
         };
         let candidate = RouteCandidate {
             version: 2,
+            role: FreshPlanRole::Headless,
             binding: binding.clone(),
             model: selection.model.clone(),
             config_sha256: selection.config_sha256.clone(),
@@ -4806,6 +5089,109 @@ mod tests {
     }
 
     #[test]
+    fn interactive_route_selection_is_distinct_one_use_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let input_path = temp.path().join("input");
+        fs::write(&input_path, b"").unwrap();
+        let process = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+        let binding = fixture_binding(&process, &process);
+        let request = |account: Option<&str>, index: Option<usize>| FreshRouteRequest {
+            d_key: uuid::Uuid::new_v4().to_string(),
+            model: "pool".into(),
+            config_sha256: "a".repeat(64),
+            account: account.map(str::to_owned),
+            index,
+            total: 1,
+            pin: None,
+            quota_script: None,
+            auth_refresh_command: None,
+        };
+        let make_plan = |arg: &str, role| {
+            let mut selected = plan(
+                Path::new("/bin/true"),
+                temp.path(),
+                &File::open(&input_path).unwrap(),
+                vec![arg.into()],
+                vec![("PATH".into(), "/usr/bin:/bin".into())],
+            )
+            .unwrap();
+            selected.role = role;
+            selected
+        };
+        register_route_candidate(
+            temp.path(),
+            &binding,
+            &request(Some("account"), Some(0)),
+            make_plan("--headless", FreshPlanRole::Headless),
+            FreshTerminalRecognizer::OpenCode,
+        )
+        .unwrap();
+        assert!(
+            register_interactive_candidate(
+                temp.path(),
+                &binding,
+                &request(Some("account"), Some(0)),
+                make_plan("--interactive", FreshPlanRole::Headless),
+            )
+            .is_err()
+        );
+        register_interactive_candidate(
+            temp.path(),
+            &binding,
+            &request(Some("account"), Some(0)),
+            make_plan("--interactive", FreshPlanRole::Interactive),
+        )
+        .unwrap();
+        assert!(
+            register_interactive_candidate(
+                temp.path(),
+                &binding,
+                &request(Some("account"), Some(0)),
+                make_plan("--changed", FreshPlanRole::Interactive),
+            )
+            .is_err()
+        );
+        let headless = select_route(temp.path(), &binding, &request(None, None)).unwrap();
+        let selected =
+            select_interactive_plan(temp.path(), &binding, &request(None, None)).unwrap();
+        assert_eq!(selected.role, FreshPlanRole::Interactive);
+        assert_eq!(selected.account, headless.account);
+        assert_ne!(selected.plan_sha256, headless.plan_sha256);
+        assert_eq!(
+            selected,
+            select_interactive_plan(temp.path(), &binding, &request(None, None)).unwrap()
+        );
+        assert!(
+            require_selected_plan(
+                temp.path(),
+                &binding,
+                &make_plan("--interactive", FreshPlanRole::Interactive)
+            )
+            .is_err()
+        );
+        assert!(
+            register_interactive_candidate(
+                temp.path(),
+                &binding,
+                &request(Some("other"), Some(0)),
+                make_plan("--interactive", FreshPlanRole::Interactive),
+            )
+            .is_err()
+        );
+        let mut sibling = binding.clone();
+        sibling.actor_starttime += 1;
+        assert!(select_interactive_plan(temp.path(), &sibling, &request(None, None)).is_err());
+        assert!(
+            require_selected_plan(
+                temp.path(),
+                &binding,
+                &make_plan("--headless", FreshPlanRole::Headless)
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn interactive_pty_handoff_binds_selected_root_session_and_real_pair_without_activation() {
         let temp = tempfile::tempdir().unwrap();
         let (master, slave) = test_pty_pair();
@@ -4859,6 +5245,7 @@ mod tests {
             &candidate_name(&binding.handoff_id, 0),
             &RouteCandidate {
                 version: 2,
+                role: FreshPlanRole::Headless,
                 binding: binding.clone(),
                 model: selection.model.clone(),
                 config_sha256: selection.config_sha256.clone(),
@@ -4873,17 +5260,86 @@ mod tests {
             },
         )
         .unwrap();
+        let interactive_selection = FreshInteractivePlanSelection {
+            role: FreshPlanRole::Interactive,
+            model: selection.model.clone(),
+            config_sha256: selection.config_sha256.clone(),
+            account: selection.account.clone(),
+            index: selection.index,
+            plan_sha256: "c".repeat(64),
+        };
+        durable_new(
+            temp.path(),
+            &interactive_candidate_name(&binding.handoff_id, 0),
+            &InteractiveCandidate {
+                version: 1,
+                role: FreshPlanRole::Interactive,
+                binding: binding.clone(),
+                model: selection.model.clone(),
+                config_sha256: selection.config_sha256.clone(),
+                account: selection.account.clone(),
+                index: 0,
+                total: 1,
+                pin: None,
+                plan_sha256: interactive_selection.plan_sha256.clone(),
+                configured_program: "/bin/true".into(),
+                broker_resolved_path: "/bin/true".into(),
+                image_descriptor: ImageDescriptor {
+                    device: 0,
+                    inode: 0,
+                    mount_id: 0,
+                },
+                cwd_device: 0,
+                cwd_inode: 0,
+            },
+        )
+        .unwrap();
+        durable_new(
+            temp.path(),
+            &interactive_decision_name(&binding.handoff_id),
+            &InteractiveDecision {
+                version: 1,
+                role: FreshPlanRole::Interactive,
+                binding: binding.clone(),
+                headless_plan_sha256: selection.plan_sha256.clone(),
+                selection: interactive_selection.clone(),
+            },
+        )
+        .unwrap();
         let request = PrivateFreshPtyHandoff {
             d_key: uuid::Uuid::new_v4().to_string(),
             session_id: binding.session_id.clone(),
+            role: FreshPlanRole::Interactive,
             account: selection.account.clone(),
-            plan_sha256: selection.plan_sha256.clone(),
+            plan_sha256: interactive_selection.plan_sha256.clone(),
             control_path: control_path.clone(),
         };
         let attest = |request: &PrivateFreshPtyHandoff, master: &File, slave: &File| {
             attest_pre_k_interactive_pty(temp.path(), &binding, &process, request, master, slave)
         };
         assert!(attest(&request, &master, &other_slave).is_err());
+        assert!(
+            attest(
+                &PrivateFreshPtyHandoff {
+                    plan_sha256: selection.plan_sha256.clone(),
+                    ..request.clone()
+                },
+                &master,
+                &slave
+            )
+            .is_err()
+        );
+        assert!(
+            attest(
+                &PrivateFreshPtyHandoff {
+                    role: FreshPlanRole::Headless,
+                    ..request.clone()
+                },
+                &master,
+                &slave
+            )
+            .is_err()
+        );
         assert!(attest(&request, &File::open("/dev/null").unwrap(), &slave).is_err());
         assert!(attest(&request, &master, &File::open("/dev/null").unwrap()).is_err());
         assert!(
@@ -4934,7 +5390,7 @@ mod tests {
         .unwrap();
         assert_eq!(record.state, "pre-k-nonactivating");
         assert_eq!(record.binding, binding);
-        assert_eq!(record.selection, selection);
+        assert_eq!(record.selection, interactive_selection);
         assert_eq!(record.control_path, control_path);
         assert_eq!(
             record.control_inode,
@@ -5207,6 +5663,7 @@ mod tests {
         let current = fixture_binding(&process, &process);
         let candidate = RouteCandidate {
             version: 2,
+            role: FreshPlanRole::Headless,
             binding: current.clone(),
             model: "model".into(),
             config_sha256: "a".repeat(64),
@@ -5314,6 +5771,7 @@ mod tests {
                 &candidate_name(&binding.handoff_id, index),
                 &RouteCandidate {
                     version: 2,
+                    role: FreshPlanRole::Headless,
                     binding: binding.clone(),
                     model: "model".into(),
                     config_sha256: "a".repeat(64),

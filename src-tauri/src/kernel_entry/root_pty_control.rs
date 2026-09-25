@@ -3,7 +3,7 @@
 //! actor retains the original descriptor and listener until its provider call
 //! returns. This module does not create a runtime generation or deliver F.
 
-use oulipoly_kernel_broker::protocol::{self, PrivateFreshPtyHandoff};
+use oulipoly_kernel_broker::protocol::{self, FreshPlanRole, PrivateFreshPtyHandoff};
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -62,6 +62,7 @@ impl RootPtyControl {
             let binding = PrivateFreshPtyHandoff {
                 d_key: d_key.into(),
                 session_id: session_id.into(),
+                role: FreshPlanRole::Interactive,
                 account: account.into(),
                 plan_sha256: plan_sha256.into(),
                 control_path: path.clone(),
@@ -134,6 +135,40 @@ impl RootPtyControl {
         )
         .map_err(|e| format!("root PTY challenge refused: {e}"))?;
         self.ensure_live()
+    }
+
+    pub(super) fn probe_wrong_bindings(
+        &self,
+        broker: &Path,
+        headless_sha256: &str,
+    ) -> Result<(), String> {
+        self.ensure_live()?;
+        for changed in [
+            PrivateFreshPtyHandoff {
+                role: FreshPlanRole::Headless,
+                ..self._binding.clone()
+            },
+            PrivateFreshPtyHandoff {
+                plan_sha256: headless_sha256.into(),
+                ..self._binding.clone()
+            },
+            PrivateFreshPtyHandoff {
+                account: "wrong-account".into(),
+                ..self._binding.clone()
+            },
+        ] {
+            if protocol::private_fresh_pty_handoff_at(
+                broker,
+                &changed,
+                self.master.as_raw_fd(),
+                self._slave.as_raw_fd(),
+            )
+            .is_ok()
+            {
+                return Err("wrong PTY plan role, digest or account accepted".into());
+            }
+        }
+        self.rechallenge(broker)
     }
 }
 

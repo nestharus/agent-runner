@@ -462,7 +462,7 @@ fn recv_request(
         #[cfg(feature = "age319-private-broker-fixture")]
         b'5' | b'6' | b'7' | b'8' | b'9' => (18..=2048 + 17).contains(&read),
         #[cfg(feature = "age319-private-broker-fixture")]
-        b'h' | b'f' | b'm' | b'n' => (18..=48 * 1024 + 17).contains(&read),
+        b'h' | b'f' | b'(' | b')' | b'm' | b'n' => (18..=48 * 1024 + 17).contains(&read),
         #[cfg(feature = "age319-private-broker-fixture")]
         b'^' => (18..=2048 + 17).contains(&read),
         b'F' => (18..=8192 + 17).contains(&read),
@@ -487,9 +487,9 @@ fn recv_request(
             #[cfg(feature = "age319-private-broker-fixture")]
             b'9' => !(read == 33 && descriptors.is_empty()) && descriptors.len() != 4,
             #[cfg(feature = "age319-private-broker-fixture")]
-            b'h' => descriptors.len() != 5,
+            b'h' | b'(' => descriptors.len() != 5,
             #[cfg(feature = "age319-private-broker-fixture")]
-            b'f' => descriptors.len() != 1,
+            b'f' | b')' => descriptors.len() != 1,
             #[cfg(feature = "age319-private-broker-fixture")]
             b'^' => descriptors.len() != 2,
             b'L' => !(1..=4).contains(&descriptors.len()),
@@ -536,7 +536,7 @@ fn recv_request(
             }
         }
         #[cfg(feature = "age319-private-broker-fixture")]
-        b'h' | b'f' => RequestPayload::FreshRouteRequest {
+        b'h' | b'f' | b'(' | b')' => RequestPayload::FreshRouteRequest {
             request: serde_json::from_slice(&request[17..read as usize])?,
             descriptors,
         },
@@ -4611,7 +4611,8 @@ fn serve_fresh_v30_at(
                     }
                 }
                 #[cfg(feature = "age319-private-broker-fixture")]
-                b'5' | b'6' | b'7' | b'8' | b'9' | b'h' | b'f' | b'm' | b'n' | b'^' => {
+                b'5' | b'6' | b'7' | b'8' | b'9' | b'h' | b'f' | b'(' | b')' | b'm' | b'n'
+                | b'^' => {
                     if !private_fixture() {
                         return Err(io::Error::other("fresh provider fixture route closed"));
                     }
@@ -4749,7 +4750,7 @@ fn serve_fresh_v30_at(
                                 "fresh route pin differs from held root intent",
                             ));
                         }
-                        if operation == b'h' {
+                        if matches!(operation, b'h' | b'(') {
                             if instance.is_closed() {
                                 return Err(io::Error::other("fresh route entry gate closed"));
                             }
@@ -4769,16 +4770,30 @@ fn serve_fresh_v30_at(
                             let plan = fresh_provider::plan_from_descriptors(
                                 &image, image_fd, cwd, input, recipe,
                             )?;
-                            fresh_provider::register_route_candidate(
-                                &directory,
-                                &binding,
-                                &route_request,
-                                plan,
-                                fresh_provider::terminal_recognizer_from_source(
+                            if operation == b'h' {
+                                fresh_provider::register_route_candidate(
+                                    &directory,
+                                    &binding,
+                                    &route_request,
+                                    plan,
+                                    fresh_provider::terminal_recognizer_from_source(
+                                        &config_dir,
+                                        &route_request,
+                                    )?,
+                                )?;
+                            } else {
+                                fresh_provider::validate_interactive_plan_source(
                                     &config_dir,
                                     &route_request,
-                                )?,
-                            )?;
+                                    &plan,
+                                )?;
+                                fresh_provider::register_interactive_candidate(
+                                    &directory,
+                                    &binding,
+                                    &route_request,
+                                    plan,
+                                )?;
+                            }
                             return Ok("fresh-route-registered\n".into());
                         }
                         let [config_dir]: [File; 1] = descriptors
@@ -4792,12 +4807,20 @@ fn serve_fresh_v30_at(
                             &config_dir,
                             false,
                         )?;
-                        let selection =
-                            fresh_provider::select_route(&directory, &binding, &route_request)?;
-                        return Ok(format!(
-                            "fresh-route-selected {}\n",
-                            serde_json::to_string(&selection)?
-                        ));
+                        let selection = if operation == b'f' {
+                            serde_json::to_string(&fresh_provider::select_route(
+                                &directory,
+                                &binding,
+                                &route_request,
+                            )?)?
+                        } else {
+                            serde_json::to_string(&fresh_provider::select_interactive_plan(
+                                &directory,
+                                &binding,
+                                &route_request,
+                            )?)?
+                        };
+                        return Ok(format!("fresh-route-selected {}\n", selection));
                     }
                     if let Some(effect_request) = effect_request {
                         if instance.is_closed() && operation == b'm' {
@@ -6013,6 +6036,7 @@ assert s.send(message) == len(message)
         let request = oulipoly_kernel_broker::protocol::PrivateFreshPtyHandoff {
             d_key: uuid::Uuid::new_v4().to_string(),
             session_id: format!("v30:{}:{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4()),
+            role: oulipoly_kernel_broker::protocol::FreshPlanRole::Interactive,
             account: "selected".into(),
             plan_sha256: "a".repeat(64),
             control_path: temp.path().join("control.sock"),

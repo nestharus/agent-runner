@@ -189,6 +189,26 @@ pub struct FreshRouteSelection {
     pub quota_remaining_basis_points: Option<u32>,
 }
 
+#[cfg(feature = "age319-private-broker-fixture")]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FreshPlanRole {
+    Headless,
+    Interactive,
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FreshInteractivePlanSelection {
+    pub role: FreshPlanRole,
+    pub model: String,
+    pub config_sha256: String,
+    pub account: String,
+    pub index: usize,
+    pub plan_sha256: String,
+}
+
 /// Begin is one-use. If its reply is lost, observe reports `Started`, which
 /// is unknown work and must never authorize a second begin.
 pub fn begin_fresh_root_effect_at(
@@ -315,6 +335,7 @@ pub fn private_fresh_provider_at(
 pub struct PrivateFreshPtyHandoff {
     pub d_key: String,
     pub session_id: String,
+    pub role: FreshPlanRole,
     pub account: String,
     pub plan_sha256: String,
     /// Live socket bound and served by the original released Runner process.
@@ -387,7 +408,25 @@ pub fn private_fresh_route_at(
     operation: u8,
     descriptors: &[RawFd],
 ) -> io::Result<Option<FreshRouteSelection>> {
-    if !matches!((operation, descriptors.len()), (b'h', 5) | (b'f', 1)) {
+    if !matches!(operation, b'h' | b'f') {
+        return Err(io::Error::other("invalid headless route operation"));
+    }
+    private_fresh_route_raw_at(path, request, operation, descriptors)?
+        .map(|raw| serde_json::from_str(&raw).map_err(io::Error::other))
+        .transpose()
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_fresh_route_raw_at(
+    path: &Path,
+    request: &FreshRouteRequest,
+    operation: u8,
+    descriptors: &[RawFd],
+) -> io::Result<Option<String>> {
+    if !matches!(
+        (operation, descriptors.len()),
+        (b'h' | b'(', 5) | (b'f' | b')', 1)
+    ) {
         return Err(io::Error::other("invalid fresh route operation"));
     }
     let id = uuid::Uuid::parse_str(&request.d_key)
@@ -456,7 +495,7 @@ pub fn private_fresh_route_at(
     if let Some(error) = answer.strip_prefix("error ") {
         return Err(io::Error::other(error.trim_end().to_owned()));
     }
-    if operation == b'h' {
+    if matches!(operation, b'h' | b'(') {
         if answer != "fresh-route-registered\n" {
             return Err(io::Error::other(
                 "fresh route registration response invalid",
@@ -467,7 +506,24 @@ pub fn private_fresh_route_at(
     let value = answer
         .strip_prefix("fresh-route-selected ")
         .ok_or_else(|| io::Error::other("fresh route selection response invalid"))?;
-    Ok(Some(serde_json::from_str(value.trim_end())?))
+    Ok(Some(value.trim_end().to_owned()))
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+pub fn private_fresh_interactive_route_at(
+    path: &Path,
+    request: &FreshRouteRequest,
+    operation: u8,
+    descriptors: &[RawFd],
+) -> io::Result<Option<FreshInteractivePlanSelection>> {
+    if !matches!(operation, b'(' | b')') {
+        return Err(io::Error::other("invalid interactive route operation"));
+    }
+    // Keep one challenged wire implementation; the typed response is parsed
+    // below using the same frame and descriptor rules as h/f.
+    private_fresh_route_raw_at(path, request, operation, descriptors)?
+        .map(|raw| serde_json::from_str(&raw).map_err(io::Error::other))
+        .transpose()
 }
 
 /// Begin a single D/account/kind-bound broker effect or read back that exact

@@ -20,7 +20,7 @@ control socket path. The broker connects to that socket, requires a matching
 kernel peer PID and per-message responder credentials, challenges the live
 server, requires it to return its still-open PTY master via `SCM_RIGHTS`,
 checks that descriptor against the offered master, and records its socket inode.
-The broker compares them with the released root and current headless broker route selection,
+The broker compares them with the released root and the separate interactive broker plan selection,
 uses `TIOCGPTN` and `TIOCGPTPEER` to verify the real PTY pair, and creates an
 exact `pre-k-nonactivating` artifact. Repeating the same pair is readback;
 presenting another pair or any request after a provider K grant refuses. The
@@ -32,9 +32,13 @@ same live root. The artifact does not hold a descriptor or socket connection
 across restart and is never consumed by K, Q, runtime generation registration
 or F. Its stored stamps alone cannot certify PTY liveness.
 
-The runtime now has a separate interactive argv plan builder, but h/f still
-select only headless plans. The remaining work must bind that separate plan
-through broker source selection. Physical interactive K must then transfer the verified slave
+The runtime and original Runner register the interactive argv/env/cwd/image
+plan through private `(`/`)` candidate and selection operations. The broker
+pins each candidate to the same D, actor, source/config, account and index as
+the headless pool, independently checks its argv against the interactive args
+in that source, records a distinct one-use interactive decision, and `^`
+requires its exact role and digest. `h/f` and provider K/Q remain headless.
+Physical interactive K must then transfer the verified slave
 into the broker's one-use selected launch, give the child a controlling
 terminal, keep the master and control server with the original root, and
 attest the broker's actual child incarnation into the fresh sidecar. The

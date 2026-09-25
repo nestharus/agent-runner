@@ -804,6 +804,7 @@ impl PrivatePinnedPlan {
 #[cfg(feature = "age319-private-broker-fixture")]
 fn private_pin_plan(
     plan: &oulipoly_runtime::executor::cli::fresh_remote::FreshProviderPlan,
+    role: oulipoly_kernel_broker::protocol::FreshPlanRole,
 ) -> Result<PrivatePinnedPlan, String> {
     use std::os::unix::fs::OpenOptionsExt;
     let image = std::fs::OpenOptions::new()
@@ -820,6 +821,7 @@ fn private_pin_plan(
     let recipe_bytes = serde_json::to_vec(&serde_json::json!({
         "configured_program": plan.configured_program,
         "argv": plan.argv, "env": plan.environment,
+        "role": role,
     }))
     .map_err(|e| e.to_string())?;
     let recipe = private_sealed_bytes(b"fresh-provider-recipe", &recipe_bytes)?;
@@ -844,7 +846,10 @@ impl oulipoly_runtime::executor::cli::fresh_remote::FreshProviderBackend
         let socket = broker_socket().with_file_name("v30.sock");
         // The broker binds the original descriptor's inode and mount before
         // one-use K. Preflight content observations cannot attest later bytes.
-        let pinned = private_pin_plan(&plan)?;
+        let pinned = private_pin_plan(
+            &plan,
+            oulipoly_kernel_broker::protocol::FreshPlanRole::Headless,
+        )?;
         let submitted = protocol::private_fresh_provider_at(
             &socket,
             &self.authority.receipt.d_key,
@@ -1044,10 +1049,11 @@ fn private_verified_output(
 #[cfg(feature = "age319-private-broker-fixture")]
 fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode, String> {
     use oulipoly_kernel_broker::protocol::{
-        self, FreshAccountEffectKind, FreshAccountEffectRequest, FreshRouteRequest,
+        self, FreshAccountEffectKind, FreshAccountEffectRequest, FreshPlanRole, FreshRouteRequest,
     };
     use oulipoly_runtime::executor::cli::fresh_remote::{
-        load_fresh_headless_pool, prepare_fresh_headless, run_prepared_fresh_headless,
+        load_fresh_headless_pool, prepare_fresh_headless, prepare_fresh_interactive,
+        run_prepared_fresh_headless,
     };
     let (model_name, provider_pin, prompt) = match &authority.receipt.root_work_intent {
         oulipoly_state::mailbox::FreshRootWorkIntent::NormalCli(args) => match args.as_slice() {
@@ -1107,15 +1113,53 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
             quota_script: pool.account_effects[index].0.clone(),
             auth_refresh_command: pool.account_effects[index].1.clone(),
         };
-        let pinned = private_pin_plan(&candidate.plan)?;
-        let [image, cwd, input, recipe] = pinned.descriptors();
+        let pinned = private_pin_plan(&candidate.plan, FreshPlanRole::Headless)?;
+        let [image, cwd_fd, input, recipe] = pinned.descriptors();
         protocol::private_fresh_route_at(
             &socket,
             &request,
             b'h',
-            &[image, cwd, input, recipe, config_source.as_raw_fd()],
+            &[image, cwd_fd, input, recipe, config_source.as_raw_fd()],
         )
         .map_err(|e| format!("fresh route candidate refused before K: {e}"))?;
+        if std::env::var_os("AGE319_PRIVATE_ROOT_PTY_CONTROL_V1").is_some() {
+            let interactive = prepare_fresh_interactive(&pool.model, index, &cwd)?;
+            if std::env::var_os("AGE319_PRIVATE_ROOT_PTY_NEGATIVE_V1").is_some() {
+                let mut mislabeled = interactive.clone();
+                mislabeled.argv = candidate.plan.argv.clone();
+                let wrong = private_pin_plan(&mislabeled, FreshPlanRole::Interactive)?;
+                if protocol::private_fresh_interactive_route_at(
+                    &socket,
+                    &request,
+                    b'(',
+                    &[
+                        wrong.image.as_raw_fd(),
+                        wrong.cwd.as_raw_fd(),
+                        wrong.input.as_raw_fd(),
+                        wrong.recipe.as_raw_fd(),
+                        config_source.as_raw_fd(),
+                    ],
+                )
+                .is_ok()
+                {
+                    return Err("headless argv mislabeled as interactive accepted".into());
+                }
+            }
+            let pinned = private_pin_plan(&interactive, FreshPlanRole::Interactive)?;
+            protocol::private_fresh_interactive_route_at(
+                &socket,
+                &request,
+                b'(',
+                &[
+                    pinned.image.as_raw_fd(),
+                    pinned.cwd.as_raw_fd(),
+                    pinned.input.as_raw_fd(),
+                    pinned.recipe.as_raw_fd(),
+                    config_source.as_raw_fd(),
+                ],
+            )
+            .map_err(|e| format!("interactive route candidate refused before K: {e}"))?;
+        }
     }
     let mut quota_receipts = Vec::new();
     let mut auth_receipts = Vec::new();
@@ -1205,16 +1249,65 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
         return Err("fresh route readback differs from configured pool before K".into());
     }
     let selected_plan = prepared.swap_remove(selected.index);
-    // This private pre-K custody exercise records only the already selected
-    // headless plan. Interactive plan selection and the broker PTY fork remain
-    // separate work; a successful ^ is never a generation or F receipt.
+    // The interactive decision is independently durable. The headless plan
+    // stays with the existing K/Q backend; ^ does not spend an interactive K.
+    let mut selected_interactive = None;
     let root_pty = if std::env::var_os("AGE319_PRIVATE_ROOT_PTY_CONTROL_V1").is_some() {
+        let interactive = protocol::private_fresh_interactive_route_at(
+            &socket,
+            &request,
+            b')',
+            &[config_source.as_raw_fd()],
+        )
+        .map_err(|e| format!("interactive route selection refused before K: {e}"))?
+        .ok_or("interactive route selection absent before K")?;
+        let local_interactive = prepare_fresh_interactive(&pool.model, selected.index, &cwd)?;
+        let local_pinned = private_pin_plan(&local_interactive, FreshPlanRole::Interactive)?;
+        let readback = protocol::private_fresh_interactive_route_at(
+            &socket,
+            &request,
+            b')',
+            &[config_source.as_raw_fd()],
+        )
+        .map_err(|e| format!("interactive route readback refused: {e}"))?
+        .ok_or("interactive route readback absent")?;
+        if interactive != readback
+            || interactive.role != FreshPlanRole::Interactive
+            || interactive.model != selected.model
+            || interactive.config_sha256 != selected.config_sha256
+            || interactive.account != selected.account
+            || interactive.index != selected.index
+            || interactive.plan_sha256 == selected.plan_sha256
+        {
+            return Err("interactive selection readback differs from held account".into());
+        }
+        let selected_request = FreshRouteRequest {
+            account: Some(interactive.account.clone()),
+            index: Some(interactive.index),
+            quota_script: pool.account_effects[interactive.index].0.clone(),
+            auth_refresh_command: pool.account_effects[interactive.index].1.clone(),
+            ..request.clone()
+        };
+        protocol::private_fresh_interactive_route_at(
+            &socket,
+            &selected_request,
+            b'(',
+            &[
+                local_pinned.image.as_raw_fd(),
+                local_pinned.cwd.as_raw_fd(),
+                local_pinned.input.as_raw_fd(),
+                local_pinned.recipe.as_raw_fd(),
+                config_source.as_raw_fd(),
+            ],
+        )
+        .map_err(|e| format!("selected interactive plan changed before ^: {e}"))?;
+        selected_interactive = Some(interactive.clone());
         Some(root_pty_control::RootPtyControl::offer(
             &socket,
             &authority.receipt.d_key,
             &authority.session.session_id,
             &selected.account,
-            &selected.plan_sha256,
+            &interactive.plan_sha256,
             &std::path::PathBuf::from(
                 std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
                     .ok_or("private PTY control directory absent")?,
@@ -1224,6 +1317,9 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
         None
     };
     if let Some(control) = &root_pty {
+        if std::env::var_os("AGE319_PRIVATE_ROOT_PTY_NEGATIVE_V1").is_some() {
+            control.probe_wrong_bindings(&socket, &selected.plan_sha256)?;
+        }
         if std::env::var_os("AGE319_PRIVATE_ROOT_PTY_REPLAY_V1").is_some() {
             control.rechallenge(&socket)?;
         }
@@ -1240,6 +1336,16 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
                     return Err("root PTY broker restart wait expired".into());
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let readback = protocol::private_fresh_interactive_route_at(
+                &socket,
+                &request,
+                b')',
+                &[config_source.as_raw_fd()],
+            )
+            .map_err(|e| format!("interactive selection restart readback refused: {e}"))?;
+            if readback.as_ref() != selected_interactive.as_ref() {
+                return Err("interactive selection changed after broker restart".into());
             }
             control.rechallenge(&socket)?;
         }
