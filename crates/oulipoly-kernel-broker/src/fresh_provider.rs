@@ -49,6 +49,61 @@ pub(super) fn offline_snapshot_v3(
 ) -> io::Result<super::fresh_index::OfflineSnapshot> {
     fresh_rebuild::offline_snapshot_v3(root, source)
 }
+
+/// Exact, read-only physical proof for a previously imported v3 account
+/// effect. This deliberately cannot announce an intent or grant a K.
+pub(super) fn v3_effect_physical_readback(
+    directory: &Path,
+    source: &Path,
+    binding: &Binding,
+    request: &FreshAccountEffectRequest,
+    effect_id: &str,
+) -> io::Result<(
+    FreshAccountEffectReadback,
+    SourceKey,
+    String,
+    Artifact,
+    Option<String>,
+)> {
+    let candidate = effect_candidate(directory, binding, request)?;
+    fresh_rebuild::validate_candidate(directory, source, &candidate)?;
+    let dir = effect_directory(directory, binding, request);
+    let intent =
+        effect_intent(&dir)?.ok_or_else(|| io::Error::other("v3 effect physical intent absent"))?;
+    if intent.version != 1
+        || intent.id != effect_id
+        || intent.binding != *binding
+        || intent.request != redacted_effect_request(request)
+        || intent.environment_sha256 != environment_digest(request)?
+        || intent.auth_source.is_some()
+        || dir.join("reuse.json").exists()
+        || dir.join("manual-reuse.json").exists()
+    {
+        return Err(io::Error::other(
+            "v3 effect physical source changed or reused",
+        ));
+    }
+    let source_key = SourceKey {
+        commands_sha256: format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&(
+                &candidate.quota_script,
+                &candidate.auth_refresh_command
+            ))?)
+        ),
+        environment_sha256: intent.environment_sha256.clone(),
+    };
+    let readback = effect_readback_from_dir_mode(&dir, &intent, false)?;
+    let artifact = effect_artifact(directory, &dir.join("intent.json"))?;
+    let grant = grant_for_binding(&dir, binding)?;
+    Ok((
+        readback,
+        source_key,
+        candidate.account_identity,
+        artifact,
+        grant,
+    ))
+}
 pub(super) use fresh_rebuild::{offline_snapshot, reconcile_offline_account};
 
 static CANCEL: AtomicBool = AtomicBool::new(false);
@@ -1856,6 +1911,7 @@ fn effect_readback_from_dir_mode(
             } else {
                 let mut raw = String::new();
                 stdout.read_to_string(&mut raw)?;
+                super::fresh_index::reader_bytes_parsed(raw.len() as u64);
                 match parse_effect_windows(&raw) {
                     Ok(windows) if !windows.is_empty() => ("valid_windows".into(), windows),
                     Ok(_) => ("empty".into(), Vec::new()),
@@ -4087,10 +4143,12 @@ fn exact_file<T: for<'de> Deserialize<'de>>(dir: &Path, name: &str) -> io::Resul
 }
 
 fn verified_output(dir: &Path, name: &str, expected: &Output) -> io::Result<File> {
+    super::fresh_index::reader_open_attempt();
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(dir.join(name))?;
+    super::fresh_index::reader_opened();
     let meta = file.metadata()?;
     if !meta.is_file() || meta.dev() != expected.device || meta.ino() != expected.inode {
         return Err(io::Error::other("provider output inode changed"));
@@ -4103,6 +4161,7 @@ fn verified_output(dir: &Path, name: &str, expected: &Output) -> io::Result<File
         if n == 0 {
             break;
         }
+        super::fresh_index::reader_bytes_parsed(n as u64);
         hash.update(&buf[..n]);
         offset = offset
             .checked_add(n as u64)

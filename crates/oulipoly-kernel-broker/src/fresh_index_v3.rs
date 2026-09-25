@@ -131,6 +131,168 @@ impl KeyedGeneration {
             .transpose()
     }
 
+    /// Certify the latest typed quota/auth observation for one exact retained
+    /// physical effect. A physical Q that arrived after keyed publication is
+    /// still debt until a separate writer settles the same K/Q/result. This
+    /// read never scans retained effect history or materializes result.json.
+    pub(crate) fn latest_effect_checkpoint(
+        &self,
+        source: &Path,
+        binding: &super::super::fresh_provider::Binding,
+        request: &oulipoly_kernel_broker::protocol::FreshAccountEffectRequest,
+        effect_id: &str,
+    ) -> Result<Option<oulipoly_kernel_broker::protocol::FreshAccountEffectReadback>> {
+        self.check_current()?;
+        let (physical, source_key, physical_key, intent_artifact, grant_id) =
+            super::super::fresh_provider::v3_effect_physical_readback(
+                &self.root, source, binding, request, effect_id,
+            )
+            .map_err(|error| corrupt(format!("v3 effect physical readback: {error}")))?;
+        let store = self.account(&physical_key)?;
+        let source_digest = keyed(&source_key)?;
+        let (revision, pending_count, mut values) = store.read_many(&[
+            ("account", "summary"),
+            ("effect", effect_id),
+            ("pending", &format!("effect:{effect_id}")),
+            ("source", &source_digest),
+        ])?;
+        let source_head: Option<SourceHead> = typed(values.pop().unwrap())?;
+        let pending: Option<PendingHead> = typed(values.pop().unwrap())?;
+        let effect: EffectIntent = typed(values.pop().unwrap())?
+            .ok_or(IndexError::RebuildRequired("v3 effect announcement absent"))?;
+        let summary = values.pop().unwrap().ok_or(IndexError::RebuildRequired(
+            "v3 effect account summary absent",
+        ))?;
+        if summary["physical_key"].as_str() != Some(physical_key.as_str())
+            || summary["pending_count"].as_u64() != Some(pending_count)
+            || effect.source != source_key
+            || effect.intent != intent_artifact
+            || effect.decision_handoff != binding.handoff_id
+        {
+            return Err(corrupt("v3 effect source, account or announcement differs"));
+        }
+        let expected_kind = match request.kind {
+            oulipoly_kernel_broker::protocol::FreshAccountEffectKind::AuthRefresh => {
+                EffectKind::Auth
+            }
+            _ => EffectKind::Quota,
+        };
+        if effect.kind != expected_kind || effect.reuse.is_some() {
+            return Err(corrupt("v3 effect kind or reuse differs"));
+        }
+        effect.intent.require_present(&self.root)?;
+        for (indexed, path) in [
+            (
+                &effect.candidate,
+                format!("{}.route-{}.json", binding.handoff_id, request.index),
+            ),
+            (
+                &effect.route_source,
+                format!("{}.route-source.json", binding.handoff_id),
+            ),
+        ] {
+            let expected = Artifact::from_existing(&self.root, Path::new(&path))?;
+            if indexed.as_ref() != Some(&expected) {
+                return Err(corrupt("v3 effect candidate or route source differs"));
+            }
+        }
+        let result = if let (Some(q), Some(result)) = (&effect.certified_q, &effect.result) {
+            if pending.is_some() || effect.consumed_k.as_ref() != Some(&q.physical_k) {
+                return Err(corrupt("v3 settled effect has pending or different K"));
+            }
+            let grant_id =
+                grant_id.ok_or_else(|| corrupt("v3 settled effect physical grant absent"))?;
+            let parent = Path::new(&effect.intent.path)
+                .parent()
+                .ok_or_else(|| corrupt("v3 effect intent parent absent"))?;
+            let expected_k = Artifact::from_existing(
+                &self.root,
+                &parent.join(format!("{grant_id}.consumed.json")),
+            )?;
+            let expected_q = Artifact::from_existing(
+                &self.root,
+                &parent.join(format!("{grant_id}.drain.json")),
+            )?;
+            if q.physical_k != expected_k || q.q != expected_q || q.terminal.is_some() {
+                return Err(corrupt("v3 effect physical K/Q differs"));
+            }
+            q.verify(&self.root)?;
+            let expected_result_artifact =
+                Artifact::from_existing(&self.root, &parent.join("result.json"))?;
+            if result != &expected_result_artifact {
+                return Err(corrupt("v3 effect result artifact differs"));
+            }
+            result.require_present(&self.root)?;
+            let expected_result = result
+                .read_json::<oulipoly_kernel_broker::protocol::FreshAccountEffectReadback>(
+                &self.root,
+            )?;
+            if serde_json::to_value(&expected_result).map_err(|e| corrupt(e.to_string()))?
+                != serde_json::to_value(&physical).map_err(|e| corrupt(e.to_string()))?
+                || physical.state != "drained"
+            {
+                return Err(corrupt("v3 effect typed result differs from physical Q"));
+            }
+            let observation = source_head.as_ref().and_then(|head| {
+                if head.source != source_key {
+                    return None;
+                }
+                match effect.kind {
+                    EffectKind::Quota => head.quota.as_ref(),
+                    EffectKind::Auth => head.auth.as_ref(),
+                    EffectKind::ManualQuota => None,
+                }
+            });
+            match observation {
+                Some(observation) if observation.q == *q => {
+                    if observation.result.as_ref() != Some(result)
+                        || observation.outcome != physical.outcome.as_deref().unwrap_or("")
+                        || observation.completed_unix_seconds != physical.completed_unix_seconds
+                        || observation.origin_model.as_deref() != Some(request.model.as_str())
+                        || observation.origin_config_sha256.as_deref()
+                            != Some(request.config_sha256.as_str())
+                        || observation.windows.len() != physical.windows.len()
+                        || observation.windows.iter().zip(&physical.windows).any(
+                            |(indexed, observed)| {
+                                indexed.used_percent != observed.used_percent
+                                    || indexed.resets_at != observed.resets_at
+                                    || DateTime::parse_from_rfc3339(&observed.resets_at)
+                                        .map_or(true, |date| {
+                                            date.timestamp() != indexed.reset_unix_seconds
+                                        })
+                                    || indexed.remaining != observed.remaining
+                            },
+                        )
+                    {
+                        return Err(corrupt("v3 effect latest typed source differs"));
+                    }
+                    Some(physical)
+                }
+                Some(_) => None, // A newer Q owns this source's current fact.
+                None => return Err(corrupt("v3 settled effect typed source absent")),
+            }
+        } else {
+            if pending
+                .as_ref()
+                .is_none_or(|item| item.announcement != effect.intent)
+                || effect.result.is_some()
+            {
+                return Err(corrupt("v3 unresolved effect pending debt differs"));
+            }
+            if let Some(q) = &effect.certified_q {
+                q.verify(&self.root)?;
+            }
+            None
+        };
+        if store.summary()? != (revision, pending_count) {
+            return Err(IndexError::Conflict(
+                "v3 effect account changed during readback",
+            ));
+        }
+        self.check_current()?;
+        Ok(result)
+    }
+
     /// Read exact physical account facts under one keyed account lock. The
     /// source key must be derived from the candidate's command pair and the
     /// verified effect environment; this method does not select a candidate

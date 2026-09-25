@@ -44,7 +44,11 @@ fn source_key(candidate: &RouteCandidate, environment: &str) -> io::Result<Sourc
         environment_sha256: environment.to_owned(),
     })
 }
-fn validate_candidate(root: &Path, source: &Path, candidate: &RouteCandidate) -> io::Result<()> {
+pub(super) fn validate_candidate(
+    root: &Path,
+    source: &Path,
+    candidate: &RouteCandidate,
+) -> io::Result<()> {
     if candidate.version != 3
         || candidate.account.is_empty()
         || candidate.account_identity.is_empty()
@@ -1356,6 +1360,7 @@ mod tests {
     fn v3_imports_typed_quota_auth_and_manual_physical_q() {
         let fixture = Fixture::new();
         fixture.prepared();
+        let mut checkpoints = Vec::new();
         for (id, kind, output_bytes) in [
             (
                 "quota",
@@ -1400,6 +1405,7 @@ mod tests {
             durable_new(&dir, &format!("{}.consumed.json", grant.id), &grant).unwrap();
             Fixture::effect_q(&dir, &grant, output_bytes);
             effect_readback_from_dir(&dir, &intent).unwrap();
+            checkpoints.push((id, request));
         }
         let operation_id = uuid::Uuid::new_v4().to_string();
         let manual = ManualQuotaRequest {
@@ -1425,6 +1431,23 @@ mod tests {
         fixture.ready();
         rebuild_keyed_offline(&fixture.root, &fixture.socket, &fixture.source).unwrap();
         let generation = KeyedGeneration::open(&fixture.root).unwrap();
+        for (id, request) in &checkpoints {
+            let (physical, keyed_io) = crate::linux_main::fresh_index::measure_keyed_io(|| {
+                let _io =
+                    crate::linux_main::fresh_index::ReaderIoGuard::start("v3-effect-checkpoint");
+                generation.latest_effect_checkpoint(&fixture.source, &fixture.binding, request, id)
+            });
+            let physical = physical.unwrap();
+            if *id == "auth" {
+                let physical = physical.expect("settled latest auth effect");
+                assert_eq!(physical.effect_id, *id);
+                assert_eq!(physical.state, "drained");
+            } else {
+                // The later manual quota Q owns this source's latest quota.
+                assert!(physical.is_none());
+            }
+            eprintln!("v3 {id} physical effect checkpoint keyed={keyed_io:?}");
+        }
         let account = generation.account("physical-first").unwrap();
         assert!(account.get("effect", "quota").unwrap().is_some());
         assert!(account.get("effect", "auth").unwrap().is_some());
@@ -1439,6 +1462,326 @@ mod tests {
         assert_eq!(source["auth"]["outcome"], "refreshed");
         assert_eq!(source["quota"]["windows"].as_array().unwrap().len(), 1);
         assert_eq!(account.summary().unwrap().1, 1); // prepared provider grant
+        let auth_dir = effect_directory(&fixture.root, &fixture.binding, &checkpoints[1].1);
+        std::fs::remove_file(auth_dir.join("result.json")).unwrap();
+        assert!(
+            generation
+                .latest_effect_checkpoint(
+                    &fixture.source,
+                    &fixture.binding,
+                    &checkpoints[1].1,
+                    "auth",
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn v3_effect_checkpoint_keeps_late_physical_q_as_pending_debt() {
+        let fixture = Fixture::new();
+        let wal = fixture.temp.path().join("state.db-wal");
+        std::fs::write(&wal, b"old WAL stays byte exact").unwrap();
+        let request = FreshAccountEffectRequest {
+            d_key: uuid::Uuid::new_v4().to_string(),
+            model: "work".into(),
+            config_sha256: fixture.candidate.config_sha256.clone(),
+            account: "first".into(),
+            index: 0,
+            kind: FreshAccountEffectKind::QuotaFirst,
+            environment: vec![],
+        };
+        let dir = effect_directory(&fixture.root, &fixture.binding, &request);
+        std::fs::create_dir_all(&dir).unwrap();
+        let grant = Grant {
+            version: 1,
+            id: uuid::Uuid::new_v4().to_string(),
+            binding: fixture.binding.clone(),
+            plan_sha256: "b".repeat(64),
+        };
+        durable_new(
+            &dir,
+            "intent.json",
+            &AccountEffectIntent {
+                version: 1,
+                id: "quota".into(),
+                binding: fixture.binding.clone(),
+                request: request.clone(),
+                environment_sha256: environment_digest(&request).unwrap(),
+                plan_sha256: grant.plan_sha256.clone(),
+                auth_source: None,
+            },
+        )
+        .unwrap();
+        durable_new(
+            &dir,
+            &format!("{}.fresh-grant.json", fixture.binding.handoff_id),
+            &grant,
+        )
+        .unwrap();
+        durable_new(&dir, &format!("{}.consumed.json", grant.id), &grant).unwrap();
+        fixture.ready();
+        rebuild_keyed_offline(&fixture.root, &fixture.socket, &fixture.source).unwrap();
+        let generation = KeyedGeneration::open(&fixture.root).unwrap();
+        assert!(
+            generation
+                .latest_effect_checkpoint(&fixture.source, &fixture.binding, &request, "quota")
+                .unwrap()
+                .is_none()
+        );
+        Fixture::effect_q(
+            &dir,
+            &grant,
+            b"{\"used_percent\":20,\"resets_at\":\"2099-01-01T00:00:00Z\"}",
+        );
+        assert!(
+            generation
+                .latest_effect_checkpoint(&fixture.source, &fixture.binding, &request, "quota")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            generation
+                .account("physical-first")
+                .unwrap()
+                .summary()
+                .unwrap()
+                .1,
+            1
+        );
+        rebuild_keyed_offline(&fixture.root, &fixture.socket, &fixture.source).unwrap();
+        let without_result = KeyedGeneration::open(&fixture.root).unwrap();
+        assert!(
+            without_result
+                .latest_effect_checkpoint(&fixture.source, &fixture.binding, &request, "quota")
+                .unwrap()
+                .is_none()
+        );
+        let intent = effect_intent(&dir).unwrap().unwrap();
+        effect_readback_from_dir(&dir, &intent).unwrap();
+        rebuild_keyed_offline(&fixture.root, &fixture.socket, &fixture.source).unwrap();
+        let settled = KeyedGeneration::open(&fixture.root).unwrap();
+        let result = settled
+            .latest_effect_checkpoint(&fixture.source, &fixture.binding, &request, "quota")
+            .unwrap()
+            .expect("offline rebuilt exact K/Q/result");
+        assert_eq!(result.outcome.as_deref(), Some("valid_windows"));
+        assert_eq!(
+            settled
+                .account("physical-first")
+                .unwrap()
+                .summary()
+                .unwrap()
+                .1,
+            0
+        );
+        assert_eq!(std::fs::read(&wal).unwrap(), b"old WAL stays byte exact");
+    }
+
+    #[test]
+    fn v3_effect_checkpoint_reads_one_of_hundreds_of_physical_settled_sources() {
+        fn measured(
+            count: usize,
+        ) -> (
+            crate::linux_main::fresh_index::KeyedIoCount,
+            crate::linux_main::fresh_index::ReaderIo,
+        ) {
+            let fixture = Fixture::new();
+            let source_meta = fixture.source.metadata().unwrap();
+            let mut target = None;
+            for n in 0..count {
+                let binding = Binding {
+                    handoff_id: uuid::Uuid::new_v4().to_string(),
+                    ..fixture.binding.clone()
+                };
+                let candidate = RouteCandidate {
+                    binding: binding.clone(),
+                    ..fixture.candidate.clone()
+                };
+                durable_new(
+                    &fixture.root,
+                    &format!("{}.route-source.json", binding.handoff_id),
+                    &RouteSource {
+                        version: 1,
+                        binding: binding.clone(),
+                        config_sha256: candidate.config_sha256.clone(),
+                        directory_device: source_meta.dev(),
+                        directory_inode: source_meta.ino(),
+                    },
+                )
+                .unwrap();
+                durable_new(
+                    &fixture.root,
+                    &candidate_name(&binding.handoff_id, 0),
+                    &candidate,
+                )
+                .unwrap();
+                let request = FreshAccountEffectRequest {
+                    d_key: uuid::Uuid::new_v4().to_string(),
+                    model: "work".into(),
+                    config_sha256: candidate.config_sha256.clone(),
+                    account: "first".into(),
+                    index: 0,
+                    kind: FreshAccountEffectKind::QuotaFirst,
+                    environment: vec![("SOURCE".into(), n.to_string())],
+                };
+                let dir = effect_directory(&fixture.root, &binding, &request);
+                std::fs::create_dir_all(&dir).unwrap();
+                let grant = Grant {
+                    version: 1,
+                    id: uuid::Uuid::new_v4().to_string(),
+                    binding: binding.clone(),
+                    plan_sha256: "b".repeat(64),
+                };
+                let id = format!("effect-{n}");
+                let intent = AccountEffectIntent {
+                    version: 1,
+                    id: id.clone(),
+                    binding: binding.clone(),
+                    request: redacted_effect_request(&request),
+                    environment_sha256: environment_digest(&request).unwrap(),
+                    plan_sha256: grant.plan_sha256.clone(),
+                    auth_source: None,
+                };
+                durable_new(&dir, "intent.json", &intent).unwrap();
+                durable_new(
+                    &dir,
+                    &format!("{}.fresh-grant.json", binding.handoff_id),
+                    &grant,
+                )
+                .unwrap();
+                durable_new(&dir, &format!("{}.consumed.json", grant.id), &grant).unwrap();
+                Fixture::effect_q(
+                    &dir,
+                    &grant,
+                    b"{\"used_percent\":20,\"resets_at\":\"2099-01-01T00:00:00Z\"}",
+                );
+                effect_readback_from_dir(&dir, &intent).unwrap();
+                target = Some((binding, request, id));
+            }
+            fixture.ready();
+            rebuild_keyed_offline(&fixture.root, &fixture.socket, &fixture.source).unwrap();
+            let generation = KeyedGeneration::open(&fixture.root).unwrap();
+            let (binding, request, id) = target.unwrap();
+            let (result, keyed_io) = crate::linux_main::fresh_index::measure_keyed_io(|| {
+                let _io =
+                    crate::linux_main::fresh_index::ReaderIoGuard::start("v3-physical-effect-read");
+                generation.latest_effect_checkpoint(&fixture.source, &binding, &request, &id)
+            });
+            assert_eq!(
+                result.unwrap().unwrap().outcome.as_deref(),
+                Some("valid_windows")
+            );
+            (
+                keyed_io,
+                crate::linux_main::fresh_index::last_reader_io().unwrap(),
+            )
+        }
+        let small = measured(1);
+        let large = measured(205);
+        eprintln!("v3 physical effect read 1={small:?} 205={large:?}");
+        assert_eq!(small.0.open_attempts, large.0.open_attempts);
+        assert_eq!(small.0.opened, large.0.opened);
+        assert_eq!(small.1.open_attempts, large.1.open_attempts);
+        assert_eq!(small.1.opened, large.1.opened);
+        assert_eq!(small.0.directory_entries + small.1.directory_entries, 0);
+        assert_eq!(large.0.directory_entries + large.1.directory_entries, 0);
+        assert_eq!(small.0.bytes_written + small.1.bytes_written, 0);
+        assert_eq!(large.0.bytes_written + large.1.bytes_written, 0);
+    }
+
+    #[test]
+    fn v3_physical_quota_result_keeps_fresh_stale_full_and_invalid_distinct() {
+        for (output, outcome, eligibility) in [
+            (
+                b"{\"used_percent\":20,\"resets_at\":\"2099-01-01T00:00:00Z\"}".as_slice(),
+                "valid_windows",
+                "Eligible",
+            ),
+            (
+                b"{\"used_percent\":100,\"resets_at\":\"2099-01-01T00:00:00Z\"}".as_slice(),
+                "valid_windows",
+                "Excluded",
+            ),
+            (b"invalid quota Q".as_slice(), "invalid", "ProbeRequired"),
+        ] {
+            let fixture = Fixture::new();
+            let request = FreshAccountEffectRequest {
+                d_key: uuid::Uuid::new_v4().to_string(),
+                model: "work".into(),
+                config_sha256: fixture.candidate.config_sha256.clone(),
+                account: "first".into(),
+                index: 0,
+                kind: FreshAccountEffectKind::QuotaFirst,
+                environment: vec![],
+            };
+            let dir = effect_directory(&fixture.root, &fixture.binding, &request);
+            std::fs::create_dir_all(&dir).unwrap();
+            let grant = Grant {
+                version: 1,
+                id: uuid::Uuid::new_v4().to_string(),
+                binding: fixture.binding.clone(),
+                plan_sha256: "b".repeat(64),
+            };
+            let intent = AccountEffectIntent {
+                version: 1,
+                id: "quota".into(),
+                binding: fixture.binding.clone(),
+                request: request.clone(),
+                environment_sha256: environment_digest(&request).unwrap(),
+                plan_sha256: grant.plan_sha256.clone(),
+                auth_source: None,
+            };
+            durable_new(&dir, "intent.json", &intent).unwrap();
+            durable_new(
+                &dir,
+                &format!("{}.fresh-grant.json", fixture.binding.handoff_id),
+                &grant,
+            )
+            .unwrap();
+            durable_new(&dir, &format!("{}.consumed.json", grant.id), &grant).unwrap();
+            Fixture::effect_q(&dir, &grant, output);
+            effect_readback_from_dir(&dir, &intent).unwrap();
+            fixture.ready();
+            rebuild_keyed_offline(&fixture.root, &fixture.socket, &fixture.source).unwrap();
+            let generation = KeyedGeneration::open(&fixture.root).unwrap();
+            let result = generation
+                .latest_effect_checkpoint(&fixture.source, &fixture.binding, &request, "quota")
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.outcome.as_deref(), Some(outcome));
+            let indexed: EffectIntent = serde_json::from_value(
+                generation
+                    .account("physical-first")
+                    .unwrap()
+                    .get("effect", "quota")
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            let now = Utc::now().timestamp();
+            let actual = generation
+                .route_facts(
+                    "physical-first",
+                    Some(&indexed.source),
+                    "work",
+                    &fixture.candidate.config_sha256,
+                    now,
+                )
+                .unwrap();
+            assert!(format!("{actual:?}").starts_with(eligibility));
+            if outcome == "valid_windows" && eligibility == "Eligible" {
+                let stale = generation
+                    .route_facts(
+                        "physical-first",
+                        Some(&indexed.source),
+                        "work",
+                        &fixture.candidate.config_sha256,
+                        now + 5 * 60 * 60 + 1,
+                    )
+                    .unwrap();
+                assert_eq!(format!("{stale:?}"), "ProbeRequired");
+            }
+        }
     }
 
     #[test]

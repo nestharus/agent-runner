@@ -32,6 +32,8 @@ use std::sync::{Mutex, OnceLock};
 #[allow(dead_code)]
 mod keyed_store;
 #[cfg(test)]
+pub(super) use keyed_store::IoCount as KeyedIoCount;
+#[cfg(test)]
 pub(super) use keyed_store::measured as measure_keyed_io;
 #[path = "fresh_index_v3.rs"]
 #[allow(dead_code)]
