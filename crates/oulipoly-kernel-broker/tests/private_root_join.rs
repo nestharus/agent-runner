@@ -125,6 +125,16 @@ fn inner() {
             | "normal_model_provider_bash_ordinary_failure"
             | "normal_model_provider_bash_ordinary_cancel"
             | "normal_model_provider_bash_ordinary_parent_tamper"
+            | "normal_model_provider_bash_ordinary_sync_reply_loss"
+            | "normal_model_provider_bash_ordinary_sync_partial"
+            | "normal_model_provider_bash_ordinary_sync_repeat"
+            | "normal_model_provider_bash_ordinary_sync_large"
+            | "normal_model_provider_bash_ordinary_sync_signal"
+            | "normal_model_provider_bash_ordinary_sync_tamper"
+            | "normal_model_provider_bash_ordinary_sync_w_debt"
+            | "normal_model_provider_bash_ordinary_sync_socket_partial"
+            | "normal_model_provider_bash_ordinary_sync_post_tamper"
+            | "normal_model_provider_bash_ordinary_sync_encode_tamper"
             | "normal_model_provider_reply_loss"
             | "normal_model_provider_q_reply_loss"
             | "normal_model_provider_restart"
@@ -488,8 +498,13 @@ fn inner() {
         )
         .envs(
             (mode == "normal_model_provider_bash_causal_w_debt"
-                || mode == "normal_model_provider_bash_causal_notify_w_debt")
+                || mode == "normal_model_provider_bash_causal_notify_w_debt"
+                || mode == "normal_model_provider_bash_ordinary_sync_w_debt")
                 .then_some(("AGE319_PRIVATE_SOURCE_W_CAPTURE_ONLY_V1", "1")),
+        )
+        .envs(
+            (mode == "normal_model_provider_bash_ordinary_sync_socket_partial")
+                .then_some(("AGE319_PRIVATE_SYNC_PARTIAL_SOCKET_REPLY_V1", "1")),
         )
         .envs(
             (mode == "normal_model_provider_bash_causal_notify_debt")
@@ -652,6 +667,25 @@ fn inner() {
                                     "ordinary-async",
                                 ))
                             })
+                    })
+                    .or_else(|| {
+                        [
+                            ("sync_reply_loss", "ordinary-sync-reply-loss"),
+                            ("sync_partial", "ordinary-sync-partial"),
+                            ("sync_repeat", "ordinary-sync-repeat"),
+                            ("sync_large", "ordinary-sync-large"),
+                            ("sync_signal", "ordinary-sync-signal"),
+                            ("sync_tamper", "ordinary-sync-tamper"),
+                            ("sync_w_debt", "ordinary-sync-w-debt"),
+                            ("sync_socket_partial", "ordinary-sync-socket-partial"),
+                            ("sync_post_tamper", "ordinary-sync-post-tamper"),
+                            ("sync_encode_tamper", "ordinary-sync-encode-tamper"),
+                        ]
+                        .into_iter()
+                        .find_map(|(suffix, value)| {
+                            (mode == format!("normal_model_provider_bash_ordinary_{suffix}"))
+                                .then_some(("AGE319_PRIVATE_BASH_ORDINARY_MODE_V1", value))
+                        })
                     }),
             )
             .envs(
@@ -1029,10 +1063,104 @@ fn inner() {
                 }
                 let asynchronous = mode.ends_with("_async") || mode.ends_with("_restart");
                 fs::write(gate.join("child-effect"), b"yes").unwrap();
+                if mode.ends_with("_sync_tamper")
+                    || mode.ends_with("_sync_post_tamper")
+                    || mode.ends_with("_sync_encode_tamper")
+                {
+                    let post = mode.ends_with("_sync_post_tamper");
+                    let encode = mode.ends_with("_sync_encode_tamper");
+                    let marker = if post {
+                        "sync-begin-paused"
+                    } else if encode {
+                        "sync-verify-paused"
+                    } else {
+                        "sync-paused"
+                    };
+                    eventually(|| gate.join(marker).exists());
+                    let request_id = fs::read_to_string(gate.join(marker)).unwrap();
+                    let fresh =
+                        rusqlite::Connection::open(broker_state.join("v30/state.db")).unwrap();
+                    let event_json: String = fresh.query_row(
+                        "SELECT receipt_json FROM fresh_bash_selected_event WHERE request_id=?1",
+                        [&request_id], |r| r.get(0),
+                    ).unwrap();
+                    let event: oulipoly_state::mailbox::FreshBashSourceEvent =
+                        serde_json::from_str(&event_json).unwrap();
+                    fs::write(
+                        broker_state
+                            .join("v30/fresh-provider")
+                            .join(format!("{}.stdout", event.physical_grant_id)),
+                        if encode {
+                            &b"changedbyts"[..]
+                        } else {
+                            &b"changedbytes"[..]
+                        },
+                    )
+                    .unwrap();
+                    fs::write(
+                        gate.join(if post {
+                            "sync-begin-release"
+                        } else if encode {
+                            "sync-verify-release"
+                        } else {
+                            "sync-release"
+                        }),
+                        b"yes",
+                    )
+                    .unwrap();
+                }
                 eventually(|| {
                     gate.join("ordinary-bash-status").exists()
                         || entry.try_wait().unwrap().is_some()
                 });
+                if mode.ends_with("_sync_partial")
+                    || mode.ends_with("_sync_tamper")
+                    || mode.ends_with("_sync_post_tamper")
+                    || mode.ends_with("_sync_encode_tamper")
+                    || mode.ends_with("_sync_w_debt")
+                {
+                    assert_ne!(
+                        fs::read_to_string(gate.join("ordinary-bash-status")).unwrap(),
+                        "0"
+                    );
+                    let fresh =
+                        rusqlite::Connection::open(broker_state.join("v30/state.db")).unwrap();
+                    let reserved: i64 = fresh
+                        .query_row(
+                            "SELECT count(*) FROM fresh_bash_sync_publication",
+                            [],
+                            |r| r.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        reserved,
+                        if mode.ends_with("_sync_partial")
+                            || mode.ends_with("_sync_post_tamper")
+                            || mode.ends_with("_sync_encode_tamper")
+                        {
+                            1
+                        } else {
+                            0
+                        }
+                    );
+                    if mode.ends_with("_sync_partial") || mode.ends_with("_sync_encode_tamper") {
+                        assert!(
+                            fs::read(gate.join("bash-causal-output"))
+                                .unwrap()
+                                .starts_with(b"{\"schema_version\":31,")
+                        );
+                    } else {
+                        assert!(
+                            fs::read(gate.join("bash-causal-output"))
+                                .unwrap()
+                                .is_empty()
+                        );
+                    }
+                    fs::write(gate.join("provider-cancel"), b"yes").unwrap();
+                    eventually(|| entry.try_wait().unwrap().is_some());
+                    stop(&mut broker);
+                    return;
+                }
                 assert_eq!(
                     fs::read_to_string(gate.join("ordinary-bash-status")).unwrap_or_default(),
                     "0",
@@ -1044,16 +1172,103 @@ fn inner() {
                 let report: serde_json::Value =
                     serde_json::from_slice(&fs::read(gate.join("bash-causal-output")).unwrap())
                         .unwrap();
-                let request_id = report["request_id"].as_str().unwrap();
-                let grant = report["physical_grant_id"].as_str().unwrap();
-                assert_eq!(
-                    report["delivery_mode"],
-                    if asynchronous { "async" } else { "sync" }
-                );
-                assert_eq!(report["completion_policy"], "tree");
-                assert!(report["handle"].as_str().unwrap().starts_with("ab30_"));
-                assert_eq!(report["effects_possible"], true);
+                let request_id = if asynchronous {
+                    report["request_id"].as_str().unwrap()
+                } else {
+                    report["publication"]["child"]["request_id"]
+                        .as_str()
+                        .unwrap()
+                };
+                let grant = if asynchronous {
+                    report["physical_grant_id"].as_str().unwrap()
+                } else {
+                    report["publication"]["event"]["physical_grant_id"]
+                        .as_str()
+                        .unwrap()
+                };
+                if asynchronous {
+                    assert_eq!(report["delivery_mode"], "async");
+                    assert_eq!(report["completion_policy"], "tree");
+                    assert!(report["handle"].as_str().unwrap().starts_with("ab30_"));
+                    assert_eq!(report["effects_possible"], true);
+                } else {
+                    assert_eq!(report["schema_version"], 31);
+                    assert_eq!(
+                        report["dispatch_state"],
+                        if mode.ends_with("_sync_reply_loss")
+                            || mode.ends_with("_sync_socket_partial")
+                        {
+                            "sync-publication-unknown"
+                        } else {
+                            "sync-child-result"
+                        }
+                    );
+                    assert_eq!(report["publication"]["phase"], "unknown");
+                    if mode.ends_with("_sync_reply_loss") || mode.ends_with("_sync_socket_partial")
+                    {
+                        assert!(report.get("stdout_base64").is_none());
+                        assert!(report.get("stderr_base64").is_none());
+                    } else {
+                        assert_eq!(report["stdout_encoding"], "base64");
+                        assert_eq!(report["stderr_encoding"], "base64");
+                    }
+                    if !mode.ends_with("_cancel")
+                        && !mode.ends_with("_sync_reply_loss")
+                        && !mode.ends_with("_sync_socket_partial")
+                        && !mode.ends_with("_sync_large")
+                    {
+                        assert_eq!(report["stdout_base64"], "Af9vcmRpbmFyeQA=");
+                        assert_eq!(report["stderr_base64"], "ZXJyAP4=");
+                    }
+                    if mode.ends_with("_sync_large") {
+                        use base64::Engine as _;
+                        let decoded = base64::engine::general_purpose::STANDARD
+                            .decode(report["stdout_base64"].as_str().unwrap())
+                            .unwrap();
+                        assert_eq!(decoded.len(), 200011);
+                        assert_eq!(&decoded[..11], b"\x01\xffordinary\x00");
+                        assert!(decoded[11..].iter().all(|byte| *byte == 0));
+                    }
+                    if report["dispatch_state"] == "sync-child-result" {
+                        use base64::Engine as _;
+                        for stream in ["stdout", "stderr"] {
+                            let decoded = base64::engine::general_purpose::STANDARD
+                                .decode(report[format!("{stream}_base64")].as_str().unwrap())
+                                .unwrap();
+                            assert_eq!(
+                                decoded.len() as u64,
+                                report["publication"]["event"][format!("{stream}_len")]
+                                    .as_u64()
+                                    .unwrap()
+                            );
+                            assert_eq!(
+                                format!("{:x}", Sha256::digest(&decoded)),
+                                report["publication"]["event"][format!("{stream}_sha256")]
+                            );
+                        }
+                    }
+                    if mode.ends_with("_failure") {
+                        assert_eq!(report["publication"]["outcome"], "exited");
+                        assert_eq!(report["publication"]["exit_code"], 37);
+                    } else if mode.ends_with("_sync_signal") {
+                        assert_eq!(report["publication"]["outcome"], "signaled");
+                        assert_eq!(report["publication"]["signal"], libc::SIGTERM);
+                    } else if mode.ends_with("_cancel") {
+                        assert_eq!(report["publication"]["outcome"], "cancelled");
+                    }
+                }
                 let directory = broker_state.join("v30/fresh-provider");
+                if !asynchronous {
+                    let parent_grant = report["publication"]["child"]["parent_work_grant_id"]
+                        .as_str()
+                        .unwrap();
+                    assert!(
+                        !directory
+                            .join(format!("{parent_grant}.drain.json"))
+                            .exists(),
+                        "sync child response waited for parent Q"
+                    );
+                }
                 let selected: serde_json::Value = serde_json::from_slice(
                     &fs::read(directory.join(format!("{request_id}.child-work-selection.json")))
                         .unwrap(),
@@ -1196,10 +1411,19 @@ fn inner() {
                     assert!(!gate.join("ordinary-background").exists());
                 } else {
                     assert!(!event.cancelled);
-                    assert_eq!(
-                        fs::read(directory.join(format!("{grant}.stdout"))).unwrap(),
-                        b"\x01\xffordinary\x00"
-                    );
+                    if mode.ends_with("_sync_large") {
+                        assert_eq!(
+                            fs::metadata(directory.join(format!("{grant}.stdout")))
+                                .unwrap()
+                                .len(),
+                            200011
+                        );
+                    } else {
+                        assert_eq!(
+                            fs::read(directory.join(format!("{grant}.stdout"))).unwrap(),
+                            b"\x01\xffordinary\x00"
+                        );
+                    }
                     assert_eq!(
                         fs::read(directory.join(format!("{grant}.stderr"))).unwrap(),
                         b"err\x00\xfe"
@@ -1236,6 +1460,42 @@ fn inner() {
                     })
                     .unwrap();
                 assert_eq!(notify_count, if asynchronous { 1 } else { 0 });
+                let sync_publications: i64 = fresh
+                    .query_row(
+                        "SELECT count(*) FROM fresh_bash_sync_publication",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(sync_publications, if asynchronous { 0 } else { 1 });
+                if !asynchronous {
+                    let stored: String = fresh.query_row(
+                        "SELECT receipt_json FROM fresh_bash_sync_publication WHERE request_id=?1",
+                        [request_id], |r| r.get(0),
+                    ).unwrap();
+                    let stored: serde_json::Value = serde_json::from_str(&stored).unwrap();
+                    assert_eq!(stored, report["publication"]);
+                    let consumed = fs::read_dir(&directory)
+                        .unwrap()
+                        .filter_map(Result::ok)
+                        .filter(|entry| {
+                            entry
+                                .file_name()
+                                .to_string_lossy()
+                                .ends_with(".consumed.json")
+                        })
+                        .count();
+                    assert_eq!(consumed, 2, "sync response created a second K");
+                    let root_publications: i64 = fresh
+                        .query_row("SELECT count(*) FROM fresh_root_publication", [], |r| {
+                            r.get(0)
+                        })
+                        .unwrap();
+                    assert_eq!(
+                        root_publications, 0,
+                        "child response created root publication"
+                    );
+                }
                 if mode.ends_with("_copy") {
                     eventually(|| gate.join("ordinary-copy-status").exists());
                     assert_eq!(
@@ -5425,6 +5685,16 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_model_provider_bash_ordinary_failure",
         "normal_model_provider_bash_ordinary_cancel",
         "normal_model_provider_bash_ordinary_parent_tamper",
+        "normal_model_provider_bash_ordinary_sync_reply_loss",
+        "normal_model_provider_bash_ordinary_sync_partial",
+        "normal_model_provider_bash_ordinary_sync_repeat",
+        "normal_model_provider_bash_ordinary_sync_large",
+        "normal_model_provider_bash_ordinary_sync_signal",
+        "normal_model_provider_bash_ordinary_sync_tamper",
+        "normal_model_provider_bash_ordinary_sync_w_debt",
+        "normal_model_provider_bash_ordinary_sync_socket_partial",
+        "normal_model_provider_bash_ordinary_sync_post_tamper",
+        "normal_model_provider_bash_ordinary_sync_encode_tamper",
         "normal_model_provider_reply_loss",
         "normal_model_provider_q_reply_loss",
         "normal_model_provider_restart",
