@@ -3,6 +3,7 @@
 use base64::Engine as _;
 use oulipoly_kernel_broker::identity::PinnedProcess;
 use oulipoly_kernel_broker::protocol::{FreshRecipientRequest, fresh_recipient_request_at};
+use oulipoly_runtime::executor::cli::pty_broker::PtyControlGenerationIdentity;
 use oulipoly_state::StateDb;
 use oulipoly_state::mailbox::{
     BindRuntimeGenerationRunning, BrokerSidecar, CreateRuntimeGeneration,
@@ -17,6 +18,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::process::{Child, Command};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 #[test]
@@ -251,7 +256,58 @@ fn private_fresh_recipient_delivery_ack_collision_and_restart() {
         prepare(preparation.clone()).is_err(),
         "absent PTY socket must refuse"
     );
-    let _control = UnixListener::bind(&control).unwrap();
+    let mut control_server = ControlFixtureServer::start(
+        &control,
+        &generation_id.to_string(),
+        &invocation,
+        &session.session_id,
+        &live,
+    );
+    for change in [
+        "generation",
+        "provider",
+        "instance",
+        "settings",
+        "session",
+        "peer",
+        "child",
+    ] {
+        control_server.change(change);
+        assert!(
+            prepare(preparation.clone()).is_err(),
+            "{change} identity must refuse"
+        );
+    }
+    control_server.restore();
+    control_server.drop_next_reply();
+    assert!(
+        prepare(preparation.clone()).is_err(),
+        "lost identity query reply must refuse"
+    );
+    assert_eq!(
+        fresh
+            .query_row("SELECT count(*) FROM fresh_native_f_preparation", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        fresh
+            .query_row("SELECT count(*) FROM fresh_recipient_grant", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        fresh
+            .query_row(
+                "SELECT count(*) FROM fresh_recipient_ack_evidence",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
     drop_reply(
         &socket,
         &FreshRecipientRequest::PrepareNativeF {
@@ -515,11 +571,26 @@ fn private_fresh_recipient_delivery_ack_collision_and_restart() {
         prepare(ambiguous).is_err(),
         "ambiguous resident generation must refuse"
     );
+    control_server.stop();
     fs::remove_file(&control).unwrap();
-    assert_eq!(
-        prepare(preparation.clone()).unwrap()["preparation"],
-        record.clone(),
-        "same-key recovery after restart must not select a replacement endpoint"
+    assert!(
+        prepare(preparation.clone()).is_err(),
+        "lost socket must refuse readback"
+    );
+    assert!(
+        fresh_recipient_request_at(
+            &socket,
+            &FreshRecipientRequest::ReadNativeFPreparation {
+                preparation_request_id: preparation.preparation_request_id.clone(),
+            }
+        )
+        .is_err(),
+        "lost socket must refuse live readback"
+    );
+    let _replacement = UnixListener::bind(&control).unwrap();
+    assert!(
+        prepare(preparation.clone()).is_err(),
+        "replacement inode must refuse"
     );
     let delegation_file = private.path().join("delegation");
     let result_file = private.path().join("result");
@@ -903,6 +974,125 @@ fn private_fresh_recipient_delivery_ack_collision_and_restart() {
     drop(lane);
     broker.kill().unwrap();
     broker.wait().unwrap();
+}
+
+struct ControlFixtureServer {
+    baseline: PtyControlGenerationIdentity,
+    reply: Arc<Mutex<PtyControlGenerationIdentity>>,
+    drop_reply: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ControlFixtureServer {
+    fn start(
+        path: &Path,
+        generation: &str,
+        invocation: &str,
+        session: &str,
+        process: &oulipoly_state::pid_identity::ProcessIdentity,
+    ) -> Self {
+        let listener = UnixListener::bind(path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let baseline = PtyControlGenerationIdentity {
+            challenge: String::new(),
+            generation_id: generation.into(),
+            spawn_invocation_uuid: invocation.into(),
+            creator_process: process.clone(),
+            provider_process: process.clone(),
+            provider_account: "fixture-provider".into(),
+            provider_instance_id: "fixture-instance".into(),
+            settings_id: "fixture-settings".into(),
+            provider_session_id: session.into(),
+        };
+        let reply = Arc::new(Mutex::new(baseline.clone()));
+        let drop_reply = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker = {
+            let reply = Arc::clone(&reply);
+            let drop_reply = Arc::clone(&drop_reply);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    let Ok((mut peer, _)) = listener.accept() else {
+                        std::thread::sleep(Duration::from_millis(2));
+                        continue;
+                    };
+                    peer.set_read_timeout(Some(Duration::from_millis(250)))
+                        .unwrap();
+                    let mut header = [0u8; 12];
+                    if peer.read_exact(&mut header).is_err()
+                        || &header[..4] != b"OPTY"
+                        || header[4] != 1
+                        || header[5] != 3
+                    {
+                        continue;
+                    }
+                    let length = u32::from_be_bytes(header[8..12].try_into().unwrap()) as usize;
+                    if length > 64 {
+                        continue;
+                    }
+                    let mut challenge = vec![0u8; length];
+                    if peer.read_exact(&mut challenge).is_err() {
+                        continue;
+                    }
+                    if drop_reply.swap(false, Ordering::AcqRel) {
+                        continue;
+                    }
+                    let mut statement = reply.lock().unwrap().clone();
+                    statement.challenge = String::from_utf8(challenge).unwrap();
+                    let bytes = serde_json::to_vec(&statement).unwrap();
+                    let mut response = [0u8; 12];
+                    response[..4].copy_from_slice(b"OPTY");
+                    response[4] = 1;
+                    response[8..12].copy_from_slice(&(bytes.len() as u32).to_be_bytes());
+                    peer.write_all(&response).unwrap();
+                    peer.write_all(&bytes).unwrap();
+                }
+            })
+        };
+        Self {
+            baseline,
+            reply,
+            drop_reply,
+            stop,
+            worker: Some(worker),
+        }
+    }
+
+    fn change(&self, field: &str) {
+        let mut statement = self.baseline.clone();
+        match field {
+            "generation" => statement.generation_id = uuid::Uuid::new_v4().to_string(),
+            "provider" => statement.provider_account = "wrong-provider".into(),
+            "instance" => statement.provider_instance_id = "wrong-instance".into(),
+            "settings" => statement.settings_id = "wrong-settings".into(),
+            "session" => statement.provider_session_id = "wrong-session".into(),
+            "peer" => statement.creator_process.os_pid += 1,
+            "child" => statement.provider_process.os_pid += 1,
+            _ => unreachable!(),
+        }
+        *self.reply.lock().unwrap() = statement;
+    }
+
+    fn restore(&self) {
+        *self.reply.lock().unwrap() = self.baseline.clone();
+    }
+    fn drop_next_reply(&self) {
+        self.drop_reply.store(true, Ordering::Release);
+    }
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            worker.join().unwrap();
+        }
+    }
+}
+
+impl Drop for ControlFixtureServer {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 #[test]

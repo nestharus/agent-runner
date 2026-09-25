@@ -101,6 +101,10 @@ impl SpawnIdentityContext {
         &self.invocation_uuid
     }
 
+    pub(super) fn provider_name(&self) -> &str {
+        &self.provider_name
+    }
+
     pub(super) fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
     }

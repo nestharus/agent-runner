@@ -38,35 +38,6 @@ pub(crate) fn prepare_private_native_f_input(
     {
         return Err("native F grant or provider identity unavailable".into());
     }
-    let prior = fresh_recipient_request_at(
-        input.socket,
-        &FreshRecipientRequest::ReadNativeFPreparation {
-            preparation_request_id: input.preparation_request_id.into(),
-        },
-    )
-    .map_err(|e| e.to_string())?;
-    if prior["kind"] != "native_f_preparation_readback" {
-        return Err("native F preparation readback kind changed".into());
-    }
-    if !prior["preparation"].is_null() {
-        let record: FreshNativeFPreparation =
-            serde_json::from_value(prior["preparation"].clone()).map_err(|e| e.to_string())?;
-        if record.preparation_request_id != input.preparation_request_id
-            || record.grant_id != input.grant.grant_id
-            || record.delivery_request_id != input.delivery_request_id
-            || record.delivery_token_sha256
-                != format!("{:x}", Sha256::digest(input.delivery_token.as_bytes()))
-            || record.runtime_generation_id != input.runtime_generation_id
-            || record.envelope_nonce != input.envelope_nonce
-            || record.provider_account != input.identity.provider_name
-            || Some(record.provider_instance_id.as_str())
-                != input.identity.provider_instance_id.as_deref()
-            || record.settings_id != input.identity.settings_id
-        {
-            return Err("native F preparation readback conflicts with exact request".into());
-        }
-        return Ok(record);
-    }
     let endpoint = input
         .registry
         .preflight_account(&input.identity.provider_name)
@@ -112,6 +83,39 @@ pub(crate) fn prepare_private_native_f_input(
         .resume_token
         .filter(|token| !token.is_empty())
         .ok_or("native F pre-send Tail anchor missing")?;
+    let prior = fresh_recipient_request_at(
+        input.socket,
+        &FreshRecipientRequest::ReadNativeFPreparation {
+            preparation_request_id: input.preparation_request_id.into(),
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    if prior["kind"] != "native_f_preparation_readback" {
+        return Err("native F preparation readback kind changed".into());
+    }
+    if !prior["preparation"].is_null() {
+        let record: FreshNativeFPreparation =
+            serde_json::from_value(prior["preparation"].clone()).map_err(|e| e.to_string())?;
+        if record.preparation_request_id != input.preparation_request_id
+            || record.grant_id != input.grant.grant_id
+            || record.delivery_request_id != input.delivery_request_id
+            || record.delivery_token_sha256
+                != format!("{:x}", Sha256::digest(input.delivery_token.as_bytes()))
+            || record.runtime_generation_id != input.runtime_generation_id
+            || record.envelope_nonce != input.envelope_nonce
+            || record.provider_account != input.identity.provider_name
+            || Some(record.provider_instance_id.as_str())
+                != input.identity.provider_instance_id.as_deref()
+            || record.settings_id != input.identity.settings_id
+            || record.session_id != input.grant.session_id
+            || record.tail_resume_token != tail
+            || record.envelope_sha256
+                != format!("{:x}", Sha256::digest(record.envelope_text.as_bytes()))
+        {
+            return Err("native F preparation readback conflicts with exact request".into());
+        }
+        return Ok(record);
+    }
     let request = FreshNativeFPrepareRequest {
         preparation_request_id: input.preparation_request_id.into(),
         delivery_request_id: input.delivery_request_id.into(),

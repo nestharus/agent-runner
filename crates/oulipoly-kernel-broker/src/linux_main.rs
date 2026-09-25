@@ -51,9 +51,10 @@ use oulipoly_kernel_broker::source_acceptance::capture_and_stage_v2_evidence;
 use oulipoly_kernel_broker::source_physical::{SourceObservation, SourcePhysicalRegistry};
 use oulipoly_kernel_broker::work_registry::{Scope, WorkRegistry, classify_scope};
 use oulipoly_state::mailbox::{
-    BrokerReleaseEvidence, BrokerSidecar, BrokerSourceEffectGrant, FreshBashListenerPolicy,
-    FreshDeliverySubmission, FreshRecipientIdentity, FreshReleasedHandoff, FreshV30Lane,
-    FreshV30LaneIdentity, PreparedBrokerOwner, PreparedProcessStamp,
+    BrokerReleaseEvidence, BrokerSidecar, BrokerSourceEffectGrant, ExactProcessEvidence,
+    FreshBashListenerPolicy, FreshDeliverySubmission, FreshNativeFPreparation,
+    FreshRecipientIdentity, FreshReleasedHandoff, FreshV30Lane, FreshV30LaneIdentity,
+    PreparedBrokerOwner, PreparedProcessStamp, RuntimeGenerationRow,
 };
 #[cfg(feature = "age319-private-broker-fixture")]
 use sha2::{Digest, Sha256};
@@ -71,6 +72,59 @@ const SOCKET: &str = "/run/oulipoly-kernel-broker/control.sock";
 const STATE: &str = "/var/lib/oulipoly-kernel-broker";
 const FRESH_SOCKET: &str = "/run/oulipoly-kernel-broker/v30.sock";
 const RUNNER: &str = "/usr/local/libexec/oulipoly/oulipoly-agent-runner";
+
+fn verify_native_f_resident(
+    generation: &RuntimeGenerationRow,
+    path: &str,
+    device: u64,
+    inode: u64,
+    instance: &str,
+    settings: &str,
+    session: &str,
+) -> Result<(), String> {
+    let reply = oulipoly_runtime::executor::cli::pty_broker::query_pty_generation_identity(
+        Path::new(path),
+        device,
+        inode,
+    )?;
+    let (ExactProcessEvidence::Recorded(creator), ExactProcessEvidence::Recorded(provider)) = (
+        &generation.creator_process_evidence,
+        &generation.exact_process_evidence,
+    ) else {
+        return Err("native F exact resident process identity unavailable".into());
+    };
+    if reply.generation_id != generation.generation_id.to_string()
+        || reply.spawn_invocation_uuid != generation.spawn_invocation_uuid
+        || &reply.creator_process != creator
+        || &reply.provider_process != provider
+        || reply.provider_account != generation.provider_name
+        || reply.provider_instance_id != instance
+        || reply.settings_id != settings
+        || reply.provider_session_id != session
+        || generation.session_id.as_deref() != Some(session)
+        || generation.pty_control_path.as_deref() != Some(path)
+    {
+        return Err("native F resident PTY attestation mismatched selected generation".into());
+    }
+    Ok(())
+}
+
+fn verify_native_f_readback(
+    lane: &FreshV30Lane,
+    record: &FreshNativeFPreparation,
+) -> Result<(), String> {
+    lane.attest_native_f_preparation(record, |generation, path, device, inode| {
+        verify_native_f_resident(
+            generation,
+            path,
+            device,
+            inode,
+            &record.provider_instance_id,
+            &record.settings_id,
+            &record.provider_session_id,
+        )
+    })
+}
 
 #[cfg(feature = "age319-private-broker-fixture")]
 fn private_fixture() -> bool {
@@ -4947,9 +5001,37 @@ fn serve_fresh_v30_at(
                             if instance.is_closed() {
                                 return Err(io::Error::other("fresh recipient entry gate closed"));
                             }
+                            if let Some(existing) = lane
+                                .read_native_f_preparation(
+                                    &preparation.preparation_request_id,
+                                    &recipient,
+                                )
+                                .map_err(io::Error::other)?
+                            {
+                                verify_native_f_readback(&lane, &existing)
+                                    .map_err(io::Error::other)?;
+                            }
                             let prepared = lane
-                                .prepare_native_f_input(&preparation, &recipient)
+                                .prepare_native_f_input(
+                                    &preparation,
+                                    &recipient,
+                                    |generation, path, device, inode| {
+                                        verify_native_f_resident(
+                                            generation,
+                                            path,
+                                            device,
+                                            inode,
+                                            &preparation.provider_instance_id,
+                                            &preparation.settings_id,
+                                            generation
+                                                .session_id
+                                                .as_deref()
+                                                .ok_or("native F provider session absent")?,
+                                        )
+                                    },
+                                )
                                 .map_err(io::Error::other)?;
+                            verify_native_f_readback(&lane, &prepared).map_err(io::Error::other)?;
                             serde_json::json!({"kind":"native_f_preparation", "preparation":prepared})
                         }
                         FreshRecipientRequest::ReadNativeFPreparation {
@@ -4958,6 +5040,10 @@ fn serve_fresh_v30_at(
                             let prepared = lane
                                 .read_native_f_preparation(&preparation_request_id, &recipient)
                                 .map_err(io::Error::other)?;
+                            if let Some(record) = prepared.as_ref() {
+                                verify_native_f_readback(&lane, record)
+                                    .map_err(io::Error::other)?;
+                            }
                             serde_json::json!({"kind":"native_f_preparation_readback", "preparation":prepared})
                         }
                         FreshRecipientRequest::Acknowledge {

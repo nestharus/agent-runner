@@ -153,6 +153,10 @@ impl LiveSessionBindingServer {
         Arc::clone(&self.session_id)
     }
 
+    pub(crate) fn provider_identity(&self) -> &SessionProviderIdentity {
+        &self.context.identity
+    }
+
     pub(crate) fn start(
         &mut self,
         spawn_context: SpawnIdentityContext,

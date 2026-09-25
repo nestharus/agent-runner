@@ -27,12 +27,13 @@ use chrono::{SecondsFormat, Utc};
 use oulipoly_config::ProviderConfig;
 use oulipoly_core::AutoWakeEnvironmentVariable;
 use oulipoly_state::mailbox::{MailboxDb, MailboxRow};
+use oulipoly_state::pid_identity::{self, ProcessIdentity};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -53,6 +54,7 @@ const CONTROL_MAGIC: &[u8; 4] = b"OPTY";
 const CONTROL_VERSION: u8 = 1;
 const CONTROL_OP_INJECT: u8 = 1;
 const CONTROL_OP_HEADLESS_RESUME: u8 = 2;
+const CONTROL_OP_GENERATION_IDENTITY: u8 = 3;
 pub const CONTROL_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 const RELAY_BUFFER_BYTES: usize = 16 * 1024;
 const RELAY_POLL_TIMEOUT_MS: i32 = 25;
@@ -112,6 +114,33 @@ pub struct PtyControlResponse {
     pub message: String,
 }
 
+/// A read-only statement from the resident control owner. This is evidence to
+/// compare against the independent generation ledger, not delivery authority.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PtyControlGenerationIdentity {
+    pub challenge: String,
+    pub generation_id: String,
+    pub spawn_invocation_uuid: String,
+    pub creator_process: ProcessIdentity,
+    pub provider_process: ProcessIdentity,
+    pub provider_account: String,
+    pub provider_instance_id: String,
+    pub settings_id: String,
+    pub provider_session_id: String,
+}
+
+#[derive(Clone)]
+struct ResidentGenerationIdentity {
+    generation_id: String,
+    spawn_invocation_uuid: String,
+    creator_process: ProcessIdentity,
+    provider_process: ProcessIdentity,
+    provider_account: String,
+    provider_instance_id: String,
+    settings_id: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LiveSessionControlOperation<'a> {
     PtyInject(&'a str),
@@ -141,6 +170,69 @@ pub fn inject_control_envelope(
     payload: &str,
 ) -> Result<PtyControlResponse, PtyControlClientError> {
     send_control_operation(path, LiveSessionControlOperation::PtyInject(payload))
+}
+
+/// Query the socket owner without reserving or writing child input. The path
+/// identity is checked on both sides of the exchange; the connected peer must
+/// be the reported live creator process.
+#[cfg(target_os = "linux")]
+pub fn query_pty_generation_identity(
+    path: &Path,
+    expected_device: u64,
+    expected_inode: u64,
+) -> Result<PtyControlGenerationIdentity, String> {
+    let check_path = || -> Result<(), String> {
+        let metadata = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+        if !metadata.file_type().is_socket()
+            || metadata.dev() != expected_device
+            || metadata.ino() != expected_inode
+        {
+            return Err("PTY control socket identity changed".into());
+        }
+        Ok(())
+    };
+    check_path()?;
+    let mut stream = UnixStream::connect(path).map_err(|e| e.to_string())?;
+    stream
+        .set_read_timeout(Some(CONTROL_IO_TIMEOUT))
+        .map_err(|e| e.to_string())?;
+    stream
+        .set_write_timeout(Some(CONTROL_IO_TIMEOUT))
+        .map_err(|e| e.to_string())?;
+    let peer = peer_credentials(&stream).map_err(|e| e.to_string())?;
+    let challenge = uuid::Uuid::new_v4().to_string();
+    write_control_frame(
+        &mut stream,
+        CONTROL_OP_GENERATION_IDENTITY,
+        challenge.as_bytes(),
+    )
+    .map_err(|e| e.to_string())?;
+    let response = read_control_response(&mut stream).map_err(|e| e.message)?;
+    if !response.ack {
+        return Err(format!(
+            "PTY generation identity refused: {}",
+            response.message
+        ));
+    }
+    let identity: PtyControlGenerationIdentity =
+        serde_json::from_str(&response.message).map_err(|e| e.to_string())?;
+    check_path()?;
+    if identity.challenge != challenge
+        || identity.generation_id.is_empty()
+        || identity.spawn_invocation_uuid.is_empty()
+        || identity.provider_account.is_empty()
+        || identity.provider_instance_id.is_empty()
+        || identity.settings_id.is_empty()
+        || identity.provider_session_id.is_empty()
+        || peer.pid <= 0
+        || pid_identity::read_live_process_identity(i64::from(peer.pid))?
+            != Some(identity.creator_process.clone())
+        || pid_identity::read_live_process_identity(identity.provider_process.os_pid)?
+            != Some(identity.provider_process.clone())
+    {
+        return Err("PTY generation identity or peer changed".into());
+    }
+    Ok(identity)
 }
 
 pub fn send_control_operation(
@@ -269,6 +361,14 @@ pub(super) fn execute_interactive_child(
         control.mark_child_spawned();
     }
     let generation = record_child_identity(custody.child().id(), generation_context)?;
+    if let (Some(control), Some(context), Some(generation), Some(server)) = (
+        control.as_mut(),
+        generation_context,
+        generation.as_ref(),
+        live_session_server.as_ref(),
+    ) {
+        control.set_generation_identity(context, generation, server);
+    }
     if let (Some(server), Some(context), Some(generation)) =
         (live_session_server.as_mut(), generation_context, generation)
     {
@@ -341,6 +441,14 @@ pub(super) fn execute_interactive_child_observed(
         control.mark_child_spawned();
     }
     let generation = record_child_identity(custody.child().id(), generation_context)?;
+    if let (Some(control), Some(context), Some(generation), Some(server)) = (
+        control.as_mut(),
+        generation_context,
+        generation.as_ref(),
+        live_session_server.as_ref(),
+    ) {
+        control.set_generation_identity(context, generation, server);
+    }
     if let (Some(server), Some(context), Some(generation)) =
         (live_session_server.as_mut(), generation_context, generation)
     {
@@ -940,6 +1048,7 @@ struct ControlSocket {
     session_id: Arc<Mutex<Option<String>>>,
     invocation_uuid: String,
     child_started_at: Instant,
+    generation_identity: Option<ResidentGenerationIdentity>,
 }
 
 impl ControlSocket {
@@ -984,6 +1093,7 @@ impl ControlSocket {
             session_id: session_state,
             invocation_uuid: invocation_uuid.to_string(),
             child_started_at: Instant::now(),
+            generation_identity: None,
         }))
     }
 
@@ -1005,6 +1115,33 @@ impl ControlSocket {
 
     fn mark_child_spawned(&mut self) {
         self.child_started_at = Instant::now();
+    }
+
+    fn set_generation_identity(
+        &mut self,
+        context: &SpawnIdentityContext,
+        generation: &super::spawn_identity::RunningRuntimeGeneration,
+        server: &LiveSessionBindingServer,
+    ) {
+        let provider = server.provider_identity();
+        let Ok(creator_process) = pid_identity::read_current_process_identity() else {
+            return;
+        };
+        let Some(provider_instance_id) = provider.provider_instance_id.as_ref() else {
+            return;
+        };
+        if provider.provider_name != context.provider_name() || provider.settings_id.is_empty() {
+            return;
+        }
+        self.generation_identity = Some(ResidentGenerationIdentity {
+            generation_id: generation.generation_id.to_string(),
+            spawn_invocation_uuid: context.invocation_uuid().to_string(),
+            creator_process,
+            provider_process: generation.exact_process_identity.clone(),
+            provider_account: provider.provider_name.clone(),
+            provider_instance_id: provider_instance_id.clone(),
+            settings_id: provider.settings_id.clone(),
+        });
     }
 }
 
@@ -2089,6 +2226,8 @@ struct PreparedControlPayload {
 enum ControlPayloadOutcome {
     Accepted(Option<String>),
     SubmissionUncertain(String),
+    Identity(String),
+    IdentityRefused(String),
 }
 
 struct ControlRequest {
@@ -2110,24 +2249,40 @@ fn handle_control_request(
     stream
         .set_write_timeout(Some(CONTROL_IO_TIMEOUT))
         .map_err(format_control_write_timeout_error)?;
-    let response = match control.session_id() {
+    let session_id = control.session_id();
+    let response = match session_id.as_deref() {
         Some(session_id) => process_control_request_with_pending(
             &mut stream,
             io,
-            Some((session_id.as_str(), control.invocation_uuid())),
+            Some((session_id, control.invocation_uuid())),
+            control
+                .generation_identity
+                .as_ref()
+                .map(|identity| (identity, session_id)),
         ),
-        None => Err("awaiting_session_identity".to_string()),
+        None => match read_control_request_payload(&mut stream) {
+            Ok(request) if request.operation == CONTROL_OP_GENERATION_IDENTITY => Ok(
+                ControlPayloadOutcome::IdentityRefused("awaiting_session_identity".into()),
+            ),
+            _ => Err("awaiting_session_identity".to_string()),
+        },
     };
-    let (ack, message) = control_response_parts(response);
-    trace_notify_gate_decision(
-        control,
-        io.master_fd,
-        io.child_pid,
-        io.line_state,
-        io.child_output_state,
-        if ack { "inject" } else { "skip" },
-        &message,
+    let identity_query = matches!(
+        &response,
+        Ok(ControlPayloadOutcome::Identity(_) | ControlPayloadOutcome::IdentityRefused(_))
     );
+    let (ack, message) = control_response_parts(response);
+    if !identity_query {
+        trace_notify_gate_decision(
+            control,
+            io.master_fd,
+            io.child_pid,
+            io.line_state,
+            io.child_output_state,
+            if ack { "inject" } else { "skip" },
+            &message,
+        );
+    }
     write_control_response(&mut stream, ack, &message).map_err(format_control_response_write_error)
 }
 
@@ -2152,6 +2307,8 @@ fn control_response_parts(response: Result<ControlPayloadOutcome, String>) -> (b
         Ok(ControlPayloadOutcome::SubmissionUncertain(delivery_nonce)) => {
             (true, pty_delivery_uncertain_message(&delivery_nonce))
         }
+        Ok(ControlPayloadOutcome::Identity(reply)) => (true, reply),
+        Ok(ControlPayloadOutcome::IdentityRefused(reason)) => (false, reason),
         Err(message) => (false, message),
     }
 }
@@ -2178,7 +2335,7 @@ fn process_control_request(
             child_output_state: &mut child_output_state,
             pending_child_input: &mut pending_child_input,
         };
-        process_control_request_with_pending(stream, &mut request_io, None)
+        process_control_request_with_pending(stream, &mut request_io, None, None)
     };
     if result.is_ok() {
         flush_pending_child_input_to_completion(master_fd, &mut pending_child_input)?;
@@ -2190,9 +2347,14 @@ fn process_control_request_with_pending(
     stream: &mut UnixStream,
     io: &mut ControlRequestIo<'_>,
     expected_target: Option<(&str, &str)>,
+    identity: Option<(&ResidentGenerationIdentity, &str)>,
 ) -> Result<ControlPayloadOutcome, String> {
     validate_control_request_peer(stream)?;
     let request = read_control_request_payload(stream)?;
+    if request.operation == CONTROL_OP_GENERATION_IDENTITY {
+        return Ok(prepare_generation_identity_reply(identity, request.payload)
+            .unwrap_or_else(ControlPayloadOutcome::IdentityRefused));
+    }
     let mut payload = prepare_control_payload(require_inject_operation(request)?, expected_target)?;
     if payload.bytes.is_empty() {
         if payload.submission_uncertain {
@@ -2205,6 +2367,36 @@ fn process_control_request_with_pending(
         return Ok(submission_uncertain_outcome(&payload));
     }
     settle_control_payload(&payload)
+}
+
+fn prepare_generation_identity_reply(
+    identity: Option<(&ResidentGenerationIdentity, &str)>,
+    challenge: Vec<u8>,
+) -> Result<ControlPayloadOutcome, String> {
+    let (identity, session_id) = identity.ok_or("resident_generation_identity_unavailable")?;
+    let challenge = std::str::from_utf8(&challenge).map_err(|_| "invalid_identity_challenge")?;
+    if uuid::Uuid::parse_str(challenge).is_err()
+        || session_id.is_empty()
+        || pid_identity::read_current_process_identity()? != identity.creator_process
+        || pid_identity::read_live_process_identity(identity.provider_process.os_pid)?
+            != Some(identity.provider_process.clone())
+    {
+        return Err("resident_generation_identity_changed".into());
+    }
+    let reply = PtyControlGenerationIdentity {
+        challenge: challenge.to_string(),
+        generation_id: identity.generation_id.clone(),
+        spawn_invocation_uuid: identity.spawn_invocation_uuid.clone(),
+        creator_process: identity.creator_process.clone(),
+        provider_process: identity.provider_process.clone(),
+        provider_account: identity.provider_account.clone(),
+        provider_instance_id: identity.provider_instance_id.clone(),
+        settings_id: identity.settings_id.clone(),
+        provider_session_id: session_id.to_string(),
+    };
+    serde_json::to_string(&reply)
+        .map(ControlPayloadOutcome::Identity)
+        .map_err(|e| e.to_string())
 }
 
 fn prepare_control_payload(
@@ -2485,6 +2677,7 @@ fn read_control_request_payload(stream: &mut UnixStream) -> Result<ControlReques
     })
 }
 
+#[cfg(test)]
 fn read_control_request(stream: &mut UnixStream) -> Result<Vec<u8>, String> {
     let request = read_control_request_payload(stream)?;
     require_inject_operation(request)
@@ -2516,7 +2709,10 @@ fn validate_control_request_header(header: &[u8; 12]) -> Result<(), String> {
     if header[4] != CONTROL_VERSION {
         return Err("bad_version".to_string());
     }
-    if !matches!(header[5], CONTROL_OP_INJECT | CONTROL_OP_HEADLESS_RESUME) {
+    if !matches!(
+        header[5],
+        CONTROL_OP_INJECT | CONTROL_OP_HEADLESS_RESUME | CONTROL_OP_GENERATION_IDENTITY
+    ) {
         return Err("bad_op".to_string());
     }
     if header[6] != 0 || header[7] != 0 {
@@ -2969,7 +3165,7 @@ mod tests {
                 child_output_state: &mut output_state,
                 pending_child_input: &mut pending,
             };
-            process_control_request_with_pending(&mut first_server, &mut request_io, None)
+            process_control_request_with_pending(&mut first_server, &mut request_io, None, None)
         };
         assert_eq!(
             control_response_parts(first),
@@ -3013,7 +3209,7 @@ mod tests {
                 child_output_state: &mut output_state,
                 pending_child_input: &mut pending,
             };
-            process_control_request_with_pending(&mut retry_server, &mut request_io, None)
+            process_control_request_with_pending(&mut retry_server, &mut request_io, None, None)
         };
         assert_eq!(
             retry,
@@ -3069,7 +3265,7 @@ mod tests {
                 child_output_state: &mut output_state,
                 pending_child_input: &mut pending,
             };
-            process_control_request_with_pending(&mut server, &mut request_io, None)
+            process_control_request_with_pending(&mut server, &mut request_io, None, None)
         };
 
         assert!(result.is_err());
@@ -3117,7 +3313,7 @@ mod tests {
                     child_output_state: &mut output_state,
                     pending_child_input: &mut pending,
                 };
-                process_control_request_with_pending(&mut server, &mut request_io, None)
+                process_control_request_with_pending(&mut server, &mut request_io, None, None)
             };
 
             assert!(result.is_err(), "{sidecar_state}: {result:?}");
@@ -3680,7 +3876,7 @@ print(json.dumps({
                 child_output_state: &mut output_state,
                 pending_child_input: &mut pending,
             };
-            process_control_request_with_pending(&mut server, &mut request_io, None)
+            process_control_request_with_pending(&mut server, &mut request_io, None, None)
         };
 
         assert_eq!(result, Ok(ControlPayloadOutcome::Accepted(None)));
@@ -3729,7 +3925,7 @@ print(json.dumps({
                 child_output_state: &mut output_state,
                 pending_child_input: &mut pending,
             };
-            process_control_request_with_pending(&mut server, &mut request_io, None)
+            process_control_request_with_pending(&mut server, &mut request_io, None, None)
         };
 
         assert_eq!(result, Ok(ControlPayloadOutcome::Accepted(None)));
@@ -3846,6 +4042,57 @@ print(json.dumps({
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resident_control_identity_query_echoes_challenge_without_child_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("control.sock");
+        let process = pid_identity::read_current_process_identity().unwrap();
+        let generation_id = uuid::Uuid::new_v4().to_string();
+        let control = ControlSocket {
+            listener: UnixListener::bind(&path).unwrap(),
+            path: path.clone(),
+            owned_dir: directory.path().to_path_buf(),
+            session_id: Arc::new(Mutex::new(Some("native-session".into()))),
+            invocation_uuid: "native-invocation".into(),
+            child_started_at: Instant::now(),
+            generation_identity: Some(ResidentGenerationIdentity {
+                generation_id: generation_id.clone(),
+                spawn_invocation_uuid: "native-invocation".into(),
+                creator_process: process.clone(),
+                provider_process: process.clone(),
+                provider_account: "provider-account".into(),
+                provider_instance_id: "provider-instance".into(),
+                settings_id: "settings".into(),
+            }),
+        };
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        let (release, released) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let (master, _) = socketpair_files();
+            let mut line = InputLineState::default();
+            let mut output = ChildOutputState::default();
+            let mut pending = PendingChildInput::new();
+            let mut io = ControlRequestIo {
+                master_fd: master.as_raw_fd(),
+                child_pid: None,
+                line_state: &mut line,
+                child_output_state: &mut output,
+                pending_child_input: &mut pending,
+            };
+            handle_control_request(&control, &mut io).unwrap();
+            let empty = pending.is_empty();
+            released.recv().unwrap();
+            empty
+        });
+        let reply = query_pty_generation_identity(&path, metadata.dev(), metadata.ino()).unwrap();
+        assert_eq!(reply.generation_id, generation_id);
+        assert_eq!(reply.creator_process, process);
+        assert_eq!(reply.provider_session_id, "native-session");
+        release.send(()).unwrap();
+        assert!(server.join().unwrap());
+    }
+
     #[test]
     fn broker_rejects_headless_resume_without_queueing_child_input() {
         let (mut client, mut server) = UnixStream::pair().unwrap();
@@ -3868,7 +4115,7 @@ print(json.dumps({
                 child_output_state: &mut output_state,
                 pending_child_input: &mut pending,
             };
-            process_control_request_with_pending(&mut server, &mut request_io, None)
+            process_control_request_with_pending(&mut server, &mut request_io, None, None)
         };
 
         assert_eq!(

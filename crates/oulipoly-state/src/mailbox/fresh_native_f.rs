@@ -76,6 +76,40 @@ impl FreshV30Lane {
         record.map(|json| serde_json::from_str(&json).map_err(|e| e.to_string())).transpose()
     }
 
+    /// Revalidate a durable readback against the one current resident generation.
+    /// A lost reply may be recovered, but an exited or replaced endpoint is not
+    /// presented as a currently usable preparation.
+    pub fn attest_native_f_preparation(
+        &self,
+        record: &FreshNativeFPreparation,
+        attest: impl FnOnce(&RuntimeGenerationRow, &str, u64, u64) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let generation = match self.sidecar.mailbox().runtime_lifecycle_reader()
+            .session_generation_projection(&record.session_id).map_err(|e| e.to_string())? {
+            SessionGenerationProjection::One(row) => row,
+            _ => return Err("native F resident PTY generation absent or ambiguous".into()),
+        };
+        if generation.generation_id.to_string() != record.runtime_generation_id
+            || generation.lifecycle_state != RuntimeLifecycleState::Running
+            || generation.runtime_mode != "pty_interactive"
+            || generation.session_id.as_deref() != Some(record.provider_session_id.as_str())
+            || generation.spawn_invocation_uuid != record.runtime_spawn_invocation_uuid
+            || generation.provider_name != record.provider_account
+            || generation.pty_control_path.as_deref() != Some(record.pty_control_path.as_str())
+        {
+            return Err("native F preparation resident generation changed".into());
+        }
+        let metadata = fs::symlink_metadata(&record.pty_control_path)
+            .map_err(|_| "native F preparation PTY endpoint absent")?;
+        if !metadata.file_type().is_socket()
+            || metadata.dev() != record.pty_control_device
+            || metadata.ino() != record.pty_control_inode
+        {
+            return Err("native F preparation PTY endpoint changed".into());
+        }
+        attest(&generation, &record.pty_control_path, metadata.dev(), metadata.ino())
+    }
+
     /// Freeze exactly one F grant into one native input plan. The caller must
     /// capture a complete provider-native Tail page before invoking this API.
     /// No PTY write, receipt, or ACK is performed here.
@@ -83,6 +117,7 @@ impl FreshV30Lane {
         &mut self,
         request: &FreshNativeFPrepareRequest,
         recipient: &FreshRecipientIdentity,
+        attest: impl FnOnce(&RuntimeGenerationRow, &str, u64, u64) -> Result<(), String>,
     ) -> Result<FreshNativeFPreparation, String> {
         for id in [
             &request.preparation_request_id,
@@ -199,6 +234,7 @@ impl FreshV30Lane {
             != Some(provider_process.clone()) {
             return Err("native F resident provider process changed or exited".into());
         }
+        attest(&generation, path, socket_meta.dev(), socket_meta.ino())?;
         if payload.len() > 192 * 1024 {
             return Err("native F payload exceeds bounded input envelope".into());
         }
