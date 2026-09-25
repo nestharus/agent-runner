@@ -51,6 +51,22 @@ pub struct FreshNativeFPreparation {
     pub prepared_at: String,
 }
 
+/// Durable one-use input attempt. Its presence means bytes may have reached
+/// the original PTY; neither this record nor a successful write proves a
+/// provider-native turn or permits ACK.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreshNativeFSubmission {
+    pub preparation_request_id: String,
+    pub grant_id: String,
+    pub recipient_identity: FreshRecipientIdentity,
+    pub envelope_sha256: String,
+    pub input_sha256: String,
+    pub input_byte_len: i64,
+    pub runtime_generation_id: String,
+    pub entered_at: String,
+}
+
 fn nonempty_bounded(name: &str, value: &str, max: usize) -> Result<(), String> {
     if value.is_empty() || value.len() > max || value.chars().any(char::is_control) {
         return Err(format!("invalid native F {name}"));
@@ -59,6 +75,86 @@ fn nonempty_bounded(name: &str, value: &str, max: usize) -> Result<(), String> {
 }
 
 impl FreshV30Lane {
+    /// Status-only readback after a lost reply or restart. It never confers
+    /// permission to write again, including when the exact key is supplied.
+    pub fn read_native_f_submission(
+        &self,
+        preparation_request_id: &str,
+        recipient: &FreshRecipientIdentity,
+    ) -> Result<Option<FreshNativeFSubmission>, String> {
+        validate_request_id(preparation_request_id)?;
+        let identity = Self::recipient_identity_json(recipient)?;
+        let json: Option<String> = self.sidecar.mailbox().conn.query_row(
+            "SELECT record_json FROM fresh_native_f_submission
+             WHERE preparation_request_id=?1 AND recipient_identity=?2",
+            params![preparation_request_id, identity], |row| row.get(0),
+        ).optional().map_err(|e| e.to_string())?;
+        json.map(|value| serde_json::from_str(&value).map_err(|e| e.to_string())).transpose()
+    }
+
+    /// Spend the one physical input attempt before any byte can be written.
+    /// A duplicate begin, even with an identical request, is a bounded unknown
+    /// and must not be treated as authorization to replay the PTY write.
+    pub fn begin_native_f_submission(
+        &mut self,
+        preparation_request_id: &str,
+        recipient: &FreshRecipientIdentity,
+        attest: impl FnOnce(&RuntimeGenerationRow, &str, u64, u64) -> Result<(), String>,
+    ) -> Result<FreshNativeFSubmission, String> {
+        if self.read_native_f_submission(preparation_request_id, recipient)?.is_some() {
+            return Err("native F submission already fenced; no replay".into());
+        }
+        let prepared = self.read_native_f_preparation(preparation_request_id, recipient)?
+            .ok_or("native F submission preparation absent")?;
+        self.attest_native_f_preparation(&prepared, attest)?;
+        let grant = self.read_recipient_delivery(&prepared.grant_id, recipient)?
+            .ok_or("native F submission original grant absent")?;
+        if !matches!(grant.phase.as_str(), "unknown" | "submitted")
+            || grant.session_id != prepared.session_id
+            || grant.seq != prepared.seq
+            || grant.source_id != prepared.source_id
+            || grant.attempt_id != prepared.attempt_id
+            || grant.payload_sha256 != prepared.payload_sha256
+            || grant.payload_byte_len != prepared.payload_byte_len
+            || grant.root_id != prepared.root_id
+            || grant.owner_generation != prepared.owner_generation
+        {
+            return Err("native F submission grant or accepted W changed".into());
+        }
+        let input = format!("{}\n", prepared.envelope_text);
+        let record = FreshNativeFSubmission {
+            preparation_request_id: prepared.preparation_request_id,
+            grant_id: prepared.grant_id,
+            recipient_identity: recipient.clone(),
+            envelope_sha256: prepared.envelope_sha256,
+            input_sha256: sha256_hex(input.as_bytes()),
+            input_byte_len: i64::try_from(input.len()).map_err(|_| "native F input length overflow")?,
+            runtime_generation_id: prepared.runtime_generation_id,
+            entered_at: Utc::now().to_rfc3339(),
+        };
+        let json = serde_json::to_string(&record).map_err(|e| e.to_string())?;
+        let changed = self.sidecar.mailbox_mut().conn.execute(
+            "INSERT INTO fresh_native_f_submission
+             (preparation_request_id,grant_id,recipient_identity,envelope_sha256,
+              input_sha256,input_byte_len,runtime_generation_id,record_json,entered_at)
+             SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9
+             WHERE EXISTS (SELECT 1 FROM fresh_recipient_grant g
+               JOIN fresh_native_f_preparation p ON p.grant_id=g.grant_id
+               WHERE g.grant_id=?2 AND g.recipient_identity=?3
+                 AND g.phase IN ('unknown','submitted')
+                 AND p.preparation_request_id=?1 AND p.envelope_sha256=?4
+                 AND p.runtime_generation_id=?7)",
+            params![record.preparation_request_id, record.grant_id,
+                Self::recipient_identity_json(recipient)?, record.envelope_sha256,
+                record.input_sha256, record.input_byte_len, record.runtime_generation_id,
+                json, record.entered_at],
+        ).map_err(|e| format!("native F submission fence refused: {e}"))?;
+        if changed != 1 {
+            return Err("native F submission grant changed before durable fence".into());
+        }
+        Ok(record)
+    }
+
     /// Same-key readback is independent of current endpoint liveness. It can
     /// recover a lost reply without selecting a replacement input effect.
     pub fn read_native_f_preparation(

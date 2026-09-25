@@ -939,6 +939,171 @@ fn private_resident_empty_tail(
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]
+fn private_resident_fence_pending_f(
+    socket: &std::path::Path,
+    root_d: &str,
+    session_id: &str,
+    registry: &oulipoly_runtime::provider_registry::ProviderRegistry,
+    model: &str,
+    account: &str,
+    instance: &str,
+    settings: &str,
+    cwd: &std::path::Path,
+    generation_id: &str,
+    gate: &std::path::Path,
+) -> Result<(), String> {
+    use base64::Engine as _;
+    use oulipoly_kernel_broker::protocol::FreshRecipientRequest;
+    use oulipoly_runtime::session_provider::SessionProviderIdentity;
+    use oulipoly_state::mailbox::FreshDeliveryReadback;
+    let delivery_request_id = uuid::Uuid::new_v4().to_string();
+    let request_path = gate.join("interactive-f-request-id");
+    let mut durable_key = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&request_path)
+        .map_err(|e| e.to_string())?;
+    durable_key
+        .write_all(delivery_request_id.as_bytes())
+        .map_err(|e| e.to_string())?;
+    durable_key.sync_all().map_err(|e| e.to_string())?;
+    File::open(gate)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|e| e.to_string())?;
+    // A broker restart can publish its main control socket before the fresh
+    // recipient listener. Only this no-effect read may wait for readiness.
+    let ready_until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        match protocol::fresh_recipient_request_at(
+            socket,
+            &FreshRecipientRequest::Read {
+                delivery_request_id: delivery_request_id.clone(),
+            },
+        ) {
+            Ok(read) if read["kind"] == "readback" && read["grant"].is_null() => break,
+            Ok(_) => return Err("original interactive F request key already used".into()),
+            Err(_) if std::time::Instant::now() < ready_until => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "original interactive F listener unavailable: {error}"
+                ));
+            }
+        }
+    }
+    let result = protocol::fresh_recipient_request_at(
+        socket,
+        &FreshRecipientRequest::Submit {
+            allocation_request_id: root_d.into(),
+            delivery_request_id: delivery_request_id.clone(),
+        },
+    )
+    .map_err(|e| format!("original interactive F submission unknown: {e}"))?;
+    if result["kind"] != "delivery" {
+        return Err("original interactive F submission reply kind changed".into());
+    }
+    let submitted: FreshDeliveryReadback = serde_json::from_value(result["grant"].clone())
+        .map_err(|e| format!("original interactive F grant absent: {e}"))?;
+    let payload = base64::engine::general_purpose::STANDARD
+        .decode(
+            result["payload_base64"]
+                .as_str()
+                .ok_or("original interactive F bytes absent")?,
+        )
+        .map_err(|e| e.to_string())?;
+    let payload_value: serde_json::Value =
+        serde_json::from_slice(&payload).map_err(|e| e.to_string())?;
+    if submitted.session_id != session_id
+        || payload_value["protocol"] != "fresh-bash-complete-v30"
+        || payload_value["source"]["source_id"] != submitted.source_id
+        || payload_value["source"]["attempt_id"] != submitted.attempt_id
+    {
+        return Err("original interactive F differs from accepted Bash W".into());
+    }
+    let token = result["grant"]["delivery_token"]
+        .as_str()
+        .or_else(|| result["delivery_token"].as_str())
+        .ok_or("original interactive F delivery token absent")?;
+    let read = protocol::fresh_recipient_request_at(
+        socket,
+        &FreshRecipientRequest::Read {
+            delivery_request_id: delivery_request_id.clone(),
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    let grant: FreshDeliveryReadback =
+        serde_json::from_value(read["grant"].clone()).map_err(|e| e.to_string())?;
+    if grant.grant_id != submitted.grant_id
+        || grant.session_id != submitted.session_id
+        || grant.seq != submitted.seq
+        || grant.source_id != submitted.source_id
+        || grant.attempt_id != submitted.attempt_id
+        || grant.payload_sha256 != submitted.payload_sha256
+        || grant.payload_byte_len != submitted.payload_byte_len
+    {
+        return Err("original interactive F readback changed selected grant".into());
+    }
+    let preparation_request_id = uuid::Uuid::new_v4().to_string();
+    let nonce = uuid::Uuid::new_v4().to_string();
+    let prepared = crate::native_f_preparation::prepare_original_recipient_native_f(
+        socket,
+        session_id,
+        &delivery_request_id,
+        &grant,
+        Some(token),
+        Some(
+            crate::native_f_preparation::OriginalRecipientNativeFSource {
+                registry,
+                identity: SessionProviderIdentity {
+                    model_name: model.into(),
+                    provider_name: account.into(),
+                    provider_instance_id: Some(instance.into()),
+                    settings_id: settings.into(),
+                },
+                effective_cwd: cwd,
+                runtime_generation_id: generation_id,
+                preparation_request_id: &preparation_request_id,
+                envelope_nonce: &nonce,
+            },
+        ),
+    )?;
+    let fence = crate::native_f_preparation::fence_original_recipient_native_f(socket, &prepared)?;
+    let duplicate = protocol::fresh_recipient_request_at(
+        socket,
+        &FreshRecipientRequest::BeginNativeFSubmission {
+            preparation_request_id: preparation_request_id.clone(),
+        },
+    );
+    if duplicate.is_ok() {
+        return Err("duplicate native F submission fence accepted".into());
+    }
+    let readback = protocol::fresh_recipient_request_at(
+        socket,
+        &FreshRecipientRequest::ReadNativeFSubmission {
+            preparation_request_id,
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    if readback["fence"] != serde_json::to_value(&fence).map_err(|e| e.to_string())? {
+        return Err("native F submission fence readback changed".into());
+    }
+    std::fs::write(
+        gate.join("interactive-f-fenced.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "delivery_request_id":delivery_request_id,
+            "grant":grant,
+            "preparation":prepared,
+            "fence":fence,
+            "duplicate_error":duplicate.unwrap_err().to_string(),
+        }))
+        .map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
 impl oulipoly_runtime::executor::cli::fresh_remote::FreshProviderBackend
     for PrivateFreshBroker<'_>
 {
@@ -1656,6 +1821,21 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
                         return Err("resident live readback gate expired".into());
                     }
                     std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                if std::env::var_os("AGE319_PRIVATE_ROOT_PTY_NATIVE_F_FENCE_V1").is_some() {
+                    private_resident_fence_pending_f(
+                        &socket,
+                        &authority.receipt.d_key,
+                        &authority.session.session_id,
+                        &registry,
+                        &pool.model.name,
+                        &selected.account,
+                        &instance,
+                        &settings,
+                        &cwd,
+                        challenge.generation_id.as_str(),
+                        &gate,
+                    )?;
                 }
                 control.finish_interactive(&socket, running, b"fixture-input-through-pty\n")?
             }

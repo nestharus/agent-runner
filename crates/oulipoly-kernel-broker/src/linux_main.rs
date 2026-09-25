@@ -5299,6 +5299,43 @@ fn serve_fresh_v30_at(
                             }
                             serde_json::json!({"kind":"native_f_preparation_readback", "preparation":prepared})
                         }
+                        FreshRecipientRequest::BeginNativeFSubmission {
+                            preparation_request_id,
+                        } => {
+                            if instance.is_closed() {
+                                return Err(io::Error::other("fresh recipient entry gate closed"));
+                            }
+                            let prepared = lane
+                                .read_native_f_preparation(&preparation_request_id, &recipient)
+                                .map_err(io::Error::other)?
+                                .ok_or_else(|| io::Error::other("native F preparation absent"))?;
+                            let fence = lane
+                                .begin_native_f_submission(
+                                    &preparation_request_id,
+                                    &recipient,
+                                    |generation, path, device, inode| {
+                                        verify_native_f_resident(
+                                            generation,
+                                            path,
+                                            device,
+                                            inode,
+                                            &prepared.provider_instance_id,
+                                            &prepared.settings_id,
+                                            &prepared.provider_session_id,
+                                        )
+                                    },
+                                )
+                                .map_err(io::Error::other)?;
+                            serde_json::json!({"kind":"native_f_submission_fence", "fence":fence})
+                        }
+                        FreshRecipientRequest::ReadNativeFSubmission {
+                            preparation_request_id,
+                        } => {
+                            let fence = lane
+                                .read_native_f_submission(&preparation_request_id, &recipient)
+                                .map_err(io::Error::other)?;
+                            serde_json::json!({"kind":"native_f_submission_readback", "fence":fence})
+                        }
                         FreshRecipientRequest::Acknowledge {
                             grant_id,
                             delivery_token,

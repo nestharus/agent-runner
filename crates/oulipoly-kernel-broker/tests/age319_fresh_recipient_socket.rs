@@ -370,6 +370,58 @@ fn private_fresh_recipient_delivery_ack_collision_and_restart() {
     let mut bad = preparation.clone();
     bad.provider_instance_id = "different-instance".into();
     assert!(prepare(bad).is_err(), "changed endpoint must refuse");
+    drop_reply(
+        &socket,
+        &FreshRecipientRequest::BeginNativeFSubmission {
+            preparation_request_id: preparation.preparation_request_id.clone(),
+        },
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let fenced = loop {
+        let read = fresh_recipient_request_at(
+            &socket,
+            &FreshRecipientRequest::ReadNativeFSubmission {
+                preparation_request_id: preparation.preparation_request_id.clone(),
+            },
+        )
+        .unwrap();
+        if !read["fence"].is_null() {
+            break read;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "lost fence reply had no durable readback"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(fenced["kind"], "native_f_submission_readback");
+    assert_eq!(fenced["fence"]["grant_id"], first_id);
+    assert_eq!(
+        fenced["fence"]["envelope_sha256"],
+        record["envelope_sha256"]
+    );
+    assert_eq!(
+        fenced["fence"]["input_sha256"],
+        format!("{:x}", Sha256::digest(format!("{envelope}\n").as_bytes()))
+    );
+    assert!(
+        fresh_recipient_request_at(
+            &socket,
+            &FreshRecipientRequest::BeginNativeFSubmission {
+                preparation_request_id: preparation.preparation_request_id.clone(),
+            }
+        )
+        .is_err(),
+        "duplicate fence must refuse despite exact key"
+    );
+    assert_eq!(
+        fresh
+            .query_row("SELECT count(*) FROM fresh_native_f_submission", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap(),
+        1
+    );
     assert_ne!(first_recovery["grant"]["phase"], "acked");
     assert!(
         fresh
@@ -457,6 +509,24 @@ fn private_fresh_recipient_delivery_ack_collision_and_restart() {
     assert_eq!(
         serde_json::to_vec(&restarted_preparation["preparation"]).unwrap(),
         serde_json::to_vec(record).unwrap()
+    );
+    let restarted_fence = fresh_recipient_request_at(
+        &socket,
+        &FreshRecipientRequest::ReadNativeFSubmission {
+            preparation_request_id: preparation.preparation_request_id.clone(),
+        },
+    )
+    .unwrap();
+    assert_eq!(restarted_fence["fence"], fenced["fence"]);
+    assert!(
+        fresh_recipient_request_at(
+            &socket,
+            &FreshRecipientRequest::BeginNativeFSubmission {
+                preparation_request_id: preparation.preparation_request_id.clone(),
+            }
+        )
+        .is_err(),
+        "broker restart replayed one-use F fence"
     );
     let recovered = fresh_recipient_request_at(
         &socket,

@@ -9,6 +9,7 @@ use oulipoly_runtime::session_provider::{
 };
 use oulipoly_state::mailbox::{
     FreshDeliveryReadback, FreshNativeFPreparation, FreshNativeFPrepareRequest,
+    FreshNativeFSubmission,
 };
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -121,13 +122,14 @@ pub(crate) fn prepare_private_native_f_input(
         return Err("native F selected adapter identity or page capability unavailable".into());
     }
     let cancellation = CancellationToken::new();
+    let observation_nonce = format!("{:x}", Sha256::digest(input.envelope_nonce.as_bytes()));
     let page = read_turn_page(SessionProviderReadPageRequest {
         registry: input.registry,
         identity: input.identity.clone(),
         session_id: &input.grant.session_id,
         effective_cwd: Some(input.effective_cwd),
         projection: SessionProviderTurnProjection::UserObservation,
-        expected_delivery_nonce: Some(input.envelope_nonce),
+        expected_delivery_nonce: Some(&observation_nonce),
         cursor: SessionProviderPageCursor::Tail,
         expected_page_index: 0,
         expected_turn_sequence: 0,
@@ -245,4 +247,61 @@ pub(crate) fn prepare_private_native_f_input(
         return Err("native F preparation reply changed selected F or endpoint".into());
     }
     Ok(record)
+}
+
+/// The returned fence permits one immediate write by this same original root.
+/// A lost begin reply is deliberately unknown: readback can diagnose that a
+/// fence exists, but must never turn into a second PTY write authorization.
+pub(crate) fn fence_original_recipient_native_f(
+    socket: &Path,
+    prepared: &FreshNativeFPreparation,
+) -> Result<FreshNativeFSubmission, String> {
+    let key = prepared.preparation_request_id.clone();
+    let read = fresh_recipient_request_at(
+        socket,
+        &FreshRecipientRequest::ReadNativeFSubmission {
+            preparation_request_id: key.clone(),
+        },
+    )
+    .map_err(|e| format!("native F pre-fence readback unavailable: {e}"))?;
+    if read["kind"] != "native_f_submission_readback" || !read["fence"].is_null() {
+        return Err("native F submission already fenced or readback changed; no replay".into());
+    }
+    let answer = fresh_recipient_request_at(
+        socket,
+        &FreshRecipientRequest::BeginNativeFSubmission {
+            preparation_request_id: key.clone(),
+        },
+    );
+    let answer = match answer {
+        Ok(answer) => answer,
+        Err(error) => {
+            let status = fresh_recipient_request_at(
+                socket,
+                &FreshRecipientRequest::ReadNativeFSubmission {
+                    preparation_request_id: key,
+                },
+            );
+            return Err(format!(
+                "native F submission begin unknown; no replay: {error}; readback: {status:?}"
+            ));
+        }
+    };
+    if answer["kind"] != "native_f_submission_fence" {
+        return Err("native F submission reply kind changed; no write".into());
+    }
+    let fence: FreshNativeFSubmission = serde_json::from_value(answer["fence"].clone())
+        .map_err(|e| format!("native F submission reply invalid; no write: {e}"))?;
+    let input = format!("{}\n", prepared.envelope_text);
+    if fence.preparation_request_id != prepared.preparation_request_id
+        || fence.grant_id != prepared.grant_id
+        || fence.recipient_identity != prepared.recipient_identity
+        || fence.envelope_sha256 != prepared.envelope_sha256
+        || fence.input_sha256 != format!("{:x}", Sha256::digest(input.as_bytes()))
+        || fence.input_byte_len != input.len() as i64
+        || fence.runtime_generation_id != prepared.runtime_generation_id
+    {
+        return Err("native F submission fence changed exact prepared input; no write".into());
+    }
+    Ok(fence)
 }

@@ -121,6 +121,7 @@ fn inner() {
     let resident_bash = mode.starts_with("normal_model_provider_pty_physical_resident_bash_");
     let resident_notify = resident_bash
         && (mode.ends_with("_notify")
+            || mode.contains("_f_fenced")
             || mode.ends_with("_restart")
             || mode.contains("_after_append"));
     let resident_failure = mode
@@ -174,6 +175,8 @@ fn inner() {
             | "normal_model_provider_pty_physical_root_exit"
             | "normal_model_provider_pty_physical_resident_tail"
             | "normal_model_provider_pty_physical_resident_bash_notify"
+            | "normal_model_provider_pty_physical_resident_bash_f_fenced"
+            | "normal_model_provider_pty_physical_resident_bash_f_fenced_restart"
             | "normal_model_provider_pty_physical_resident_bash_response"
             | "normal_model_provider_pty_physical_resident_bash_wrong_image"
             | "normal_model_provider_pty_physical_resident_bash_absent_parent"
@@ -706,6 +709,10 @@ fn inner() {
             .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
             .envs(resident_mode.then_some(("AGE319_PRIVATE_NATIVE_STORE", &native_store)))
             .envs(resident_mode.then_some(("AGE319_PRIVATE_ROOT_PTY_RESIDENT_V1", "1")))
+            .envs(
+                mode.contains("_f_fenced")
+                    .then_some(("AGE319_PRIVATE_ROOT_PTY_NATIVE_F_FENCE_V1", "1")),
+            )
             .envs(resident_failure.map(|case| ("AGE319_PRIVATE_RESIDENT_FAILURE_V1", case)))
             .envs(
                 bash.as_ref()
@@ -2101,6 +2108,8 @@ fn inner() {
                     | "normal_model_provider_pty_physical"
                     | "normal_model_provider_pty_physical_resident_tail"
                     | "normal_model_provider_pty_physical_resident_bash_notify"
+                    | "normal_model_provider_pty_physical_resident_bash_f_fenced"
+                    | "normal_model_provider_pty_physical_resident_bash_f_fenced_restart"
                     | "normal_model_provider_pty_physical_resident_bash_response"
                     | "normal_model_provider_pty_physical_resident_bash_wrong_image"
                     | "normal_model_provider_pty_physical_resident_bash_absent_parent"
@@ -3650,7 +3659,95 @@ fn inner() {
                         )
                         .unwrap();
                         assert_eq!(pending, i64::from(resident_notify));
-                        if resident_notify {
+                        if mode.contains("_f_fenced") {
+                            let fenced: serde_json::Value = serde_json::from_slice(
+                                &fs::read(gate.join("interactive-f-fenced.json")).unwrap(),
+                            )
+                            .unwrap();
+                            assert_eq!(fenced["grant"]["session_id"], session.session_id);
+                            assert_eq!(fenced["preparation"]["session_id"], session.session_id);
+                            assert_eq!(
+                                fenced["preparation"]["grant_id"],
+                                fenced["grant"]["grant_id"]
+                            );
+                            assert_eq!(fenced["fence"]["grant_id"], fenced["grant"]["grant_id"]);
+                            assert_eq!(fenced["fence"]["runtime_generation_id"], grant_id);
+                            assert_eq!(
+                                fenced["preparation"]["tail_resume_token"],
+                                readback["native_tail"]["resume_token"]
+                            );
+                            let bash_report: serde_json::Value = serde_json::from_slice(
+                                &fs::read(gate.join("bash-causal-output")).unwrap(),
+                            )
+                            .unwrap();
+                            assert_eq!(
+                                fenced["preparation"]["source_id"],
+                                bash_report["fresh_source_w"]["source_id"]
+                            );
+                            assert_eq!(
+                                fenced["preparation"]["attempt_id"],
+                                bash_report["fresh_source_w"]["attempt_id"]
+                            );
+                            let envelope = fenced["preparation"]["envelope_text"].as_str().unwrap();
+                            let encoded = envelope
+                                .lines()
+                                .find_map(|line| line.strip_prefix("payload-base64: "))
+                                .unwrap();
+                            use base64::Engine as _;
+                            let selected_bytes = base64::engine::general_purpose::STANDARD
+                                .decode(encoded)
+                                .unwrap();
+                            assert_eq!(
+                                fenced["preparation"]["payload_sha256"],
+                                format!("{:x}", Sha256::digest(&selected_bytes))
+                            );
+                            assert_eq!(
+                                fenced["preparation"]["payload_byte_len"],
+                                selected_bytes.len()
+                            );
+                            assert!(
+                                fenced["duplicate_error"]
+                                    .as_str()
+                                    .unwrap()
+                                    .contains("no replay")
+                            );
+                            let side = rusqlite::Connection::open(
+                                broker_state.join("v30/sidecar/pid-identity.db"),
+                            )
+                            .unwrap();
+                            for table in [
+                                "fresh_recipient_grant",
+                                "fresh_native_f_preparation",
+                                "fresh_native_f_submission",
+                            ] {
+                                assert_eq!(
+                                    side.query_row(
+                                        &format!("SELECT count(*) FROM {table}"),
+                                        [],
+                                        |r| r.get::<_, i64>(0)
+                                    )
+                                    .unwrap(),
+                                    1
+                                );
+                            }
+                            assert_eq!(
+                                side.query_row(
+                                    "SELECT count(*) FROM fresh_recipient_ack_evidence",
+                                    [],
+                                    |r| r.get::<_, i64>(0)
+                                )
+                                .unwrap(),
+                                0
+                            );
+                            let effect: serde_json::Value = serde_json::from_slice(
+                                &fs::read(gate.join("interactive-effect")).unwrap(),
+                            )
+                            .unwrap();
+                            assert_eq!(effect["input"], "fixture-input-through-pty\n");
+                            let native_after_q: serde_json::Value =
+                                serde_json::from_slice(&fs::read(&native_store).unwrap()).unwrap();
+                            assert_eq!(native_after_q["turns"], serde_json::json!([]));
+                        } else if resident_notify {
                             assert_pending_notify_without_delivery(&broker_state);
                         } else {
                             assert_old_debt_and_no_f_ack(&broker_state);
@@ -6688,6 +6785,8 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_model_provider_pty_physical",
         "normal_model_provider_pty_physical_resident_tail",
         "normal_model_provider_pty_physical_resident_bash_notify",
+        "normal_model_provider_pty_physical_resident_bash_f_fenced",
+        "normal_model_provider_pty_physical_resident_bash_f_fenced_restart",
         "normal_model_provider_pty_physical_resident_bash_response",
         "normal_model_provider_pty_physical_resident_bash_wrong_image",
         "normal_model_provider_pty_physical_resident_bash_absent_parent",

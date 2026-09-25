@@ -36,6 +36,8 @@ const FRESH_RECIPIENT_SCHEMA: &str = include_str!("migrations/0030_fresh_recipie
 const FRESH_RECIPIENT_ACK_SCHEMA: &str = include_str!("migrations/0039_fresh_recipient_ack.sql");
 const FRESH_NATIVE_F_PREPARATION_SCHEMA: &str =
     include_str!("migrations/0040_fresh_native_f_preparation.sql");
+const FRESH_NATIVE_F_SUBMISSION_SCHEMA: &str =
+    include_str!("migrations/0041_fresh_native_f_submission.sql");
 const FRESH_RECIPIENT_STATE_SCHEMA: &str =
     include_str!("migrations/0030_fresh_recipient_state.sql");
 
@@ -406,7 +408,7 @@ impl FreshV30Lane {
             .mailbox()
             .conn
             .execute_batch(&format!(
-                "{FRESH_SCHEMA}\n{FRESH_RECIPIENT_SCHEMA}\n{FRESH_RECIPIENT_ACK_SCHEMA}\n{FRESH_NATIVE_F_PREPARATION_SCHEMA}"
+                "{FRESH_SCHEMA}\n{FRESH_RECIPIENT_SCHEMA}\n{FRESH_RECIPIENT_ACK_SCHEMA}\n{FRESH_NATIVE_F_PREPARATION_SCHEMA}\n{FRESH_NATIVE_F_SUBMISSION_SCHEMA}"
             ))
             .map_err(|e| e.to_string())?;
         sidecar
@@ -610,6 +612,36 @@ impl FreshV30Lane {
             &[
                 "fresh_native_f_preparation_no_update",
                 "fresh_native_f_preparation_no_delete",
+            ],
+        )?;
+        let submission_schema_count: i64 = sidecar
+            .mailbox()
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE
+                 (type='table' AND name='fresh_native_f_submission') OR
+                 (type='trigger' AND name IN ('fresh_native_f_submission_no_update',
+                  'fresh_native_f_submission_no_delete'))",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        match submission_schema_count {
+            0 => sidecar
+                .mailbox()
+                .conn
+                .execute_batch(FRESH_NATIVE_F_SUBMISSION_SCHEMA)
+                .map_err(|e| e.to_string())?,
+            3 => {}
+            _ => return Err("fresh native F submission schema is incomplete".into()),
+        }
+        verify_fresh_sql_objects(
+            &sidecar.mailbox().conn,
+            FRESH_NATIVE_F_SUBMISSION_SCHEMA,
+            "fresh_native_f_submission",
+            &[
+                "fresh_native_f_submission_no_update",
+                "fresh_native_f_submission_no_delete",
             ],
         )?;
         let request_key_columns: i64 = sidecar

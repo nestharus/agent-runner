@@ -1137,6 +1137,12 @@ pub enum FreshRecipientRequest {
     ReadNativeFPreparation {
         preparation_request_id: String,
     },
+    BeginNativeFSubmission {
+        preparation_request_id: String,
+    },
+    ReadNativeFSubmission {
+        preparation_request_id: String,
+    },
     Acknowledge {
         grant_id: String,
         delivery_token: String,
