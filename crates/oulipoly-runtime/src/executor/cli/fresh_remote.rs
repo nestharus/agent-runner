@@ -430,6 +430,9 @@ pub fn forbidden_fresh_environment(key: &str) -> bool {
         || key.starts_with("DYLD_")
         || key.starts_with("OULIPOLY_KERNEL_")
         || key == "OULIPOLY_ROOT_AUTHORITY_V1"
+        || key == "AGE319_PRIVATE_SECOND_RESULT_V1"
+        || key == "AGE319_PRIVATE_ROOT_TERMINAL_V1"
+        || key == "AGE319_PRIVATE_CALLER_OUTPUT_V1"
         || matches!(key, "GLIBC_TUNABLES" | "GCONV_PATH")
 }
 

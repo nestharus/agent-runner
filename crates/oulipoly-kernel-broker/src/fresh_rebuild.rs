@@ -1651,7 +1651,7 @@ mod tests {
             kind: FreshAccountEffectKind::AuthRefresh,
             ..quota.clone()
         };
-        let (source_dir, source_grant, source_intent) = make_physical(&auth, "auth-source", None);
+        let (source_dir, source_grant, _source_intent) = make_physical(&auth, "auth-source", None);
         let pool = oulipoly_runtime::executor::cli::fresh_remote::load_fresh_headless_pool(
             &fixture.source,
             "other",
@@ -1741,23 +1741,7 @@ mod tests {
                 .observe_auth_alias(&binding, &follower, &intent.id)
                 .unwrap()
                 .state,
-            "unknown"
-        );
-        assert_eq!(
-            generation
-                .settle_quota_effect(
-                    &fixture.binding,
-                    &FreshAccountEffectRequest {
-                        kind: FreshAccountEffectKind::AuthRefresh,
-                        ..quota.clone()
-                    },
-                    &source_intent.id
-                )
-                .unwrap()
-                .unwrap()
-                .outcome
-                .as_deref(),
-            Some("refreshed")
+            "drained"
         );
         let readback = generation
             .observe_auth_alias(&binding, &follower, &intent.id)

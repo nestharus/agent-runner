@@ -99,6 +99,9 @@ fn inner() {
     );
     let v3_quota = mode.starts_with("normal_model_provider_v3_quota");
     let manual_route = mode.starts_with("normal_model_provider_v3_quota_route_manual");
+    let shared_mode = mode.starts_with("normal_model_provider_v3_quota_route_physical_shared");
+    let shared_manual = mode == "normal_model_provider_v3_quota_route_physical_shared_manual";
+    let manual_setup = manual_route || shared_manual;
     let manual_physical = mode.starts_with("normal_model_provider_v3_quota_route_manual_physical");
     let terminal_v3 = matches!(
         mode.as_str(),
@@ -125,7 +128,7 @@ fn inner() {
         Some("--capacity-clean")
     } else if mode.ends_with("physical_account_quota_terminal") {
         Some("--quota-clean")
-    } else if terminal_v3 {
+    } else if terminal_v3 || shared_mode {
         Some("--clean")
     } else if mode == "normal_model_provider_auth_after_healthy" {
         Some("--auth")
@@ -335,7 +338,11 @@ fn inner() {
             if mode.starts_with("normal_model_provider_v3_quota_auth")
                 || mode == "normal_model_provider_v3_quota_route_auth_failed"
             {
-                if mode == "normal_model_provider_v3_quota_auth_restart" {
+                if matches!(
+                    mode.as_str(),
+                    "normal_model_provider_v3_quota_auth_restart"
+                        | "normal_model_provider_v3_quota_auth_shared"
+                ) {
                     format!(
                         "quota_script = 'if test -e {0}/auth-ok; then cat {0}/quota.json; else printf invalid; fi'\nauth_refresh_command = 'printf x > {0}/started-auth; while ! test -e {0}/finish-auth; do sleep 0.05; done; printf x >> {0}/auth-ok'\n",
                         gate.display()
@@ -357,7 +364,9 @@ fn inner() {
                     "quota_script = 'while ! test -e {0}/finish-manual-quota; do sleep 0.05; done; cat {0}/quota.json'\n",
                     gate.display()
                 )
-            } else if mode == "normal_model_provider_v3_quota_restart" {
+            } else if mode == "normal_model_provider_v3_quota_restart"
+                || mode.ends_with("shared_pending")
+            {
                 format!(
                     "quota_script = 'printf x > {0}/started-quota; while ! test -e {0}/finish-quota; do sleep 0.05; done; cat {0}/quota.json'\n",
                     gate.display()
@@ -431,9 +440,35 @@ fn inner() {
         } else {
             ""
         };
-        let authority = if manual_route {
+        let authority = if manual_setup {
             format!(
                 "settings_id = 'fixture'\nimplementation = {{ family = 'private-test', executable = {provider_command} }}\n"
+            )
+        } else {
+            String::new()
+        };
+        let second_provider = if mode
+            .starts_with("normal_model_provider_v3_quota_route_physical_shared")
+            || mode == "normal_model_provider_v3_quota_auth_shared"
+        {
+            let second_marker =
+                serde_json::to_string(gate.join("provider-effect-second").to_str().unwrap())
+                    .unwrap();
+            let second_quota = if mode.ends_with("shared_command_changed") {
+                format!(
+                    "quota_script = 'cat {}; true'\n",
+                    gate.join("quota.json").display()
+                )
+            } else {
+                quota.clone()
+            };
+            let second_identity = if mode.ends_with("shared_account_changed") {
+                "physical-other"
+            } else {
+                "physical-local"
+            };
+            format!(
+                "[local-two]\ncommand = {provider_command}\nargs = [{second_marker}]\nquota_account_id = '{second_identity}'\n{authority}{selected_env}{second_quota}"
             )
         } else {
             String::new()
@@ -441,7 +476,7 @@ fn inner() {
         fs::write(
             config_dir.join("providers.toml"),
             format!(
-                "[unused]\ncommand = {provider_command}\nargs = [{unused_marker}]\nquota_account_id = 'physical-unused'\n{provider_environment}{authority}[{provider_name}]\ncommand = {provider_command}\nargs = [{local_args}]\nquota_account_id = 'physical-local'\n{provider_environment}{authority}{selected_env}{prompt_mode}{quota}"
+                "[unused]\ncommand = {provider_command}\nargs = [{unused_marker}]\nquota_account_id = 'physical-unused'\n{provider_environment}{authority}[{provider_name}]\ncommand = {provider_command}\nargs = [{local_args}]\nquota_account_id = 'physical-local'\n{provider_environment}{authority}{selected_env}{prompt_mode}{quota}{second_provider}"
             ),
         )
         .unwrap();
@@ -460,6 +495,15 @@ fn inner() {
             fs::write(
                 config_dir.join("models/alias.toml"),
                 "[[providers]]\nname = \"local\"\n",
+            )
+            .unwrap();
+        }
+        if mode.starts_with("normal_model_provider_v3_quota_route_physical_shared")
+            || mode == "normal_model_provider_v3_quota_auth_shared"
+        {
+            fs::write(
+                config_dir.join("models/configured-model-two.toml"),
+                "[[providers]]\nname = \"unused\"\n[[providers]]\nname = \"local-two\"\n",
             )
             .unwrap();
         }
@@ -723,6 +767,10 @@ fn inner() {
                 .then_some(("OULIPOLY_KERNEL_BROKER_FIXTURE_ROUTE_V3_V1", "1")),
         )
         .envs(v3_physical.then_some(("OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_K_V3_V1", "1")))
+        .envs(mode.ends_with("shared_reply_loss").then_some((
+            "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_SHARED_Q_REPLY_V3_V1",
+            "1",
+        )))
         .envs(
             matches!(
                 mode.as_str(),
@@ -818,7 +866,7 @@ fn inner() {
         "broker startup: {}",
         fs::read_to_string(&broker_log).unwrap()
     );
-    if manual_route {
+    if manual_setup {
         let run_manual = || {
             Command::new(&runner)
                 .arg("--usage")
@@ -968,6 +1016,7 @@ fn inner() {
             .envs(provider_mode.then_some(("AGE319_PRIVATE_FRESH_PROVIDER_V1", "1")))
             .envs(
                 (terminal_v3
+                    || shared_mode
                     || matches!(
                         mode.as_str(),
                         "normal_model_provider"
@@ -983,7 +1032,10 @@ fn inner() {
                     ))
                 .then_some(("AGE319_PRIVATE_ROOT_TERMINAL_V1", "1")),
             )
-            .envs((caller_mode || terminal_v3).then_some(("AGE319_PRIVATE_CALLER_OUTPUT_V1", "1")))
+            .envs(
+                (caller_mode || terminal_v3 || shared_mode)
+                    .then_some(("AGE319_PRIVATE_CALLER_OUTPUT_V1", "1")),
+            )
             .envs(
                 (mode == "normal_model_provider_caller_partial")
                     .then_some(("AGE319_PRIVATE_CALLER_PARTIAL_WRITE_V1", "1")),
@@ -3541,6 +3593,10 @@ fn inner() {
                         v3_physical
                             .then_some(("OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_K_V3_V1", "1")),
                     )
+                    .envs(mode.ends_with("shared_reply_loss").then_some((
+                        "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_SHARED_Q_REPLY_V3_V1",
+                        "1",
+                    )))
                     .envs(
                         matches!(
                             mode.as_str(),
@@ -3644,6 +3700,191 @@ fn inner() {
                 let v29_wal = historical_data.join("pid-identity.db-wal");
                 let v29_wal_before = fs::read(&v29_wal).ok();
                 fs::write(gate.join("child-effect"), b"yes").unwrap();
+                if mode.ends_with("shared_pending") {
+                    let provider_dir = broker_state.join("v30/fresh-provider");
+                    eventually(|| {
+                        gate.join("started-quota").exists() || entry.try_wait().unwrap().is_some()
+                    });
+                    assert!(
+                        gate.join("started-quota").exists(),
+                        "first quota K absent: {}",
+                        fs::read_to_string(&err).unwrap()
+                    );
+                    let second_err = temp.path().join("second-pending.err");
+                    let mut second = Command::new(&runner)
+                        .args([
+                            "--model",
+                            "configured-model-two",
+                            "--pin-provider",
+                            "local-two",
+                            "hello second",
+                        ])
+                        .env("OULIPOLY_DATA_DIR", &data)
+                        .env("OULIPOLY_CONFIG_HOME", &config_home)
+                        .env("OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1", "1")
+                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+                        .env("AGE319_PRIVATE_REPAIR_CHALLENGE_V1", "1")
+                        .env("AGE319_PRIVATE_SOURCE_SELECTION_CHALLENGE_V1", "1")
+                        .env("AGE319_PRIVATE_NORMAL_ROOT_V1", "1")
+                        .env("AGE319_PRIVATE_FRESH_PROVIDER_V1", "1")
+                        .env("AGE319_PRIVATE_PROVIDER_IMAGE_V1", &provider_image)
+                        .env("AGE319_PRIVATE_SECOND_RESULT_V1", "1")
+                        .env(
+                            "AGE319_PRIVATE_PROVIDER_MARKER_V1",
+                            gate.join("provider-effect"),
+                        )
+                        .env_remove("LD_LIBRARY_PATH")
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::from(File::create(&second_err).unwrap()))
+                        .spawn()
+                        .unwrap();
+                    eventually(|| second.try_wait().unwrap().is_some());
+                    assert!(!second.wait().unwrap().success());
+                    assert!(
+                        fs::read_to_string(&second_err)
+                            .unwrap()
+                            .contains("OULIPOLY_KERNEL_ENTRY_GAP=v30 E did not reserve a root"),
+                        "second pending actor: {}",
+                        fs::read_to_string(&second_err).unwrap()
+                    );
+                    let effects = provider_dir.join("account-effects");
+                    assert_eq!(
+                        fs::read_dir(&effects)
+                            .unwrap()
+                            .filter_map(Result::ok)
+                            .filter(|item| item
+                                .file_name()
+                                .to_string_lossy()
+                                .ends_with("-quota-first"))
+                            .count(),
+                        1
+                    );
+                    assert!(
+                        !effects
+                            .join(format!("{}-1-quota-first/result.json", receipt.handoff_id))
+                            .exists()
+                    );
+                    fs::write(gate.join("finish-quota"), b"yes").unwrap();
+                    fs::write(gate.join("provider-cancel"), b"yes").unwrap();
+                    eventually(|| entry.try_wait().unwrap().is_some());
+                    assert!(entry.wait().unwrap().success());
+                    assert_eq!(fs::read(&old_state_path).unwrap(), old_state_before);
+                    assert_eq!(fs::read(&old_wal_path).ok(), old_wal_before);
+                    stop(&mut broker);
+                    return;
+                }
+                if mode == "normal_model_provider_v3_quota_auth_shared" {
+                    let provider_dir = broker_state.join("v30/fresh-provider");
+                    eventually(|| {
+                        gate.join("shared-auth-first-ready").exists()
+                            || entry.try_wait().unwrap().is_some()
+                    });
+                    assert!(
+                        gate.join("shared-auth-first-ready").exists(),
+                        "first invalid Q absent: {}",
+                        fs::read_to_string(&err).unwrap()
+                    );
+                    fs::write(gate.join("shared-auth-first-go"), b"yes").unwrap();
+                    eventually(|| {
+                        gate.join("started-auth").exists() || entry.try_wait().unwrap().is_some()
+                    });
+                    assert!(
+                        gate.join("started-auth").exists(),
+                        "first auth K absent: {}",
+                        fs::read_to_string(&err).unwrap()
+                    );
+                    let second_err = temp.path().join("second-auth.err");
+                    let mut second = Command::new(&runner)
+                        .args([
+                            "--model",
+                            "configured-model-two",
+                            "--pin-provider",
+                            "local-two",
+                            "hello second",
+                        ])
+                        .env("OULIPOLY_DATA_DIR", &data)
+                        .env("OULIPOLY_CONFIG_HOME", &config_home)
+                        .env("OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1", "1")
+                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+                        .env("AGE319_PRIVATE_REPAIR_CHALLENGE_V1", "1")
+                        .env("AGE319_PRIVATE_SOURCE_SELECTION_CHALLENGE_V1", "1")
+                        .env("AGE319_PRIVATE_NORMAL_ROOT_V1", "1")
+                        .env("AGE319_PRIVATE_FRESH_PROVIDER_V1", "1")
+                        .env("AGE319_PRIVATE_PROVIDER_IMAGE_V1", &provider_image)
+                        .env("AGE319_PRIVATE_SECOND_RESULT_V1", "1")
+                        .env(
+                            "AGE319_PRIVATE_PROVIDER_MARKER_V1",
+                            gate.join("provider-effect"),
+                        )
+                        .env_remove("LD_LIBRARY_PATH")
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::from(File::create(&second_err).unwrap()))
+                        .spawn()
+                        .unwrap();
+                    eventually(|| second.try_wait().unwrap().is_some());
+                    assert!(!second.wait().unwrap().success());
+                    assert!(
+                        fs::read_to_string(&second_err)
+                            .unwrap()
+                            .contains("OULIPOLY_KERNEL_ENTRY_GAP=v30 E did not reserve a root"),
+                        "second auth actor: {}",
+                        fs::read_to_string(&second_err).unwrap()
+                    );
+                    assert_eq!(
+                        fs::read_dir(broker_state.join("released-handoffs"))
+                            .unwrap()
+                            .count(),
+                        1
+                    );
+                    let first_auth = provider_dir
+                        .join("account-effects")
+                        .join(format!("{}-1-auth-refresh", receipt.handoff_id));
+                    assert_eq!(
+                        fs::read_dir(&first_auth)
+                            .unwrap()
+                            .filter_map(Result::ok)
+                            .filter(|item| item
+                                .file_name()
+                                .to_string_lossy()
+                                .ends_with(".consumed.json"))
+                            .count(),
+                        1,
+                        "invalid-Q auth spent another physical K"
+                    );
+                    fs::write(gate.join("finish-auth"), b"yes").unwrap();
+                    eventually(|| {
+                        gate.join("shared-auth-first-refreshed").exists()
+                            || entry.try_wait().unwrap().is_some()
+                    });
+                    assert!(
+                        gate.join("shared-auth-first-refreshed").exists(),
+                        "auth Q not refreshed: {}",
+                        fs::read_to_string(&err).unwrap()
+                    );
+                    fs::write(gate.join("shared-auth-first-retry-go"), b"yes").unwrap();
+                    eventually(|| entry.try_wait().unwrap().is_some());
+                    assert!(!entry.wait().unwrap().success());
+                    assert!(
+                        fs::read_to_string(&err)
+                            .unwrap()
+                            .contains("v3 auth already spent after rejection"),
+                        "{}",
+                        fs::read_to_string(&err).unwrap()
+                    );
+                    assert!(
+                        !provider_dir
+                            .join(format!("{}.fresh-grant.json", receipt.handoff_id))
+                            .exists()
+                    );
+                    assert_eq!(fs::read(&old_state_path).unwrap(), old_state_before);
+                    assert_eq!(fs::read(&old_wal_path).ok(), old_wal_before);
+                    stop(&mut broker);
+                    return;
+                }
                 if matches!(
                     mode.as_str(),
                     "normal_model_provider_v3_quota_restart"
@@ -3985,7 +4226,7 @@ fn inner() {
                         .unwrap();
                         assert_eq!(actor_selection, route["selection"]);
                     }
-                    if v3_quota && !manual_route {
+                    if v3_quota && !manual_setup {
                         let effect_dir = provider_dir
                             .join("account-effects")
                             .join(format!("{}-1-quota-first", receipt.handoff_id));
@@ -4771,7 +5012,7 @@ fn inner() {
                         fs::read(&selected_marker).unwrap(),
                         b"one-provider-effect\n"
                     );
-                    if !caller_mode && !terminal_v3 {
+                    if !caller_mode && !terminal_v3 && !shared_mode {
                         assert!(
                             !gate.join("provider-runtime-result").exists(),
                             "runtime mapped a provider result before physical Q"
@@ -4859,7 +5100,7 @@ fn inner() {
                     fs::write(gate.join("provider-cancel"), b"yes").unwrap();
                     eventually(|| entry.try_wait().unwrap().is_some());
                     let entry_status = entry.wait().unwrap();
-                    if caller_mode || terminal_v3 {
+                    if caller_mode || terminal_v3 || shared_mode {
                         let expected = if mode.ends_with("nonzero") {
                             9
                         } else if mode.ends_with("partial")
@@ -4912,7 +5153,7 @@ fn inner() {
                         stop(&mut broker);
                         return;
                     }
-                    if !caller_mode && !terminal_v3 {
+                    if !caller_mode && !terminal_v3 && !shared_mode {
                         assert!(
                             fs::read_to_string(&err)
                                 .unwrap()
@@ -5263,7 +5504,7 @@ fn inner() {
                             "model_at_capacity"
                         } else if mode.ends_with("physical_account_quota_terminal") {
                             "quota_rejected"
-                        } else if terminal_v3 {
+                        } else if terminal_v3 || shared_mode {
                             "clean"
                         } else if mode.ends_with("physical_nonzero") {
                             "generic_failure"
@@ -5332,13 +5573,13 @@ fn inner() {
                     assert!(terminal.delivery_grant_id.is_none());
                     assert_eq!(
                         terminal.publication_state,
-                        if caller_mode || terminal_v3 {
+                        if caller_mode || terminal_v3 || shared_mode {
                             "unknown"
                         } else {
                             "not_started"
                         }
                     );
-                    if caller_mode || terminal_v3 {
+                    if caller_mode || terminal_v3 || shared_mode {
                         assert!(gate.join("caller-control-stdout").exists());
                         assert!(gate.join("caller-control-stderr").exists());
                         let expected_out = if typed_terminal_v3 {
@@ -5537,6 +5778,270 @@ fn inner() {
                                 .execution,
                             terminal.execution
                         );
+                    }
+                    if shared_mode {
+                        if mode.ends_with("shared_config_changed") {
+                            fs::write(
+                                config_home
+                                    .join("oulipoly-agent-runner/models/configured-model-two.toml"),
+                                "[[providers]]\nname = \"unused\"\n",
+                            )
+                            .unwrap();
+                        }
+                        if mode.ends_with("shared_restart") {
+                            stop(&mut broker);
+                            let restart_log = temp.path().join("shared-broker-restart.log");
+                            broker = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
+                                .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                                .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
+                                .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
+                                .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+                                .env(
+                                    "OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_READBACK_V3_V1",
+                                    "1",
+                                )
+                                .env(
+                                    "OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_READBACK_V3_SOURCE_V1",
+                                    config_home.join("oulipoly-agent-runner"),
+                                )
+                                .env("OULIPOLY_KERNEL_BROKER_FIXTURE_ROUTE_V3_V1", "1")
+                                .env("OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_K_V3_V1", "1")
+                                .stderr(Stdio::from(File::create(&restart_log).unwrap()))
+                                .spawn()
+                                .unwrap();
+                            eventually(|| {
+                                protocol::request_at(&socket, Operation::Classify).is_ok()
+                                    || broker.try_wait().unwrap().is_some()
+                            });
+                            assert!(
+                                broker.try_wait().unwrap().is_none(),
+                                "shared broker restart: {}",
+                                fs::read_to_string(&restart_log).unwrap()
+                            );
+                        }
+                        let second_err = temp.path().join("second.err");
+                        let mut second = Command::new(&runner)
+                            .args([
+                                "--model",
+                                "configured-model-two",
+                                "--pin-provider",
+                                "local-two",
+                                "hello second",
+                            ])
+                            .env("OULIPOLY_DATA_DIR", &data)
+                            .env("OULIPOLY_CONFIG_HOME", &config_home)
+                            .env("OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1", "1")
+                            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+                            .env("AGE319_PRIVATE_REPAIR_CHALLENGE_V1", "1")
+                            .env("AGE319_PRIVATE_SOURCE_SELECTION_CHALLENGE_V1", "1")
+                            .env("AGE319_PRIVATE_NORMAL_ROOT_V1", "1")
+                            .env("AGE319_PRIVATE_FRESH_PROVIDER_V1", "1")
+                            .env("AGE319_PRIVATE_PROVIDER_IMAGE_V1", &provider_image)
+                            .env("AGE319_PRIVATE_SECOND_RESULT_V1", "1")
+                            .envs(
+                                mode.ends_with("shared_env_changed")
+                                    .then_some(("AGE319_SHARED_ENV_CHANGED_V1", "1")),
+                            )
+                            .env(
+                                "AGE319_PRIVATE_PROVIDER_MARKER_V1",
+                                gate.join("provider-effect"),
+                            )
+                            .env_remove("LD_LIBRARY_PATH")
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::from(File::create(&second_err).unwrap()))
+                            .spawn()
+                            .unwrap();
+                        eventually(|| second.try_wait().unwrap().is_some());
+                        let second_status = second.wait().unwrap();
+                        let second_error = fs::read_to_string(&second_err).unwrap();
+                        if !matches!(
+                            mode.as_str(),
+                            "normal_model_provider_v3_quota_route_physical_shared"
+                                | "normal_model_provider_v3_quota_route_physical_shared_manual"
+                                | "normal_model_provider_v3_quota_route_physical_shared_reply_loss"
+                                | "normal_model_provider_v3_quota_route_physical_shared_restart"
+                        ) && !mode.ends_with("shared_account_changed")
+                        {
+                            assert!(!second_status.success(), "changed source was admitted");
+                            assert!(
+                                second_error.contains("shared physical quota readback refused")
+                                    || second_error.contains("config source changed")
+                                    || second_error.contains("pin")
+                                    || second_error.contains("candidate"),
+                                "second actor: {second_error}"
+                            );
+                            let effects = provider_dir.join("account-effects");
+                            assert_eq!(
+                                fs::read_dir(&effects)
+                                    .unwrap()
+                                    .filter_map(Result::ok)
+                                    .filter(|entry| entry
+                                        .file_name()
+                                        .to_string_lossy()
+                                        .ends_with("-quota-first"))
+                                    .count(),
+                                1,
+                                "incompatible source announced a second quota K"
+                            );
+                            assert!(!gate.join("provider-effect-second").exists());
+                            assert_eq!(fs::read(&old_state_path).unwrap(), old_state_before);
+                            assert_eq!(fs::read(&old_wal_path).ok(), old_wal_before);
+                            stop(&mut broker);
+                            return;
+                        }
+                        assert!(
+                            !second_status.success()
+                                && second_error
+                                    .contains("private provider runtime result mapped after Q"),
+                            "second actor: {second_error}; broker status: {:?}; broker: {}",
+                            broker.try_wait().unwrap(),
+                            fs::read_to_string(&broker_log).unwrap_or_default()
+                        );
+                        let second_mapped: serde_json::Value = serde_json::from_slice(
+                            &fs::read(gate.join("provider-runtime-result-second")).unwrap(),
+                        )
+                        .unwrap();
+                        assert_eq!(second_mapped["model"], "configured-model-two");
+                        if mode.ends_with("shared_reply_loss") {
+                            assert!(gate.join("account-effect-reply-dropped").exists());
+                        }
+                        if mode.ends_with("shared_account_changed") {
+                            assert_eq!(
+                                second_mapped["shared_quota_receipts"]
+                                    .as_array()
+                                    .unwrap()
+                                    .len(),
+                                0,
+                                "a different physical account reused Q"
+                            );
+                            assert_eq!(second_mapped["provider"], "local-two");
+                            let effects = provider_dir.join("account-effects");
+                            assert_eq!(
+                                fs::read_dir(&effects)
+                                    .unwrap()
+                                    .filter_map(Result::ok)
+                                    .filter(|entry| entry
+                                        .file_name()
+                                        .to_string_lossy()
+                                        .ends_with("-quota-first"))
+                                    .count(),
+                                2,
+                                "different physical account needs its own quota K"
+                            );
+                            assert_eq!(fs::read(&old_state_path).unwrap(), old_state_before);
+                            assert_eq!(fs::read(&old_wal_path).ok(), old_wal_before);
+                            stop(&mut broker);
+                            return;
+                        }
+                        assert_eq!(
+                            second_mapped["shared_quota_receipts"]
+                                .as_array()
+                                .unwrap()
+                                .len(),
+                            1
+                        );
+                        assert_eq!(
+                            second_mapped["route_config_sha256"].as_str().unwrap().len(),
+                            64
+                        );
+                        let effects = provider_dir.join("account-effects");
+                        assert_eq!(
+                            fs::read_dir(&effects)
+                                .unwrap()
+                                .filter_map(Result::ok)
+                                .filter(|entry| entry
+                                    .file_name()
+                                    .to_string_lossy()
+                                    .ends_with("-quota-first"))
+                                .count(),
+                            if shared_manual { 0 } else { 1 },
+                            "second actor announced another quota effect"
+                        );
+                        assert_eq!(
+                            fs::read_dir(&provider_dir)
+                                .unwrap()
+                                .filter_map(Result::ok)
+                                .filter(|entry| entry
+                                    .file_name()
+                                    .to_string_lossy()
+                                    .ends_with(".consumed.json"))
+                                .count(),
+                            2,
+                            "second actor did not consume its own provider K"
+                        );
+                        let receipts: Vec<_> = fs::read_dir(broker_state.join("released-handoffs"))
+                            .unwrap()
+                            .filter_map(Result::ok)
+                            .collect();
+                        assert_eq!(
+                            receipts.len(),
+                            2,
+                            "two original roots need separate receipts"
+                        );
+                        let released: Vec<oulipoly_state::mailbox::FreshReleasedHandoff> = receipts
+                            .iter()
+                            .map(|entry| {
+                                serde_json::from_slice(&fs::read(entry.path()).unwrap()).unwrap()
+                            })
+                            .collect();
+                        assert_ne!(released[0].d_key, released[1].d_key);
+                        let second_receipt = released
+                            .iter()
+                            .find(|value| value.d_key != receipt.d_key)
+                            .unwrap();
+                        assert_ne!(
+                            second_receipt.old_release.prepared.root_id,
+                            receipt.old_release.prepared.root_id
+                        );
+                        let second_route: serde_json::Value = serde_json::from_slice(
+                            &fs::read(provider_dir.join(format!(
+                                "{}.route-selection.json",
+                                second_receipt.handoff_id
+                            )))
+                            .unwrap(),
+                        )
+                        .unwrap();
+                        let second_grant: serde_json::Value =
+                            serde_json::from_slice(
+                                &fs::read(provider_dir.join(format!(
+                                    "{}.fresh-grant.json",
+                                    second_receipt.handoff_id
+                                )))
+                                .unwrap(),
+                            )
+                            .unwrap();
+                        assert_eq!(
+                            second_route["binding"]["handoff_id"],
+                            second_receipt.handoff_id
+                        );
+                        assert_eq!(second_route["selection"]["account"], "local-two");
+                        assert_eq!(
+                            second_route["selection"]["plan_sha256"],
+                            second_grant["plan_sha256"]
+                        );
+                        assert_eq!(
+                            second_route["selection"]["config_sha256"],
+                            second_mapped["route_config_sha256"]
+                        );
+                        let second_process: serde_json::Value = serde_json::from_slice(
+                            &fs::read(gate.join("provider-effect-second.process.json")).unwrap(),
+                        )
+                        .unwrap();
+                        let expected_plan: serde_json::Value = serde_json::from_slice(
+                            &fs::read(gate.join("v3-provider-expected-plan.json")).unwrap(),
+                        )
+                        .unwrap();
+                        assert_eq!(second_process["argv"], expected_plan["argv"]);
+                        assert_eq!(second_process["cwd"], expected_plan["cwd"]);
+                        assert_eq!(second_process["env"], expected_plan["env"]);
+                        assert_eq!(second_process["selected_account"], "physical-local");
+                        assert_eq!(second_process["no_new_privs"], 0);
+                        assert_eq!(second_process["seccomp"], 0);
+                        assert_eq!(second_process["forbidden_environment"], false);
+                        assert_eq!(fs::read(&old_state_path).unwrap(), old_state_before);
+                        assert_eq!(fs::read(&old_wal_path).ok(), old_wal_before);
                     }
                     stop(&mut broker);
                     return;
@@ -7732,6 +8237,7 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_model_provider_v3_quota_auth_post_k",
         "normal_model_provider_v3_quota_auth_restart",
         "normal_model_provider_v3_quota_auth_failed",
+        "normal_model_provider_v3_quota_auth_shared",
         "normal_model_provider_v3_quota_route",
         "normal_model_provider_v3_quota_route_reply_loss",
         "normal_model_provider_v3_quota_route_invalid",
@@ -7775,6 +8281,15 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_model_provider_v3_quota_route_physical_bad_plan",
         "normal_model_provider_v3_quota_route_physical_bad_actor",
         "normal_model_provider_v3_quota_route_physical_source_changed",
+        "normal_model_provider_v3_quota_route_physical_shared",
+        "normal_model_provider_v3_quota_route_physical_shared_manual",
+        "normal_model_provider_v3_quota_route_physical_shared_command_changed",
+        "normal_model_provider_v3_quota_route_physical_shared_env_changed",
+        "normal_model_provider_v3_quota_route_physical_shared_config_changed",
+        "normal_model_provider_v3_quota_route_physical_shared_account_changed",
+        "normal_model_provider_v3_quota_route_physical_shared_reply_loss",
+        "normal_model_provider_v3_quota_route_physical_shared_restart",
+        "normal_model_provider_v3_quota_route_physical_shared_pending",
         "normal_model_provider_quota",
         "normal_model_provider_auth",
         "normal_model_provider_auth_recovery",

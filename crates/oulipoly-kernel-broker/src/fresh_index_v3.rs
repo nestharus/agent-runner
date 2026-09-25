@@ -1225,6 +1225,22 @@ impl KeyedGeneration {
                 id,
             )
             .map_err(|e| corrupt(format!("v3 auth alias observation: {e}")))?;
+        if readback.state == "drained" {
+            let (peer_binding, peer_request, peer_id) =
+                super::super::fresh_provider::v3_auth_alias_peer(&self.root, binding, request)
+                    .map_err(|e| corrupt(format!("v3 auth physical peer: {e}")))?;
+            if self
+                .latest_effect_checkpoint(
+                    self.admitted_source()?,
+                    &peer_binding,
+                    &peer_request,
+                    &peer_id,
+                )?
+                .is_none()
+            {
+                self.settle_quota_effect(&peer_binding, &peer_request, &peer_id)?;
+            }
+        }
         let store = self.account(&account)?;
         let digest = keyed(&source)?;
         let (revision, pending, mut values) =
@@ -2188,6 +2204,176 @@ impl KeyedGeneration {
             observed_invocations: invocations,
             observed_failures: failures,
         })
+    }
+
+    /// Read an account's newest physical quota for a different original D.
+    /// The candidate and held-root actor are checked by the socket before
+    /// entry; the keyed revision is checked again after physical readback.
+    pub(crate) fn shared_quota_checkpoint(
+        &self,
+        physical_key: &str,
+        source_key: &SourceKey,
+        model: &str,
+        config_sha256: &str,
+    ) -> Result<Option<oulipoly_kernel_broker::protocol::FreshAccountEffectReadback>> {
+        self.check_current()?;
+        if !source_key.valid() || model.is_empty() || config_sha256.is_empty() {
+            return Err(IndexError::Conflict("v3 shared quota identity invalid"));
+        }
+        let account_digest = keyed(&physical_key)?;
+        let account_path = self.storage.join("keyed-accounts").join(&account_digest);
+        let catalog_path = self
+            .storage
+            .join("account-catalog")
+            .join(format!("{account_digest}.json"));
+        match (
+            fs::symlink_metadata(&account_path),
+            fs::symlink_metadata(&catalog_path),
+        ) {
+            (Err(account), Err(catalog))
+                if account.kind() == io::ErrorKind::NotFound
+                    && catalog.kind() == io::ErrorKind::NotFound =>
+            {
+                return Ok(None);
+            }
+            (Ok(_), Ok(_)) => {}
+            _ => {
+                return Err(IndexError::RebuildRequired(
+                    "v3 shared quota account/catalog differs",
+                ));
+            }
+        }
+        let store = self.account(physical_key)?;
+        let digest = keyed(source_key)?;
+        let (revision, pending, mut values) = store.read_many(&[
+            ("account", "summary"),
+            ("source", &digest),
+            ("latest-quota", "account"),
+            ("quota-marker", "account"),
+            ("auth-flight", "account"),
+        ])?;
+        let auth_flight: Option<Artifact> = typed(values.pop().unwrap())?;
+        let marker: Option<MarkerHead> = typed(values.pop().unwrap())?;
+        let latest: Option<LatestQuota> = typed(values.pop().unwrap())?;
+        let head: Option<SourceHead> = typed(values.pop().unwrap())?;
+        let summary = values.pop().unwrap().ok_or(IndexError::RebuildRequired(
+            "v3 shared quota summary absent",
+        ))?;
+        if summary["physical_key"].as_str() != Some(physical_key)
+            || summary["pending_count"].as_u64() != Some(pending)
+            || summary["unknown_marker_scope"].as_bool() != Some(false)
+        {
+            return Err(IndexError::Conflict(
+                "v3 shared quota debt or scope unknown",
+            ));
+        }
+        let following_auth = if pending == 0 && auth_flight.is_none() {
+            false
+        } else if pending == 1 && auth_flight.is_some() {
+            if self.auth_peer_intent(physical_key, source_key)? != auth_flight {
+                return Err(IndexError::Conflict("v3 shared quota auth flight changed"));
+            }
+            true
+        } else {
+            return Err(IndexError::Conflict(
+                "v3 shared quota debt or scope unknown",
+            ));
+        };
+        let Some(latest) = latest else {
+            return Ok(None);
+        };
+        if latest.source != *source_key
+            || head.as_ref().is_none_or(|head| {
+                head.source != *source_key || head.quota.as_ref() != Some(&latest.observation)
+            })
+        {
+            return Err(IndexError::Conflict("v3 shared quota source changed"));
+        }
+        let quota = &latest.observation;
+        let now = Utc::now().timestamp();
+        let completed = quota
+            .completed_unix_seconds
+            .ok_or(IndexError::Conflict("v3 shared quota completion absent"))?;
+        if now < completed
+            || now
+                .checked_sub(completed)
+                .is_none_or(|age| age >= 5 * 60 * 60)
+        {
+            return Err(IndexError::Conflict("v3 shared quota expired"));
+        }
+        if marker
+            .as_ref()
+            .is_some_and(|marker| marker.q.completed_unix_nanos >= quota.q.completed_unix_nanos)
+        {
+            return Err(IndexError::Conflict(
+                "v3 shared quota rejected by newer marker",
+            ));
+        }
+        quota.q.verify(&self.root)?;
+        let result = quota
+            .result
+            .as_ref()
+            .ok_or(IndexError::Conflict("v3 shared quota result absent"))?;
+        result.require_present(&self.root)?;
+        let source = self.admitted_source()?;
+        let (physical, origin_model, origin_config) = if result.path.starts_with("manual-quota/") {
+            super::super::fresh_provider::v3_shared_manual_quota_origin(
+                &self.root,
+                source,
+                physical_key,
+                source_key,
+                &quota.q,
+                result,
+            )
+        } else {
+            super::super::fresh_provider::v3_shared_quota_origin(
+                &self.root,
+                source,
+                physical_key,
+                source_key,
+                &quota.q,
+                result,
+            )
+        }
+        .map_err(|error| corrupt(format!("v3 shared physical Q: {error}")))?;
+        if quota.origin_model.as_deref() != Some(origin_model.as_str())
+            || quota.origin_config_sha256.as_deref() != Some(origin_config.as_str())
+            || quota.outcome != physical.outcome.as_deref().unwrap_or("")
+            || quota.completed_unix_seconds != physical.completed_unix_seconds
+            || quota.windows.len() != physical.windows.len()
+            || quota
+                .windows
+                .iter()
+                .zip(&physical.windows)
+                .any(|(indexed, observed)| {
+                    indexed.used_percent != observed.used_percent
+                        || indexed.resets_at != observed.resets_at
+                        || indexed.remaining != observed.remaining
+                        || DateTime::parse_from_rfc3339(&observed.resets_at)
+                            .map_or(true, |date| date.timestamp() != indexed.reset_unix_seconds)
+                })
+        {
+            return Err(corrupt("v3 shared Q typed result differs"));
+        }
+        match quota.outcome.as_str() {
+            "valid_windows" if !following_auth && quota.quota_basis_points_at(now).is_some() => {
+                match self.route_facts(physical_key, Some(source_key), model, config_sha256, now)? {
+                    RouteEligibility::Eligible {
+                        account_revision, ..
+                    } if account_revision == revision => {}
+                    _ => return Err(IndexError::Conflict("v3 shared quota route facts refuse")),
+                }
+            }
+            "invalid" | "empty" => {
+                self.check_auth_prerequisite(head.as_ref().unwrap(), None)?;
+            }
+            _ => return Err(IndexError::Conflict("v3 shared quota not reusable")),
+        }
+        if store.summary()? != (revision, pending) {
+            return Err(IndexError::Conflict("v3 shared quota account changed"));
+        }
+        self.check_current()?;
+        Ok(Some(physical))
     }
 
     fn verify_retained(&self, source: &Path) -> Result<()> {
@@ -3287,6 +3473,142 @@ mod tests {
             key,
             revision,
         )
+    }
+
+    #[test]
+    fn v3_shared_quota_refusals_are_exact_and_bounded_across_settled_sources() {
+        fn changed_source(history: usize) -> (keyed_store::IoCount, ReaderIo) {
+            let (_temp, generation, _, _) = route_fixture(history);
+            let other = SourceKey {
+                commands_sha256: "different-command".into(),
+                environment_sha256: "environment".into(),
+            };
+            let guard = ReaderIoGuard::start("v3-shared-quota-changed-source");
+            let (result, keyed_io) = keyed_store::measured(|| {
+                generation.shared_quota_checkpoint("physical", &other, "model-b", "config-b")
+            });
+            drop(guard);
+            assert!(matches!(
+                result,
+                Err(IndexError::Conflict("v3 shared quota source changed"))
+            ));
+            (keyed_io, last_reader_io().unwrap())
+        }
+        let one = changed_source(1);
+        let many = changed_source(205);
+        assert_eq!(one.0.open_attempts, many.0.open_attempts);
+        assert_eq!(one.0.opened, many.0.opened);
+        assert_eq!(one.0.directory_entries, 0);
+        assert_eq!(many.0.directory_entries, 0);
+        assert_eq!(one.1.open_attempts, many.1.open_attempts);
+        assert_eq!(one.1.opened, many.1.opened);
+        assert_eq!(one.1.directory_entries, 0);
+        assert_eq!(many.1.directory_entries, 0);
+        assert_eq!(one.1.bytes_written, 0);
+        assert_eq!(many.1.bytes_written, 0);
+        eprintln!(
+            "v3 shared Q refusal 1/205 keyed: {:?} / {:?}",
+            one.0, many.0
+        );
+        eprintln!(
+            "v3 shared Q refusal 1/205 physical: {:?} / {:?}",
+            one.1, many.1
+        );
+
+        let (_temp, generation, source, revision) = route_fixture(0);
+        let store = generation.account("physical").unwrap();
+        let digest = keyed(&source).unwrap();
+        let mut head: SourceHead = typed(store.get("source", &digest).unwrap())
+            .unwrap()
+            .unwrap();
+        head.quota.as_mut().unwrap().completed_unix_seconds =
+            Some(Utc::now().timestamp() - 5 * 60 * 60);
+        let revision = store
+            .commit(revision, route_source_changes(&source, &head))
+            .unwrap();
+        assert!(matches!(
+            generation.shared_quota_checkpoint("physical", &source, "model-b", "config-b"),
+            Err(IndexError::Conflict("v3 shared quota expired"))
+        ));
+        head.quota.as_mut().unwrap().completed_unix_seconds = Some(Utc::now().timestamp());
+        let marker = MarkerHead {
+            q: head.quota.as_ref().unwrap().q.clone(),
+            model: "model-a".into(),
+            config_sha256: "config".into(),
+            outcome: "quota_rejected".into(),
+        };
+        let revision = store
+            .commit(
+                revision,
+                [
+                    route_source_changes(&source, &head),
+                    vec![change("quota-marker", "account", &marker).unwrap()],
+                ]
+                .concat(),
+            )
+            .unwrap();
+        assert!(matches!(
+            generation.shared_quota_checkpoint("physical", &source, "model-b", "config-b"),
+            Err(IndexError::Conflict(
+                "v3 shared quota rejected by newer marker"
+            ))
+        ));
+        let mut summary = route_summary(1);
+        summary["source_count"] = 1.into();
+        store
+            .commit(
+                revision,
+                vec![
+                    change("pending", "unresolved", &serde_json::json!({})).unwrap(),
+                    change("account", "summary", &summary).unwrap(),
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            generation.shared_quota_checkpoint("physical", &source, "model-b", "config-b"),
+            Err(IndexError::Conflict(
+                "v3 shared quota debt or scope unknown"
+            ))
+        ));
+
+        let (_temp, generation, old_source, revision) = route_fixture(0);
+        let store = generation.account("physical").unwrap();
+        let mut newer: SourceHead =
+            typed(store.get("source", &keyed(&old_source).unwrap()).unwrap())
+                .unwrap()
+                .unwrap();
+        newer.source.commands_sha256 = "newer-command".into();
+        newer.quota.as_mut().unwrap().q.completed_unix_nanos += 1;
+        newer.quota.as_mut().unwrap().outcome = "invalid".into();
+        newer.quota.as_mut().unwrap().windows.clear();
+        let mut summary = route_summary(0);
+        summary["source_count"] = 2.into();
+        store
+            .commit(
+                revision,
+                [
+                    route_source_changes(&newer.source, &newer),
+                    vec![change("account", "summary", &summary).unwrap()],
+                ]
+                .concat(),
+            )
+            .unwrap();
+        assert_eq!(
+            generation
+                .route_facts(
+                    "physical",
+                    Some(&old_source),
+                    "model-b",
+                    "config-b",
+                    1_800_000_100
+                )
+                .unwrap(),
+            RouteEligibility::ProbeRequired
+        );
+        assert!(matches!(
+            generation.shared_quota_checkpoint("physical", &old_source, "model-b", "config-b"),
+            Err(IndexError::Conflict("v3 shared quota source changed"))
+        ));
     }
 
     #[test]

@@ -1138,6 +1138,10 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
         )
         .map_err(|e| format!("fresh route candidate refused before K: {e}"))?;
     }
+    let keyed_v3_mode = std::env::var("AGE319_PRIVATE_JOIN_MODE")
+        .ok()
+        .as_deref()
+        .is_some_and(|mode| mode.starts_with("normal_model_provider_v3_"));
     let mut environment = Vec::new();
     for (key, value) in std::env::vars_os() {
         let key = key
@@ -1167,6 +1171,7 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
     // a duplicate K before the decision could inspect the manual fact.
     let route_mode = std::env::var("AGE319_PRIVATE_JOIN_MODE").unwrap_or_default();
     let manual_route = route_mode.starts_with("normal_model_provider_v3_quota_route_manual");
+    let mut shared_quota_receipts = Vec::new();
     for (index, (quota_script, auth_command)) in pool.account_effects.iter().enumerate() {
         if manual_route {
             continue;
@@ -1183,13 +1188,48 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
             kind: FreshAccountEffectKind::QuotaFirst,
             environment: prepared[index].plan.environment.clone(),
         };
-        let first = private_run_account_effect(&socket, &authority.receipt.handoff_id, &effect)?;
+        let shared = if keyed_v3_mode {
+            Some(
+                protocol::private_shared_quota_at(&socket, &effect)
+                    .or_else(|_| protocol::private_shared_quota_at(&socket, &effect))
+                    .map_err(|e| format!("v3 shared physical quota readback refused: {e}"))?,
+            )
+        } else {
+            None
+        };
+        let first = if let Some(reused) = shared.flatten() {
+            if reused.state != "drained" {
+                return Err("v3 shared physical quota Q not drained".into());
+            }
+            shared_quota_receipts.push((index, reused.effect_id.clone()));
+            reused
+        } else {
+            private_run_account_effect(&socket, &authority.receipt.handoff_id, &effect)?
+        };
         quota_receipts.push((
             effect.clone(),
             first.effect_id.clone(),
             first.outcome.clone(),
         ));
         if first.outcome.as_deref() != Some("valid_windows") && auth_command.is_some() {
+            let shared_auth_first = std::env::var("AGE319_PRIVATE_JOIN_MODE").ok().as_deref()
+                == Some("normal_model_provider_v3_quota_auth_shared")
+                && std::env::var_os("AGE319_PRIVATE_SECOND_RESULT_V1").is_none();
+            if shared_auth_first {
+                let gate = std::path::PathBuf::from(
+                    std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                        .map_err(|e| e.to_string())?,
+                );
+                std::fs::write(gate.join("shared-auth-first-ready"), b"yes")
+                    .map_err(|e| e.to_string())?;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while !gate.join("shared-auth-first-go").exists() {
+                    if std::time::Instant::now() >= deadline {
+                        return Err("shared auth first actor gate timed out".into());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
             effect.kind = FreshAccountEffectKind::AuthRefresh;
             let auth = private_run_account_effect(&socket, &authority.receipt.handoff_id, &effect)?;
             if std::env::var("AGE319_PRIVATE_JOIN_MODE")
@@ -1218,9 +1258,39 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
             auth_receipts.push((effect.clone(), auth.effect_id.clone(), auth.outcome.clone()));
             if auth.outcome.as_deref() == Some("refreshed") {
                 effect.kind = FreshAccountEffectKind::QuotaRetry;
-                let retry =
-                    private_run_account_effect(&socket, &authority.receipt.handoff_id, &effect)?;
-                auth_receipts.push((effect.clone(), retry.effect_id, retry.outcome));
+                if shared_auth_first {
+                    let gate = std::path::PathBuf::from(
+                        std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                            .map_err(|e| e.to_string())?,
+                    );
+                    std::fs::write(gate.join("shared-auth-first-refreshed"), b"yes")
+                        .map_err(|e| e.to_string())?;
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                    while !gate.join("shared-auth-first-retry-go").exists() {
+                        if std::time::Instant::now() >= deadline {
+                            return Err("shared auth retry gate timed out".into());
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    let mut follow = effect.clone();
+                    follow.kind = FreshAccountEffectKind::QuotaFirst;
+                    let retry = protocol::private_shared_quota_at(&socket, &follow)
+                        .map_err(|e| format!("shared quota retry readback refused: {e}"))?
+                        .ok_or("shared quota retry Q absent")?;
+                    if retry.state != "drained" || retry.outcome.as_deref() != Some("valid_windows")
+                    {
+                        return Err("shared quota retry Q invalid".into());
+                    }
+                    shared_quota_receipts.push((index, retry.effect_id.clone()));
+                    auth_receipts.push((effect.clone(), retry.effect_id, retry.outcome));
+                } else {
+                    let retry = private_run_account_effect(
+                        &socket,
+                        &authority.receipt.handoff_id,
+                        &effect,
+                    )?;
+                    auth_receipts.push((effect.clone(), retry.effect_id, retry.outcome));
+                }
             }
         }
     }
@@ -1526,11 +1596,17 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
         "route_observed_failures": selected.observed_failures,
         "route_observed_invocations": selected.observed_invocations,
         "quota_restart_readback": quota_restart_readback,
+        "shared_quota_receipts": shared_quota_receipts,
         "auth_after_provider_q": auth_after_provider_q,
         "terminal_reason": result.terminal_reason,
     });
+    let result_name = if std::env::var_os("AGE319_PRIVATE_SECOND_RESULT_V1").is_some() {
+        "provider-runtime-result-second"
+    } else {
+        "provider-runtime-result"
+    };
     std::fs::write(
-        std::path::Path::new(&gate).join("provider-runtime-result"),
+        std::path::Path::new(&gate).join(result_name),
         serde_json::to_vec(&witness).map_err(|e| {
             backend.unknown(
                 backend.grant_id.as_deref(),

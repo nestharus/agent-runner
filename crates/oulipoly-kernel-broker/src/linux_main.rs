@@ -504,7 +504,7 @@ fn recv_request(
         #[cfg(feature = "age319-private-broker-fixture")]
         b'5' | b'6' | b'7' | b'8' | b'9' => (18..=2048 + 17).contains(&read),
         #[cfg(feature = "age319-private-broker-fixture")]
-        b'h' | b'f' | b'm' | b'n' | b'w' | b'r' => (18..=48 * 1024 + 17).contains(&read),
+        b'h' | b'f' | b'm' | b'n' | b'o' | b'w' | b'r' => (18..=48 * 1024 + 17).contains(&read),
         b'F' => (18..=8192 + 17).contains(&read),
         b'O' => (18..=1024 + 17).contains(&read),
         b'U' => (18..=512 + 17).contains(&read),
@@ -583,7 +583,7 @@ fn recv_request(
             descriptors,
         },
         #[cfg(feature = "age319-private-broker-fixture")]
-        b'm' | b'n' => RequestPayload::FreshAccountEffectRequest {
+        b'm' | b'n' | b'o' => RequestPayload::FreshAccountEffectRequest {
             request: serde_json::from_slice(&request[17..read as usize])?,
         },
         #[cfg(feature = "age319-private-broker-fixture")]
@@ -5170,7 +5170,7 @@ fn serve_fresh_v30_at(
                     }
                 }
                 #[cfg(feature = "age319-private-broker-fixture")]
-                b'5' | b'6' | b'7' | b'8' | b'9' | b'h' | b'f' | b'm' | b'n' => {
+                b'5' | b'6' | b'7' | b'8' | b'9' | b'h' | b'f' | b'm' | b'n' | b'o' => {
                     if !private_fixture() {
                         return Err(io::Error::other("fresh provider fixture route closed"));
                     }
@@ -5241,7 +5241,7 @@ fn serve_fresh_v30_at(
                         fresh_provider::binding_from_held(&receipt, &held, &actor, &root)?;
                     let directory = state_root.join("v30/fresh-provider");
                     if provider_readback_v3.is_some()
-                        && !(matches!(operation, b'6' | b'8' | b'9' | b'h' | b'm' | b'n')
+                        && !(matches!(operation, b'6' | b'8' | b'9' | b'h' | b'm' | b'n' | b'o')
                             || (route_writer_v3 && operation == b'f'))
                         && !(provider_writer_v3 && matches!(operation, b'5' | b'7'))
                     {
@@ -5417,6 +5417,41 @@ fn serve_fresh_v30_at(
                         if expected_pin.is_some_and(|pin| pin != effect_request.account) {
                             return Err(io::Error::other(
                                 "fresh effect account differs from held pin",
+                            ));
+                        }
+                        if operation == b'o' {
+                            let generation = provider_readback_v3.as_ref().ok_or_else(|| {
+                                io::Error::other("shared quota requires keyed v3 admission")
+                            })?;
+                            let _route_lock = fresh_provider::route_selection_lock(&directory)?;
+                            let (shared, keyed_io) = fresh_index::measure_keyed_io(|| {
+                                let _physical_io =
+                                    fresh_index::ReaderIoGuard::start("v3-shared-quota");
+                                fresh_provider::shared_quota_effect_v3(
+                                    &directory,
+                                    generation,
+                                    &binding,
+                                    &effect_request,
+                                )
+                            });
+                            eprintln!("age319 v3 shared quota keyed I/O: {keyed_io:?}");
+                            if matches!(&shared, Ok(Some(_)))
+                                && std::env::var_os(
+                                    "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_SHARED_Q_REPLY_V3_V1",
+                                )
+                                .is_some()
+                                && std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                                    .is_some_and(|gate| {
+                                        !Path::new(&gate)
+                                            .join("account-effect-reply-dropped")
+                                            .exists()
+                                    })
+                            {
+                                drop_account_effect_reply = true;
+                            }
+                            return Ok(format!(
+                                "fresh-shared-quota {}\n",
+                                serde_json::to_string(&shared?)?
                             ));
                         }
                         let effect = if let Some(generation) = provider_readback_v3.as_ref() {
