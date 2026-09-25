@@ -1429,7 +1429,10 @@ fn private_bash_recipient_probe(
     use protocol::FreshRecipientRequest;
     use sha2::Digest as _;
     let mode = std::env::var("AGE319_PRIVATE_BASH_RECIPIENT_MODE_V1").map_err(|e| e.to_string())?;
-    if !matches!(mode.as_str(), "ack" | "lost_pending") {
+    if !matches!(
+        mode.as_str(),
+        "ack" | "lost_pending" | "prepare_unavailable"
+    ) {
         return Err("invalid private Bash recipient mode".into());
     }
     let request_id = std::env::var("AGE319_PRIVATE_BASH_REQUEST_KEY").map_err(|e| e.to_string())?;
@@ -1548,6 +1551,73 @@ fn private_bash_recipient_probe(
     if lookup["payload_base64"] != delivered["payload_base64"] {
         return Err("read-only lookup changed fresh F bytes".into());
     }
+    let preparation_refusal = if mode == "prepare_unavailable" {
+        let read = protocol::fresh_recipient_request_at(
+            socket,
+            &FreshRecipientRequest::Read {
+                delivery_request_id: delivery_request_id.clone(),
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        let exact: oulipoly_state::mailbox::FreshDeliveryReadback =
+            serde_json::from_value(read["grant"].clone()).map_err(|e| e.to_string())?;
+        if exact.grant_id != grant["grant_id"]
+            || exact.session_id != grant["session_id"]
+            || exact.seq != seq
+            || exact.source_id != grant["source_id"]
+            || exact.attempt_id != grant["attempt_id"]
+        {
+            return Err("native F original recipient readback changed F".into());
+        }
+        let token = grant["delivery_token"]
+            .as_str()
+            .ok_or("native F original F token absent")?;
+        let wrong_session = crate::native_f_preparation::prepare_original_recipient_native_f(
+            socket,
+            &uuid::Uuid::new_v4().to_string(),
+            &delivery_request_id,
+            &exact,
+            Some(token),
+            None,
+        )
+        .expect_err("wrong fresh session unexpectedly prepared native F");
+        if wrong_session != "native F original recipient grant or fresh session changed" {
+            return Err(format!(
+                "native F wrong-session refusal changed: {wrong_session}"
+            ));
+        }
+        let lost_token = crate::native_f_preparation::prepare_original_recipient_native_f(
+            socket,
+            &exact.session_id,
+            &delivery_request_id,
+            &exact,
+            None,
+            None,
+        )
+        .expect_err("lost F token unexpectedly prepared native F");
+        if lost_token != "native F delivery token unknown after lost F reply" {
+            return Err(format!("native F lost-token refusal changed: {lost_token}"));
+        }
+        let mut refusal = None;
+        for _ in 0..2 {
+            let error = crate::native_f_preparation::prepare_original_recipient_native_f(
+                socket,
+                &exact.session_id,
+                &delivery_request_id,
+                &exact,
+                Some(token),
+                None,
+            )
+            .expect_err("headless private root unexpectedly prepared native F");
+            if refusal.as_ref().is_some_and(|previous| previous != &error) {
+                return Err("native F unavailable retry changed refusal".into());
+            }
+            refusal = Some(error);
+        }
+        refusal
+    } else {
+        None
+    };
     if mode == "ack" {
         if protocol::fresh_recipient_request_at(
             socket,
@@ -1595,6 +1665,7 @@ fn private_bash_recipient_probe(
         serde_json::to_vec(
             &serde_json::json!({"mode":mode,"listener_policy":"notify_at_admission",
             "delivery_request_id":delivery_request_id,"grant":grant,"readback":read,
+            "native_f_preparation_refusal":preparation_refusal,
             "observed_payload_sha256":format!("{:x}",sha2::Sha256::digest(&bytes))}),
         )
         .map_err(|e| e.to_string())?,

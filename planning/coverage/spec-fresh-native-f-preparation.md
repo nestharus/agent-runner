@@ -5,6 +5,8 @@
 - `crates/oulipoly-state/src/mailbox/fresh_native_f.rs`
 - `crates/oulipoly-state/src/mailbox/migrations/0040_fresh_native_f_preparation.sql`
 - `src-tauri/src/native_f_preparation.rs`
+- `src-tauri/src/kernel_entry.rs`
+- `src-tauri/src/main.rs`
 - `crates/oulipoly-kernel-broker/src/linux_main.rs`
 - `crates/oulipoly-runtime/src/executor/cli/pty_broker/mod.rs`
 - `crates/oulipoly-runtime/src/executor/cli/pty_broker/tui_control.rs`
@@ -33,6 +35,7 @@
 
 - Missing or ambiguous resident generation, missing socket, changed process, missing Tail anchor, and mismatched F token refuse preparation. Durable readback refuses when its live generation cannot be reattested.
 - The current ordinary private root flow has no live PTY generation or adapter Tail join, so it must leave this preparation absent.
+- The original recipient reads back the exact F key before calling preparation. A lost F token, changed grant/session, or absent resident PTY and selected adapter page authority refuses without creating a record or ACK.
 
 ## Boundaries
 
@@ -42,6 +45,7 @@
 ## Declared test patterns
 
 - `crates/oulipoly-kernel-broker/tests/age319_fresh_recipient_socket.rs` exercises clean fixture preparation, readback, lost reply, restart, refusal, old WAL isolation, and pending/manual ACK separation.
+- `crates/oulipoly-kernel-broker/tests/private_root_join.rs` exercises accepted W to original-root F and repeatable refusal when the headless private K/Q route lacks a resident PTY generation and typed adapter page authority.
 - PTY broker unit tests exercise both plain and TUI resident query handlers without child input.
 - Existing native page and PTY outbound tests cover the adapter Tail and transport mechanics separately; this slice does not join a physical send.
 

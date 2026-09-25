@@ -112,6 +112,7 @@ fn inner() {
             | "normal_model_provider_bash_causal_w_debt"
             | "normal_model_provider_bash_causal_notify_w_debt"
             | "normal_model_provider_bash_causal_notify_ack"
+            | "normal_model_provider_bash_causal_notify_prepare_unavailable"
             | "normal_model_provider_bash_causal_notify_lost_pending"
             | "normal_model_provider_bash_causal_notify_debt"
             | "normal_model_provider_bash_causal_notify_row_debt"
@@ -587,6 +588,7 @@ fn inner() {
                         | "normal_model_provider_bash_causal"
                         | "normal_model_provider_bash_causal_success"
                         | "normal_model_provider_bash_causal_notify_ack"
+                        | "normal_model_provider_bash_causal_notify_prepare_unavailable"
                         | "normal_model_provider_bash_causal_notify_lost_pending"
                 )
                 .then_some(("AGE319_PRIVATE_ROOT_TERMINAL_V1", "1")),
@@ -612,6 +614,14 @@ fn inner() {
             .envs(
                 (mode == "normal_model_provider_bash_causal_notify_lost_pending")
                     .then_some(("AGE319_PRIVATE_BASH_RECIPIENT_MODE_V1", "lost_pending")),
+            )
+            .envs(
+                (mode == "normal_model_provider_bash_causal_notify_prepare_unavailable").then_some(
+                    (
+                        "AGE319_PRIVATE_BASH_RECIPIENT_MODE_V1",
+                        "prepare_unavailable",
+                    ),
+                ),
             )
             .envs(
                 provider_mode
@@ -1030,7 +1040,20 @@ fn inner() {
                         fs::read_to_string(gate.join("causal-helper-error")).unwrap_or_default()
                     )
                 });
-                eventually(|| gate.join("bash-causal-terminal-status").exists());
+                let terminal_deadline = Instant::now() + Duration::from_secs(20);
+                while !gate.join("bash-causal-terminal-status").exists()
+                    && Instant::now() < terminal_deadline
+                {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                assert!(
+                    gate.join("bash-causal-terminal-status").exists(),
+                    "causal Bash terminal status absent: bash={} helper={} entry={} broker={}",
+                    fs::read_to_string(gate.join("bash-causal-error")).unwrap_or_default(),
+                    fs::read_to_string(gate.join("causal-helper-error")).unwrap_or_default(),
+                    fs::read_to_string(&err).unwrap_or_default(),
+                    fs::read_to_string(&broker_log).unwrap_or_default(),
+                );
                 assert_eq!(
                     fs::read(gate.join("bash-causal-terminal-status")).unwrap(),
                     b"0"
@@ -1662,6 +1685,30 @@ fn inner() {
                         )
                         .unwrap();
                     assert_eq!(acked, mode.ends_with("notify_ack"));
+                    if mode.ends_with("notify_prepare_unavailable") {
+                        assert_eq!(
+                            observed["native_f_preparation_refusal"],
+                            "native F original-root resident PTY generation and selected adapter page authority absent"
+                        );
+                        assert!(matches!(
+                            observed["readback"]["grant"]["phase"].as_str(),
+                            Some("unknown" | "submitted")
+                        ));
+                        let count: i64 = row
+                            .query_row("SELECT count(*) FROM fresh_native_f_preparation", [], |r| {
+                                r.get(0)
+                            })
+                            .unwrap();
+                        assert_eq!(count, 0);
+                        let generation_count: i64 = row
+                            .query_row(
+                                "SELECT count(*) FROM runtime_generation WHERE session_id=?1",
+                                [&session.session_id],
+                                |r| r.get(0),
+                            )
+                            .unwrap();
+                        assert_eq!(generation_count, 0);
+                    }
                 }
                 fs::write(gate.join("provider-cancel"), b"yes").unwrap();
                 let until = Instant::now() + Duration::from_secs(20);
@@ -5011,6 +5058,7 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_model_provider_bash_causal_w_debt",
         "normal_model_provider_bash_causal_notify_w_debt",
         "normal_model_provider_bash_causal_notify_ack",
+        "normal_model_provider_bash_causal_notify_prepare_unavailable",
         "normal_model_provider_bash_causal_notify_lost_pending",
         "normal_model_provider_bash_causal_notify_debt",
         "normal_model_provider_bash_causal_notify_row_debt",
