@@ -3970,12 +3970,25 @@ fn serve_fresh_v30_at(
                         let [source]: [File; 1] = descriptors
                             .try_into()
                             .map_err(|_| io::Error::other("manual quota config source absent"))?;
-                        manual_quota::begin(&directory, &source, &request, peer.uid, peer.gid)?
+                        manual_quota::begin_indexed(
+                            &directory,
+                            &source,
+                            &request,
+                            peer.uid,
+                            peer.gid,
+                            route_index.as_ref(),
+                        )?
                     } else {
                         let RequestPayload::ManualQuotaObserve { operation_id } = payload else {
                             return Err(io::Error::other("manual quota observation absent"));
                         };
-                        manual_quota::readback_id(&directory, &operation_id, peer.uid, peer.gid)?
+                        manual_quota::readback_id_indexed(
+                            &directory,
+                            &operation_id,
+                            peer.uid,
+                            peer.gid,
+                            route_index.as_ref(),
+                        )?
                     };
                     return Ok(format!(
                         "manual-quota {}\n",

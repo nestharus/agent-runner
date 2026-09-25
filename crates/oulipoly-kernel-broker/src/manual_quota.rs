@@ -15,7 +15,7 @@ use std::process::{Command, Stdio};
 
 const MAX_OUTPUT: u64 = 1024 * 1024;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Intent {
     version: u32,
@@ -189,12 +189,227 @@ fn same_source(a: &Intent, b: &Intent) -> bool {
         && a.source_inode == b.source_inode
 }
 
+fn indexed_artifact(
+    index: &super::fresh_index::Index,
+    path: &Path,
+) -> io::Result<super::fresh_index::Artifact> {
+    let root = index.evidence_root();
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| io::Error::other("manual quota artifact outside broker root"))?;
+    super::fresh_index::Artifact::from_existing(root, relative).map_err(io::Error::other)
+}
+
+/// Project one retained manual operation. The retained intent is the exact
+/// source/physical-account grant; only its source operation owns a physical K.
+/// A CAS reply may be lost, so every transition is followed by exact readback.
+fn reconcile_indexed_manual(index: &super::fresh_index::Index, intent: &Intent) -> io::Result<()> {
+    use super::fresh_index::{
+        AccountUpdate, EffectIntent, EffectKind, PhysicalQ as IndexedQ, SourceKey,
+    };
+    let root = index.evidence_root();
+    let id = &intent.request.operation_id;
+    let dir = operation_dir(root, id);
+    if !valid_id(id)
+        || intent.version != 1
+        || intent.physical_account_id.is_empty()
+        || intent.request.environment.len() != 0
+        || intent.environment_sha256.len() != 64
+        || !intent
+            .environment_sha256
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit())
+        || read_exact::<Intent>(&dir, "intent.json")?.as_ref() != Some(intent)
+    {
+        return Err(io::Error::other("indexed manual intent/source changed"));
+    }
+    let source = SourceKey {
+        commands_sha256: sha(&serde_json::to_vec(&(
+            &intent.quota_script,
+            &intent.auth_refresh_command,
+        ))?),
+        environment_sha256: intent.environment_sha256.clone(),
+    };
+    let announced = EffectIntent {
+        kind: EffectKind::ManualQuota,
+        source,
+        decision_handoff: String::new(),
+        route_source: None,
+        candidate: None,
+        intent: indexed_artifact(index, &dir.join("intent.json"))?,
+        reuse: None,
+        consumed_k: None,
+        certified_q: None,
+        result: None,
+    };
+    if let Some(source_id) = &intent.source_operation_id {
+        if !valid_id(source_id) || source_id == id {
+            return Err(io::Error::other("indexed manual reuse source invalid"));
+        }
+    }
+    // This also validates a follower's exact source identity and any
+    // independently observed physical Q before it can enter the index.
+    let readback = readback_intent(root, intent)?;
+    let k: Option<serde_json::Value> = read_exact(&dir, "k.json")?;
+    if (intent.source_operation_id.is_some() || intent.quota_script.is_none()) && k.is_some() {
+        return Err(io::Error::other(
+            "indexed manual nonphysical operation has K",
+        ));
+    }
+    if let Some(k) = &k {
+        if k.get("version").and_then(|v| v.as_u64()) != Some(1)
+            || k.get("operation_id").and_then(|v| v.as_str()) != Some(id)
+            || k.get("effect_id").and_then(|v| v.as_str()) != intent.effect_id.as_deref()
+        {
+            return Err(io::Error::other("indexed manual K identity changed"));
+        }
+    }
+    let key = &intent.physical_account_id;
+    let mut account = index.account(key).map_err(io::Error::other)?;
+    if let Some(existing) = account.effects.get(id) {
+        if existing.kind != announced.kind
+            || existing.source != announced.source
+            || existing.intent != announced.intent
+            || existing.decision_handoff != announced.decision_handoff
+            || existing.route_source.is_some()
+            || existing.candidate.is_some()
+            || existing.reuse.is_some()
+        {
+            return Err(io::Error::other("indexed manual announcement changed"));
+        }
+    } else {
+        if k.is_some() || dir.join("q.json").exists() {
+            return Err(io::Error::other(
+                "physical manual K/Q lacks indexed announcement",
+            ));
+        }
+        let update = index.update_account(
+            key,
+            account.revision,
+            AccountUpdate::AnnounceEffect {
+                id: id.clone(),
+                effect: announced.clone(),
+            },
+        );
+        account = index.account(key).map_err(io::Error::other)?;
+        if account.effects.get(id) != Some(&announced) {
+            return Err(io::Error::other(format!(
+                "indexed manual announcement failed: {update:?}"
+            )));
+        }
+    }
+    if k.is_some() {
+        let k_ref = indexed_artifact(index, &dir.join("k.json"))?;
+        if account.effects[id].consumed_k.as_ref() != Some(&k_ref) {
+            if account.effects[id].consumed_k.is_some() {
+                return Err(io::Error::other("indexed manual K changed"));
+            }
+            let update = index.update_account(
+                key,
+                account.revision,
+                AccountUpdate::ConsumeEffect {
+                    id: id.clone(),
+                    k: k_ref.clone(),
+                },
+            );
+            account = index.account(key).map_err(io::Error::other)?;
+            if account.effects[id].consumed_k.as_ref() != Some(&k_ref) {
+                return Err(io::Error::other(format!(
+                    "indexed manual K publication failed: {update:?}"
+                )));
+            }
+        }
+        if readback.state == "drained" {
+            let q_path = dir.join("q.json");
+            let q_ref = indexed_artifact(index, &q_path)?;
+            let q = IndexedQ {
+                physical_k: k_ref,
+                q: q_ref.clone(),
+                terminal: None,
+                completed_unix_nanos: i64::try_from(physical_q_nanos(root, id)?)
+                    .map_err(io::Error::other)?,
+            };
+            let indexed = &account.effects[id];
+            if indexed.certified_q.as_ref() != Some(&q) || indexed.result.as_ref() != Some(&q_ref) {
+                if indexed.certified_q.is_some() || indexed.result.is_some() {
+                    return Err(io::Error::other("indexed manual Q changed"));
+                }
+                // The typed readback certifies complete stdout/stderr and Q.
+                // Keep Q as the result identity for admission and restart.
+                let update = index.update_account(
+                    key,
+                    account.revision,
+                    AccountUpdate::SettleEffect {
+                        id: id.clone(),
+                        q: q.clone(),
+                        result: Some(q_ref.clone()),
+                        marker: (readback.outcome.as_deref() == Some("valid_windows"))
+                            .then_some(false),
+                    },
+                );
+                account = index.account(key).map_err(io::Error::other)?;
+                if account.effects[id].certified_q.as_ref() != Some(&q)
+                    || account.effects[id].result.as_ref() != Some(&q_ref)
+                {
+                    return Err(io::Error::other(format!(
+                        "indexed manual Q publication failed: {update:?}"
+                    )));
+                }
+            }
+        } else if account.effects[id].certified_q.is_some() {
+            return Err(io::Error::other("indexed manual Q lost physical readback"));
+        }
+    } else if account.effects[id].consumed_k.is_some() || dir.join("q.json").exists() {
+        return Err(io::Error::other(
+            "indexed manual K/Q lost physical reference",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn reconcile_live_manual_accounts(index: &super::fresh_index::Index) -> io::Result<()> {
+    let parent = index.evidence_root().join("manual-quota");
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            return Err(io::Error::other(
+                "indexed manual operation is not directory",
+            ));
+        }
+        let dir = entry.path();
+        let intent: Intent = read_exact(&dir, "intent.json")?
+            .ok_or_else(|| io::Error::other("indexed manual intent absent"))?;
+        if dir != operation_dir(index.evidence_root(), &intent.request.operation_id) {
+            return Err(io::Error::other("indexed manual operation path changed"));
+        }
+        reconcile_indexed_manual(index, &intent)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 pub(super) fn begin(
     directory: &Path,
     source: &File,
     request: &ManualQuotaRequest,
     uid: u32,
     gid: u32,
+) -> io::Result<ManualQuotaReadback> {
+    begin_indexed(directory, source, request, uid, gid, None)
+}
+
+pub(super) fn begin_indexed(
+    directory: &Path,
+    source: &File,
+    request: &ManualQuotaRequest,
+    uid: u32,
+    gid: u32,
+    index: Option<&super::fresh_index::Index>,
 ) -> io::Result<ManualQuotaReadback> {
     let mut intent = source_intent(source, request, uid, gid)?;
     let parent = directory.join("manual-quota");
@@ -216,6 +431,9 @@ pub(super) fn begin(
             || old.source_inode != intent.source_inode
         {
             return Err(io::Error::other("manual quota operation/source mismatch"));
+        }
+        if let Some(index) = index {
+            reconcile_indexed_manual(index, &old)?;
         }
         return readback(directory, request, uid, gid);
     }
@@ -260,6 +478,11 @@ pub(super) fn begin(
     fs::create_dir(&own)?;
     File::open(&parent)?.sync_all()?;
     durable_new(&own, "intent.json", &intent)?;
+    if let Some(index) = index {
+        // No physical K may be published until the exact source, account,
+        // intent, and index generation have been announced and read back.
+        reconcile_indexed_manual(index, &intent)?;
+    }
     if intent.source_operation_id.is_some() || intent.quota_script.is_none() {
         return readback_intent(directory, &intent);
     }
@@ -273,6 +496,10 @@ pub(super) fn begin(
             "operation_id": request.operation_id,
         }),
     )?;
+    if let Some(index) = index {
+        // A failed post-K CAS leaves one-use debt; never start the worker.
+        reconcile_indexed_manual(index, &intent)?;
+    }
     #[cfg(not(test))]
     {
         let executable = std::env::current_exe()?;
@@ -317,11 +544,12 @@ pub(super) fn readback(
     readback_intent(directory, &intent)
 }
 
-pub(super) fn readback_id(
+pub(super) fn readback_id_indexed(
     directory: &Path,
     operation_id: &str,
     uid: u32,
     gid: u32,
+    index: Option<&super::fresh_index::Index>,
 ) -> io::Result<ManualQuotaReadback> {
     if !valid_id(operation_id) {
         return Err(io::Error::other("manual quota operation ID invalid"));
@@ -335,6 +563,9 @@ pub(super) fn readback_id(
         || intent.peer_gid != gid
     {
         return Err(io::Error::other("manual quota readback identity mismatch"));
+    }
+    if let Some(index) = index {
+        reconcile_indexed_manual(index, &intent)?;
     }
     readback_intent(directory, &intent)
 }
@@ -624,7 +855,7 @@ pub(super) fn offline_collect(
         let relative = Path::new("manual-quota").join(&id);
         let effect = EffectIntent {
             kind: EffectKind::ManualQuota,
-            source: source_key,
+            source: source_key.clone(),
             decision_handoff: String::new(),
             route_source: None,
             candidate: None,
@@ -654,7 +885,14 @@ pub(super) fn offline_collect(
             } else {
                 None
             },
-            result: None,
+            result: if result.state == "drained" && k.is_some() {
+                Some(
+                    Artifact::from_existing(directory, &relative.join("q.json"))
+                        .map_err(io::Error::other)?,
+                )
+            } else {
+                None
+            },
         };
         let account = snapshot
             .accounts
@@ -670,6 +908,27 @@ pub(super) fn offline_collect(
                 source_q: BTreeMap::new(),
                 recent_failure_nanos: Vec::new(),
             });
+        if result.outcome.as_deref() == Some("valid_windows") {
+            if let Some(q) = &effect.certified_q {
+                let digest = sha(&serde_json::to_vec(&source_key)?);
+                let source =
+                    account
+                        .source_q
+                        .entry(digest)
+                        .or_insert_with(|| super::fresh_index::SourceQ {
+                            source: source_key.clone(),
+                            latest_quota_q: None,
+                            latest_auth_q: None,
+                        });
+                if source
+                    .latest_quota_q
+                    .as_ref()
+                    .is_none_or(|old| old.completed_unix_nanos <= q.completed_unix_nanos)
+                {
+                    source.latest_quota_q = Some(q.clone());
+                }
+            }
+        }
         if account.effects.insert(id, effect).is_some() {
             return Err(io::Error::other("offline manual operation duplicated"));
         }
@@ -850,6 +1109,7 @@ pub(super) fn worker_with_environment(
 
 #[cfg(test)]
 mod tests {
+    use super::super::fresh_index::{Index, broker_admission_lease};
     use super::*;
 
     struct Fixture {
@@ -915,6 +1175,199 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    #[test]
+    fn indexed_manual_announces_before_k_and_reuses_exact_k_q_after_restart() {
+        let f = Fixture::new(r#"printf '{"used_percent":24,"resets_at":"2099-01-01T00:00:00Z"}'"#);
+        let lease = broker_admission_lease(&f.ledger).unwrap();
+        let index = Index::admit_live_routes(&f.ledger, &lease).unwrap();
+        let request = f.request("first");
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        let source = File::open(&f.source).unwrap();
+        let pending = begin_indexed(&f.ledger, &source, &request, uid, gid, Some(&index)).unwrap();
+        assert_eq!(pending.state, "unknown");
+        let dir = operation_dir(&f.ledger, &request.operation_id);
+        let before = index.account("physical-first").unwrap();
+        assert_eq!(
+            before.effects[&request.operation_id].kind,
+            super::super::fresh_index::EffectKind::ManualQuota
+        );
+        assert!(before.effects[&request.operation_id].consumed_k.is_some());
+        let k_bytes = fs::read(dir.join("k.json")).unwrap();
+        let first_revision = before.revision;
+        f.run_worker(&request);
+        let drained =
+            readback_id_indexed(&f.ledger, &request.operation_id, uid, gid, Some(&index)).unwrap();
+        assert_eq!(drained.outcome.as_deref(), Some("valid_windows"));
+        let settled = index.account("physical-first").unwrap();
+        assert!(settled.effects[&request.operation_id].certified_q.is_some());
+        assert_eq!(
+            settled.effects[&request.operation_id].result,
+            settled.effects[&request.operation_id]
+                .certified_q
+                .as_ref()
+                .map(|q| q.q.clone())
+        );
+        assert_eq!(settled.source_q.len(), 1);
+        assert_eq!(settled.observed_invocations, 0);
+        assert!(settled.revision > first_revision);
+        let restarted = Index::admit_live_routes(&f.ledger, &lease).unwrap();
+        let again =
+            begin_indexed(&f.ledger, &source, &request, uid, gid, Some(&restarted)).unwrap();
+        assert_eq!(again.effect_id, drained.effect_id);
+        assert_eq!(fs::read(dir.join("k.json")).unwrap(), k_bytes);
+        assert_eq!(
+            restarted.account("physical-first").unwrap().revision,
+            settled.revision
+        );
+    }
+
+    #[test]
+    fn indexed_manual_damaged_generation_blocks_physical_k() {
+        let f = Fixture::new("exit 0");
+        let lease = broker_admission_lease(&f.ledger).unwrap();
+        let index = Index::admit_live_routes(&f.ledger, &lease).unwrap();
+        fs::remove_file(f.ledger.join("index-v1/manifest.json")).unwrap();
+        let request = f.request("first");
+        assert!(
+            begin_indexed(
+                &f.ledger,
+                &File::open(&f.source).unwrap(),
+                &request,
+                unsafe { libc::getuid() },
+                unsafe { libc::getgid() },
+                Some(&index)
+            )
+            .is_err()
+        );
+        assert!(
+            !operation_dir(&f.ledger, &request.operation_id)
+                .join("k.json")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn indexed_manual_incomplete_q_is_debt_and_invalid_q_has_no_healthy_source() {
+        let f = Fixture::new("printf invalid");
+        let lease = broker_admission_lease(&f.ledger).unwrap();
+        let index = Index::admit_live_routes(&f.ledger, &lease).unwrap();
+        let request = f.request("first");
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        let pending = begin_indexed(
+            &f.ledger,
+            &File::open(&f.source).unwrap(),
+            &request,
+            uid,
+            gid,
+            Some(&index),
+        )
+        .unwrap();
+        let debt = index.account("physical-first").unwrap();
+        assert!(debt.effects[&request.operation_id].consumed_k.is_some());
+        assert!(debt.effects[&request.operation_id].certified_q.is_none());
+        assert!(debt.source_q.is_empty());
+        let dir = operation_dir(&f.ledger, &request.operation_id);
+        durable_new(
+            &dir,
+            "q.json",
+            &PhysicalQ {
+                version: 1,
+                effect_id: pending.effect_id.unwrap(),
+                wait_success: true,
+                stdout_len: 0,
+                stdout_sha256: sha(b""),
+                stderr_len: 0,
+                stderr_sha256: sha(b""),
+                completed_unix_seconds: Utc::now().timestamp(),
+            },
+        )
+        .unwrap();
+        assert!(
+            readback_id_indexed(&f.ledger, &request.operation_id, uid, gid, Some(&index)).is_err()
+        );
+        assert!(
+            index.account("physical-first").unwrap().effects[&request.operation_id]
+                .certified_q
+                .is_none()
+        );
+        assert!(Index::admit_live_routes(&f.ledger, &lease).is_err());
+        fs::remove_file(dir.join("q.json")).unwrap();
+        Index::admit_live_routes(&f.ledger, &lease).unwrap();
+        f.run_worker(&request);
+        let readback =
+            readback_id_indexed(&f.ledger, &request.operation_id, uid, gid, Some(&index)).unwrap();
+        assert_eq!(readback.outcome.as_deref(), Some("invalid"));
+        let settled = index.account("physical-first").unwrap();
+        assert!(settled.effects[&request.operation_id].certified_q.is_some());
+        assert!(settled.source_q.is_empty());
+    }
+
+    #[test]
+    fn indexed_manual_shared_physical_account_keeps_newest_q_across_models() {
+        let f = Fixture::new(r#"printf '{"used_percent":36,"resets_at":"2099-01-01T00:00:00Z"}'"#);
+        fs::write(
+            f.source.join("models/other.toml"),
+            "[[providers]]\nname = 'first'\n",
+        )
+        .unwrap();
+        let lease = broker_admission_lease(&f.ledger).unwrap();
+        let index = Index::admit_live_routes(&f.ledger, &lease).unwrap();
+        let first = f.request("first");
+        let pool = oulipoly_runtime::executor::cli::fresh_remote::load_fresh_headless_pool(
+            &f.source, "other",
+        )
+        .unwrap();
+        let second = ManualQuotaRequest {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            model: "other".into(),
+            account: "first".into(),
+            config_sha256: pool.config_sha256,
+            environment: first.environment.clone(),
+        };
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        let source = File::open(&f.source).unwrap();
+        for request in [&first, &second] {
+            begin_indexed(&f.ledger, &source, request, uid, gid, Some(&index)).unwrap();
+            f.run_worker(request);
+            assert_eq!(
+                readback_id_indexed(&f.ledger, &request.operation_id, uid, gid, Some(&index))
+                    .unwrap()
+                    .state,
+                "drained"
+            );
+        }
+        let account = index.account("physical-first").unwrap();
+        assert!(account.effects.contains_key(&first.operation_id));
+        assert!(account.effects.contains_key(&second.operation_id));
+        assert!(account.markers.model_capacity_nanos.is_none());
+        assert!(account.markers.quota_rejection_nanos.is_none());
+        let latest = account
+            .source_q
+            .values()
+            .next()
+            .unwrap()
+            .latest_quota_q
+            .as_ref()
+            .unwrap()
+            .clone();
+        readback_id_indexed(&f.ledger, &first.operation_id, uid, gid, Some(&index)).unwrap();
+        assert_eq!(
+            index
+                .account("physical-first")
+                .unwrap()
+                .source_q
+                .values()
+                .next()
+                .unwrap()
+                .latest_quota_q
+                .as_ref(),
+            Some(&latest)
+        );
     }
 
     #[test]
@@ -1138,6 +1591,25 @@ mod tests {
         };
         assert_eq!(drained.outcome.as_deref(), Some("valid_windows"));
         assert_eq!(drained.windows[0].used_percent, 31.0);
+        if std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_ROUTE_INDEX_V1")
+            .is_some_and(|value| value == "1")
+        {
+            let index = Index::open(&broker_ledger).unwrap();
+            let account = index.account("physical-first").unwrap();
+            let effect = &account.effects[&request.operation_id];
+            assert!(effect.consumed_k.is_some());
+            assert!(effect.certified_q.is_some());
+            assert_eq!(
+                effect.result.as_ref(),
+                effect.certified_q.as_ref().map(|q| &q.q)
+            );
+            assert!(
+                account
+                    .source_q
+                    .values()
+                    .any(|source| source.latest_quota_q.is_some())
+            );
+        }
         if let Some(child) = broker.as_mut() {
             child.kill().unwrap();
             child.wait().unwrap();

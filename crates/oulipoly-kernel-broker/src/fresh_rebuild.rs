@@ -603,6 +603,11 @@ pub(crate) fn reconcile_offline_account(
             // together with the materialized result at broker admission.
             continue;
         }
+        if indexed.certified_q.is_some() {
+            // Frozen collection already certified the exact manual Q and
+            // retained its result identity for live admission readback.
+            continue;
+        }
         let Some(k) = indexed.consumed_k else {
             continue;
         };
@@ -659,12 +664,10 @@ pub(crate) fn reconcile_offline_account(
                     .map_err(io::Error::other)?;
                 (q_relative, healthy, time)
             };
-        if !healthy {
-            continue;
-        }
+        let q_artifact = artifact(root, q_relative)?;
         let q = PhysicalQ {
             physical_k: k,
-            q: artifact(root, q_relative)?,
+            q: q_artifact.clone(),
             terminal: None,
             completed_unix_nanos,
         };
@@ -675,8 +678,8 @@ pub(crate) fn reconcile_offline_account(
                 AccountUpdate::SettleEffect {
                     id,
                     q,
-                    result: None,
-                    marker: Some(false),
+                    result: Some(q_artifact),
+                    marker: healthy.then_some(false),
                 },
             )
             .map_err(io::Error::other)?;
@@ -1436,7 +1439,8 @@ mod tests {
         let after = index
             .reconcile_offline_account("physical-first", &fixture.source)
             .unwrap();
-        assert!(!after.effects.contains_key(&operation_id));
+        assert!(after.effects[&operation_id].certified_q.is_some());
+        assert!(after.effects[&operation_id].result.is_some());
         assert_eq!(after.source_q.len(), 1);
         assert!(
             after
@@ -1447,6 +1451,49 @@ mod tests {
                 .latest_quota_q
                 .is_some()
         );
+    }
+
+    #[test]
+    fn manual_q_after_frozen_rebuild_keeps_exact_identity() {
+        let fixture = Fixture::new();
+        let operation_id = uuid::Uuid::new_v4().to_string();
+        let request = ManualQuotaRequest {
+            operation_id: operation_id.clone(),
+            model: "work".into(),
+            account: "first".into(),
+            config_sha256: fixture.candidate.config_sha256.clone(),
+            environment: vec![],
+        };
+        crate::linux_main::manual_quota::begin(
+            &fixture.root,
+            &File::open(&fixture.source).unwrap(),
+            &request,
+            unsafe { libc::geteuid() },
+            unsafe { libc::getegid() },
+        )
+        .unwrap();
+        fixture.ready();
+        let index = fixture.rebuild().unwrap();
+        assert!(
+            index.account("physical-first").unwrap().effects[&operation_id]
+                .certified_q
+                .is_none()
+        );
+        crate::linux_main::manual_quota::worker_with_environment(
+            &fixture.root.join("manual-quota").join(&operation_id),
+            &[],
+        )
+        .unwrap();
+        let account = index
+            .reconcile_offline_account("physical-first", &fixture.source)
+            .unwrap();
+        let effect = &account.effects[&operation_id];
+        assert!(effect.certified_q.is_some());
+        assert_eq!(
+            effect.result.as_ref(),
+            effect.certified_q.as_ref().map(|q| &q.q)
+        );
+        assert_eq!(account.source_q.len(), 1);
     }
 
     #[test]

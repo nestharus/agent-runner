@@ -1,7 +1,8 @@
 //! Broker-owned evidence index and detached frozen rebuild. The private broker
 //! holds the admission lease. The fixture route and original root provider
-//! writers mirror exact evidence here; routing and effect/manual readers still
-//! use retained files. Index Q pointers follow physical certification and a
+//! writers mirror exact provider, account-effect, and manual quota evidence
+//! here; routing and effect/manual readers still use retained files. Index Q
+//! pointers follow physical certification and a
 //! typed terminal marker; their hashes alone do not certify completion.
 //!
 //! Lock order for a same-broker cutover: route lock, then account locks
@@ -555,6 +556,8 @@ impl Index {
             .map_err(|error| corrupt(format!("live provider account admission: {error}")))?;
         super::fresh_provider::reconcile_live_account_effects(&index)
             .map_err(|error| corrupt(format!("live effect account admission: {error}")))?;
+        super::manual_quota::reconcile_live_manual_accounts(&index)
+            .map_err(|error| corrupt(format!("live manual account admission: {error}")))?;
         Ok(index)
     }
 
