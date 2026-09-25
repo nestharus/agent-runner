@@ -26,6 +26,11 @@ use std::os::unix::net::UnixStream;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+// Candidate storage only. No live writer or selector calls this module yet.
+#[path = "fresh_index_keyed.rs"]
+#[allow(dead_code)]
+mod keyed_store;
+
 // v1 account records have no atomic compact head. They must be rebuilt offline.
 const VERSION: u32 = 2;
 const ADMISSION_PROTOCOL_VERSION: u32 = 1;
@@ -42,6 +47,8 @@ pub(super) struct ReaderIo {
     pub open_attempts: u64,
     pub opened: u64,
     pub directory_entries: u64,
+    pub bytes_parsed: u64,
+    pub bytes_written: u64,
 }
 thread_local! {
     static READER_IO: Cell<Option<ReaderIo>> = const { Cell::new(None) };
@@ -76,6 +83,22 @@ pub(super) fn reader_directory_entry() {
         }
     });
 }
+fn reader_bytes_parsed(bytes: u64) {
+    READER_IO.with(|cell| {
+        if let Some(mut count) = cell.get() {
+            count.bytes_parsed += bytes;
+            cell.set(Some(count));
+        }
+    });
+}
+fn reader_bytes_written(bytes: u64) {
+    READER_IO.with(|cell| {
+        if let Some(mut count) = cell.get() {
+            count.bytes_written += bytes;
+            cell.set(Some(count));
+        }
+    });
+}
 pub(super) struct ReaderIoGuard(&'static str);
 impl ReaderIoGuard {
     pub(super) fn start(boundary: &'static str) -> Self {
@@ -92,8 +115,13 @@ impl Drop for ReaderIoGuard {
         #[cfg(test)]
         LAST_READER_IO.with(|cell| cell.set(Some(count)));
         eprintln!(
-            "age319 indexed {} read: open_attempts={} opened={} directory_entries={}",
-            self.0, count.open_attempts, count.opened, count.directory_entries
+            "age319 indexed {} I/O: open_attempts={} opened={} directory_entries={} bytes_parsed={} bytes_written={}",
+            self.0,
+            count.open_attempts,
+            count.opened,
+            count.directory_entries,
+            count.bytes_parsed,
+            count.bytes_written
         );
     }
 }
@@ -155,6 +183,7 @@ fn read<T: DeserializeOwned + Serialize>(path: &Path) -> Result<Option<T>> {
     }
     let mut bytes = Vec::new();
     file.take(MAX_RECORD + 1).read_to_end(&mut bytes)?;
+    reader_bytes_parsed(bytes.len() as u64);
     let sealed: Sealed<T> =
         serde_json::from_slice(&bytes).map_err(|e| corrupt(format!("{}: {e}", path.display())))?;
     let actual = keyed(&sealed.data)?;
@@ -164,7 +193,10 @@ fn read<T: DeserializeOwned + Serialize>(path: &Path) -> Result<Option<T>> {
     Ok(Some(sealed.data))
 }
 fn sync_dir(path: &Path) -> Result<()> {
-    File::open(path)?.sync_all()?;
+    reader_open_attempt();
+    let file = File::open(path)?;
+    reader_opened();
+    file.sync_all()?;
     Ok(())
 }
 fn write_atomic<T: Serialize>(path: &Path, data: &T) -> Result<()> {
@@ -180,13 +212,16 @@ fn write_atomic<T: Serialize>(path: &Path, data: &T) -> Result<()> {
         return Err(IndexError::Conflict("record exceeds bound"));
     }
     let temp = parent.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
+    reader_open_attempt();
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(&temp)?;
+    reader_opened();
     let result = (|| -> Result<()> {
         file.write_all(&bytes)?;
+        reader_bytes_written(bytes.len() as u64);
         file.sync_all()?;
         fs::rename(&temp, path)?;
         sync_dir(parent)
@@ -209,13 +244,16 @@ fn write_new<T: Serialize>(path: &Path, data: &T) -> Result<()> {
         .parent()
         .ok_or_else(|| corrupt("record parent absent"))?;
     let temp = parent.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
+    reader_open_attempt();
     let mut f = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(&temp)?;
+    reader_opened();
     let result = (|| -> Result<()> {
         f.write_all(&bytes)?;
+        reader_bytes_written(bytes.len() as u64);
         f.sync_all()?;
         // hard_link publishes an immutable name without replacing an existing
         // decision. The temporary inode is already durable before visibility.
@@ -1353,15 +1391,18 @@ impl Artifact {
             .to_str()
             .ok_or_else(|| corrupt("non-UTF8 offline artifact path"))?
             .to_owned();
+        reader_open_attempt();
         let mut f = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
             .open(root.join(relative))?;
+        reader_opened();
         if !f.metadata()?.is_file() {
             return Err(corrupt("offline artifact not regular"));
         }
         let mut hasher = Sha256::new();
-        io::copy(&mut f, &mut hasher)?;
+        let copied = io::copy(&mut f, &mut hasher)?;
+        reader_bytes_parsed(copied);
         let artifact = Self {
             path,
             sha256: format!("{:x}", hasher.finalize()),
@@ -1396,7 +1437,8 @@ impl Artifact {
             return Err(corrupt("artifact is not regular"));
         }
         let mut hasher = Sha256::new();
-        io::copy(&mut f, &mut hasher)?;
+        let copied = io::copy(&mut f, &mut hasher)?;
+        reader_bytes_parsed(copied);
         let after = f.metadata()?;
         if before.dev() != after.dev() || before.ino() != after.ino() || before.len() != after.len()
         {
@@ -1410,16 +1452,19 @@ impl Artifact {
     fn read_json<T: DeserializeOwned>(&self, root: &Path) -> Result<T> {
         self.validate()?;
         let path = root.join(&self.path);
+        reader_open_attempt();
         let mut file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
             .open(&path)?;
+        reader_opened();
         let before = file.metadata()?;
         if !before.is_file() || before.len() > MAX_RECORD {
             return Err(corrupt("typed artifact invalid or oversize"));
         }
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
+        reader_bytes_parsed(bytes.len() as u64);
         let after = file.metadata()?;
         if (before.dev(), before.ino(), before.len()) != (after.dev(), after.ino(), after.len())
             || hash(&bytes) != self.sha256
@@ -3334,6 +3379,33 @@ mod tests {
                 .quota_basis_points_at(100 + 5 * 60 * 60),
             None
         );
+        let intent = artifact(root, "effect-321.intent", b"pending");
+        let pending_effect = EffectIntent {
+            kind: EffectKind::Quota,
+            source: source.clone(),
+            decision_handoff: String::new(),
+            route_source: None,
+            candidate: None,
+            intent,
+            reuse: None,
+            consumed_k: None,
+            certified_q: None,
+            result: None,
+        };
+        let one_writer_io = {
+            let _guard = ReaderIoGuard::start("writer-one");
+            one.update_account(
+                "physical",
+                first.revision,
+                AccountUpdate::AnnounceEffect {
+                    id: "effect-321".into(),
+                    effect: pending_effect.clone(),
+                },
+            )
+            .unwrap();
+            drop(_guard);
+            last_reader_io().unwrap()
+        };
         for n in 2..317 {
             add(
                 root,
@@ -3402,10 +3474,9 @@ mod tests {
         assert_eq!(q.q.completed_unix_nanos, 320);
         assert_eq!(q.outcome, "invalid");
         assert_eq!(q.quota_basis_points_at(100), None);
-        assert_eq!(
-            many_io, first_io,
-            "compact read must not reopen settled history"
-        );
+        assert_eq!(many_io.open_attempts, first_io.open_attempts);
+        assert_eq!(many_io.opened, first_io.opened);
+        assert_eq!(many_io.directory_entries, first_io.directory_entries);
         assert_eq!(many_io.directory_entries, 0);
         assert!(many_io.opened > 0);
         assert_eq!(fs::read(&wal).unwrap(), b"old WAL sentinel");
@@ -3421,27 +3492,23 @@ mod tests {
             one.compact_account("physical"),
             Err(IndexError::RebuildRequired(_))
         ));
-        let intent = artifact(root, "effect-321.intent", b"pending");
-        many.update_account(
-            "physical",
-            latest.revision,
-            AccountUpdate::AnnounceEffect {
-                id: "effect-321".into(),
-                effect: EffectIntent {
-                    kind: EffectKind::Quota,
-                    source: source.clone(),
-                    decision_handoff: String::new(),
-                    route_source: None,
-                    candidate: None,
-                    intent,
-                    reuse: None,
-                    consumed_k: None,
-                    certified_q: None,
-                    result: None,
+        let many_writer_io = {
+            let _guard = ReaderIoGuard::start("writer-many");
+            many.update_account(
+                "physical",
+                latest.revision,
+                AccountUpdate::AnnounceEffect {
+                    id: "effect-321".into(),
+                    effect: pending_effect,
                 },
-            },
-        )
-        .unwrap();
+            )
+            .unwrap();
+            drop(_guard);
+            last_reader_io().unwrap()
+        };
+        assert!(many_writer_io.opened > one_writer_io.opened);
+        assert!(many_writer_io.bytes_parsed > one_writer_io.bytes_parsed);
+        assert!(many_writer_io.bytes_written > one_writer_io.bytes_written);
         assert_eq!(many.compact_account("physical").unwrap().pending.len(), 1);
         assert!(matches!(
             many.route_reader_preflight("physical"),

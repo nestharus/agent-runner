@@ -5371,7 +5371,8 @@ mod tests {
             "{choice_error}"
         );
         let choice_io = last_reader_io().unwrap();
-        assert_eq!(choice_io, baseline_io);
+        assert_eq!(choice_io.open_attempts, baseline_io.open_attempts);
+        assert_eq!(choice_io.opened, baseline_io.opened);
         assert_eq!(choice_io.directory_entries, 0);
 
         let pre_k_error =
@@ -5383,7 +5384,8 @@ mod tests {
             "{pre_k_error}"
         );
         let pre_k_io = last_reader_io().unwrap();
-        assert_eq!(pre_k_io, baseline_pre_k_io);
+        assert_eq!(pre_k_io.open_attempts, baseline_pre_k_io.open_attempts);
+        assert_eq!(pre_k_io.opened, baseline_pre_k_io.opened);
         assert_eq!(pre_k_io.directory_entries, 0);
 
         let grant = Grant {
