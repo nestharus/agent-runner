@@ -4,6 +4,7 @@
 use super::*;
 use chrono::Utc;
 use keyed_store::{Change, KeyedAccountStore};
+use oulipoly_kernel_broker::protocol::FreshAccountEffectKind;
 
 const V3: u32 = 3;
 
@@ -200,6 +201,309 @@ impl KeyedGeneration {
             .transpose()
     }
 
+    /// Find a settled auth source by the physical account and command/env
+    /// key. This is one exact source read, independent of retained effects.
+    pub(crate) fn auth_peer_intent(
+        &self,
+        account: &str,
+        source: &SourceKey,
+    ) -> Result<Option<Artifact>> {
+        self.check_current()?;
+        let store = self.account(account)?;
+        let digest = keyed(source)?;
+        let (revision, pending, mut values) =
+            store.read_many(&[("source", &digest), ("auth-flight", "account")])?;
+        let active: Option<Artifact> = typed(values.pop().unwrap())?;
+        if let Some(active) = active {
+            let value: serde_json::Value = active.read_json(&self.root)?;
+            let id = value["id"]
+                .as_str()
+                .ok_or_else(|| corrupt("v3 auth flight id absent"))?;
+            let effect: EffectIntent = typed(store.get("effect", id)?)?
+                .ok_or(IndexError::RebuildRequired("v3 auth flight effect absent"))?;
+            let debt: PendingHead = typed(store.get("pending", &format!("effect:{id}"))?)?
+                .ok_or(IndexError::Conflict("v3 auth flight pending debt absent"))?;
+            if pending == 0
+                || debt.announcement != active
+                || debt.source.as_ref() != Some(source)
+                || effect.kind != EffectKind::Auth
+                || effect.reuse.is_some()
+                || effect.source != *source
+                || effect.intent != active
+                || effect.certified_q.is_some()
+                || effect.result.is_some()
+            {
+                return Err(corrupt("v3 auth flight source differs"));
+            }
+            active.require_present(&self.root)?;
+            if store.summary()? != (revision, pending) {
+                return Err(IndexError::Conflict("v3 auth flight account changed"));
+            }
+            self.check_current()?;
+            return Ok(Some(active));
+        }
+        if pending != 0 {
+            return Ok(None);
+        }
+        let head: Option<SourceHead> = typed(values.pop().unwrap())?;
+        let Some(head) = head else {
+            return Ok(None);
+        };
+        if head.source != *source {
+            return Err(corrupt("v3 auth peer source changed"));
+        }
+        let (Some(quota), Some(auth)) = (head.quota, head.auth) else {
+            return Ok(None);
+        };
+        if auth.q.completed_unix_nanos <= quota.q.completed_unix_nanos {
+            return Ok(None);
+        }
+        auth.q.verify(&self.root)?;
+        let result = auth
+            .result
+            .ok_or(IndexError::Conflict("v3 auth peer result absent"))?;
+        result.require_present(&self.root)?;
+        let parent = Path::new(&result.path)
+            .parent()
+            .ok_or_else(|| corrupt("v3 auth peer result parent absent"))?;
+        let intent = Artifact::from_existing(&self.root, &parent.join("intent.json"))?;
+        if store.summary()? != (revision, pending) {
+            return Err(IndexError::Conflict("v3 auth peer account changed"));
+        }
+        self.check_current()?;
+        Ok(Some(intent))
+    }
+
+    pub(crate) fn require_auth_source(&self, account: &str, source: &SourceKey) -> Result<()> {
+        self.check_current()?;
+        let store = self.account(account)?;
+        let digest = keyed(source)?;
+        let (revision, pending, mut values) =
+            store.read_many(&[("source", &digest), ("auth-marker", "account")])?;
+        let marker: Option<MarkerHead> = typed(values.pop().unwrap())?;
+        let head: Option<SourceHead> = typed(values.pop().unwrap())?;
+        if pending != 0 {
+            return Err(IndexError::Conflict("v3 auth account has pending debt"));
+        }
+        let head = head.ok_or(IndexError::Conflict("v3 auth has no quota Q"))?;
+        if head.source != *source {
+            return Err(corrupt("v3 auth source identity changed"));
+        }
+        self.check_auth_prerequisite(&head, marker.as_ref())?;
+        if store.summary()? != (revision, pending) {
+            return Err(IndexError::Conflict("v3 auth account changed"));
+        }
+        self.check_current()?;
+        Ok(())
+    }
+
+    fn check_auth_prerequisite(
+        &self,
+        head: &SourceHead,
+        marker: Option<&MarkerHead>,
+    ) -> Result<()> {
+        let quota = head
+            .quota
+            .as_ref()
+            .ok_or(IndexError::Conflict("v3 auth has no quota Q"))?;
+        quota.q.verify(&self.root)?;
+        quota
+            .result
+            .as_ref()
+            .ok_or(IndexError::Conflict("v3 auth quota result absent"))?
+            .require_present(&self.root)?;
+        let failed_quota = matches!(quota.outcome.as_str(), "failed" | "empty" | "invalid");
+        let rejected_healthy = marker.is_some_and(|marker| {
+            marker.outcome == "auth_rejected"
+                && quota
+                    .quota_basis_points_at(Utc::now().timestamp())
+                    .is_some()
+                && marker.q.completed_unix_nanos > quota.q.completed_unix_nanos
+        });
+        if !failed_quota && !rejected_healthy {
+            return Err(IndexError::Conflict(
+                "v3 auth has no failed quota or newer typed auth rejection",
+            ));
+        }
+        if let Some(marker) = marker {
+            marker.q.verify(&self.root)?;
+        }
+        if head.auth.as_ref().is_some_and(|auth| {
+            auth.q.completed_unix_nanos >= quota.q.completed_unix_nanos
+                && marker.is_none_or(|marker| {
+                    auth.q.completed_unix_nanos >= marker.q.completed_unix_nanos
+                })
+        }) {
+            return Err(IndexError::Conflict(
+                "v3 auth already spent after rejection",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn announce_auth_alias(
+        &self,
+        binding: &super::super::fresh_provider::Binding,
+        request: &oulipoly_kernel_broker::protocol::FreshAccountEffectRequest,
+        id: &str,
+    ) -> Result<()> {
+        self.check_current()?;
+        let (readback, source, account, intent) =
+            super::super::fresh_provider::v3_auth_alias_readback(
+                &self.root,
+                self.admitted_source()?,
+                binding,
+                request,
+                id,
+            )
+            .map_err(|e| corrupt(format!("v3 auth peer: {e}")))?;
+        let peer_intent = self
+            .auth_peer_intent(&account, &source)?
+            .ok_or(IndexError::Conflict("v3 auth peer no longer current"))?;
+        let peer_dir = Path::new(&peer_intent.path)
+            .parent()
+            .ok_or_else(|| corrupt("v3 auth peer parent absent"))?;
+        let peer_value: serde_json::Value = peer_intent.read_json(&self.root)?;
+        if readback.peer_artifact.as_deref()
+            != Some(self.root.join(peer_dir).to_string_lossy().as_ref())
+            || readback.peer_effect_id.as_deref() != peer_value["id"].as_str()
+        {
+            return Err(IndexError::Conflict("v3 auth alias peer differs"));
+        }
+        self.ensure_quota_account(&account, &request.model, &request.config_sha256)?;
+        let store = self.account(&account)?;
+        let (revision, pending, mut values) =
+            store.read_many(&[("account", "summary"), ("effect", id)])?;
+        if values.pop().unwrap().is_some() {
+            return Err(IndexError::Conflict(
+                "v3 auth alias already announced or account pending",
+            ));
+        }
+        let mut summary = values
+            .pop()
+            .unwrap()
+            .ok_or(IndexError::RebuildRequired("v3 auth alias summary absent"))?;
+        if summary["physical_key"].as_str() != Some(account.as_str())
+            || summary["pending_count"].as_u64() != Some(pending)
+        {
+            return Err(corrupt("v3 auth alias account differs"));
+        }
+        let count = summary["effect_count"]
+            .as_u64()
+            .ok_or_else(|| corrupt("v3 auth alias count absent"))?;
+        summary["effect_count"] = count
+            .checked_add(1)
+            .ok_or(IndexError::Conflict("v3 auth alias count overflow"))?
+            .into();
+        let effect = EffectIntent {
+            kind: EffectKind::Auth,
+            source,
+            decision_handoff: binding.handoff_id.clone(),
+            route_source: Some(Artifact::from_existing(
+                &self.root,
+                Path::new(&format!("{}.route-source.json", binding.handoff_id)),
+            )?),
+            candidate: Some(Artifact::from_existing(
+                &self.root,
+                Path::new(&format!(
+                    "{}.route-{}.json",
+                    binding.handoff_id, request.index
+                )),
+            )?),
+            intent: intent.clone(),
+            reuse: Some(intent),
+            consumed_k: None,
+            certified_q: None,
+            result: None,
+        };
+        store.commit(
+            revision,
+            vec![
+                change("effect", id, &effect)?,
+                change("account", "summary", &summary)?,
+            ],
+        )?;
+        self.check_current()?;
+        Ok(())
+    }
+
+    pub(crate) fn observe_auth_alias(
+        &self,
+        binding: &super::super::fresh_provider::Binding,
+        request: &oulipoly_kernel_broker::protocol::FreshAccountEffectRequest,
+        id: &str,
+    ) -> Result<oulipoly_kernel_broker::protocol::FreshAccountEffectReadback> {
+        self.check_current()?;
+        let (readback, source, account, intent) =
+            super::super::fresh_provider::v3_auth_alias_readback(
+                &self.root,
+                self.admitted_source()?,
+                binding,
+                request,
+                id,
+            )
+            .map_err(|e| corrupt(format!("v3 auth alias observation: {e}")))?;
+        let store = self.account(&account)?;
+        let digest = keyed(&source)?;
+        let (revision, pending, mut values) =
+            store.read_many(&[("effect", id), ("source", &digest)])?;
+        let source_head: Option<SourceHead> = typed(values.pop().unwrap())?;
+        let effect: EffectIntent = typed(values.pop().unwrap())?.ok_or(
+            IndexError::RebuildRequired("v3 auth alias announcement absent"),
+        )?;
+        if effect.kind != EffectKind::Auth
+            || effect.source != source
+            || effect.intent != intent
+            || effect.reuse.as_ref() != Some(&intent)
+            || effect.consumed_k.is_some()
+            || effect.certified_q.is_some()
+            || effect.result.is_some()
+        {
+            return Err(corrupt("v3 auth alias keyed source differs"));
+        }
+        if store.summary()? != (revision, pending) {
+            return Err(IndexError::Conflict("v3 auth alias account changed"));
+        }
+        self.check_current()?;
+        if readback.state != "drained" {
+            return Ok(readback);
+        }
+        let committed = source_head.as_ref().is_some_and(|head| {
+            head.source == source
+                && head.auth.as_ref().is_some_and(|auth| {
+                    auth.outcome == readback.outcome.as_deref().unwrap_or("")
+                        && auth.completed_unix_seconds == readback.completed_unix_seconds
+                        && auth.result.as_ref().is_some_and(|result| {
+                            Path::new(&result.path).parent().is_some_and(|parent| {
+                                readback.peer_artifact.as_deref()
+                                    == Some(self.root.join(parent).to_string_lossy().as_ref())
+                            })
+                        })
+                })
+        });
+        if !committed {
+            return Ok(
+                oulipoly_kernel_broker::protocol::FreshAccountEffectReadback {
+                    state: "unknown".into(),
+                    outcome: None,
+                    windows: Vec::new(),
+                    completed_unix_seconds: None,
+                    ..readback
+                },
+            );
+        }
+        let auth = source_head
+            .as_ref()
+            .and_then(|head| head.auth.as_ref())
+            .ok_or_else(|| corrupt("v3 auth alias typed source absent"))?;
+        auth.q.verify(&self.root)?;
+        auth.result
+            .as_ref()
+            .ok_or_else(|| corrupt("v3 auth alias result absent"))?
+            .require_present(&self.root)?;
+        Ok(readback)
+    }
+
     /// Publish the exact physical intent and account debt before the broker
     /// can consume K. The source was pinned by v3 admission, not supplied by
     /// this request. An existing fresh Q or any physical-account debt refuses
@@ -211,8 +515,13 @@ impl KeyedGeneration {
         id: &str,
     ) -> Result<u64> {
         use oulipoly_kernel_broker::protocol::FreshAccountEffectKind;
-        if request.kind != FreshAccountEffectKind::QuotaFirst {
-            return Err(IndexError::Conflict("v3 quota-first effect required"));
+        if !matches!(
+            request.kind,
+            FreshAccountEffectKind::QuotaFirst
+                | FreshAccountEffectKind::AuthRefresh
+                | FreshAccountEffectKind::QuotaRetry
+        ) {
+            return Err(IndexError::Conflict("v3 account effect kind closed"));
         }
         self.check_current()?;
         let source = self.admitted_source()?;
@@ -227,8 +536,13 @@ impl KeyedGeneration {
         self.ensure_quota_account(&account, &request.model, &request.config_sha256)?;
         let store = self.account(&account)?;
         let digest = keyed(&source_key)?;
-        let (revision, pending_count, mut values) =
-            store.read_many(&[("account", "summary"), ("source", &digest), ("effect", id)])?;
+        let (revision, pending_count, mut values) = store.read_many(&[
+            ("account", "summary"),
+            ("source", &digest),
+            ("effect", id),
+            ("auth-marker", "account"),
+        ])?;
+        let auth_marker: Option<MarkerHead> = typed(values.pop().unwrap())?;
         if values.pop().unwrap().is_some() {
             return Err(IndexError::Conflict("v3 quota effect already announced"));
         }
@@ -245,31 +559,68 @@ impl KeyedGeneration {
                 "v3 quota account has debt or unknown scope",
             ));
         }
-        if let Some(head) = &source_head {
-            if head.source != source_key {
-                return Err(corrupt("v3 quota source key changed"));
+        if request.kind == FreshAccountEffectKind::AuthRefresh {
+            let head = source_head
+                .as_ref()
+                .ok_or(IndexError::Conflict("v3 auth has no quota Q"))?;
+            self.check_auth_prerequisite(head, auth_marker.as_ref())?;
+        }
+        if request.kind == FreshAccountEffectKind::QuotaRetry {
+            let head = source_head
+                .as_ref()
+                .ok_or(IndexError::Conflict("v3 retry has no quota Q"))?;
+            let quota = head
+                .quota
+                .as_ref()
+                .ok_or(IndexError::Conflict("v3 retry has no quota Q"))?;
+            let auth = head
+                .auth
+                .as_ref()
+                .ok_or(IndexError::Conflict("v3 retry has no auth Q"))?;
+            quota.q.verify(&self.root)?;
+            auth.q.verify(&self.root)?;
+            auth.result
+                .as_ref()
+                .ok_or(IndexError::Conflict("v3 retry auth result absent"))?
+                .require_present(&self.root)?;
+            if auth.outcome != "refreshed"
+                || auth.q.completed_unix_nanos <= quota.q.completed_unix_nanos
+                || auth_marker.as_ref().is_some_and(|marker| {
+                    marker.q.completed_unix_nanos >= auth.q.completed_unix_nanos
+                })
+            {
+                return Err(IndexError::Conflict(
+                    "v3 retry has no newer successful auth Q",
+                ));
             }
-            if let Some(quota) = &head.quota {
-                quota.q.verify(&self.root)?;
-                quota
-                    .result
-                    .as_ref()
-                    .ok_or(IndexError::Conflict("v3 quota source result absent"))?
-                    .require_present(&self.root)?;
-                let now = Utc::now().timestamp();
-                if quota.outcome == "valid_windows"
-                    && quota
-                        .completed_unix_seconds
-                        .is_some_and(|completed| now >= completed && now - completed < 5 * 60 * 60)
-                    && !quota.windows.is_empty()
-                    && quota
-                        .windows
-                        .iter()
-                        .all(|window| window.reset_unix_seconds > now)
-                {
-                    // A fresh full window is still a cached Q. It excludes
-                    // routing; it must not trigger an automatic second probe.
-                    return Err(IndexError::Conflict("v3 quota source has fresh Q"));
+        }
+        if request.kind == FreshAccountEffectKind::QuotaFirst {
+            if let Some(head) = &source_head {
+                if head.source != source_key {
+                    return Err(corrupt("v3 quota source key changed"));
+                }
+                if let Some(quota) = &head.quota {
+                    quota.q.verify(&self.root)?;
+                    quota
+                        .result
+                        .as_ref()
+                        .ok_or(IndexError::Conflict("v3 quota source result absent"))?
+                        .require_present(&self.root)?;
+                    let now = Utc::now().timestamp();
+                    if quota.outcome == "valid_windows"
+                        && quota.completed_unix_seconds.is_some_and(|completed| {
+                            now >= completed && now - completed < 5 * 60 * 60
+                        })
+                        && !quota.windows.is_empty()
+                        && quota
+                            .windows
+                            .iter()
+                            .all(|window| window.reset_unix_seconds > now)
+                    {
+                        // A fresh full window is still a cached Q. It excludes
+                        // routing; it must not trigger an automatic second probe.
+                        return Err(IndexError::Conflict("v3 quota source has fresh Q"));
+                    }
                 }
             }
         }
@@ -285,7 +636,11 @@ impl KeyedGeneration {
             Path::new(&format!("{}.route-source.json", binding.handoff_id)),
         )?;
         let effect = EffectIntent {
-            kind: EffectKind::Quota,
+            kind: if request.kind == FreshAccountEffectKind::AuthRefresh {
+                EffectKind::Auth
+            } else {
+                EffectKind::Quota
+            },
             source: source_key.clone(),
             decision_handoff: binding.handoff_id.clone(),
             route_source: Some(route_source),
@@ -304,7 +659,12 @@ impl KeyedGeneration {
             model: Some(request.model.clone()),
             config_sha256: Some(request.config_sha256.clone()),
             decision_handoff: binding.handoff_id.clone(),
-            kind: "Quota".into(),
+            kind: if request.kind == FreshAccountEffectKind::AuthRefresh {
+                "Auth"
+            } else {
+                "Quota"
+            }
+            .into(),
         };
         let effect_count = summary["effect_count"]
             .as_u64()
@@ -314,14 +674,17 @@ impl KeyedGeneration {
             .ok_or(IndexError::Conflict("v3 quota effect count overflow"))?)
         .into();
         summary["pending_count"] = 1.into();
-        let next = store.commit(
-            revision,
-            vec![
+        let next = store.commit(revision, {
+            let mut changes = vec![
                 change("effect", id, &effect)?,
                 change("pending", &format!("effect:{id}"), &pending)?,
                 change("account", "summary", &summary)?,
-            ],
-        )?;
+            ];
+            if request.kind == FreshAccountEffectKind::AuthRefresh {
+                changes.push(change("auth-flight", "account", &effect.intent)?);
+            }
+            changes
+        })?;
         if store.summary()? != (next, 1) {
             return Err(corrupt("v3 quota intent commit readback differs"));
         }
@@ -349,10 +712,15 @@ impl KeyedGeneration {
             )
             .map_err(|e| corrupt(format!("v3 quota K: {e}")))?;
         let grant = grant.ok_or(IndexError::Conflict("v3 quota physical K absent"))?;
+        let kind = match request.kind {
+            FreshAccountEffectKind::AuthRefresh => "auth-refresh",
+            FreshAccountEffectKind::QuotaFirst => "quota-first",
+            FreshAccountEffectKind::QuotaRetry => "quota-retry",
+        };
         let k = Artifact::from_existing(
             &self.root,
             Path::new(&format!(
-                "account-effects/{}-{}-quota-first/{grant}.consumed.json",
+                "account-effects/{}-{}-{kind}/{grant}.consumed.json",
                 binding.handoff_id, request.index
             )),
         )?;
@@ -377,13 +745,34 @@ impl KeyedGeneration {
         if effect.consumed_k.as_ref() == Some(&k) && pending.physical_k.as_ref() == Some(&k) {
             return Ok(());
         }
-        if effect.consumed_k.is_some() || pending.physical_k.is_some() {
+        if effect.consumed_k.is_some()
+            || pending.physical_k.is_some()
+            || effect.kind
+                != if request.kind == FreshAccountEffectKind::AuthRefresh {
+                    EffectKind::Auth
+                } else {
+                    EffectKind::Quota
+                }
+            || pending.kind
+                != if request.kind == FreshAccountEffectKind::AuthRefresh {
+                    "Auth"
+                } else {
+                    "Quota"
+                }
+        {
             return Err(corrupt("v3 quota K differs"));
         }
         #[cfg(feature = "age319-private-broker-fixture")]
-        if std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_FAIL_QUOTA_POST_K_CAS_V3_V1").is_some()
+        if (request.kind == FreshAccountEffectKind::AuthRefresh
+            && std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_FAIL_AUTH_POST_K_CAS_V3_V1")
+                .is_some())
+            || (request.kind != FreshAccountEffectKind::AuthRefresh
+                && std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_FAIL_QUOTA_POST_K_CAS_V3_V1")
+                    .is_some())
         {
-            return Err(IndexError::Conflict("fixture v3 quota post-K CAS failure"));
+            return Err(IndexError::Conflict(
+                "fixture v3 account post-K CAS failure",
+            ));
         }
         effect.consumed_k = Some(k.clone());
         pending.physical_k = Some(k);
@@ -531,12 +920,16 @@ impl KeyedGeneration {
         if head.source != source_key {
             return Err(corrupt("v3 quota source identity changed"));
         }
-        if head
-            .quota
+        let slot = if request.kind == FreshAccountEffectKind::AuthRefresh {
+            &mut head.auth
+        } else {
+            &mut head.quota
+        };
+        if slot
             .as_ref()
             .is_none_or(|old| old.q.completed_unix_nanos <= q.completed_unix_nanos)
         {
-            head.quota = Some(observation);
+            *slot = Some(observation);
         }
         effect.certified_q = Some(q);
         effect.result = Some(result);
@@ -550,9 +943,8 @@ impl KeyedGeneration {
                 .ok_or(IndexError::Conflict("v3 quota source count overflow"))?
                 .into();
         }
-        store.commit(
-            revision,
-            vec![
+        store.commit(revision, {
+            let mut changes = vec![
                 change("effect", id, &effect)?,
                 Change {
                     class: "pending".into(),
@@ -561,8 +953,16 @@ impl KeyedGeneration {
                 },
                 change("source", &digest, &head)?,
                 change("account", "summary", &summary)?,
-            ],
-        )?;
+            ];
+            if request.kind == FreshAccountEffectKind::AuthRefresh {
+                changes.push(Change {
+                    class: "auth-flight".into(),
+                    key: "account".into(),
+                    value: None,
+                });
+            }
+            changes
+        })?;
         self.latest_effect_checkpoint(source, binding, request, id)
     }
 
@@ -1029,6 +1429,7 @@ impl KeyedGeneration {
                 std::collections::HashSet::from([("account".to_owned(), "summary".to_owned())]);
             let mut lag_effects = BTreeMap::<String, EffectIntent>::new();
             let mut lag_sources = std::collections::HashSet::<String>::new();
+            let mut lag_auth_sources = std::collections::HashSet::<String>::new();
             let (revision, pending_count) = store.summary()?;
             let summary = store
                 .get("account", "summary")?
@@ -1101,7 +1502,7 @@ impl KeyedGeneration {
                     common.certified_q = actual.certified_q.clone();
                     common.result = actual.result.clone();
                     if class != "effect"
-                        || effect.kind != EffectKind::Quota
+                        || !matches!(effect.kind, EffectKind::Quota | EffectKind::Auth)
                         || effect.reuse.is_some()
                         || common != actual
                         || actual.consumed_k.is_some() && actual.consumed_k != effect.consumed_k
@@ -1111,6 +1512,9 @@ impl KeyedGeneration {
                         return Err(corrupt("v3 retained account effect differs"));
                     }
                     lag_sources.insert(keyed(&effect.source)?);
+                    if effect.kind == EffectKind::Auth {
+                        lag_auth_sources.insert(keyed(&effect.source)?);
+                    }
                     lag_effects.insert(id.clone(), actual);
                 }
                 let uncertain = effect
@@ -1154,6 +1558,34 @@ impl KeyedGeneration {
                     return Err(corrupt("v3 retained pending source differs"));
                 }
             }
+            let mut auth_flights: Vec<_> = head
+                .pending
+                .values()
+                .filter(|pending| pending.kind == "Auth")
+                .map(|pending| pending.announcement.clone())
+                .collect();
+            auth_flights.extend(
+                lag_effects
+                    .values()
+                    .filter(|effect| effect.kind == EffectKind::Auth)
+                    .map(|effect| effect.intent.clone()),
+            );
+            auth_flights.sort_by(|a, b| a.path.cmp(&b.path));
+            auth_flights.dedup();
+            let expected_auth_flight = (auth_flights.len() == 1).then(|| auth_flights[0].clone());
+            if store.get("auth-flight", "account")?
+                != expected_auth_flight
+                    .as_ref()
+                    .map(|artifact| {
+                        serde_json::to_value(artifact).map_err(|e| corrupt(e.to_string()))
+                    })
+                    .transpose()?
+            {
+                return Err(corrupt("v3 auth flight pointer differs"));
+            }
+            if expected_auth_flight.is_some() {
+                expected_keys.insert(("auth-flight".to_owned(), "account".to_owned()));
+            }
             for (id, effect) in &lag_effects {
                 let pending_key = format!("effect:{id}");
                 let pending: PendingHead = typed(store.get("pending", &pending_key)?)?
@@ -1163,7 +1595,12 @@ impl KeyedGeneration {
                     || pending.physical_k != effect.consumed_k
                     || pending.source.as_ref() != Some(&effect.source)
                     || pending.decision_handoff != effect.decision_handoff
-                    || pending.kind != "Quota"
+                    || pending.kind
+                        != if effect.kind == EffectKind::Auth {
+                            "Auth"
+                        } else {
+                            "Quota"
+                        }
                 {
                     return Err(corrupt("v3 lagging quota pending debt differs"));
                 }
@@ -1175,7 +1612,14 @@ impl KeyedGeneration {
                     if !lag_sources.contains(id)
                         || actual.as_ref().is_some_and(|old| {
                             old.source != typed.source
-                                || old.auth != typed.auth
+                                || (old.auth != typed.auth
+                                    && (!lag_auth_sources.contains(id)
+                                        || old.auth.as_ref().zip(typed.auth.as_ref()).is_some_and(
+                                            |(before, after)| {
+                                                before.q.completed_unix_nanos
+                                                    >= after.q.completed_unix_nanos
+                                            },
+                                        )))
                                 || old.quota.as_ref().zip(typed.quota.as_ref()).is_some_and(
                                     |(before, after)| {
                                         before.q.completed_unix_nanos
@@ -1424,6 +1868,18 @@ fn stage_account(root: &Path, staged: &Index, key: &str, mut account: Account) -
     }
     for (id, pending) in &head.pending {
         insert_checked(&store, &mut revision, change("pending", id, pending)?)?;
+    }
+    let auth_flights: Vec<_> = head
+        .pending
+        .values()
+        .filter(|pending| pending.kind == "Auth")
+        .collect();
+    if auth_flights.len() == 1 {
+        insert_checked(
+            &store,
+            &mut revision,
+            change("auth-flight", "account", &auth_flights[0].announcement)?,
+        )?;
     }
     for (source, typed) in &head.sources {
         insert_checked(&store, &mut revision, change("source", source, typed)?)?;
@@ -2040,7 +2496,7 @@ mod tests {
             completed_unix_seconds: Some(now),
             windows: Vec::new(),
         });
-        store
+        revision = store
             .commit(revision, vec![change("source", &digest, &source).unwrap()])
             .unwrap();
         assert!(matches!(
@@ -2049,6 +2505,18 @@ mod tests {
                 .unwrap(),
             RouteEligibility::Eligible { .. }
         ));
+        let auth = source.auth.as_mut().unwrap();
+        auth.q.completed_unix_nanos += 1;
+        auth.outcome = "failed".into();
+        store
+            .commit(revision, vec![change("source", &digest, &source).unwrap()])
+            .unwrap();
+        assert_eq!(
+            generation
+                .route_facts("physical", Some(&key), "model-a", "config", now)
+                .unwrap(),
+            RouteEligibility::Excluded
+        );
     }
 
     fn artifact(root: &Path, name: &str, bytes: &[u8]) -> Artifact {

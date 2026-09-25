@@ -118,6 +118,59 @@ pub(super) fn v3_effect_physical_readback(
     ))
 }
 
+fn v3_source_key(
+    candidate: &RouteCandidate,
+    request: &FreshAccountEffectRequest,
+) -> io::Result<SourceKey> {
+    Ok(SourceKey {
+        commands_sha256: format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&(
+                &candidate.quota_script,
+                &candidate.auth_refresh_command
+            ))?)
+        ),
+        environment_sha256: environment_digest(request)?,
+    })
+}
+
+/// A follower has its own exact intent but no physical K. The v2 physical
+/// reader verifies the referenced source account, commands and environment.
+pub(super) fn v3_auth_alias_readback(
+    directory: &Path,
+    source: &Path,
+    binding: &Binding,
+    request: &FreshAccountEffectRequest,
+    id: &str,
+) -> io::Result<(FreshAccountEffectReadback, SourceKey, String, Artifact)> {
+    if request.kind != FreshAccountEffectKind::AuthRefresh {
+        return Err(io::Error::other("v3 auth alias kind changed"));
+    }
+    let candidate = effect_candidate(directory, binding, request)?;
+    fresh_rebuild::validate_candidate(directory, source, &candidate)?;
+    let dir = effect_directory(directory, binding, request);
+    let intent =
+        effect_intent(&dir)?.ok_or_else(|| io::Error::other("v3 auth alias intent absent"))?;
+    if intent.version != 1
+        || intent.id != id
+        || intent.binding != *binding
+        || intent.request != redacted_effect_request(request)
+        || intent.environment_sha256 != environment_digest(request)?
+        || intent.auth_source.is_none()
+        || dir.join("reuse.json").exists()
+        || dir.join("manual-reuse.json").exists()
+    {
+        return Err(io::Error::other("v3 auth alias source changed"));
+    }
+    let result = effect_readback_from_dir_mode(&dir, &intent, false)?;
+    Ok((
+        result,
+        v3_source_key(&candidate, request)?,
+        candidate.account_identity,
+        effect_artifact(directory, &dir.join("intent.json"))?,
+    ))
+}
+
 pub(super) fn v3_materialize_quota_result(
     directory: &Path,
     binding: &Binding,
@@ -137,9 +190,9 @@ pub(super) fn v3_materialize_quota_result(
     Ok(())
 }
 
-/// One private physical quota-first effect. The caller has already passed the
+/// One private physical quota or auth-refresh effect. The caller has already passed the
 /// original D/held-root/peer challenge in the broker socket handler. This
-/// path has no retained-history scan and cannot launch auth, retry or manual
+/// path has no retained-history scan and cannot launch manual
 /// effects. The keyed announcement is durable before the one-use physical K.
 pub(super) fn begin_quota_effect_v3(
     directory: &Path,
@@ -151,25 +204,71 @@ pub(super) fn begin_quota_effect_v3(
     uid: u32,
     gid: u32,
 ) -> io::Result<FreshAccountEffectReadback> {
-    if request.kind != FreshAccountEffectKind::QuotaFirst {
-        return Err(io::Error::other("v3 quota-first effect required"));
-    }
     let candidate = effect_candidate(directory, binding, request)?;
     fresh_rebuild::validate_candidate(
         directory,
         generation.admitted_source().map_err(io::Error::other)?,
         &candidate,
     )?;
-    let command = candidate
-        .quota_script
-        .as_deref()
-        .ok_or_else(|| io::Error::other("v3 quota command absent"))?;
+    let command = effect_command(&candidate, request.kind)?;
     let _account_lock = auth_admission_lock(directory, &candidate.account_identity)?;
     let dir = effect_directory(directory, binding, request);
     if dir.exists() {
         return Err(io::Error::other(
             "v3 quota effect already begun; observe exact effect",
         ));
+    }
+    if request.kind == FreshAccountEffectKind::AuthRefresh {
+        let source_key = v3_source_key(&candidate, request)?;
+        if let Some(peer_intent) = generation
+            .auth_peer_intent(&candidate.account_identity, &source_key)
+            .map_err(io::Error::other)?
+        {
+            let peer_dir = directory
+                .join(&peer_intent.path)
+                .parent()
+                .ok_or_else(|| io::Error::other("v3 auth peer directory absent"))?
+                .to_owned();
+            let peer = effect_intent(&peer_dir)?
+                .ok_or_else(|| io::Error::other("v3 auth peer intent absent"))?;
+            if peer.version != 1
+                || peer.request.kind != FreshAccountEffectKind::AuthRefresh
+                || peer.auth_source.is_some()
+                || peer.environment_sha256 != source_key.environment_sha256
+                || !same_physical_effect_source(directory, &candidate, &peer)?
+            {
+                return Err(io::Error::other("v3 auth peer provenance changed"));
+            }
+            let parent = directory.join("account-effects");
+            std::fs::create_dir(&dir)?;
+            File::open(&parent)?.sync_all()?;
+            let intent = AccountEffectIntent {
+                version: 1,
+                id: uuid::Uuid::new_v4().to_string(),
+                binding: binding.clone(),
+                request: redacted_effect_request(request),
+                environment_sha256: source_key.environment_sha256,
+                plan_sha256: format!("coalesced:{}", peer.id),
+                auth_source: Some(AuthReuse {
+                    source_directory: peer_dir
+                        .file_name()
+                        .ok_or_else(|| io::Error::other("v3 auth peer filename absent"))?
+                        .to_string_lossy()
+                        .into_owned(),
+                    source_effect_id: peer.id,
+                }),
+            };
+            durable_new(&dir, "intent.json", &intent)?;
+            generation
+                .announce_auth_alias(binding, request, &intent.id)
+                .map_err(io::Error::other)?;
+            return generation
+                .observe_auth_alias(binding, request, &intent.id)
+                .map_err(io::Error::other);
+        }
+        generation
+            .require_auth_source(&candidate.account_identity, &source_key)
+            .map_err(io::Error::other)?;
     }
     let cwd = std::fs::read_link(format!("/proc/{}/cwd", actor.host_pid))?;
     let shell = std::fs::canonicalize("/bin/sh")?;
@@ -217,9 +316,6 @@ pub(super) fn observe_quota_effect_v3(
     binding: &Binding,
     request: &FreshAccountEffectRequest,
 ) -> io::Result<FreshAccountEffectReadback> {
-    if request.kind != FreshAccountEffectKind::QuotaFirst {
-        return Err(io::Error::other("v3 quota-first effect required"));
-    }
     let candidate = effect_candidate(directory, binding, request)?;
     fresh_rebuild::validate_candidate(
         directory,
@@ -234,6 +330,11 @@ pub(super) fn observe_quota_effect_v3(
         || intent.environment_sha256 != environment_digest(request)?
     {
         return Err(io::Error::other("v3 quota effect source changed"));
+    }
+    if intent.auth_source.is_some() {
+        return generation
+            .observe_auth_alias(binding, request, &intent.id)
+            .map_err(io::Error::other);
     }
     let result = effect_readback_from_dir_mode(&dir, &intent, false)?;
     let settled = generation

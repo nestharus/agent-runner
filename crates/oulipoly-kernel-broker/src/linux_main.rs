@@ -4653,10 +4653,11 @@ fn serve_fresh_v30_at(
                             )?
                         };
                         if operation == b'm'
-                            && std::env::var_os(
+                            && (std::env::var_os(
                                 "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_ACCOUNT_EFFECT_REPLY_V1",
-                            )
-                            .is_some()
+                            ).is_some()
+                                || (effect_request.kind == oulipoly_kernel_broker::protocol::FreshAccountEffectKind::AuthRefresh
+                                    && std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_AUTH_EFFECT_REPLY_V3_V1").is_some()))
                         {
                             drop_account_effect_reply = true;
                         }

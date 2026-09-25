@@ -1029,6 +1029,29 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
         if first.outcome.as_deref() != Some("valid_windows") && auth_command.is_some() {
             effect.kind = FreshAccountEffectKind::AuthRefresh;
             let auth = private_run_account_effect(&socket, &authority.receipt.handoff_id, &effect)?;
+            if std::env::var("AGE319_PRIVATE_JOIN_MODE")
+                .ok()
+                .as_deref()
+                .is_some_and(|mode| mode.starts_with("normal_model_provider_v3_quota_auth"))
+            {
+                let mut changed_env = effect.clone();
+                changed_env
+                    .environment
+                    .push(("AGE319_CHANGED_ENV".into(), "1".into()));
+                if protocol::private_fresh_account_effect_at(&socket, &changed_env, false).is_ok() {
+                    return Err("v3 auth accepted changed environment readback".into());
+                }
+                let mut changed_account = effect.clone();
+                changed_account.account = "different".into();
+                if protocol::private_fresh_account_effect_at(&socket, &changed_account, false)
+                    .is_ok()
+                {
+                    return Err("v3 auth accepted changed account readback".into());
+                }
+                if protocol::private_fresh_account_effect_at(&socket, &effect, true).is_ok() {
+                    return Err("v3 auth began a second physical effect".into());
+                }
+            }
             auth_receipts.push((effect.clone(), auth.effect_id.clone(), auth.outcome.clone()));
             if auth.outcome.as_deref() == Some("refreshed") {
                 effect.kind = FreshAccountEffectKind::QuotaRetry;
@@ -1197,8 +1220,13 @@ fn private_run_account_effect(
     request: &oulipoly_kernel_broker::protocol::FreshAccountEffectRequest,
 ) -> Result<oulipoly_kernel_broker::protocol::FreshAccountEffectReadback, String> {
     use oulipoly_kernel_broker::protocol;
-    let restart_probe = std::env::var("AGE319_PRIVATE_JOIN_MODE").ok().as_deref()
-        == Some("normal_model_provider_v3_quota_restart");
+    let restart_probe = matches!(
+        std::env::var("AGE319_PRIVATE_JOIN_MODE").ok().as_deref(),
+        Some(
+            "normal_model_provider_v3_quota_restart"
+                | "normal_model_provider_v3_quota_auth_restart"
+        )
+    );
     let restart_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     let started = match protocol::private_fresh_account_effect_at(socket, request, true) {
         Ok(started) => started,

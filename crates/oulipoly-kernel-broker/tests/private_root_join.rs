@@ -176,7 +176,21 @@ fn inner() {
                 _ => br#"{"used_percent":20,"resets_at":"2099-01-01T00:00:00Z"}"#,
             };
             fs::write(gate.join("quota.json"), quota_bytes).unwrap();
-            if mode == "normal_model_provider_v3_quota_restart" {
+            if mode.starts_with("normal_model_provider_v3_quota_auth") {
+                if mode == "normal_model_provider_v3_quota_auth_restart" {
+                    format!(
+                        "quota_script = 'if test -e {0}/auth-ok; then cat {0}/quota.json; else printf invalid; fi'\nauth_refresh_command = 'printf x > {0}/started-auth; while ! test -e {0}/finish-auth; do sleep 0.05; done; printf x >> {0}/auth-ok'\n",
+                        gate.display()
+                    )
+                } else if mode == "normal_model_provider_v3_quota_auth_failed" {
+                    format!("quota_script = 'printf invalid'\nauth_refresh_command = 'exit 9'\n")
+                } else {
+                    format!(
+                        "quota_script = 'if test -e {0}/auth-ok; then cat {0}/quota.json; else printf invalid; fi'\nauth_refresh_command = 'printf x >> {0}/auth-ok'\n",
+                        gate.display()
+                    )
+                }
+            } else if mode == "normal_model_provider_v3_quota_restart" {
                 format!(
                     "quota_script = 'printf x > {0}/started-quota; while ! test -e {0}/finish-quota; do sleep 0.05; done; cat {0}/quota.json'\n",
                     gate.display()
@@ -498,10 +512,22 @@ fn inner() {
                 "1",
             )),
         )
+        .envs(
+            (mode == "normal_model_provider_v3_quota_auth_reply_loss").then_some((
+                "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_AUTH_EFFECT_REPLY_V3_V1",
+                "1",
+            )),
+        )
         .envs(native_mode.then_some(("OULIPOLY_KERNEL_BROKER_FIXTURE_NATIVE_GATE_V1", &gate)))
         .envs(
             (mode == "normal_model_provider_v3_quota_post_k").then_some((
                 "OULIPOLY_KERNEL_BROKER_FIXTURE_FAIL_QUOTA_POST_K_CAS_V3_V1",
+                "1",
+            )),
+        )
+        .envs(
+            (mode == "normal_model_provider_v3_quota_auth_post_k").then_some((
+                "OULIPOLY_KERNEL_BROKER_FIXTURE_FAIL_AUTH_POST_K_CAS_V3_V1",
                 "1",
             )),
         )
@@ -1389,8 +1415,20 @@ fn inner() {
                         )),
                     )
                     .envs(
+                        (mode == "normal_model_provider_v3_quota_auth_reply_loss").then_some((
+                            "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_AUTH_EFFECT_REPLY_V3_V1",
+                            "1",
+                        )),
+                    )
+                    .envs(
                         (mode == "normal_model_provider_v3_quota_post_k").then_some((
                             "OULIPOLY_KERNEL_BROKER_FIXTURE_FAIL_QUOTA_POST_K_CAS_V3_V1",
+                            "1",
+                        )),
+                    )
+                    .envs(
+                        (mode == "normal_model_provider_v3_quota_auth_post_k").then_some((
+                            "OULIPOLY_KERNEL_BROKER_FIXTURE_FAIL_AUTH_POST_K_CAS_V3_V1",
                             "1",
                         )),
                     )
@@ -1440,10 +1478,23 @@ fn inner() {
                 let v29_wal = historical_data.join("pid-identity.db-wal");
                 let v29_wal_before = fs::read(&v29_wal).ok();
                 fs::write(gate.join("child-effect"), b"yes").unwrap();
-                if mode == "normal_model_provider_v3_quota_restart" {
+                if matches!(
+                    mode.as_str(),
+                    "normal_model_provider_v3_quota_restart"
+                        | "normal_model_provider_v3_quota_auth_restart"
+                ) {
+                    let auth_restart = mode == "normal_model_provider_v3_quota_auth_restart";
                     let effect_dir = broker_state
                         .join("v30/fresh-provider/account-effects")
-                        .join(format!("{}-1-quota-first", receipt.handoff_id));
+                        .join(format!(
+                            "{}-1-{}",
+                            receipt.handoff_id,
+                            if auth_restart {
+                                "auth-refresh"
+                            } else {
+                                "quota-first"
+                            }
+                        ));
                     eventually(|| {
                         effect_dir.exists()
                             && fs::read_dir(&effect_dir)
@@ -1455,7 +1506,13 @@ fn inner() {
                                         .to_string_lossy()
                                         .ends_with(".consumed.json")
                                 })
-                            && gate.join("started-quota").exists()
+                            && gate
+                                .join(if auth_restart {
+                                    "started-auth"
+                                } else {
+                                    "started-quota"
+                                })
+                                .exists()
                     });
                     assert!(!effect_dir.join("result.json").exists());
                     stop(&mut broker);
@@ -1486,13 +1543,25 @@ fn inner() {
                         "v3 pending quota restart refused: {}",
                         fs::read_to_string(&restart_log).unwrap()
                     );
-                    fs::write(gate.join("finish-quota"), b"yes").unwrap();
+                    fs::write(
+                        gate.join(if auth_restart {
+                            "finish-auth"
+                        } else {
+                            "finish-quota"
+                        }),
+                        b"yes",
+                    )
+                    .unwrap();
                 }
                 if provider_negative {
                     eventually(|| entry.try_wait().unwrap().is_some());
                     assert!(!entry.wait().unwrap().success());
                     let stderr = fs::read_to_string(&err).unwrap();
-                    let reason = if mode == "normal_model_provider_v3_quota_post_k" {
+                    let reason = if matches!(
+                        mode.as_str(),
+                        "normal_model_provider_v3_quota_post_k"
+                            | "normal_model_provider_v3_quota_auth_post_k"
+                    ) {
                         "fresh account effect unknown"
                     } else if v3_quota {
                         "v3 route, auth/manual, cancellation and provider K writers are closed"
@@ -1542,7 +1611,9 @@ fn inner() {
                             assert_eq!(result["effect_id"], intent["id"]);
                             assert_eq!(
                                 result["outcome"],
-                                if mode == "normal_model_provider_v3_quota_invalid" {
+                                if mode == "normal_model_provider_v3_quota_invalid"
+                                    || mode.starts_with("normal_model_provider_v3_quota_auth")
+                                {
                                     "invalid"
                                 } else {
                                     "valid_windows"
@@ -1576,6 +1647,88 @@ fn inner() {
                             1,
                             "v3 quota probe spent more than one K"
                         );
+                        if mode.starts_with("normal_model_provider_v3_quota_auth") {
+                            let auth_dir = provider_dir
+                                .join("account-effects")
+                                .join(format!("{}-1-auth-refresh", receipt.handoff_id));
+                            if mode == "normal_model_provider_v3_quota_auth_post_k" {
+                                assert!(!auth_dir.join("result.json").exists());
+                                assert!(!gate.join("auth-ok").exists());
+                                assert_eq!(
+                                    fs::read_dir(&auth_dir)
+                                        .unwrap()
+                                        .filter_map(Result::ok)
+                                        .filter(|entry| entry
+                                            .file_name()
+                                            .to_string_lossy()
+                                            .ends_with(".consumed.json"))
+                                        .count(),
+                                    1
+                                );
+                                assert_eq!(
+                                    fs::read_dir(&auth_dir)
+                                        .unwrap()
+                                        .filter_map(Result::ok)
+                                        .filter(|entry| entry
+                                            .file_name()
+                                            .to_string_lossy()
+                                            .ends_with(".drain.json"))
+                                        .count(),
+                                    0
+                                );
+                            } else {
+                                let auth: serde_json::Value = serde_json::from_slice(
+                                    &fs::read(auth_dir.join("result.json")).unwrap(),
+                                )
+                                .unwrap();
+                                assert_eq!(auth["state"], "drained");
+                                assert_eq!(
+                                    auth["outcome"],
+                                    if mode == "normal_model_provider_v3_quota_auth_failed" {
+                                        "failed"
+                                    } else {
+                                        "refreshed"
+                                    }
+                                );
+                                if mode != "normal_model_provider_v3_quota_auth_failed" {
+                                    assert_eq!(fs::read(gate.join("auth-ok")).unwrap(), b"x");
+                                }
+                                assert_eq!(
+                                    fs::read_dir(&auth_dir)
+                                        .unwrap()
+                                        .filter_map(Result::ok)
+                                        .filter(|entry| entry
+                                            .file_name()
+                                            .to_string_lossy()
+                                            .ends_with(".consumed.json"))
+                                        .count(),
+                                    1
+                                );
+                                assert_eq!(
+                                    fs::read_dir(&auth_dir)
+                                        .unwrap()
+                                        .filter_map(Result::ok)
+                                        .filter(|entry| entry
+                                            .file_name()
+                                            .to_string_lossy()
+                                            .ends_with(".drain.json"))
+                                        .count(),
+                                    1
+                                );
+                                let retry_dir = provider_dir
+                                    .join("account-effects")
+                                    .join(format!("{}-1-quota-retry", receipt.handoff_id));
+                                if mode == "normal_model_provider_v3_quota_auth_failed" {
+                                    assert!(!retry_dir.exists());
+                                } else {
+                                    let retry: serde_json::Value = serde_json::from_slice(
+                                        &fs::read(retry_dir.join("result.json")).unwrap(),
+                                    )
+                                    .unwrap();
+                                    assert_eq!(retry["outcome"], "valid_windows");
+                                }
+                            }
+                        }
                         assert_eq!(
                             fs::read_dir(&effect_dir)
                                 .unwrap()
@@ -1589,7 +1742,11 @@ fn inner() {
                             "v3 quota Q state differs"
                         );
                         assert!(provider_dir.join("index-v1/manifest.json").exists());
-                        if mode == "normal_model_provider_v3_quota_reply_loss" {
+                        if matches!(
+                            mode.as_str(),
+                            "normal_model_provider_v3_quota_reply_loss"
+                                | "normal_model_provider_v3_quota_auth_reply_loss"
+                        ) {
                             assert!(gate.join("account-effect-reply-dropped").exists());
                         }
                     }
@@ -1599,19 +1756,22 @@ fn inner() {
                             .exists(),
                         "negative quota authorized provider K"
                     );
-                    if !matches!(
-                        mode.as_str(),
-                        "normal_model_provider_quota"
-                            | "normal_model_provider_auth"
-                            | "normal_model_provider_v3_closed"
-                            | "normal_model_provider_v3_quota"
-                            | "normal_model_provider_v3_quota_reply_loss"
-                            | "normal_model_provider_v3_quota_post_k"
-                            | "normal_model_provider_v3_quota_restart"
-                            | "normal_model_provider_v3_quota_invalid"
-                            | "normal_model_provider_v3_quota_full"
-                            | "normal_model_provider_v3_quota_stale"
-                    ) {
+                    if !mode.starts_with("normal_model_provider_v3_quota_auth")
+                        && !matches!(
+                            mode.as_str(),
+                            "normal_model_provider_quota"
+                                | "normal_model_provider_auth"
+                                | "normal_model_provider_v3_closed"
+                                | "normal_model_provider_v3_quota"
+                                | "normal_model_provider_v3_quota_reply_loss"
+                                | "normal_model_provider_v3_quota_post_k"
+                                | "normal_model_provider_v3_quota_restart"
+                                | "normal_model_provider_v3_quota_invalid"
+                                | "normal_model_provider_v3_quota_full"
+                                | "normal_model_provider_v3_quota_stale"
+                                | "normal_model_provider_v3_quota_auth"
+                        )
+                    {
                         assert_eq!(
                             fs::read_dir(&provider_dir).unwrap().count(),
                             0,
@@ -1667,6 +1827,23 @@ fn inner() {
                             1,
                             "v3 quota restart replayed physical K"
                         );
+                        if mode.starts_with("normal_model_provider_v3_quota_auth") {
+                            let auth_dir = provider_dir
+                                .join("account-effects")
+                                .join(format!("{}-1-auth-refresh", receipt.handoff_id));
+                            assert_eq!(
+                                fs::read_dir(&auth_dir)
+                                    .unwrap()
+                                    .filter_map(Result::ok)
+                                    .filter(|entry| entry
+                                        .file_name()
+                                        .to_string_lossy()
+                                        .ends_with(".consumed.json"))
+                                    .count(),
+                                1,
+                                "v3 auth restart replayed physical K"
+                            );
+                        }
                     }
                     stop(&mut broker);
                     return;
@@ -4348,6 +4525,11 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_model_provider_v3_quota_invalid",
         "normal_model_provider_v3_quota_full",
         "normal_model_provider_v3_quota_stale",
+        "normal_model_provider_v3_quota_auth",
+        "normal_model_provider_v3_quota_auth_reply_loss",
+        "normal_model_provider_v3_quota_auth_post_k",
+        "normal_model_provider_v3_quota_auth_restart",
+        "normal_model_provider_v3_quota_auth_failed",
         "normal_model_provider_quota",
         "normal_model_provider_auth",
         "normal_model_provider_auth_recovery",
