@@ -582,7 +582,15 @@ pub(super) fn launch(
             .map(|arg| String::from_utf8(arg.clone()))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| io::Error::other("private CLI mode requires UTF-8 args"))?;
-        if !supported_offline_entry_args(&args) {
+        let private_probe = super::private_fixture()
+            && (matches!(args.as_slice(), [first, second]
+                if first == "__age319-private-installed-probe-v1"
+                    && matches!(second.as_str(), "tty" | "setuid" | "sleep"))
+                || matches!(args.as_slice(), [first, second, marker]
+                    if first == "__age319-private-installed-probe-v1"
+                        && second == "ambient"
+                        && marker.starts_with('/')));
+        if !supported_offline_entry_args(&args) && !private_probe {
             return Err(io::Error::other("private CLI mode refused"));
         }
     }
