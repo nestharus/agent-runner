@@ -732,6 +732,7 @@ struct FreshEntryAuthority<'a> {
 struct PrivateFreshBroker<'a> {
     authority: FreshEntryAuthority<'a>,
     grant_id: Option<String>,
+    raw_result: Option<oulipoly_runtime::executor::cli::fresh_remote::FreshProviderCompletion>,
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]
@@ -894,6 +895,7 @@ impl oulipoly_runtime::executor::cli::fresh_remote::FreshProviderBackend
             .map_err(|_| self.unknown(Some(&grant), "K reply", "invalid grant"))?;
         self.grant_id = Some(grant.clone());
         let causal = std::env::var_os("AGE319_PRIVATE_PROVIDER_CAUSAL_BASH_V1").is_some();
+        let direct_caller = std::env::var_os("AGE319_PRIVATE_CALLER_OUTPUT_V1").is_some();
         let deadline = std::time::Instant::now()
             + if causal {
                 PRIVATE_CAUSAL_BASH_RESULT_WAIT
@@ -911,6 +913,9 @@ impl oulipoly_runtime::executor::cli::fresh_remote::FreshProviderBackend
             if state.starts_with(&format!("fresh-provider-exited {grant} ")) {
                 break;
             }
+            if direct_caller && state.starts_with(&format!("fresh-provider-drained {grant} ")) {
+                break;
+            }
             if state.starts_with("fresh-provider-unknown ") || std::time::Instant::now() >= deadline
             {
                 return Err(self.unknown(Some(&grant), "provider exit readback", &state));
@@ -922,7 +927,7 @@ impl oulipoly_runtime::executor::cli::fresh_remote::FreshProviderBackend
         let mut sibling_checked = !causal;
         let mut recipient_checked =
             std::env::var_os("AGE319_PRIVATE_BASH_RECIPIENT_MODE_V1").is_none();
-        while !std::path::Path::new(&gate).join("provider-cancel").exists() {
+        while !direct_caller && !std::path::Path::new(&gate).join("provider-cancel").exists() {
             if !recipient_checked
                 && std::fs::read(std::path::Path::new(&gate).join("bash-causal-output"))
                     .ok()
@@ -966,8 +971,10 @@ impl oulipoly_runtime::executor::cli::fresh_remote::FreshProviderBackend
             }
             std::thread::sleep(PRIVATE_PROVIDER_RESULT_POLL);
         }
-        protocol::private_fresh_provider_at(&socket, &self.authority.receipt.d_key, b'7', None)
-            .map_err(|e| self.unknown(Some(&grant), "cancel reply", &e.to_string()))?;
+        if !direct_caller {
+            protocol::private_fresh_provider_at(&socket, &self.authority.receipt.d_key, b'7', None)
+                .map_err(|e| self.unknown(Some(&grant), "cancel reply", &e.to_string()))?;
+        }
         loop {
             let state = protocol::private_fresh_provider_at(
                 &socket,
@@ -988,7 +995,10 @@ impl oulipoly_runtime::executor::cli::fresh_remote::FreshProviderBackend
         let output =
             protocol::private_fresh_provider_output_at(&socket, &self.authority.receipt.d_key)
                 .map_err(|e| self.unknown(Some(&grant), "output readback", &e.to_string()))?;
-        if output.grant_id != grant || !output.cancelled {
+        if output.grant_id != grant
+            || (direct_caller && output.cancelled)
+            || (!direct_caller && !output.cancelled)
+        {
             return Err(self.unknown(Some(&grant), "output readback", "grant/Q mismatch"));
         }
         let stdout =
@@ -997,6 +1007,13 @@ impl oulipoly_runtime::executor::cli::fresh_remote::FreshProviderBackend
         let stderr =
             private_verified_output(output.stderr, output.stderr_len, &output.stderr_sha256)
                 .map_err(|e| self.unknown(Some(&grant), "stderr verification", &e))?;
+        self.raw_result = Some(
+            oulipoly_runtime::executor::cli::fresh_remote::FreshProviderCompletion {
+                wait_status: output.wait_status,
+                stdout: stdout.clone(),
+                stderr: stderr.clone(),
+            },
+        );
         Ok(
             oulipoly_runtime::executor::cli::fresh_remote::FreshProviderCompletion {
                 wait_status: output.wait_status,
@@ -1205,6 +1222,7 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
     let mut backend = PrivateFreshBroker {
         authority,
         grant_id: None,
+        raw_result: None,
     };
     let result = run_prepared_fresh_headless(selected_plan, &mut backend)?;
     let typed_auth_rejection = oulipoly_runtime::diagnostics::non_quota_failure_diagnosis(
@@ -1338,10 +1356,148 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
             serde_json::to_vec(&read).map_err(|e| e.to_string())?,
         )
         .map_err(|e| e.to_string())?;
+        if std::env::var_os("AGE319_PRIVATE_CALLER_OUTPUT_V1").is_some() {
+            let raw = backend
+                .raw_result
+                .as_ref()
+                .ok_or("broker Q raw result absent")?;
+            return private_publish_caller_result(
+                &socket,
+                &backend.authority.receipt.d_key,
+                &read,
+                raw,
+            );
+        }
     }
     // The private mapped result and terminal readback do not activate the
     // ordinary caller publication path.
     Err("private provider runtime result mapped after Q; root terminal publication closed".into())
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_publish_caller_result(
+    socket: &std::path::Path,
+    d_key: &str,
+    terminal: &oulipoly_state::mailbox::FreshRootTerminalReadback,
+    raw: &oulipoly_runtime::executor::cli::fresh_remote::FreshProviderCompletion,
+) -> Result<ExitCode, String> {
+    use oulipoly_kernel_broker::protocol::FreshRecipientRequest;
+    use oulipoly_state::mailbox::FreshRootCallerResult;
+    use sha2::{Digest as _, Sha256};
+    let execution = terminal
+        .execution
+        .as_ref()
+        .ok_or("caller result terminal execution absent")?;
+    if execution.child_event.is_some() {
+        return Err("caller result gap: child C requires original response endpoint".into());
+    }
+    if terminal.publication_state != "not_started" {
+        return Err(
+            "caller result publication already unknown; automatic output replay refused".into(),
+        );
+    }
+    if terminal.execution_state == "unknown" || !terminal.unresolved_child_request_ids.is_empty() {
+        return Err("caller result blocked by terminal execution or child C debt".into());
+    }
+    let offered = FreshRootCallerResult {
+        parent_grant_id: execution.parent.grant_id.clone(),
+        wait_status: raw.wait_status,
+        stdout_sha256: format!("{:x}", Sha256::digest(&raw.stdout)),
+        stdout_len: raw.stdout.len() as u64,
+        stderr_sha256: format!("{:x}", Sha256::digest(&raw.stderr)),
+        stderr_len: raw.stderr.len() as u64,
+    };
+    if offered.wait_status != execution.parent.wait_status
+        || offered.stdout_sha256 != execution.parent.stdout_sha256
+        || offered.stdout_len != execution.parent.stdout_len
+        || offered.stderr_sha256 != execution.parent.stderr_sha256
+        || offered.stderr_len != execution.parent.stderr_len
+    {
+        return Err("caller result bytes differ from verified parent Q".into());
+    }
+    if !libc::WIFEXITED(raw.wait_status) {
+        return Err(
+            "caller result gap: non-exit wait status cannot be represented by CLI exit code".into(),
+        );
+    }
+    let code = libc::WEXITSTATUS(raw.wait_status);
+    let code = u8::try_from(code).map_err(|_| "caller result exit code out of range")?;
+    let reserved = protocol::fresh_root_terminal_request_at(
+        socket,
+        &FreshRecipientRequest::BeginRootCallerResult {
+            d_key: d_key.to_owned(),
+            result: offered,
+        },
+    )
+    .map_err(|e| format!("caller result publication reservation failed: {e}"))?;
+    if reserved.publication_state != "unknown"
+        || reserved.execution_state == "unknown"
+        || !reserved.unresolved_child_request_ids.is_empty()
+        || reserved.execution != terminal.execution
+        || reserved.actor != terminal.actor
+        || reserved.invocation_uuid != terminal.invocation_uuid
+        || reserved.d_key != terminal.d_key
+    {
+        return Err("caller result publication readback changed".into());
+    }
+    if std::env::var_os("AGE319_PRIVATE_CALLER_LOST_WRITE_V1").is_some() {
+        return Err("caller result write lost before bytes; publication remains unknown".into());
+    }
+    let mut stderr = std::io::stderr().lock();
+    let mut stdout = std::io::stdout().lock();
+    if std::env::var_os("AGE319_PRIVATE_CALLER_PARTIAL_WRITE_V1").is_some() {
+        let mut partial = PrivatePartialCallerWrite {
+            inner: &mut stdout,
+            remaining: 1,
+        };
+        return private_write_caller_bytes(&mut partial, &mut stderr, &raw.stdout, &raw.stderr)
+            .map(|_| ExitCode::from(code))
+            .map_err(|e| {
+                format!("caller result write uncertain; publication remains unknown: {e}")
+            });
+    }
+    private_write_caller_bytes(&mut stdout, &mut stderr, &raw.stdout, &raw.stderr)
+        .map_err(|e| format!("caller result write uncertain; publication remains unknown: {e}"))?;
+    Ok(ExitCode::from(code))
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+struct PrivatePartialCallerWrite<'a, W: Write> {
+    inner: &'a mut W,
+    remaining: usize,
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+impl<W: Write> Write for PrivatePartialCallerWrite<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "private caller disconnected",
+            ));
+        }
+        let size = bytes.len().min(self.remaining);
+        let written = self.inner.write(&bytes[..size])?;
+        self.remaining -= written;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_write_caller_bytes(
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+    stdout_bytes: &[u8],
+    stderr_bytes: &[u8],
+) -> std::io::Result<()> {
+    stderr.write_all(stderr_bytes)?;
+    stderr.flush()?;
+    stdout.write_all(stdout_bytes)?;
+    stdout.flush()
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]
@@ -2637,6 +2793,26 @@ fn v30_host_entry() -> Result<ExitCode, String> {
     if pid == 0 {
         drop(entry);
         let result = (|| {
+            #[cfg(feature = "age319-private-broker-fixture")]
+            if std::env::var_os("AGE319_PRIVATE_CALLER_OUTPUT_V1").is_some() {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                let gate = std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                    .map_err(|e| e.to_string())?;
+                for (channel, name) in [
+                    (libc::STDOUT_FILENO, "caller-control-stdout"),
+                    (libc::STDERR_FILENO, "caller-control-stderr"),
+                ] {
+                    let diagnostic = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(std::path::Path::new(&gate).join(name))
+                        .map_err(|e| e.to_string())?;
+                    if unsafe { libc::dup2(diagnostic.as_raw_fd(), channel) } != channel {
+                        return Err(std::io::Error::last_os_error().to_string());
+                    }
+                }
+            }
             let mut gate = [0];
             guardian.read_exact(&mut gate).map_err(|e| e.to_string())?;
             if gate != [b'P'] {
@@ -3081,6 +3257,39 @@ fn join_child(
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[cfg(feature = "age319-private-broker-fixture")]
+    #[test]
+    fn private_caller_bytes_preserve_binary_channels_and_surface_partial_write() {
+        struct Partial(std::vec::Vec<u8>);
+        impl Write for Partial {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.0.is_empty() {
+                    self.0.push(bytes[0]);
+                    Ok(1)
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "caller gone",
+                    ))
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        private_write_caller_bytes(&mut out, &mut err, b"\0\xffout", b"err\0\xfe").unwrap();
+        assert_eq!(out, b"\0\xffout");
+        assert_eq!(err, b"err\0\xfe");
+        let mut partial = Partial(Vec::new());
+        let mut out = Vec::new();
+        let failure = private_write_caller_bytes(&mut out, &mut partial, b"out", b"err");
+        assert_eq!(failure.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
+        assert_eq!(partial.0, b"e");
+        assert!(out.is_empty());
+    }
 
     #[cfg(feature = "age319-private-broker-fixture")]
     #[test]

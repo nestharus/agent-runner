@@ -384,9 +384,17 @@ fn main() -> std::io::Result<()> {
     let marker = args
         .first()
         .ok_or_else(|| std::io::Error::other("marker absent"))?;
-    let fail = std::env::args().nth(2).as_deref() == Some("--fail");
+    let fail = matches!(
+        std::env::args().nth(2).as_deref(),
+        Some("--fail" | "--fail-clean")
+    );
     let quota = std::env::args().nth(2).as_deref() == Some("--quota");
     let auth = std::env::args().nth(2).as_deref() == Some("--auth");
+    let binary = std::env::args().nth(2).as_deref() == Some("--binary");
+    let clean = matches!(
+        std::env::args().nth(2).as_deref(),
+        Some("--clean" | "--fail-clean")
+    );
     let mut input = Vec::new();
     std::io::stdin().read_to_end(&mut input)?;
     let mut file = OpenOptions::new()
@@ -400,7 +408,11 @@ fn main() -> std::io::Result<()> {
         return causal_bash(&args);
     }
     if args.len() != 1
-        && !(args.len() == 2 && matches!(args[1].as_str(), "--fail" | "--quota" | "--auth"))
+        && !(args.len() == 2
+            && matches!(
+                args[1].as_str(),
+                "--fail" | "--quota" | "--auth" | "--binary" | "--clean" | "--fail-clean"
+            ))
     {
         return Err(std::io::Error::other("provider fixture arguments changed"));
     }
@@ -410,21 +422,28 @@ fn main() -> std::io::Result<()> {
         )?;
         std::process::exit(1);
     }
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    if pid == 0 {
-        unsafe {
-            libc::setsid();
-            libc::clearenv();
-            if libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) != 0 {
-                libc::_exit(72);
-            }
-            loop {
-                libc::pause();
+    if !clean && !binary {
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if pid == 0 {
+            unsafe {
+                libc::setsid();
+                libc::clearenv();
+                if libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) != 0 {
+                    libc::_exit(72);
+                }
+                loop {
+                    libc::pause();
+                }
             }
         }
+    }
+    if binary {
+        std::io::stdout().write_all(b"\0\xffstdout\n")?;
+        std::io::stderr().write_all(b"err\0\xfestderr")?;
+        return Ok(());
     }
     std::io::stdout().write_all(b"provider-stdout:")?;
     std::io::stdout().write_all(&input)?;

@@ -5110,7 +5110,8 @@ fn serve_fresh_v30_at(
                         FreshRecipientRequest::ReadRootTerminal { ref d_key }
                         | FreshRecipientRequest::SettleRootTerminal { ref d_key }
                         | FreshRecipientRequest::RepairRootTerminal { ref d_key }
-                        | FreshRecipientRequest::BeginRootPublication { ref d_key, .. } => {
+                        | FreshRecipientRequest::BeginRootPublication { ref d_key, .. }
+                        | FreshRecipientRequest::BeginRootCallerResult { ref d_key, .. } => {
                             let root = lane
                                 .released_handoff_for_child(&d_key, &recipient)
                                 .map_err(io::Error::other)?;
@@ -5120,29 +5121,34 @@ fn serve_fresh_v30_at(
                                 .ok_or_else(|| {
                                     io::Error::other("root terminal D session absent")
                                 })?;
-                            let read =
-                                match &request {
-                                    FreshRecipientRequest::ReadRootTerminal { .. } => {
-                                        lane.read_private_root_terminal(&root, &recipient, &session)
-                                    }
-                                    FreshRecipientRequest::SettleRootTerminal { .. } => lane
-                                        .settle_private_root_terminal(&root, &recipient, &session),
-                                    FreshRecipientRequest::RepairRootTerminal { .. } => lane
-                                        .repair_private_root_terminal(&root, &recipient, &session),
-                                    FreshRecipientRequest::BeginRootPublication {
-                                        artifact_base64,
-                                        ..
-                                    } => {
-                                        let bytes = base64::engine::general_purpose::STANDARD
-                                            .decode(artifact_base64)
-                                            .map_err(io::Error::other)?;
-                                        lane.begin_private_root_publication(
-                                            &root, &recipient, &session, &bytes,
-                                        )
-                                    }
-                                    _ => unreachable!(),
+                            let read = match &request {
+                                FreshRecipientRequest::ReadRootTerminal { .. } => {
+                                    lane.read_private_root_terminal(&root, &recipient, &session)
                                 }
-                                .map_err(io::Error::other)?;
+                                FreshRecipientRequest::SettleRootTerminal { .. } => {
+                                    lane.settle_private_root_terminal(&root, &recipient, &session)
+                                }
+                                FreshRecipientRequest::RepairRootTerminal { .. } => {
+                                    lane.repair_private_root_terminal(&root, &recipient, &session)
+                                }
+                                FreshRecipientRequest::BeginRootPublication {
+                                    artifact_base64,
+                                    ..
+                                } => {
+                                    let bytes = base64::engine::general_purpose::STANDARD
+                                        .decode(artifact_base64)
+                                        .map_err(io::Error::other)?;
+                                    lane.begin_private_root_publication(
+                                        &root, &recipient, &session, &bytes,
+                                    )
+                                }
+                                FreshRecipientRequest::BeginRootCallerResult { result, .. } => lane
+                                    .begin_private_root_caller_result(
+                                        &root, &recipient, &session, result,
+                                    ),
+                                _ => unreachable!(),
+                            }
+                            .map_err(io::Error::other)?;
                             serde_json::json!({"kind":"root_terminal_readback", "terminal":read})
                         }
                         FreshRecipientRequest::ActivateBashSource { request_id } => {

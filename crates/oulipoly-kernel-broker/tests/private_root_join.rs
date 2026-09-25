@@ -79,6 +79,7 @@ impl Drop for SnapshotRestore {
 fn inner() {
     let mode = std::env::var("AGE319_PRIVATE_JOIN_MODE").unwrap_or_else(|_| "help".into());
     let provider_mode = mode.starts_with("normal_model_provider");
+    let caller_mode = mode.starts_with("normal_model_provider_caller_");
     let path_mode = matches!(
         mode.as_str(),
         "normal_model_provider_path" | "normal_model_provider_prefix"
@@ -107,6 +108,10 @@ fn inner() {
             | "normal_help"
             | "normal_model_held"
             | "normal_model_provider"
+            | "normal_model_provider_caller_binary"
+            | "normal_model_provider_caller_nonzero"
+            | "normal_model_provider_caller_partial"
+            | "normal_model_provider_caller_lost"
             | "normal_model_provider_bash_causal"
             | "normal_model_provider_bash_causal_success"
             | "normal_model_provider_bash_causal_w_debt"
@@ -273,6 +278,12 @@ fn inner() {
         };
         let local_args = if mode == "normal_model_provider_auth_after_healthy" {
             format!("{marker}, \"--auth\"")
+        } else if mode == "normal_model_provider_caller_binary" {
+            format!("{marker}, \"--binary\"")
+        } else if mode == "normal_model_provider_caller_nonzero" {
+            format!("{marker}, \"--fail-clean\"")
+        } else if caller_mode {
+            format!("{marker}, \"--clean\"")
         } else {
             marker.clone()
         };
@@ -595,12 +606,25 @@ fn inner() {
                 matches!(
                     mode.as_str(),
                     "normal_model_provider"
+                        | "normal_model_provider_caller_binary"
+                        | "normal_model_provider_caller_nonzero"
+                        | "normal_model_provider_caller_partial"
+                        | "normal_model_provider_caller_lost"
                         | "normal_model_provider_bash_causal"
                         | "normal_model_provider_bash_causal_success"
                         | "normal_model_provider_bash_causal_notify_ack"
                         | "normal_model_provider_bash_causal_notify_lost_pending"
                 )
                 .then_some(("AGE319_PRIVATE_ROOT_TERMINAL_V1", "1")),
+            )
+            .envs(caller_mode.then_some(("AGE319_PRIVATE_CALLER_OUTPUT_V1", "1")))
+            .envs(
+                (mode == "normal_model_provider_caller_partial")
+                    .then_some(("AGE319_PRIVATE_CALLER_PARTIAL_WRITE_V1", "1")),
+            )
+            .envs(
+                (mode == "normal_model_provider_caller_lost")
+                    .then_some(("AGE319_PRIVATE_CALLER_LOST_WRITE_V1", "1")),
             )
             .envs(
                 mode.starts_with("normal_model_provider_bash_causal")
@@ -1278,6 +1302,39 @@ fn inner() {
                 }
                 fs::write(gate.join("provider-cancel"), b"yes").unwrap();
                 eventually(|| entry.try_wait().unwrap().is_some());
+                if mode.ends_with("_sync") {
+                    let lane = FreshV30Lane::open_at(&broker_state).unwrap();
+                    let (root, actor) = lane.released_handoff_for_root(&prepared.root_id).unwrap();
+                    let session = lane.read_session(&root.d_key).unwrap().unwrap();
+                    let terminal = lane
+                        .settle_private_root_terminal(&root, &actor, &session)
+                        .unwrap();
+                    assert_eq!(
+                        terminal.execution.as_ref().unwrap().child_event,
+                        Some(event)
+                    );
+                    assert_eq!(terminal.publication_state, "not_started");
+                    let parent = &terminal.execution.as_ref().unwrap().parent;
+                    let offered = oulipoly_state::mailbox::FreshRootCallerResult {
+                        parent_grant_id: parent.grant_id.clone(),
+                        wait_status: parent.wait_status,
+                        stdout_sha256: parent.stdout_sha256.clone(),
+                        stdout_len: parent.stdout_len,
+                        stderr_sha256: parent.stderr_sha256.clone(),
+                        stderr_len: parent.stderr_len,
+                    };
+                    assert_eq!(
+                        lane.begin_private_root_caller_result(&root, &actor, &session, &offered)
+                            .unwrap_err(),
+                        "child C result lacks original sync response endpoint"
+                    );
+                    assert_eq!(
+                        lane.read_private_root_terminal(&root, &actor, &session)
+                            .unwrap()
+                            .publication_state,
+                        "not_started"
+                    );
+                }
                 stop(&mut broker);
                 return;
             }
@@ -2206,6 +2263,25 @@ fn inner() {
                     )
                     .is_err()
                 );
+                let parent = &terminal.execution.as_ref().unwrap().parent;
+                let offered = oulipoly_state::mailbox::FreshRootCallerResult {
+                    parent_grant_id: parent.grant_id.clone(),
+                    wait_status: parent.wait_status,
+                    stdout_sha256: parent.stdout_sha256.clone(),
+                    stdout_len: parent.stdout_len,
+                    stderr_sha256: parent.stderr_sha256.clone(),
+                    stderr_len: parent.stderr_len,
+                };
+                assert_eq!(
+                    lane.begin_private_root_caller_result(
+                        &terminal_root,
+                        &terminal_actor,
+                        &terminal_session,
+                        &offered
+                    )
+                    .unwrap_err(),
+                    "root terminal has unresolved child C"
+                );
                 assert!(
                     lane.begin_private_root_publication(
                         &terminal_root,
@@ -2263,6 +2339,10 @@ fn inner() {
                     | "normal_help"
                     | "normal_model_held"
                     | "normal_model_provider"
+                    | "normal_model_provider_caller_binary"
+                    | "normal_model_provider_caller_nonzero"
+                    | "normal_model_provider_caller_partial"
+                    | "normal_model_provider_caller_lost"
                     | "normal_model_provider_reply_loss"
                     | "normal_model_provider_q_reply_loss"
                     | "normal_model_provider_restart"
@@ -2953,10 +3033,14 @@ fn inner() {
                         fs::read(&selected_marker).unwrap(),
                         b"one-provider-effect\n"
                     );
-                    assert!(
-                        !gate.join("provider-runtime-result").exists(),
-                        "runtime mapped a provider result before physical Q"
-                    );
+                    if !caller_mode {
+                        assert!(
+                            !gate.join("provider-runtime-result").exists(),
+                            "runtime mapped a provider result before physical Q"
+                        );
+                    } else if gate.join("provider-runtime-result").exists() {
+                        assert!(provider_dir.join(format!("{grant_id}.drain.json")).exists());
+                    }
                     if matches!(
                         mode.as_str(),
                         "normal_model_provider_restart"
@@ -3016,10 +3100,28 @@ fn inner() {
                     }
                     fs::write(gate.join("provider-cancel"), b"yes").unwrap();
                     eventually(|| entry.try_wait().unwrap().is_some());
-                    assert!(
-                        !entry.wait().unwrap().success(),
-                        "private provider fixture became ordinary CLI success"
-                    );
+                    let entry_status = entry.wait().unwrap();
+                    if caller_mode {
+                        let expected = if mode.ends_with("nonzero") {
+                            9
+                        } else if mode.ends_with("partial") || mode.ends_with("lost") {
+                            1
+                        } else {
+                            0
+                        };
+                        assert_eq!(
+                            entry_status.code(),
+                            Some(expected),
+                            "runner={} broker={}",
+                            String::from_utf8_lossy(&fs::read(&err).unwrap()),
+                            fs::read_to_string(&broker_log).unwrap_or_default()
+                        );
+                    } else {
+                        assert!(
+                            !entry_status.success(),
+                            "private provider fixture became ordinary CLI success"
+                        );
+                    }
                     if mode == "normal_model_provider_q_reply_loss" {
                         let stderr = fs::read_to_string(&err).unwrap();
                         assert!(stderr.contains("fresh provider unknown:"), "{stderr}");
@@ -3047,13 +3149,15 @@ fn inner() {
                         stop(&mut broker);
                         return;
                     }
-                    assert!(
-                        fs::read_to_string(&err)
-                            .unwrap()
-                            .contains("private provider runtime result mapped after Q; root terminal publication closed"),
-                        "{}",
-                        fs::read_to_string(&err).unwrap()
-                    );
+                    if !caller_mode {
+                        assert!(
+                            fs::read_to_string(&err)
+                                .unwrap()
+                                .contains("private provider runtime result mapped after Q; root terminal publication closed"),
+                            "{}",
+                            fs::read_to_string(&err).unwrap()
+                        );
+                    }
                     let mapped: serde_json::Value = serde_json::from_slice(
                         &fs::read(gate.join("provider-runtime-result")).unwrap(),
                     )
@@ -3069,7 +3173,10 @@ fn inner() {
                             "quota result was not read back through restarted broker"
                         );
                     }
-                    assert_eq!(mapped["exit_code"], 0);
+                    assert_eq!(
+                        mapped["exit_code"],
+                        if mode.ends_with("nonzero") { 9 } else { 0 }
+                    );
                     assert_eq!(
                         mapped["provider_index"],
                         if mode == "normal_model_provider_no_pin" {
@@ -3104,15 +3211,25 @@ fn inner() {
                             "lost K reply caused duplicate provider launch"
                         );
                     }
-                    assert_eq!(mapped["stdout"], "provider-stdout:hello fixture");
-                    assert_eq!(mapped["stderr"], "provider-stderr\n");
+                    if !mode.ends_with("binary") {
+                        assert_eq!(mapped["stdout"], "provider-stdout:hello fixture");
+                        assert_eq!(mapped["stderr"], "provider-stderr\n");
+                    }
                     assert_eq!(
                         fs::read(provider_dir.join(format!("{grant_id}.stdout"))).unwrap(),
-                        b"provider-stdout:hello fixture"
+                        if mode.ends_with("binary") {
+                            b"\0\xffstdout\n".as_slice()
+                        } else {
+                            b"provider-stdout:hello fixture".as_slice()
+                        }
                     );
                     assert_eq!(
                         fs::read(provider_dir.join(format!("{grant_id}.stderr"))).unwrap(),
-                        b"provider-stderr\n"
+                        if mode.ends_with("binary") {
+                            b"err\0\xfestderr".as_slice()
+                        } else {
+                            b"provider-stderr\n".as_slice()
+                        }
                     );
                     for suffix in [
                         "consumed.json",
@@ -3145,7 +3262,84 @@ fn inner() {
                     assert!(terminal.execution.as_ref().unwrap().child_event.is_none());
                     assert_eq!(terminal.notification_state, "not_applicable");
                     assert!(terminal.delivery_grant_id.is_none());
-                    assert_eq!(terminal.publication_state, "not_started");
+                    assert_eq!(
+                        terminal.publication_state,
+                        if caller_mode {
+                            "unknown"
+                        } else {
+                            "not_started"
+                        }
+                    );
+                    if caller_mode {
+                        assert!(gate.join("caller-control-stdout").exists());
+                        assert!(gate.join("caller-control-stderr").exists());
+                        let expected_out = if mode.ends_with("binary") {
+                            b"\0\xffstdout\n".as_slice()
+                        } else {
+                            b"provider-stdout:hello fixture".as_slice()
+                        };
+                        let expected_err = if mode.ends_with("binary") {
+                            b"err\0\xfestderr".as_slice()
+                        } else {
+                            b"provider-stderr\n".as_slice()
+                        };
+                        if mode.ends_with("lost") {
+                            assert!(fs::read(&out).unwrap().is_empty());
+                            assert!(
+                                fs::read(&err)
+                                    .unwrap()
+                                    .windows(b"caller result write lost before bytes".len())
+                                    .any(|w| w == b"caller result write lost before bytes")
+                            );
+                        } else if mode.ends_with("partial") {
+                            assert_eq!(fs::read(&out).unwrap(), &expected_out[..1]);
+                            assert!(fs::read(&err).unwrap().starts_with(expected_err));
+                            assert!(fs::read(&err).unwrap().windows(b"publication remains unknown: private caller disconnected".len()).any(|w| w == b"publication remains unknown: private caller disconnected"));
+                        } else {
+                            assert_eq!(fs::read(&out).unwrap(), expected_out);
+                            assert_eq!(fs::read(&err).unwrap(), expected_err);
+                        }
+                        assert!(terminal.publication_sha256.is_some());
+                        let parent = &terminal.execution.as_ref().unwrap().parent;
+                        let offered = oulipoly_state::mailbox::FreshRootCallerResult {
+                            parent_grant_id: parent.grant_id.clone(),
+                            wait_status: parent.wait_status,
+                            stdout_sha256: parent.stdout_sha256.clone(),
+                            stdout_len: parent.stdout_len,
+                            stderr_sha256: parent.stderr_sha256.clone(),
+                            stderr_len: parent.stderr_len,
+                        };
+                        assert_eq!(
+                            terminal_lane
+                                .begin_private_root_caller_result(
+                                    &receipt, &actor, &session, &offered
+                                )
+                                .unwrap()
+                                .publication_sha256,
+                            terminal.publication_sha256
+                        );
+                        let mut wrong = offered.clone();
+                        wrong.stderr_len += 1;
+                        assert!(
+                            terminal_lane
+                                .begin_private_root_caller_result(
+                                    &receipt, &actor, &session, &wrong
+                                )
+                                .is_err()
+                        );
+                        let mut wrong_actor = actor.clone();
+                        wrong_actor.starttime_ticks += 1;
+                        assert!(
+                            terminal_lane
+                                .begin_private_root_caller_result(
+                                    &receipt,
+                                    &wrong_actor,
+                                    &session,
+                                    &offered
+                                )
+                                .is_err()
+                        );
+                    }
                     if mode == "normal_model_provider" {
                         let mut wrong_actor = actor.clone();
                         wrong_actor.starttime_ticks += 1;
@@ -3243,7 +3437,7 @@ fn inner() {
                     assert_eq!(fs::read(&old_wal_path).ok(), old_wal_before);
                     assert_eq!(fs::read(&historical_sidecar).unwrap(), v29_main_before);
                     assert_eq!(fs::read(&v29_wal).ok(), v29_wal_before);
-                    if mode == "normal_model_provider" {
+                    if mode == "normal_model_provider" || caller_mode {
                         stop(&mut broker);
                         broker = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
                             .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
@@ -5407,6 +5601,10 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_help",
         "normal_model_held",
         "normal_model_provider",
+        "normal_model_provider_caller_binary",
+        "normal_model_provider_caller_nonzero",
+        "normal_model_provider_caller_partial",
+        "normal_model_provider_caller_lost",
         "normal_model_provider_bash_causal",
         "normal_model_provider_bash_causal_success",
         "normal_model_provider_bash_causal_w_debt",
