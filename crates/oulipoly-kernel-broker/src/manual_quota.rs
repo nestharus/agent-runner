@@ -148,6 +148,39 @@ pub(super) fn v3_source_key(intent: &Intent) -> io::Result<super::fresh_index::S
     })
 }
 
+/// Recheck the original manual Q's pinned config when another root reuses it.
+/// A matching command digest alone cannot certify a replaced config source.
+pub(super) fn v3_validate_origin_source(source: &Path, intent: &Intent) -> io::Result<()> {
+    let meta = source.metadata()?;
+    let pool = oulipoly_runtime::executor::cli::fresh_remote::load_fresh_headless_pool(
+        source,
+        &intent.request.model,
+    )
+    .map_err(io::Error::other)?;
+    let index = pool
+        .model
+        .providers
+        .iter()
+        .position(|member| member.name == intent.request.account)
+        .ok_or_else(|| io::Error::other("shared manual origin account absent"))?;
+    if !meta.is_dir()
+        || meta.dev() != intent.source_device
+        || meta.ino() != intent.source_inode
+        || pool.config_sha256 != intent.request.config_sha256
+        || pool.account_identities[index].as_deref() != Some(intent.physical_account_id.as_str())
+        || pool.account_effects[index]
+            != (
+                intent.quota_script.clone(),
+                intent.auth_refresh_command.clone(),
+            )
+    {
+        return Err(io::Error::other(
+            "shared manual origin config/source changed",
+        ));
+    }
+    Ok(())
+}
+
 fn valid_id(id: &str) -> bool {
     uuid::Uuid::parse_str(id).is_ok_and(|parsed| !parsed.is_nil() && parsed.to_string() == id)
 }
@@ -1395,6 +1428,29 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    #[test]
+    fn v3_shared_manual_origin_rejects_changed_config_source() {
+        let f = Fixture::new(r#"printf '{"used_percent":24,"resets_at":"2099-01-01T00:00:00Z"}'"#);
+        let request = f.request("first");
+        let source = File::open(&f.source).unwrap();
+        let intent = source_intent(&source, &request, unsafe { libc::getuid() }, unsafe {
+            libc::getgid()
+        })
+        .unwrap();
+        v3_validate_origin_source(&f.source, &intent).unwrap();
+        fs::write(
+            f.source.join("models/work.toml"),
+            "[[providers]]\nname = 'second'\n[[providers]]\nname = 'first'\n",
+        )
+        .unwrap();
+        assert!(
+            v3_validate_origin_source(&f.source, &intent)
+                .unwrap_err()
+                .to_string()
+                .contains("config/source changed")
+        );
     }
 
     #[test]

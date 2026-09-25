@@ -134,6 +134,166 @@ fn v3_source_key(
     })
 }
 
+/// Reopen the indexed latest Q through its original physical intent and K/Q.
+/// The caller checks the account revision again after this read.
+pub(super) fn v3_shared_quota_origin(
+    directory: &Path,
+    source: &Path,
+    physical_key: &str,
+    source_key: &SourceKey,
+    q: &PhysicalQ,
+    result: &Artifact,
+) -> io::Result<(FreshAccountEffectReadback, String, String)> {
+    let result_path = directory.join(&result.path);
+    let dir = result_path
+        .parent()
+        .ok_or_else(|| io::Error::other("shared Q result parent absent"))?;
+    if dir.parent() != Some(directory.join("account-effects").as_path())
+        || result_path
+            .file_name()
+            .is_none_or(|name| name != "result.json")
+    {
+        return Err(io::Error::other("shared Q result path invalid"));
+    }
+    let intent = effect_intent(dir)?.ok_or_else(|| io::Error::other("shared Q intent absent"))?;
+    if intent.version != 1
+        || !matches!(
+            intent.request.kind,
+            FreshAccountEffectKind::QuotaFirst | FreshAccountEffectKind::QuotaRetry
+        )
+        || intent.auth_source.is_some()
+        || dir.join("reuse.json").exists()
+        || dir.join("manual-reuse.json").exists()
+        || intent.binding.handoff_id.is_empty()
+    {
+        return Err(io::Error::other("shared Q origin is not physical quota"));
+    }
+    let candidate = effect_candidate(directory, &intent.binding, &intent.request)?;
+    fresh_rebuild::validate_candidate(directory, source, &candidate)?;
+    if candidate.account_identity != physical_key
+        || intent.environment_sha256 != source_key.environment_sha256
+        || v3_source_key(&candidate, &intent.request)?.commands_sha256 != source_key.commands_sha256
+        || effect_artifact(directory, &result_path).map_err(io::Error::other)? != *result
+    {
+        return Err(io::Error::other("shared Q origin identity changed"));
+    }
+    let grant = grant_for_binding(dir, &intent.binding)?
+        .ok_or_else(|| io::Error::other("shared Q physical grant absent"))?;
+    let k = effect_artifact(directory, &dir.join(format!("{grant}.consumed.json")))?;
+    let drain = effect_artifact(directory, &dir.join(format!("{grant}.drain.json")))?;
+    if q.physical_k != k
+        || q.q != drain
+        || q.terminal.is_some()
+        || q.completed_unix_nanos
+            != i64::try_from(file_unix_nanos(&dir.join(format!("{grant}.drain.json")))?)
+                .map_err(io::Error::other)?
+    {
+        return Err(io::Error::other("shared Q physical K/Q changed"));
+    }
+    let physical = effect_readback_from_dir_mode(dir, &intent, false)?;
+    let indexed: FreshAccountEffectReadback =
+        serde_json::from_slice(&std::fs::read(&result_path)?)?;
+    if physical.state != "drained"
+        || physical.effect_id != intent.id
+        || physical.artifact != dir.display().to_string()
+        || serde_json::to_value(&physical)? != serde_json::to_value(&indexed)?
+    {
+        return Err(io::Error::other("shared Q physical result changed"));
+    }
+    Ok((physical, candidate.model, candidate.config_sha256))
+}
+
+/// Reopen a manual --usage Q through its own physical K, Q, and typed output.
+/// The keyed caller has already selected this exact latest account Q.
+pub(super) fn v3_shared_manual_quota_origin(
+    directory: &Path,
+    source: &Path,
+    physical_key: &str,
+    source_key: &SourceKey,
+    q: &PhysicalQ,
+    result: &Artifact,
+) -> io::Result<(FreshAccountEffectReadback, String, String)> {
+    let result_path = directory.join(&result.path);
+    let dir = result_path
+        .parent()
+        .ok_or_else(|| io::Error::other("shared manual Q parent absent"))?;
+    if dir.parent() != Some(directory.join("manual-quota").as_path())
+        || result_path.file_name().is_none_or(|name| name != "q.json")
+    {
+        return Err(io::Error::other("shared manual Q path invalid"));
+    }
+    let id = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| io::Error::other("shared manual Q ID absent"))?;
+    let intent = super::manual_quota::v3_intent(directory, id)?;
+    super::manual_quota::v3_validate_origin_source(source, &intent)?;
+    if intent.source_operation_id.is_some()
+        || intent.quota_script.is_none()
+        || intent.physical_account_id != physical_key
+        || super::manual_quota::v3_source_key(&intent)? != *source_key
+        || q.physical_k != effect_artifact(directory, &dir.join("k.json"))?
+        || q.q != *result
+        || q.terminal.is_some()
+        || q.completed_unix_nanos
+            != i64::try_from(super::manual_quota::physical_q_nanos(directory, id)?)
+                .map_err(io::Error::other)?
+    {
+        return Err(io::Error::other("shared manual Q origin changed"));
+    }
+    let manual = super::manual_quota::v3_readback(directory, &intent)?;
+    if manual.state != "drained"
+        || manual.operation_id != id
+        || manual.physical_account_id != physical_key
+        || manual.effect_id.as_deref().is_none_or(str::is_empty)
+        || manual.artifact != dir.display().to_string()
+    {
+        return Err(io::Error::other("shared manual Q physical result changed"));
+    }
+    Ok((
+        FreshAccountEffectReadback {
+            effect_id: manual.effect_id.unwrap(),
+            state: manual.state,
+            outcome: manual.outcome,
+            windows: manual.windows,
+            completed_unix_seconds: manual.completed_unix_seconds,
+            artifact: manual.artifact,
+            peer_effect_id: None,
+            peer_artifact: None,
+        },
+        intent.request.model,
+        intent.request.config_sha256,
+    ))
+}
+
+pub(super) fn shared_quota_effect_v3(
+    directory: &Path,
+    generation: &KeyedGeneration,
+    binding: &Binding,
+    request: &FreshAccountEffectRequest,
+) -> io::Result<Option<FreshAccountEffectReadback>> {
+    if request.kind != FreshAccountEffectKind::QuotaFirst {
+        return Err(io::Error::other("shared Q requires quota-first request"));
+    }
+    let candidate = effect_candidate(directory, binding, request)?;
+    fresh_rebuild::validate_candidate(
+        directory,
+        generation.admitted_source().map_err(io::Error::other)?,
+        &candidate,
+    )?;
+    if candidate.quota_script.is_none() {
+        return Err(io::Error::other("shared Q requires metered account"));
+    }
+    generation
+        .shared_quota_checkpoint(
+            &candidate.account_identity,
+            &v3_source_key(&candidate, request)?,
+            &request.model,
+            &request.config_sha256,
+        )
+        .map_err(io::Error::other)
+}
+
 /// A follower has its own exact intent but no physical K. The v2 physical
 /// reader verifies the referenced source account, commands and environment.
 pub(super) fn v3_auth_alias_readback(
@@ -169,6 +329,51 @@ pub(super) fn v3_auth_alias_readback(
         candidate.account_identity,
         effect_artifact(directory, &dir.join("intent.json"))?,
     ))
+}
+
+/// Recover the one physical auth effect named by this exact follower. The
+/// follower supplies the live environment bytes; the peer intent binds their
+/// digest and the same physical command pair before keyed settlement.
+pub(super) fn v3_auth_alias_peer(
+    directory: &Path,
+    binding: &Binding,
+    request: &FreshAccountEffectRequest,
+) -> io::Result<(Binding, FreshAccountEffectRequest, String)> {
+    let dir = effect_directory(directory, binding, request);
+    let alias =
+        effect_intent(&dir)?.ok_or_else(|| io::Error::other("auth follower intent absent"))?;
+    let reuse = alias
+        .auth_source
+        .as_ref()
+        .ok_or_else(|| io::Error::other("auth follower source absent"))?;
+    if alias.binding != *binding
+        || alias.request != redacted_effect_request(request)
+        || alias.environment_sha256 != environment_digest(request)?
+        || reuse.source_directory.contains('/')
+        || reuse.source_directory.contains("..")
+        || !reuse.source_directory.ends_with("-auth-refresh")
+    {
+        return Err(io::Error::other("auth follower identity changed"));
+    }
+    let peer_dir = dir
+        .parent()
+        .ok_or_else(|| io::Error::other("auth follower parent absent"))?
+        .join(&reuse.source_directory);
+    let peer =
+        effect_intent(&peer_dir)?.ok_or_else(|| io::Error::other("auth physical intent absent"))?;
+    let candidate = effect_candidate(directory, binding, request)?;
+    if peer.id != reuse.source_effect_id
+        || peer.binding == *binding
+        || peer.request.kind != FreshAccountEffectKind::AuthRefresh
+        || peer.auth_source.is_some()
+        || peer.environment_sha256 != alias.environment_sha256
+        || !same_physical_effect_source(directory, &candidate, &peer)?
+    {
+        return Err(io::Error::other("auth physical peer changed"));
+    }
+    let mut peer_request = peer.request.clone();
+    peer_request.environment = request.environment.clone();
+    Ok((peer.binding, peer_request, peer.id))
 }
 
 pub(super) fn v3_materialize_quota_result(
@@ -7428,7 +7633,12 @@ mod tests {
                         .join(format!("effect-{index}"))
                         .display()
                         .to_string(),
-                    if index == 0 { "--quota" } else { "--success" }.into(),
+                    if index == 0 {
+                        "--quota-single"
+                    } else {
+                        "--success"
+                    }
+                    .into(),
                 ],
                 vec![("PATH".into(), "/usr/bin:/bin".into())],
             )
