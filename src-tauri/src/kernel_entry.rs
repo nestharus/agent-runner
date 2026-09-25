@@ -42,6 +42,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 #[cfg(feature = "age319-private-broker-fixture")]
+mod root_pty_control;
+
+#[cfg(feature = "age319-private-broker-fixture")]
 const PRIVATE_PREPARED_ENTRY: &str = "__age319-private-held-prepared-v30";
 #[cfg(feature = "age319-private-broker-fixture")]
 const PRIVATE_NORMAL_ENTRY: &str = "__age319-private-normal-v30";
@@ -1202,11 +1205,53 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
         return Err("fresh route readback differs from configured pool before K".into());
     }
     let selected_plan = prepared.swap_remove(selected.index);
+    // This private pre-K custody exercise records only the already selected
+    // headless plan. Interactive plan selection and the broker PTY fork remain
+    // separate work; a successful ^ is never a generation or F receipt.
+    let root_pty = if std::env::var_os("AGE319_PRIVATE_ROOT_PTY_CONTROL_V1").is_some() {
+        Some(root_pty_control::RootPtyControl::offer(
+            &socket,
+            &authority.receipt.d_key,
+            &authority.session.session_id,
+            &selected.account,
+            &selected.plan_sha256,
+            &std::path::PathBuf::from(
+                std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                    .ok_or("private PTY control directory absent")?,
+            ),
+        )?)
+    } else {
+        None
+    };
+    if let Some(control) = &root_pty {
+        if std::env::var_os("AGE319_PRIVATE_ROOT_PTY_REPLAY_V1").is_some() {
+            control.rechallenge(&socket)?;
+        }
+        if std::env::var_os("AGE319_PRIVATE_ROOT_PTY_RESTART_V1").is_some() {
+            let gate = std::path::PathBuf::from(
+                std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                    .ok_or("private PTY restart gate absent")?,
+            );
+            std::fs::write(gate.join("root-pty-ready"), b"challenged")
+                .map_err(|e| e.to_string())?;
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !gate.join("root-pty-rechallenge").exists() {
+                if std::time::Instant::now() >= until {
+                    return Err("root PTY broker restart wait expired".into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            control.rechallenge(&socket)?;
+        }
+    }
     let mut backend = PrivateFreshBroker {
         authority,
         grant_id: None,
     };
     let result = run_prepared_fresh_headless(selected_plan, &mut backend)?;
+    if let Some(control) = &root_pty {
+        control.ensure_live()?;
+    }
     let typed_auth_rejection = oulipoly_runtime::diagnostics::non_quota_failure_diagnosis(
         &result.stderr,
         result.exit_code,

@@ -24,9 +24,13 @@ The broker compares them with the released root and current headless broker rout
 uses `TIOCGPTN` and `TIOCGPTPEER` to verify the real PTY pair, and creates an
 exact `pre-k-nonactivating` artifact. Repeating the same pair is readback;
 presenting another pair or any request after a provider K grant refuses. The
-artifact does not hold a descriptor or socket connection across restart and is never consumed by K,
-Q, runtime generation registration or F. It cannot certify PTY liveness after
-the challenged request ends.
+original Runner's private call site creates the pair after h/f selection and
+keeps its master and control listener through a successful current headless
+provider Q readback; an uncertain K/Q fails without an interactive claim. A
+later exact challenge, including after broker restart, must find that
+same live root. The artifact does not hold a descriptor or socket connection
+across restart and is never consumed by K, Q, runtime generation registration
+or F. Its stored stamps alone cannot certify PTY liveness.
 
 The runtime now has a separate interactive argv plan builder, but h/f still
 select only headless plans. The remaining work must bind that separate plan

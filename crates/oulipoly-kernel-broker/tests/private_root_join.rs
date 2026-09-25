@@ -107,6 +107,10 @@ fn inner() {
             | "normal_help"
             | "normal_model_held"
             | "normal_model_provider"
+            | "normal_model_provider_pty_control"
+            | "normal_model_provider_pty_restart"
+            | "normal_model_provider_pty_replaced"
+            | "normal_model_provider_pty_root_exit"
             | "normal_model_provider_bash_causal"
             | "normal_model_provider_bash_causal_success"
             | "normal_model_provider_bash_causal_w_debt"
@@ -581,6 +585,18 @@ fn inner() {
             .envs((mode == "normal_help").then_some(("AGE319_PRIVATE_OFFLINE_ROOT_V1", "1")))
             .envs(model_mode.then_some(("AGE319_PRIVATE_NORMAL_ROOT_V1", "1")))
             .envs(provider_mode.then_some(("AGE319_PRIVATE_FRESH_PROVIDER_V1", "1")))
+            .envs(
+                mode.starts_with("normal_model_provider_pty_")
+                    .then_some(("AGE319_PRIVATE_ROOT_PTY_CONTROL_V1", "1")),
+            )
+            .envs(
+                (mode == "normal_model_provider_pty_control")
+                    .then_some(("AGE319_PRIVATE_ROOT_PTY_REPLAY_V1", "1")),
+            )
+            .envs(
+                (mode == "normal_model_provider_pty_restart")
+                    .then_some(("AGE319_PRIVATE_ROOT_PTY_RESTART_V1", "1")),
+            )
             .envs(
                 matches!(
                     mode.as_str(),
@@ -1909,6 +1925,10 @@ fn inner() {
                     | "normal_help"
                     | "normal_model_held"
                     | "normal_model_provider"
+                    | "normal_model_provider_pty_control"
+                    | "normal_model_provider_pty_restart"
+                    | "normal_model_provider_pty_replaced"
+                    | "normal_model_provider_pty_root_exit"
                     | "normal_model_provider_reply_loss"
                     | "normal_model_provider_q_reply_loss"
                     | "normal_model_provider_restart"
@@ -2404,6 +2424,48 @@ fn inner() {
                     return;
                 }
                 if provider_mode {
+                    let pty_record_before =
+                        (mode == "normal_model_provider_pty_restart").then(|| {
+                            eventually(|| {
+                                gate.join("root-pty-ready").exists()
+                                    || entry.try_wait().unwrap().is_some()
+                            });
+                            assert!(
+                                gate.join("root-pty-ready").exists(),
+                                "{}",
+                                fs::read_to_string(&err).unwrap()
+                            );
+                            fs::read(
+                                broker_state.join("v30/fresh-provider").join(format!(
+                                    "{}.interactive-pty-pre-k.json",
+                                    receipt.handoff_id
+                                )),
+                            )
+                            .unwrap()
+                        });
+                    if mode == "normal_model_provider_pty_restart" {
+                        let fresh_socket = socket.with_file_name("v30.sock");
+                        stop(&mut broker);
+                        broker = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
+                            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
+                            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
+                            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::from(
+                                File::create(temp.path().join("pty-broker-restart.log")).unwrap(),
+                            ))
+                            .spawn()
+                            .unwrap();
+                        eventually(|| {
+                            protocol::request_at(
+                                &fresh_socket,
+                                protocol::Operation::ObserveEntryGate,
+                            )
+                            .is_ok()
+                        });
+                        fs::write(gate.join("root-pty-rechallenge"), b"go").unwrap();
+                    }
                     let provider_dir = broker_state.join("v30/fresh-provider");
                     let selected_marker = if mode == "normal_model_provider_no_pin" {
                         gate.join("provider-effect-unused")
@@ -2463,6 +2525,98 @@ fn inner() {
                         }
                     );
                     assert_eq!(route["selection"]["plan_sha256"], grant["plan_sha256"]);
+                    if mode.starts_with("normal_model_provider_pty_") {
+                        let record_bytes = fs::read(
+                            provider_dir
+                                .join(format!("{}.interactive-pty-pre-k.json", receipt.handoff_id)),
+                        )
+                        .unwrap();
+                        if let Some(before) = &pty_record_before {
+                            assert_eq!(&record_bytes, before, "broker restart changed ^ record");
+                        }
+                        let record: serde_json::Value =
+                            serde_json::from_slice(&record_bytes).unwrap();
+                        assert_eq!(record["state"], "pre-k-nonactivating");
+                        assert_eq!(record["binding"]["actor_pid"], actor.host_pid);
+                        assert_eq!(
+                            record["binding"]["session_id"],
+                            route["binding"]["session_id"]
+                        );
+                        assert_eq!(record["selection"]["account"], "local");
+                        assert_eq!(
+                            record["selection"]["plan_sha256"],
+                            route["selection"]["plan_sha256"]
+                        );
+                        let path = Path::new(record["control_path"].as_str().unwrap());
+                        assert!(path.exists(), "root control closed before provider Q");
+                        assert!(
+                            std::fs::read_dir(format!("/proc/{}/fd", actor.host_pid))
+                                .unwrap()
+                                .filter_map(Result::ok)
+                                .filter_map(|fd| fs::read_link(fd.path()).ok())
+                                .any(|target| target.to_string_lossy().starts_with("/dev/ptmx")),
+                            "original root actor dropped PTY master after first challenge"
+                        );
+                        assert_old_debt_and_no_f_ack(&broker_state);
+                        if mode == "normal_model_provider_pty_replaced" {
+                            let held_path = gate.join("held-root-pty.sock");
+                            fs::rename(path, &held_path).unwrap();
+                            let sibling = std::os::unix::net::UnixListener::bind(path).unwrap();
+                            let mut sibling_master = -1;
+                            let mut sibling_slave = -1;
+                            assert_eq!(
+                                unsafe {
+                                    libc::openpty(
+                                        &mut sibling_master,
+                                        &mut sibling_slave,
+                                        std::ptr::null_mut(),
+                                        std::ptr::null(),
+                                        std::ptr::null(),
+                                    )
+                                },
+                                0
+                            );
+                            let sibling_master = unsafe { File::from_raw_fd(sibling_master) };
+                            let sibling_slave = unsafe { File::from_raw_fd(sibling_slave) };
+                            let request = protocol::PrivateFreshPtyHandoff {
+                                d_key: receipt.d_key.clone(),
+                                session_id: route["binding"]["session_id"].as_str().unwrap().into(),
+                                account: "local".into(),
+                                plan_sha256: route["selection"]["plan_sha256"]
+                                    .as_str()
+                                    .unwrap()
+                                    .into(),
+                                control_path: path.to_path_buf(),
+                            };
+                            assert!(
+                                protocol::private_fresh_pty_handoff_at(
+                                    &socket.with_file_name("v30.sock"),
+                                    &request,
+                                    sibling_master.as_raw_fd(),
+                                    sibling_slave.as_raw_fd()
+                                )
+                                .is_err(),
+                                "sibling/copied endpoint replaced original root custody"
+                            );
+                            drop(sibling);
+                        }
+                        if mode == "normal_model_provider_pty_root_exit" {
+                            let path = path.to_path_buf();
+                            assert_eq!(unsafe { libc::kill(actor.host_pid, libc::SIGKILL) }, 0);
+                            eventually(|| std::os::unix::net::UnixStream::connect(&path).is_err());
+                            stop(&mut entry);
+                            assert!(
+                                path.exists(),
+                                "abrupt root death unexpectedly unlinked endpoint"
+                            );
+                            assert!(grant_file.exists());
+                            assert!(!gate.join("provider-runtime-result").exists());
+                            assert_old_debt_and_no_f_ack(&broker_state);
+                            fs::write(gate.join("provider-cancel"), b"yes").unwrap();
+                            stop(&mut broker);
+                            return;
+                        }
+                    }
                     assert_eq!(route["binding"]["handoff_id"], receipt.handoff_id);
                     if matches!(
                         mode.as_str(),
@@ -2662,6 +2816,33 @@ fn inner() {
                     }
                     fs::write(gate.join("provider-cancel"), b"yes").unwrap();
                     eventually(|| entry.try_wait().unwrap().is_some());
+                    if matches!(
+                        mode.as_str(),
+                        "normal_model_provider_pty_control" | "normal_model_provider_pty_restart"
+                    ) {
+                        assert!(
+                            !gate
+                                .join(format!("root-pty-{}.sock", receipt.d_key))
+                                .exists(),
+                            "root control socket survived root exit"
+                        );
+                    }
+                    if mode == "normal_model_provider_pty_replaced" {
+                        assert!(
+                            gate.join(format!("root-pty-{}.sock", receipt.d_key))
+                                .exists(),
+                            "root removed a replacement endpoint it did not own"
+                        );
+                        let stderr = fs::read_to_string(&err).unwrap();
+                        assert!(
+                            stderr.contains("root PTY control endpoint replaced"),
+                            "{stderr}"
+                        );
+                        assert!(!gate.join("provider-runtime-result").exists());
+                        assert_old_debt_and_no_f_ack(&broker_state);
+                        stop(&mut broker);
+                        return;
+                    }
                     assert!(
                         !entry.wait().unwrap().success(),
                         "private provider fixture became ordinary CLI success"
@@ -5053,6 +5234,10 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_help",
         "normal_model_held",
         "normal_model_provider",
+        "normal_model_provider_pty_control",
+        "normal_model_provider_pty_restart",
+        "normal_model_provider_pty_replaced",
+        "normal_model_provider_pty_root_exit",
         "normal_model_provider_bash_causal",
         "normal_model_provider_bash_causal_success",
         "normal_model_provider_bash_causal_w_debt",

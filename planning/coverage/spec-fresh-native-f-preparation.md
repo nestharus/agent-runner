@@ -6,6 +6,7 @@
 - `crates/oulipoly-state/src/mailbox/migrations/0040_fresh_native_f_preparation.sql`
 - `src-tauri/src/native_f_preparation.rs`
 - `src-tauri/src/kernel_entry.rs`
+- `src-tauri/src/kernel_entry/root_pty_control.rs`
 - `src-tauri/src/main.rs`
 - `crates/oulipoly-kernel-broker/src/linux_main.rs`
 - `crates/oulipoly-kernel-broker/src/fresh_provider.rs`
@@ -43,13 +44,13 @@
 ## Boundaries
 
 - Preparation does not write to the PTY, assert a provider turn, ACK F, launch headless resume, or publish an ordinary caller result.
-- Private `^` PTY handoff is earlier and nonactivating: it authenticates the original released root and selected D/account/plan, verifies a real master/slave pair and challenges a live control socket served by that root PID. The server must return its open master via `SCM_RIGHTS`; the broker checks that it is the selected master before recording only `pre-k-nonactivating`. The separate runtime interactive argv builder is not yet bound into h/f selection. This creates no provider K, resident generation, F preparation, send, or ACK. Its durable stamps cannot attest PTY or server liveness after broker restart.
+- Private `^` PTY handoff is earlier and nonactivating: the original released Runner creates a real master/slave pair after h/f headless selection, serves the broker challenge from its own process, returns its still-open master via `SCM_RIGHTS`, and retains master/control custody through the selected headless provider Q path. The broker binds original actor, D/session/account and selected headless plan, then records only `pre-k-nonactivating`. The separate runtime interactive argv builder is not yet bound into h/f selection. This creates no interactive provider K, resident generation, F preparation, send, or ACK. Durable stamps alone cannot attest PTY or server liveness after broker restart; a fresh challenge is required.
 - The broker attests the resident endpoint before storing an F record. The private caller helper performs adapter preflight and a typed Tail read on creation and readback. A direct broker preparation still lacks independently proven Tail provenance and is not native receipt authority.
 
 ## Declared test patterns
 
 - `crates/oulipoly-kernel-broker/tests/age319_fresh_recipient_socket.rs` exercises clean fixture preparation, readback, lost reply, restart, refusal, old WAL isolation, and pending/manual ACK separation.
-- `crates/oulipoly-kernel-broker/tests/private_root_join.rs` exercises accepted W to original-root F and repeatable refusal when the headless private K/Q route lacks a resident PTY generation and typed adapter page authority.
+- `crates/oulipoly-kernel-broker/tests/private_root_join.rs` exercises the actual Runner-owned `^` challenge, exact replay, broker restart and rechallenge, held master beyond the first challenge while the headless provider runs, sibling/copied endpoint refusal, replacement fail-closed, root-exit custody loss and normal socket cleanup. It also exercises accepted W to original-root F and repeatable refusal when the headless private K/Q route lacks a resident PTY generation and typed adapter page authority.
 - Broker unit tests exercise the challenged `^` frame, real PTY pair and live same-process control socket checks, including a same-actor response with the wrong master, wrong slave, no TTY, wrong account/session, changed pair, replaced socket inode and post-K preparation refusal. Runtime tests distinguish the separate interactive argv from headless argv. They do not claim a broker-launched interactive provider.
 - PTY broker unit tests exercise both plain and TUI resident query handlers without child input.
 - Existing native page and PTY outbound tests cover the adapter Tail and transport mechanics separately; this slice does not join a physical send.
