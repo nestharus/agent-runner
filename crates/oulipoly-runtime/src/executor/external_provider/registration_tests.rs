@@ -53,9 +53,12 @@ fn registration_native_exclusion_and_binding_storage_are_distinct() {
         drop(oulipoly_state::mailbox::MailboxDb::open(&path).unwrap());
         let conn = rusqlite::Connection::open(&path).unwrap();
         // Synthetic pre-existing reservation; no production owner or fake drain.
-        conn.execute_batch("INSERT INTO completion_continuation_owner SELECT 'owner',domain_id,'running','{}','{}','fixture' FROM completion_continuation_domain;
-            INSERT INTO completion_continuation_attempt(attempt_id,domain_id,owner_generation,operation,request_sha256,session_id,claim_token,phase,result_path)
-            SELECT 'attempt',domain_id,'owner','activation','hash','fixture-session','claim','reserved','fixture' FROM completion_continuation_domain;").unwrap();
+        conn.execute_batch("INSERT INTO completion_supervisor_authority(authority_id,domain_id,phase,created_by_generation,guardian_identity)
+            SELECT 'fixture-authority',domain_id,'active','owner','{}' FROM completion_continuation_domain;
+            INSERT INTO completion_continuation_owner(generation,domain_id,phase,guardian_identity,driver_identity,endpoint,supervisor_authority_id)
+            SELECT 'owner',domain_id,'running','{}','{}','fixture','fixture-authority' FROM completion_continuation_domain;
+            INSERT INTO completion_continuation_attempt(attempt_id,domain_id,owner_generation,operation,request_sha256,session_id,claim_token,phase,result_path,supervisor_authority_id)
+            SELECT 'attempt',domain_id,'owner','activation','hash','fixture-session','claim','reserved','fixture','fixture-authority' FROM completion_continuation_domain;").unwrap();
         if broken_storage {
             let identity = oulipoly_state::pid_identity::read_live_process_identity(i64::from(
                 std::process::id(),
