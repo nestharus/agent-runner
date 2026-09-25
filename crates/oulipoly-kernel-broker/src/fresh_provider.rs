@@ -21,7 +21,7 @@ use oulipoly_kernel_broker::identity::{PinnedProcess, host_proc_file, observed_i
 use oulipoly_kernel_broker::json_artifact;
 use oulipoly_kernel_broker::protocol::{
     FreshAccountEffectKind, FreshAccountEffectReadback, FreshAccountEffectRequest,
-    FreshQuotaWindow, FreshRouteRequest, FreshRouteSelection,
+    FreshQuotaWindow, FreshRouteRequest, FreshRouteSelection, PrivateFreshPtyHandoff,
 };
 use oulipoly_runtime::executor::cli::fresh_remote::FreshTerminalRecognizer;
 use oulipoly_runtime::executor::terminal_signal::TerminalSignalKind;
@@ -1049,6 +1049,148 @@ fn candidate_name(handoff: &str, index: usize) -> String {
 
 fn decision_name(handoff: &str) -> String {
     format!("{handoff}.route-selection.json")
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct PtyHandoffStamp {
+    device: u64,
+    inode: u64,
+}
+
+impl PtyHandoffStamp {
+    fn of(file: &File) -> io::Result<Self> {
+        let metadata = file.metadata()?;
+        if metadata.mode() & libc::S_IFMT != libc::S_IFCHR {
+            return Err(io::Error::other(
+                "PTY handoff descriptor is not a character device",
+            ));
+        }
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct PreKInteractivePtyHandoff {
+    version: u32,
+    state: String,
+    binding: Binding,
+    selection: FreshRouteSelection,
+    master: PtyHandoffStamp,
+    slave: PtyHandoffStamp,
+    pty_number: u32,
+}
+
+/// Record a physical PTY pair presented by the original challenged Runner.
+/// This record is deliberately inert: it has no provider process, K grant,
+/// runtime generation or native-F authority. A restarted broker must recheck
+/// the pair; the durable stamps alone never prove that a master remains open.
+pub(super) fn attest_pre_k_interactive_pty(
+    directory: &Path,
+    binding: &Binding,
+    request: &PrivateFreshPtyHandoff,
+    master: &File,
+    slave: &File,
+) -> io::Result<()> {
+    if binding.causal_parent.is_some()
+        || request.session_id != binding.session_id
+        || request.account.is_empty()
+        || request.plan_sha256.len() != 64
+        || !request.plan_sha256.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err(io::Error::other(
+            "PTY handoff D/session or plan assertion changed",
+        ));
+    }
+    if grant_for_binding(directory, binding)?.is_some() {
+        return Err(io::Error::other(
+            "PTY handoff is after provider K preparation",
+        ));
+    }
+    let decision: RouteDecision = exact_file(directory, &decision_name(&binding.handoff_id))?
+        .ok_or_else(|| io::Error::other("PTY handoff has no broker route selection"))?;
+    if decision.version != 1
+        || decision.binding != *binding
+        || decision.selection.account != request.account
+        || decision.selection.plan_sha256 != request.plan_sha256
+        || !decision
+            .selection
+            .eligible_accounts
+            .contains(&decision.selection.account)
+    {
+        return Err(io::Error::other(
+            "PTY handoff differs from selected account or plan",
+        ));
+    }
+    let candidate: RouteCandidate = exact_file(
+        directory,
+        &candidate_name(&binding.handoff_id, decision.selection.index),
+    )?
+    .ok_or_else(|| io::Error::other("PTY handoff selected candidate absent"))?;
+    if candidate.version != 2
+        || candidate.binding != *binding
+        || candidate.model != decision.selection.model
+        || candidate.config_sha256 != decision.selection.config_sha256
+        || candidate.account != decision.selection.account
+        || candidate.plan_sha256 != decision.selection.plan_sha256
+    {
+        return Err(io::Error::other("PTY handoff selected candidate changed"));
+    }
+    let master_flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+    let slave_flags = unsafe { libc::fcntl(slave.as_raw_fd(), libc::F_GETFL) };
+    if master_flags < 0
+        || slave_flags < 0
+        || master_flags & libc::O_ACCMODE != libc::O_RDWR
+        || slave_flags & libc::O_ACCMODE != libc::O_RDWR
+        || unsafe { libc::isatty(slave.as_raw_fd()) } != 1
+    {
+        return Err(io::Error::other(
+            "PTY handoff requires read/write master and TTY slave",
+        ));
+    }
+    let mut pty_number = 0u32;
+    if unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCGPTN, &mut pty_number) } != 0 {
+        return Err(io::Error::other("PTY handoff master is not a Unix PTY"));
+    }
+    let peer_fd = unsafe {
+        libc::ioctl(
+            master.as_raw_fd(),
+            libc::TIOCGPTPEER,
+            libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+        )
+    };
+    if peer_fd < 0 {
+        return Err(io::Error::other("PTY handoff master peer unavailable"));
+    }
+    let peer = unsafe { File::from_raw_fd(peer_fd) };
+    let master_stamp = PtyHandoffStamp::of(master)?;
+    let slave_stamp = PtyHandoffStamp::of(slave)?;
+    if PtyHandoffStamp::of(&peer)? != slave_stamp {
+        return Err(io::Error::other(
+            "PTY handoff slave is not the master's peer",
+        ));
+    }
+    let record = PreKInteractivePtyHandoff {
+        version: 1,
+        state: "pre-k-nonactivating".into(),
+        binding: binding.clone(),
+        selection: decision.selection,
+        master: master_stamp,
+        slave: slave_stamp,
+        pty_number,
+    };
+    let name = format!("{}.interactive-pty-pre-k.json", binding.handoff_id);
+    match exact_file::<PreKInteractivePtyHandoff>(directory, &name)? {
+        Some(existing) if existing == record => Ok(()),
+        Some(_) => Err(io::Error::other(
+            "PTY handoff already bound to a different pair",
+        )),
+        None => durable_new(directory, &name, &record),
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -4440,6 +4582,139 @@ mod tests {
             root_pidns_ino: root.pidns_ino,
             causal_parent: None,
         }
+    }
+
+    fn test_pty_pair() -> (File, File) {
+        let mut master = -1;
+        let mut slave = -1;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        (unsafe { File::from_raw_fd(master) }, unsafe {
+            File::from_raw_fd(slave)
+        })
+    }
+
+    #[test]
+    fn interactive_pty_handoff_binds_selected_root_session_and_real_pair_without_activation() {
+        let temp = tempfile::tempdir().unwrap();
+        let process = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+        let binding = fixture_binding(&process, &process);
+        let selection = FreshRouteSelection {
+            model: "selected-model".into(),
+            config_sha256: "a".repeat(64),
+            account: "selected-account".into(),
+            index: 0,
+            plan_sha256: "b".repeat(64),
+            observed_live: 0,
+            observed_failures: 0,
+            observed_invocations: 0,
+            policy_version: "fresh-account-effects-v2".into(),
+            eligible_accounts: vec!["selected-account".into()],
+            quota_remaining_basis_points: None,
+        };
+        durable_new(
+            temp.path(),
+            &decision_name(&binding.handoff_id),
+            &RouteDecision {
+                version: 1,
+                binding: binding.clone(),
+                total: 1,
+                pin: None,
+                selection: selection.clone(),
+            },
+        )
+        .unwrap();
+        durable_new(
+            temp.path(),
+            &candidate_name(&binding.handoff_id, 0),
+            &RouteCandidate {
+                version: 2,
+                binding: binding.clone(),
+                model: selection.model.clone(),
+                config_sha256: selection.config_sha256.clone(),
+                account: selection.account.clone(),
+                index: 0,
+                total: 1,
+                pin: None,
+                plan_sha256: selection.plan_sha256.clone(),
+                quota_script: None,
+                auth_refresh_command: None,
+                terminal_recognizer: FreshTerminalRecognizer::OpenCode,
+            },
+        )
+        .unwrap();
+        let request = PrivateFreshPtyHandoff {
+            d_key: uuid::Uuid::new_v4().to_string(),
+            session_id: binding.session_id.clone(),
+            account: selection.account.clone(),
+            plan_sha256: selection.plan_sha256.clone(),
+        };
+        let (master, slave) = test_pty_pair();
+        let (other_master, other_slave) = test_pty_pair();
+        let attest = |request: &PrivateFreshPtyHandoff, master: &File, slave: &File| {
+            attest_pre_k_interactive_pty(temp.path(), &binding, request, master, slave)
+        };
+        assert!(attest(&request, &master, &other_slave).is_err());
+        assert!(attest(&request, &File::open("/dev/null").unwrap(), &slave).is_err());
+        assert!(attest(&request, &master, &File::open("/dev/null").unwrap()).is_err());
+        assert!(
+            attest(
+                &PrivateFreshPtyHandoff {
+                    account: "other".into(),
+                    ..request.clone()
+                },
+                &master,
+                &slave,
+            )
+            .is_err()
+        );
+        assert!(
+            attest(
+                &PrivateFreshPtyHandoff {
+                    session_id: "v30:wrong:session".into(),
+                    ..request.clone()
+                },
+                &master,
+                &slave,
+            )
+            .is_err()
+        );
+        attest(&request, &master, &slave).unwrap();
+        attest(&request, &master, &slave).unwrap();
+        assert!(attest(&request, &other_master, &other_slave).is_err());
+        let record: PreKInteractivePtyHandoff = exact_file(
+            temp.path(),
+            &format!("{}.interactive-pty-pre-k.json", binding.handoff_id),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(record.state, "pre-k-nonactivating");
+        assert_eq!(record.binding, binding);
+        assert_eq!(record.selection, selection);
+        assert!(grant_for_binding(temp.path(), &binding).unwrap().is_none());
+        assert!(!temp.path().join("result.json").exists());
+        let input = temp.path().join("empty-input");
+        std::fs::write(&input, []).unwrap();
+        let prepared_plan = plan(
+            Path::new("/bin/true"),
+            temp.path(),
+            &File::open(input).unwrap(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        prepare(temp.path(), binding.clone(), prepared_plan).unwrap();
+        assert!(attest(&request, &master, &slave).is_err());
     }
 
     #[test]

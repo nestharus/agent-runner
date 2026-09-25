@@ -13,6 +13,27 @@ This source is not a deployable AGE-319 restoration.
 
 ## Private fresh provider execution
 
+The private `^` request is a nonactivating interactive PTY handoff substrate.
+Its private client accepts read/write master and slave descriptors with the
+original released Runner's D key, session, selected account and plan digest.
+The broker compares them with the released root and current headless broker route selection,
+uses `TIOCGPTN` and `TIOCGPTPEER` to verify the real PTY pair, and creates an
+exact `pre-k-nonactivating` artifact. Repeating the same pair is readback;
+presenting another pair or any request after a provider K grant refuses. The
+artifact does not hold a descriptor across restart and is never consumed by K,
+Q, runtime generation registration or F. It cannot certify PTY liveness after
+the challenged request ends.
+
+The remaining work must first extend source-selected h/f plans to interactive
+provider mode. Physical interactive K must then transfer that verified slave
+into the broker's one-use selected launch, give the child a controlling
+terminal, keep the master and control server with the original root, and
+attest the broker's actual child incarnation into the fresh sidecar. The
+ordinary runtime generation registrar accepts only a local direct child;
+it cannot register the broker-forked provider. Until that broker-owned
+registration and cross-namespace observer proof exist, no live generation or
+native F claim follows from `^`.
+
 The closed private route assembles the configured first command, arguments,
 environment, cwd and stdin through the normal runtime launch path. A bare
 first command is resolved against that child's effective `PATH` for each

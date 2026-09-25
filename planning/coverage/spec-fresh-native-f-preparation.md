@@ -8,6 +8,8 @@
 - `src-tauri/src/kernel_entry.rs`
 - `src-tauri/src/main.rs`
 - `crates/oulipoly-kernel-broker/src/linux_main.rs`
+- `crates/oulipoly-kernel-broker/src/fresh_provider.rs`
+- `crates/oulipoly-kernel-broker/src/protocol.rs`
 - `crates/oulipoly-runtime/src/executor/cli/pty_broker/mod.rs`
 - `crates/oulipoly-runtime/src/executor/cli/pty_broker/tui_control.rs`
 
@@ -40,12 +42,14 @@
 ## Boundaries
 
 - Preparation does not write to the PTY, assert a provider turn, ACK F, launch headless resume, or publish an ordinary caller result.
+- Private `^` PTY handoff is earlier and nonactivating: it authenticates the original released root and selected D/account/plan, verifies a real master/slave pair, and records only `pre-k-nonactivating`. It creates no provider K, resident generation, F preparation, send, or ACK. Its durable stamp cannot attest PTY liveness after broker restart.
 - The broker attests the resident endpoint before storing an F record. The private caller helper performs adapter preflight and a typed Tail read on creation and readback. A direct broker preparation still lacks independently proven Tail provenance and is not native receipt authority.
 
 ## Declared test patterns
 
 - `crates/oulipoly-kernel-broker/tests/age319_fresh_recipient_socket.rs` exercises clean fixture preparation, readback, lost reply, restart, refusal, old WAL isolation, and pending/manual ACK separation.
 - `crates/oulipoly-kernel-broker/tests/private_root_join.rs` exercises accepted W to original-root F and repeatable refusal when the headless private K/Q route lacks a resident PTY generation and typed adapter page authority.
+- Broker unit tests exercise the challenged `^` frame and real PTY pair checks, including wrong slave, no TTY, wrong account/session, changed pair and post-K preparation refusal. They do not claim a broker-launched interactive provider.
 - PTY broker unit tests exercise both plain and TUI resident query handlers without child input.
 - Existing native page and PTY outbound tests cover the adapter Tail and transport mechanics separately; this slice does not join a physical send.
 

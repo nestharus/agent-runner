@@ -255,6 +255,11 @@ enum RequestPayload {
         descriptors: Vec<File>,
     },
     #[cfg(feature = "age319-private-broker-fixture")]
+    FreshInteractivePtyHandoff {
+        request: oulipoly_kernel_broker::protocol::PrivateFreshPtyHandoff,
+        descriptors: Vec<File>,
+    },
+    #[cfg(feature = "age319-private-broker-fixture")]
     FreshRouteRequest {
         request: oulipoly_kernel_broker::protocol::FreshRouteRequest,
         descriptors: Vec<File>,
@@ -458,6 +463,8 @@ fn recv_request(
         b'5' | b'6' | b'7' | b'8' | b'9' => (18..=2048 + 17).contains(&read),
         #[cfg(feature = "age319-private-broker-fixture")]
         b'h' | b'f' | b'm' | b'n' => (18..=48 * 1024 + 17).contains(&read),
+        #[cfg(feature = "age319-private-broker-fixture")]
+        b'^' => (18..=2048 + 17).contains(&read),
         b'F' => (18..=8192 + 17).contains(&read),
         b'O' => (18..=1024 + 17).contains(&read),
         b'U' => (18..=512 + 17).contains(&read),
@@ -483,6 +490,8 @@ fn recv_request(
             b'h' => descriptors.len() != 5,
             #[cfg(feature = "age319-private-broker-fixture")]
             b'f' => descriptors.len() != 1,
+            #[cfg(feature = "age319-private-broker-fixture")]
+            b'^' => descriptors.len() != 2,
             b'L' => !(1..=4).contains(&descriptors.len()),
             b'V' | b'S' | b's' | b'T' => descriptors.len() != 1,
             _ => !descriptors.is_empty(),
@@ -528,6 +537,11 @@ fn recv_request(
         }
         #[cfg(feature = "age319-private-broker-fixture")]
         b'h' | b'f' => RequestPayload::FreshRouteRequest {
+            request: serde_json::from_slice(&request[17..read as usize])?,
+            descriptors,
+        },
+        #[cfg(feature = "age319-private-broker-fixture")]
+        b'^' => RequestPayload::FreshInteractivePtyHandoff {
             request: serde_json::from_slice(&request[17..read as usize])?,
             descriptors,
         },
@@ -4597,24 +4611,47 @@ fn serve_fresh_v30_at(
                     }
                 }
                 #[cfg(feature = "age319-private-broker-fixture")]
-                b'5' | b'6' | b'7' | b'8' | b'9' | b'h' | b'f' | b'm' | b'n' => {
+                b'5' | b'6' | b'7' | b'8' | b'9' | b'h' | b'f' | b'm' | b'n' | b'^' => {
                     if !private_fixture() {
                         return Err(io::Error::other("fresh provider fixture route closed"));
                     }
-                    let (d_key, route_request, effect_request, descriptors) = match payload {
-                        RequestPayload::FreshProviderRequest {
-                            request,
-                            descriptors,
-                        } if request.success.is_none() => (request.d_key, None, None, descriptors),
-                        RequestPayload::FreshRouteRequest {
-                            request,
-                            descriptors,
-                        } => (request.d_key.clone(), Some(request), None, descriptors),
-                        RequestPayload::FreshAccountEffectRequest { request } => {
-                            (request.d_key.clone(), None, Some(request), Vec::new())
-                        }
-                        _ => return Err(io::Error::other("fresh provider/route request absent")),
-                    };
+                    let (d_key, route_request, effect_request, pty_request, descriptors) =
+                        match payload {
+                            RequestPayload::FreshProviderRequest {
+                                request,
+                                descriptors,
+                            } if request.success.is_none() => {
+                                (request.d_key, None, None, None, descriptors)
+                            }
+                            RequestPayload::FreshRouteRequest {
+                                request,
+                                descriptors,
+                            } => (
+                                request.d_key.clone(),
+                                Some(request),
+                                None,
+                                None,
+                                descriptors,
+                            ),
+                            RequestPayload::FreshAccountEffectRequest { request } => {
+                                (request.d_key.clone(), None, Some(request), None, Vec::new())
+                            }
+                            RequestPayload::FreshInteractivePtyHandoff {
+                                request,
+                                descriptors,
+                            } => (
+                                request.d_key.clone(),
+                                None,
+                                None,
+                                Some(request),
+                                descriptors,
+                            ),
+                            _ => {
+                                return Err(io::Error::other(
+                                    "fresh provider/route request absent",
+                                ));
+                            }
+                        };
                     let receipt = lane
                         .released_handoff_for_child(&d_key, &recipient)
                         .map_err(io::Error::other)?;
@@ -4667,6 +4704,22 @@ fn serve_fresh_v30_at(
                     let binding =
                         fresh_provider::binding_from_held(&receipt, &held, &actor, &root)?;
                     let directory = state_root.join("v30/fresh-provider");
+                    if let Some(pty_request) = pty_request {
+                        if operation != b'^' || instance.is_closed() {
+                            return Err(io::Error::other("fresh PTY handoff gate closed"));
+                        }
+                        let [master, slave]: [File; 2] = descriptors.try_into().map_err(|_| {
+                            io::Error::other("fresh PTY handoff descriptors absent")
+                        })?;
+                        fresh_provider::attest_pre_k_interactive_pty(
+                            &directory,
+                            &binding,
+                            &pty_request,
+                            &master,
+                            &slave,
+                        )?;
+                        return Ok("fresh-pty-handoff-pre-k\n".into());
+                    }
                     if let Some(route_request) = route_request {
                         let expected_pin = match &held.intent {
                             oulipoly_state::mailbox::FreshRootWorkIntent::NormalCli(args)
@@ -5931,6 +5984,99 @@ assert s.send(message) == len(message)
             *(libc::CMSG_DATA(cmsg) as *mut i32) = payload.as_raw_fd();
             assert_eq!(libc::sendmsg(client.as_raw_fd(), &message, 0), 33);
         }
+        server.join().unwrap();
+    }
+
+    #[cfg(feature = "age319-private-broker-fixture")]
+    #[test]
+    fn fresh_interactive_pty_handoff_frame_preserves_peer_and_exact_pair() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("socket");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let mut master_fd = -1;
+        let mut slave_fd = -1;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master_fd,
+                    &mut slave_fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        let master = unsafe { File::from_raw_fd(master_fd) };
+        let slave = unsafe { File::from_raw_fd(slave_fd) };
+        let request = oulipoly_kernel_broker::protocol::PrivateFreshPtyHandoff {
+            d_key: uuid::Uuid::new_v4().to_string(),
+            session_id: format!("v30:{}:{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4()),
+            account: "selected".into(),
+            plan_sha256: "a".repeat(64),
+        };
+        let expected_request = request.clone();
+        let client_master = master.try_clone().unwrap();
+        let client_slave = slave.try_clone().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let (operation, payload, peer) = peer_from_request(&mut stream).unwrap();
+            assert_eq!(operation, b'^');
+            assert_eq!(peer.process.host_pid, std::process::id() as i32);
+            let RequestPayload::FreshInteractivePtyHandoff {
+                request,
+                descriptors,
+            } = payload
+            else {
+                panic!("PTY handoff decoded as another operation");
+            };
+            assert_eq!(request.d_key, expected_request.d_key);
+            assert_eq!(request.session_id, expected_request.session_id);
+            assert_eq!(request.account, expected_request.account);
+            assert_eq!(request.plan_sha256, expected_request.plan_sha256);
+            assert_eq!(descriptors.len(), 2);
+            assert_eq!(
+                descriptors[0].metadata().unwrap().ino(),
+                master.metadata().unwrap().ino()
+            );
+            assert_eq!(
+                descriptors[1].metadata().unwrap().ino(),
+                slave.metadata().unwrap().ino()
+            );
+            stream.write_all(b"fresh-pty-handoff-pre-k\n").unwrap();
+        });
+        let mut client = UnixStream::connect(&socket).unwrap();
+        let mut challenge = [0u8; 16];
+        client.read_exact(&mut challenge).unwrap();
+        let mut frame = vec![b'^'];
+        frame.extend_from_slice(&challenge);
+        frame.extend_from_slice(&serde_json::to_vec(&request).unwrap());
+        let descriptors = [client_master.as_raw_fd(), client_slave.as_raw_fd()];
+        let mut iov = libc::iovec {
+            iov_base: frame.as_mut_ptr().cast(),
+            iov_len: frame.len(),
+        };
+        let mut control = [0u8; 64];
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = &mut iov;
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen =
+            unsafe { libc::CMSG_SPACE(std::mem::size_of_val(&descriptors) as _) } as _;
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&message);
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(&descriptors) as _) as _;
+            std::ptr::copy_nonoverlapping(descriptors.as_ptr(), libc::CMSG_DATA(cmsg).cast(), 2);
+            assert_eq!(
+                libc::sendmsg(client.as_raw_fd(), &message, 0),
+                frame.len() as isize
+            );
+        }
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert_eq!(response, "fresh-pty-handoff-pre-k\n");
         server.join().unwrap();
     }
 

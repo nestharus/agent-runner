@@ -306,6 +306,76 @@ pub fn private_fresh_provider_at(
     Ok(answer)
 }
 
+/// A pre-K PTY handoff assertion. This does not launch a provider, create a
+/// runtime generation, or authorize native F. Both descriptors must come in
+/// the challenged request from the original released Runner process.
+#[cfg(feature = "age319-private-broker-fixture")]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrivateFreshPtyHandoff {
+    pub d_key: String,
+    pub session_id: String,
+    pub account: String,
+    pub plan_sha256: String,
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+pub fn private_fresh_pty_handoff_at(
+    path: &Path,
+    request: &PrivateFreshPtyHandoff,
+    master: RawFd,
+    slave: RawFd,
+) -> io::Result<()> {
+    let id = uuid::Uuid::parse_str(&request.d_key)
+        .map_err(|_| io::Error::other("invalid PTY handoff D key"))?;
+    if id.is_nil() || id.to_string() != request.d_key {
+        return Err(io::Error::other("noncanonical PTY handoff D key"));
+    }
+    let body = serde_json::to_vec(request)?;
+    if body.len() > 2048 {
+        return Err(io::Error::other("PTY handoff request too large"));
+    }
+    let mut stream = checked_connection(path)?;
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let mut frame = Vec::with_capacity(17 + body.len());
+    frame.push(b'^');
+    frame.extend_from_slice(&challenge);
+    frame.extend_from_slice(&body);
+    let descriptors = [master, slave];
+    let mut iov = libc::iovec {
+        iov_base: frame.as_mut_ptr().cast(),
+        iov_len: frame.len(),
+    };
+    let mut control = [0u8; 64];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen =
+        unsafe { libc::CMSG_SPACE(std::mem::size_of_val(&descriptors) as _) } as usize;
+    unsafe {
+        let header = libc::CMSG_FIRSTHDR(&msg);
+        (*header).cmsg_level = libc::SOL_SOCKET;
+        (*header).cmsg_type = libc::SCM_RIGHTS;
+        (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(&descriptors) as _) as usize;
+        std::ptr::copy_nonoverlapping(descriptors.as_ptr(), libc::CMSG_DATA(header).cast(), 2);
+    }
+    if unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) }
+        != frame.len() as isize
+    {
+        return Err(io::Error::other("PTY handoff submission uncertain"));
+    }
+    let response = read_response(stream)?;
+    if response != "fresh-pty-handoff-pre-k\n" {
+        return Err(io::Error::other(format!(
+            "PTY handoff refused: {}",
+            response.trim_end()
+        )));
+    }
+    Ok(())
+}
+
 /// Register one sealed candidate plan, then durably select/read back the
 /// complete pool. The same D-bound broker socket authenticates every step.
 #[cfg(feature = "age319-private-broker-fixture")]
