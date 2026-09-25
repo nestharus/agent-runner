@@ -39,6 +39,7 @@ sections. The auditor returns the spec(s) that match.
 | `spec-event-storage.md` | Durable diagnostic event store, rotation/readers, retention policy, and detached maintenance lifecycle. |
 | `spec-kernel-broker.md` | Source-only Linux PID namespace broker, root/work identity registries, and challenged classifier. |
 | `spec-fresh-native-f-preparation.md` | Private F to resident PTY input preparation and exact readback. |
+| `spec-codex-raw-verifier.md` | Bounded synthetic Codex rollout byte check; default F/ACK stays closed. |
 
 ## Spec schema
 
