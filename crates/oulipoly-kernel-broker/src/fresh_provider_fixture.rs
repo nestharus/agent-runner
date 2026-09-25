@@ -579,8 +579,9 @@ fn main() -> std::io::Result<()> {
     );
     let quota = matches!(
         std::env::args().nth(2).as_deref(),
-        Some("--quota" | "--quota-clean")
+        Some("--quota" | "--quota-clean" | "--quota-single")
     );
+    let single_process_quota = std::env::args().nth(2).as_deref() == Some("--quota-single");
     let auth = std::env::args().nth(2).as_deref() == Some("--auth");
     let binary = std::env::args().nth(2).as_deref() == Some("--binary");
     let clean = matches!(
@@ -629,12 +630,13 @@ fn main() -> std::io::Result<()> {
                     | "--fail-clean"
                     | "--capacity"
                     | "--quota-clean"
+                    | "--quota-single"
                     | "--capacity-clean"
             ))
     {
         return Err(std::io::Error::other("provider fixture arguments changed"));
     }
-    if !clean && !binary {
+    if !clean && !binary && !single_process_quota {
         let pid = unsafe { libc::fork() };
         if pid < 0 {
             return Err(std::io::Error::last_os_error());
