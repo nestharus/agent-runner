@@ -13,6 +13,7 @@ age319-private-broker-fixture = []
 test-support = []
 
 [dependencies]
+base64 = "0.22"
 chrono.workspace = true
 ctor.workspace = true
 dirs.workspace = true

@@ -808,6 +808,14 @@ pub enum FreshRecipientRequest {
     Recover {
         delivery_request_id: String,
     },
+    /// Private, authority-neutral pre-send record. A typed Tail read must
+    /// precede this call; no PTY write or ACK is implied.
+    PrepareNativeF {
+        preparation: oulipoly_state::mailbox::FreshNativeFPrepareRequest,
+    },
+    ReadNativeFPreparation {
+        preparation_request_id: String,
+    },
     Acknowledge {
         grant_id: String,
         delivery_token: String,

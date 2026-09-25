@@ -4943,6 +4943,23 @@ fn serve_fresh_v30_at(
                                 .map_err(io::Error::other)?;
                             fresh_payload_reply("recovered_delivery", recovered)?
                         }
+                        FreshRecipientRequest::PrepareNativeF { preparation } => {
+                            if instance.is_closed() {
+                                return Err(io::Error::other("fresh recipient entry gate closed"));
+                            }
+                            let prepared = lane
+                                .prepare_native_f_input(&preparation, &recipient)
+                                .map_err(io::Error::other)?;
+                            serde_json::json!({"kind":"native_f_preparation", "preparation":prepared})
+                        }
+                        FreshRecipientRequest::ReadNativeFPreparation {
+                            preparation_request_id,
+                        } => {
+                            let prepared = lane
+                                .read_native_f_preparation(&preparation_request_id, &recipient)
+                                .map_err(io::Error::other)?;
+                            serde_json::json!({"kind":"native_f_preparation_readback", "preparation":prepared})
+                        }
                         FreshRecipientRequest::Acknowledge {
                             grant_id,
                             delivery_token,

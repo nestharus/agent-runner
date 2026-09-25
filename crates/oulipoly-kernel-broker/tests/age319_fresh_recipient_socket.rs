@@ -4,13 +4,17 @@ use base64::Engine as _;
 use oulipoly_kernel_broker::identity::PinnedProcess;
 use oulipoly_kernel_broker::protocol::{FreshRecipientRequest, fresh_recipient_request_at};
 use oulipoly_state::StateDb;
-use oulipoly_state::mailbox::{FreshRecipientIdentity, FreshV30Lane, MailboxDb};
+use oulipoly_state::mailbox::{
+    BindRuntimeGenerationRunning, BrokerSidecar, CreateRuntimeGeneration,
+    FreshNativeFPrepareRequest, FreshRecipientIdentity, FreshV30Lane, MailboxDb,
+    RuntimeGenerationFence, RuntimeGenerationId,
+};
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
@@ -179,6 +183,165 @@ fn private_fresh_recipient_delivery_ack_collision_and_restart() {
         .as_str()
         .unwrap()
         .to_string();
+    let generation_id = RuntimeGenerationId::new();
+    let control = private.path().join("native-f-control.sock");
+    let invocation = uuid::Uuid::new_v4().to_string();
+    let mut runtime =
+        BrokerSidecar::open_existing(&sidecar_path, &broker_root.join("v30")).unwrap();
+    runtime
+        .mailbox_mut()
+        .runtime_lifecycle()
+        .create_runtime_generation(CreateRuntimeGeneration {
+            generation_id: &generation_id,
+            spawn_invocation_uuid: &invocation,
+            session_id: Some(&session.session_id),
+            runtime_mode: "pty_interactive",
+            provider_name: "fixture-provider",
+            model_name: None,
+            pty_control_path: control.to_str(),
+            models_dir: None,
+            effective_cwd: None,
+        })
+        .unwrap();
+    let live =
+        oulipoly_state::pid_identity::read_live_process_identity(i64::from(std::process::id()))
+            .unwrap()
+            .unwrap();
+    runtime
+        .mailbox_mut()
+        .runtime_lifecycle()
+        .bind_runtime_generation_running(BindRuntimeGenerationRunning {
+            fence: RuntimeGenerationFence {
+                generation_id: &generation_id,
+                spawn_invocation_uuid: &invocation,
+            },
+            spawned_os_pid: live.os_pid,
+            exact_process_identity: &live,
+            os_pgid: None,
+        })
+        .unwrap();
+    drop(runtime);
+    let preparation = FreshNativeFPrepareRequest {
+        preparation_request_id: uuid::Uuid::new_v4().to_string(),
+        delivery_request_id: first_request.clone(),
+        grant_id: first_id.clone(),
+        delivery_token: first_token.clone(),
+        runtime_generation_id: generation_id.to_string(),
+        provider_instance_id: "fixture-instance".into(),
+        settings_id: "fixture-settings".into(),
+        envelope_nonce: uuid::Uuid::new_v4().to_string(),
+        tail_resume_token: "typed-tail-token".into(),
+    };
+    let prepare = |input: FreshNativeFPrepareRequest| {
+        fresh_recipient_request_at(
+            &socket,
+            &FreshRecipientRequest::PrepareNativeF { preparation: input },
+        )
+    };
+    let mut bad = preparation.clone();
+    bad.tail_resume_token.clear();
+    assert!(prepare(bad).is_err(), "missing Tail anchor must refuse");
+    let mut bad = preparation.clone();
+    bad.runtime_generation_id = uuid::Uuid::new_v4().to_string();
+    assert!(prepare(bad).is_err(), "wrong generation must refuse");
+    let mut bad = preparation.clone();
+    bad.delivery_token = uuid::Uuid::new_v4().to_string();
+    assert!(prepare(bad).is_err(), "wrong F token must refuse");
+    assert!(
+        prepare(preparation.clone()).is_err(),
+        "absent PTY socket must refuse"
+    );
+    let _control = UnixListener::bind(&control).unwrap();
+    drop_reply(
+        &socket,
+        &FreshRecipientRequest::PrepareNativeF {
+            preparation: preparation.clone(),
+        },
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let prepared = loop {
+        let read = fresh_recipient_request_at(
+            &socket,
+            &FreshRecipientRequest::ReadNativeFPreparation {
+                preparation_request_id: preparation.preparation_request_id.clone(),
+            },
+        )
+        .unwrap();
+        if !read["preparation"].is_null() {
+            break read;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "lost preparation reply had no durable readback"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(prepared["kind"], "native_f_preparation_readback");
+    let record = &prepared["preparation"];
+    assert_eq!(record["grant_id"], first_id);
+    assert_eq!(record["session_id"], session.session_id);
+    assert_eq!(record["source_id"], source_id);
+    assert_eq!(
+        record["payload_sha256"],
+        format!("{:x}", Sha256::digest(payloads[0]))
+    );
+    assert_eq!(record["runtime_generation_id"], generation_id.to_string());
+    assert_eq!(record["tail_resume_token"], "typed-tail-token");
+    let envelope = record["envelope_text"].as_str().unwrap();
+    assert!(envelope.contains(&preparation.envelope_nonce));
+    assert_eq!(
+        record["envelope_sha256"],
+        format!("{:x}", Sha256::digest(envelope.as_bytes()))
+    );
+    let read_prepared = fresh_recipient_request_at(
+        &socket,
+        &FreshRecipientRequest::ReadNativeFPreparation {
+            preparation_request_id: preparation.preparation_request_id.clone(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_vec(&read_prepared["preparation"]).unwrap(),
+        serde_json::to_vec(record).unwrap()
+    );
+    assert_eq!(
+        prepare(preparation.clone()).unwrap()["preparation"],
+        record.clone()
+    );
+    let mut bad = preparation.clone();
+    bad.tail_resume_token = "changed-tail".into();
+    assert!(prepare(bad).is_err(), "changed Tail anchor must refuse");
+    let mut bad = preparation.clone();
+    bad.provider_instance_id = "different-instance".into();
+    assert!(prepare(bad).is_err(), "changed endpoint must refuse");
+    assert_ne!(first_recovery["grant"]["phase"], "acked");
+    assert!(
+        fresh
+            .query_row(
+                "SELECT delivered_at IS NULL FROM mailbox WHERE seq=?1",
+                [seqs[0]],
+                |r| r.get::<_, bool>(0)
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        fresh
+            .query_row(
+                "SELECT count(*) FROM fresh_recipient_ack_evidence",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        Connection::open(broker_root.join("v30/state.db"))
+            .unwrap()
+            .query_row("SELECT count(*) FROM fresh_root_publication", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
     assert_eq!(
         base64::engine::general_purpose::STANDARD
             .decode(first_recovery["payload_base64"].as_str().unwrap())
@@ -204,6 +367,14 @@ fn private_fresh_recipient_delivery_ack_collision_and_restart() {
         .env("AGE319_FRESH_REQUEST", &first_request)
         .env("AGE319_FRESH_GRANT", &first_id)
         .env("AGE319_FRESH_TOKEN", &first_token)
+        .env(
+            "AGE319_FRESH_PREPARATION",
+            &preparation.preparation_request_id,
+        )
+        .env(
+            "AGE319_FRESH_PREP_REQUEST",
+            serde_json::to_string(&preparation).unwrap(),
+        )
         .status()
         .unwrap();
     assert!(wrong.success());
@@ -220,6 +391,17 @@ fn private_fresh_recipient_delivery_ack_collision_and_restart() {
     broker.kill().unwrap();
     broker.wait().unwrap();
     broker = start_broker(&broker_root, &socket, &runner);
+    let restarted_preparation = fresh_recipient_request_at(
+        &socket,
+        &FreshRecipientRequest::ReadNativeFPreparation {
+            preparation_request_id: preparation.preparation_request_id.clone(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_vec(&restarted_preparation["preparation"]).unwrap(),
+        serde_json::to_vec(record).unwrap()
+    );
     let recovered = fresh_recipient_request_at(
         &socket,
         &FreshRecipientRequest::Read {
@@ -285,6 +467,60 @@ fn private_fresh_recipient_delivery_ack_collision_and_restart() {
         assert_eq!(response["grant"]["seq"].as_i64(), Some(*seq));
         next.push(response["grant"].clone());
     }
+    let mut duplicate_nonce = preparation.clone();
+    duplicate_nonce.preparation_request_id = uuid::Uuid::new_v4().to_string();
+    // The grant readback intentionally omits the request ID. Recover the
+    // fixture's exact second grant key from its immutable row for this check.
+    duplicate_nonce.delivery_request_id = fresh
+        .query_row(
+            "SELECT delivery_request_id FROM fresh_recipient_grant WHERE grant_id=?1",
+            [next[0]["grant_id"].as_str().unwrap()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    duplicate_nonce.grant_id = next[0]["grant_id"].as_str().unwrap().into();
+    duplicate_nonce.delivery_token = next[0]["delivery_token"].as_str().unwrap().into();
+    assert!(
+        prepare(duplicate_nonce).is_err(),
+        "same nonce with different W envelope must refuse"
+    );
+    fresh
+        .execute(
+            "INSERT INTO runtime_generation
+         (generation_uuid,lifecycle_state,spawn_invocation_uuid,session_id,
+          runtime_mode,provider_name,pty_control_path,created_at)
+         VALUES(?1,'starting',?2,?3,'pty_interactive','other-provider',?4,
+                '2026-09-24T00:00:00Z')",
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                uuid::Uuid::new_v4().to_string(),
+                session.session_id,
+                control.to_str().unwrap()
+            ],
+        )
+        .unwrap();
+    let mut ambiguous = preparation.clone();
+    ambiguous.preparation_request_id = uuid::Uuid::new_v4().to_string();
+    ambiguous.envelope_nonce = uuid::Uuid::new_v4().to_string();
+    ambiguous.delivery_request_id = fresh
+        .query_row(
+            "SELECT delivery_request_id FROM fresh_recipient_grant WHERE grant_id=?1",
+            [next[0]["grant_id"].as_str().unwrap()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    ambiguous.grant_id = next[0]["grant_id"].as_str().unwrap().into();
+    ambiguous.delivery_token = next[0]["delivery_token"].as_str().unwrap().into();
+    assert!(
+        prepare(ambiguous).is_err(),
+        "ambiguous resident generation must refuse"
+    );
+    fs::remove_file(&control).unwrap();
+    assert_eq!(
+        prepare(preparation.clone()).unwrap()["preparation"],
+        record.clone(),
+        "same-key recovery after restart must not select a replacement endpoint"
+    );
     let delegation_file = private.path().join("delegation");
     let result_file = private.path().join("result");
     let mut delegate = Command::new(&runner)
@@ -679,6 +915,25 @@ fn wrong_recipient_child() {
     let request = std::env::var("AGE319_FRESH_REQUEST").unwrap();
     let grant = std::env::var("AGE319_FRESH_GRANT").unwrap();
     let token = std::env::var("AGE319_FRESH_TOKEN").unwrap();
+    let preparation = std::env::var("AGE319_FRESH_PREPARATION").unwrap();
+    let forged: FreshNativeFPrepareRequest =
+        serde_json::from_str(&std::env::var("AGE319_FRESH_PREP_REQUEST").unwrap()).unwrap();
+    assert!(
+        fresh_recipient_request_at(
+            Path::new(&socket),
+            &FreshRecipientRequest::PrepareNativeF {
+                preparation: forged
+            }
+        )
+        .is_err()
+    );
+    let denied = fresh_recipient_request_at(
+        Path::new(&socket),
+        &FreshRecipientRequest::ReadNativeFPreparation {
+            preparation_request_id: preparation,
+        },
+    );
+    assert!(denied.is_err() || denied.unwrap()["preparation"].is_null());
     assert!(
         fresh_recipient_request_at(
             Path::new(&socket),
