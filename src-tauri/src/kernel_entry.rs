@@ -1197,30 +1197,58 @@ fn private_run_account_effect(
     request: &oulipoly_kernel_broker::protocol::FreshAccountEffectRequest,
 ) -> Result<oulipoly_kernel_broker::protocol::FreshAccountEffectReadback, String> {
     use oulipoly_kernel_broker::protocol;
-    let started = protocol::private_fresh_account_effect_at(socket, request, true)
-        .or_else(|_| protocol::private_fresh_account_effect_at(socket, request, false))
-        .map_err(|e| {
-            private_account_effect_unknown(
-                handoff_id,
-                request,
-                None,
-                "begin/readback",
-                &e.to_string(),
-            )
-        })?;
-    let mut effect = started;
-    while effect.state == "pending" {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        effect =
+    let restart_probe = std::env::var("AGE319_PRIVATE_JOIN_MODE").ok().as_deref()
+        == Some("normal_model_provider_v3_quota_restart");
+    let restart_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let started = match protocol::private_fresh_account_effect_at(socket, request, true) {
+        Ok(started) => started,
+        Err(_) if restart_probe => loop {
+            match protocol::private_fresh_account_effect_at(socket, request, false) {
+                Ok(observed) => break observed,
+                Err(_) if std::time::Instant::now() < restart_deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Err(e) => {
+                    return Err(private_account_effect_unknown(
+                        handoff_id,
+                        request,
+                        None,
+                        "begin/readback",
+                        &e.to_string(),
+                    ));
+                }
+            }
+        },
+        Err(_) => {
             protocol::private_fresh_account_effect_at(socket, request, false).map_err(|e| {
                 private_account_effect_unknown(
                     handoff_id,
                     request,
-                    Some(&effect),
-                    "Q readback",
+                    None,
+                    "begin/readback",
                     &e.to_string(),
                 )
-            })?;
+            })?
+        }
+    };
+    let mut effect = started;
+    while effect.state == "pending" {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        effect = match protocol::private_fresh_account_effect_at(socket, request, false) {
+            Ok(observed) => observed,
+            Err(_) if restart_probe && std::time::Instant::now() < restart_deadline => continue,
+            Err(e) => {
+                return Err({
+                    private_account_effect_unknown(
+                        handoff_id,
+                        request,
+                        Some(&effect),
+                        "Q readback",
+                        &e.to_string(),
+                    )
+                });
+            }
+        };
     }
     if effect.state != "drained" {
         return Err(private_account_effect_unknown(

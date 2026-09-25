@@ -60,15 +60,25 @@ impl Drop for SnapshotRestore {
 
 fn inner() {
     let mode = std::env::var("AGE319_PRIVATE_JOIN_MODE").unwrap_or_else(|_| "help".into());
+    let v3_quota = mode.starts_with("normal_model_provider_v3_quota");
+    let v3_mode = mode == "normal_model_provider_v3_closed" || v3_quota;
     let provider_mode = mode.starts_with("normal_model_provider");
-    let provider_negative = matches!(
-        mode.as_str(),
-        "normal_model_provider_bad_config"
-            | "normal_model_provider_unsupported"
-            | "normal_model_provider_v3_closed"
-            | "normal_model_provider_quota"
-            | "normal_model_provider_auth"
-    );
+    let provider_negative = v3_quota
+        || matches!(
+            mode.as_str(),
+            "normal_model_provider_bad_config"
+                | "normal_model_provider_unsupported"
+                | "normal_model_provider_v3_closed"
+                | "normal_model_provider_v3_quota"
+                | "normal_model_provider_v3_quota_reply_loss"
+                | "normal_model_provider_v3_quota_post_k"
+                | "normal_model_provider_v3_quota_restart"
+                | "normal_model_provider_v3_quota_invalid"
+                | "normal_model_provider_v3_quota_full"
+                | "normal_model_provider_v3_quota_stale"
+                | "normal_model_provider_quota"
+                | "normal_model_provider_auth"
+        );
     let model_mode = mode == "normal_model_held" || provider_mode;
     let native_mode = mode.starts_with("native_");
     let native_live = matches!(
@@ -77,33 +87,36 @@ fn inner() {
     );
     let release_mode = mode.starts_with("held_release") || native_mode;
     let normal_mode = mode.starts_with("normal_");
-    let handoff_mode = matches!(
-        mode.as_str(),
-        "normal_handoff"
-            | "normal_handoff_bash_child"
-            | "normal_handoff_fsync"
-            | "normal_handoff_effect_reply_loss"
-            | "normal_help"
-            | "normal_model_held"
-            | "normal_model_provider"
-            | "normal_model_provider_reply_loss"
-            | "normal_model_provider_q_reply_loss"
-            | "normal_model_provider_restart"
-            | "normal_model_provider_bad_config"
-            | "normal_model_provider_unsupported"
-            | "normal_model_provider_v3_closed"
-            | "normal_model_provider_quota"
-            | "normal_model_provider_auth"
-            | "normal_model_provider_auth_recovery"
-            | "normal_model_provider_auth_after_healthy"
-            | "normal_model_provider_auth_success"
-            | "normal_model_provider_auth_reply_loss"
-            | "normal_model_provider_auth_restart"
-            | "normal_model_provider_quota_available"
-            | "normal_model_provider_quota_reply_loss"
-            | "normal_model_provider_quota_restart"
-            | "normal_model_provider_no_pin"
-    );
+    let handoff_mode = v3_quota
+        || matches!(
+            mode.as_str(),
+            "normal_handoff"
+                | "normal_handoff_bash_child"
+                | "normal_handoff_fsync"
+                | "normal_handoff_effect_reply_loss"
+                | "normal_help"
+                | "normal_model_held"
+                | "normal_model_provider"
+                | "normal_model_provider_reply_loss"
+                | "normal_model_provider_q_reply_loss"
+                | "normal_model_provider_restart"
+                | "normal_model_provider_bad_config"
+                | "normal_model_provider_unsupported"
+                | "normal_model_provider_v3_closed"
+                | "normal_model_provider_v3_quota"
+                | "normal_model_provider_v3_quota_restart"
+                | "normal_model_provider_quota"
+                | "normal_model_provider_auth"
+                | "normal_model_provider_auth_recovery"
+                | "normal_model_provider_auth_after_healthy"
+                | "normal_model_provider_auth_success"
+                | "normal_model_provider_auth_reply_loss"
+                | "normal_model_provider_auth_restart"
+                | "normal_model_provider_quota_available"
+                | "normal_model_provider_quota_reply_loss"
+                | "normal_model_provider_quota_restart"
+                | "normal_model_provider_no_pin"
+        );
     let recipient_mode = mode.starts_with("normal_recipient");
     let real_source = mode.starts_with("normal_bash_source");
     let nonzero_source = mode == "normal_bash_source_nonzero";
@@ -145,21 +158,35 @@ fn inner() {
         } else {
             ""
         };
-        let quota = if matches!(
-            mode.as_str(),
-            "normal_model_provider_quota_available"
-                | "normal_model_provider_quota_reply_loss"
-                | "normal_model_provider_quota_restart"
-        ) {
-            fs::write(
-                gate.join("quota.json"),
-                br#"{"used_percent":20,"resets_at":"2099-01-01T00:00:00Z"}"#,
-            )
-            .unwrap();
-            format!(
-                "quota_script = 'cat {}'\n",
-                gate.join("quota.json").display()
-            )
+        let quota = if v3_quota
+            || matches!(
+                mode.as_str(),
+                "normal_model_provider_quota_available"
+                    | "normal_model_provider_quota_reply_loss"
+                    | "normal_model_provider_quota_restart"
+            ) {
+            let quota_bytes: &[u8] = match mode.as_str() {
+                "normal_model_provider_v3_quota_invalid" => b"invalid quota",
+                "normal_model_provider_v3_quota_full" => {
+                    br#"{"used_percent":100,"resets_at":"2099-01-01T00:00:00Z"}"#
+                }
+                "normal_model_provider_v3_quota_stale" => {
+                    br#"{"used_percent":20,"resets_at":"2020-01-01T00:00:00Z"}"#
+                }
+                _ => br#"{"used_percent":20,"resets_at":"2099-01-01T00:00:00Z"}"#,
+            };
+            fs::write(gate.join("quota.json"), quota_bytes).unwrap();
+            if mode == "normal_model_provider_v3_quota_restart" {
+                format!(
+                    "quota_script = 'printf x > {0}/started-quota; while ! test -e {0}/finish-quota; do sleep 0.05; done; cat {0}/quota.json'\n",
+                    gate.display()
+                )
+            } else {
+                format!(
+                    "quota_script = 'cat {}'\n",
+                    gate.join("quota.json").display()
+                )
+            }
         } else if mode == "normal_model_provider_quota" {
             "quota_script = \"quota-must-not-run\"\n".into()
         } else if mode == "normal_model_provider_auth_after_healthy" {
@@ -406,7 +433,7 @@ fn inner() {
     if handoff_mode {
         FreshV30Lane::initialize_at(&broker_state).unwrap();
     }
-    if mode == "normal_model_provider_v3_closed" {
+    if v3_mode {
         let mut bootstrap = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
             .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
             .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
@@ -447,11 +474,11 @@ fn inner() {
                 .map(|path| ("OULIPOLY_KERNEL_BROKER_FIXTURE_BASH_V1", path)),
         )
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
-        .envs((mode == "normal_model_provider_v3_closed").then_some((
+        .envs(v3_mode.then_some((
             "OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_READBACK_V3_V1",
             "1",
         )))
-        .envs((mode == "normal_model_provider_v3_closed").then_some((
+        .envs(v3_mode.then_some((
             "OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_READBACK_V3_SOURCE_V1",
             config_home.join("oulipoly-agent-runner").to_str().unwrap(),
         )))
@@ -462,7 +489,9 @@ fn inner() {
         .envs(
             matches!(
                 mode.as_str(),
-                "normal_model_provider_quota_reply_loss" | "normal_model_provider_auth_reply_loss"
+                "normal_model_provider_quota_reply_loss"
+                    | "normal_model_provider_auth_reply_loss"
+                    | "normal_model_provider_v3_quota_reply_loss"
             )
             .then_some((
                 "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_ACCOUNT_EFFECT_REPLY_V1",
@@ -470,6 +499,12 @@ fn inner() {
             )),
         )
         .envs(native_mode.then_some(("OULIPOLY_KERNEL_BROKER_FIXTURE_NATIVE_GATE_V1", &gate)))
+        .envs(
+            (mode == "normal_model_provider_v3_quota_post_k").then_some((
+                "OULIPOLY_KERNEL_BROKER_FIXTURE_FAIL_QUOTA_POST_K_CAS_V3_V1",
+                "1",
+            )),
+        )
         .envs(
             (mode == "held_release_gate_fail")
                 .then_some(("OULIPOLY_KERNEL_BROKER_FIXTURE_FAIL_GATE_WRITE_V1", "1")),
@@ -483,14 +518,14 @@ fn inner() {
         .spawn()
         .unwrap();
     eventually(|| {
-        (if mode == "normal_model_provider_v3_closed" {
+        (if v3_mode {
             UnixStream::connect(&socket).is_ok()
         } else {
             socket.exists()
         }) || broker.try_wait().unwrap().is_some()
     });
     assert!(
-        if mode == "normal_model_provider_v3_closed" {
+        if v3_mode {
             broker.try_wait().unwrap().is_none() && UnixStream::connect(&socket).is_ok()
         } else {
             socket.exists()
@@ -1022,31 +1057,34 @@ fn inner() {
                 stop(&mut broker);
                 return;
             }
-            if matches!(
-                mode.as_str(),
-                "normal_handoff"
-                    | "normal_handoff_effect_reply_loss"
-                    | "normal_help"
-                    | "normal_model_held"
-                    | "normal_model_provider"
-                    | "normal_model_provider_reply_loss"
-                    | "normal_model_provider_q_reply_loss"
-                    | "normal_model_provider_restart"
-                    | "normal_model_provider_bad_config"
-                    | "normal_model_provider_unsupported"
-                    | "normal_model_provider_v3_closed"
-                    | "normal_model_provider_quota"
-                    | "normal_model_provider_auth"
-                    | "normal_model_provider_auth_recovery"
-                    | "normal_model_provider_auth_after_healthy"
-                    | "normal_model_provider_auth_success"
-                    | "normal_model_provider_auth_reply_loss"
-                    | "normal_model_provider_auth_restart"
-                    | "normal_model_provider_quota_available"
-                    | "normal_model_provider_quota_reply_loss"
-                    | "normal_model_provider_quota_restart"
-                    | "normal_model_provider_no_pin"
-            ) {
+            if v3_quota
+                || matches!(
+                    mode.as_str(),
+                    "normal_handoff"
+                        | "normal_handoff_effect_reply_loss"
+                        | "normal_help"
+                        | "normal_model_held"
+                        | "normal_model_provider"
+                        | "normal_model_provider_reply_loss"
+                        | "normal_model_provider_q_reply_loss"
+                        | "normal_model_provider_restart"
+                        | "normal_model_provider_bad_config"
+                        | "normal_model_provider_unsupported"
+                        | "normal_model_provider_v3_closed"
+                        | "normal_model_provider_v3_quota"
+                        | "normal_model_provider_quota"
+                        | "normal_model_provider_auth"
+                        | "normal_model_provider_auth_recovery"
+                        | "normal_model_provider_auth_after_healthy"
+                        | "normal_model_provider_auth_success"
+                        | "normal_model_provider_auth_reply_loss"
+                        | "normal_model_provider_auth_restart"
+                        | "normal_model_provider_quota_available"
+                        | "normal_model_provider_quota_reply_loss"
+                        | "normal_model_provider_quota_restart"
+                        | "normal_model_provider_no_pin"
+                )
+            {
                 let marker: serde_json::Value =
                     serde_json::from_slice(&fs::read(gate.join("child-handoff")).unwrap()).unwrap();
                 let receipt: oulipoly_state::mailbox::FreshReleasedHandoff =
@@ -1327,11 +1365,11 @@ fn inner() {
                     .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
                     .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
                     .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
-                    .envs((mode == "normal_model_provider_v3_closed").then_some((
+                    .envs(v3_mode.then_some((
                         "OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_READBACK_V3_V1",
                         "1",
                     )))
-                    .envs((mode == "normal_model_provider_v3_closed").then_some((
+                    .envs(v3_mode.then_some((
                         "OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_READBACK_V3_SOURCE_V1",
                         config_home.join("oulipoly-agent-runner").to_str().unwrap(),
                     )))
@@ -1340,8 +1378,19 @@ fn inner() {
                         "1",
                     )))
                     .envs(
-                        (mode == "normal_model_provider_quota_reply_loss").then_some((
+                        matches!(
+                            mode.as_str(),
+                            "normal_model_provider_quota_reply_loss"
+                                | "normal_model_provider_v3_quota_reply_loss"
+                        )
+                        .then_some((
                             "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_ACCOUNT_EFFECT_REPLY_V1",
+                            "1",
+                        )),
+                    )
+                    .envs(
+                        (mode == "normal_model_provider_v3_quota_post_k").then_some((
+                            "OULIPOLY_KERNEL_BROKER_FIXTURE_FAIL_QUOTA_POST_K_CAS_V3_V1",
                             "1",
                         )),
                     )
@@ -1391,32 +1440,159 @@ fn inner() {
                 let v29_wal = historical_data.join("pid-identity.db-wal");
                 let v29_wal_before = fs::read(&v29_wal).ok();
                 fs::write(gate.join("child-effect"), b"yes").unwrap();
+                if mode == "normal_model_provider_v3_quota_restart" {
+                    let effect_dir = broker_state
+                        .join("v30/fresh-provider/account-effects")
+                        .join(format!("{}-1-quota-first", receipt.handoff_id));
+                    eventually(|| {
+                        effect_dir.exists()
+                            && fs::read_dir(&effect_dir)
+                                .unwrap()
+                                .filter_map(Result::ok)
+                                .any(|entry| {
+                                    entry
+                                        .file_name()
+                                        .to_string_lossy()
+                                        .ends_with(".consumed.json")
+                                })
+                            && gate.join("started-quota").exists()
+                    });
+                    assert!(!effect_dir.join("result.json").exists());
+                    stop(&mut broker);
+                    let restart_log = temp.path().join("v3-quota-inflight-restart.log");
+                    broker = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
+                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
+                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
+                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+                        .env(
+                            "OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_READBACK_V3_V1",
+                            "1",
+                        )
+                        .env(
+                            "OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_READBACK_V3_SOURCE_V1",
+                            config_home.join("oulipoly-agent-runner"),
+                        )
+                        .stderr(Stdio::from(File::create(&restart_log).unwrap()))
+                        .spawn()
+                        .unwrap();
+                    let fresh_socket = socket.with_file_name("v30.sock");
+                    eventually(|| {
+                        protocol::request_at(&fresh_socket, Operation::ObserveEntryGate).is_ok()
+                            || broker.try_wait().unwrap().is_some()
+                    });
+                    assert!(
+                        protocol::request_at(&fresh_socket, Operation::ObserveEntryGate).is_ok(),
+                        "v3 pending quota restart refused: {}",
+                        fs::read_to_string(&restart_log).unwrap()
+                    );
+                    fs::write(gate.join("finish-quota"), b"yes").unwrap();
+                }
                 if provider_negative {
                     eventually(|| entry.try_wait().unwrap().is_some());
                     assert!(!entry.wait().unwrap().success());
                     let stderr = fs::read_to_string(&err).unwrap();
-                    let reason = match mode.as_str() {
-                        "normal_model_provider_bad_config" => {
-                            "fresh provider \"local\" absent before K"
+                    let reason = if mode == "normal_model_provider_v3_quota_post_k" {
+                        "fresh account effect unknown"
+                    } else if v3_quota {
+                        "v3 route, auth/manual, cancellation and provider K writers are closed"
+                    } else {
+                        match mode.as_str() {
+                            "normal_model_provider_bad_config" => {
+                                "fresh provider \"local\" absent before K"
+                            }
+                            "normal_model_provider_unsupported" => {
+                                "fresh pool has incompatible prompt modes before K"
+                            }
+                            "normal_model_provider_v3_closed" => {
+                                "v3 route, auth/manual, cancellation and provider K writers are closed"
+                            }
+                            "normal_model_provider_quota" => {
+                                "fresh route has no eligible account or pin"
+                            }
+                            "normal_model_provider_auth" => {
+                                "fresh route has no eligible account or pin"
+                            }
+                            _ => unreachable!(),
                         }
-                        "normal_model_provider_unsupported" => {
-                            "fresh pool has incompatible prompt modes before K"
-                        }
-                        "normal_model_provider_v3_closed" => {
-                            "v3 route, account effect, cancellation and physical K writers are closed"
-                        }
-                        "normal_model_provider_quota" => {
-                            "fresh route has no eligible account or pin"
-                        }
-                        "normal_model_provider_auth" => {
-                            "fresh route has no eligible account or pin"
-                        }
-                        _ => unreachable!(),
                     };
-                    assert!(stderr.contains(reason), "{stderr}");
+                    assert!(
+                        stderr.contains(reason),
+                        "runner: {stderr}; broker status: {:?}; broker: {}; restarted: {}",
+                        broker.try_wait().unwrap(),
+                        fs::read_to_string(&broker_log).unwrap(),
+                        fs::read_to_string(temp.path().join("handoff-restart.log")).unwrap()
+                    );
                     assert!(!gate.join("provider-effect").exists());
                     assert!(!gate.join("provider-runtime-result").exists());
                     let provider_dir = broker_state.join("v30/fresh-provider");
+                    if v3_quota {
+                        let effect_dir = provider_dir
+                            .join("account-effects")
+                            .join(format!("{}-1-quota-first", receipt.handoff_id));
+                        let intent: serde_json::Value = serde_json::from_slice(
+                            &fs::read(effect_dir.join("intent.json")).unwrap(),
+                        )
+                        .unwrap();
+                        if mode != "normal_model_provider_v3_quota_post_k" {
+                            let result: serde_json::Value = serde_json::from_slice(
+                                &fs::read(effect_dir.join("result.json")).unwrap(),
+                            )
+                            .unwrap();
+                            assert_eq!(result["effect_id"], intent["id"]);
+                            assert_eq!(
+                                result["outcome"],
+                                if mode == "normal_model_provider_v3_quota_invalid" {
+                                    "invalid"
+                                } else {
+                                    "valid_windows"
+                                }
+                            );
+                            assert_eq!(result["state"], "drained");
+                            if mode == "normal_model_provider_v3_quota_full" {
+                                assert_eq!(
+                                    result["windows"][0]["used_percent"].as_f64(),
+                                    Some(100.0)
+                                );
+                            }
+                            if mode == "normal_model_provider_v3_quota_stale" {
+                                assert_eq!(
+                                    result["windows"][0]["resets_at"],
+                                    "2020-01-01T00:00:00Z"
+                                );
+                            }
+                        } else {
+                            assert!(!effect_dir.join("result.json").exists());
+                        }
+                        assert_eq!(
+                            fs::read_dir(&effect_dir)
+                                .unwrap()
+                                .filter_map(Result::ok)
+                                .filter(|entry| entry
+                                    .file_name()
+                                    .to_string_lossy()
+                                    .ends_with(".consumed.json"))
+                                .count(),
+                            1,
+                            "v3 quota probe spent more than one K"
+                        );
+                        assert_eq!(
+                            fs::read_dir(&effect_dir)
+                                .unwrap()
+                                .filter_map(Result::ok)
+                                .filter(|entry| entry
+                                    .file_name()
+                                    .to_string_lossy()
+                                    .ends_with(".drain.json"))
+                                .count(),
+                            usize::from(mode != "normal_model_provider_v3_quota_post_k"),
+                            "v3 quota Q state differs"
+                        );
+                        assert!(provider_dir.join("index-v1/manifest.json").exists());
+                        if mode == "normal_model_provider_v3_quota_reply_loss" {
+                            assert!(gate.join("account-effect-reply-dropped").exists());
+                        }
+                    }
                     assert!(
                         !provider_dir
                             .join(format!("{}.fresh-grant.json", receipt.handoff_id))
@@ -1428,6 +1604,13 @@ fn inner() {
                         "normal_model_provider_quota"
                             | "normal_model_provider_auth"
                             | "normal_model_provider_v3_closed"
+                            | "normal_model_provider_v3_quota"
+                            | "normal_model_provider_v3_quota_reply_loss"
+                            | "normal_model_provider_v3_quota_post_k"
+                            | "normal_model_provider_v3_quota_restart"
+                            | "normal_model_provider_v3_quota_invalid"
+                            | "normal_model_provider_v3_quota_full"
+                            | "normal_model_provider_v3_quota_stale"
                     ) {
                         assert_eq!(
                             fs::read_dir(&provider_dir).unwrap().count(),
@@ -1439,6 +1622,52 @@ fn inner() {
                     assert_eq!(fs::read(&old_wal_path).ok(), old_wal_before);
                     assert_eq!(fs::read(&historical_sidecar).unwrap(), v29_main_before);
                     assert_eq!(fs::read(&v29_wal).ok(), v29_wal_before);
+                    if v3_quota {
+                        stop(&mut broker);
+                        let restart_log = temp.path().join("v3-quota-restart.log");
+                        broker = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
+                            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
+                            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
+                            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+                            .env(
+                                "OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_READBACK_V3_V1",
+                                "1",
+                            )
+                            .env(
+                                "OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_READBACK_V3_SOURCE_V1",
+                                config_home.join("oulipoly-agent-runner"),
+                            )
+                            .stderr(Stdio::from(File::create(&restart_log).unwrap()))
+                            .spawn()
+                            .unwrap();
+                        let fresh_socket = socket.with_file_name("v30.sock");
+                        eventually(|| {
+                            protocol::request_at(&fresh_socket, Operation::ObserveEntryGate).is_ok()
+                                || broker.try_wait().unwrap().is_some()
+                        });
+                        assert!(
+                            protocol::request_at(&fresh_socket, Operation::ObserveEntryGate)
+                                .is_ok(),
+                            "v3 quota restart refused: {}",
+                            fs::read_to_string(&restart_log).unwrap()
+                        );
+                        let effect_dir = provider_dir
+                            .join("account-effects")
+                            .join(format!("{}-1-quota-first", receipt.handoff_id));
+                        assert_eq!(
+                            fs::read_dir(&effect_dir)
+                                .unwrap()
+                                .filter_map(Result::ok)
+                                .filter(|entry| entry
+                                    .file_name()
+                                    .to_string_lossy()
+                                    .ends_with(".consumed.json"))
+                                .count(),
+                            1,
+                            "v3 quota restart replayed physical K"
+                        );
+                    }
                     stop(&mut broker);
                     return;
                 }
@@ -4112,6 +4341,13 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_model_provider_bad_config",
         "normal_model_provider_unsupported",
         "normal_model_provider_v3_closed",
+        "normal_model_provider_v3_quota",
+        "normal_model_provider_v3_quota_reply_loss",
+        "normal_model_provider_v3_quota_post_k",
+        "normal_model_provider_v3_quota_restart",
+        "normal_model_provider_v3_quota_invalid",
+        "normal_model_provider_v3_quota_full",
+        "normal_model_provider_v3_quota_stale",
         "normal_model_provider_quota",
         "normal_model_provider_auth",
         "normal_model_provider_auth_recovery",

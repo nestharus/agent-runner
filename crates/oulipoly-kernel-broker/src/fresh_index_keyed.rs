@@ -423,11 +423,14 @@ impl KeyedAccountStore {
             let pointer = self
                 .pointer(&known.class, &known.key, &root)?
                 .ok_or_else(|| corrupt("keyed admission pointer absent"))?;
-            self.object(&PointerChange {
-                class: known.class,
-                key: known.key,
+            let object = self.object(&PointerChange {
+                class: known.class.clone(),
+                key: known.key.clone(),
                 pointer,
             })?;
+            if object.value.is_none() {
+                keys.remove(&(known.class, known.key));
+            }
         }
         Ok(keys)
     }

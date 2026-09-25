@@ -96,6 +96,19 @@ pub(super) fn v3_effect_physical_readback(
     let readback = effect_readback_from_dir_mode(&dir, &intent, false)?;
     let artifact = effect_artifact(directory, &dir.join("intent.json"))?;
     let grant = grant_for_binding(&dir, binding)?;
+    if let Some(grant_id) = &grant {
+        let physical: Grant =
+            exact_file(&dir, &format!("{}.fresh-grant.json", binding.handoff_id))?
+                .ok_or_else(|| io::Error::other("v3 effect physical grant absent"))?;
+        if physical.id != *grant_id || physical.plan_sha256 != intent.plan_sha256 {
+            return Err(io::Error::other("v3 effect physical grant/plan changed"));
+        }
+        if let Some(consumed) = exact_file::<Grant>(&dir, &format!("{grant_id}.consumed.json"))?
+            && consumed != physical
+        {
+            return Err(io::Error::other("v3 effect physical K differs from grant"));
+        }
+    }
     Ok((
         readback,
         source_key,
@@ -103,6 +116,130 @@ pub(super) fn v3_effect_physical_readback(
         artifact,
         grant,
     ))
+}
+
+pub(super) fn v3_materialize_quota_result(
+    directory: &Path,
+    binding: &Binding,
+    request: &FreshAccountEffectRequest,
+    id: &str,
+) -> io::Result<()> {
+    let dir = effect_directory(directory, binding, request);
+    let intent = effect_intent(&dir)?.ok_or_else(|| io::Error::other("v3 quota intent absent"))?;
+    if intent.id != id
+        || intent.binding != *binding
+        || intent.request != redacted_effect_request(request)
+        || intent.environment_sha256 != environment_digest(request)?
+    {
+        return Err(io::Error::other("v3 quota result source changed"));
+    }
+    let _ = effect_readback_from_dir_mode(&dir, &intent, true)?;
+    Ok(())
+}
+
+/// One private physical quota-first effect. The caller has already passed the
+/// original D/held-root/peer challenge in the broker socket handler. This
+/// path has no retained-history scan and cannot launch auth, retry or manual
+/// effects. The keyed announcement is durable before the one-use physical K.
+pub(super) fn begin_quota_effect_v3(
+    directory: &Path,
+    generation: &KeyedGeneration,
+    binding: &Binding,
+    request: &FreshAccountEffectRequest,
+    root: &PinnedProcess,
+    actor: &PinnedProcess,
+    uid: u32,
+    gid: u32,
+) -> io::Result<FreshAccountEffectReadback> {
+    if request.kind != FreshAccountEffectKind::QuotaFirst {
+        return Err(io::Error::other("v3 quota-first effect required"));
+    }
+    let candidate = effect_candidate(directory, binding, request)?;
+    fresh_rebuild::validate_candidate(
+        directory,
+        generation.admitted_source().map_err(io::Error::other)?,
+        &candidate,
+    )?;
+    let command = candidate
+        .quota_script
+        .as_deref()
+        .ok_or_else(|| io::Error::other("v3 quota command absent"))?;
+    let _account_lock = auth_admission_lock(directory, &candidate.account_identity)?;
+    let dir = effect_directory(directory, binding, request);
+    if dir.exists() {
+        return Err(io::Error::other(
+            "v3 quota effect already begun; observe exact effect",
+        ));
+    }
+    let cwd = std::fs::read_link(format!("/proc/{}/cwd", actor.host_pid))?;
+    let shell = std::fs::canonicalize("/bin/sh")?;
+    let input_fd =
+        unsafe { libc::memfd_create(c"fresh-account-empty-stdin".as_ptr(), libc::MFD_CLOEXEC) };
+    if input_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let input = unsafe { File::from_raw_fd(input_fd) };
+    let plan = plan(
+        &shell,
+        &cwd,
+        &input,
+        vec!["-c".into(), command.into()],
+        request.environment.clone(),
+    )?;
+    let parent = directory.join("account-effects");
+    std::fs::create_dir_all(&parent)?;
+    File::open(directory)?.sync_all()?;
+    std::fs::create_dir(&dir)?;
+    File::open(&parent)?.sync_all()?;
+    let intent = AccountEffectIntent {
+        version: 1,
+        id: uuid::Uuid::new_v4().to_string(),
+        binding: binding.clone(),
+        request: redacted_effect_request(request),
+        environment_sha256: environment_digest(request)?,
+        plan_sha256: plan.digest.clone(),
+        auth_source: None,
+    };
+    durable_new(&dir, "intent.json", &intent)?;
+    let revision = generation
+        .announce_quota_effect(binding, request, &intent.id)
+        .map_err(io::Error::other)?;
+    let prepared = prepare(&dir, binding.clone(), plan)?;
+    launch_v3_quota(
+        prepared, root, actor, uid, gid, generation, &intent, request, revision,
+    )?;
+    observe_quota_effect_v3(directory, generation, binding, request)
+}
+
+pub(super) fn observe_quota_effect_v3(
+    directory: &Path,
+    generation: &KeyedGeneration,
+    binding: &Binding,
+    request: &FreshAccountEffectRequest,
+) -> io::Result<FreshAccountEffectReadback> {
+    if request.kind != FreshAccountEffectKind::QuotaFirst {
+        return Err(io::Error::other("v3 quota-first effect required"));
+    }
+    let candidate = effect_candidate(directory, binding, request)?;
+    fresh_rebuild::validate_candidate(
+        directory,
+        generation.admitted_source().map_err(io::Error::other)?,
+        &candidate,
+    )?;
+    let dir = effect_directory(directory, binding, request);
+    let intent =
+        effect_intent(&dir)?.ok_or_else(|| io::Error::other("v3 quota effect intent absent"))?;
+    if intent.binding != *binding
+        || intent.request != redacted_effect_request(request)
+        || intent.environment_sha256 != environment_digest(request)?
+    {
+        return Err(io::Error::other("v3 quota effect source changed"));
+    }
+    let result = effect_readback_from_dir_mode(&dir, &intent, false)?;
+    let settled = generation
+        .settle_quota_effect(binding, request, &intent.id)
+        .map_err(io::Error::other)?;
+    Ok(settled.unwrap_or(result))
 }
 pub(super) use fresh_rebuild::{offline_snapshot, reconcile_offline_account};
 
@@ -886,14 +1023,20 @@ fn durable_new<T: Serialize>(directory: &Path, name: &str, value: &T) -> io::Res
 }
 
 fn durable_new_bytes(directory: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
+    super::fresh_index::reader_open_attempt();
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(directory.join(name))?;
+    super::fresh_index::reader_opened();
     file.write_all(bytes)?;
+    super::fresh_index::reader_bytes_written(bytes.len() as u64);
     file.sync_all()?;
-    File::open(directory)?.sync_all()
+    super::fresh_index::reader_open_attempt();
+    let parent = File::open(directory)?;
+    super::fresh_index::reader_opened();
+    parent.sync_all()
 }
 
 fn durable_result<T: Serialize>(directory: &Path, value: &T) -> io::Result<()> {
@@ -3914,6 +4057,45 @@ pub(super) fn launch(
     gid: u32,
     index: Option<&Index>,
 ) -> io::Result<String> {
+    launch_inner(prepared, root, actor, uid, gid, index, None)
+}
+
+fn launch_v3_quota(
+    prepared: Prepared,
+    root: &PinnedProcess,
+    actor: &PinnedProcess,
+    uid: u32,
+    gid: u32,
+    generation: &KeyedGeneration,
+    intent: &AccountEffectIntent,
+    request: &FreshAccountEffectRequest,
+    revision: u64,
+) -> io::Result<String> {
+    launch_inner(
+        prepared,
+        root,
+        actor,
+        uid,
+        gid,
+        None,
+        Some((generation, intent, request, revision)),
+    )
+}
+
+fn launch_inner(
+    prepared: Prepared,
+    root: &PinnedProcess,
+    actor: &PinnedProcess,
+    uid: u32,
+    gid: u32,
+    index: Option<&Index>,
+    v3_quota: Option<(
+        &KeyedGeneration,
+        &AccountEffectIntent,
+        &FreshAccountEffectRequest,
+        u64,
+    )>,
+) -> io::Result<String> {
     root.verify()?;
     actor.verify()?;
     let b = &prepared.grant.binding;
@@ -3959,6 +4141,11 @@ pub(super) fn launch(
             }
         }
     }
+    if let Some((generation, intent, request, revision)) = v3_quota {
+        generation
+            .require_quota_pre_k(&intent.binding, request, &intent.id, revision)
+            .map_err(io::Error::other)?;
+    }
     if prepared
         .directory
         .join(decision_name(&b.handoff_id))
@@ -3971,6 +4158,11 @@ pub(super) fn launch(
         &format!("{}.consumed.json", prepared.grant.id),
         &prepared.grant,
     )?;
+    if let Some((generation, intent, request, revision)) = v3_quota {
+        generation
+            .record_quota_k(&intent.binding, request, &intent.id, Some(revision))
+            .map_err(io::Error::other)?;
+    }
     if let Some(index) = index {
         // The provider child has not been created. A failed publication leaves
         // one-use K debt, but cannot release the executable.

@@ -4463,9 +4463,11 @@ fn serve_fresh_v30_at(
                     let binding =
                         fresh_provider::binding_from_held(&receipt, &held, &actor, &root)?;
                     let directory = state_root.join("v30/fresh-provider");
-                    if provider_readback_v3.is_some() && !matches!(operation, b'6' | b'8' | b'9') {
+                    if provider_readback_v3.is_some()
+                        && !matches!(operation, b'6' | b'8' | b'9' | b'h' | b'm' | b'n')
+                    {
                         return Err(io::Error::other(
-                            "v3 route, account effect, cancellation and physical K writers are closed",
+                            "v3 route, auth/manual, cancellation and provider K writers are closed",
                         ));
                     }
                     if let Some(route_request) = route_request {
@@ -4601,7 +4603,37 @@ fn serve_fresh_v30_at(
                                 "fresh effect account differs from held pin",
                             ));
                         }
-                        let effect = if operation == b'm' {
+                        let effect = if let Some(generation) = provider_readback_v3.as_ref() {
+                            let boundary = if operation == b'm' {
+                                "v3-quota-begin"
+                            } else {
+                                "v3-quota-observe"
+                            };
+                            let (effect, keyed_io) = fresh_index::measure_keyed_io(|| {
+                                let _physical_io = fresh_index::ReaderIoGuard::start(boundary);
+                                if operation == b'm' {
+                                    fresh_provider::begin_quota_effect_v3(
+                                        &directory,
+                                        generation,
+                                        &binding,
+                                        &effect_request,
+                                        &root,
+                                        &actor,
+                                        actor_uid,
+                                        actor_gid,
+                                    )
+                                } else {
+                                    fresh_provider::observe_quota_effect_v3(
+                                        &directory,
+                                        generation,
+                                        &binding,
+                                        &effect_request,
+                                    )
+                                }
+                            });
+                            eprintln!("age319 v3 quota {boundary} keyed I/O: {keyed_io:?}");
+                            effect?
+                        } else if operation == b'm' {
                             fresh_provider::begin_account_effect_indexed(
                                 &directory,
                                 &binding,

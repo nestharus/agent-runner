@@ -414,9 +414,21 @@ fn offline_snapshot_inner(
             .or(candidate_handoff);
         if let Some(handoff) = handoff {
             if !decisions.contains(handoff) && !effect_handoffs.contains(handoff) {
-                return Err(invalid(
-                    "offline candidate has no decision or effect intent",
-                ));
+                if !allow_uncertain_q {
+                    return Err(invalid(
+                        "offline candidate has no decision or effect intent",
+                    ));
+                }
+                // A private v3 root may have registered a candidate before
+                // the broker stopped, without ever beginning an effect. The
+                // source-validated candidate is inert: no route or K can be
+                // inferred from it, and the original root must submit the
+                // quota request again after restart.
+                if candidate_handoff.is_some() && !name.ends_with(".route-source.json") {
+                    let candidate: RouteCandidate = exact_file(root, name)?
+                        .ok_or_else(|| invalid("v3 inert candidate vanished"))?;
+                    validate_candidate(root, source, &candidate)?;
+                }
             }
         }
     }
@@ -1578,13 +1590,13 @@ mod tests {
     }
 
     #[test]
-    fn v3_effect_checkpoint_reads_one_of_hundreds_of_physical_settled_sources() {
+    fn v3_effect_checkpoint_and_quota_writer_io_stay_exact_with_hundreds_of_sources() {
         fn measured(
             count: usize,
-        ) -> (
+        ) -> Vec<(
             crate::linux_main::fresh_index::KeyedIoCount,
             crate::linux_main::fresh_index::ReaderIo,
-        ) {
+        )> {
             let fixture = Fixture::new();
             let source_meta = fixture.source.metadata().unwrap();
             let mut target = None;
@@ -1660,7 +1672,10 @@ mod tests {
             }
             fixture.ready();
             rebuild_keyed_offline(&fixture.root, &fixture.socket, &fixture.source).unwrap();
-            let generation = KeyedGeneration::open(&fixture.root).unwrap();
+            let lease = broker_admission_lease(&fixture.root).unwrap();
+            let generation =
+                KeyedGeneration::admit_provider_readback(&fixture.root, &lease, &fixture.source)
+                    .unwrap();
             let (binding, request, id) = target.unwrap();
             let (result, keyed_io) = crate::linux_main::fresh_index::measure_keyed_io(|| {
                 let _io =
@@ -1671,22 +1686,121 @@ mod tests {
                 result.unwrap().unwrap().outcome.as_deref(),
                 Some("valid_windows")
             );
-            (
+            let read = (
                 keyed_io,
                 crate::linux_main::fresh_index::last_reader_io().unwrap(),
+            );
+            let binding = Binding {
+                handoff_id: uuid::Uuid::new_v4().to_string(),
+                ..fixture.binding.clone()
+            };
+            let candidate = RouteCandidate {
+                binding: binding.clone(),
+                ..fixture.candidate.clone()
+            };
+            durable_new(
+                &fixture.root,
+                &format!("{}.route-source.json", binding.handoff_id),
+                &RouteSource {
+                    version: 1,
+                    binding: binding.clone(),
+                    config_sha256: candidate.config_sha256.clone(),
+                    directory_device: source_meta.dev(),
+                    directory_inode: source_meta.ino(),
+                },
             )
+            .unwrap();
+            durable_new(
+                &fixture.root,
+                &candidate_name(&binding.handoff_id, 0),
+                &candidate,
+            )
+            .unwrap();
+            let request = FreshAccountEffectRequest {
+                d_key: uuid::Uuid::new_v4().to_string(),
+                model: "work".into(),
+                config_sha256: candidate.config_sha256.clone(),
+                account: "first".into(),
+                index: 0,
+                kind: FreshAccountEffectKind::QuotaFirst,
+                environment: vec![("SOURCE".into(), "writer".into())],
+            };
+            let dir = effect_directory(&fixture.root, &binding, &request);
+            std::fs::create_dir_all(&dir).unwrap();
+            let grant = Grant {
+                version: 1,
+                id: uuid::Uuid::new_v4().to_string(),
+                binding: binding.clone(),
+                plan_sha256: "b".repeat(64),
+            };
+            let intent = AccountEffectIntent {
+                version: 1,
+                id: uuid::Uuid::new_v4().to_string(),
+                binding: binding.clone(),
+                request: redacted_effect_request(&request),
+                environment_sha256: environment_digest(&request).unwrap(),
+                plan_sha256: grant.plan_sha256.clone(),
+                auth_source: None,
+            };
+            durable_new(&dir, "intent.json", &intent).unwrap();
+            let measured_step = |label: &'static str, run: &mut dyn FnMut()| {
+                let (_, keyed) = crate::linux_main::fresh_index::measure_keyed_io(|| {
+                    let _guard = crate::linux_main::fresh_index::ReaderIoGuard::start(label);
+                    run();
+                });
+                (
+                    keyed,
+                    crate::linux_main::fresh_index::last_reader_io().unwrap(),
+                )
+            };
+            let mut revision = 0;
+            let announce = measured_step("v3-quota-announce-write", &mut || {
+                revision = generation
+                    .announce_quota_effect(&binding, &request, &intent.id)
+                    .unwrap();
+            });
+            durable_new(
+                &dir,
+                &format!("{}.fresh-grant.json", binding.handoff_id),
+                &grant,
+            )
+            .unwrap();
+            durable_new(&dir, &format!("{}.consumed.json", grant.id), &grant).unwrap();
+            let consume = measured_step("v3-quota-K-write", &mut || {
+                generation
+                    .record_quota_k(&binding, &request, &intent.id, Some(revision))
+                    .unwrap();
+            });
+            Fixture::effect_q(
+                &dir,
+                &grant,
+                b"{\"used_percent\":20,\"resets_at\":\"2099-01-01T00:00:00Z\"}",
+            );
+            let settle = measured_step("v3-quota-Q-settle-write", &mut || {
+                let result = generation
+                    .settle_quota_effect(&binding, &request, &intent.id)
+                    .unwrap();
+                assert_eq!(result.unwrap().outcome.as_deref(), Some("valid_windows"));
+            });
+            vec![read, announce, consume, settle]
         }
         let small = measured(1);
         let large = measured(205);
-        eprintln!("v3 physical effect read 1={small:?} 205={large:?}");
-        assert_eq!(small.0.open_attempts, large.0.open_attempts);
-        assert_eq!(small.0.opened, large.0.opened);
-        assert_eq!(small.1.open_attempts, large.1.open_attempts);
-        assert_eq!(small.1.opened, large.1.opened);
-        assert_eq!(small.0.directory_entries + small.1.directory_entries, 0);
-        assert_eq!(large.0.directory_entries + large.1.directory_entries, 0);
-        assert_eq!(small.0.bytes_written + small.1.bytes_written, 0);
-        assert_eq!(large.0.bytes_written + large.1.bytes_written, 0);
+        eprintln!("v3 physical effect read/announce/K/settle 1={small:?} 205={large:?}");
+        for (one, many) in small.iter().zip(&large) {
+            assert_eq!(one.0.open_attempts, many.0.open_attempts);
+            assert_eq!(one.0.opened, many.0.opened);
+            assert_eq!(one.1.open_attempts, many.1.open_attempts);
+            assert_eq!(one.1.opened, many.1.opened);
+            assert_eq!(one.0.directory_entries + one.1.directory_entries, 0);
+            assert_eq!(many.0.directory_entries + many.1.directory_entries, 0);
+        }
+        assert_eq!(small[0].0.bytes_written + small[0].1.bytes_written, 0);
+        assert_eq!(large[0].0.bytes_written + large[0].1.bytes_written, 0);
+        for step in 1..=3 {
+            assert!(small[step].0.bytes_written + small[step].1.bytes_written > 0);
+            assert!(large[step].0.bytes_written + large[step].1.bytes_written > 0);
+        }
     }
 
     #[test]

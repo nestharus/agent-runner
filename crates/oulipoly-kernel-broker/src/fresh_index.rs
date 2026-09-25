@@ -33,7 +33,7 @@ use std::sync::{Mutex, OnceLock};
 mod keyed_store;
 #[cfg(test)]
 pub(super) use keyed_store::IoCount as KeyedIoCount;
-#[cfg(test)]
+#[cfg(any(test, feature = "age319-private-broker-fixture"))]
 pub(super) use keyed_store::measured as measure_keyed_io;
 #[path = "fresh_index_v3.rs"]
 #[allow(dead_code)]
@@ -114,7 +114,7 @@ pub(super) fn reader_bytes_parsed(bytes: u64) {
         }
     });
 }
-fn reader_bytes_written(bytes: u64) {
+pub(super) fn reader_bytes_written(bytes: u64) {
     READER_IO.with(|cell| {
         if let Some(mut count) = cell.get() {
             count.bytes_written += bytes;
@@ -1599,14 +1599,14 @@ pub(super) struct PendingHead {
     pub decision_handoff: String,
     pub kind: String,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct SourceHead {
     pub source: SourceKey,
     pub quota: Option<ObservationHead>,
     pub auth: Option<ObservationHead>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ObservationHead {
     pub q: PhysicalQ,
@@ -1617,7 +1617,7 @@ pub(super) struct ObservationHead {
     pub completed_unix_seconds: Option<i64>,
     pub windows: Vec<WindowHead>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct WindowHead {
     pub used_percent: f64,
