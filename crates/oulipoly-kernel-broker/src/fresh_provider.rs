@@ -4525,6 +4525,8 @@ fn candidate_quota(
             )));
         }
         if auth.outcome.as_deref() != Some("refreshed") {
+            // A drained failed refresh is a known v2 rejection. Keep the
+            // cumulative v3 source gate's artifact classification.
             return Ok((None, enforce_v3_source.then_some(auth.artifact)));
         }
         let retry_dir = effect_directory(
@@ -4556,6 +4558,8 @@ fn candidate_quota(
         return Ok((None, Some(result.artifact)));
     }
     if result.outcome.as_deref() != Some("valid_windows") || result.windows.is_empty() {
+        // A settled invalid/failed quota result is ineligible on v2. Preserve
+        // the cumulative v3 source gate for its separate route checks.
         return Ok((None, enforce_v3_source.then_some(result.artifact)));
     }
     let now = Utc::now().timestamp();

@@ -14913,9 +14913,9 @@ mod tests {
             "current-schema open did extra work after summary deletion"
         );
         assert!(
-            // The current schema needs more work than the old v29 ceiling,
-            // but ordinary reopen must still have a fixed, bounded cost.
-            current_open_steps < 10_000,
+            // An ordinary current-schema reopen must stay within the
+            // original fixed budget after the fingerprint optimization.
+            current_open_steps < 7_500,
             "current-schema open exceeded its fixed VM budget: {current_open_steps}"
         );
     }

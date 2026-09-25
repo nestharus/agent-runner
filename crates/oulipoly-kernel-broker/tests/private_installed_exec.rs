@@ -692,6 +692,9 @@ fn inner() {
     // the launcher's real/effective UID, while the broker remains UID 0.
     let plain_state = temp.path().join("plain-state");
     fs::create_dir(&plain_state).unwrap();
+    let plain_runner = temp.path().join("plain-runner");
+    fs::copy(&original_runner, &plain_runner).unwrap();
+    fs::set_permissions(&plain_runner, fs::Permissions::from_mode(0o755)).unwrap();
     let plain_launcher = temp.path().join("plain-launcher");
     fs::copy(launcher, &plain_launcher).unwrap();
     fs::set_permissions(&plain_launcher, fs::Permissions::from_mode(0o755)).unwrap();
@@ -706,7 +709,7 @@ fn inner() {
     let mut plain_broker = Command::new(broker_image)
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &plain_socket)
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &plain_state)
-        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &original_runner)
+        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &plain_runner)
         .env(
             "OULIPOLY_KERNEL_BROKER_FIXTURE_LAUNCHER_V1",
             &plain_launcher,
