@@ -1090,7 +1090,7 @@ struct PreKInteractivePtyHandoff {
 
 /// The inode stamp alone survives a dead root. Challenge the live listener
 /// and require the kernel-reported server PID to be the held original actor.
-fn attest_original_control(path: &Path, actor_pid: i32) -> io::Result<(u64, u64)> {
+fn attest_original_control(path: &Path, actor_pid: i32, master: &File) -> io::Result<(u64, u64)> {
     if !path.is_absolute() || actor_pid <= 0 {
         return Err(io::Error::other("PTY control path or actor invalid"));
     }
@@ -1139,28 +1139,63 @@ fn attest_original_control(path: &Path, actor_pid: i32) -> io::Result<(u64, u64)
         iov_base: reply.as_mut_ptr().cast(),
         iov_len: reply.len(),
     };
-    let mut control = [0u8; 64];
+    // The challenged actor must return a live descriptor for the same master.
+    // A socket owned by that PID alone does not prove PTY custody.
+    let mut control = [0u8; 128];
     let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
     message.msg_iov = &mut iov;
     message.msg_iovlen = 1;
     message.msg_control = control.as_mut_ptr().cast();
     message.msg_controllen = control.len();
-    let received = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut message, libc::MSG_WAITALL) };
-    if received != reply.len() as isize || message.msg_flags & libc::MSG_CTRUNC != 0 {
-        return Err(io::Error::other("PTY control response incomplete"));
-    }
-    let header = unsafe { libc::CMSG_FIRSTHDR(&message) };
-    if header.is_null()
-        || unsafe {
-            (*header).cmsg_level != libc::SOL_SOCKET
-                || (*header).cmsg_type != libc::SCM_CREDENTIALS
-                || (*header).cmsg_len
-                    < libc::CMSG_LEN(std::mem::size_of::<libc::ucred>() as _) as usize
+    let received = unsafe {
+        libc::recvmsg(
+            stream.as_raw_fd(),
+            &mut message,
+            libc::MSG_WAITALL | libc::MSG_CMSG_CLOEXEC,
+        )
+    };
+    // Parse ancillary data even on a short response so every received fd is
+    // closed before refusing the challenge.
+    let response_incomplete = received != reply.len() as isize;
+    let mut responder = None;
+    let mut returned_fds = Vec::new();
+    let mut ancillary_invalid = message.msg_flags & libc::MSG_CTRUNC != 0;
+    let mut header = unsafe { libc::CMSG_FIRSTHDR(&message) };
+    while !header.is_null() {
+        let item = unsafe { &*header };
+        if item.cmsg_level == libc::SOL_SOCKET && item.cmsg_type == libc::SCM_CREDENTIALS {
+            if responder.is_some()
+                || item.cmsg_len
+                    != unsafe { libc::CMSG_LEN(std::mem::size_of::<libc::ucred>() as _) } as usize
+            {
+                ancillary_invalid = true;
+            } else {
+                responder = Some(unsafe { *(libc::CMSG_DATA(header) as *const libc::ucred) });
+            }
+        } else if item.cmsg_level == libc::SOL_SOCKET && item.cmsg_type == libc::SCM_RIGHTS {
+            let base = unsafe { libc::CMSG_LEN(0) } as usize;
+            let bytes = item.cmsg_len.saturating_sub(base);
+            if item.cmsg_len < base || bytes == 0 || bytes % std::mem::size_of::<i32>() != 0 {
+                ancillary_invalid = true;
+            } else {
+                for index in 0..bytes / std::mem::size_of::<i32>() {
+                    let fd = unsafe { *libc::CMSG_DATA(header).cast::<i32>().add(index) };
+                    returned_fds.push(unsafe { File::from_raw_fd(fd) });
+                }
+            }
+        } else {
+            ancillary_invalid = true;
         }
-    {
-        return Err(io::Error::other("PTY control responder credentials absent"));
+        header = unsafe { libc::CMSG_NXTHDR(&message, header) };
     }
-    let responder = unsafe { *(libc::CMSG_DATA(header) as *const libc::ucred) };
+    if response_incomplete || ancillary_invalid || returned_fds.len() != 1 {
+        return Err(io::Error::other(
+            "PTY control master or credentials invalid",
+        ));
+    }
+    let responder =
+        responder.ok_or_else(|| io::Error::other("PTY control responder credentials absent"))?;
+    let returned_master = returned_fds.pop().expect("one returned master");
     if (responder.pid, responder.uid, responder.gid)
         != (credential.pid, credential.uid, credential.gid)
     {
@@ -1169,6 +1204,23 @@ fn attest_original_control(path: &Path, actor_pid: i32) -> io::Result<(u64, u64)
         ));
     }
     let after = fs::symlink_metadata(path)?;
+    let mut original_number = 0u32;
+    let mut returned_number = 0u32;
+    if unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCGPTN, &mut original_number) } != 0
+        || unsafe {
+            libc::ioctl(
+                returned_master.as_raw_fd(),
+                libc::TIOCGPTN,
+                &mut returned_number,
+            )
+        } != 0
+        || original_number != returned_number
+        || PtyHandoffStamp::of(&returned_master)? != PtyHandoffStamp::of(master)?
+    {
+        return Err(io::Error::other(
+            "PTY control actor does not retain selected master",
+        ));
+    }
     if reply != challenge
         || !after.file_type().is_socket()
         || (before.dev(), before.ino()) != (after.dev(), after.ino())
@@ -1276,7 +1328,7 @@ pub(super) fn attest_pre_k_interactive_pty(
         ));
     }
     let (control_device, control_inode) =
-        attest_original_control(&request.control_path, binding.actor_pid)?;
+        attest_original_control(&request.control_path, binding.actor_pid, master)?;
     actor.verify()?;
     let record = PreKInteractivePtyHandoff {
         version: 1,
@@ -4712,17 +4764,67 @@ mod tests {
         })
     }
 
+    fn send_control_master(stream: &UnixStream, challenge: &[u8; 16], master_fd: i32) {
+        let mut iov = libc::iovec {
+            iov_base: challenge.as_ptr().cast_mut().cast(),
+            iov_len: challenge.len(),
+        };
+        let mut control = [0u8; 64];
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = &mut iov;
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen =
+            unsafe { libc::CMSG_SPACE(std::mem::size_of::<i32>() as _) } as usize;
+        unsafe {
+            let header = libc::CMSG_FIRSTHDR(&message);
+            (*header).cmsg_level = libc::SOL_SOCKET;
+            (*header).cmsg_type = libc::SCM_RIGHTS;
+            (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<i32>() as _) as usize;
+            *(libc::CMSG_DATA(header) as *mut i32) = master_fd;
+            assert_eq!(
+                libc::sendmsg(stream.as_raw_fd(), &message, libc::MSG_NOSIGNAL),
+                challenge.len() as isize
+            );
+        }
+    }
+
+    #[test]
+    fn original_control_challenge_requires_master_descriptor() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("control.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let (master, _slave) = test_pty_pair();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut challenge = [0u8; 16];
+            stream.read_exact(&mut challenge).unwrap();
+            stream.write_all(&challenge).unwrap();
+        });
+        assert!(attest_original_control(&path, std::process::id() as i32, &master).is_err());
+        server.join().unwrap();
+    }
+
     #[test]
     fn interactive_pty_handoff_binds_selected_root_session_and_real_pair_without_activation() {
         let temp = tempfile::tempdir().unwrap();
+        let (master, slave) = test_pty_pair();
+        let (other_master, other_slave) = test_pty_pair();
         let control_path = temp.path().join("original-root-control.sock");
         let listener = UnixListener::bind(&control_path).unwrap();
+        let offered_master = master.try_clone().unwrap();
+        let wrong_master = other_master.try_clone().unwrap();
         let control = std::thread::spawn(move || {
-            for _ in 0..3 {
+            for index in 0..4 {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut challenge = [0u8; 16];
                 stream.read_exact(&mut challenge).unwrap();
-                stream.write_all(&challenge).unwrap();
+                let fd = if index == 0 {
+                    wrong_master.as_raw_fd()
+                } else {
+                    offered_master.as_raw_fd()
+                };
+                send_control_master(&stream, &challenge, fd);
             }
         });
         let process = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
@@ -4778,8 +4880,6 @@ mod tests {
             plan_sha256: selection.plan_sha256.clone(),
             control_path: control_path.clone(),
         };
-        let (master, slave) = test_pty_pair();
-        let (other_master, other_slave) = test_pty_pair();
         let attest = |request: &PrivateFreshPtyHandoff, master: &File, slave: &File| {
             attest_pre_k_interactive_pty(temp.path(), &binding, &process, request, master, slave)
         };
@@ -4819,6 +4919,9 @@ mod tests {
             )
             .is_err()
         );
+        // Same original PID and correct challenge are insufficient when its
+        // control server returns a different live PTY master.
+        assert!(attest(&request, &master, &slave).is_err());
         attest(&request, &master, &slave).unwrap();
         attest(&request, &master, &slave).unwrap();
         assert!(attest(&request, &other_master, &other_slave).is_err());
@@ -4842,11 +4945,12 @@ mod tests {
         let replacement_path = temp.path().join("replacement-control.sock");
         let replacement = UnixListener::bind(&replacement_path).unwrap();
         fs::rename(&replacement_path, &control_path).unwrap();
+        let replacement_master = master.try_clone().unwrap();
         let replacement_server = std::thread::spawn(move || {
             let (mut stream, _) = replacement.accept().unwrap();
             let mut challenge = [0u8; 16];
             stream.read_exact(&mut challenge).unwrap();
-            stream.write_all(&challenge).unwrap();
+            send_control_master(&stream, &challenge, replacement_master.as_raw_fd());
         });
         assert_ne!(
             record.control_inode,

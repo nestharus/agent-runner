@@ -18,7 +18,8 @@ Its private client accepts read/write master and slave descriptors with the
 original released Runner's D key, session, selected account, plan digest and
 control socket path. The broker connects to that socket, requires a matching
 kernel peer PID and per-message responder credentials, challenges the live
-server and records its socket inode.
+server, requires it to return its still-open PTY master via `SCM_RIGHTS`,
+checks that descriptor against the offered master, and records its socket inode.
 The broker compares them with the released root and current headless broker route selection,
 uses `TIOCGPTN` and `TIOCGPTPEER` to verify the real PTY pair, and creates an
 exact `pre-k-nonactivating` artifact. Repeating the same pair is readback;
