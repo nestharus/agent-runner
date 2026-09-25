@@ -142,6 +142,10 @@ fn inner() {
             | "normal_model_provider_bash_ordinary_sync_socket_partial"
             | "normal_model_provider_bash_ordinary_sync_post_tamper"
             | "normal_model_provider_bash_ordinary_sync_encode_tamper"
+            | "normal_model_provider_bash_ordinary_script"
+            | "normal_model_provider_bash_ordinary_script_replace"
+            | "normal_model_provider_bash_ordinary_script_remove"
+            | "normal_model_provider_bash_ordinary_script_loss"
             | "normal_model_provider_reply_loss"
             | "normal_model_provider_q_reply_loss"
             | "normal_model_provider_restart"
@@ -653,6 +657,15 @@ fn inner() {
                     }),
             )
             .envs(
+                mode.strip_prefix("normal_model_provider_bash_ordinary_script")
+                    .map(|suffix| {
+                        (
+                            "AGE319_PRIVATE_BASH_ORDINARY_MODE_V1",
+                            format!("ordinary-script{}", suffix.replace('_', "-")),
+                        )
+                    }),
+            )
+            .envs(
                 (mode == "normal_model_provider_bash_ordinary_refuse")
                     .then_some(("AGE319_PRIVATE_BASH_ORDINARY_MODE_V1", "ordinary-refuse"))
                     .or_else(|| {
@@ -1008,6 +1021,142 @@ fn inner() {
                 return;
             }
             if mode.starts_with("normal_model_provider_bash_ordinary") {
+                if mode.contains("_ordinary_script") {
+                    use std::os::unix::fs::MetadataExt;
+                    fs::write(gate.join("child-effect"), b"yes").unwrap();
+                    let replacing = mode.ends_with("_replace");
+                    let removing = mode.ends_with("_remove");
+                    let script_path = gate.join("script-bin/scriptcmd");
+                    let original_inode = if replacing || removing {
+                        eventually(|| gate.join("ordinary-paused").exists());
+                        let inode = fs::metadata(&script_path).unwrap().ino();
+                        if replacing {
+                            let replacement = gate.join("script-bin/replacement");
+                            fs::write(&replacement, "#!/bin/sh\nprintf 'new|%s|%s|%s|%s|%s\\n' \"$0\" \"$1\" \"$2\" \"$PWD\" \"$AGE319_ORDINARY_EFFECTIVE_ENV\"\nprintf new > \"$3\"\n").unwrap();
+                            fs::set_permissions(
+                                &replacement,
+                                fs::metadata(&script_path).unwrap().permissions(),
+                            )
+                            .unwrap();
+                            fs::rename(replacement, &script_path).unwrap();
+                        } else {
+                            fs::remove_file(&script_path).unwrap();
+                        }
+                        fs::write(gate.join("ordinary-release"), b"yes").unwrap();
+                        inode
+                    } else {
+                        0
+                    };
+                    eventually(|| gate.join("ordinary-bash-status").exists());
+                    assert_eq!(
+                        fs::read_to_string(gate.join("ordinary-bash-status")).unwrap(),
+                        "0",
+                        "{}",
+                        fs::read_to_string(gate.join("bash-causal-error")).unwrap_or_default()
+                    );
+                    let report: serde_json::Value =
+                        serde_json::from_slice(&fs::read(gate.join("bash-causal-output")).unwrap())
+                            .unwrap();
+                    assert_eq!(report["schema_version"], 31);
+                    assert_eq!(report["dispatch_state"], "sync-child-result");
+                    assert_eq!(report["publication"]["phase"], "unknown");
+                    let request_id = report["publication"]["child"]["request_id"]
+                        .as_str()
+                        .unwrap();
+                    let grant_id = report["publication"]["event"]["physical_grant_id"]
+                        .as_str()
+                        .unwrap();
+                    let directory = broker_state.join("v30/fresh-provider");
+                    let selected: serde_json::Value = serde_json::from_slice(
+                        &fs::read(
+                            directory.join(format!("{request_id}.child-work-selection.json")),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    let grant: serde_json::Value = serde_json::from_slice(
+                        &fs::read(directory.join(format!("{request_id}.fresh-grant.json")))
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        selected["broker_resolved_path"],
+                        script_path.display().to_string()
+                    );
+                    assert_eq!(selected["configured_program"], "scriptcmd");
+                    assert_eq!(selected["path_execution"], true);
+                    assert_eq!(selected["selected_source"]["observed_shebang"], true);
+                    assert_eq!(grant["preflight_image"], selected["selected_source"]);
+                    assert_eq!(grant["path_execution"], true);
+                    if replacing || removing {
+                        assert_eq!(selected["image_descriptor"]["inode"], original_inode);
+                    }
+                    if replacing {
+                        assert_ne!(
+                            grant["path_at_k"]["inode"],
+                            selected["image_descriptor"]["inode"]
+                        );
+                    } else if removing {
+                        assert!(grant["path_at_k"].is_null());
+                    }
+                    eventually(|| {
+                        directory
+                            .join(format!("{grant_id}.source-event.json"))
+                            .exists()
+                    });
+                    let event: oulipoly_state::mailbox::FreshBashSourceEvent =
+                        serde_json::from_slice(
+                            &fs::read(directory.join(format!("{grant_id}.source-event.json")))
+                                .unwrap(),
+                        )
+                        .unwrap();
+                    assert!(event.tree_drained && event.output_closed);
+                    assert!(directory.join(format!("{grant_id}.drain.json")).exists());
+                    assert!(directory.join(format!("{grant_id}.consumed.json")).exists());
+                    if removing {
+                        assert_eq!(event.wait_status, 127 << 8);
+                        assert_eq!(report["publication"]["exit_code"], 127);
+                        assert!(!gate.join("ordinary-effect").exists());
+                    } else {
+                        assert_eq!(event.wait_status, 0);
+                        let label = if replacing { "new" } else { "old" };
+                        let expected = format!(
+                            "{label}|{}|alpha|beta|{}|original-value\n",
+                            script_path.display(),
+                            std::env::current_dir().unwrap().display()
+                        );
+                        assert_eq!(
+                            fs::read(directory.join(format!("{grant_id}.stdout"))).unwrap(),
+                            expected.as_bytes()
+                        );
+                        use base64::Engine as _;
+                        assert_eq!(
+                            base64::engine::general_purpose::STANDARD
+                                .decode(report["stdout_base64"].as_str().unwrap())
+                                .unwrap(),
+                            expected.as_bytes()
+                        );
+                        assert_eq!(
+                            fs::read(gate.join("ordinary-effect")).unwrap(),
+                            label.as_bytes()
+                        );
+                    }
+                    let consumed = fs::read_dir(&directory)
+                        .unwrap()
+                        .filter_map(Result::ok)
+                        .filter(|entry| {
+                            entry
+                                .file_name()
+                                .to_string_lossy()
+                                .ends_with(".consumed.json")
+                        })
+                        .count();
+                    assert_eq!(consumed, 2, "script result replayed a physical K");
+                    fs::write(gate.join("provider-cancel"), b"yes").unwrap();
+                    eventually(|| entry.try_wait().unwrap().is_some());
+                    stop(&mut broker);
+                    return;
+                }
                 if mode.ends_with("_parent_tamper") {
                     fs::write(gate.join("child-effect"), b"yes").unwrap();
                     eventually(|| {
@@ -1054,28 +1203,50 @@ fn inner() {
                         &fs::read(gate.join("ordinary-refuse-statuses")).unwrap(),
                     )
                     .unwrap();
-                    assert_eq!(statuses.len(), 10);
+                    assert_eq!(statuses.len(), 12);
                     assert!(
-                        statuses.iter().all(|(_, status)| *status != 0),
+                        statuses[..7].iter().all(|(_, status)| *status != 0),
                         "{statuses:?}"
                     );
                     assert!(
-                        fs::read_to_string(gate.join("ordinary-shebang-error"))
-                            .unwrap()
-                            .contains("shebang script path semantics unavailable before K")
+                        statuses[7..].iter().all(|(_, status)| *status == 0),
+                        "{statuses:?}"
                     );
-                    assert!(
-                        fs::read_to_string(gate.join("ordinary-malformed-elf-error"))
-                            .unwrap()
-                            .contains("ELF format unavailable before K")
+                    assert_eq!(
+                        fs::read(gate.join("ordinary-shebang-effect")).unwrap(),
+                        b"effect"
                     );
-                    assert!(
-                        fs::read_to_string(gate.join("ordinary-missing-interp-error"))
-                            .unwrap()
-                            .contains("ELF interpreter unavailable before K")
+                    assert_eq!(
+                        fs::read(gate.join("ordinary-plain-effect")).unwrap(),
+                        b"effect"
                     );
                     assert!(!gate.join("ordinary-refused-effect").exists());
                     let physical = broker_state.join("v30/fresh-provider");
+                    for (case, code) in [
+                        ("malformed-elf", 126),
+                        ("missing-interp", 127),
+                        ("non-executable", 126),
+                    ] {
+                        let report: serde_json::Value = serde_json::from_slice(
+                            &fs::read(gate.join(format!("ordinary-{case}-output"))).unwrap(),
+                        )
+                        .unwrap();
+                        assert_eq!(report["schema_version"], 31, "{case}");
+                        assert_eq!(report["dispatch_state"], "sync-child-result", "{case}");
+                        assert_eq!(report["publication"]["phase"], "unknown", "{case}");
+                        assert_eq!(report["publication"]["exit_code"], code, "{case}");
+                        let grant = report["publication"]["event"]["physical_grant_id"]
+                            .as_str()
+                            .unwrap();
+                        let event: oulipoly_state::mailbox::FreshBashSourceEvent =
+                            serde_json::from_slice(
+                                &fs::read(physical.join(format!("{grant}.source-event.json")))
+                                    .unwrap(),
+                            )
+                            .unwrap();
+                        assert_eq!(event.wait_status, code << 8, "{case}");
+                        assert!(physical.join(format!("{grant}.drain.json")).exists());
+                    }
                     let child_grants = fs::read_dir(&physical)
                         .unwrap()
                         .filter_map(Result::ok)
@@ -1087,8 +1258,8 @@ fn inner() {
                         })
                         .count();
                     assert_eq!(
-                        child_grants, 1,
-                        "refused ordinary command reached physical K"
+                        child_grants, 6,
+                        "ordinary format outcomes missed or duplicated physical K"
                     );
                     fs::write(gate.join("provider-cancel"), b"yes").unwrap();
                     eventually(|| entry.try_wait().unwrap().is_some());
@@ -6000,6 +6171,10 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_model_provider_bash_ordinary_sync_socket_partial",
         "normal_model_provider_bash_ordinary_sync_post_tamper",
         "normal_model_provider_bash_ordinary_sync_encode_tamper",
+        "normal_model_provider_bash_ordinary_script",
+        "normal_model_provider_bash_ordinary_script_replace",
+        "normal_model_provider_bash_ordinary_script_remove",
+        "normal_model_provider_bash_ordinary_script_loss",
         "normal_model_provider_reply_loss",
         "normal_model_provider_q_reply_loss",
         "normal_model_provider_restart",

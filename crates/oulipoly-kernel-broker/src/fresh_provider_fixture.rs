@@ -97,6 +97,12 @@ fn causal_bash(args: &[String]) -> std::io::Result<()> {
                 let refused_shebang = gate.join("ordinary-refused-shebang");
                 std::fs::write(&refused_shebang, "#!/bin/sh\nprintf effect > \"$1\"\n")?;
                 std::fs::set_permissions(&refused_shebang, std::fs::Permissions::from_mode(0o755))?;
+                let non_executable = gate.join("ordinary-non-executable");
+                std::fs::write(&non_executable, "#!/bin/sh\nprintf effect > \"$1\"\n")?;
+                std::fs::set_permissions(&non_executable, std::fs::Permissions::from_mode(0o644))?;
+                let plain_script = gate.join("ordinary-plain-script");
+                std::fs::write(&plain_script, "printf effect > \"$1\"\n")?;
+                std::fs::set_permissions(&plain_script, std::fs::Permissions::from_mode(0o755))?;
                 let malformed_elf = gate.join("ordinary-malformed-elf");
                 std::fs::write(&malformed_elf, b"\x7fELFbroken")?;
                 std::fs::set_permissions(&malformed_elf, std::fs::Permissions::from_mode(0o755))?;
@@ -136,6 +142,8 @@ fn causal_bash(args: &[String]) -> std::io::Result<()> {
                     "shebang",
                     "malformed-elf",
                     "missing-interp",
+                    "non-executable",
+                    "plain-script",
                 ] {
                     let mut command = Command::new(&args[1]);
                     command.args(["run", "--delivery", "sync"]);
@@ -153,10 +161,19 @@ fn causal_bash(args: &[String]) -> std::io::Result<()> {
                         }
                         _ => {}
                     }
-                    if matches!(case, "shebang" | "malformed-elf" | "missing-interp") {
+                    if matches!(
+                        case,
+                        "shebang"
+                            | "malformed-elf"
+                            | "missing-interp"
+                            | "non-executable"
+                            | "plain-script"
+                    ) {
                         let image = match case {
                             "shebang" => &refused_shebang,
                             "malformed-elf" => &malformed_elf,
+                            "non-executable" => &non_executable,
+                            "plain-script" => &plain_script,
                             _ => &missing_interp,
                         };
                         command.arg("--").arg(image);
@@ -164,7 +181,11 @@ fn causal_bash(args: &[String]) -> std::io::Result<()> {
                         command.args(["--", "sh", "-c", "printf effect > \"$1\"", "sh"]);
                     }
                     let status = command
-                        .arg(gate.join("ordinary-refused-effect"))
+                        .arg(gate.join(match case {
+                            "shebang" => "ordinary-shebang-effect",
+                            "plain-script" => "ordinary-plain-effect",
+                            _ => "ordinary-refused-effect",
+                        }))
                         .env_clear()
                         .env("PATH", "/usr/bin:/bin")
                         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &args[2])
@@ -202,6 +223,17 @@ fn causal_bash(args: &[String]) -> std::io::Result<()> {
                     serde_json::to_vec(&statuses)?,
                 )?;
             } else {
+                let script_case = args[5].starts_with("ordinary-script");
+                let script_path = gate.join("script-bin/scriptcmd");
+                if script_case {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::create_dir_all(script_path.parent().unwrap())?;
+                    std::fs::write(
+                        &script_path,
+                        "#!/bin/sh\nprintf 'old|%s|%s|%s|%s|%s\\n' \"$0\" \"$1\" \"$2\" \"$PWD\" \"$AGE319_ORDINARY_EFFECTIVE_ENV\"\nprintf old > \"$3\"\n",
+                    )?;
+                    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?;
+                }
                 let mode = if args[5] == "ordinary-async" || args[5] == "ordinary-restart" {
                     "async"
                 } else {
@@ -248,7 +280,9 @@ fn causal_bash(args: &[String]) -> std::io::Result<()> {
                 }
                 let mut command = Command::new(&args[1]);
                 command.args(["run", "--delivery", mode, "--"]);
-                if args[5] == "ordinary-elf" {
+                if script_case {
+                    command.args(["scriptcmd", "alpha", "beta"]);
+                } else if args[5] == "ordinary-elf" {
                     command.arg(&image).args(["-c", script.as_str(), "sh"]);
                 } else {
                     command.args(["sh", "-c", script.as_str(), "sh"]);
@@ -256,10 +290,17 @@ fn causal_bash(args: &[String]) -> std::io::Result<()> {
                 let mut child =
                     command
                         .arg(gate.join("ordinary-effect"))
-                        .arg(gate.join("ordinary-background"))
-                        .arg("")
+                        .args((!script_case).then_some(gate.join("ordinary-background")))
+                        .args((!script_case).then_some(""))
                         .env_clear()
-                        .env("PATH", "/usr/bin:/bin")
+                        .env(
+                            "PATH",
+                            if script_case {
+                                format!("{}:/usr/bin:/bin", script_path.parent().unwrap().display())
+                            } else {
+                                "/usr/bin:/bin".into()
+                            },
+                        )
                         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &args[2])
                         .env("AGE319_ORDINARY_EFFECTIVE_ENV", "original-value")
                         .env(
@@ -267,19 +308,19 @@ fn causal_bash(args: &[String]) -> std::io::Result<()> {
                             "age319-secret-must-stay-in-memfd-319",
                         )
                         .envs(
-                            (args[5] == "ordinary-loss")
+                            (args[5] == "ordinary-loss" || args[5] == "ordinary-script-loss")
                                 .then_some(("AGE319_PRIVATE_ORDINARY_DROP_C_REPLY_V1", "1")),
                         )
                         .envs(
-                            (args[5] == "ordinary-loss")
+                            (args[5] == "ordinary-loss" || args[5] == "ordinary-script-loss")
                                 .then_some(("AGE319_PRIVATE_ORDINARY_DROP_K_REPLY_V1", "1")),
                         )
                         .envs(
-                            (args[5] == "ordinary-loss")
+                            (args[5] == "ordinary-loss" || args[5] == "ordinary-script-loss")
                                 .then_some(("AGE319_PRIVATE_ORDINARY_DROP_Q_REPLY_V1", "1")),
                         )
                         .envs(
-                            (args[5] == "ordinary-loss")
+                            (args[5] == "ordinary-loss" || args[5] == "ordinary-script-loss")
                                 .then_some(("AGE319_PRIVATE_ORDINARY_DROP_W_REPLY_V1", "1")),
                         )
                         .envs(
@@ -314,10 +355,15 @@ fn causal_bash(args: &[String]) -> std::io::Result<()> {
                             "AGE319_PRIVATE_SYNC_PAUSE_AFTER_VERIFY_DIR_V1",
                             gate.as_os_str(),
                         )))
-                        .envs((args[5] == "ordinary-parent-tamper").then_some((
-                            "AGE319_PRIVATE_ORDINARY_PAUSE_AFTER_C_DIR_V1",
-                            gate.as_os_str(),
-                        )))
+                        .envs(
+                            (args[5] == "ordinary-parent-tamper"
+                                || args[5] == "ordinary-script-replace"
+                                || args[5] == "ordinary-script-remove")
+                                .then_some((
+                                    "AGE319_PRIVATE_ORDINARY_PAUSE_AFTER_C_DIR_V1",
+                                    gate.as_os_str(),
+                                )),
+                        )
                         .stdin(Stdio::null())
                         .stdout(Stdio::from(std::fs::File::create(
                             gate.join("bash-causal-output"),
