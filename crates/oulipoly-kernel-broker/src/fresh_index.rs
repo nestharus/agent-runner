@@ -1,9 +1,8 @@
 //! Broker-owned evidence index and detached frozen rebuild. The private broker
-//! holds the admission lease. The fixture route and original root provider
-//! writers mirror exact provider, account-effect, and manual quota evidence
-//! here; routing and effect/manual readers still use retained files. Index Q
-//! pointers follow physical certification and a
-//! typed terminal marker; their hashes alone do not certify completion.
+//! holds the admission lease. The private route and account-effect writers
+//! join retained physical provider and manual quota evidence to keyed heads.
+//! Index Q pointers follow physical certification and a typed terminal
+//! marker; their hashes alone do not certify completion.
 //!
 //! Lock order for a same-broker cutover: route lock, then account locks
 //! in sorted physical-key order. Grant/effect admission takes only its account
@@ -26,8 +25,9 @@ use std::os::unix::net::UnixStream;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-// The keyed generation has a separate private, provider-readback-only
-// admission. Route/effect/manual writers and physical K remain closed there.
+// The keyed generation has separate private admission. Quota, auth, manual
+// account effects, and route receipts have explicit keyed writers. Provider K
+// remains closed here.
 #[path = "fresh_index_keyed.rs"]
 #[allow(dead_code)]
 mod keyed_store;

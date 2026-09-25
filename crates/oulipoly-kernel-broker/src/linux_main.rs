@@ -4006,12 +4006,12 @@ fn serve_fresh_v30_at(
                     if !private_fixture() {
                         return Err(io::Error::other("manual quota fixture route closed"));
                     }
-                    if provider_readback_v3.is_some() {
-                        return Err(io::Error::other(
-                            "v3 manual usage writer and reader are not joined",
-                        ));
-                    }
                     let directory = state_root.join("v30/fresh-provider");
+                    let _route_lock = if provider_readback_v3.is_some() {
+                        Some(fresh_provider::route_selection_lock(&directory)?)
+                    } else {
+                        None
+                    };
                     let result = if operation == b'u' {
                         let RequestPayload::ManualQuotaRequest {
                             request,
@@ -4026,26 +4026,51 @@ fn serve_fresh_v30_at(
                         let [source]: [File; 1] = descriptors
                             .try_into()
                             .map_err(|_| io::Error::other("manual quota config source absent"))?;
-                        manual_quota::begin_indexed(
-                            &directory,
-                            &source,
-                            &request,
-                            peer.uid,
-                            peer.gid,
-                            route_index.as_ref(),
-                        )?
+                        if let Some(generation) = provider_readback_v3.as_ref() {
+                            manual_quota::begin_v3(
+                                &directory, &source, &request, peer.uid, peer.gid, generation,
+                            )?
+                        } else {
+                            manual_quota::begin_indexed(
+                                &directory,
+                                &source,
+                                &request,
+                                peer.uid,
+                                peer.gid,
+                                route_index.as_ref(),
+                            )?
+                        }
                     } else {
                         let RequestPayload::ManualQuotaObserve { operation_id } = payload else {
                             return Err(io::Error::other("manual quota observation absent"));
                         };
-                        manual_quota::readback_id_indexed(
-                            &directory,
-                            &operation_id,
-                            peer.uid,
-                            peer.gid,
-                            route_index.as_ref(),
-                        )?
+                        if let Some(generation) = provider_readback_v3.as_ref() {
+                            manual_quota::readback_id_v3(
+                                &directory,
+                                &operation_id,
+                                peer.uid,
+                                peer.gid,
+                                generation,
+                            )?
+                        } else {
+                            manual_quota::readback_id_indexed(
+                                &directory,
+                                &operation_id,
+                                peer.uid,
+                                peer.gid,
+                                route_index.as_ref(),
+                            )?
+                        }
                     };
+                    if operation == b'u'
+                        && provider_readback_v3.is_some()
+                        && std::env::var_os(
+                            "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_MANUAL_BEGIN_REPLY_V3_V1",
+                        )
+                        .is_some()
+                    {
+                        return Ok(String::new());
+                    }
                     return Ok(format!(
                         "manual-quota {}\n",
                         serde_json::to_string(&result)?
@@ -4476,7 +4501,7 @@ fn serve_fresh_v30_at(
                             || (route_writer_v3 && operation == b'f'))
                     {
                         return Err(io::Error::other(
-                            "v3 route, auth/manual, cancellation and provider K writers are closed",
+                            "v3 route, cancellation and provider K writers are closed",
                         ));
                     }
                     if let Some(route_request) = route_request {

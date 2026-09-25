@@ -543,10 +543,7 @@ pub(super) fn plan(
                 || k.contains(['=', '\0'])
                 || v.contains('\0')
                 || !keys.insert(k)
-                || k.starts_with("LD_")
-                || k.starts_with("DYLD_")
-                || k.starts_with("OULIPOLY_KERNEL_")
-                || matches!(k.as_str(), "GLIBC_TUNABLES" | "GCONV_PATH")
+                || oulipoly_runtime::executor::cli::fresh_remote::forbidden_fresh_environment(k)
         })
     {
         return Err(io::Error::other("unsupported fresh provider plan"));
@@ -669,10 +666,7 @@ pub(super) fn plan_from_descriptors(
                 || key.contains(['=', '\0'])
                 || value.contains('\0')
                 || !keys.insert(key)
-                || key.starts_with("LD_")
-                || key.starts_with("DYLD_")
-                || key.starts_with("OULIPOLY_KERNEL_")
-                || matches!(key.as_str(), "GLIBC_TUNABLES" | "GCONV_PATH")
+                || oulipoly_runtime::executor::cli::fresh_remote::forbidden_fresh_environment(key)
         })
     {
         return Err(io::Error::other("unsupported fresh provider recipe"));

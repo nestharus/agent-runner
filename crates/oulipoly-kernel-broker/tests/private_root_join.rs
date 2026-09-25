@@ -61,6 +61,7 @@ impl Drop for SnapshotRestore {
 fn inner() {
     let mode = std::env::var("AGE319_PRIVATE_JOIN_MODE").unwrap_or_else(|_| "help".into());
     let v3_quota = mode.starts_with("normal_model_provider_v3_quota");
+    let manual_route = mode.starts_with("normal_model_provider_v3_quota_route_manual");
     let v3_mode = mode == "normal_model_provider_v3_closed" || v3_quota;
     let provider_mode = mode.starts_with("normal_model_provider");
     let provider_negative = v3_quota
@@ -166,10 +167,12 @@ fn inner() {
                     | "normal_model_provider_quota_restart"
             ) {
             let quota_bytes: &[u8] = match mode.as_str() {
-                "normal_model_provider_v3_quota_invalid"
+                "normal_model_provider_v3_quota_route_manual_invalid"
+                | "normal_model_provider_v3_quota_invalid"
                 | "normal_model_provider_v3_quota_route_invalid"
                 | "normal_model_provider_v3_quota_route_auth_failed" => b"invalid quota",
-                "normal_model_provider_v3_quota_full"
+                "normal_model_provider_v3_quota_route_manual_full"
+                | "normal_model_provider_v3_quota_full"
                 | "normal_model_provider_v3_quota_route_full" => {
                     br#"{"used_percent":100,"resets_at":"2099-01-01T00:00:00Z"}"#
                 }
@@ -198,6 +201,13 @@ fn inner() {
                         gate.display()
                     )
                 }
+            } else if mode == "normal_model_provider_v3_quota_route_manual_failed" {
+                "quota_script = 'exit 7'\n".into()
+            } else if mode == "normal_model_provider_v3_quota_route_manual_pending" {
+                format!(
+                    "quota_script = 'while ! test -e {0}/finish-manual-quota; do sleep 0.05; done; cat {0}/quota.json'\n",
+                    gate.display()
+                )
             } else if mode == "normal_model_provider_v3_quota_restart" {
                 format!(
                     "quota_script = 'printf x > {0}/started-quota; while ! test -e {0}/finish-quota; do sleep 0.05; done; cat {0}/quota.json'\n",
@@ -259,10 +269,17 @@ fn inner() {
         } else {
             marker.clone()
         };
+        let authority = if manual_route {
+            format!(
+                "settings_id = 'fixture'\nimplementation = {{ family = 'private-test', executable = {provider_command} }}\n"
+            )
+        } else {
+            String::new()
+        };
         fs::write(
             config_dir.join("providers.toml"),
             format!(
-                "[unused]\ncommand = {provider_command}\nargs = [{unused_marker}]\nquota_account_id = 'physical-unused'\n[{provider_name}]\ncommand = {provider_command}\nargs = [{local_args}]\nquota_account_id = 'physical-local'\n{prompt_mode}{quota}"
+                "[unused]\ncommand = {provider_command}\nargs = [{unused_marker}]\nquota_account_id = 'physical-unused'\n{authority}[{provider_name}]\ncommand = {provider_command}\nargs = [{local_args}]\nquota_account_id = 'physical-local'\n{authority}{prompt_mode}{quota}"
             ),
         )
         .unwrap();
@@ -271,6 +288,13 @@ fn inner() {
             "[[providers]]\nname = \"unused\"\n[[providers]]\nname = \"local\"\n",
         )
         .unwrap();
+        if mode == "normal_model_provider_v3_quota_route_manual_cross_model" {
+            fs::write(
+                config_dir.join("models/alias.toml"),
+                "[[providers]]\nname = \"local\"\n",
+            )
+            .unwrap();
+        }
     }
     let mailbox =
         MailboxDb::open_completion_continuation_domain(&data.join("pid-identity.db")).unwrap();
@@ -509,8 +533,24 @@ fn inner() {
                 .then_some(("OULIPOLY_KERNEL_BROKER_FIXTURE_ROUTE_V3_V1", "1")),
         )
         .envs(
-            (mode == "normal_model_provider_v3_quota_route_reply_loss")
-                .then_some(("OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_ROUTE_V3_REPLY_V1", "1")),
+            matches!(
+                mode.as_str(),
+                "normal_model_provider_v3_quota_route_reply_loss"
+                    | "normal_model_provider_v3_quota_route_manual_route_reply_loss"
+            )
+            .then_some(("OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_ROUTE_V3_REPLY_V1", "1")),
+        )
+        .envs(
+            (mode == "normal_model_provider_v3_quota_route_manual_reply_loss").then_some((
+                "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_MANUAL_BEGIN_REPLY_V3_V1",
+                "1",
+            )),
+        )
+        .envs(
+            (mode == "normal_model_provider_v3_quota_route_manual_unknown").then_some((
+                "OULIPOLY_KERNEL_BROKER_FIXTURE_FAIL_MANUAL_POST_K_CAS_V3_V1",
+                "1",
+            )),
         )
         .envs((mode == "normal_model_provider_reply_loss").then_some((
             "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_PROVIDER_K_REPLY_V1",
@@ -575,6 +615,87 @@ fn inner() {
         "broker startup: {}",
         fs::read_to_string(&broker_log).unwrap()
     );
+    if manual_route {
+        let run_manual = || {
+            Command::new(&runner)
+                .arg("--usage")
+                .arg("--models-dir")
+                .arg(config_home.join("oulipoly-agent-runner/models"))
+                .env("OULIPOLY_DATA_DIR", &data)
+                .env("OULIPOLY_CONFIG_HOME", &config_home)
+                .env(
+                    "OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1",
+                    socket.with_file_name("v30.sock"),
+                )
+                .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+                .env("AGE319_PRIVATE_REPAIR_CHALLENGE_V1", "1")
+                .env("AGE319_PRIVATE_SOURCE_SELECTION_CHALLENGE_V1", "1")
+                .env("AGE319_PRIVATE_NORMAL_ROOT_V1", "1")
+                .env("AGE319_PRIVATE_FRESH_PROVIDER_V1", "1")
+                .env("AGE319_PRIVATE_PROVIDER_IMAGE_V1", &provider_image)
+                .env(
+                    "AGE319_PRIVATE_PROVIDER_MARKER_V1",
+                    gate.join("provider-effect"),
+                )
+                .env_remove("LD_LIBRARY_PATH")
+                .output()
+                .unwrap()
+        };
+        let manual = run_manual();
+        assert_eq!(
+            manual.status.success(),
+            !matches!(
+                mode.as_str(),
+                "normal_model_provider_v3_quota_route_manual_invalid"
+                    | "normal_model_provider_v3_quota_route_manual_failed"
+                    | "normal_model_provider_v3_quota_route_manual_pending"
+                    | "normal_model_provider_v3_quota_route_manual_unknown"
+            ),
+            "manual stdout: {} stderr: {} broker: {}",
+            String::from_utf8_lossy(&manual.stdout),
+            String::from_utf8_lossy(&manual.stderr),
+            fs::read_to_string(&broker_log).unwrap()
+        );
+        if mode == "normal_model_provider_v3_quota_route_manual_refresh" {
+            fs::write(
+                gate.join("quota.json"),
+                br#"{"used_percent":24,"resets_at":"2099-01-01T00:00:00Z"}"#,
+            )
+            .unwrap();
+            let refreshed = run_manual();
+            assert!(
+                refreshed.status.success(),
+                "manual refresh: {}",
+                String::from_utf8_lossy(&refreshed.stdout)
+            );
+            assert!(String::from_utf8_lossy(&refreshed.stdout).contains("24%"));
+        }
+        let operations = broker_state.join("v30/fresh-provider/manual-quota");
+        if mode == "normal_model_provider_v3_quota_route_manual_cross_model" {
+            let source = fs::read_dir(&operations)
+                .unwrap()
+                .filter_map(Result::ok)
+                .find(|entry| entry.path().join("k.json").exists())
+                .unwrap();
+            let intent: serde_json::Value =
+                serde_json::from_slice(&fs::read(source.path().join("intent.json")).unwrap())
+                    .unwrap();
+            assert_eq!(intent["request"]["model"], "alias");
+        }
+        assert_eq!(
+            fs::read_dir(&operations)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().join("k.json").exists())
+                .count(),
+            if mode == "normal_model_provider_v3_quota_route_manual_refresh" {
+                2
+            } else {
+                1
+            },
+            "manual call must spend one physical K per deliberate refresh"
+        );
+    }
     if normal_mode {
         let generation = broker_generation.unwrap();
         fs::write(data.join("pid-identity.db"), b"retired copied owner").unwrap();
@@ -1420,10 +1541,12 @@ fn inner() {
                             .then_some(("OULIPOLY_KERNEL_BROKER_FIXTURE_ROUTE_V3_V1", "1")),
                     )
                     .envs(
-                        (mode == "normal_model_provider_v3_quota_route_reply_loss").then_some((
-                            "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_ROUTE_V3_REPLY_V1",
-                            "1",
-                        )),
+                        matches!(
+                            mode.as_str(),
+                            "normal_model_provider_v3_quota_route_reply_loss"
+                                | "normal_model_provider_v3_quota_route_manual_route_reply_loss"
+                        )
+                        .then_some(("OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_ROUTE_V3_REPLY_V1", "1")),
                     )
                     .envs((mode == "normal_model_provider_reply_loss").then_some((
                         "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_PROVIDER_K_REPLY_V1",
@@ -1579,11 +1702,25 @@ fn inner() {
                     )
                     .unwrap();
                 }
-                if mode == "normal_model_provider_v3_quota_route_reply_loss" {
+                if matches!(
+                    mode.as_str(),
+                    "normal_model_provider_v3_quota_route_reply_loss"
+                        | "normal_model_provider_v3_quota_route_manual_route_reply_loss"
+                ) {
                     let route = broker_state
                         .join("v30/fresh-provider")
                         .join(format!("{}.route-selection.json", receipt.handoff_id));
-                    eventually(|| gate.join("route-reply-dropped").exists() && route.exists());
+                    eventually(|| {
+                        gate.join("route-reply-dropped").exists() && route.exists()
+                            || entry.try_wait().unwrap().is_some()
+                            || broker.try_wait().unwrap().is_some()
+                    });
+                    assert!(
+                        gate.join("route-reply-dropped").exists() && route.exists(),
+                        "route reply did not drop: runner: {}; broker: {}",
+                        fs::read_to_string(&err).unwrap(),
+                        fs::read_to_string(&broker_log).unwrap()
+                    );
                     let before = fs::read(&route).unwrap();
                     stop(&mut broker);
                     let restart_log = temp.path().join("v3-route-inflight-restart.log");
@@ -1621,6 +1758,115 @@ fn inner() {
                     eventually(|| entry.try_wait().unwrap().is_some());
                     assert!(!entry.wait().unwrap().success());
                     let stderr = fs::read_to_string(&err).unwrap();
+                    if manual_route {
+                        let provider_dir = broker_state.join("v30/fresh-provider");
+                        let route_file = provider_dir
+                            .join(format!("{}.route-selection.json", receipt.handoff_id));
+                        let healthy = matches!(
+                            mode.as_str(),
+                            "normal_model_provider_v3_quota_route_manual_healthy"
+                                | "normal_model_provider_v3_quota_route_manual_cross_model"
+                                | "normal_model_provider_v3_quota_route_manual_refresh"
+                                | "normal_model_provider_v3_quota_route_manual_reply_loss"
+                                | "normal_model_provider_v3_quota_route_manual_route_reply_loss"
+                        );
+                        assert_eq!(route_file.exists(), healthy, "runner: {stderr}");
+                        if healthy {
+                            let route: serde_json::Value =
+                                serde_json::from_slice(&fs::read(&route_file).unwrap()).unwrap();
+                            assert_eq!(route["selection"]["account"], "local");
+                            assert_eq!(route["selection"]["account_identity"], "physical-local");
+                            assert_eq!(route["sequence"], 0);
+                            if mode == "normal_model_provider_v3_quota_route_manual_refresh" {
+                                assert_eq!(
+                                    route["selection"]["quota_remaining_basis_points"],
+                                    7600
+                                );
+                            }
+                            assert!(
+                                stderr.contains(
+                                    "v3 route, cancellation and provider K writers are closed"
+                                ),
+                                "{stderr}"
+                            );
+                            let actor_selection: serde_json::Value = serde_json::from_slice(
+                                &fs::read(gate.join("v3-route-selection.json")).unwrap(),
+                            )
+                            .unwrap();
+                            assert_eq!(actor_selection, route["selection"]);
+                        } else {
+                            assert!(
+                                stderr.contains(
+                                    if matches!(
+                                        mode.as_str(),
+                                        "normal_model_provider_v3_quota_route_manual_pending"
+                                            | "normal_model_provider_v3_quota_route_manual_unknown"
+                                    ) {
+                                        "v3 route has unknown physical-account debt"
+                                    } else {
+                                        "v3 route has no eligible account or pin"
+                                    }
+                                ),
+                                "{stderr}"
+                            );
+                        }
+                        let effect_parent = provider_dir.join("account-effects");
+                        let physical_effects: Vec<_> = if effect_parent.exists() {
+                            fs::read_dir(&effect_parent)
+                                .unwrap()
+                                .filter_map(Result::ok)
+                                .filter(|entry| entry.path().join("intent.json").exists())
+                                .map(|entry| entry.file_name())
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
+                        assert!(
+                            physical_effects.is_empty(),
+                            "route actor spent a duplicate physical Q K: {physical_effects:?}"
+                        );
+                        assert!(
+                            !provider_dir
+                                .join(format!("{}.fresh-grant.json", receipt.handoff_id))
+                                .exists()
+                        );
+                        assert_eq!(fs::read(&old_state_path).unwrap(), old_state_before);
+                        assert_eq!(fs::read(&old_wal_path).ok(), old_wal_before);
+                        assert_eq!(fs::read(&historical_sidecar).unwrap(), v29_main_before);
+                        assert_eq!(fs::read(&v29_wal).ok(), v29_wal_before);
+                        stop(&mut broker);
+                        let restart_log = temp.path().join("manual-route-restart.log");
+                        broker = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
+                            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
+                            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
+                            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+                            .env(
+                                "OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_READBACK_V3_V1",
+                                "1",
+                            )
+                            .env(
+                                "OULIPOLY_KERNEL_BROKER_FIXTURE_PROVIDER_READBACK_V3_SOURCE_V1",
+                                config_home.join("oulipoly-agent-runner"),
+                            )
+                            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_ROUTE_V3_V1", "1")
+                            .stderr(Stdio::from(File::create(&restart_log).unwrap()))
+                            .spawn()
+                            .unwrap();
+                        let fresh_socket = socket.with_file_name("v30.sock");
+                        eventually(|| {
+                            protocol::request_at(&fresh_socket, Operation::ObserveEntryGate).is_ok()
+                                || broker.try_wait().unwrap().is_some()
+                        });
+                        assert!(
+                            protocol::request_at(&fresh_socket, Operation::ObserveEntryGate)
+                                .is_ok(),
+                            "manual-route restart refused: {}",
+                            fs::read_to_string(&restart_log).unwrap()
+                        );
+                        stop(&mut broker);
+                        return;
+                    }
                     let reason = if matches!(
                         mode.as_str(),
                         "normal_model_provider_v3_quota_post_k"
@@ -1636,7 +1882,7 @@ fn inner() {
                     ) {
                         "v3 route has no eligible account or pin"
                     } else if v3_quota {
-                        "v3 route, auth/manual, cancellation and provider K writers are closed"
+                        "v3 route, cancellation and provider K writers are closed"
                     } else {
                         match mode.as_str() {
                             "normal_model_provider_bad_config" => {
@@ -1646,7 +1892,7 @@ fn inner() {
                                 "fresh pool has incompatible prompt modes before K"
                             }
                             "normal_model_provider_v3_closed" => {
-                                "v3 route, auth/manual, cancellation and provider K writers are closed"
+                                "v3 route, cancellation and provider K writers are closed"
                             }
                             "normal_model_provider_quota" => {
                                 "fresh route has no eligible account or pin"
@@ -1689,7 +1935,7 @@ fn inner() {
                         .unwrap();
                         assert_eq!(actor_selection, route["selection"]);
                     }
-                    if v3_quota {
+                    if v3_quota && !manual_route {
                         let effect_dir = provider_dir
                             .join("account-effects")
                             .join(format!("{}-1-quota-first", receipt.handoff_id));
@@ -4647,6 +4893,16 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_model_provider_v3_quota_route_full",
         "normal_model_provider_v3_quota_route_stale",
         "normal_model_provider_v3_quota_route_auth_failed",
+        "normal_model_provider_v3_quota_route_manual_healthy",
+        "normal_model_provider_v3_quota_route_manual_invalid",
+        "normal_model_provider_v3_quota_route_manual_full",
+        "normal_model_provider_v3_quota_route_manual_failed",
+        "normal_model_provider_v3_quota_route_manual_cross_model",
+        "normal_model_provider_v3_quota_route_manual_refresh",
+        "normal_model_provider_v3_quota_route_manual_reply_loss",
+        "normal_model_provider_v3_quota_route_manual_route_reply_loss",
+        "normal_model_provider_v3_quota_route_manual_pending",
+        "normal_model_provider_v3_quota_route_manual_unknown",
         "normal_model_provider_quota",
         "normal_model_provider_auth",
         "normal_model_provider_auth_recovery",

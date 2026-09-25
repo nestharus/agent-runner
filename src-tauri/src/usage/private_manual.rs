@@ -99,41 +99,62 @@ fn read_request(path: &Path) -> Result<Option<Journal>, String> {
     }
 }
 
+struct ManualCallError {
+    text: String,
+    no_intent: bool,
+}
+
+fn no_broker_intent(error: &io::Error) -> bool {
+    error.to_string().contains("manual quota operation absent")
+}
+
 fn observe_or_begin(
     source: &File,
     request: &ManualQuotaRequest,
     may_begin: bool,
-) -> Result<ManualQuotaReadback, String> {
+) -> Result<ManualQuotaReadback, ManualCallError> {
     let socket = socket();
     match protocol::private_manual_quota_observe_at(&socket, &request.operation_id) {
         Ok(result) => Ok(result),
-        Err(error) if error.to_string().contains("manual quota operation absent") => {
+        Err(error) if no_broker_intent(&error) => {
             if !may_begin {
-                return Err(format!(
-                    "manual quota request {} has no broker intent and its effect environment changed; exact result unknown",
-                    request.operation_id
-                ));
-            }
-            protocol::private_manual_quota_at(&socket, request, true, Some(source.as_raw_fd()))
-                .or_else(|begin_error| {
-                    protocol::private_manual_quota_observe_at(&socket, &request.operation_id)
-                        .map_err(|read_error| {
-                            io::Error::other(format!(
-                                "begin: {begin_error}; exact readback: {read_error}"
-                            ))
-                        })
-                })
-                .map_err(|error| {
-                    format!(
-                        "manual quota begin/readback unknown for {}: {error}",
+                return Err(ManualCallError {
+                    text: format!(
+                        "manual quota request {} has no broker intent and its effect environment changed; no K was granted",
                         request.operation_id
-                    )
-                })
+                    ),
+                    no_intent: true,
+                });
+            }
+            match protocol::private_manual_quota_at(
+                &socket,
+                request,
+                true,
+                Some(source.as_raw_fd()),
+            ) {
+                Ok(result) => Ok(result),
+                Err(begin_error) => {
+                    match protocol::private_manual_quota_observe_at(&socket, &request.operation_id)
+                    {
+                        Ok(result) => Ok(result),
+                        Err(read_error) => Err(ManualCallError {
+                            no_intent: no_broker_intent(&read_error),
+                            text: format!(
+                                "manual quota begin/readback for {}: begin: {begin_error}; exact readback: {read_error}",
+                                request.operation_id
+                            ),
+                        }),
+                    }
+                }
+            }
         }
-        Err(error) => Err(format!(
-            "manual quota readback unknown for {}: {error}",
-            request.operation_id
-        )),
+        Err(error) => Err(ManualCallError {
+            text: format!(
+                "manual quota readback unknown for {}: {error}",
+                request.operation_id
+            ),
+            no_intent: false,
+        }),
     }
 }
 
@@ -300,10 +321,13 @@ pub(crate) fn run(
                     || result.physical_account_id != physical_id
                     || (result.state == "drained" && result.effect_id.is_none())
                 {
-                    Err(format!(
-                        "manual quota exact account/Q readback mismatch for {}",
-                        request.operation_id
-                    ))
+                    Err(ManualCallError {
+                        text: format!(
+                            "manual quota exact account/Q readback mismatch for {}",
+                            request.operation_id
+                        ),
+                        no_intent: false,
+                    })
                 } else {
                     Ok(result)
                 }
@@ -315,13 +339,21 @@ pub(crate) fn run(
                 }
                 row_from_result(physical_id, &account.vendor, &result)
             }
-            Err(error) => UsageRow {
-                account_id: physical_id.into(),
-                vendor: account.vendor.clone(),
-                windows: Vec::new(),
-                row_state: RowState::Error(error),
-                cache_warning: None,
-            },
+            Err(error) => {
+                if error.no_intent {
+                    // The broker's exact observation found no durable intent.
+                    // Since K is published only after intent, this journal
+                    // cannot denote a spent effect and a later call may retry.
+                    settled_journals.push(path);
+                }
+                UsageRow {
+                    account_id: physical_id.into(),
+                    vendor: account.vendor.clone(),
+                    windows: Vec::new(),
+                    row_state: RowState::Error(error.text),
+                    cache_warning: None,
+                }
+            }
         };
         incomplete |= matches!(row.row_state, RowState::Error(_) | RowState::NoWindows);
         rows.push(row);
@@ -329,7 +361,11 @@ pub(crate) fn run(
     renderer::render(&rows, writer).map_err(|e| e.to_string())?;
     writer.flush().map_err(|e| e.to_string())?;
     for path in settled_journals {
-        fs::remove_file(path).map_err(|e| e.to_string())?;
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
     }
     Ok(i32::from(incomplete))
 }

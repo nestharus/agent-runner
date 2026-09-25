@@ -993,11 +993,7 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
         let key = key
             .into_string()
             .map_err(|_| "fresh effect environment key is not UTF-8")?;
-        if key.starts_with("LD_")
-            || key.starts_with("DYLD_")
-            || key.starts_with("OULIPOLY_KERNEL_")
-            || matches!(key.as_str(), "GLIBC_TUNABLES" | "GCONV_PATH")
-        {
+        if oulipoly_runtime::executor::cli::fresh_remote::forbidden_fresh_environment(&key) {
             continue;
         }
         let value = value
@@ -1015,7 +1011,16 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
     };
     let mut quota_receipts = Vec::new();
     let mut auth_receipts = Vec::new();
+    // The private manual/route join exercises a second original-root actor
+    // against an already settled physical account Q. Route admission itself
+    // decides whether that Q is usable; starting QuotaFirst here would spend
+    // a duplicate K before the decision could inspect the manual fact.
+    let route_mode = std::env::var("AGE319_PRIVATE_JOIN_MODE").unwrap_or_default();
+    let manual_route = route_mode.starts_with("normal_model_provider_v3_quota_route_manual");
     for (index, (quota_script, auth_command)) in pool.account_effects.iter().enumerate() {
+        if manual_route {
+            continue;
+        }
         if quota_script.is_none() {
             continue;
         }
@@ -1083,10 +1088,13 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
         auth_refresh_command: None,
         environment_sha256: Some(environment_sha256),
     };
-    let route_mode = std::env::var("AGE319_PRIVATE_JOIN_MODE").unwrap_or_default();
     let first =
         protocol::private_fresh_route_at(&socket, &request, b'f', &[config_source.as_raw_fd()]);
-    let selected = if route_mode == "normal_model_provider_v3_quota_route_reply_loss" {
+    let selected = if matches!(
+        route_mode.as_str(),
+        "normal_model_provider_v3_quota_route_reply_loss"
+            | "normal_model_provider_v3_quota_route_manual_route_reply_loss"
+    ) {
         if first.is_ok() {
             return Err("v3 route fixture did not lose first reply".into());
         }
