@@ -69,6 +69,20 @@ pub struct FreshRootTerminalReadback {
     pub artifacts: Vec<String>,
 }
 
+/// Byte identity offered by the original root before its caller-visible write.
+/// The State lane compares this with broker-owned Q, then records an immutable
+/// publication intent. A matching intent is not a consumer acknowledgement.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreshRootCallerResult {
+    pub parent_grant_id: String,
+    pub wait_status: i32,
+    pub stdout_sha256: String,
+    pub stdout_len: u64,
+    pub stderr_sha256: String,
+    pub stderr_len: u64,
+}
+
 impl FreshRootTerminalReadback {
     fn record_unknown(&mut self, stage: String) {
         self.unknown_stage = Some(stage.clone());
@@ -141,6 +155,43 @@ fn verify_fresh_root_terminal_schema(state: &Connection) -> Result<(), String> {
 }
 
 impl FreshV30Lane {
+    pub fn begin_private_root_caller_result(
+        &self,
+        root: &FreshReleasedHandoff,
+        actor: &FreshRecipientIdentity,
+        session: &FreshV30Session,
+        offered: &FreshRootCallerResult,
+    ) -> Result<FreshRootTerminalReadback, String> {
+        let read = self.read_private_root_terminal(root, actor, session)?;
+        if !read.unresolved_child_request_ids.is_empty() {
+            return Err("root terminal has unresolved child C".into());
+        }
+        if read.execution_state == "unknown" {
+            return Err("root terminal execution unknown".into());
+        }
+        let execution = read.execution.ok_or("root terminal execution absent")?;
+        if execution.child_event.is_some() {
+            return Err("child C result lacks original sync response endpoint".into());
+        }
+        let parent = &execution.parent;
+        if parent.cancelled {
+            return Err("caller result terminal was cancelled".into());
+        }
+        if offered.parent_grant_id != parent.grant_id
+            || offered.wait_status != parent.wait_status
+            || offered.stdout_sha256 != parent.stdout_sha256
+            || offered.stdout_len != parent.stdout_len
+            || offered.stderr_sha256 != parent.stderr_sha256
+            || offered.stderr_len != parent.stderr_len
+        {
+            return Err("caller result differs from verified parent Q".into());
+        }
+        // Include the original D/J/actor and parent Q in the committed
+        // artifact. The caller retains the raw stream bytes.
+        let artifact = serde_json::to_vec(&execution).map_err(|e| e.to_string())?;
+        self.begin_private_root_publication(root, actor, session, &artifact)
+    }
+
     fn physical_root_terminal(
         &self,
         root: &FreshReleasedHandoff,
