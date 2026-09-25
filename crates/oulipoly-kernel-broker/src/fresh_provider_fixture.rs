@@ -112,6 +112,32 @@ fn causal_bash(args: &[String]) -> std::io::Result<()> {
 
 fn main() -> std::io::Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "--interactive-only") {
+        if args.len() != 2 {
+            return Err(std::io::Error::other(
+                "interactive fixture arguments changed",
+            ));
+        }
+        let tty = unsafe { libc::isatty(0) } == 1
+            && unsafe { libc::isatty(1) } == 1
+            && unsafe { libc::tcgetsid(0) } == unsafe { libc::getsid(0) };
+        std::io::stdout().write_all(b"interactive-ready\n")?;
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        let evidence = serde_json::json!({
+            "controlling_tty": tty,
+            "input": input,
+            "pid": unsafe { libc::getpid() },
+        });
+        std::fs::write(&args[1], serde_json::to_vec(&evidence)?)?;
+        std::io::stdout().write_all(b"interactive-output:")?;
+        std::io::stdout().write_all(input.as_bytes())?;
+        return if tty {
+            Ok(())
+        } else {
+            Err(std::io::Error::other("no controlling tty"))
+        };
+    }
     let marker = args
         .first()
         .ok_or_else(|| std::io::Error::other("marker absent"))?;

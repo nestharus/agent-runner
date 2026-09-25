@@ -1266,6 +1266,8 @@ pub(super) fn validate_interactive_plan_source(
     let mut recipe = plan.recipe.try_clone()?;
     recipe.seek(SeekFrom::Start(0))?;
     let actual: Recipe = serde_json::from_reader(recipe)?;
+    let mut recipe = plan.recipe.try_clone()?;
+    recipe.seek(SeekFrom::Start(0))?;
     if actual.role != FreshPlanRole::Interactive
         || actual.configured_program != program
         || actual.argv != argv
@@ -1363,6 +1365,277 @@ struct InteractiveKPreparation {
     cwd_inode: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct InteractiveK {
+    version: u32,
+    state: String,
+    preparation: InteractiveKPreparation,
+    grant: Grant,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InteractiveQ {
+    version: u32,
+    k: InteractiveK,
+    identity: InteractiveIdentity,
+    attach: Attach,
+    provider_exit: ProviderExit,
+    tree_drain: Drain,
+    pid1_wait: Pid1Wait,
+    pty_output: Output,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct InteractiveIdentity {
+    version: u32,
+    grant_id: String,
+    work_id: String,
+    pid1_host_pid: i32,
+    pid1_boot_id: String,
+    pid1_starttime_ticks: u64,
+    pid1_pidns_dev: u64,
+    pid1_pidns_ino: u64,
+    provider_host_pid: i32,
+    provider_local_pid: i32,
+    provider_boot_id: String,
+    provider_starttime_ticks: u64,
+    provider_pidns_dev: u64,
+    provider_pidns_ino: u64,
+    peer_uid: u32,
+    peer_gid: u32,
+}
+
+fn interactive_k_name(binding: &Binding) -> String {
+    format!("{}.interactive-k.json", binding.handoff_id)
+}
+
+fn interactive_q_name(binding: &Binding) -> String {
+    format!("{}.interactive-q.json", binding.handoff_id)
+}
+
+/// The create-new K record is the one-use decision. It is durable before the
+/// namespace helper or provider is released. Any post-K error is debt and a
+/// repeated submission can only read the original record.
+pub(super) fn launch_interactive(
+    directory: &Path,
+    binding: Binding,
+    plan: Plan,
+    root: &PinnedProcess,
+    actor: &PinnedProcess,
+    uid: u32,
+    gid: u32,
+    master: File,
+    slave: File,
+    relay: UnixStream,
+) -> io::Result<String> {
+    root.verify()?;
+    actor.verify()?;
+    if binding.causal_parent.is_some()
+        || root.host_pid != binding.root_pid
+        || root.starttime_ticks != binding.root_starttime
+        || (root.pidns_dev, root.pidns_ino) != (binding.root_pidns_dev, binding.root_pidns_ino)
+        || actor.host_pid != binding.actor_pid
+        || actor.starttime_ticks != binding.actor_starttime
+        || actor.boot_id != binding.actor_boot_id
+        || (actor.pidns_dev, actor.pidns_ino) != (binding.actor_pidns_dev, binding.actor_pidns_ino)
+        || !root.is_namespace_init()?
+        || !actor.direct_child_of(root)?
+        || !actor.in_namespace(root.namespace())?
+    {
+        return Err(io::Error::other(
+            "interactive K original root or actor changed",
+        ));
+    }
+    plan.verify()?;
+    if unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) } != 0
+        || unsafe { libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0) } != 0
+    {
+        return Err(io::Error::other("interactive K inherited NNP/seccomp"));
+    }
+    let preparation: InteractiveKPreparation = exact_file(
+        directory,
+        &format!("{}.interactive-k-preparation.json", binding.handoff_id),
+    )?
+    .ok_or_else(|| io::Error::other("interactive K preparation absent"))?;
+    if preparation.version != 1
+        || preparation.state != "pre-k-nonactivating"
+        || preparation.handoff.binding != binding
+        || preparation.handoff.selection.role != FreshPlanRole::Interactive
+        || preparation.handoff.selection.plan_sha256 != plan.digest
+        || preparation.configured_program != plan.configured_program
+        || preparation.broker_resolved_path != plan.broker_resolved_path
+        || preparation.image_descriptor != plan.image_descriptor
+        || (preparation.cwd_device, preparation.cwd_inode) != (plan.cwd_device, plan.cwd_inode)
+        || plan.role != FreshPlanRole::Interactive
+    {
+        return Err(io::Error::other("interactive K selected source changed"));
+    }
+    if exact_file::<InteractiveK>(directory, &interactive_k_name(&binding))?.is_some() {
+        return Err(io::Error::other(
+            "interactive K already consumed; read same K/Q",
+        ));
+    }
+    let grant = Grant {
+        version: 3,
+        id: uuid::Uuid::new_v4().to_string(),
+        binding: binding.clone(),
+        plan_sha256: plan.digest.clone(),
+        configured_program: plan.configured_program.clone(),
+        broker_resolved_path: plan.broker_resolved_path.clone(),
+        image_descriptor: plan.image_descriptor.clone(),
+        preflight_image: plan.preflight_image.clone(),
+    };
+    let k = InteractiveK {
+        version: 1,
+        state: "consumed-before-child-release".into(),
+        preparation,
+        grant: grant.clone(),
+    };
+    durable_new(directory, &interactive_k_name(&binding), &k)?;
+    if std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_INTERACTIVE_POST_K_UNKNOWN_V1").is_some() {
+        return Err(io::Error::other(
+            "injected unknown after consumed interactive K",
+        ));
+    }
+    launch_with_pty(
+        Prepared {
+            grant,
+            plan,
+            directory: directory.to_owned(),
+        },
+        root,
+        actor,
+        uid,
+        gid,
+        Some((master, slave, relay)),
+    )
+}
+
+/// Readback is tied to the same original D, actor and selected PTY assertion.
+/// A missing attach after K is unknown, never permission to launch again.
+pub(super) fn observe_interactive(
+    directory: &Path,
+    binding: &Binding,
+    request: &PrivateFreshPtyHandoff,
+) -> io::Result<String> {
+    let Some(k): Option<InteractiveK> = exact_file(directory, &interactive_k_name(binding))? else {
+        return Ok("fresh-interactive-k-absent\n".into());
+    };
+    if k.version != 1
+        || k.state != "consumed-before-child-release"
+        || k.grant.binding != *binding
+        || k.preparation.handoff.binding != *binding
+        || k.preparation.handoff.selection.plan_sha256 != k.grant.plan_sha256
+        || k.preparation.configured_program != k.grant.configured_program
+        || k.preparation.broker_resolved_path != k.grant.broker_resolved_path
+        || k.preparation.image_descriptor != k.grant.image_descriptor
+        || k.preparation.handoff.selection.account != request.account
+        || k.preparation.handoff.selection.plan_sha256 != request.plan_sha256
+        || k.preparation.handoff.selection.role != request.role
+        || k.preparation.handoff.control_path != request.control_path
+        || request.session_id != binding.session_id
+    {
+        return Err(io::Error::other("interactive K readback source changed"));
+    }
+    let grant_id = k.grant.id.clone();
+    let consumed: Option<Grant> = exact_file(directory, &format!("{grant_id}.consumed.json"))?;
+    if consumed.as_ref() != Some(&k.grant) {
+        return Ok(format!("fresh-interactive-unknown-or-pending {grant_id}\n"));
+    }
+    let old_q: Option<InteractiveQ> = exact_file(directory, &interactive_q_name(binding))?;
+    let Observation::Drained { .. } = observe(directory, &grant_id)? else {
+        return Ok(format!("fresh-interactive-unknown-or-pending {grant_id}\n"));
+    };
+    let Some(pty_output): Option<Output> =
+        exact_file(directory, &format!("{grant_id}.interactive-output.json"))?
+    else {
+        return Ok(format!("fresh-interactive-unknown-or-pending {grant_id}\n"));
+    };
+    let _ = verified_output(
+        directory,
+        &format!("{grant_id}.interactive-output"),
+        &pty_output,
+    )?;
+    let attach: Attach = exact_file(directory, &format!("{grant_id}.attach.json"))?
+        .ok_or_else(|| io::Error::other("interactive attach absent"))?;
+    let identity: InteractiveIdentity =
+        exact_file(directory, &format!("{grant_id}.interactive-identity.json"))?
+            .ok_or_else(|| io::Error::other("interactive process identity absent"))?;
+    if identity.version != 1
+        || identity.grant_id != grant_id
+        || identity.work_id != attach.work_id
+        || identity.pid1_host_pid != attach.pid1
+        || identity.pid1_starttime_ticks != attach.pid1_starttime
+        || (identity.pid1_pidns_dev, identity.pid1_pidns_ino)
+            != (attach.pidns_dev, attach.pidns_ino)
+        || identity.provider_host_pid != attach.provider_pid
+        || identity.provider_local_pid != attach.provider_local_pid
+        || identity.provider_starttime_ticks != attach.provider_starttime
+        || (identity.provider_pidns_dev, identity.provider_pidns_ino)
+            != (attach.pidns_dev, attach.pidns_ino)
+        || identity.pid1_boot_id != binding.actor_boot_id
+        || identity.provider_boot_id != binding.actor_boot_id
+    {
+        return Err(io::Error::other("interactive process identity changed"));
+    }
+    let provider_exit: ProviderExit = exact_file(directory, &format!("{grant_id}.exit.json"))?
+        .ok_or_else(|| io::Error::other("interactive wait absent"))?;
+    let tree_drain: Drain = exact_file(directory, &format!("{grant_id}.drain.json"))?
+        .ok_or_else(|| io::Error::other("interactive tree drain absent"))?;
+    let pid1_wait: Pid1Wait = exact_file(directory, &format!("{grant_id}.pid1-wait.json"))?
+        .ok_or_else(|| io::Error::other("interactive PID1 wait absent"))?;
+    let q = InteractiveQ {
+        version: 1,
+        k,
+        identity,
+        attach,
+        provider_exit,
+        tree_drain,
+        pid1_wait,
+        pty_output,
+    };
+    match old_q {
+        Some(existing)
+            if existing.version == 1
+                && serde_json::to_vec(&existing)? == serde_json::to_vec(&q)? => {}
+        Some(_) => return Err(io::Error::other("interactive Q readback changed")),
+        None => durable_new(directory, &interactive_q_name(binding), &q)?,
+    }
+    Ok(format!(
+        "fresh-interactive-drained {grant_id} {} {} {}\n",
+        q.provider_exit.wait_status, q.pty_output.bytes, q.pty_output.sha256
+    ))
+}
+
+pub(super) fn interactive_output(
+    directory: &Path,
+    binding: &Binding,
+    request: &PrivateFreshPtyHandoff,
+) -> io::Result<(String, File)> {
+    let state = observe_interactive(directory, binding, request)?;
+    if !state.starts_with("fresh-interactive-drained ") {
+        return Err(io::Error::other("interactive Q not drained for output"));
+    }
+    let q: InteractiveQ = exact_file(directory, &interactive_q_name(binding))?
+        .ok_or_else(|| io::Error::other("interactive Q record absent"))?;
+    let grant = &q.k.grant.id;
+    let file = verified_output(
+        directory,
+        &format!("{grant}.interactive-output"),
+        &q.pty_output,
+    )?;
+    Ok((
+        format!(
+            "fresh-interactive-output {grant} {} {} {}\n",
+            q.provider_exit.wait_status, q.pty_output.bytes, q.pty_output.sha256
+        ),
+        file,
+    ))
+}
+
 /// Recheck the independently selected interactive recipe against the pinned
 /// config and the original root's live PTY pair. This is admission only: no
 /// consumed K, child, generation, or Q can follow from this artifact.
@@ -1378,7 +1651,7 @@ pub(super) fn prepare_interactive_k(
     config_dir: File,
     master: File,
     slave: File,
-) -> io::Result<()> {
+) -> io::Result<Plan> {
     attest_pre_k_interactive_pty(directory, binding, actor, request, &master, &slave)?;
     let handoff: PreKInteractivePtyHandoff = exact_file(
         directory,
@@ -1469,9 +1742,9 @@ pub(super) fn prepare_interactive_k(
         version: 1,
         state: "pre-k-nonactivating".into(),
         handoff,
-        configured_program: plan.configured_program,
-        broker_resolved_path: plan.broker_resolved_path,
-        image_descriptor: plan.image_descriptor,
+        configured_program: plan.configured_program.clone(),
+        broker_resolved_path: plan.broker_resolved_path.clone(),
+        image_descriptor: plan.image_descriptor.clone(),
         cwd_device: plan.cwd_device,
         cwd_inode: plan.cwd_inode,
     };
@@ -1480,7 +1753,8 @@ pub(super) fn prepare_interactive_k(
         Some(existing) if existing == preparation => Ok(()),
         Some(_) => Err(io::Error::other("interactive K preparation changed")),
         None => durable_new(directory, &name, &preparation),
-    }
+    }?;
+    Ok(plan)
 }
 
 /// The inode stamp alone survives a dead root. Challenge the live listener
@@ -3569,6 +3843,56 @@ fn output(file: &File) -> io::Result<Output> {
     })
 }
 
+fn capture_interactive_output(
+    master: File,
+    relay: UnixStream,
+    directory: PathBuf,
+    grant_id: String,
+) -> io::Result<()> {
+    let mut transcript = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(directory.join(format!("{grant_id}.interactive-output")))?;
+    std::thread::Builder::new()
+        .name("fresh-interactive-pty-output".into())
+        .spawn(move || {
+            let result = (|| -> io::Result<()> {
+                let mut master = master;
+                let mut relay = Some(relay);
+                let mut buffer = [0u8; 8192];
+                loop {
+                    match master.read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            transcript.write_all(&buffer[..n])?;
+                            if relay
+                                .as_mut()
+                                .is_some_and(|stream| stream.write_all(&buffer[..n]).is_err())
+                            {
+                                relay = None;
+                            }
+                        }
+                        Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(error) => return Err(error),
+                    }
+                }
+                let receipt = output(&transcript)?;
+                durable_new(
+                    &directory,
+                    &format!("{grant_id}.interactive-output.json"),
+                    &receipt,
+                )
+            })();
+            if let Err(error) = result {
+                eprintln!("fresh interactive PTY output unknown for {grant_id}: {error}");
+            }
+        })?;
+    Ok(())
+}
+
 struct Init {
     plan: Plan,
     dir: File,
@@ -3576,6 +3900,7 @@ struct Init {
     work_id: String,
     stdout: File,
     stderr: File,
+    interactive_slave: Option<File>,
     control: UnixStream,
     gate: UnixStream,
     uid: u32,
@@ -3596,6 +3921,9 @@ fn run_init(mut init: Init) -> io::Result<()> {
         init.dir.as_raw_fd(),
         init.stdout.as_raw_fd(),
         init.stderr.as_raw_fd(),
+        init.interactive_slave
+            .as_ref()
+            .map_or(-1, AsRawFd::as_raw_fd),
         init.control.as_raw_fd(),
         init.gate.as_raw_fd(),
     ])?;
@@ -3647,10 +3975,17 @@ fn run_init(mut init: Init) -> io::Result<()> {
     let mut command = Command::new(image);
     command.env_clear();
     init.plan.input.seek(SeekFrom::Start(0))?;
-    command
-        .stdin(Stdio::from(init.plan.input.try_clone()?))
-        .stdout(Stdio::from(init.stdout.try_clone()?))
-        .stderr(Stdio::from(init.stderr.try_clone()?));
+    if let Some(slave) = &init.interactive_slave {
+        command
+            .stdin(Stdio::from(slave.try_clone()?))
+            .stdout(Stdio::from(slave.try_clone()?))
+            .stderr(Stdio::from(slave.try_clone()?));
+    } else {
+        command
+            .stdin(Stdio::from(init.plan.input.try_clone()?))
+            .stdout(Stdio::from(init.stdout.try_clone()?))
+            .stderr(Stdio::from(init.stderr.try_clone()?));
+    }
     let control_fd = init.control.as_raw_fd();
     let gate_fd = init.gate.as_raw_fd();
     let cwd_fd = init.plan.cwd.as_raw_fd();
@@ -3658,6 +3993,7 @@ fn run_init(mut init: Init) -> io::Result<()> {
     let gid = init.gid;
     let groups = init.groups;
     let image_fd = init.plan.image.as_raw_fd();
+    let slave_fd = init.interactive_slave.as_ref().map(AsRawFd::as_raw_fd);
     let image_probe = CString::new(format!("/proc/self/fd/{image_fd}"))?;
     let preflight_shebang = init.plan.preflight_image.observed_shebang;
     let fixture = super::private_fixture();
@@ -3665,6 +4001,7 @@ fn run_init(mut init: Init) -> io::Result<()> {
         command.pre_exec(move || {
             if libc::fchdir(cwd_fd) != 0
                 || libc::setsid() < 0
+                || slave_fd.is_some_and(|fd| libc::ioctl(fd, libc::TIOCSCTTY, 0) != 0)
                 || (!fixture && libc::setgroups(groups.len(), groups.as_ptr()) != 0)
                 || libc::setresgid(gid, gid, gid) != 0
                 || libc::setresuid(uid, uid, uid) != 0
@@ -3925,6 +4262,17 @@ pub(super) fn launch(
     uid: u32,
     gid: u32,
 ) -> io::Result<String> {
+    launch_with_pty(prepared, root, actor, uid, gid, None)
+}
+
+fn launch_with_pty(
+    prepared: Prepared,
+    root: &PinnedProcess,
+    actor: &PinnedProcess,
+    uid: u32,
+    gid: u32,
+    pty: Option<(File, File, UnixStream)>,
+) -> io::Result<String> {
     root.verify()?;
     actor.verify()?;
     let b = &prepared.grant.binding;
@@ -3990,7 +4338,13 @@ pub(super) fn launch(
     {
         return Err(io::Error::other("fresh provider plan changed before K"));
     }
-    if b.causal_parent.is_some() {
+    if pty.is_some() {
+        let k: InteractiveK = exact_file(&prepared.directory, &interactive_k_name(b))?
+            .ok_or_else(|| io::Error::other("interactive K record absent"))?;
+        if k.grant != prepared.grant || prepared.plan.role != FreshPlanRole::Interactive {
+            return Err(io::Error::other("interactive K record or role changed"));
+        }
+    } else if b.causal_parent.is_some() {
         require_child_work_plan(&prepared.directory, b, &prepared.plan)?;
     } else if prepared
         .directory
@@ -4026,6 +4380,11 @@ pub(super) fn launch(
         )?;
     let placeholder = UnixStream::pair()?;
     let work_id = uuid::Uuid::new_v4().to_string();
+    let interactive = pty.is_some();
+    let (master, slave, relay) = match pty {
+        Some((master, slave, relay)) => (Some(master), Some(slave), Some(relay)),
+        None => (None, None, None),
+    };
     let init = Init {
         plan: prepared.plan,
         dir: File::open(&prepared.directory)?,
@@ -4033,6 +4392,7 @@ pub(super) fn launch(
         work_id: work_id.clone(),
         stdout,
         stderr,
+        interactive_slave: slave,
         control: placeholder.0,
         gate: placeholder.1,
         uid,
@@ -4040,6 +4400,14 @@ pub(super) fn launch(
         groups: actor.supplementary_groups()?,
     };
     let (pid, mut control, mut gate) = create_init(&parent_namespace, init)?;
+    if let (Some(master), Some(relay)) = (master, relay) {
+        capture_interactive_output(
+            master,
+            relay,
+            prepared.directory.clone(),
+            prepared.grant.id.clone(),
+        )?;
+    }
     let init_pin = PinnedProcess::open(pid)?;
     if !init_pin.is_namespace_init()? {
         return Err(io::Error::other("fresh provider PID1 not namespace init"));
@@ -4077,6 +4445,30 @@ pub(super) fn launch(
         &format!("{}.attach.json", prepared.grant.id),
         &attach,
     )?;
+    if interactive {
+        durable_new(
+            &prepared.directory,
+            &format!("{}.interactive-identity.json", prepared.grant.id),
+            &InteractiveIdentity {
+                version: 1,
+                grant_id: prepared.grant.id.clone(),
+                work_id: attach.work_id.clone(),
+                pid1_host_pid: init_pin.host_pid,
+                pid1_boot_id: init_pin.boot_id.clone(),
+                pid1_starttime_ticks: init_pin.starttime_ticks,
+                pid1_pidns_dev: init_pin.pidns_dev,
+                pid1_pidns_ino: init_pin.pidns_ino,
+                provider_host_pid: provider.host_pid,
+                provider_local_pid: attach.provider_local_pid,
+                provider_boot_id: provider.boot_id.clone(),
+                provider_starttime_ticks: provider.starttime_ticks,
+                provider_pidns_dev: provider.pidns_dev,
+                provider_pidns_ino: provider.pidns_ino,
+                peer_uid: uid,
+                peer_gid: gid,
+            },
+        )?;
+    }
     init_pin.verify()?;
     provider.verify()?;
     gate.write_all(b"R")?;

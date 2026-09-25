@@ -349,7 +349,7 @@ pub fn private_fresh_pty_handoff_at(
     master: RawFd,
     slave: RawFd,
 ) -> io::Result<()> {
-    private_fresh_pty_request_at(path, request, b'^', &[master, slave])
+    private_fresh_pty_request_at(path, request, b'^', &[master, slave]).map(|_| ())
 }
 
 /// Exact admission recheck for the selected interactive plan and live pair.
@@ -360,7 +360,26 @@ pub fn private_fresh_interactive_k_preparation_at(
     request: &PrivateFreshPtyHandoff,
     descriptors: [RawFd; 7],
 ) -> io::Result<()> {
-    private_fresh_pty_request_at(path, request, b'{', &descriptors)
+    private_fresh_pty_request_at(path, request, b'{', &descriptors).map(|_| ())
+}
+
+/// This is the one-use physical K. An uncertain reply must be followed only
+/// by `private_fresh_interactive_q_at`, never another submission.
+#[cfg(feature = "age319-private-broker-fixture")]
+pub fn private_fresh_interactive_k_at(
+    path: &Path,
+    request: &PrivateFreshPtyHandoff,
+    descriptors: [RawFd; 8],
+) -> io::Result<String> {
+    private_fresh_pty_request_at(path, request, b'}', &descriptors)
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+pub fn private_fresh_interactive_q_at(
+    path: &Path,
+    request: &PrivateFreshPtyHandoff,
+) -> io::Result<String> {
+    private_fresh_pty_request_at(path, request, b']', &[])
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]
@@ -369,7 +388,7 @@ fn private_fresh_pty_request_at(
     request: &PrivateFreshPtyHandoff,
     operation: u8,
     descriptors: &[RawFd],
-) -> io::Result<()> {
+) -> io::Result<String> {
     let id = uuid::Uuid::parse_str(&request.d_key)
         .map_err(|_| io::Error::other("invalid PTY handoff D key"))?;
     if id.is_nil() || id.to_string() != request.d_key {
@@ -394,19 +413,23 @@ fn private_fresh_pty_request_at(
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
-    msg.msg_control = control.as_mut_ptr().cast();
-    msg.msg_controllen =
-        unsafe { libc::CMSG_SPACE(std::mem::size_of_val(descriptors) as _) } as usize;
-    unsafe {
-        let header = libc::CMSG_FIRSTHDR(&msg);
-        (*header).cmsg_level = libc::SOL_SOCKET;
-        (*header).cmsg_type = libc::SCM_RIGHTS;
-        (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(descriptors) as _) as usize;
-        std::ptr::copy_nonoverlapping(
-            descriptors.as_ptr(),
-            libc::CMSG_DATA(header).cast(),
-            descriptors.len(),
-        );
+    if !descriptors.is_empty() {
+        msg.msg_control = control.as_mut_ptr().cast();
+        msg.msg_controllen =
+            unsafe { libc::CMSG_SPACE(std::mem::size_of_val(descriptors) as _) } as usize;
+    }
+    if !descriptors.is_empty() {
+        unsafe {
+            let header = libc::CMSG_FIRSTHDR(&msg);
+            (*header).cmsg_level = libc::SOL_SOCKET;
+            (*header).cmsg_type = libc::SCM_RIGHTS;
+            (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(descriptors) as _) as usize;
+            std::ptr::copy_nonoverlapping(
+                descriptors.as_ptr(),
+                libc::CMSG_DATA(header).cast(),
+                descriptors.len(),
+            );
+        }
     }
     if unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) }
         != frame.len() as isize
@@ -414,18 +437,18 @@ fn private_fresh_pty_request_at(
         return Err(io::Error::other("PTY handoff submission uncertain"));
     }
     let response = read_response(stream)?;
-    let expected = if operation == b'^' {
-        "fresh-pty-handoff-pre-k\n"
-    } else {
-        "fresh-interactive-k-preparation-pre-k\n"
+    let expected = match operation {
+        b'^' => Some("fresh-pty-handoff-pre-k\n"),
+        b'{' => Some("fresh-interactive-k-preparation-pre-k\n"),
+        _ => None,
     };
-    if response != expected {
+    if response.starts_with("error ") || expected.is_some_and(|expected| response != expected) {
         return Err(io::Error::other(format!(
             "PTY handoff refused: {}",
             response.trim_end()
         )));
     }
-    Ok(())
+    Ok(response)
 }
 
 /// Register one sealed candidate plan, then durably select/read back the
@@ -715,6 +738,93 @@ pub fn private_fresh_provider_output_at(
             .map_err(|_| io::Error::other("cancel flag invalid"))?,
         stdout: files.remove(0),
         stderr: files.remove(0),
+    })
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+pub struct PrivateFreshInteractiveOutput {
+    pub grant_id: String,
+    pub wait_status: i32,
+    pub output: std::fs::File,
+    pub bytes: u64,
+    pub sha256: String,
+}
+
+/// Transfer the Q-verified PTY transcript by descriptor to the original root.
+#[cfg(feature = "age319-private-broker-fixture")]
+pub fn private_fresh_interactive_output_at(
+    path: &Path,
+    request: &PrivateFreshPtyHandoff,
+) -> io::Result<PrivateFreshInteractiveOutput> {
+    let id = uuid::Uuid::parse_str(&request.d_key)
+        .map_err(|_| io::Error::other("invalid interactive D key"))?;
+    if id.is_nil() || id.to_string() != request.d_key {
+        return Err(io::Error::other("noncanonical interactive D key"));
+    }
+    let body = serde_json::to_vec(request)?;
+    let mut stream = checked_connection(path)?;
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let mut frame = Vec::with_capacity(17 + body.len());
+    frame.push(b'|');
+    frame.extend_from_slice(&challenge);
+    frame.extend_from_slice(&body);
+    stream.write_all(&frame)?;
+    let mut data = [0u8; 512];
+    let mut control = [0u8; 64];
+    let mut iov = libc::iovec {
+        iov_base: data.as_mut_ptr().cast(),
+        iov_len: data.len(),
+    };
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = control.len();
+    let count = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
+    if count <= 0 || msg.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 {
+        return Err(io::Error::other("interactive output reply incomplete"));
+    }
+    let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+    if cmsg.is_null()
+        || unsafe {
+            (*cmsg).cmsg_level != libc::SOL_SOCKET || (*cmsg).cmsg_type != libc::SCM_RIGHTS
+        }
+        || unsafe { (*cmsg).cmsg_len }
+            != unsafe { libc::CMSG_LEN(std::mem::size_of::<i32>() as _) } as usize
+        || !unsafe { libc::CMSG_NXTHDR(&msg, cmsg) }.is_null()
+    {
+        return Err(io::Error::other(
+            "interactive output descriptor absent or changed",
+        ));
+    }
+    let fd = unsafe { *(libc::CMSG_DATA(cmsg) as *const i32) };
+    let output = unsafe { std::fs::File::from_raw_fd(fd) };
+    let reply = std::str::from_utf8(&data[..count as usize])
+        .map_err(|_| io::Error::other("interactive output reply encoding"))?;
+    let fields: Vec<_> = reply.trim_end_matches('\n').split(' ').collect();
+    if fields.len() != 5 || fields[0] != "fresh-interactive-output" {
+        return Err(io::Error::other("interactive output Q reply invalid"));
+    }
+    let grant_id = uuid::Uuid::parse_str(fields[1])
+        .map_err(|_| io::Error::other("interactive output grant invalid"))?
+        .to_string();
+    if grant_id != fields[1]
+        || fields[4].len() != 64
+        || !fields[4].bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(io::Error::other("interactive output digest invalid"));
+    }
+    Ok(PrivateFreshInteractiveOutput {
+        grant_id,
+        wait_status: fields[2]
+            .parse()
+            .map_err(|_| io::Error::other("interactive wait invalid"))?,
+        bytes: fields[3]
+            .parse()
+            .map_err(|_| io::Error::other("interactive output length invalid"))?,
+        sha256: fields[4].into(),
+        output,
     })
 }
 

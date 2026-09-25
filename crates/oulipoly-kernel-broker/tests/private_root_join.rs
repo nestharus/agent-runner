@@ -78,6 +78,14 @@ impl Drop for SnapshotRestore {
 
 fn inner() {
     let mode = std::env::var("AGE319_PRIVATE_JOIN_MODE").unwrap_or_else(|_| "help".into());
+    let physical_mode = mode.starts_with("normal_model_provider_pty_physical");
+    let physical_success = physical_mode
+        && !matches!(
+            mode.as_str(),
+            "normal_model_provider_pty_physical_post_k_unknown"
+                | "normal_model_provider_pty_physical_root_exit"
+                | "normal_model_provider_pty_physical_restart_after_k"
+        );
     let provider_mode = mode.starts_with("normal_model_provider");
     let path_mode = matches!(
         mode.as_str(),
@@ -108,6 +116,14 @@ fn inner() {
             | "normal_model_held"
             | "normal_model_provider"
             | "normal_model_provider_pty_control"
+            | "normal_model_provider_pty_physical"
+            | "normal_model_provider_pty_physical_wrong_plan"
+            | "normal_model_provider_pty_physical_wrong_actor"
+            | "normal_model_provider_pty_physical_reply_loss"
+            | "normal_model_provider_pty_physical_post_k_unknown"
+            | "normal_model_provider_pty_physical_restart"
+            | "normal_model_provider_pty_physical_restart_after_k"
+            | "normal_model_provider_pty_physical_root_exit"
             | "normal_model_provider_pty_restart"
             | "normal_model_provider_pty_replaced"
             | "normal_model_provider_pty_root_exit"
@@ -271,9 +287,12 @@ fn inner() {
             marker.clone()
         };
         let interactive_args = if mode.starts_with("normal_model_provider_pty_") {
-            "interactive_args = [\"--interactive-only\"]\n"
+            format!(
+                "interactive_args = [\"--interactive-only\", {}]\n",
+                serde_json::to_string(gate.join("interactive-effect").to_str().unwrap()).unwrap()
+            )
         } else {
-            ""
+            String::new()
         };
         fs::write(
             config_dir.join("providers.toml"),
@@ -503,6 +522,18 @@ fn inner() {
             "1",
         )))
         .envs(
+            (mode == "normal_model_provider_pty_physical_reply_loss").then_some((
+                "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_INTERACTIVE_K_REPLY_V1",
+                "1",
+            )),
+        )
+        .envs(
+            (mode == "normal_model_provider_pty_physical_post_k_unknown").then_some((
+                "OULIPOLY_KERNEL_BROKER_FIXTURE_INTERACTIVE_POST_K_UNKNOWN_V1",
+                "1",
+            )),
+        )
+        .envs(
             matches!(
                 mode.as_str(),
                 "normal_model_provider_quota_reply_loss" | "normal_model_provider_auth_reply_loss"
@@ -603,8 +634,26 @@ fn inner() {
                     .then_some(("AGE319_PRIVATE_ROOT_PTY_NEGATIVE_V1", "1")),
             )
             .envs(
-                (mode == "normal_model_provider_pty_restart")
+                (mode == "normal_model_provider_pty_restart"
+                    || mode == "normal_model_provider_pty_physical_restart")
                     .then_some(("AGE319_PRIVATE_ROOT_PTY_RESTART_V1", "1")),
+            )
+            .envs(physical_mode.then_some(("AGE319_PRIVATE_ROOT_PTY_PHYSICAL_V1", "1")))
+            .envs(
+                (mode == "normal_model_provider_pty_physical_wrong_plan")
+                    .then_some(("AGE319_PRIVATE_ROOT_PTY_PHYSICAL_NEGATIVE_V1", "1")),
+            )
+            .envs(
+                (mode == "normal_model_provider_pty_physical_wrong_actor")
+                    .then_some(("AGE319_PRIVATE_ROOT_PTY_PHYSICAL_ACTOR_GATE_V1", "1")),
+            )
+            .envs(
+                (mode == "normal_model_provider_pty_physical_root_exit")
+                    .then_some(("AGE319_PRIVATE_ROOT_PTY_EXIT_AFTER_K_V1", "1")),
+            )
+            .envs(
+                (mode == "normal_model_provider_pty_physical_restart_after_k")
+                    .then_some(("AGE319_PRIVATE_ROOT_PTY_RESTART_AFTER_K_V1", "1")),
             )
             .envs(
                 matches!(
@@ -1935,6 +1984,14 @@ fn inner() {
                     | "normal_model_held"
                     | "normal_model_provider"
                     | "normal_model_provider_pty_control"
+                    | "normal_model_provider_pty_physical"
+                    | "normal_model_provider_pty_physical_wrong_plan"
+                    | "normal_model_provider_pty_physical_wrong_actor"
+                    | "normal_model_provider_pty_physical_reply_loss"
+                    | "normal_model_provider_pty_physical_post_k_unknown"
+                    | "normal_model_provider_pty_physical_restart"
+                    | "normal_model_provider_pty_physical_restart_after_k"
+                    | "normal_model_provider_pty_physical_root_exit"
                     | "normal_model_provider_pty_restart"
                     | "normal_model_provider_pty_replaced"
                     | "normal_model_provider_pty_root_exit"
@@ -2242,6 +2299,18 @@ fn inner() {
                         "1",
                     )))
                     .envs(
+                        (mode == "normal_model_provider_pty_physical_reply_loss").then_some((
+                            "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_INTERACTIVE_K_REPLY_V1",
+                            "1",
+                        )),
+                    )
+                    .envs(
+                        (mode == "normal_model_provider_pty_physical_post_k_unknown").then_some((
+                            "OULIPOLY_KERNEL_BROKER_FIXTURE_INTERACTIVE_POST_K_UNKNOWN_V1",
+                            "1",
+                        )),
+                    )
+                    .envs(
                         (mode == "normal_model_provider_quota_reply_loss").then_some((
                             "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_ACCOUNT_EFFECT_REPLY_V1",
                             "1",
@@ -2433,34 +2502,33 @@ fn inner() {
                     return;
                 }
                 if provider_mode {
-                    let pty_record_before =
-                        (mode == "normal_model_provider_pty_restart").then(|| {
-                            eventually(|| {
-                                gate.join("root-pty-ready").exists()
-                                    || entry.try_wait().unwrap().is_some()
-                            });
-                            assert!(
-                                gate.join("root-pty-ready").exists(),
-                                "{}",
-                                fs::read_to_string(&err).unwrap()
-                            );
-                            fs::read(
-                                broker_state.join("v30/fresh-provider").join(format!(
-                                    "{}.interactive-pty-pre-k.json",
-                                    receipt.handoff_id
-                                )),
-                            )
-                            .unwrap()
+                    let pty_restart = mode == "normal_model_provider_pty_restart"
+                        || mode == "normal_model_provider_pty_physical_restart";
+                    let pty_record_before = pty_restart.then(|| {
+                        eventually(|| {
+                            gate.join("root-pty-ready").exists()
+                                || entry.try_wait().unwrap().is_some()
                         });
-                    let preparation_before =
-                        (mode == "normal_model_provider_pty_restart").then(|| {
-                            fs::read(broker_state.join("v30/fresh-provider").join(format!(
-                                "{}.interactive-k-preparation.json",
-                                receipt.handoff_id
-                            )))
-                            .unwrap()
-                        });
-                    if mode == "normal_model_provider_pty_restart" {
+                        assert!(
+                            gate.join("root-pty-ready").exists(),
+                            "{}",
+                            fs::read_to_string(&err).unwrap()
+                        );
+                        fs::read(
+                            broker_state
+                                .join("v30/fresh-provider")
+                                .join(format!("{}.interactive-pty-pre-k.json", receipt.handoff_id)),
+                        )
+                        .unwrap()
+                    });
+                    let preparation_before = pty_restart.then(|| {
+                        fs::read(broker_state.join("v30/fresh-provider").join(format!(
+                            "{}.interactive-k-preparation.json",
+                            receipt.handoff_id
+                        )))
+                        .unwrap()
+                    });
+                    if pty_restart {
                         let fresh_socket = socket.with_file_name("v30.sock");
                         stop(&mut broker);
                         broker = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
@@ -2484,12 +2552,229 @@ fn inner() {
                         fs::write(gate.join("root-pty-rechallenge"), b"go").unwrap();
                     }
                     let provider_dir = broker_state.join("v30/fresh-provider");
+                    if mode == "normal_model_provider_pty_physical_restart_after_k" {
+                        eventually(|| gate.join("physical-k-ready").exists());
+                        let k_path =
+                            provider_dir.join(format!("{}.interactive-k.json", receipt.handoff_id));
+                        let original_k = fs::read(&k_path).unwrap();
+                        let k: serde_json::Value = serde_json::from_slice(&original_k).unwrap();
+                        let id = k["grant"]["id"].as_str().unwrap();
+                        assert!(provider_dir.join(format!("{id}.consumed.json")).exists());
+                        assert!(provider_dir.join(format!("{id}.attach.json")).exists());
+                        let control_path = k["preparation"]["handoff"]["control_path"]
+                            .as_str()
+                            .unwrap();
+                        assert!(
+                            Path::new(control_path).exists(),
+                            "original root control lost before broker restart"
+                        );
+                        stop(&mut broker);
+                        broker = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
+                            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
+                            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
+                            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+                            .stderr(Stdio::from(
+                                File::create(temp.path().join("physical-post-k-restart.log"))
+                                    .unwrap(),
+                            ))
+                            .spawn()
+                            .unwrap();
+                        eventually(|| {
+                            protocol::request_at(
+                                &socket.with_file_name("v30.sock"),
+                                Operation::ObserveEntryGate,
+                            )
+                            .is_ok()
+                        });
+                        fs::write(gate.join("physical-restarted"), b"go").unwrap();
+                        eventually(|| entry.try_wait().unwrap().is_some());
+                        assert_eq!(fs::read(&k_path).unwrap(), original_k);
+                        assert!(fs::read_to_string(&err).unwrap().contains(id));
+                        assert!(
+                            !provider_dir
+                                .join(format!("{}.interactive-q.json", receipt.handoff_id))
+                                .exists()
+                        );
+                        assert!(
+                            !provider_dir
+                                .join(format!("{}.fresh-grant.json", receipt.handoff_id))
+                                .exists()
+                        );
+                        assert!(!gate.join("provider-effect").exists());
+                        assert!(!gate.join("interactive-effect").exists());
+                        assert_eq!(
+                            fs::read_dir(&provider_dir)
+                                .unwrap()
+                                .filter_map(Result::ok)
+                                .filter(|entry| entry
+                                    .file_name()
+                                    .to_string_lossy()
+                                    .ends_with(".interactive-k.json"))
+                                .count(),
+                            1
+                        );
+                        assert_old_debt_and_no_f_ack(&broker_state);
+                        stop(&mut broker);
+                        return;
+                    }
+                    if mode == "normal_model_provider_pty_physical_wrong_actor" {
+                        eventually(|| gate.join("physical-before-k").exists());
+                        let handoff: serde_json::Value = serde_json::from_slice(
+                            &fs::read(provider_dir.join(format!(
+                                "{}.interactive-pty-pre-k.json",
+                                receipt.handoff_id
+                            )))
+                            .unwrap(),
+                        )
+                        .unwrap();
+                        let selected: serde_json::Value = serde_json::from_slice(
+                            &fs::read(provider_dir.join(format!(
+                                "{}.interactive-route-selection.json",
+                                receipt.handoff_id
+                            )))
+                            .unwrap(),
+                        )
+                        .unwrap();
+                        let request = protocol::PrivateFreshPtyHandoff {
+                            d_key: receipt.d_key.clone(),
+                            session_id: handoff["binding"]["session_id"].as_str().unwrap().into(),
+                            role: protocol::FreshPlanRole::Interactive,
+                            account: "local".into(),
+                            plan_sha256: selected["selection"]["plan_sha256"]
+                                .as_str()
+                                .unwrap()
+                                .into(),
+                            control_path: handoff["control_path"].as_str().unwrap().into(),
+                        };
+                        let dummy = File::open("/dev/null").unwrap();
+                        assert!(
+                            protocol::private_fresh_interactive_k_at(
+                                &socket.with_file_name("v30.sock"),
+                                &request,
+                                [dummy.as_raw_fd(); 8],
+                            )
+                            .is_err(),
+                            "sibling actor consumed interactive K"
+                        );
+                        assert!(
+                            !provider_dir
+                                .join(format!("{}.interactive-k.json", receipt.handoff_id))
+                                .exists()
+                        );
+                        fs::write(gate.join("physical-continue"), b"go").unwrap();
+                    }
+                    if mode == "normal_model_provider_pty_physical_post_k_unknown" {
+                        eventually(|| entry.try_wait().unwrap().is_some());
+                        let k: serde_json::Value = serde_json::from_slice(
+                            &fs::read(
+                                provider_dir
+                                    .join(format!("{}.interactive-k.json", receipt.handoff_id)),
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap();
+                        let id = k["grant"]["id"].as_str().unwrap();
+                        assert_eq!(k["state"], "consumed-before-child-release");
+                        assert!(!provider_dir.join(format!("{id}.consumed.json")).exists());
+                        assert!(!provider_dir.join(format!("{id}.attach.json")).exists());
+                        assert!(
+                            !provider_dir
+                                .join(format!("{}.interactive-q.json", receipt.handoff_id))
+                                .exists()
+                        );
+                        assert!(!gate.join("interactive-effect").exists());
+                        assert!(!gate.join("provider-effect").exists());
+                        assert!(fs::read_to_string(&err).unwrap().contains(id));
+                        assert_eq!(
+                            fs::read_dir(&provider_dir)
+                                .unwrap()
+                                .filter_map(Result::ok)
+                                .filter(|entry| entry
+                                    .file_name()
+                                    .to_string_lossy()
+                                    .ends_with(".interactive-k.json"))
+                                .count(),
+                            1
+                        );
+                        assert_old_debt_and_no_f_ack(&broker_state);
+                        stop(&mut broker);
+                        return;
+                    }
+                    if mode == "normal_model_provider_pty_physical_root_exit" {
+                        eventually(|| entry.try_wait().unwrap().is_some());
+                        let k: serde_json::Value = serde_json::from_slice(
+                            &fs::read(
+                                provider_dir
+                                    .join(format!("{}.interactive-k.json", receipt.handoff_id)),
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap();
+                        let id = k["grant"]["id"].as_str().unwrap();
+                        eventually(|| {
+                            provider_dir.join(format!("{id}.pid1-wait.json")).exists()
+                                && provider_dir
+                                    .join(format!("{id}.interactive-output.json"))
+                                    .exists()
+                        });
+                        assert!(provider_dir.join(format!("{id}.consumed.json")).exists());
+                        assert!(provider_dir.join(format!("{id}.attach.json")).exists());
+                        assert!(provider_dir.join(format!("{id}.exit.json")).exists());
+                        assert!(provider_dir.join(format!("{id}.drain.json")).exists());
+                        assert!(
+                            !provider_dir
+                                .join(format!("{}.interactive-q.json", receipt.handoff_id))
+                                .exists()
+                        );
+                        assert!(!gate.join("provider-effect").exists());
+                        assert_eq!(
+                            fs::read_dir(&provider_dir)
+                                .unwrap()
+                                .filter_map(Result::ok)
+                                .filter(|entry| entry
+                                    .file_name()
+                                    .to_string_lossy()
+                                    .ends_with(".interactive-k.json"))
+                                .count(),
+                            1
+                        );
+                        assert_old_debt_and_no_f_ack(&broker_state);
+                        stop(&mut broker);
+                        return;
+                    }
                     let selected_marker = if mode == "normal_model_provider_no_pin" {
                         gate.join("provider-effect-unused")
                     } else {
                         gate.join("provider-effect")
                     };
-                    eventually(|| selected_marker.exists() || entry.try_wait().unwrap().is_some());
+                    if physical_success {
+                        let until = Instant::now() + Duration::from_secs(30);
+                        while !selected_marker.exists()
+                            && entry.try_wait().unwrap().is_none()
+                            && Instant::now() < until
+                        {
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        if !selected_marker.exists() {
+                            let artifacts = fs::read_dir(&provider_dir)
+                                .unwrap()
+                                .filter_map(Result::ok)
+                                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                                .collect::<Vec<_>>();
+                            panic!(
+                                "physical root stderr: {}; broker status: {:?}; artifacts: {artifacts:?}; broker log: {}",
+                                fs::read_to_string(&err).unwrap_or_default(),
+                                broker.try_wait().unwrap(),
+                                fs::read_to_string(temp.path().join("handoff-restart.log"))
+                                    .unwrap_or_default()
+                            );
+                        }
+                    } else {
+                        eventually(|| {
+                            selected_marker.exists() || entry.try_wait().unwrap().is_some()
+                        });
+                    }
                     assert!(
                         selected_marker.exists(),
                         "{}",
@@ -2630,6 +2915,152 @@ fn inner() {
                             preparation["broker_resolved_path"],
                             candidate["broker_resolved_path"]
                         );
+                        if physical_success {
+                            let k: serde_json::Value = serde_json::from_slice(
+                                &fs::read(
+                                    provider_dir
+                                        .join(format!("{}.interactive-k.json", receipt.handoff_id)),
+                                )
+                                .unwrap(),
+                            )
+                            .unwrap();
+                            let q: serde_json::Value = serde_json::from_slice(
+                                &fs::read(
+                                    provider_dir
+                                        .join(format!("{}.interactive-q.json", receipt.handoff_id)),
+                                )
+                                .unwrap(),
+                            )
+                            .unwrap();
+                            let interactive_id = k["grant"]["id"].as_str().unwrap();
+                            assert_eq!(k["state"], "consumed-before-child-release");
+                            assert_eq!(k["preparation"], preparation);
+                            assert_eq!(q["k"], k);
+                            assert_eq!(q["attach"]["grant_id"], interactive_id);
+                            assert_eq!(q["provider_exit"]["grant_id"], interactive_id);
+                            assert_eq!(
+                                q["provider_exit"]["provider_local_pid"],
+                                q["attach"]["provider_local_pid"]
+                            );
+                            assert_eq!(q["provider_exit"]["wait_status"], 0);
+                            assert_eq!(q["tree_drain"]["zero_remaining"], true);
+                            assert_eq!(q["pid1_wait"]["reaped"], true);
+                            assert_eq!(q["pid1_wait"]["wait_status"], 0);
+                            assert!(q["attach"]["provider_pid"].as_i64().unwrap() > 0);
+                            assert!(q["attach"]["provider_starttime"].as_u64().unwrap() > 0);
+                            assert!(q["attach"]["pidns_ino"].as_u64().unwrap() > 0);
+                            assert_eq!(
+                                q["identity"]["provider_host_pid"],
+                                q["attach"]["provider_pid"]
+                            );
+                            assert_eq!(
+                                q["identity"]["provider_local_pid"],
+                                q["attach"]["provider_local_pid"]
+                            );
+                            assert_eq!(
+                                q["identity"]["provider_starttime_ticks"],
+                                q["attach"]["provider_starttime"]
+                            );
+                            assert_eq!(
+                                q["identity"]["provider_pidns_ino"],
+                                q["attach"]["pidns_ino"]
+                            );
+                            assert_eq!(
+                                q["identity"]["provider_boot_id"],
+                                k["grant"]["binding"]["actor_boot_id"]
+                            );
+                            assert_eq!(
+                                q["identity"]["pid1_boot_id"],
+                                k["grant"]["binding"]["actor_boot_id"]
+                            );
+                            assert_eq!(
+                                q["identity"],
+                                serde_json::from_slice::<serde_json::Value>(
+                                    &fs::read(provider_dir.join(format!(
+                                        "{interactive_id}.interactive-identity.json"
+                                    )))
+                                    .unwrap()
+                                )
+                                .unwrap()
+                            );
+                            let fixture: serde_json::Value = serde_json::from_slice(
+                                &fs::read(gate.join("interactive-effect")).unwrap(),
+                            )
+                            .unwrap();
+                            assert_eq!(fixture["controlling_tty"], true);
+                            assert_eq!(fixture["input"], "fixture-input-through-pty\n");
+                            assert_eq!(fixture["pid"], q["attach"]["provider_local_pid"]);
+                            let output = fs::read(
+                                provider_dir.join(format!("{interactive_id}.interactive-output")),
+                            )
+                            .unwrap();
+                            assert_eq!(
+                                fs::read(gate.join("interactive-output-readback")).unwrap(),
+                                output
+                            );
+                            assert!(
+                                output
+                                    .windows(b"interactive-ready".len())
+                                    .any(|part| part == b"interactive-ready")
+                            );
+                            assert!(
+                                output
+                                    .windows(b"interactive-output:fixture-input-through-pty".len())
+                                    .any(|part| part
+                                        == b"interactive-output:fixture-input-through-pty")
+                            );
+                            assert_eq!(q["pty_output"]["bytes"], output.len());
+                            assert_eq!(
+                                q["pty_output"]["sha256"],
+                                format!("{:x}", Sha256::digest(&output))
+                            );
+                            let q_readback =
+                                fs::read_to_string(gate.join("interactive-q-readback")).unwrap();
+                            assert!(q_readback.starts_with(&format!(
+                                "fresh-interactive-drained {interactive_id} 0 "
+                            )));
+                            if mode == "normal_model_provider_pty_physical" {
+                                eprintln!(
+                                    "interactive physical evidence: grant={interactive_id} provider_host_pid={} provider_local_pid={} provider_starttime_ticks={} provider_pidns_ino={} wait_status={} output_bytes={} output_sha256={} controlling_tty={} input={:?}",
+                                    q["identity"]["provider_host_pid"],
+                                    q["identity"]["provider_local_pid"],
+                                    q["identity"]["provider_starttime_ticks"],
+                                    q["identity"]["provider_pidns_ino"],
+                                    q["provider_exit"]["wait_status"],
+                                    q["pty_output"]["bytes"],
+                                    q["pty_output"]["sha256"],
+                                    fixture["controlling_tty"],
+                                    fixture["input"]
+                                );
+                            }
+                            if mode == "normal_model_provider_pty_physical_reply_loss" {
+                                assert!(
+                                    gate.join("interactive-k-reply-dropped").exists(),
+                                    "gate files: {:?}; broker log: {}",
+                                    fs::read_dir(&gate)
+                                        .unwrap()
+                                        .filter_map(Result::ok)
+                                        .map(|entry| entry
+                                            .file_name()
+                                            .to_string_lossy()
+                                            .into_owned())
+                                        .collect::<Vec<_>>(),
+                                    fs::read_to_string(&broker_log).unwrap_or_default()
+                                );
+                            }
+                            assert_ne!(interactive_id, grant["id"].as_str().unwrap());
+                            assert_eq!(
+                                fs::read_dir(&provider_dir)
+                                    .unwrap()
+                                    .filter_map(Result::ok)
+                                    .filter(|entry| entry
+                                        .file_name()
+                                        .to_string_lossy()
+                                        .ends_with(".interactive-k.json"))
+                                    .count(),
+                                1
+                            );
+                        }
                         let path = Path::new(record["control_path"].as_str().unwrap());
                         assert!(path.exists(), "root control closed before provider Q");
                         assert!(
@@ -2909,6 +3340,13 @@ fn inner() {
                                 .join(format!("root-pty-{}.sock", receipt.d_key))
                                 .exists(),
                             "root control socket survived root exit"
+                        );
+                    }
+                    if physical_success {
+                        assert!(
+                            !gate
+                                .join(format!("root-pty-{}.sock", receipt.d_key))
+                                .exists()
                         );
                     }
                     if mode == "normal_model_provider_pty_replaced" {
@@ -5319,6 +5757,14 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_model_held",
         "normal_model_provider",
         "normal_model_provider_pty_control",
+        "normal_model_provider_pty_physical",
+        "normal_model_provider_pty_physical_wrong_plan",
+        "normal_model_provider_pty_physical_wrong_actor",
+        "normal_model_provider_pty_physical_reply_loss",
+        "normal_model_provider_pty_physical_post_k_unknown",
+        "normal_model_provider_pty_physical_restart",
+        "normal_model_provider_pty_physical_restart_after_k",
+        "normal_model_provider_pty_physical_root_exit",
         "normal_model_provider_pty_restart",
         "normal_model_provider_pty_replaced",
         "normal_model_provider_pty_root_exit",
@@ -5388,6 +5834,9 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        if mode == "normal_model_provider_pty_physical" {
+            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        }
         eprintln!("private root mode passed: {mode}");
         if std::env::var("AGE319_PRIVATE_JOIN_THROUGH_MODE")
             .ok()

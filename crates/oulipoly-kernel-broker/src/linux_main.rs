@@ -61,6 +61,8 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Write};
+#[cfg(feature = "age319-private-broker-fixture")]
+use std::os::fd::IntoRawFd;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -464,7 +466,7 @@ fn recv_request(
         #[cfg(feature = "age319-private-broker-fixture")]
         b'h' | b'f' | b'(' | b')' | b'm' | b'n' => (18..=48 * 1024 + 17).contains(&read),
         #[cfg(feature = "age319-private-broker-fixture")]
-        b'^' | b'{' => (18..=2048 + 17).contains(&read),
+        b'^' | b'{' | b'}' | b']' | b'|' => (18..=2048 + 17).contains(&read),
         b'F' => (18..=8192 + 17).contains(&read),
         b'O' => (18..=1024 + 17).contains(&read),
         b'U' => (18..=512 + 17).contains(&read),
@@ -494,6 +496,8 @@ fn recv_request(
             b'^' => descriptors.len() != 2,
             #[cfg(feature = "age319-private-broker-fixture")]
             b'{' => descriptors.len() != 7,
+            #[cfg(feature = "age319-private-broker-fixture")]
+            b'}' => descriptors.len() != 8,
             b'L' => !(1..=4).contains(&descriptors.len()),
             b'V' | b'S' | b's' | b'T' => descriptors.len() != 1,
             _ => !descriptors.is_empty(),
@@ -543,7 +547,7 @@ fn recv_request(
             descriptors,
         },
         #[cfg(feature = "age319-private-broker-fixture")]
-        b'^' | b'{' => RequestPayload::FreshInteractivePtyHandoff {
+        b'^' | b'{' | b'}' | b']' | b'|' => RequestPayload::FreshInteractivePtyHandoff {
             request: serde_json::from_slice(&request[17..read as usize])?,
             descriptors,
         },
@@ -4025,11 +4029,13 @@ fn serve_fresh_v30_at(
         #[cfg(feature = "age319-private-broker-fixture")]
         let mut drop_provider_k_reply = false;
         #[cfg(feature = "age319-private-broker-fixture")]
+        let mut drop_interactive_k_reply = false;
+        #[cfg(feature = "age319-private-broker-fixture")]
         let mut drop_provider_q_reply = false;
         #[cfg(feature = "age319-private-broker-fixture")]
         let mut drop_account_effect_reply = false;
         #[cfg(feature = "age319-private-broker-fixture")]
-        let mut provider_output_files: Option<[File; 2]> = None;
+        let mut provider_output_files: Option<Vec<File>> = None;
         let mut diagnostic_opcode = b'?';
         let mut diagnostic_stage = "request_decode";
         #[cfg(feature = "age319-private-broker-fixture")]
@@ -4614,7 +4620,7 @@ fn serve_fresh_v30_at(
                 }
                 #[cfg(feature = "age319-private-broker-fixture")]
                 b'5' | b'6' | b'7' | b'8' | b'9' | b'h' | b'f' | b'(' | b')' | b'm' | b'n'
-                | b'^' | b'{' => {
+                | b'^' | b'{' | b'}' | b']' | b'|' => {
                     if !private_fixture() {
                         return Err(io::Error::other("fresh provider fixture route closed"));
                     }
@@ -4708,8 +4714,26 @@ fn serve_fresh_v30_at(
                         fresh_provider::binding_from_held(&receipt, &held, &actor, &root)?;
                     let directory = state_root.join("v30/fresh-provider");
                     if let Some(pty_request) = pty_request {
-                        if !matches!(operation, b'^' | b'{') || instance.is_closed() {
+                        if !matches!(operation, b'^' | b'{' | b'}' | b']' | b'|')
+                            || (!matches!(operation, b']' | b'|') && instance.is_closed())
+                        {
                             return Err(io::Error::other("fresh PTY handoff gate closed"));
+                        }
+                        if operation == b']' {
+                            return fresh_provider::observe_interactive(
+                                &directory,
+                                &binding,
+                                &pty_request,
+                            );
+                        }
+                        if operation == b'|' {
+                            let (reply, file) = fresh_provider::interactive_output(
+                                &directory,
+                                &binding,
+                                &pty_request,
+                            )?;
+                            provider_output_files = Some(vec![file]);
+                            return Ok(reply);
                         }
                         if operation == b'^' {
                             let [master, slave]: [File; 2] =
@@ -4726,11 +4750,21 @@ fn serve_fresh_v30_at(
                             )?;
                             return Ok("fresh-pty-handoff-pre-k\n".into());
                         }
+                        let mut descriptors = descriptors;
+                        let relay = if operation == b'}' {
+                            Some(
+                                descriptors
+                                    .pop()
+                                    .ok_or_else(|| io::Error::other("interactive relay absent"))?,
+                            )
+                        } else {
+                            None
+                        };
                         let [image, cwd, input, recipe, source, master, slave]: [File; 7] =
                             descriptors.try_into().map_err(|_| {
                                 io::Error::other("fresh interactive preparation descriptors absent")
                             })?;
-                        fresh_provider::prepare_interactive_k(
+                        let plan = fresh_provider::prepare_interactive_k(
                             &directory,
                             &binding,
                             &actor,
@@ -4740,10 +4774,50 @@ fn serve_fresh_v30_at(
                             input,
                             recipe,
                             source,
-                            master,
-                            slave,
+                            master.try_clone()?,
+                            slave.try_clone()?,
                         )?;
-                        return Ok("fresh-interactive-k-preparation-pre-k\n".into());
+                        if operation == b'{' {
+                            return Ok("fresh-interactive-k-preparation-pre-k\n".into());
+                        }
+                        let relay =
+                            relay.ok_or_else(|| io::Error::other("interactive relay absent"))?;
+                        if !relay.metadata()?.file_type().is_socket() {
+                            return Err(io::Error::other("interactive relay is not a socket"));
+                        }
+                        let relay = unsafe { UnixStream::from_raw_fd(relay.into_raw_fd()) };
+                        let mut relay_peer: libc::ucred = unsafe { std::mem::zeroed() };
+                        let mut relay_peer_len =
+                            std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+                        if unsafe {
+                            libc::getsockopt(
+                                relay.as_raw_fd(),
+                                libc::SOL_SOCKET,
+                                libc::SO_PEERCRED,
+                                (&mut relay_peer as *mut libc::ucred).cast(),
+                                &mut relay_peer_len,
+                            )
+                        } != 0
+                            || relay_peer_len as usize != std::mem::size_of::<libc::ucred>()
+                            || (relay_peer.pid, relay_peer.uid, relay_peer.gid)
+                                != (actor_pid, actor_uid, actor_gid)
+                        {
+                            return Err(io::Error::other(
+                                "interactive relay peer differs from original actor",
+                            ));
+                        }
+                        let grant = fresh_provider::launch_interactive(
+                            &directory, binding, plan, &root, &actor, actor_uid, actor_gid, master,
+                            slave, relay,
+                        )?;
+                        if std::env::var_os(
+                            "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_INTERACTIVE_K_REPLY_V1",
+                        )
+                        .is_some()
+                        {
+                            drop_interactive_k_reply = true;
+                        }
+                        return Ok(format!("fresh-interactive-k {grant}\n"));
                     }
                     if let Some(route_request) = route_request {
                         let expected_pin = match &held.intent {
@@ -4979,7 +5053,7 @@ fn serve_fresh_v30_at(
                                 drop_provider_q_reply = true;
                             }
                             if operation == b'8' {
-                                provider_output_files = Some([stdout, stderr]);
+                                provider_output_files = Some(vec![stdout, stderr]);
                                 format!(
                                     "fresh-provider-output {grant} {status} {stdout_len} {stdout_sha256} {stderr_len} {stderr_sha256} {cancelled}\n"
                                 )
@@ -5208,10 +5282,16 @@ fn serve_fresh_v30_at(
             }
         })();
         #[cfg(feature = "age319-private-broker-fixture")]
-        if drop_provider_k_reply || drop_provider_q_reply || drop_account_effect_reply {
+        if drop_provider_k_reply
+            || drop_interactive_k_reply
+            || drop_provider_q_reply
+            || drop_account_effect_reply
+        {
             if let Some(gate) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1") {
                 let marker = if drop_provider_k_reply {
                     "provider-k-reply-dropped"
+                } else if drop_interactive_k_reply {
+                    "interactive-k-reply-dropped"
                 } else if drop_provider_q_reply {
                     "provider-q-reply-dropped"
                 } else {
@@ -5245,7 +5325,7 @@ fn serve_fresh_v30_at(
         });
         #[cfg(feature = "age319-private-broker-fixture")]
         if let Some(files) = provider_output_files {
-            let fds = [files[0].as_raw_fd(), files[1].as_raw_fd()];
+            let fds: Vec<_> = files.iter().map(AsRawFd::as_raw_fd).collect();
             let mut iov = libc::iovec {
                 iov_base: response.as_ptr().cast_mut().cast(),
                 iov_len: response.len(),
@@ -5256,13 +5336,18 @@ fn serve_fresh_v30_at(
             msg.msg_iovlen = 1;
             msg.msg_control = control.as_mut_ptr().cast();
             msg.msg_controllen =
-                unsafe { libc::CMSG_SPACE(std::mem::size_of_val(&fds) as _) } as usize;
+                unsafe { libc::CMSG_SPACE(std::mem::size_of_val(fds.as_slice()) as _) } as usize;
             unsafe {
                 let header = libc::CMSG_FIRSTHDR(&msg);
                 (*header).cmsg_level = libc::SOL_SOCKET;
                 (*header).cmsg_type = libc::SCM_RIGHTS;
-                (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(&fds) as _) as usize;
-                std::ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(header).cast(), 2);
+                (*header).cmsg_len =
+                    libc::CMSG_LEN(std::mem::size_of_val(fds.as_slice()) as _) as usize;
+                std::ptr::copy_nonoverlapping(
+                    fds.as_ptr(),
+                    libc::CMSG_DATA(header).cast(),
+                    fds.len(),
+                );
                 libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL);
             }
             continue;

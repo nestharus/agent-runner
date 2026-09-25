@@ -1,23 +1,24 @@
-//! Original Runner actor's private, nonactivating PTY custody for the ^ challenge.
+//! Original Runner actor's private PTY custody for the selected interactive K.
 //! The broker receives a duplicate master only for its exact challenge; this
 //! actor retains the original descriptor and listener until its provider call
 //! returns. This module does not create a runtime generation or deliver F.
 
 use oulipoly_kernel_broker::protocol::{self, FreshPlanRole, PrivateFreshPtyHandoff};
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 pub(super) struct RootPtyControl {
     master: File,
-    _slave: File,
+    slave: Option<File>,
     path: PathBuf,
     device: u64,
     inode: u64,
@@ -78,7 +79,7 @@ impl RootPtyControl {
                 .map_err(|e| e.to_string())?;
             let control = Self {
                 master,
-                _slave: slave,
+                slave: Some(slave),
                 path: path.clone(),
                 device: metadata.dev(),
                 inode: metadata.ino(),
@@ -131,7 +132,10 @@ impl RootPtyControl {
             broker,
             &self._binding,
             self.master.as_raw_fd(),
-            self._slave.as_raw_fd(),
+            self.slave
+                .as_ref()
+                .ok_or("root PTY slave released")?
+                .as_raw_fd(),
         )
         .map_err(|e| format!("root PTY challenge refused: {e}"))?;
         self.ensure_live()
@@ -153,11 +157,190 @@ impl RootPtyControl {
                 plan_source[3],
                 plan_source[4],
                 self.master.as_raw_fd(),
-                self._slave.as_raw_fd(),
+                self.slave
+                    .as_ref()
+                    .ok_or("root PTY slave released")?
+                    .as_raw_fd(),
             ],
         )
         .map_err(|e| format!("interactive K preparation refused: {e}"))?;
         self.ensure_live()
+    }
+
+    pub(super) fn run_interactive(
+        &mut self,
+        broker: &Path,
+        plan_source: [i32; 5],
+        input: &[u8],
+    ) -> Result<(String, Vec<u8>), String> {
+        self.ensure_live()?;
+        self.rechallenge(broker)?;
+        let slave = self.slave.as_ref().ok_or("root PTY slave released")?;
+        let (mut relay_rx, relay_tx) = UnixStream::pair().map_err(|e| e.to_string())?;
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let live_reader = std::thread::Builder::new()
+            .name("root-interactive-pty-output".into())
+            .spawn(move || -> Result<Vec<u8>, String> {
+                let mut bytes = Vec::new();
+                let mut announced = false;
+                let mut buffer = [0u8; 8192];
+                loop {
+                    let n = relay_rx.read(&mut buffer).map_err(|e| e.to_string())?;
+                    if n == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&buffer[..n]);
+                    if !announced
+                        && bytes
+                            .windows(b"interactive-ready".len())
+                            .any(|part| part == b"interactive-ready")
+                    {
+                        let _ = ready_tx.send(());
+                        announced = true;
+                    }
+                }
+                Ok(bytes)
+            })
+            .map_err(|e| e.to_string())?;
+        let descriptors = [
+            plan_source[0],
+            plan_source[1],
+            plan_source[2],
+            plan_source[3],
+            plan_source[4],
+            self.master.as_raw_fd(),
+            slave.as_raw_fd(),
+            relay_tx.as_raw_fd(),
+        ];
+        if std::env::var_os("AGE319_PRIVATE_ROOT_PTY_PHYSICAL_NEGATIVE_V1").is_some() {
+            for changed in [
+                PrivateFreshPtyHandoff {
+                    role: FreshPlanRole::Headless,
+                    ..self._binding.clone()
+                },
+                PrivateFreshPtyHandoff {
+                    plan_sha256: "0".repeat(64),
+                    ..self._binding.clone()
+                },
+                PrivateFreshPtyHandoff {
+                    account: "wrong-account".into(),
+                    ..self._binding.clone()
+                },
+                PrivateFreshPtyHandoff {
+                    control_path: self.path.with_file_name("wrong-control.sock"),
+                    ..self._binding.clone()
+                },
+            ] {
+                if protocol::private_fresh_interactive_k_at(broker, &changed, descriptors).is_ok() {
+                    return Err(
+                        "wrong interactive K plan, account, role or control accepted".into(),
+                    );
+                }
+            }
+            if protocol::private_fresh_interactive_q_at(broker, &self._binding)
+                .map_err(|e| e.to_string())?
+                != "fresh-interactive-k-absent\n"
+            {
+                return Err("wrong interactive K probe consumed grant".into());
+            }
+        }
+        let submitted =
+            protocol::private_fresh_interactive_k_at(broker, &self._binding, descriptors);
+        drop(relay_tx);
+        let mut k_error = None;
+        let first = match submitted {
+            Ok(reply) => reply,
+            Err(error) => {
+                k_error = Some(error.to_string());
+                let readback = protocol::private_fresh_interactive_q_at(broker, &self._binding)
+                    .map_err(|readback| {
+                        format!("interactive K uncertain: {error}; readback: {readback}")
+                    })?;
+                if readback == "fresh-interactive-k-absent\n" {
+                    return Err(format!("interactive K refused before consumption: {error}"));
+                }
+                readback
+            }
+        };
+        if !first.starts_with("fresh-interactive-k ")
+            && !first.starts_with("fresh-interactive-unknown-or-pending ")
+            && !first.starts_with("fresh-interactive-drained ")
+        {
+            return Err(format!("interactive K readback invalid: {first}"));
+        }
+        ready_rx.recv_timeout(Duration::from_secs(5))
+            .map_err(|e| format!("interactive prompt did not arrive on live PTY relay: {e}; K reply: {k_error:?}; same K readback: {first}"))?;
+        if std::env::var_os("AGE319_PRIVATE_ROOT_PTY_RESTART_AFTER_K_V1").is_some() {
+            let gate = PathBuf::from(
+                std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                    .map_err(|e| e.to_string())?,
+            );
+            fs::write(gate.join("physical-k-ready"), b"ready").map_err(|e| e.to_string())?;
+            let until = std::time::Instant::now() + Duration::from_secs(20);
+            while !gate.join("physical-restarted").exists() {
+                if std::time::Instant::now() >= until {
+                    return Err("physical post-K restart gate expired".into());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let state = protocol::private_fresh_interactive_q_at(broker, &self._binding)
+                .map_err(|e| format!("interactive post-K restart readback failed: {e}"))?;
+            let grant = first
+                .split_whitespace()
+                .nth(1)
+                .ok_or("interactive K grant absent")?;
+            if !state.starts_with(&format!("fresh-interactive-unknown-or-pending {grant}\n")) {
+                return Err(format!(
+                    "interactive post-K restart changed original K: {state}"
+                ));
+            }
+            return Err(format!("interactive post-K broker restart debt: {state}"));
+        }
+        self.master
+            .try_clone()
+            .map_err(|e| e.to_string())?
+            .write_all(input)
+            .map_err(|e| format!("interactive PTY input failed after K: {e}"))?;
+        if std::env::var_os("AGE319_PRIVATE_ROOT_PTY_EXIT_AFTER_K_V1").is_some() {
+            unsafe { libc::_exit(79) };
+        }
+        self.slave.take();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let state = protocol::private_fresh_interactive_q_at(broker, &self._binding)
+                .map_err(|e| format!("interactive Q unknown after K: {e}"))?;
+            if state.starts_with("fresh-interactive-drained ") {
+                self.ensure_live()?;
+                let output = protocol::private_fresh_interactive_output_at(broker, &self._binding)
+                    .map_err(|e| format!("interactive output transfer failed after Q: {e}"))?;
+                let fields: Vec<_> = state.split_whitespace().collect();
+                if fields.len() != 5
+                    || fields[1] != output.grant_id
+                    || fields[2] != output.wait_status.to_string()
+                    || fields[3] != output.bytes.to_string()
+                    || fields[4] != output.sha256
+                {
+                    return Err("interactive Q/output transfer differs from exact K".into());
+                }
+                let bytes =
+                    super::private_verified_output(output.output, output.bytes, &output.sha256)?;
+                let streamed = live_reader
+                    .join()
+                    .map_err(|_| "interactive live PTY relay panicked".to_string())??;
+                if streamed != bytes {
+                    return Err("interactive live PTY relay differs from Q transcript".into());
+                }
+                return Ok((state, bytes));
+            }
+            if !state.starts_with("fresh-interactive-unknown-or-pending ")
+                || std::time::Instant::now() >= deadline
+            {
+                return Err(format!(
+                    "interactive Q unknown after K: {state}; K reply: {k_error:?}"
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     pub(super) fn probe_wrong_bindings(
@@ -184,7 +367,10 @@ impl RootPtyControl {
                 broker,
                 &changed,
                 self.master.as_raw_fd(),
-                self._slave.as_raw_fd(),
+                self.slave
+                    .as_ref()
+                    .ok_or("root PTY slave released")?
+                    .as_raw_fd(),
             )
             .is_ok()
             {

@@ -1252,7 +1252,7 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
     // The interactive decision is independently durable. The headless plan
     // stays with the existing K/Q backend; ^ does not spend an interactive K.
     let mut selected_interactive = None;
-    let root_pty = if std::env::var_os("AGE319_PRIVATE_ROOT_PTY_CONTROL_V1").is_some() {
+    let mut root_pty = if std::env::var_os("AGE319_PRIVATE_ROOT_PTY_CONTROL_V1").is_some() {
         let interactive = protocol::private_fresh_interactive_route_at(
             &socket,
             &request,
@@ -1390,6 +1390,43 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
                 ],
             )?;
         }
+    }
+    if std::env::var_os("AGE319_PRIVATE_ROOT_PTY_PHYSICAL_V1").is_some() {
+        let control = root_pty.as_mut().ok_or("physical PTY control absent")?;
+        if std::env::var_os("AGE319_PRIVATE_ROOT_PTY_PHYSICAL_ACTOR_GATE_V1").is_some() {
+            let gate = std::path::PathBuf::from(
+                std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                    .map_err(|e| e.to_string())?,
+            );
+            std::fs::write(gate.join("physical-before-k"), b"ready").map_err(|e| e.to_string())?;
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !gate.join("physical-continue").exists() {
+                if std::time::Instant::now() >= until {
+                    return Err("physical wrong-actor gate expired".into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        let interactive = prepare_fresh_interactive(&pool.model, selected.index, &cwd)?;
+        let pinned = private_pin_plan(&interactive, FreshPlanRole::Interactive)?;
+        let (q, output) = control.run_interactive(
+            &socket,
+            [
+                pinned.image.as_raw_fd(),
+                pinned.cwd.as_raw_fd(),
+                pinned.input.as_raw_fd(),
+                pinned.recipe.as_raw_fd(),
+                config_source.as_raw_fd(),
+            ],
+            b"fixture-input-through-pty\n",
+        )?;
+        let gate = std::path::PathBuf::from(
+            std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                .map_err(|e| e.to_string())?,
+        );
+        std::fs::write(gate.join("interactive-q-readback"), q).map_err(|e| e.to_string())?;
+        std::fs::write(gate.join("interactive-output-readback"), output)
+            .map_err(|e| e.to_string())?;
     }
     let mut backend = PrivateFreshBroker {
         authority,

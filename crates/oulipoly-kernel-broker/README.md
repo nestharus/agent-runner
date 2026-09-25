@@ -46,15 +46,24 @@ plan through private `(`/`)` candidate and selection operations. The broker
 pins each candidate to the same D, actor, source/config, account and index as
 the headless pool, independently checks its argv against the interactive args
 in that source, records a distinct one-use interactive decision, and `^`
-requires its exact role and digest. `h/f` and provider K/Q remain headless.
-Physical interactive K must then transfer the verified slave
-into the broker's one-use selected launch, give the child a controlling
-terminal, keep the master and control server with the original root, and
-attest the broker's actual child incarnation into the fresh sidecar. The
-ordinary runtime generation registrar accepts only a local direct child;
-it cannot register the broker-forked provider. Until that broker-owned
-registration and cross-namespace observer proof exist, no live generation or
-native F claim follows from `^`.
+requires its exact role and digest. `h/f` and their provider K/Q remain headless.
+Private `}` rechallenges the original live root and its master/control pair,
+rechecks the selected image, argv/env/cwd and pinned config, then fsyncs a
+distinct one-use `interactive-k.json` before any child release. Its separate
+consumed grant gates a broker fork into the held root's PID namespace. The
+provider acquires the offered slave as its controlling terminal under the
+selected peer UID/GID/groups. The root retains the master and control socket,
+writes PTY input and receives live PTY output over a peer-checked relay; the
+broker also records the raw transcript. The selected fixture waits for a live
+prompt before input, then the root verifies the streamed bytes against the
+Q-gated transcript descriptor. `]` reads the same K after a lost reply or
+broker restart and never resubmits K. A missing attach or output closure stays
+unknown debt. After provider wait, PID1 tree drain, PID1 wait, PTY closure and
+output hash verification, `]` creates or checks exact `interactive-q.json`
+with the K, observed PID/boot/starttime/PID namespace, wait and output facts.
+The ordinary runtime generation registrar accepts only a local direct child;
+it cannot register the broker-forked provider. This private physical K/Q does
+not create a resident generation or native F authority.
 
 The closed private route assembles the configured first command, arguments,
 environment, cwd and stdin through the normal runtime launch path. A bare
