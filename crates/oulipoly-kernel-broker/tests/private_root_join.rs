@@ -1472,6 +1472,38 @@ fn inner() {
                 }
                 if provider_mode {
                     let provider_dir = broker_state.join("v30/fresh-provider");
+                    if mode == "normal_model_provider_no_pin"
+                        && std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_ROUTE_READER_PROBE_V1")
+                            .is_some()
+                    {
+                        eventually(|| entry.try_wait().unwrap().is_some());
+                        assert!(!entry.wait().unwrap().success());
+                        let stderr = fs::read_to_string(&err).unwrap();
+                        assert!(stderr.contains("source census"), "{stderr}");
+                        assert!(
+                            !provider_dir
+                                .join(format!("{}.route-selection.json", receipt.handoff_id))
+                                .exists()
+                        );
+                        assert!(
+                            !provider_dir
+                                .join(format!("{}.fresh-grant.json", receipt.handoff_id))
+                                .exists()
+                        );
+                        let broker_reads = format!(
+                            "{}{}",
+                            fs::read_to_string(&broker_log).unwrap(),
+                            fs::read_to_string(temp.path().join("handoff-restart.log")).unwrap()
+                        );
+                        assert!(
+                            broker_reads.contains("age319 indexed route-choice read:"),
+                            "{broker_reads}"
+                        );
+                        assert_eq!(fs::read(&old_state_path).unwrap(), old_state_before);
+                        assert_eq!(fs::read(&old_wal_path).ok(), old_wal_before);
+                        stop(&mut broker);
+                        return;
+                    }
                     let selected_marker = if mode == "normal_model_provider_no_pin" {
                         gate.join("provider-effect-unused")
                     } else {

@@ -5,7 +5,7 @@
 use super::work_launch;
 use crate::linux_main::fresh_index::{
     AccountUpdate, Artifact, CursorKey, Decision, EffectIntent, EffectKind, Index, PhysicalQ,
-    ProviderGrant, SourceKey, TerminalMarkerKind,
+    ProviderGrant, ReaderIoGuard, SourceKey, TerminalMarkerKind,
 };
 use chrono::{DateTime, Utc};
 use oulipoly_kernel_broker::identity::{PinnedProcess, host_proc_file, observed_incarnation_gone};
@@ -2420,6 +2420,7 @@ fn route_evidence_excluding(
     let mut markers = Vec::new();
     for entry in std::fs::read_dir(directory)? {
         let entry = entry?;
+        super::fresh_index::reader_directory_entry();
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if !name.ends_with(".route-selection.json") {
@@ -2692,6 +2693,7 @@ fn newer_quota_effect(
     }
     for entry in std::fs::read_dir(directory.join("account-effects"))? {
         let entry = entry?;
+        super::fresh_index::reader_directory_entry();
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if !name.ends_with("-quota-first") && !name.ends_with("-quota-retry") {
@@ -2979,12 +2981,14 @@ const FRESH_ROUTE_POLICY_VERSION: &str = "fresh-quota-account-v4";
 /// next durable decision across broker threads and restarts, including roots
 /// that select before their provider K has begun.
 fn route_selection_lock(directory: &Path) -> io::Result<File> {
+    super::fresh_index::reader_open_attempt();
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .mode(0o600)
         .open(directory.join("route-selection.lock"))?;
+    super::fresh_index::reader_opened();
     loop {
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
             return Ok(file);
@@ -3005,6 +3009,7 @@ fn last_route_cursor(
     let mut sequences = HashSet::new();
     for entry in std::fs::read_dir(directory)? {
         let entry = entry?;
+        super::fresh_index::reader_directory_entry();
         if !entry
             .file_name()
             .to_string_lossy()
@@ -3077,6 +3082,9 @@ pub(super) fn select_route_with_index(
     if request.account.is_some() || request.index.is_some() {
         return Err(io::Error::other("fresh route selection includes candidate"));
     }
+    let _reader_io = index
+        .filter(|index| index.route_reader_probe())
+        .map(|_| ReaderIoGuard::start("route-choice"));
     let _cursor_lock = route_selection_lock(directory)?;
     let candidates = route_candidates(directory, binding, request)?;
     let name = decision_name(&binding.handoff_id);
@@ -3106,12 +3114,22 @@ pub(super) fn select_route_with_index(
             index
                 .require_live_route(&binding.handoff_id)
                 .map_err(io::Error::other)?;
+            if index.route_reader_probe() {
+                index
+                    .route_reader_preflight(&existing.selection.account_identity)
+                    .map_err(io::Error::other)?;
+            }
         }
         return Ok(existing.selection);
     }
     let mut eligible = Vec::new();
     let mut unknown_artifact = None;
     for candidate in candidates {
+        if let Some(index) = index.filter(|index| index.route_reader_probe()) {
+            index
+                .route_reader_preflight(&candidate.account_identity)
+                .map_err(io::Error::other)?;
+        }
         let (live, failures, invocations, markers) = route_evidence(directory, &candidate)?;
         let (quota, unknown) = candidate_quota(directory, binding, &candidate)?;
         if unknown.is_some()
@@ -3225,11 +3243,24 @@ pub(super) fn select_route_with_index(
     Ok(selection)
 }
 
+#[cfg(test)]
 pub(super) fn require_selected_plan(
     directory: &Path,
     binding: &Binding,
     plan: &Plan,
 ) -> io::Result<()> {
+    require_selected_plan_indexed(directory, binding, plan, None)
+}
+
+pub(super) fn require_selected_plan_indexed(
+    directory: &Path,
+    binding: &Binding,
+    plan: &Plan,
+    index: Option<&Index>,
+) -> io::Result<()> {
+    let _reader_io = index
+        .filter(|index| index.route_reader_probe())
+        .map(|_| ReaderIoGuard::start("pre-K"));
     let decision: RouteDecision = exact_file(directory, &decision_name(&binding.handoff_id))?
         .ok_or_else(|| io::Error::other("fresh route selection absent before K"))?;
     if decision.version != 1
@@ -3258,6 +3289,11 @@ pub(super) fn require_selected_plan(
         return Err(io::Error::other(
             "fresh provider selected candidate changed",
         ));
+    }
+    if let Some(index) = index.filter(|index| index.route_reader_probe()) {
+        index
+            .route_reader_preflight(&candidate.account_identity)
+            .map_err(io::Error::other)?;
     }
     let (_, _, _, markers) =
         route_evidence_excluding(directory, &candidate, Some(&binding.handoff_id))?;
@@ -3741,7 +3777,7 @@ pub(super) fn launch(
         .join(decision_name(&b.handoff_id))
         .exists()
     {
-        require_selected_plan(&prepared.directory, b, &prepared.plan)?;
+        require_selected_plan_indexed(&prepared.directory, b, &prepared.plan, index)?;
     }
     durable_new(
         &prepared.directory,
@@ -3883,13 +3919,20 @@ fn parent_namespace_pid(host_pid: i32) -> io::Result<i32> {
 }
 
 fn exact_file<T: for<'de> Deserialize<'de>>(dir: &Path, name: &str) -> io::Result<Option<T>> {
+    super::fresh_index::reader_open_attempt();
     match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(dir.join(name))
     {
-        Ok(file) if file.metadata()?.is_file() => Ok(Some(serde_json::from_reader(file)?)),
-        Ok(_) => Err(io::Error::other("fresh provider receipt is not regular")),
+        Ok(file) if file.metadata()?.is_file() => {
+            super::fresh_index::reader_opened();
+            Ok(Some(serde_json::from_reader(file)?))
+        }
+        Ok(_) => {
+            super::fresh_index::reader_opened();
+            Err(io::Error::other("fresh provider receipt is not regular"))
+        }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
@@ -5153,6 +5196,13 @@ mod tests {
         reconcile_indexed_account_effect(&f.index, &dir, &intent).unwrap();
         durable_new(&dir, &format!("{}.consumed.json", grant.id), &grant).unwrap();
         reconcile_indexed_account_effect(&f.index, &dir, &intent).unwrap();
+        assert!(
+            f.index
+                .route_reader_preflight("physical-first")
+                .unwrap_err()
+                .to_string()
+                .contains("unresolved effect or manual K/Q")
+        );
         let work = IndexedEffectFixture::physical_q_before_wait(
             &dir,
             &grant,
@@ -5200,6 +5250,13 @@ mod tests {
         let effect = &settled.effects[&intent.id];
         assert!(effect.certified_q.is_some() && effect.result.is_some());
         assert_eq!(settled.source_q.len(), 1);
+        assert!(
+            f.index
+                .route_reader_preflight("physical-first")
+                .unwrap_err()
+                .to_string()
+                .contains("typed quota projection")
+        );
         let result: FreshAccountEffectReadback = exact_file(&dir, "result.json").unwrap().unwrap();
         assert_eq!(result.outcome.as_deref(), Some("valid_windows"));
         let lease = broker_admission_lease(&f.root()).unwrap();
@@ -5225,6 +5282,127 @@ mod tests {
         assert!(account.markers.quota_rejection_nanos.is_none());
         assert!(account.source_q.is_empty());
         assert_eq!(f.index.account("physical-first").unwrap(), before);
+    }
+
+    #[test]
+    fn indexed_reader_probe_counts_real_choice_and_pre_k_reads_then_refuses_gap() {
+        use crate::linux_main::fresh_index::{Index, broker_admission_lease, last_reader_io};
+        let temp = tempfile::tempdir().unwrap();
+        let broker = temp.path().join("broker");
+        std::fs::create_dir(&broker).unwrap();
+        let wal = temp.path().join("state.db-wal");
+        std::fs::write(&wal, b"old WAL").unwrap();
+        let lease = broker_admission_lease(&broker).unwrap();
+        let index = Index::admit_live_routes(&broker, &lease).unwrap();
+        let process = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+        let chosen_binding = fixture_binding(&process, &process);
+        let chosen_request = register_unmetered_route(&broker, &chosen_binding, None);
+        let chosen =
+            select_route_with_index(&broker, &chosen_binding, &chosen_request, Some(&index))
+                .unwrap();
+        for _ in 0..220 {
+            let previous = fixture_binding(&process, &process);
+            let request = register_unmetered_route(&broker, &previous, None);
+            select_route_with_index(&broker, &previous, &request, Some(&index)).unwrap();
+        }
+        Index::admit_live_routes(&broker, &lease).unwrap();
+        let probe = index.clone().enable_route_reader_probe();
+        let baseline_binding = fixture_binding(&process, &process);
+        let baseline_request = register_unmetered_route(&broker, &baseline_binding, None);
+        assert!(
+            select_route_with_index(&broker, &baseline_binding, &baseline_request, Some(&probe))
+                .unwrap_err()
+                .to_string()
+                .contains("source census")
+        );
+        let baseline_io = last_reader_io().unwrap();
+        let input_path = temp.path().join("input");
+        std::fs::write(&input_path, b"").unwrap();
+        let mut selected_plan = plan(
+            &Path::new("/bin/true").canonicalize().unwrap(),
+            temp.path(),
+            &File::open(&input_path).unwrap(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        selected_plan.digest = chosen.plan_sha256.clone();
+        assert!(
+            require_selected_plan_indexed(&broker, &chosen_binding, &selected_plan, Some(&probe))
+                .unwrap_err()
+                .to_string()
+                .contains("source census")
+        );
+        let baseline_pre_k_io = last_reader_io().unwrap();
+        let effect_parent = broker.join("account-effects");
+        std::fs::create_dir(&effect_parent).unwrap();
+        let manual_parent = broker.join("manual-quota");
+        std::fs::create_dir(&manual_parent).unwrap();
+        for n in 0..300 {
+            std::fs::write(broker.join(format!("old-{n}.route-selection.json")), b"old").unwrap();
+            let effect = effect_parent.join(format!("old-{n}-quota-first"));
+            std::fs::create_dir(&effect).unwrap();
+            std::fs::write(effect.join("intent.json"), b"old").unwrap();
+            std::fs::write(manual_parent.join(format!("old-{n}.json")), b"old").unwrap();
+        }
+        // A source artifact not announced by the index must not be read as
+        // healthy merely because the account record itself is well formed.
+        std::fs::write(broker.join("unannounced.consumed.json"), b"new K").unwrap();
+        std::fs::write(broker.join("unannounced.drain.json"), b"new Q").unwrap();
+        std::fs::write(broker.join("unannounced.terminal.json"), b"new marker").unwrap();
+        let pending_effect = effect_parent.join("pending-quota-first");
+        std::fs::create_dir(&pending_effect).unwrap();
+        std::fs::write(pending_effect.join("new.consumed.json"), b"new effect K").unwrap();
+        std::fs::write(pending_effect.join("new.drain.json"), b"new effect Q").unwrap();
+        let next_binding = fixture_binding(&process, &process);
+        let next_request = register_unmetered_route(&broker, &next_binding, None);
+        let choice_error =
+            select_route_with_index(&broker, &next_binding, &next_request, Some(&probe))
+                .unwrap_err()
+                .to_string();
+        assert!(choice_error.contains("source census"), "{choice_error}");
+        let choice_io = last_reader_io().unwrap();
+        assert_eq!(choice_io, baseline_io);
+        assert_eq!(choice_io.directory_entries, 0);
+
+        let pre_k_error =
+            require_selected_plan_indexed(&broker, &chosen_binding, &selected_plan, Some(&probe))
+                .unwrap_err()
+                .to_string();
+        assert!(pre_k_error.contains("source census"), "{pre_k_error}");
+        let pre_k_io = last_reader_io().unwrap();
+        assert_eq!(pre_k_io, baseline_pre_k_io);
+        assert_eq!(pre_k_io.directory_entries, 0);
+
+        let grant = Grant {
+            version: 1,
+            id: uuid::Uuid::new_v4().to_string(),
+            binding: chosen_binding.clone(),
+            plan_sha256: chosen.plan_sha256,
+        };
+        durable_new(
+            &broker,
+            &format!("{}.fresh-grant.json", chosen_binding.handoff_id),
+            &grant,
+        )
+        .unwrap();
+        reconcile_indexed_provider_grant(&index, &grant).unwrap();
+        durable_new(&broker, &format!("{}.consumed.json", grant.id), &grant).unwrap();
+        reconcile_indexed_provider_grant(&index, &grant).unwrap();
+        let k_error =
+            require_selected_plan_indexed(&broker, &chosen_binding, &selected_plan, Some(&probe))
+                .unwrap_err()
+                .to_string();
+        assert!(k_error.contains("unresolved provider K/Q"), "{k_error}");
+        assert_eq!(last_reader_io().unwrap().directory_entries, 0);
+        assert_eq!(std::fs::read(&wal).unwrap(), b"old WAL");
+        assert!(Index::admit_live_routes(&broker, &lease).is_err());
+        std::fs::remove_file(broker.join("index-v1/manifest.json")).unwrap();
+        let damaged = probe
+            .route_reader_preflight("first")
+            .unwrap_err()
+            .to_string();
+        assert!(damaged.contains("manifest absent"), "{damaged}");
     }
 
     #[test]

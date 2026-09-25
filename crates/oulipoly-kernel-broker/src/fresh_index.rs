@@ -15,6 +15,7 @@
 //! either can admit a decision.
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -27,6 +28,70 @@ use std::sync::{Mutex, OnceLock};
 const VERSION: u32 = 1;
 const MAX_RECORD: u64 = 4 * 1024 * 1024;
 const MAX_RECENT_FAILURES: usize = 256;
+
+/// Counts actual open attempts/successes and directory entries while an opt-in
+/// route decision or pre-K read is running on this thread. The guard is placed
+/// at the production read boundary, so a future scan is visible in the audit.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(super) struct ReaderIo {
+    pub open_attempts: u64,
+    pub opened: u64,
+    pub directory_entries: u64,
+}
+thread_local! {
+    static READER_IO: Cell<Option<ReaderIo>> = const { Cell::new(None) };
+    #[cfg(test)]
+    static LAST_READER_IO: Cell<Option<ReaderIo>> = const { Cell::new(None) };
+}
+#[cfg(test)]
+pub(super) fn last_reader_io() -> Option<ReaderIo> {
+    LAST_READER_IO.with(Cell::get)
+}
+pub(super) fn reader_open_attempt() {
+    READER_IO.with(|cell| {
+        if let Some(mut count) = cell.get() {
+            count.open_attempts += 1;
+            cell.set(Some(count));
+        }
+    });
+}
+pub(super) fn reader_opened() {
+    READER_IO.with(|cell| {
+        if let Some(mut count) = cell.get() {
+            count.opened += 1;
+            cell.set(Some(count));
+        }
+    });
+}
+pub(super) fn reader_directory_entry() {
+    READER_IO.with(|cell| {
+        if let Some(mut count) = cell.get() {
+            count.directory_entries += 1;
+            cell.set(Some(count));
+        }
+    });
+}
+pub(super) struct ReaderIoGuard(&'static str);
+impl ReaderIoGuard {
+    pub(super) fn start(boundary: &'static str) -> Self {
+        READER_IO.with(|cell| {
+            assert!(cell.get().is_none(), "nested route reader audit");
+            cell.set(Some(ReaderIo::default()));
+        });
+        Self(boundary)
+    }
+}
+impl Drop for ReaderIoGuard {
+    fn drop(&mut self) {
+        let count = READER_IO.with(|cell| cell.replace(None).unwrap_or_default());
+        #[cfg(test)]
+        LAST_READER_IO.with(|cell| cell.set(Some(count)));
+        eprintln!(
+            "age319 indexed {} read: open_attempts={} opened={} directory_entries={}",
+            self.0, count.open_attempts, count.opened, count.directory_entries
+        );
+    }
+}
 
 #[derive(Debug)]
 pub(super) enum IndexError {
@@ -71,8 +136,12 @@ struct Sealed<T> {
     sha256: String,
 }
 fn read<T: DeserializeOwned + Serialize>(path: &Path) -> Result<Option<T>> {
+    reader_open_attempt();
     let file = match File::open(path) {
-        Ok(f) => f,
+        Ok(f) => {
+            reader_opened();
+            f
+        }
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
@@ -156,6 +225,7 @@ fn write_new<T: Serialize>(path: &Path, data: &T) -> Result<()> {
     result
 }
 fn locked(path: &Path) -> Result<File> {
+    reader_open_attempt();
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -163,6 +233,7 @@ fn locked(path: &Path) -> Result<File> {
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)?;
+    reader_opened();
     loop {
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
             return Ok(file);
@@ -299,6 +370,7 @@ pub(super) struct Index {
     root: PathBuf,
     generation: String,
     storage: PathBuf,
+    route_reader_probe: bool,
 }
 /// The caller must hold an admission freeze for this previously unused broker
 /// directory. The empty-directory check below is a second, local guard.
@@ -306,6 +378,45 @@ pub(super) enum GenesisAuthority {
     ConfirmedFreshEmptyDirectory,
 }
 impl Index {
+    /// The private reader probe is intentionally non-activating until the
+    /// index can authenticate newly visible source evidence at read time.
+    pub(super) fn enable_route_reader_probe(mut self) -> Self {
+        self.route_reader_probe = true;
+        self
+    }
+    pub(super) fn route_reader_probe(&self) -> bool {
+        self.route_reader_probe
+    }
+    pub(super) fn route_reader_preflight(&self, physical_key: &str) -> Result<()> {
+        let _lock = locked(&self.key_path("accounts", &format!("lock:{physical_key}"))?)?;
+        self.check_generation()?;
+        let account = self.account_unlocked(physical_key)?;
+        if account
+            .grants
+            .values()
+            .any(|grant| grant.consumed_k.is_some() && grant.certified_q.is_none())
+        {
+            return Err(IndexError::Conflict(
+                "indexed route reader has unresolved provider K/Q",
+            ));
+        }
+        if account
+            .effects
+            .values()
+            .any(|effect| effect.consumed_k.is_some() && effect.certified_q.is_none())
+        {
+            return Err(IndexError::Conflict(
+                "indexed route reader has unresolved effect or manual K/Q",
+            ));
+        }
+        // The record carries Q references and marker maxima, but neither a
+        // read-time census of unannounced source files nor the typed window
+        // result needed to authorize the current physical quota cache. A
+        // successful account read is therefore not an eligibility verdict.
+        Err(IndexError::RebuildRequired(
+            "route reader lacks read-time source census and typed quota projection",
+        ))
+    }
     pub(super) fn evidence_root(&self) -> &Path {
         &self.root
     }
@@ -357,6 +468,7 @@ impl Index {
             root: root.to_owned(),
             generation: manifest.generation,
             storage: base,
+            route_reader_probe: false,
         })
     }
     pub(super) fn open(root: &Path) -> Result<Self> {
@@ -386,6 +498,7 @@ impl Index {
             root: root.to_owned(),
             generation: manifest.generation,
             storage,
+            route_reader_probe: false,
         })
     }
     fn base(&self) -> PathBuf {
@@ -780,6 +893,7 @@ impl Index {
             root: root.to_owned(),
             generation: generation.clone(),
             storage,
+            route_reader_probe: false,
         };
         let mut cursors: BTreeMap<String, Cursor> = BTreeMap::new();
         let mut seen_handoffs = std::collections::HashSet::new();

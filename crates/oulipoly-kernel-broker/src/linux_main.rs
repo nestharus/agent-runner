@@ -3867,6 +3867,17 @@ fn serve_fresh_v30_at(
             }
         }
     };
+    #[cfg(feature = "age319-private-broker-fixture")]
+    let route_index = match std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_ROUTE_READER_PROBE_V1")
+    {
+        Some(value) if value == "1" && private_fixture() => Some(
+            route_index
+                .ok_or_else(|| io::Error::other("route reader probe requires indexed writer"))?
+                .enable_route_reader_probe(),
+        ),
+        Some(_) => return Err(io::Error::other("route reader probe switch invalid")),
+        None => route_index,
+    };
     let instance = EntryGate::open(&state_root.join("v30"))?;
     // An installed Bash child must match the package's pinned digest. Private
     // fixtures supply their built source binary only at broker startup.
@@ -4592,7 +4603,12 @@ fn serve_fresh_v30_at(
                         let plan = fresh_provider::plan_from_descriptors(
                             &image, image_fd, cwd, input, recipe,
                         )?;
-                        fresh_provider::require_selected_plan(&directory, &binding, &plan)?;
+                        fresh_provider::require_selected_plan_indexed(
+                            &directory,
+                            &binding,
+                            &plan,
+                            route_index.as_ref(),
+                        )?;
                         if let Some(index) = route_index.as_ref() {
                             index
                                 .require_live_route(&binding.handoff_id)

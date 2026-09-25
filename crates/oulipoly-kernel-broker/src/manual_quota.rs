@@ -1195,6 +1195,13 @@ mod tests {
             super::super::fresh_index::EffectKind::ManualQuota
         );
         assert!(before.effects[&request.operation_id].consumed_k.is_some());
+        assert!(
+            index
+                .route_reader_preflight("physical-first")
+                .unwrap_err()
+                .to_string()
+                .contains("unresolved effect or manual K/Q")
+        );
         let k_bytes = fs::read(dir.join("k.json")).unwrap();
         let first_revision = before.revision;
         f.run_worker(&request);
@@ -1211,6 +1218,13 @@ mod tests {
                 .map(|q| q.q.clone())
         );
         assert_eq!(settled.source_q.len(), 1);
+        assert!(
+            index
+                .route_reader_preflight("physical-first")
+                .unwrap_err()
+                .to_string()
+                .contains("typed quota projection")
+        );
         assert_eq!(settled.observed_invocations, 0);
         assert!(settled.revision > first_revision);
         let restarted = Index::admit_live_routes(&f.ledger, &lease).unwrap();
