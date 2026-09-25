@@ -6,6 +6,11 @@ mod mailbox_delivery;
 // Keep the sweep's receipt dependency on the production implementation and registry wiring.
 #[path = "../src/native_receipt.rs"]
 mod native_receipt;
+// This integration crate includes the production receipt module directly, so
+// its private helper's crate-root probe dependency must be included here too.
+#[cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
+#[path = "../src/private_provider_probe.rs"]
+mod private_provider_probe;
 #[path = "../src/wake_coordinator/mod.rs"]
 mod wake_coordinator;
 #[path = "../src/wiring.rs"]

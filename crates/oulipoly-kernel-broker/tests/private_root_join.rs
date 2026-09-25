@@ -115,6 +115,16 @@ fn inner() {
             | "normal_model_provider_bash_causal_notify_lost_pending"
             | "normal_model_provider_bash_causal_notify_debt"
             | "normal_model_provider_bash_causal_notify_row_debt"
+            | "normal_model_provider_bash_ordinary_sync"
+            | "normal_model_provider_bash_ordinary_async"
+            | "normal_model_provider_bash_ordinary_refuse"
+            | "normal_model_provider_bash_ordinary_loss"
+            | "normal_model_provider_bash_ordinary_copy"
+            | "normal_model_provider_bash_ordinary_restart"
+            | "normal_model_provider_bash_ordinary_elf"
+            | "normal_model_provider_bash_ordinary_failure"
+            | "normal_model_provider_bash_ordinary_cancel"
+            | "normal_model_provider_bash_ordinary_parent_tamper"
             | "normal_model_provider_reply_loss"
             | "normal_model_provider_q_reply_loss"
             | "normal_model_provider_restart"
@@ -141,7 +151,8 @@ fn inner() {
     let runner =
         std::env::var("OULIPOLY_AGE319_RUNNER_IMAGE").expect("built Runner image required");
     let bash = (mode == "normal_handoff_bash_child"
-        || mode.starts_with("normal_model_provider_bash_causal"))
+        || mode.starts_with("normal_model_provider_bash_causal")
+        || mode.starts_with("normal_model_provider_bash_ordinary"))
     .then(|| std::env::var("OULIPOLY_AGE319_BASH_IMAGE").expect("built Bash image required"));
     let bash_request = uuid::Uuid::new_v4().to_string();
     let provider_image = std::env::var("OULIPOLY_AGE319_PROVIDER_IMAGE").unwrap_or_default();
@@ -593,7 +604,55 @@ fn inner() {
             )
             .envs(
                 mode.starts_with("normal_model_provider_bash_causal")
-                    .then_some(("AGE319_PRIVATE_PROVIDER_CAUSAL_BASH_V1", "1")),
+                    .then_some(("AGE319_PRIVATE_PROVIDER_CAUSAL_BASH_V1", "1"))
+                    .or_else(|| {
+                        mode.starts_with("normal_model_provider_bash_ordinary")
+                            .then_some(("AGE319_PRIVATE_PROVIDER_CAUSAL_BASH_V1", "1"))
+                    }),
+            )
+            .envs(
+                (mode == "normal_model_provider_bash_ordinary_refuse")
+                    .then_some(("AGE319_PRIVATE_BASH_ORDINARY_MODE_V1", "ordinary-refuse"))
+                    .or_else(|| {
+                        (mode == "normal_model_provider_bash_ordinary_parent_tamper").then_some((
+                            "AGE319_PRIVATE_BASH_ORDINARY_MODE_V1",
+                            "ordinary-parent-tamper",
+                        ))
+                    })
+                    .or_else(|| {
+                        (mode == "normal_model_provider_bash_ordinary_failure")
+                            .then_some(("AGE319_PRIVATE_BASH_ORDINARY_MODE_V1", "ordinary-failure"))
+                    })
+                    .or_else(|| {
+                        (mode == "normal_model_provider_bash_ordinary_cancel")
+                            .then_some(("AGE319_PRIVATE_BASH_ORDINARY_MODE_V1", "ordinary-cancel"))
+                    })
+                    .or_else(|| {
+                        (mode == "normal_model_provider_bash_ordinary_elf")
+                            .then_some(("AGE319_PRIVATE_BASH_ORDINARY_MODE_V1", "ordinary-elf"))
+                    })
+                    .or_else(|| {
+                        (mode == "normal_model_provider_bash_ordinary_restart")
+                            .then_some(("AGE319_PRIVATE_BASH_ORDINARY_MODE_V1", "ordinary-restart"))
+                    })
+                    .or_else(|| {
+                        (mode == "normal_model_provider_bash_ordinary_copy")
+                            .then_some(("AGE319_PRIVATE_BASH_ORDINARY_MODE_V1", "ordinary-copy"))
+                    })
+                    .or_else(|| {
+                        (mode == "normal_model_provider_bash_ordinary_loss")
+                            .then_some(("AGE319_PRIVATE_BASH_ORDINARY_MODE_V1", "ordinary-loss"))
+                    })
+                    .or_else(|| {
+                        (mode == "normal_model_provider_bash_ordinary_sync")
+                            .then_some(("AGE319_PRIVATE_BASH_ORDINARY_MODE_V1", "ordinary-sync"))
+                            .or_else(|| {
+                                (mode == "normal_model_provider_bash_ordinary_async").then_some((
+                                    "AGE319_PRIVATE_BASH_ORDINARY_MODE_V1",
+                                    "ordinary-async",
+                                ))
+                            })
+                    }),
             )
             .envs(
                 mode.contains("_notify_")
@@ -877,6 +936,348 @@ fn inner() {
                     "{}",
                     fs::read_to_string(&err).unwrap()
                 );
+                stop(&mut broker);
+                return;
+            }
+            if mode.starts_with("normal_model_provider_bash_ordinary") {
+                if mode.ends_with("_parent_tamper") {
+                    fs::write(gate.join("child-effect"), b"yes").unwrap();
+                    eventually(|| {
+                        gate.join("ordinary-paused").exists() || entry.try_wait().unwrap().is_some()
+                    });
+                    let request_id = fs::read_to_string(gate.join("ordinary-paused")).unwrap();
+                    let directory = broker_state.join("v30/fresh-provider");
+                    let selected_path =
+                        directory.join(format!("{request_id}.child-work-selection.json"));
+                    let mut selected: serde_json::Value =
+                        serde_json::from_slice(&fs::read(&selected_path).unwrap()).unwrap();
+                    assert_eq!(selected["role"], "bash-child-ordinary-tree-v1");
+                    selected["binding"]["causal_parent"]["grant_id"] =
+                        uuid::Uuid::new_v4().to_string().into();
+                    fs::write(&selected_path, serde_json::to_vec(&selected).unwrap()).unwrap();
+                    fs::write(gate.join("ordinary-release"), b"yes").unwrap();
+                    eventually(|| {
+                        gate.join("ordinary-bash-status").exists()
+                            || entry.try_wait().unwrap().is_some()
+                    });
+                    assert_ne!(
+                        fs::read_to_string(gate.join("ordinary-bash-status")).unwrap(),
+                        "0",
+                        "changed parent selection reached ordinary K"
+                    );
+                    assert!(!gate.join("ordinary-effect").exists());
+                    assert!(
+                        !directory
+                            .join(format!("{request_id}.fresh-grant.json"))
+                            .exists()
+                    );
+                    fs::write(gate.join("provider-cancel"), b"yes").unwrap();
+                    eventually(|| entry.try_wait().unwrap().is_some());
+                    stop(&mut broker);
+                    return;
+                }
+                if mode.ends_with("_refuse") {
+                    fs::write(gate.join("child-effect"), b"yes").unwrap();
+                    eventually(|| {
+                        gate.join("ordinary-refuse-statuses").exists()
+                            || entry.try_wait().unwrap().is_some()
+                    });
+                    let statuses: Vec<(String, i32)> = serde_json::from_slice(
+                        &fs::read(gate.join("ordinary-refuse-statuses")).unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(statuses.len(), 10);
+                    assert!(
+                        statuses.iter().all(|(_, status)| *status != 0),
+                        "{statuses:?}"
+                    );
+                    assert!(
+                        fs::read_to_string(gate.join("ordinary-shebang-error"))
+                            .unwrap()
+                            .contains("shebang script path semantics unavailable before K")
+                    );
+                    assert!(
+                        fs::read_to_string(gate.join("ordinary-malformed-elf-error"))
+                            .unwrap()
+                            .contains("ELF format unavailable before K")
+                    );
+                    assert!(
+                        fs::read_to_string(gate.join("ordinary-missing-interp-error"))
+                            .unwrap()
+                            .contains("ELF interpreter unavailable before K")
+                    );
+                    assert!(!gate.join("ordinary-refused-effect").exists());
+                    let physical = broker_state.join("v30/fresh-provider");
+                    let child_grants = fs::read_dir(&physical)
+                        .unwrap()
+                        .filter_map(Result::ok)
+                        .filter(|entry| {
+                            entry
+                                .file_name()
+                                .to_string_lossy()
+                                .ends_with(".fresh-grant.json")
+                        })
+                        .count();
+                    assert_eq!(
+                        child_grants, 1,
+                        "refused ordinary command reached physical K"
+                    );
+                    fs::write(gate.join("provider-cancel"), b"yes").unwrap();
+                    eventually(|| entry.try_wait().unwrap().is_some());
+                    stop(&mut broker);
+                    return;
+                }
+                let asynchronous = mode.ends_with("_async") || mode.ends_with("_restart");
+                fs::write(gate.join("child-effect"), b"yes").unwrap();
+                eventually(|| {
+                    gate.join("ordinary-bash-status").exists()
+                        || entry.try_wait().unwrap().is_some()
+                });
+                assert_eq!(
+                    fs::read_to_string(gate.join("ordinary-bash-status")).unwrap_or_default(),
+                    "0",
+                    "ordinary Bash: {}; broker: {}; entry: {}",
+                    fs::read_to_string(gate.join("bash-causal-error")).unwrap_or_default(),
+                    fs::read_to_string(&broker_log).unwrap_or_default(),
+                    fs::read_to_string(&err).unwrap_or_default(),
+                );
+                let report: serde_json::Value =
+                    serde_json::from_slice(&fs::read(gate.join("bash-causal-output")).unwrap())
+                        .unwrap();
+                let request_id = report["request_id"].as_str().unwrap();
+                let grant = report["physical_grant_id"].as_str().unwrap();
+                assert_eq!(
+                    report["delivery_mode"],
+                    if asynchronous { "async" } else { "sync" }
+                );
+                assert_eq!(report["completion_policy"], "tree");
+                assert!(report["handle"].as_str().unwrap().starts_with("ab30_"));
+                assert_eq!(report["effects_possible"], true);
+                let directory = broker_state.join("v30/fresh-provider");
+                let selected: serde_json::Value = serde_json::from_slice(
+                    &fs::read(directory.join(format!("{request_id}.child-work-selection.json")))
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(selected["role"], "bash-child-ordinary-tree-v1");
+                let configured = if mode.ends_with("_elf") {
+                    gate.join("ordinary-elf-image").display().to_string()
+                } else {
+                    "sh".into()
+                };
+                assert_eq!(
+                    selected["configured_program"], configured,
+                    "original argv0 changed"
+                );
+                assert_eq!(selected["child_request_id"], request_id);
+                if mode.ends_with("_elf") {
+                    use std::os::unix::fs::MetadataExt;
+                    let image = gate.join("ordinary-elf-image");
+                    let metadata = fs::metadata(&image).unwrap();
+                    assert_eq!(selected["image_descriptor"]["inode"], metadata.ino());
+                    assert_eq!(selected["image_descriptor"]["device"], metadata.dev());
+                    let grant_record: serde_json::Value = serde_json::from_slice(
+                        &fs::read(directory.join(format!("{request_id}.fresh-grant.json")))
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(grant_record["preflight_image"]["observed_shebang"], false);
+                    assert!(
+                        grant_record["preflight_image"]["observed_xattrs_sha256"]
+                            .as_str()
+                            .is_some()
+                    );
+                }
+                let intent: serde_json::Value = serde_json::from_slice(
+                    &fs::read(directory.join(format!("{request_id}.ordinary-bash-intent.json")))
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    intent["command_sha256"],
+                    selected["ordinary_command_sha256"]
+                );
+                assert!(
+                    intent.get("command").is_none(),
+                    "effective environment persisted in C intent"
+                );
+                assert!(
+                    !fs::read_to_string(
+                        directory.join(format!("{request_id}.ordinary-bash-intent.json"))
+                    )
+                    .unwrap()
+                    .contains("original-value")
+                );
+                for entry in fs::read_dir(&directory).unwrap().filter_map(Result::ok) {
+                    if entry.file_type().unwrap().is_file() {
+                        let bytes = fs::read(entry.path()).unwrap();
+                        assert!(
+                            !bytes
+                                .windows(b"age319-secret-must-stay-in-memfd-319".len())
+                                .any(|window| window == b"age319-secret-must-stay-in-memfd-319"),
+                            "secret persisted in broker artifact {}",
+                            entry.path().display()
+                        );
+                    }
+                }
+                if mode.ends_with("_restart") {
+                    assert!(
+                        directory.join(format!("{grant}.consumed.json")).exists(),
+                        "ordinary child K was not durably consumed before broker stop"
+                    );
+                    let consumed_before = fs::read_dir(&directory)
+                        .unwrap()
+                        .filter_map(Result::ok)
+                        .filter(|entry| {
+                            entry
+                                .file_name()
+                                .to_string_lossy()
+                                .ends_with(".consumed.json")
+                        })
+                        .count();
+                    assert_eq!(consumed_before, 2, "expected parent and one child K");
+                    assert!(
+                        !directory.join(format!("{grant}.drain.json")).exists(),
+                        "ordinary Q completed before restart boundary"
+                    );
+                    stop(&mut broker);
+                    assert!(
+                        !directory
+                            .join(format!("{grant}.source-event.json"))
+                            .exists(),
+                        "ordinary W completed before restart boundary"
+                    );
+                    broker = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
+                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
+                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
+                        .env(
+                            "OULIPOLY_KERNEL_BROKER_FIXTURE_BASH_V1",
+                            bash.as_ref().unwrap(),
+                        )
+                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::from(
+                            File::create(temp.path().join("ordinary-broker-restart.log")).unwrap(),
+                        ))
+                        .spawn()
+                        .unwrap();
+                    eventually(|| protocol::request_at(&socket, Operation::Classify).is_ok());
+                    let consumed_after = fs::read_dir(&directory)
+                        .unwrap()
+                        .filter_map(Result::ok)
+                        .filter(|entry| {
+                            entry
+                                .file_name()
+                                .to_string_lossy()
+                                .ends_with(".consumed.json")
+                        })
+                        .count();
+                    assert_eq!(
+                        consumed_after, consumed_before,
+                        "restart created a second K"
+                    );
+                }
+                eventually(|| {
+                    directory
+                        .join(format!("{grant}.source-event.json"))
+                        .exists()
+                });
+                let event: oulipoly_state::mailbox::FreshBashSourceEvent = serde_json::from_slice(
+                    &fs::read(directory.join(format!("{grant}.source-event.json"))).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(event.request_id, request_id);
+                assert_eq!(event.physical_grant_id, grant);
+                assert!(event.tree_drained && event.output_closed);
+                if mode.ends_with("_cancel") {
+                    assert!(event.cancelled && event.selected_kind == "cancelled");
+                    assert_eq!(event.cancel_grant_id.as_deref(), Some(grant));
+                    assert!(!gate.join("ordinary-background").exists());
+                } else {
+                    assert!(!event.cancelled);
+                    assert_eq!(
+                        fs::read(directory.join(format!("{grant}.stdout"))).unwrap(),
+                        b"\x01\xffordinary\x00"
+                    );
+                    assert_eq!(
+                        fs::read(directory.join(format!("{grant}.stderr"))).unwrap(),
+                        b"err\x00\xfe"
+                    );
+                    assert_eq!(fs::read(gate.join("ordinary-effect")).unwrap(), b"effect");
+                    assert_eq!(
+                        fs::read(gate.join("ordinary-background")).unwrap(),
+                        b"background"
+                    );
+                }
+                if mode.ends_with("_failure") {
+                    assert_eq!(event.wait_status, 37 << 8);
+                }
+                let fresh = rusqlite::Connection::open(broker_state.join("v30/state.db")).unwrap();
+                eventually(|| {
+                    fresh
+                        .query_row("SELECT count(*) FROM fresh_bash_selected_event", [], |r| {
+                            r.get::<_, i64>(0)
+                        })
+                        .is_ok_and(|count| count == 1)
+                });
+                if asynchronous {
+                    eventually(|| {
+                        fresh
+                            .query_row("SELECT count(*) FROM fresh_bash_notify_request", [], |r| {
+                                r.get::<_, i64>(0)
+                            })
+                            .is_ok_and(|count| count == 1)
+                    });
+                }
+                let notify_count: i64 = fresh
+                    .query_row("SELECT count(*) FROM fresh_bash_notify_request", [], |r| {
+                        r.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(notify_count, if asynchronous { 1 } else { 0 });
+                if mode.ends_with("_copy") {
+                    eventually(|| gate.join("ordinary-copy-status").exists());
+                    assert_eq!(
+                        fs::read_to_string(gate.join("ordinary-sibling-status")).unwrap(),
+                        "0",
+                        "{}",
+                        fs::read_to_string(gate.join("ordinary-sibling-error")).unwrap_or_default()
+                    );
+                    assert_ne!(
+                        fs::read_to_string(gate.join("ordinary-copy-status")).unwrap(),
+                        "0"
+                    );
+                    let grant_count = fs::read_dir(&directory)
+                        .unwrap()
+                        .filter_map(Result::ok)
+                        .filter(|entry| {
+                            entry
+                                .file_name()
+                                .to_string_lossy()
+                                .ends_with(".fresh-grant.json")
+                        })
+                        .count();
+                    assert_eq!(grant_count, 2, "copied request launched second child work");
+                }
+                if asynchronous {
+                    let side = rusqlite::Connection::open(
+                        broker_state.join("v30/sidecar/pid-identity.db"),
+                    )
+                    .unwrap();
+                    eventually(|| {
+                        side.query_row(
+                            "SELECT count(*) FROM mailbox WHERE handle=?1 AND delivered_at IS NULL",
+                            [report["handle"].as_str().unwrap()],
+                            |r| r.get::<_, i64>(0),
+                        )
+                        .is_ok_and(|count| count == 1)
+                    });
+                } else {
+                    assert_old_debt_and_no_f_ack(&broker_state);
+                }
+                fs::write(gate.join("provider-cancel"), b"yes").unwrap();
+                eventually(|| entry.try_wait().unwrap().is_some());
                 stop(&mut broker);
                 return;
             }
@@ -5014,6 +5415,16 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_model_provider_bash_causal_notify_lost_pending",
         "normal_model_provider_bash_causal_notify_debt",
         "normal_model_provider_bash_causal_notify_row_debt",
+        "normal_model_provider_bash_ordinary_sync",
+        "normal_model_provider_bash_ordinary_async",
+        "normal_model_provider_bash_ordinary_refuse",
+        "normal_model_provider_bash_ordinary_loss",
+        "normal_model_provider_bash_ordinary_copy",
+        "normal_model_provider_bash_ordinary_restart",
+        "normal_model_provider_bash_ordinary_elf",
+        "normal_model_provider_bash_ordinary_failure",
+        "normal_model_provider_bash_ordinary_cancel",
+        "normal_model_provider_bash_ordinary_parent_tamper",
         "normal_model_provider_reply_loss",
         "normal_model_provider_q_reply_loss",
         "normal_model_provider_restart",
