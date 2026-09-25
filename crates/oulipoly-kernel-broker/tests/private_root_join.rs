@@ -1802,10 +1802,20 @@ fn inner() {
                         .unwrap();
                     eventually(|| second.try_wait().unwrap().is_some());
                     assert!(!second.wait().unwrap().success());
+                    let second_error = fs::read_to_string(&second_err).unwrap();
                     assert!(
-                        fs::read_to_string(&second_err)
+                        second_error.contains("retained sidecar has one running owner"),
+                        "{second_error}"
+                    );
+                    assert!(
+                        entry.try_wait().unwrap().is_none(),
+                        "first pending-Q root exited early"
+                    );
+                    assert_eq!(
+                        fs::read_dir(broker_state.join("released-handoffs"))
                             .unwrap()
-                            .contains("shared physical quota readback refused")
+                            .count(),
+                        1
                     );
                     let effects = provider_dir.join("account-effects");
                     assert_eq!(
@@ -1826,6 +1836,11 @@ fn inner() {
                     );
                     fs::write(gate.join("finish-quota"), b"yes").unwrap();
                     fs::write(gate.join("provider-cancel"), b"yes").unwrap();
+                    eventually(|| {
+                        gate.join("provider-runtime-result").exists()
+                            || entry.try_wait().unwrap().is_some()
+                    });
+                    fs::write(gate.join("shared-first-release"), b"yes").unwrap();
                     eventually(|| entry.try_wait().unwrap().is_some());
                     assert!(!entry.wait().unwrap().success());
                     assert_eq!(fs::read(&old_state_path).unwrap(), old_state_before);
@@ -1883,158 +1898,41 @@ fn inner() {
                         .stderr(Stdio::from(File::create(&second_err).unwrap()))
                         .spawn()
                         .unwrap();
-                    let second_receipt: oulipoly_state::mailbox::FreshReleasedHandoff = {
-                        eventually(|| {
-                            fs::read_dir(broker_state.join("released-handoffs"))
-                                .unwrap()
-                                .count()
-                                == 2
-                                || second.try_wait().unwrap().is_some()
-                        });
-                        fs::read_dir(broker_state.join("released-handoffs"))
-                            .unwrap()
-                            .filter_map(Result::ok)
-                            .find(|entry| {
-                                entry.file_name().to_string_lossy()
-                                    != format!("{}.json", prepared.root_id)
-                            })
-                            .map(|entry| {
-                                serde_json::from_slice(&fs::read(entry.path()).unwrap()).unwrap()
-                            })
-                            .unwrap_or_else(|| {
-                                panic!(
-                                    "second original-root receipt absent: {}",
-                                    fs::read_to_string(&second_err).unwrap()
-                                )
-                            })
-                    };
-                    assert_ne!(second_receipt.d_key, receipt.d_key);
-                    assert_ne!(
-                        second_receipt.old_release.prepared.root_id,
-                        receipt.old_release.prepared.root_id
-                    );
-                    let first_auth = provider_dir
-                        .join("account-effects")
-                        .join(format!("{}-1-auth-refresh", receipt.handoff_id));
-                    let second_auth = provider_dir
-                        .join("account-effects")
-                        .join(format!("{}-1-auth-refresh", second_receipt.handoff_id));
-                    eventually(|| {
-                        second_auth.join("intent.json").exists()
-                            || second.try_wait().unwrap().is_some()
-                    });
-                    assert!(
-                        second_auth.join("intent.json").exists(),
-                        "second auth alias absent: {}; second: {}; broker: {}",
-                        fs::read_to_string(&err).unwrap(),
-                        fs::read_to_string(&second_err).unwrap(),
-                        fs::read_to_string(temp.path().join("handoff-restart.log"))
-                            .unwrap_or_default()
-                    );
-                    let alias: serde_json::Value =
-                        serde_json::from_slice(&fs::read(second_auth.join("intent.json")).unwrap())
-                            .unwrap();
-                    assert!(
-                        alias["auth_source"].is_object(),
-                        "second actor did not follow auth K"
-                    );
-                    assert_eq!(
-                        fs::read_dir(&second_auth)
-                            .unwrap()
-                            .filter_map(Result::ok)
-                            .filter(|entry| entry
-                                .file_name()
-                                .to_string_lossy()
-                                .ends_with(".consumed.json"))
-                            .count(),
-                        0
-                    );
-                    assert_eq!(
-                        fs::read_dir(&first_auth)
-                            .unwrap()
-                            .filter_map(Result::ok)
-                            .filter(|entry| entry
-                                .file_name()
-                                .to_string_lossy()
-                                .ends_with(".consumed.json"))
-                            .count(),
-                        1
-                    );
-                    fs::write(gate.join("finish-auth"), b"yes").unwrap();
-                    let second_retry = provider_dir
-                        .join("account-effects")
-                        .join(format!("{}-1-quota-retry", second_receipt.handoff_id));
-                    eventually(|| {
-                        second_retry.join("result.json").exists()
-                            || second.try_wait().unwrap().is_some()
-                    });
-                    assert!(
-                        second_retry.join("result.json").exists(),
-                        "second actor did not retry quota: {}",
-                        fs::read_to_string(&second_err).unwrap()
-                    );
-                    fs::write(gate.join("shared-auth-first-retry-go"), b"yes").unwrap();
-                    eventually(|| {
-                        entry.try_wait().unwrap().is_some() && second.try_wait().unwrap().is_some()
-                    });
-                    assert!(!entry.wait().unwrap().success());
+                    eventually(|| second.try_wait().unwrap().is_some());
                     assert!(!second.wait().unwrap().success());
-                    let first_error = fs::read_to_string(&err).unwrap();
                     let second_error = fs::read_to_string(&second_err).unwrap();
                     assert!(
-                        first_error.contains("automatic_replay\\\":false")
-                            || first_error.contains("broker exact running owner absent"),
-                        "{first_error}"
+                        second_error.contains("retained sidecar has one running owner"),
+                        "second original root: {second_error}"
                     );
                     assert!(
-                        second_error
-                            .contains("v3 route, cancellation and provider K writers are closed"),
-                        "{second_error}"
+                        entry.try_wait().unwrap().is_none(),
+                        "first root exited early"
                     );
                     assert_eq!(
-                        serde_json::from_slice::<serde_json::Value>(
-                            &fs::read(first_auth.join("result.json")).unwrap()
-                        )
-                        .unwrap()["outcome"],
-                        "refreshed"
-                    );
-                    assert_eq!(
-                        serde_json::from_slice::<serde_json::Value>(
-                            &fs::read(second_retry.join("result.json")).unwrap()
-                        )
-                        .unwrap()["outcome"],
-                        "valid_windows"
-                    );
-                    assert_eq!(
-                        fs::read_dir(&first_auth)
+                        fs::read_dir(broker_state.join("released-handoffs"))
                             .unwrap()
-                            .filter_map(Result::ok)
-                            .filter(|entry| entry
-                                .file_name()
-                                .to_string_lossy()
-                                .ends_with(".consumed.json"))
                             .count(),
-                        1
+                        1,
+                        "refused second root acquired D"
                     );
-                    assert_eq!(
-                        fs::read_dir(&second_retry)
-                            .unwrap()
-                            .filter_map(Result::ok)
-                            .filter(|entry| entry
-                                .file_name()
-                                .to_string_lossy()
-                                .ends_with(".consumed.json"))
-                            .count(),
-                        1
+                    fs::write(gate.join("finish-auth"), b"yes").unwrap();
+                    eventually(|| {
+                        gate.join("shared-auth-first-refreshed").exists()
+                            || entry.try_wait().unwrap().is_some()
+                    });
+                    fs::write(gate.join("shared-auth-first-retry-go"), b"yes").unwrap();
+                    eventually(|| entry.try_wait().unwrap().is_some());
+                    assert!(!entry.wait().unwrap().success());
+                    let first_error = fs::read_to_string(&err).unwrap();
+                    assert!(
+                        first_error.contains("shared quota retry readback refused")
+                            && first_error.contains("auth already spent after rejection"),
+                        "{first_error}"
                     );
                     assert!(
                         !provider_dir
                             .join(format!("{}.fresh-grant.json", receipt.handoff_id))
-                            .exists()
-                    );
-                    assert!(
-                        !provider_dir
-                            .join(format!("{}.fresh-grant.json", second_receipt.handoff_id))
                             .exists()
                     );
                     assert_eq!(fs::read(&old_state_path).unwrap(), old_state_before);
@@ -3447,6 +3345,54 @@ fn inner() {
                             .stderr(Stdio::from(File::create(&second_err).unwrap()))
                             .spawn()
                             .unwrap();
+                        if mode
+                            != "normal_model_provider_v3_quota_route_physical_shared_concurrent_red"
+                        {
+                            eventually(|| second.try_wait().unwrap().is_some());
+                            assert!(!second.wait().unwrap().success());
+                            let second_error = fs::read_to_string(&second_err).unwrap();
+                            assert!(
+                                second_error.contains("retained sidecar has one running owner"),
+                                "second original root: {second_error}"
+                            );
+                            assert!(
+                                entry.try_wait().unwrap().is_none(),
+                                "first root exited early"
+                            );
+                            assert_eq!(
+                                fs::read_dir(broker_state.join("released-handoffs"))
+                                    .unwrap()
+                                    .count(),
+                                1,
+                                "refused second root acquired D"
+                            );
+                            assert!(!gate.join("provider-effect-second").exists());
+                            assert!(!gate.join("provider-runtime-result-second").exists());
+                            let sidecar = rusqlite::Connection::open(
+                                broker_state.join("sidecar/pid-identity.db"),
+                            )
+                            .unwrap();
+                            let owner: String = sidecar.query_row(
+                                "SELECT kernel_root_id FROM completion_continuation_owner WHERE phase='running'",
+                                [],
+                                |row| row.get(0),
+                            ).unwrap();
+                            assert_eq!(owner, prepared.root_id);
+                            fs::write(gate.join("shared-first-release"), b"yes").unwrap();
+                            eventually(|| entry.try_wait().unwrap().is_some());
+                            assert!(!entry.wait().unwrap().success());
+                            assert!(fs::read_to_string(&err).unwrap().contains(
+                                "private provider runtime result mapped after Q; root terminal publication closed"
+                            ));
+                            assert_eq!(fs::read(&old_state_path).unwrap(), old_state_before);
+                            assert_eq!(fs::read(&old_wal_path).ok(), old_wal_before);
+                            stop(&mut broker);
+                            return;
+                        }
+                        assert!(
+                            entry.try_wait().unwrap().is_none(),
+                            "first root must remain live during second root K/Q"
+                        );
                         eventually(|| second.try_wait().unwrap().is_some());
                         assert!(!second.wait().unwrap().success());
                         let second_error = fs::read_to_string(&second_err).unwrap();
@@ -5877,7 +5823,17 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_guardian_post",
         "normal_driver_post",
         "normal_broker_post",
-    ] {
+    ]
+    .into_iter()
+    .chain(
+        std::iter::once("normal_model_provider_v3_quota_route_physical_shared_concurrent_red")
+            .filter(|_| {
+                std::env::var("AGE319_PRIVATE_JOIN_ONLY_MODE")
+                    .ok()
+                    .as_deref()
+                    == Some("normal_model_provider_v3_quota_route_physical_shared_concurrent_red")
+            }),
+    ) {
         if std::env::var("AGE319_PRIVATE_JOIN_ONLY_MODE")
             .ok()
             .is_some_and(|only| only != mode)

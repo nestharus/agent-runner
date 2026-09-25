@@ -1512,6 +1512,59 @@ impl BrokerSidecar {
         Ok(prepared)
     }
 
+    /// The retained completion schema has one running owner per domain. A
+    /// second original root must not turn the first root's live evidence into
+    /// `lost` merely to consume shared account facts in the independent v3
+    /// provider index. The broker checks this before opening a held J gate.
+    fn running_broker_root(
+        &self,
+        source_generation: &str,
+    ) -> Result<Option<Option<String>>, String> {
+        self.check_mailbox_read(source_generation)?;
+        let running: Option<Option<String>> = self
+            .mailbox
+            .conn
+            .query_row(
+                "SELECT owner.kernel_root_id FROM completion_continuation_owner owner
+                 JOIN broker_completion_owner broker
+                   ON broker.owner_generation=owner.generation
+                  AND broker.source_generation=?1
+                 WHERE owner.phase='running'",
+                [source_generation],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        self.check_mailbox_read(source_generation)?;
+        Ok(running)
+    }
+
+    /// Refuse before E spends an entry, leaving no second-root registry debt.
+    pub fn refuse_new_original_root(&self, source_generation: &str) -> Result<(), String> {
+        if self.running_broker_root(source_generation)?.is_some() {
+            return Err(
+                "concurrent original root refused: retained sidecar has one running owner".into(),
+            );
+        }
+        Ok(())
+    }
+
+    pub fn refuse_parallel_running_root(
+        &self,
+        source_generation: &str,
+        root_id: &str,
+    ) -> Result<(), String> {
+        if self
+            .running_broker_root(source_generation)?
+            .is_some_and(|running| running.as_deref() != Some(root_id))
+        {
+            return Err(
+                "concurrent original root refused: retained sidecar has one running owner".into(),
+            );
+        }
+        Ok(())
+    }
+
     /// Commit only after the serving broker has written its retained gate.
     /// A lost reply is reconciled with `read_exact_release`, never a retry.
     pub fn commit_exact_prepared_release(
@@ -3625,6 +3678,7 @@ mod tests {
         let uid = unsafe { libc::geteuid() };
         let source_generation = activate_with_owner(&path, uid, root.path()).unwrap();
         let mut broker = open_with_owner(&path, uid, root.path()).unwrap();
+        broker.refuse_new_original_root(&source_generation).unwrap();
         let boot_id = uuid::Uuid::new_v4().to_string();
         let stamp = |host_pid, pidns_ino| PreparedProcessStamp {
             host_pid,
@@ -3828,6 +3882,21 @@ mod tests {
         let released = broker.commit_exact_prepared_release(&prepared).unwrap();
         assert_eq!(released.prepared, prepared);
         assert_eq!(released.owner.owner_generation, prepared.owner_generation);
+        broker
+            .refuse_parallel_running_root(&source_generation, &prepared.root_id)
+            .unwrap();
+        assert!(
+            broker
+                .refuse_new_original_root(&source_generation)
+                .unwrap_err()
+                .contains("one running owner")
+        );
+        assert!(
+            broker
+                .refuse_parallel_running_root(&source_generation, &uuid::Uuid::new_v4().to_string())
+                .unwrap_err()
+                .contains("one running owner")
+        );
         assert!(broker.commit_exact_prepared_release(&prepared).is_err());
         drop(broker);
         let broker = open_with_owner(&path, uid, root.path()).unwrap();

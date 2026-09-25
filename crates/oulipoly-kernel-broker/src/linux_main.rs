@@ -2076,6 +2076,9 @@ fn prepare_broker_owner(
         return Err(io::Error::other("invalid pending endpoint"));
     }
     let actors = held_prepared_actors(&spec.root_id, peer, roots, entries, held)?;
+    sidecar
+        .refuse_parallel_running_root(&spec.source_generation, &spec.root_id)
+        .map_err(io::Error::other)?;
     let entry_process = PinnedProcess::open(actors[0].host_pid)?;
     if ProcessStamp::from(&peer.process) != actors[1]
         || !peer.process.same_executable_as(runner_image)?
@@ -2235,6 +2238,9 @@ fn release_prepared_broker_owner(
     {
         return Err(io::Error::other("held release requires original guardian"));
     }
+    sidecar
+        .refuse_parallel_running_root(&prepared.source_generation, &prepared.root_id)
+        .map_err(io::Error::other)?;
     let gate = held
         .get_mut(&spec.root_id)
         .ok_or_else(|| io::Error::other("held gate absent"))?;
@@ -3641,6 +3647,13 @@ fn serve() -> io::Result<()> {
                     None => "state-route legacy\n".into(),
                 })
             } else {
+                if matches!(operation, b'e' | b'E') {
+                    if let Some(sidecar) = broker_sidecar.as_ref() {
+                        sidecar
+                            .refuse_new_original_root(sidecar.source_generation())
+                            .map_err(io::Error::other)?;
+                    }
+                }
                 dispatch_authenticated(
                     match operation {
                         b'e' => b'E',
