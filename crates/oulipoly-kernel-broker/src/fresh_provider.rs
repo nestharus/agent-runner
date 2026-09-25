@@ -252,6 +252,7 @@ pub(super) struct Plan {
     preflight_image: ImagePreflight,
     cwd: File,
     input: File,
+    stdin_dev_null: bool,
     recipe: File,
     digest: String,
     cwd_device: u64,
@@ -539,19 +540,42 @@ pub(super) fn plan(
     argv: Vec<String>,
     env: Vec<(String, String)>,
 ) -> io::Result<Plan> {
+    plan_with_environment_policy(
+        image_path,
+        cwd,
+        input,
+        image_path.to_string_lossy().into_owned(),
+        argv,
+        env,
+        false,
+    )
+}
+
+fn plan_with_environment_policy(
+    image_path: &Path,
+    cwd: &Path,
+    input: &File,
+    configured_program: String,
+    argv: Vec<String>,
+    env: Vec<(String, String)>,
+    allow_bash_environment: bool,
+) -> io::Result<Plan> {
     let mut keys = HashSet::new();
     if !image_path.is_absolute()
         || !cwd.is_absolute()
+        || configured_program.is_empty()
+        || configured_program.contains('\0')
         || argv.iter().any(|a| a.contains('\0'))
         || env.iter().any(|(k, v)| {
             k.is_empty()
                 || k.contains(['=', '\0'])
                 || v.contains('\0')
                 || !keys.insert(k)
-                || k.starts_with("LD_")
-                || k.starts_with("DYLD_")
-                || k.starts_with("OULIPOLY_KERNEL_")
-                || matches!(k.as_str(), "GLIBC_TUNABLES" | "GCONV_PATH")
+                || (!allow_bash_environment
+                    && (k.starts_with("LD_")
+                        || k.starts_with("DYLD_")
+                        || k.starts_with("OULIPOLY_KERNEL_")
+                        || matches!(k.as_str(), "GLIBC_TUNABLES" | "GCONV_PATH")))
         })
     {
         return Err(io::Error::other("unsupported fresh provider plan"));
@@ -580,7 +604,7 @@ pub(super) fn plan(
     serde_json::to_writer(
         &mut recipe,
         &Recipe {
-            configured_program: image_path.to_string_lossy().into_owned(),
+            configured_program: configured_program.clone(),
             argv,
             env,
         },
@@ -608,12 +632,13 @@ pub(super) fn plan(
     );
     Ok(Plan {
         image,
-        configured_program: image_path.to_string_lossy().into_owned(),
+        configured_program,
         broker_resolved_path: image_path.to_owned(),
         image_descriptor,
         preflight_image,
         cwd,
         input,
+        stdin_dev_null: false,
         recipe,
         digest,
         cwd_device: cwd_meta.dev(),
@@ -698,6 +723,7 @@ pub(super) fn plan_from_descriptors(
         preflight_image,
         cwd,
         input,
+        stdin_dev_null: false,
         recipe,
         digest,
         cwd_device: cwd_meta.dev(),
@@ -817,10 +843,386 @@ struct ChildWorkSelection {
     configured_program: String,
     broker_resolved_path: PathBuf,
     image_descriptor: ImageDescriptor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ordinary_command_sha256: Option<String>,
+}
+
+/// The pinned Bash image captures these values at its original `run` entry.
+/// The broker freezes them before C can return; later K never accepts a new
+/// argv, cwd, environment, or completion policy from the caller.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct OrdinaryBashCommand {
+    pub version: u32,
+    pub original_cli_argv: Vec<String>,
+    pub argv: Vec<String>,
+    pub resolved_program: PathBuf,
+    pub cwd: PathBuf,
+    pub environment: Vec<(String, String)>,
+    pub completion_scope: String,
+    pub ready_sentinel: Option<String>,
+    pub cancel_on_owner_exit: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct OrdinaryBashIntent {
+    version: u32,
+    child_request_id: String,
+    actor_pid: i32,
+    actor_starttime: u64,
+    actor_pidns_dev: u64,
+    actor_pidns_ino: u64,
+    command_sha256: String,
+}
+
+fn ordinary_intent_name(request_id: &str) -> String {
+    format!("{request_id}.ordinary-bash-intent.json")
+}
+
+pub(super) fn bind_ordinary_bash_intent(
+    directory: &Path,
+    request_id: &str,
+    actor: &PinnedProcess,
+    command: &OrdinaryBashCommand,
+) -> io::Result<()> {
+    if command.version != 1
+        || command.argv.is_empty()
+        || command.argv[0].is_empty()
+        || command.completion_scope != "tree"
+        || command.ready_sentinel.is_some()
+        || command.cancel_on_owner_exit
+    {
+        return Err(io::Error::other(
+            "ordinary Bash command shape unavailable before K",
+        ));
+    }
+    let raw_cli = std::fs::read(format!("/proc/{}/cmdline", actor.host_pid))?;
+    if raw_cli.last() != Some(&0) {
+        return Err(io::Error::other(
+            "ordinary Bash CLI argv terminal delimiter absent",
+        ));
+    }
+    let actual_cli = raw_cli[..raw_cli.len() - 1]
+        .split(|byte| *byte == 0)
+        .map(|part| String::from_utf8(part.to_vec()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| io::Error::other("ordinary Bash CLI argv is not UTF-8"))?;
+    if actual_cli != command.original_cli_argv {
+        return Err(io::Error::other("ordinary Bash original CLI argv changed"));
+    }
+    let command_separator = actual_cli
+        .iter()
+        .position(|arg| arg == "--")
+        .ok_or_else(|| io::Error::other("ordinary Bash CLI command separator absent"))?;
+    if actual_cli.get(1).map(String::as_str) != Some("run")
+        || actual_cli[command_separator + 1..] != command.argv
+    {
+        return Err(io::Error::other(
+            "ordinary Bash command differs from original CLI argv",
+        ));
+    }
+    let observed_cwd = File::open(format!("/proc/{}/cwd", actor.host_pid))?;
+    let named_cwd = File::open(&command.cwd)?;
+    if observed_cwd.metadata()?.dev() != named_cwd.metadata()?.dev()
+        || observed_cwd.metadata()?.ino() != named_cwd.metadata()?.ino()
+    {
+        return Err(io::Error::other("ordinary Bash original cwd changed"));
+    }
+    let intent = OrdinaryBashIntent {
+        version: 1,
+        child_request_id: request_id.into(),
+        actor_pid: actor.host_pid,
+        actor_starttime: actor.starttime_ticks,
+        actor_pidns_dev: actor.pidns_dev,
+        actor_pidns_ino: actor.pidns_ino,
+        command_sha256: format!("{:x}", Sha256::digest(serde_json::to_vec(command)?)),
+    };
+    let name = ordinary_intent_name(request_id);
+    match exact_file::<OrdinaryBashIntent>(directory, &name)? {
+        Some(old) if old == intent => Ok(()),
+        Some(_) => Err(io::Error::other("ordinary Bash C command or actor changed")),
+        None => durable_new(directory, &name, &intent),
+    }
+}
+
+pub(super) fn require_ordinary_bash_command(
+    directory: &Path,
+    request_id: &str,
+    actor: &PinnedProcess,
+    command: &OrdinaryBashCommand,
+) -> io::Result<()> {
+    let intent: OrdinaryBashIntent = exact_file(directory, &ordinary_intent_name(request_id))?
+        .ok_or_else(|| io::Error::other("ordinary Bash C intent absent"))?;
+    if intent.version != 1
+        || intent.child_request_id != request_id
+        || intent.actor_pid != actor.host_pid
+        || intent.actor_starttime != actor.starttime_ticks
+        || (intent.actor_pidns_dev, intent.actor_pidns_ino) != (actor.pidns_dev, actor.pidns_ino)
+        || intent.command_sha256 != format!("{:x}", Sha256::digest(serde_json::to_vec(command)?))
+    {
+        return Err(io::Error::other(
+            "ordinary Bash C intent actor or command changed",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn ordinary_bash_plan(command: &OrdinaryBashCommand) -> io::Result<Plan> {
+    if command.version != 1
+        || command.argv.is_empty()
+        || command.argv[0].is_empty()
+        || !command.cwd.is_absolute()
+        || command.completion_scope != "tree"
+        || command.ready_sentinel.is_some()
+        || command.cancel_on_owner_exit
+    {
+        return Err(io::Error::other(
+            "ordinary Bash command shape unavailable before K",
+        ));
+    }
+    // The pinned Bash image resolves PATH under its own effective credentials
+    // at original C. The broker checks that the selected path belongs to that
+    // exact command/PATH and pins the original inode; argv0 remains original.
+    let first = Path::new(&command.argv[0]);
+    let candidates: Vec<PathBuf> = if command.argv[0].contains('/') {
+        vec![command.cwd.join(first)]
+    } else {
+        let path_value = command
+            .environment
+            .iter()
+            .find(|(key, _)| key == "PATH")
+            .map(|(_, value)| value.as_str())
+            .unwrap_or("/bin:/usr/bin");
+        path_value
+            .split(':')
+            .map(|entry| {
+                if entry.is_empty() {
+                    command.cwd.clone()
+                } else {
+                    command.cwd.join(entry)
+                }
+            })
+            .map(|directory| directory.join(first))
+            .collect()
+    };
+    if !command.resolved_program.is_absolute() || !candidates.contains(&command.resolved_program) {
+        return Err(io::Error::other(
+            "ordinary Bash resolved command differs from original PATH",
+        ));
+    }
+    let image = std::fs::canonicalize(&command.resolved_program)?;
+    let mut probe = File::open(&image)
+        .map_err(|_| io::Error::other("ordinary Bash executable format unavailable before K"))?;
+    let mut magic = [0u8; 4];
+    let count = probe.read(&mut magic)?;
+    if count >= 2 && magic[..2] == *b"#!" {
+        return Err(io::Error::other(
+            "ordinary Bash shebang script path semantics unavailable before K",
+        ));
+    }
+    if count < 4 || magic != *b"\x7fELF" {
+        return Err(io::Error::other(
+            "ordinary Bash execvp format fallback unavailable before K",
+        ));
+    }
+    preflight_ordinary_elf(&mut probe)?;
+    let input_fd =
+        unsafe { libc::memfd_create(c"ordinary-bash-empty-input".as_ptr(), libc::MFD_CLOEXEC) };
+    if input_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let input = unsafe { File::from_raw_fd(input_fd) };
+    let mut plan = plan_with_environment_policy(
+        &image,
+        &command.cwd,
+        &input,
+        command.argv[0].clone(),
+        command.argv[1..].to_vec(),
+        command.environment.clone(),
+        true,
+    )?;
+    // Legacy Bash redirects its workload stdin from the character device.
+    // Keep the sealed empty input in the plan guard, but bind the ordinary
+    // launch mode into the digest and use the same /dev/null fd type at exec.
+    plan.stdin_dev_null = true;
+    plan.digest = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&(
+            &plan.digest,
+            "ordinary-stdin-dev-null-v1"
+        ))?)
+    );
+    Ok(plan)
+}
+
+fn preflight_ordinary_elf(image: &mut File) -> io::Result<()> {
+    let unavailable = || io::Error::other("ordinary Bash ELF format unavailable before K");
+    let length = image.metadata()?.len();
+    if length < 64 {
+        return Err(unavailable());
+    }
+    image.seek(SeekFrom::Start(0))?;
+    let mut header = [0u8; 64];
+    image.read_exact(&mut header).map_err(|_| unavailable())?;
+    #[cfg(target_arch = "x86_64")]
+    let host_machine = 62u16;
+    #[cfg(target_arch = "aarch64")]
+    let host_machine = 183u16;
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let host_machine = 0u16;
+    let elf_type = u16::from_le_bytes(header[16..18].try_into().unwrap());
+    let machine = u16::from_le_bytes(header[18..20].try_into().unwrap());
+    let version = u32::from_le_bytes(header[20..24].try_into().unwrap());
+    let phoff = u64::from_le_bytes(header[32..40].try_into().unwrap());
+    let ehsize = u16::from_le_bytes(header[52..54].try_into().unwrap());
+    let phentsize = u16::from_le_bytes(header[54..56].try_into().unwrap());
+    let phnum = u16::from_le_bytes(header[56..58].try_into().unwrap());
+    if header[..4] != *b"\x7fELF"
+        || header[4] != 2
+        || header[5] != 1
+        || header[6] != 1
+        || !matches!(elf_type, 2 | 3)
+        || machine != host_machine
+        || version != 1
+        || ehsize != 64
+        || phentsize != 56
+        || !(1..=256).contains(&phnum)
+        || phoff < 64
+        || phoff
+            .checked_add(u64::from(phnum) * 56)
+            .is_none_or(|end| end > length)
+    {
+        return Err(unavailable());
+    }
+    let mut executable_load = false;
+    let mut interpreter = None;
+    for index in 0..phnum {
+        image.seek(SeekFrom::Start(phoff + u64::from(index) * 56))?;
+        let mut program = [0u8; 56];
+        image.read_exact(&mut program).map_err(|_| unavailable())?;
+        let kind = u32::from_le_bytes(program[..4].try_into().unwrap());
+        let flags = u32::from_le_bytes(program[4..8].try_into().unwrap());
+        let offset = u64::from_le_bytes(program[8..16].try_into().unwrap());
+        let filesz = u64::from_le_bytes(program[32..40].try_into().unwrap());
+        let memsz = u64::from_le_bytes(program[40..48].try_into().unwrap());
+        if offset.checked_add(filesz).is_none_or(|end| end > length) {
+            return Err(unavailable());
+        }
+        if kind == 1 {
+            if filesz > memsz {
+                return Err(unavailable());
+            }
+            executable_load |= flags & 1 != 0 && memsz > 0;
+        }
+        if kind == 3 {
+            if interpreter.is_some() || !(2..=4096).contains(&filesz) {
+                return Err(unavailable());
+            }
+            let mut bytes = vec![0u8; filesz as usize];
+            image.seek(SeekFrom::Start(offset))?;
+            image.read_exact(&mut bytes).map_err(|_| unavailable())?;
+            if bytes.last() != Some(&0) || bytes[..bytes.len() - 1].contains(&0) {
+                return Err(unavailable());
+            }
+            interpreter = Some(bytes);
+        }
+    }
+    if !executable_load {
+        return Err(unavailable());
+    }
+    if let Some(interpreter) = interpreter {
+        use std::os::unix::ffi::OsStrExt;
+        let path = Path::new(std::ffi::OsStr::from_bytes(
+            &interpreter[..interpreter.len() - 1],
+        ));
+        if !path.is_absolute()
+            || !path
+                .metadata()
+                .is_ok_and(|meta| meta.is_file() && meta.mode() & 0o111 != 0)
+        {
+            return Err(io::Error::other(
+                "ordinary Bash ELF interpreter unavailable before K",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn child_selection_name(request_id: &str) -> String {
     format!("{request_id}.child-work-selection.json")
+}
+
+pub(super) fn child_selection_is_ordinary(
+    directory: &Path,
+    child: &FreshBashChild,
+    binding: &Binding,
+) -> io::Result<bool> {
+    let selection: ChildWorkSelection =
+        exact_file(directory, &child_selection_name(&child.request_id))?
+            .ok_or_else(|| io::Error::other("fresh Bash child selection absent"))?;
+    if selection.child_request_id != child.request_id
+        || selection.child_d_key != child.d_key
+        || selection.child_receipt_sha256
+            != format!("{:x}", Sha256::digest(serde_json::to_vec(child)?))
+        || selection.binding != *binding
+    {
+        return Err(io::Error::other(
+            "fresh Bash selected child identity changed",
+        ));
+    }
+    if selection.version == 2 && selection.role == "bash-child-ordinary-tree-v1" {
+        if !ordinary_selection_digest_matches(directory, &selection)? {
+            return Err(io::Error::other("ordinary Bash selected command changed"));
+        }
+        Ok(true)
+    } else if selection.version == 1 && selection.role == "bash-child-private-fixed-v1" {
+        Ok(false)
+    } else {
+        Err(io::Error::other("fresh Bash child selection role changed"))
+    }
+}
+
+pub(super) fn ordinary_selection_binding(
+    directory: &Path,
+    child: &FreshBashChild,
+) -> io::Result<Binding> {
+    let selection: ChildWorkSelection =
+        exact_file(directory, &child_selection_name(&child.request_id))?
+            .ok_or_else(|| io::Error::other("ordinary Bash child selection absent"))?;
+    if selection.version != 2
+        || selection.role != "bash-child-ordinary-tree-v1"
+        || selection.child_request_id != child.request_id
+        || selection.child_d_key != child.d_key
+        || selection.child_receipt_sha256
+            != format!("{:x}", Sha256::digest(serde_json::to_vec(child)?))
+        || !ordinary_selection_digest_matches(directory, &selection)?
+    {
+        return Err(io::Error::other("ordinary Bash child selection changed"));
+    }
+    Ok(selection.binding)
+}
+
+pub(super) fn ordinary_selection_request_ids(directory: &Path) -> io::Result<Vec<String>> {
+    let mut requests = Vec::new();
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(request_id) = name
+            .to_string_lossy()
+            .strip_suffix(".child-work-selection.json")
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        let selection: ChildWorkSelection =
+            exact_file(directory, &child_selection_name(&request_id))?
+                .ok_or_else(|| io::Error::other("ordinary Bash selection vanished"))?;
+        if selection.version == 2 && selection.role == "bash-child-ordinary-tree-v1" {
+            requests.push(request_id);
+        }
+    }
+    Ok(requests)
 }
 
 pub(super) fn select_private_child_work(
@@ -856,11 +1258,57 @@ pub(super) fn select_private_child_work(
         configured_program: plan.configured_program.clone(),
         broker_resolved_path: plan.broker_resolved_path.clone(),
         image_descriptor: plan.image_descriptor.clone(),
+        ordinary_command_sha256: None,
     };
     let name = child_selection_name(&child.request_id);
     match exact_file::<ChildWorkSelection>(directory, &name)? {
         Some(existing) if existing == selection => Ok(()),
         Some(_) => Err(io::Error::other("child work selection conflict")),
+        None => durable_new(directory, &name, &selection),
+    }
+}
+
+pub(super) fn select_ordinary_child_work(
+    directory: &Path,
+    child: &FreshBashChild,
+    binding: &Binding,
+    actor: &PinnedProcess,
+    command: &OrdinaryBashCommand,
+    plan: &Plan,
+) -> io::Result<()> {
+    require_ordinary_bash_command(directory, &child.request_id, actor, command)?;
+    if binding.grant_key() != child.request_id
+        || binding.invocation_uuid != child.invocation_uuid
+        || binding.session_id != child.session.session_id
+        || binding.causal_parent.as_ref().is_none_or(|parent| {
+            parent.grant_id != child.parent_work_grant_id || parent.work_id != child.parent_work_id
+        })
+    {
+        return Err(io::Error::other("ordinary Bash C/D or parent mismatch"));
+    }
+    plan.verify()?;
+    let selection = ChildWorkSelection {
+        version: 2,
+        role: "bash-child-ordinary-tree-v1".into(),
+        child_request_id: child.request_id.clone(),
+        child_d_key: child.d_key.clone(),
+        child_receipt_sha256: format!("{:x}", Sha256::digest(serde_json::to_vec(child)?)),
+        binding: binding.clone(),
+        plan_sha256: plan.digest.clone(),
+        configured_program: plan.configured_program.clone(),
+        broker_resolved_path: plan.broker_resolved_path.clone(),
+        image_descriptor: plan.image_descriptor.clone(),
+        ordinary_command_sha256: Some(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(command)?)
+        )),
+    };
+    let name = child_selection_name(&child.request_id);
+    match exact_file::<ChildWorkSelection>(directory, &name)? {
+        Some(existing) if existing == selection => Ok(()),
+        Some(_) => Err(io::Error::other(
+            "ordinary Bash child work selection conflict",
+        )),
         None => durable_new(directory, &name, &selection),
     }
 }
@@ -878,9 +1326,10 @@ pub(super) fn require_child_work_plan(
     let selection: ChildWorkSelection =
         exact_file(directory, &child_selection_name(binding.grant_key()))?
             .ok_or_else(|| io::Error::other("child work selection absent before K"))?;
-    if selection.version != 1
-        || selection.role != "bash-child-private-fixed-v1"
-        || selection.child_request_id != binding.grant_key()
+    if !matches!(
+        (selection.version, selection.role.as_str()),
+        (1, "bash-child-private-fixed-v1") | (2, "bash-child-ordinary-tree-v1")
+    ) || selection.child_request_id != binding.grant_key()
         || selection.child_d_key.is_empty()
         || selection.child_receipt_sha256.len() != 64
         || selection.binding != *binding
@@ -888,12 +1337,32 @@ pub(super) fn require_child_work_plan(
         || selection.configured_program != plan.configured_program
         || selection.broker_resolved_path != plan.broker_resolved_path
         || selection.image_descriptor != plan.image_descriptor
+        || (selection.version == 1 && selection.ordinary_command_sha256.is_some())
+        || (selection.version == 2 && !ordinary_selection_digest_matches(directory, &selection)?)
     {
         return Err(io::Error::other(
             "fresh Bash K differs from child work selection",
         ));
     }
     Ok(())
+}
+
+fn ordinary_selection_digest_matches(
+    directory: &Path,
+    selection: &ChildWorkSelection,
+) -> io::Result<bool> {
+    let intent: OrdinaryBashIntent = exact_file(
+        directory,
+        &ordinary_intent_name(&selection.child_request_id),
+    )?
+    .ok_or_else(|| io::Error::other("ordinary Bash command intent absent"))?;
+    Ok(intent.version == 1
+        && intent.child_request_id == selection.child_request_id
+        && intent.actor_pid == selection.binding.actor_pid
+        && intent.actor_starttime == selection.binding.actor_starttime
+        && intent.actor_pidns_dev == selection.binding.actor_pidns_dev
+        && intent.actor_pidns_ino == selection.binding.actor_pidns_ino
+        && selection.ordinary_command_sha256.as_deref() == Some(intent.command_sha256.as_str()))
 }
 
 pub(super) fn require_admitted_child_work_plan(
@@ -926,9 +1395,10 @@ fn require_captured_child_work_selection(
     let selection: ChildWorkSelection =
         exact_file(directory, &child_selection_name(&child.request_id))?
             .ok_or_else(|| io::Error::other("fresh Bash W child work selection absent"))?;
-    if selection.version != 1
-        || selection.role != "bash-child-private-fixed-v1"
-        || selection.child_request_id != child.request_id
+    if !matches!(
+        (selection.version, selection.role.as_str()),
+        (1, "bash-child-private-fixed-v1") | (2, "bash-child-ordinary-tree-v1")
+    ) || selection.child_request_id != child.request_id
         || selection.child_d_key != child.d_key
         || selection.child_receipt_sha256
             != format!("{:x}", Sha256::digest(serde_json::to_vec(child)?))
@@ -940,6 +1410,8 @@ fn require_captured_child_work_selection(
         || selection.configured_program != grant.configured_program
         || selection.broker_resolved_path != grant.broker_resolved_path
         || selection.image_descriptor != grant.image_descriptor
+        || (selection.version == 1 && selection.ordinary_command_sha256.is_some())
+        || (selection.version == 2 && !ordinary_selection_digest_matches(directory, &selection)?)
     {
         return Err(io::Error::other(
             "fresh Bash W child selection or consumed K changed",
@@ -2938,9 +3410,14 @@ fn run_init(mut init: Init) -> io::Result<()> {
         .collect::<Vec<_>>();
     let mut command = Command::new(image);
     command.env_clear();
-    init.plan.input.seek(SeekFrom::Start(0))?;
+    let stdin = if init.plan.stdin_dev_null {
+        File::open("/dev/null")?
+    } else {
+        init.plan.input.seek(SeekFrom::Start(0))?;
+        init.plan.input.try_clone()?
+    };
     command
-        .stdin(Stdio::from(init.plan.input.try_clone()?))
+        .stdin(Stdio::from(stdin))
         .stdout(Stdio::from(init.stdout.try_clone()?))
         .stderr(Stdio::from(init.stderr.try_clone()?));
     let control_fd = init.control.as_raw_fd();

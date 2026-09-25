@@ -1082,7 +1082,9 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
                 std::env::var("AGE319_PRIVATE_BASH_EFFECT_MARKER")
                     .map_err(|_| "private Bash marker absent")?,
             ]);
-            if std::env::var_os("AGE319_PRIVATE_BASH_SOURCE_SUCCESS_V1").is_some() {
+            if let Some(mode) = std::env::var_os("AGE319_PRIVATE_BASH_ORDINARY_MODE_V1") {
+                plan.plan.argv.push(mode.to_string_lossy().into_owned());
+            } else if std::env::var_os("AGE319_PRIVATE_BASH_SOURCE_SUCCESS_V1").is_some() {
                 plan.plan.argv.push("no-cancel".into());
             } else if std::env::var_os("AGE319_PRIVATE_BASH_ORIGINAL_NOTIFY_V1").is_some() {
                 plan.plan.argv.push("notify".into());

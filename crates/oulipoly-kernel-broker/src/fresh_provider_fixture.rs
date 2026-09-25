@@ -79,22 +79,292 @@ fn causal_bash(args: &[String]) -> std::io::Result<()> {
                 }
             }
         }
-        if unsafe { libc::unshare(libc::CLONE_NEWPID) } != 0 {
+        if !args
+            .get(5)
+            .is_some_and(|option| option.starts_with("ordinary-"))
+            && unsafe { libc::unshare(libc::CLONE_NEWPID) } != 0
+        {
             return Err(std::io::Error::last_os_error());
         }
-        let output = std::fs::File::create(gate.join("bash-causal-output"))?;
-        let error = std::fs::File::create(gate.join("bash-causal-error"))?;
-        let child = Command::new(&args[1])
-            .arg("__age319-private-admit-child-v1")
-            .args([&args[2], &args[3], &args[4]])
-            .args(args.get(5))
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(output))
-            .stderr(Stdio::from(error))
-            .spawn()?;
-        std::fs::write(gate.join("causal-bash-pid"), child.id().to_string())?;
+        if args
+            .get(5)
+            .is_some_and(|option| option.starts_with("ordinary-"))
+        {
+            if args[5] == "ordinary-refuse" {
+                use std::os::unix::fs::PermissionsExt;
+                let refused_shebang = gate.join("ordinary-refused-shebang");
+                std::fs::write(&refused_shebang, "#!/bin/sh\nprintf effect > \"$1\"\n")?;
+                std::fs::set_permissions(&refused_shebang, std::fs::Permissions::from_mode(0o755))?;
+                let malformed_elf = gate.join("ordinary-malformed-elf");
+                std::fs::write(&malformed_elf, b"\x7fELFbroken")?;
+                std::fs::set_permissions(&malformed_elf, std::fs::Permissions::from_mode(0o755))?;
+                let missing_interp = gate.join("ordinary-missing-interp");
+                let mut elf = vec![0u8; 256];
+                elf[..4].copy_from_slice(b"\x7fELF");
+                elf[4] = 2;
+                elf[5] = 1;
+                elf[6] = 1;
+                elf[16..18].copy_from_slice(&2u16.to_le_bytes());
+                elf[18..20].copy_from_slice(&62u16.to_le_bytes());
+                elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+                elf[32..40].copy_from_slice(&64u64.to_le_bytes());
+                elf[52..54].copy_from_slice(&64u16.to_le_bytes());
+                elf[54..56].copy_from_slice(&56u16.to_le_bytes());
+                elf[56..58].copy_from_slice(&2u16.to_le_bytes());
+                elf[64..68].copy_from_slice(&1u32.to_le_bytes());
+                elf[68..72].copy_from_slice(&5u32.to_le_bytes());
+                elf[96..104].copy_from_slice(&256u64.to_le_bytes());
+                elf[104..112].copy_from_slice(&256u64.to_le_bytes());
+                elf[120..124].copy_from_slice(&3u32.to_le_bytes());
+                elf[128..136].copy_from_slice(&200u64.to_le_bytes());
+                let missing_loader = b"/no/such/age319-elf-loader\0";
+                elf[152..160].copy_from_slice(&(missing_loader.len() as u64).to_le_bytes());
+                elf[200..200 + missing_loader.len()].copy_from_slice(missing_loader);
+                std::fs::write(&missing_interp, elf)?;
+                std::fs::set_permissions(&missing_interp, std::fs::Permissions::from_mode(0o755))?;
+                let mut statuses = Vec::new();
+                for case in [
+                    "root",
+                    "ready",
+                    "cancel",
+                    "env-drift",
+                    "cwd-drift",
+                    "argv-before-c",
+                    "argv-after-c",
+                    "shebang",
+                    "malformed-elf",
+                    "missing-interp",
+                ] {
+                    let mut command = Command::new(&args[1]);
+                    command.args(["run", "--delivery", "sync"]);
+                    match case {
+                        "root" => {
+                            command.args(["--completion-scope", "root"]);
+                        }
+                        "ready" => {
+                            command.args(["--ready-sentinel", "READY"]);
+                        }
+                        "cancel" => {
+                            command
+                                .args(["--cancel-on-owner-exit", "--owner-pid"])
+                                .arg(std::process::id().to_string());
+                        }
+                        _ => {}
+                    }
+                    if matches!(case, "shebang" | "malformed-elf" | "missing-interp") {
+                        let image = match case {
+                            "shebang" => &refused_shebang,
+                            "malformed-elf" => &malformed_elf,
+                            _ => &missing_interp,
+                        };
+                        command.arg("--").arg(image);
+                    } else {
+                        command.args(["--", "sh", "-c", "printf effect > \"$1\"", "sh"]);
+                    }
+                    let status = command
+                        .arg(gate.join("ordinary-refused-effect"))
+                        .env_clear()
+                        .env("PATH", "/usr/bin:/bin")
+                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &args[2])
+                        .env("AGE319_ORDINARY_EFFECTIVE_ENV", "original-value")
+                        .envs(
+                            (case == "env-drift")
+                                .then_some(("AGE319_PRIVATE_ORDINARY_MUTATE_ENV_AFTER_C_V1", "1")),
+                        )
+                        .envs(
+                            (case == "cwd-drift")
+                                .then_some(("AGE319_PRIVATE_ORDINARY_MUTATE_CWD_AFTER_C_V1", "1")),
+                        )
+                        .envs(
+                            (case == "argv-before-c").then_some((
+                                "AGE319_PRIVATE_ORDINARY_MUTATE_ARGV_BEFORE_C_V1",
+                                "1",
+                            )),
+                        )
+                        .envs(
+                            (case == "argv-after-c")
+                                .then_some(("AGE319_PRIVATE_ORDINARY_MUTATE_ARGV_AFTER_C_V1", "1")),
+                        )
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::from(std::fs::File::create(
+                            gate.join(format!("ordinary-{case}-output")),
+                        )?))
+                        .stderr(Stdio::from(std::fs::File::create(
+                            gate.join(format!("ordinary-{case}-error")),
+                        )?))
+                        .status()?;
+                    statuses.push((case, status.code().unwrap_or(70)));
+                }
+                std::fs::write(
+                    gate.join("ordinary-refuse-statuses"),
+                    serde_json::to_vec(&statuses)?,
+                )?;
+            } else {
+                let mode = if args[5] == "ordinary-async" || args[5] == "ordinary-restart" {
+                    "async"
+                } else {
+                    "sync"
+                };
+                let delay = if args[5] == "ordinary-restart" || args[5] == "ordinary-cancel" {
+                    "2"
+                } else {
+                    "0.3"
+                };
+                let ending = if args[5] == "ordinary-failure" {
+                    "exit 37"
+                } else {
+                    ":"
+                };
+                let script = format!(
+                    "test -c /dev/stdin || exit 90; test \"$AGE319_ORDINARY_EFFECTIVE_ENV\" = original-value || exit 91; printf '\\001\\377ordinary\\000'; printf 'err\\000\\376' >&2; printf effect > \"$1\"; (sleep {delay}; printf background > \"$2\") & {ending}"
+                );
+                let image = gate.join("ordinary-elf-image");
+                if args[5] == "ordinary-elf" {
+                    use std::os::unix::ffi::OsStrExt;
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::copy("/bin/sh", &image)?;
+                    std::fs::set_permissions(&image, std::fs::Permissions::from_mode(0o755))?;
+                    let path = std::ffi::CString::new(image.as_os_str().as_bytes())?;
+                    let name = c"user.age319-ordinary";
+                    let value = b"original-xattr";
+                    if unsafe {
+                        libc::setxattr(
+                            path.as_ptr(),
+                            name.as_ptr(),
+                            value.as_ptr().cast(),
+                            value.len(),
+                            0,
+                        )
+                    } != 0
+                    {
+                        return Err(std::io::Error::last_os_error().into());
+                    }
+                }
+                let mut command = Command::new(&args[1]);
+                command.args(["run", "--delivery", mode, "--"]);
+                if args[5] == "ordinary-elf" {
+                    command.arg(&image).args(["-c", script.as_str(), "sh"]);
+                } else {
+                    command.args(["sh", "-c", script.as_str(), "sh"]);
+                }
+                let mut child = command
+                    .arg(gate.join("ordinary-effect"))
+                    .arg(gate.join("ordinary-background"))
+                    .arg("")
+                    .env_clear()
+                    .env("PATH", "/usr/bin:/bin")
+                    .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &args[2])
+                    .env("AGE319_ORDINARY_EFFECTIVE_ENV", "original-value")
+                    .env(
+                        "AGE319_ORDINARY_SECRET_SENTINEL",
+                        "age319-secret-must-stay-in-memfd-319",
+                    )
+                    .envs(
+                        (args[5] == "ordinary-loss")
+                            .then_some(("AGE319_PRIVATE_ORDINARY_DROP_C_REPLY_V1", "1")),
+                    )
+                    .envs(
+                        (args[5] == "ordinary-loss")
+                            .then_some(("AGE319_PRIVATE_ORDINARY_DROP_K_REPLY_V1", "1")),
+                    )
+                    .envs(
+                        (args[5] == "ordinary-loss")
+                            .then_some(("AGE319_PRIVATE_ORDINARY_DROP_Q_REPLY_V1", "1")),
+                    )
+                    .envs(
+                        (args[5] == "ordinary-loss")
+                            .then_some(("AGE319_PRIVATE_ORDINARY_DROP_W_REPLY_V1", "1")),
+                    )
+                    .envs(
+                        (args[5] == "ordinary-cancel")
+                            .then_some(("AGE319_PRIVATE_ORDINARY_CANCEL_AFTER_K_V1", "1")),
+                    )
+                    .envs((args[5] == "ordinary-parent-tamper").then_some((
+                        "AGE319_PRIVATE_ORDINARY_PAUSE_AFTER_C_DIR_V1",
+                        gate.as_os_str(),
+                    )))
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::from(std::fs::File::create(
+                        gate.join("bash-causal-output"),
+                    )?))
+                    .stderr(Stdio::from(std::fs::File::create(
+                        gate.join("bash-causal-error"),
+                    )?))
+                    .spawn()?;
+                std::fs::write(gate.join("causal-bash-pid"), child.id().to_string())?;
+                let status = child.wait()?;
+                std::fs::write(
+                    gate.join("ordinary-bash-status"),
+                    status.code().unwrap_or(70).to_string(),
+                )?;
+                if args[5] == "ordinary-copy" && status.success() {
+                    let report: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(gate.join("bash-causal-output"))?)?;
+                    let copied = report["request_id"].as_str().ok_or_else(|| {
+                        std::io::Error::other("ordinary copied request id absent")
+                    })?;
+                    let sibling = Command::new(&args[1])
+                        .args(["__age319-private-probe-sibling-read-v1", &args[2], copied])
+                        .env_clear()
+                        .env("PATH", "/usr/bin:/bin")
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::from(std::fs::File::create(
+                            gate.join("ordinary-sibling-error"),
+                        )?))
+                        .status()?;
+                    std::fs::write(
+                        gate.join("ordinary-sibling-status"),
+                        sibling.code().unwrap_or(70).to_string(),
+                    )?;
+                    let status = Command::new(&args[1])
+                        .args([
+                            "run",
+                            "--delivery",
+                            "sync",
+                            "--",
+                            "sh",
+                            "-c",
+                            script.as_str(),
+                            "sh",
+                        ])
+                        .arg(gate.join("ordinary-effect"))
+                        .arg(gate.join("ordinary-background"))
+                        .arg("")
+                        .env_clear()
+                        .env("PATH", "/usr/bin:/bin")
+                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &args[2])
+                        .env("AGE319_ORDINARY_EFFECTIVE_ENV", "original-value")
+                        .env("AGE319_PRIVATE_ORDINARY_COPIED_REQUEST_ID_V1", copied)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::from(std::fs::File::create(
+                            gate.join("ordinary-copy-output"),
+                        )?))
+                        .stderr(Stdio::from(std::fs::File::create(
+                            gate.join("ordinary-copy-error"),
+                        )?))
+                        .status()?;
+                    std::fs::write(
+                        gate.join("ordinary-copy-status"),
+                        status.code().unwrap_or(70).to_string(),
+                    )?;
+                }
+            }
+        } else {
+            let output = std::fs::File::create(gate.join("bash-causal-output"))?;
+            let error = std::fs::File::create(gate.join("bash-causal-error"))?;
+            let child = Command::new(&args[1])
+                .arg("__age319-private-admit-child-v1")
+                .args([&args[2], &args[3], &args[4]])
+                .args(args.get(5))
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(output))
+                .stderr(Stdio::from(error))
+                .spawn()?;
+            std::fs::write(gate.join("causal-bash-pid"), child.id().to_string())?;
+        }
         Ok(())
     })();
     let code = match outcome {

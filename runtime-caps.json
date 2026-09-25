@@ -477,6 +477,25 @@
       }
     },
     {
+      "id": "kernel-broker.linux-main.ordinary-bash-completion-poll-interval",
+      "owner": "kernel-broker/linux_main",
+      "class": "polling_cadence",
+      "protected_resource": "pending ordinary Bash physical Q settlement",
+      "exhaustion_behavior": "The broker revisits pending grants every 100 milliseconds without expiring or relaunching work.",
+      "observability": "The consumed grant and Q/W/F artifacts retain the exact pending or settled outcome.",
+      "configurability": "Fixed private source declaration; no runtime override.",
+      "rationale": "Bounds completion repair wake frequency without imposing a work timeout.",
+      "default_value": "std :: time :: Duration :: from_millis (100)",
+      "source": "crates/oulipoly-kernel-broker/src/linux_main.rs",
+      "symbol": "ORDINARY_BASH_COMPLETION_POLL_INTERVAL",
+      "declaration_scope": "module::cfg:feature=\"age319-private-broker-fixture\"",
+      "controlling_use": {
+        "source": "crates/oulipoly-kernel-broker/src/linux_main.rs",
+        "scope": "module::fn:ordinary_bash_completion_worker",
+        "kind": "direct_control"
+      }
+    },
+    {
       "id": "kernel-broker.linux-main.released-handoff-reply-capacity",
       "owner": "kernel-broker/linux_main",
       "class": "resource_guard",
