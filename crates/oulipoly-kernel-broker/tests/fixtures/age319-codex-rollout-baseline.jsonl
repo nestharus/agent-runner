@@ -1,0 +1,2 @@
+{"type":"session_meta","payload":{"id":"age319-synthetic-session","cwd":"/synthetic"}}
+{"timestamp":"2026-09-25T12:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"[Oulipoly native F v1]\nnonce: f05e0000-0000-4000-8000-000000000319\nsource: synthetic-source-319\nsession: age319-synthetic-session\nrow: 7\npayload-sha256: ea77d7f3b40e5422286396d3f638bbffe9a85dc4d4d38ebedbc1261fb87c5bf7\npayload-base64: c3ludGhldGljIGNyZWRlbnRpYWwtZnJlZSBGIHBheWxvYWQ=\n[/Oulipoly native F v1]"}]}}

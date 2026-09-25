@@ -13,6 +13,60 @@ This source is not a deployable AGE-319 restoration.
 
 ## Private fresh provider execution
 
+The private `^` request is a nonactivating interactive PTY handoff substrate.
+Its private client accepts read/write master and slave descriptors with the
+original released Runner's D key, session, selected account, plan digest and
+control socket path. The broker connects to that socket, requires a matching
+kernel peer PID and per-message responder credentials, challenges the live
+server, requires it to return its still-open PTY master via `SCM_RIGHTS`,
+checks that descriptor against the offered master, and records its socket inode.
+The broker compares them with the released root and the separate interactive broker plan selection,
+uses `TIOCGPTN` and `TIOCGPTPEER` to verify the real PTY pair, and creates an
+exact `pre-k-nonactivating` artifact. Repeating the same pair is readback;
+presenting another pair or any request after a provider K grant refuses. The
+original Runner's private call site creates the pair after h/f selection and
+keeps its master and control listener through a successful current headless
+provider Q readback; an uncertain K/Q fails without an interactive claim. A
+later exact challenge, including after broker restart, must find that
+same live root. The artifact does not hold a descriptor or socket connection
+across restart and is never consumed by K, Q, runtime generation registration
+or F. Its stored stamps alone cannot certify PTY liveness.
+
+The private `{` admission request is a second, still nonactivating check from
+that same original root. It carries the selected interactive image, cwd,
+sealed input and recipe, pinned config directory, and live master/slave pair.
+The broker rechallenges the control server, rechecks role/account/plan and
+source bytes, compares image mount/inode and cwd identity with the selected
+candidate, then creates exact `interactive-k-preparation.json` readback.
+Restart and exact resubmission preserve those bytes. A headless recipe is
+refused. This preparation is not an interactive K grant or child settlement.
+
+The runtime and original Runner register the interactive argv/env/cwd/image
+plan through private `(`/`)` candidate and selection operations. The broker
+pins each candidate to the same D, actor, source/config, account and index as
+the headless pool, independently checks its argv against the interactive args
+in that source, records a distinct one-use interactive decision, and `^`
+requires its exact role and digest. `h/f` and their provider K/Q remain headless.
+Private `}` rechallenges the original live root and its master/control pair,
+rechecks the selected image, argv/env/cwd and pinned config, then fsyncs a
+distinct one-use `interactive-k.json` before any child release. Its separate
+consumed grant gates a broker fork into the held root's PID namespace. The
+provider acquires the offered slave as its controlling terminal under the
+selected peer UID/GID/groups. The original root retains the master and control
+socket and is the sole PTY reader across broker restarts. After PTY EOF it
+supplies its complete transcript and held master to private `]`. The broker
+reattests the original D/actor/session, selected K/account/plan, attach and
+provider identity, control socket and master, physical wait/tree/PID1 drain,
+and PTY EOF before copying and hashing the transcript. An interrupted copy
+can resume only from a byte-for-byte matching prefix supplied by that same
+root; a changed prefix or lost root is unknown debt. Plain `]` reads the same
+K after a lost reply or broker restart and never resubmits K. A missing attach
+or output closure stays unknown debt. After these checks, `]` creates or checks exact `interactive-q.json`
+with the K, observed PID/boot/starttime/PID namespace, wait and output facts.
+The ordinary runtime generation registrar accepts only a local direct child;
+it cannot register the broker-forked provider. This private physical K/Q does
+not create a resident generation or native F authority.
+
 The closed private route assembles the configured first command, arguments,
 environment, cwd and stdin through the normal runtime launch path. A bare
 first command is resolved against that child's effective `PATH` for each

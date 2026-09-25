@@ -60,6 +60,87 @@ fn physical_entry_exists(directory: &Path, name: &str) -> Result<bool, String> {
     }
 }
 
+#[derive(serde::Deserialize, PartialEq, Eq)]
+struct InteractiveParentSelection {
+    role: String,
+    model: String,
+    config_sha256: String,
+    account: String,
+    index: usize,
+    plan_sha256: String,
+}
+
+#[derive(serde::Deserialize)]
+struct InteractiveParentHandoff {
+    binding: serde_json::Value,
+    selection: InteractiveParentSelection,
+}
+
+#[derive(serde::Deserialize)]
+struct InteractiveParentPreparation {
+    handoff: InteractiveParentHandoff,
+    configured_program: String,
+    broker_resolved_path: String,
+    image_descriptor: serde_json::Value,
+}
+
+#[derive(serde::Deserialize)]
+struct InteractiveParentK {
+    version: u32,
+    state: String,
+    preparation: InteractiveParentPreparation,
+    grant: serde_json::Value,
+}
+
+#[derive(serde::Deserialize)]
+struct InteractiveParentDecision {
+    version: u32,
+    role: String,
+    binding: serde_json::Value,
+    selection: InteractiveParentSelection,
+}
+
+fn physical_parent_for_bash(
+    directory: &Path,
+    child: &FreshBashChild,
+) -> Result<(serde_json::Value, bool), String> {
+    let handoff = &child.root_handoff_id;
+    let headless_name = format!("{handoff}.fresh-grant.json");
+    let interactive_name = format!("{handoff}.interactive-k.json");
+    match (
+        physical_entry_exists(directory, &headless_name)?,
+        physical_entry_exists(directory, &interactive_name)?,
+    ) {
+        (true, true) => Err("ambiguous causal parent K".into()),
+        (true, false) => Ok((physical_json(directory, &headless_name)?, false)),
+        (false, false) => Err("causal parent K absent".into()),
+        (false, true) => {
+            let k: InteractiveParentK = serde_json::from_value(physical_json(directory, &interactive_name)?)
+                .map_err(|e| format!("interactive parent K: {e}"))?;
+            let decision: InteractiveParentDecision = serde_json::from_value(physical_json(
+                directory, &format!("{handoff}.interactive-route-selection.json"),
+            )?).map_err(|e| format!("interactive parent selection: {e}"))?;
+            let grant = &k.grant;
+            if k.version != 1 || k.state != "consumed-before-child-release"
+                || decision.version != 1 || decision.role != "interactive"
+                || k.preparation.handoff.selection != decision.selection
+                || decision.selection.role != "interactive"
+                || decision.binding != grant["binding"]
+                || k.preparation.handoff.binding != grant["binding"]
+                || grant["version"] != 3
+                || grant["binding"]["causal_parent"] != serde_json::Value::Null
+                || grant["plan_sha256"] != decision.selection.plan_sha256
+                || grant["configured_program"] != k.preparation.configured_program
+                || grant["broker_resolved_path"] != k.preparation.broker_resolved_path
+                || grant["image_descriptor"] != k.preparation.image_descriptor
+            {
+                return Err("interactive parent K or selected plan changed".into());
+            }
+            Ok((grant.clone(), true))
+        }
+    }
+}
+
 fn fresh_bash_source_schema_count(state: &Connection) -> Result<i64, String> {
     state.query_row(
         "SELECT count(*) FROM sqlite_master WHERE
@@ -250,10 +331,7 @@ impl FreshV30Lane {
             &directory,
             &format!("{}.pid1-wait.json", event.physical_grant_id),
         )?;
-        let parent_grant = physical_json(
-            &directory,
-            &format!("{}.fresh-grant.json", child.root_handoff_id),
-        )?;
+        let (parent_grant, interactive_parent) = physical_parent_for_bash(&directory, &child)?;
         let parent_consumed = physical_json(
             &directory,
             &format!("{}.consumed.json", child.parent_work_grant_id),
@@ -262,6 +340,40 @@ impl FreshV30Lane {
             &directory,
             &format!("{}.attach.json", child.parent_work_grant_id),
         )?;
+        if interactive_parent {
+            let identity = physical_json(
+                &directory,
+                &format!("{}.interactive-identity.json", child.parent_work_grant_id),
+            )?;
+            let pid = identity["provider_host_pid"].as_i64()
+                .ok_or("interactive parent provider PID absent")?;
+            let prior: Option<String> = self.state_connection(OpenFlags::SQLITE_OPEN_READ_ONLY)?
+                .query_row("SELECT receipt_json FROM fresh_bash_selected_event WHERE request_id=?1",
+                    [&event.request_id], |row| row.get(0)).optional().map_err(|e| e.to_string())?;
+            let receipt = serde_json::to_string(event).map_err(|e| e.to_string())?;
+            if prior.as_ref().is_some_and(|stored| stored != &receipt) {
+                return Err("interactive parent W replay changed".into());
+            }
+            let live = crate::pid_identity::read_live_process_identity(pid)?;
+            if prior.is_none() && live.is_none() {
+                return Err("interactive parent provider no longer live at W".into());
+            }
+            if identity["grant_id"] != child.parent_work_grant_id
+                || identity["work_id"] != child.parent_work_id
+                || identity["provider_host_pid"] != parent_attach["provider_pid"]
+                || identity["provider_local_pid"] != parent_attach["provider_local_pid"]
+                || identity["provider_starttime_ticks"] != parent_attach["provider_starttime"]
+                || (prior.is_none() && live.as_ref().is_some_and(|process| identity["provider_boot_id"] != process.os_boot_id
+                    || identity["provider_starttime_ticks"] != process.os_pid_starttime_ticks)
+                )
+                || identity["pid1_host_pid"] != parent_attach["pid1"]
+                || identity["pid1_starttime_ticks"] != parent_attach["pid1_starttime"]
+                || identity["provider_pidns_dev"] != parent_attach["pidns_dev"]
+                || identity["provider_pidns_ino"] != parent_attach["pidns_ino"]
+            {
+                return Err("interactive parent provider identity changed at W".into());
+            }
+        }
         let b = &grant["binding"];
         let q = &event.physical_grant_id;
         let w = &event.physical_work_id;
@@ -270,6 +382,11 @@ impl FreshV30Lane {
             || parent_grant["binding"]["root_id"] != child.root_id
             || parent_grant["binding"]["handoff_id"] != child.root_handoff_id
             || parent_grant["binding"]["invocation_uuid"] != child.parent_invocation_uuid
+            || parent_grant["binding"]["session_id"] != self.read_session(&root.d_key)?
+                .ok_or("root D absent at W")?.session_id
+            || parent_grant["binding"]["actor_pid"] != root.old_release.prepared.joined_child.host_pid
+            || parent_grant["binding"]["actor_starttime"] != root.old_release.prepared.joined_child.starttime_ticks
+            || parent_grant["binding"]["actor_boot_id"] != root.old_release.prepared.joined_child.boot_id
             || parent_attach["grant_id"] != child.parent_work_grant_id
             || parent_attach["work_id"] != child.parent_work_id
             || grant != consumed

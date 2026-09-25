@@ -335,6 +335,26 @@ pub struct FreshRouteSelection {
     pub quota_remaining_basis_points: Option<u32>,
 }
 
+#[cfg(feature = "age319-private-broker-fixture")]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FreshPlanRole {
+    Headless,
+    Interactive,
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FreshInteractivePlanSelection {
+    pub role: FreshPlanRole,
+    pub model: String,
+    pub config_sha256: String,
+    pub account: String,
+    pub index: usize,
+    pub plan_sha256: String,
+}
+
 /// Begin is one-use. If its reply is lost, observe reports `Started`, which
 /// is unknown work and must never authorize a second begin.
 pub fn begin_fresh_root_effect_at(
@@ -452,6 +472,185 @@ pub fn private_fresh_provider_at(
     Ok(answer)
 }
 
+/// A pre-K PTY handoff assertion. This does not launch a provider, create a
+/// runtime generation, or authorize native F. Both descriptors must come in
+/// the challenged request from the original released Runner process.
+#[cfg(feature = "age319-private-broker-fixture")]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrivateFreshPtyHandoff {
+    pub d_key: String,
+    pub session_id: String,
+    pub role: FreshPlanRole,
+    pub account: String,
+    pub plan_sha256: String,
+    /// Live socket bound and served by the original released Runner process.
+    pub control_path: std::path::PathBuf,
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+pub fn private_fresh_pty_handoff_at(
+    path: &Path,
+    request: &PrivateFreshPtyHandoff,
+    master: RawFd,
+    slave: RawFd,
+) -> io::Result<()> {
+    private_fresh_pty_request_at(path, request, b'#', &[master, slave]).map(|_| ())
+}
+
+/// Exact admission recheck for the selected interactive plan and live pair.
+/// A successful reply is still pre-K and grants no launch or Q authority.
+#[cfg(feature = "age319-private-broker-fixture")]
+pub fn private_fresh_interactive_k_preparation_at(
+    path: &Path,
+    request: &PrivateFreshPtyHandoff,
+    descriptors: [RawFd; 7],
+) -> io::Result<()> {
+    private_fresh_pty_request_at(path, request, b'{', &descriptors).map(|_| ())
+}
+
+/// This is the one-use physical K. An uncertain reply must be followed only
+/// by `private_fresh_interactive_q_at`, never another submission.
+#[cfg(feature = "age319-private-broker-fixture")]
+pub fn private_fresh_interactive_k_at(
+    path: &Path,
+    request: &PrivateFreshPtyHandoff,
+    descriptors: [RawFd; 8],
+) -> io::Result<String> {
+    private_fresh_pty_request_at(path, request, b'}', &descriptors)
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+pub fn private_fresh_interactive_q_at(
+    path: &Path,
+    request: &PrivateFreshPtyHandoff,
+) -> io::Result<String> {
+    private_fresh_pty_request_at(path, request, b']', &[])
+}
+
+/// Present the original root's completed PTY transcript and held master.
+/// The broker may publish Q only after its independent physical wait/drain
+/// checks and an EOF challenge of this exact master.
+#[cfg(feature = "age319-private-broker-fixture")]
+pub fn private_fresh_interactive_finalize_at(
+    path: &Path,
+    request: &PrivateFreshPtyHandoff,
+    master: RawFd,
+    transcript: RawFd,
+) -> io::Result<String> {
+    private_fresh_pty_request_at(path, request, b']', &[master, transcript])
+}
+
+/// Read the broker-attested running K and register/read its one fresh-sidecar
+/// generation while the original root still holds the PTY master. This does
+/// not request Q or authorize any provider input.
+#[cfg(feature = "age319-private-broker-fixture")]
+pub fn private_fresh_interactive_resident_at(
+    path: &Path,
+    request: &PrivateFreshPtyHandoff,
+    master: RawFd,
+) -> io::Result<serde_json::Value> {
+    let reply = private_fresh_pty_request_at(path, request, b'~', &[master])?;
+    let value = reply
+        .strip_prefix("fresh-interactive-resident ")
+        .and_then(|v| v.strip_suffix('\n'))
+        .ok_or_else(|| io::Error::other("interactive resident readback invalid"))?;
+    serde_json::from_str(value).map_err(io::Error::other)
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+pub fn private_fresh_interactive_resident_readback_at(
+    path: &Path,
+    request: &PrivateFreshPtyHandoff,
+    master: RawFd,
+) -> io::Result<serde_json::Value> {
+    let reply = private_fresh_pty_request_at(path, request, b'?', &[master])?;
+    let value = reply
+        .strip_prefix("fresh-interactive-resident ")
+        .and_then(|v| v.strip_suffix('\n'))
+        .ok_or_else(|| io::Error::other("interactive resident challenged readback invalid"))?;
+    serde_json::from_str(value).map_err(io::Error::other)
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_fresh_pty_request_at(
+    path: &Path,
+    request: &PrivateFreshPtyHandoff,
+    operation: u8,
+    descriptors: &[RawFd],
+) -> io::Result<String> {
+    let id = uuid::Uuid::parse_str(&request.d_key)
+        .map_err(|_| io::Error::other("invalid PTY handoff D key"))?;
+    if id.is_nil() || id.to_string() != request.d_key {
+        return Err(io::Error::other("noncanonical PTY handoff D key"));
+    }
+    let body = serde_json::to_vec(request)?;
+    if body.len() > 2048 {
+        return Err(io::Error::other("PTY handoff request too large"));
+    }
+    let mut stream = checked_connection(path)?;
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let mut frame = Vec::with_capacity(17 + body.len());
+    frame.push(operation);
+    frame.extend_from_slice(&challenge);
+    frame.extend_from_slice(&body);
+    let mut iov = libc::iovec {
+        iov_base: frame.as_mut_ptr().cast(),
+        iov_len: frame.len(),
+    };
+    let mut control = [0u8; 64];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    if !descriptors.is_empty() {
+        msg.msg_control = control.as_mut_ptr().cast();
+        msg.msg_controllen =
+            unsafe { libc::CMSG_SPACE(std::mem::size_of_val(descriptors) as _) } as usize;
+    }
+    if !descriptors.is_empty() {
+        unsafe {
+            let header = libc::CMSG_FIRSTHDR(&msg);
+            (*header).cmsg_level = libc::SOL_SOCKET;
+            (*header).cmsg_type = libc::SCM_RIGHTS;
+            (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(descriptors) as _) as usize;
+            std::ptr::copy_nonoverlapping(
+                descriptors.as_ptr(),
+                libc::CMSG_DATA(header).cast(),
+                descriptors.len(),
+            );
+        }
+    }
+    if unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) }
+        != frame.len() as isize
+    {
+        return Err(io::Error::other("PTY handoff submission uncertain"));
+    }
+    let response = if matches!(operation, b'~' | b'?') {
+        let mut response = Vec::new();
+        stream.take(16 * 1024 + 1).read_to_end(&mut response)?;
+        if response.len() > 16 * 1024 || !response.ends_with(b"\n") {
+            return Err(io::Error::other("interactive resident response incomplete"));
+        }
+        String::from_utf8(response)
+            .map_err(|_| io::Error::other("interactive resident response encoding"))?
+    } else {
+        read_response(stream)?
+    };
+    let expected = match operation {
+        b'#' => Some("fresh-pty-handoff-pre-k\n"),
+        b'{' => Some("fresh-interactive-k-preparation-pre-k\n"),
+        _ => None,
+    };
+    if response.starts_with("error ") || expected.is_some_and(|expected| response != expected) {
+        return Err(io::Error::other(format!(
+            "PTY handoff refused: {}",
+            response.trim_end()
+        )));
+    }
+    Ok(response)
+}
+
 /// Register one sealed candidate plan, then durably select/read back the
 /// complete pool. The same D-bound broker socket authenticates every step.
 #[cfg(feature = "age319-private-broker-fixture")]
@@ -461,7 +660,25 @@ pub fn private_fresh_route_at(
     operation: u8,
     descriptors: &[RawFd],
 ) -> io::Result<Option<FreshRouteSelection>> {
-    if !matches!((operation, descriptors.len()), (b'h', 5) | (b'f', 1)) {
+    if !matches!(operation, b'h' | b'f') {
+        return Err(io::Error::other("invalid headless route operation"));
+    }
+    private_fresh_route_raw_at(path, request, operation, descriptors)?
+        .map(|raw| serde_json::from_str(&raw).map_err(io::Error::other))
+        .transpose()
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_fresh_route_raw_at(
+    path: &Path,
+    request: &FreshRouteRequest,
+    operation: u8,
+    descriptors: &[RawFd],
+) -> io::Result<Option<String>> {
+    if !matches!(
+        (operation, descriptors.len()),
+        (b'h' | b'(', 5) | (b'f' | b')', 1)
+    ) {
         return Err(io::Error::other("invalid fresh route operation"));
     }
     let id = uuid::Uuid::parse_str(&request.d_key)
@@ -530,7 +747,7 @@ pub fn private_fresh_route_at(
     if let Some(error) = answer.strip_prefix("error ") {
         return Err(io::Error::other(error.trim_end().to_owned()));
     }
-    if operation == b'h' {
+    if matches!(operation, b'h' | b'(') {
         if answer != "fresh-route-registered\n" {
             return Err(io::Error::other(
                 "fresh route registration response invalid",
@@ -541,7 +758,24 @@ pub fn private_fresh_route_at(
     let value = answer
         .strip_prefix("fresh-route-selected ")
         .ok_or_else(|| io::Error::other("fresh route selection response invalid"))?;
-    Ok(Some(serde_json::from_str(value.trim_end())?))
+    Ok(Some(value.trim_end().to_owned()))
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+pub fn private_fresh_interactive_route_at(
+    path: &Path,
+    request: &FreshRouteRequest,
+    operation: u8,
+    descriptors: &[RawFd],
+) -> io::Result<Option<FreshInteractivePlanSelection>> {
+    if !matches!(operation, b'(' | b')') {
+        return Err(io::Error::other("invalid interactive route operation"));
+    }
+    // Keep one challenged wire implementation; the typed response is parsed
+    // below using the same frame and descriptor rules as h/f.
+    private_fresh_route_raw_at(path, request, operation, descriptors)?
+        .map(|raw| serde_json::from_str(&raw).map_err(io::Error::other))
+        .transpose()
 }
 
 /// Begin a single D/account/kind-bound broker effect or read back that exact
@@ -704,6 +938,93 @@ pub fn private_fresh_provider_output_at(
             .map_err(|_| io::Error::other("cancel flag invalid"))?,
         stdout: files.remove(0),
         stderr: files.remove(0),
+    })
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+pub struct PrivateFreshInteractiveOutput {
+    pub grant_id: String,
+    pub wait_status: i32,
+    pub output: std::fs::File,
+    pub bytes: u64,
+    pub sha256: String,
+}
+
+/// Transfer the Q-verified PTY transcript by descriptor to the original root.
+#[cfg(feature = "age319-private-broker-fixture")]
+pub fn private_fresh_interactive_output_at(
+    path: &Path,
+    request: &PrivateFreshPtyHandoff,
+) -> io::Result<PrivateFreshInteractiveOutput> {
+    let id = uuid::Uuid::parse_str(&request.d_key)
+        .map_err(|_| io::Error::other("invalid interactive D key"))?;
+    if id.is_nil() || id.to_string() != request.d_key {
+        return Err(io::Error::other("noncanonical interactive D key"));
+    }
+    let body = serde_json::to_vec(request)?;
+    let mut stream = checked_connection(path)?;
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let mut frame = Vec::with_capacity(17 + body.len());
+    frame.push(b'|');
+    frame.extend_from_slice(&challenge);
+    frame.extend_from_slice(&body);
+    stream.write_all(&frame)?;
+    let mut data = [0u8; 512];
+    let mut control = [0u8; 64];
+    let mut iov = libc::iovec {
+        iov_base: data.as_mut_ptr().cast(),
+        iov_len: data.len(),
+    };
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = control.len();
+    let count = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
+    if count <= 0 || msg.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 {
+        return Err(io::Error::other("interactive output reply incomplete"));
+    }
+    let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+    if cmsg.is_null()
+        || unsafe {
+            (*cmsg).cmsg_level != libc::SOL_SOCKET || (*cmsg).cmsg_type != libc::SCM_RIGHTS
+        }
+        || unsafe { (*cmsg).cmsg_len }
+            != unsafe { libc::CMSG_LEN(std::mem::size_of::<i32>() as _) } as usize
+        || !unsafe { libc::CMSG_NXTHDR(&msg, cmsg) }.is_null()
+    {
+        return Err(io::Error::other(
+            "interactive output descriptor absent or changed",
+        ));
+    }
+    let fd = unsafe { *(libc::CMSG_DATA(cmsg) as *const i32) };
+    let output = unsafe { std::fs::File::from_raw_fd(fd) };
+    let reply = std::str::from_utf8(&data[..count as usize])
+        .map_err(|_| io::Error::other("interactive output reply encoding"))?;
+    let fields: Vec<_> = reply.trim_end_matches('\n').split(' ').collect();
+    if fields.len() != 5 || fields[0] != "fresh-interactive-output" {
+        return Err(io::Error::other("interactive output Q reply invalid"));
+    }
+    let grant_id = uuid::Uuid::parse_str(fields[1])
+        .map_err(|_| io::Error::other("interactive output grant invalid"))?
+        .to_string();
+    if grant_id != fields[1]
+        || fields[4].len() != 64
+        || !fields[4].bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(io::Error::other("interactive output digest invalid"));
+    }
+    Ok(PrivateFreshInteractiveOutput {
+        grant_id,
+        wait_status: fields[2]
+            .parse()
+            .map_err(|_| io::Error::other("interactive wait invalid"))?,
+        bytes: fields[3]
+            .parse()
+            .map_err(|_| io::Error::other("interactive output length invalid"))?,
+        sha256: fields[4].into(),
+        output,
     })
 }
 
@@ -959,6 +1280,40 @@ pub enum FreshRecipientRequest {
     },
     Recover {
         delivery_request_id: String,
+    },
+    /// Private, authority-neutral pre-send record. A typed Tail read must
+    /// precede this call; no PTY write or ACK is implied.
+    PrepareNativeF {
+        preparation: oulipoly_state::mailbox::FreshNativeFPrepareRequest,
+    },
+    ReadNativeFPreparation {
+        preparation_request_id: String,
+    },
+    BeginNativeFSubmission {
+        preparation_request_id: String,
+    },
+    ReadNativeFSubmission {
+        preparation_request_id: String,
+    },
+    RecordNativeFTransport {
+        preparation_request_id: String,
+    },
+    ReadNativeFTransport {
+        preparation_request_id: String,
+    },
+    CertifyNativeFReceipt {
+        preparation_request_id: String,
+        observed: oulipoly_state::mailbox::FreshNativeFObservedTurn,
+    },
+    ReadNativeFReceipt {
+        preparation_request_id: String,
+    },
+    AcknowledgeNativeFReceipt {
+        preparation_request_id: String,
+        delivery_token: String,
+    },
+    ReadNativeFAutoAck {
+        preparation_request_id: String,
     },
     Acknowledge {
         grant_id: String,

@@ -901,6 +901,7 @@ mod tests {
             };
             let candidate = RouteCandidate {
                 version: 3,
+                role: FreshPlanRole::Headless,
                 binding: binding.clone(),
                 model: "work".into(),
                 config_sha256: pool.config_sha256.clone(),

@@ -337,6 +337,127 @@ pub fn prepare_fresh_headless(
     })
 }
 
+/// Build the ordinary interactive argv as a separate plan before any broker
+/// K. The prompt is deliberately absent: later input belongs on the PTY.
+/// This plan is never passed to the headless completion backend.
+pub fn expected_fresh_interactive_command(
+    model: &ModelConfig,
+    provider_index: usize,
+) -> Result<(String, Vec<String>), String> {
+    let provider = provider_for_index(model, provider_index)?;
+    let parts = super::shell_split(&provider.command);
+    let program = parts
+        .first()
+        .ok_or("fresh interactive command has no executable before K")?
+        .clone();
+    let mut args = provider
+        .interactive_args
+        .clone()
+        .ok_or("fresh interactive_args absent before K")?;
+    let mut no_prompt = None;
+    super::policy::apply_provider_policy(provider, &mut args, &mut no_prompt)?;
+    let mut argv = parts.into_iter().skip(1).collect::<Vec<_>>();
+    argv.extend(args);
+    Ok((program, argv))
+}
+
+pub fn prepare_fresh_interactive(
+    model: &ModelConfig,
+    provider_index: usize,
+    working_dir: &Path,
+) -> Result<FreshProviderPlan, String> {
+    let provider = provider_for_index(model, provider_index)?;
+    if !model.inputs.is_empty()
+        || model.provider.is_some()
+        || provider.resume.is_some()
+        || provider.session_capture.is_some()
+        || provider.resume_acceptance.is_some()
+        || provider.session_storage.is_some()
+        || provider.system_prompt_override.is_some()
+        || provider.tool_restrictions.is_some()
+        || !working_dir.is_absolute()
+        || provider
+            .environment
+            .keys()
+            .any(|key| forbidden_fresh_environment(key))
+    {
+        return Err("fresh interactive provider shape unsupported before K".into());
+    }
+    let parts = super::shell_split(&provider.command);
+    if parts.is_empty() {
+        return Err("fresh interactive command has no executable before K".into());
+    }
+    let mut args = provider
+        .interactive_args
+        .clone()
+        .ok_or("fresh interactive_args absent before K")?;
+    let mut no_prompt = None;
+    super::policy::apply_provider_policy(provider, &mut args, &mut no_prompt)?;
+    let mut cmd = super::launch::build_command(provider, &args, Some(working_dir), None, None)?;
+    for key in std::env::vars_os().map(|(key, _)| key) {
+        if key.to_str().is_some_and(forbidden_fresh_environment) {
+            cmd.env_remove(key);
+        }
+    }
+    if cmd.get_program() != parts[0].as_str() || cmd.get_current_dir() != Some(working_dir) {
+        return Err("fresh interactive command changed before K".into());
+    }
+    let mut environment = BTreeMap::<String, String>::new();
+    for (key, value) in std::env::vars_os() {
+        let key = key
+            .to_str()
+            .ok_or("fresh interactive inherited key is not UTF-8")?;
+        if forbidden_fresh_environment(key) {
+            continue;
+        }
+        environment.insert(
+            key.into(),
+            value
+                .to_str()
+                .ok_or("fresh interactive inherited value is not UTF-8")?
+                .into(),
+        );
+    }
+    for (key, value) in cmd.get_envs() {
+        let key = key
+            .to_str()
+            .ok_or("fresh interactive environment key is not UTF-8")?;
+        if let Some(value) = value {
+            environment.insert(
+                key.into(),
+                value
+                    .to_str()
+                    .ok_or("fresh interactive environment value is not UTF-8")?
+                    .into(),
+            );
+        } else {
+            environment.remove(key);
+        }
+    }
+    let argv = cmd
+        .get_args()
+        .map(|arg| {
+            arg.to_str()
+                .map(str::to_owned)
+                .ok_or("fresh interactive argument is not UTF-8")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let (expected_program, expected_argv) =
+        expected_fresh_interactive_command(model, provider_index)?;
+    if parts[0] != expected_program || argv != expected_argv {
+        return Err("fresh interactive argv changed during preparation".into());
+    }
+    let executable = resolve_first_executable(&parts[0], working_dir, &environment)?;
+    Ok(FreshProviderPlan {
+        configured_program: parts[0].clone(),
+        executable,
+        cwd: working_dir.to_path_buf(),
+        argv,
+        environment: environment.into_iter().collect(),
+        stdin: Vec::new(),
+    })
+}
+
 /// Resolve each attempt using the assembled child's PATH and cwd. The broker
 /// then opens and pins the chosen mount/inode before one-use K.
 fn resolve_first_executable(
@@ -470,6 +591,38 @@ mod tests {
             providers: vec![ProviderConfig::new(command, vec!["--fixture".into()])],
             inputs: Vec::new(),
             provider: None,
+        }
+    }
+
+    #[test]
+    fn interactive_plan_uses_interactive_argv_and_pty_input_contract() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let old_data = std::env::var_os(oulipoly_state::paths::DATA_DIR_ENV);
+        unsafe { std::env::set_var(oulipoly_state::paths::DATA_DIR_ENV, data.path()) };
+        assert!(prepare_fresh_interactive(&model("/bin/true"), 0, data.path()).is_err());
+        fs::create_dir(data.path().join("models")).unwrap();
+        fs::write(
+            data.path().join("models/fixture.toml"),
+            "[[providers]]\nname = 'chosen'\n",
+        )
+        .unwrap();
+        fs::write(data.path().join("providers.toml"),
+            "[chosen]\ncommand = '/bin/true'\nargs = ['--headless']\ninteractive_args = ['--interactive']\n").unwrap();
+        let pool = load_fresh_headless_pool(data.path(), "fixture").unwrap();
+        let interactive = prepare_fresh_interactive(&pool.model, 0, data.path()).unwrap();
+        assert_eq!(
+            expected_fresh_interactive_command(&pool.model, 0).unwrap(),
+            ("/bin/true".into(), vec!["--interactive".into()])
+        );
+        let headless = prepare_fresh_headless(&pool.model, 0, "prompt", data.path()).unwrap();
+        assert_eq!(interactive.argv, ["--interactive"]);
+        assert!(interactive.stdin.is_empty());
+        assert_eq!(headless.plan.argv, ["--headless"]);
+        assert_eq!(headless.plan.stdin, b"prompt");
+        match old_data {
+            Some(value) => unsafe { std::env::set_var(oulipoly_state::paths::DATA_DIR_ENV, value) },
+            None => unsafe { std::env::remove_var(oulipoly_state::paths::DATA_DIR_ENV) },
         }
     }
 

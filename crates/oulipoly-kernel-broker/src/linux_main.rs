@@ -67,10 +67,10 @@ use oulipoly_kernel_broker::source_acceptance::capture_and_stage_v2_evidence;
 use oulipoly_kernel_broker::source_physical::{SourceObservation, SourcePhysicalRegistry};
 use oulipoly_kernel_broker::work_registry::{Scope, WorkRegistry, classify_scope};
 use oulipoly_state::mailbox::{
-    BrokerReleaseEvidence, BrokerSidecar, BrokerSourceEffectGrant, FreshBashListenerPolicy,
-    FreshDeliverySubmission, FreshRecipientIdentity, FreshReleasedHandoff,
-    FreshRootTerminalReadback, FreshV30Lane, FreshV30LaneIdentity, PreparedBrokerOwner,
-    PreparedProcessStamp,
+    BrokerReleaseEvidence, BrokerSidecar, BrokerSourceEffectGrant, ExactProcessEvidence,
+    FreshBashListenerPolicy, FreshDeliverySubmission, FreshNativeFPreparation,
+    FreshRecipientIdentity, FreshReleasedHandoff, FreshRootTerminalReadback, FreshV30Lane,
+    FreshV30LaneIdentity, PreparedBrokerOwner, PreparedProcessStamp, RuntimeGenerationRow,
 };
 #[cfg(feature = "age319-private-broker-fixture")]
 use sha2::{Digest, Sha256};
@@ -79,6 +79,7 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 #[cfg(feature = "age319-private-broker-fixture")]
 use std::io::{Read, Seek, SeekFrom};
+use std::os::fd::IntoRawFd;
 use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(feature = "age319-private-broker-fixture")]
 use std::os::unix::fs::OpenOptionsExt;
@@ -92,6 +93,202 @@ const SOCKET: &str = "/run/oulipoly-kernel-broker/control.sock";
 const STATE: &str = "/var/lib/oulipoly-kernel-broker";
 const FRESH_SOCKET: &str = "/run/oulipoly-kernel-broker/v30.sock";
 const RUNNER: &str = "/usr/local/libexec/oulipoly/oulipoly-agent-runner";
+
+fn verify_native_f_resident(
+    generation: &RuntimeGenerationRow,
+    path: &str,
+    device: u64,
+    inode: u64,
+    instance: &str,
+    settings: &str,
+    session: &str,
+) -> Result<(), String> {
+    let reply = oulipoly_runtime::executor::cli::pty_broker::query_pty_generation_identity(
+        Path::new(path),
+        device,
+        inode,
+    )?;
+    let (ExactProcessEvidence::Recorded(creator), ExactProcessEvidence::Recorded(provider)) = (
+        &generation.creator_process_evidence,
+        &generation.exact_process_evidence,
+    ) else {
+        return Err("native F exact resident process identity unavailable".into());
+    };
+    if reply.generation_id != generation.generation_id.to_string()
+        || reply.spawn_invocation_uuid != generation.spawn_invocation_uuid
+        || &reply.creator_process != creator
+        || &reply.provider_process != provider
+        || reply.provider_account != generation.provider_name
+        || reply.provider_instance_id != instance
+        || reply.settings_id != settings
+        || reply.provider_session_id != session
+        || generation.session_id.as_deref() != Some(session)
+        || generation.pty_control_path.as_deref() != Some(path)
+    {
+        return Err("native F resident PTY attestation mismatched selected generation".into());
+    }
+    Ok(())
+}
+
+fn verify_native_f_readback(
+    lane: &FreshV30Lane,
+    record: &FreshNativeFPreparation,
+) -> Result<(), String> {
+    lane.attest_native_f_preparation(record, |generation, path, device, inode| {
+        verify_native_f_resident(
+            generation,
+            path,
+            device,
+            inode,
+            &record.provider_instance_id,
+            &record.settings_id,
+            &record.provider_session_id,
+        )
+    })
+}
+
+/// The private physical provider owns this native session file. A typed page
+/// supplied by the original root is corroborated against that file and the
+/// pinned live provider; a constructed F socket request alone is insufficient.
+#[cfg(feature = "age319-private-broker-fixture")]
+fn verify_private_native_f_source(
+    lane: &FreshV30Lane,
+    prepared: &FreshNativeFPreparation,
+    observed: &oulipoly_state::mailbox::FreshNativeFObservedTurn,
+) -> Result<(), String> {
+    if !private_fixture() {
+        return Err("native F provider source verifier unavailable; pending".into());
+    }
+    verify_native_f_readback(lane, prepared)?;
+    let gate = PathBuf::from(
+        std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+            .map_err(|_| "native F provider source gate absent")?,
+    );
+    let path = gate.join("provider-native-session.json");
+    let metadata = fs::symlink_metadata(&path).map_err(|_| "native F provider source absent")?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 4 * 1024 * 1024
+    {
+        return Err("native F provider source file invalid".into());
+    }
+    let native: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).map_err(|e| e.to_string())?)
+            .map_err(|_| "native F provider source malformed")?;
+    let source_turns = native["turns"]
+        .as_array()
+        .ok_or("native F provider turns absent")?;
+    if native["format"] != "age319-interactive-native-session/v1"
+        || native["session_id"] != prepared.provider_session_id
+        || native["controlling_tty"] != true
+        || source_turns.len() != 1
+        || observed.anchor_token
+            != format!(
+                "age319-native:{}:0",
+                native["store_nonce"]
+                    .as_str()
+                    .ok_or("native F store nonce absent")?
+            )
+        || source_turns[0]["turn_id"] != observed.turn_id
+        || source_turns[0]["body"] != observed.body
+        || source_turns[0]["nonce"] != observed.nonce
+        || source_turns[0]["session_id"] != prepared.provider_session_id
+        || source_turns[0]["payload_sha256"] != prepared.payload_sha256
+    {
+        return Err("native F provider-authored turn differs from typed page".into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn certify_native_f_with_source(
+    lane: &mut FreshV30Lane,
+    request: &str,
+    recipient: &FreshRecipientIdentity,
+    observed: &oulipoly_state::mailbox::FreshNativeFObservedTurn,
+) -> Result<oulipoly_state::mailbox::FreshNativeFReceipt, String> {
+    let prepared = lane
+        .read_native_f_preparation(request, recipient)?
+        .ok_or("native F preparation absent")?;
+    verify_private_native_f_source(lane, &prepared, observed)?;
+    lane.certify_native_f_receipt(request, recipient, observed)
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn verify_native_f_committed_receipt(
+    lane: &FreshV30Lane,
+    request: &str,
+    recipient: &FreshRecipientIdentity,
+) -> Result<(), String> {
+    let Some(receipt) = lane.read_native_f_receipt(request, recipient)? else {
+        return Ok(());
+    };
+    let prepared = lane
+        .read_native_f_preparation(request, recipient)?
+        .ok_or("native F committed receipt preparation absent")?;
+    verify_private_native_f_source(lane, &prepared, &receipt.observation)?;
+    if receipt.preparation_request_id != prepared.preparation_request_id
+        || receipt.grant_id != prepared.grant_id
+        || receipt.recipient_identity != *recipient
+        || receipt.envelope_sha256 != prepared.envelope_sha256
+        || receipt.payload_sha256 != prepared.payload_sha256
+    {
+        return Err("native F committed receipt lineage changed".into());
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "age319-private-broker-fixture"))]
+fn certify_native_f_with_source(
+    _lane: &mut FreshV30Lane,
+    _request: &str,
+    _recipient: &FreshRecipientIdentity,
+    _observed: &oulipoly_state::mailbox::FreshNativeFObservedTurn,
+) -> Result<oulipoly_state::mailbox::FreshNativeFReceipt, String> {
+    Err("native F provider source verifier unavailable; pending".into())
+}
+
+#[cfg(not(feature = "age319-private-broker-fixture"))]
+fn verify_native_f_committed_receipt(
+    lane: &FreshV30Lane,
+    request: &str,
+    recipient: &FreshRecipientIdentity,
+) -> Result<(), String> {
+    // A receipt imported from another Broker image is a historical State fact,
+    // not independent provider-native evidence for this image. Preserve an
+    // absent-receipt status read, but never use an existing receipt for ACK or
+    // as a currently certified readback without a supported source verifier.
+    if lane.read_native_f_receipt(request, recipient)?.is_some() {
+        return Err("native F provider source verifier unavailable; pending".into());
+    }
+    Ok(())
+}
+
+fn read_native_f_receipt_with_source(
+    lane: &FreshV30Lane,
+    request: &str,
+    recipient: &FreshRecipientIdentity,
+) -> Result<Option<oulipoly_state::mailbox::FreshNativeFReceipt>, String> {
+    verify_native_f_committed_receipt(lane, request, recipient)?;
+    lane.read_native_f_receipt(request, recipient)
+}
+
+fn acknowledge_native_f_receipt_with_source(
+    lane: &mut FreshV30Lane,
+    request: &str,
+    token: &str,
+    recipient: &FreshRecipientIdentity,
+) -> Result<oulipoly_state::mailbox::FreshDeliveryReadback, String> {
+    verify_native_f_committed_receipt(lane, request, recipient)?;
+    lane.acknowledge_native_f_receipt(request, token, recipient)
+}
+
+fn read_native_f_auto_ack_with_source(
+    lane: &FreshV30Lane,
+    request: &str,
+    recipient: &FreshRecipientIdentity,
+) -> Result<Option<oulipoly_state::mailbox::FreshNativeFAutoAck>, String> {
+    verify_native_f_committed_receipt(lane, request, recipient)?;
+    lane.read_native_f_auto_ack(request, recipient)
+}
 
 #[cfg(feature = "age319-private-broker-fixture")]
 fn private_fixture() -> bool {
@@ -135,6 +332,22 @@ fn open_exact_sync_stream(
     }
     file.seek(SeekFrom::Start(0))?;
     Ok(file)
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_native_f_drop_reply(stage: &str) {
+    if !private_fixture()
+        || std::env::var("AGE319_PRIVATE_NATIVE_F_DROP_REPLY_V1")
+            .ok()
+            .as_deref()
+            != Some(stage)
+    {
+        return;
+    }
+    if let Ok(gate) = std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1") {
+        let _ = fs::write(Path::new(&gate).join("interactive-f-reply-dropped"), stage);
+    }
+    std::process::exit(82);
 }
 #[cfg(not(feature = "age319-private-broker-fixture"))]
 fn private_fixture() -> bool {
@@ -258,6 +471,11 @@ enum RequestPayload {
     #[cfg(feature = "age319-private-broker-fixture")]
     FreshProviderRequest {
         request: FreshRootEffectRequest,
+        descriptors: Vec<File>,
+    },
+    #[cfg(feature = "age319-private-broker-fixture")]
+    FreshInteractivePtyHandoff {
+        request: oulipoly_kernel_broker::protocol::PrivateFreshPtyHandoff,
         descriptors: Vec<File>,
     },
     #[cfg(feature = "age319-private-broker-fixture")]
@@ -504,7 +722,11 @@ fn recv_request(
         #[cfg(feature = "age319-private-broker-fixture")]
         b'5' | b'6' | b'7' | b'8' | b'9' => (18..=2048 + 17).contains(&read),
         #[cfg(feature = "age319-private-broker-fixture")]
-        b'h' | b'f' | b'm' | b'n' | b'w' | b'r' => (18..=48 * 1024 + 17).contains(&read),
+        b'h' | b'f' | b'(' | b')' | b'm' | b'n' | b'w' | b'r' => {
+            (18..=48 * 1024 + 17).contains(&read)
+        }
+        #[cfg(feature = "age319-private-broker-fixture")]
+        b'#' | b'{' | b'}' | b']' | b'|' | b'~' | b'?' => (18..=2048 + 17).contains(&read),
         b'F' => (18..=8192 + 17).contains(&read),
         b'O' => (18..=1024 + 17).contains(&read),
         b'U' => (18..=512 + 17).contains(&read),
@@ -527,13 +749,17 @@ fn recv_request(
             #[cfg(feature = "age319-private-broker-fixture")]
             b'9' => !(read == 33 && descriptors.is_empty()) && descriptors.len() != 4,
             #[cfg(feature = "age319-private-broker-fixture")]
-            b'h' => descriptors.len() != 5,
+            b'h' | b'(' => descriptors.len() != 5,
             #[cfg(feature = "age319-private-broker-fixture")]
-            b'X' | b'^' => descriptors.len() != 1,
+            b'X' | b'^' | b'f' | b')' | b'w' | b'~' | b'?' => descriptors.len() != 1,
             #[cfg(feature = "age319-private-broker-fixture")]
-            b'f' => descriptors.len() != 1,
+            b'#' => descriptors.len() != 2,
             #[cfg(feature = "age319-private-broker-fixture")]
-            b'w' => descriptors.len() != 1,
+            b'{' => descriptors.len() != 7,
+            #[cfg(feature = "age319-private-broker-fixture")]
+            b'}' => descriptors.len() != 8,
+            #[cfg(feature = "age319-private-broker-fixture")]
+            b']' => !matches!(descriptors.len(), 0 | 2),
             b'L' => !(1..=4).contains(&descriptors.len()),
             b'V' | b'S' | b's' | b'T' => descriptors.len() != 1,
             _ => !descriptors.is_empty(),
@@ -578,10 +804,17 @@ fn recv_request(
             }
         }
         #[cfg(feature = "age319-private-broker-fixture")]
-        b'h' | b'f' => RequestPayload::FreshRouteRequest {
+        b'h' | b'f' | b'(' | b')' => RequestPayload::FreshRouteRequest {
             request: serde_json::from_slice(&request[17..read as usize])?,
             descriptors,
         },
+        #[cfg(feature = "age319-private-broker-fixture")]
+        b'#' | b'{' | b'}' | b']' | b'|' | b'~' | b'?' => {
+            RequestPayload::FreshInteractivePtyHandoff {
+                request: serde_json::from_slice(&request[17..read as usize])?,
+                descriptors,
+            }
+        }
         #[cfg(feature = "age319-private-broker-fixture")]
         b'm' | b'n' => RequestPayload::FreshAccountEffectRequest {
             request: serde_json::from_slice(&request[17..read as usize])?,
@@ -4353,13 +4586,14 @@ fn serve_fresh_v30_at(
         #[cfg(feature = "age319-private-broker-fixture")]
         let mut drop_provider_k_reply = false;
         #[cfg(feature = "age319-private-broker-fixture")]
+        let mut drop_interactive_k_reply = false;
+        #[cfg(feature = "age319-private-broker-fixture")]
         let mut drop_provider_q_reply = false;
         #[cfg(feature = "age319-private-broker-fixture")]
         let mut drop_account_effect_reply = false;
         #[cfg(feature = "age319-private-broker-fixture")]
+        let mut provider_output_files: Option<Vec<File>> = None;
         let mut drop_route_reply = false;
-        #[cfg(feature = "age319-private-broker-fixture")]
-        let mut provider_output_files: Option<[File; 2]> = None;
         let mut diagnostic_opcode = b'?';
         let mut diagnostic_stage = "request_decode";
         #[cfg(feature = "age319-private-broker-fixture")]
@@ -4694,7 +4928,7 @@ fn serve_fresh_v30_at(
                                     receipt.event.stderr_len,
                                     &receipt.event.stderr_sha256,
                                 )?;
-                                provider_output_files = Some([stdout, stderr]);
+                                provider_output_files = Some(vec![stdout, stderr]);
                             }
                             Ok(format!(
                                 "fresh-bash-sync-{} {}\n",
@@ -5170,24 +5404,48 @@ fn serve_fresh_v30_at(
                     }
                 }
                 #[cfg(feature = "age319-private-broker-fixture")]
-                b'5' | b'6' | b'7' | b'8' | b'9' | b'h' | b'f' | b'm' | b'n' => {
+                b'5' | b'6' | b'7' | b'8' | b'9' | b'h' | b'f' | b'(' | b')' | b'm' | b'n'
+                | b'#' | b'{' | b'}' | b']' | b'|' | b'~' | b'?' => {
                     if !private_fixture() {
                         return Err(io::Error::other("fresh provider fixture route closed"));
                     }
-                    let (d_key, route_request, effect_request, descriptors) = match payload {
-                        RequestPayload::FreshProviderRequest {
-                            request,
-                            descriptors,
-                        } if request.success.is_none() => (request.d_key, None, None, descriptors),
-                        RequestPayload::FreshRouteRequest {
-                            request,
-                            descriptors,
-                        } => (request.d_key.clone(), Some(request), None, descriptors),
-                        RequestPayload::FreshAccountEffectRequest { request } => {
-                            (request.d_key.clone(), None, Some(request), Vec::new())
-                        }
-                        _ => return Err(io::Error::other("fresh provider/route request absent")),
-                    };
+                    let (d_key, route_request, effect_request, pty_request, descriptors) =
+                        match payload {
+                            RequestPayload::FreshProviderRequest {
+                                request,
+                                descriptors,
+                            } if request.success.is_none() => {
+                                (request.d_key, None, None, None, descriptors)
+                            }
+                            RequestPayload::FreshRouteRequest {
+                                request,
+                                descriptors,
+                            } => (
+                                request.d_key.clone(),
+                                Some(request),
+                                None,
+                                None,
+                                descriptors,
+                            ),
+                            RequestPayload::FreshAccountEffectRequest { request } => {
+                                (request.d_key.clone(), None, Some(request), None, Vec::new())
+                            }
+                            RequestPayload::FreshInteractivePtyHandoff {
+                                request,
+                                descriptors,
+                            } => (
+                                request.d_key.clone(),
+                                None,
+                                None,
+                                Some(request),
+                                descriptors,
+                            ),
+                            _ => {
+                                return Err(io::Error::other(
+                                    "fresh provider/route request absent",
+                                ));
+                            }
+                        };
                     let receipt = lane
                         .released_handoff_for_child(&d_key, &recipient)
                         .map_err(io::Error::other)?;
@@ -5241,6 +5499,7 @@ fn serve_fresh_v30_at(
                         fresh_provider::binding_from_held(&receipt, &held, &actor, &root)?;
                     let directory = state_root.join("v30/fresh-provider");
                     if provider_readback_v3.is_some()
+                        && pty_request.is_none()
                         && !(matches!(operation, b'6' | b'8' | b'9' | b'h' | b'm' | b'n')
                             || (route_writer_v3 && operation == b'f'))
                         && !(provider_writer_v3 && matches!(operation, b'5' | b'7'))
@@ -5248,6 +5507,185 @@ fn serve_fresh_v30_at(
                         return Err(io::Error::other(
                             "v3 route, cancellation and provider K writers are closed",
                         ));
+                    }
+                    if let Some(pty_request) = pty_request {
+                        if !matches!(operation, b'#' | b'{' | b'}' | b']' | b'|' | b'~' | b'?')
+                            || (!matches!(operation, b']' | b'|' | b'~' | b'?')
+                                && instance.is_closed())
+                        {
+                            return Err(io::Error::other("fresh PTY handoff gate closed"));
+                        }
+                        if operation == b']' {
+                            if !descriptors.is_empty() {
+                                let [master, transcript]: [File; 2] =
+                                    descriptors.try_into().map_err(|_| {
+                                        io::Error::other("interactive finalizer descriptors absent")
+                                    })?;
+                                fresh_provider::finalize_interactive_output(
+                                    &directory,
+                                    &binding,
+                                    &pty_request,
+                                    &actor,
+                                    master,
+                                    transcript,
+                                )?;
+                            }
+                            return fresh_provider::observe_interactive(
+                                &directory,
+                                &binding,
+                                &pty_request,
+                            );
+                        }
+                        if operation == b'|' {
+                            let (reply, file) = fresh_provider::interactive_output(
+                                &directory,
+                                &binding,
+                                &pty_request,
+                            )?;
+                            provider_output_files = Some(vec![file]);
+                            return Ok(reply);
+                        }
+                        if matches!(operation, b'~' | b'?') {
+                            let [master]: [File; 1] = descriptors.try_into().map_err(|_| {
+                                io::Error::other("resident original PTY master absent")
+                            })?;
+                            let resident = fresh_provider::observe_interactive_resident(
+                                &directory,
+                                &binding,
+                                &pty_request,
+                                &actor,
+                                &master,
+                            )?;
+                            if resident.registration.session_id != session.session_id
+                                || resident.registration.invocation_uuid != receipt.invocation_uuid
+                                || resident.registration.creator.os_pid
+                                    != i64::from(recipient.host_pid)
+                                || resident.registration.creator.os_boot_id != recipient.boot_id
+                                || resident.registration.creator.os_pid_starttime_ticks
+                                    != recipient.starttime_ticks as i64
+                            {
+                                return Err(io::Error::other(
+                                    "resident original root or D changed",
+                                ));
+                            }
+                            let generation = lane
+                                .register_interactive_resident(&resident.registration)
+                                .map_err(io::Error::other)?;
+                            let socket_identity = if operation == b'?' {
+                                let statement = oulipoly_runtime::executor::cli::pty_broker::query_pty_generation_identity(
+                                    &pty_request.control_path,
+                                    resident.control_device,
+                                    resident.control_inode,
+                                ).map_err(io::Error::other)?;
+                                if statement.generation_id != resident.registration.grant_id
+                                    || statement.spawn_invocation_uuid != receipt.invocation_uuid
+                                    || statement.creator_process != resident.registration.creator
+                                    || statement.provider_process != resident.registration.provider
+                                    || statement.provider_account != resident.registration.account
+                                    || statement.provider_session_id != session.session_id
+                                {
+                                    return Err(io::Error::other(
+                                        "resident broker socket challenge changed",
+                                    ));
+                                }
+                                Some(statement)
+                            } else {
+                                None
+                            };
+                            return Ok(format!(
+                                "fresh-interactive-resident {}\n",
+                                serde_json::to_string(&serde_json::json!({
+                                    "resident": resident,
+                                    "generation": generation,
+                                    "lane_id": session.lane_id,
+                                    "source_generation": session.source_generation,
+                                    "socket": socket_identity,
+                                }))?
+                            ));
+                        }
+                        if operation == b'#' {
+                            let [master, slave]: [File; 2] =
+                                descriptors.try_into().map_err(|_| {
+                                    io::Error::other("fresh PTY handoff descriptors absent")
+                                })?;
+                            fresh_provider::attest_pre_k_interactive_pty(
+                                &directory,
+                                &binding,
+                                &actor,
+                                &pty_request,
+                                &master,
+                                &slave,
+                            )?;
+                            return Ok("fresh-pty-handoff-pre-k\n".into());
+                        }
+                        let mut descriptors = descriptors;
+                        let relay = if operation == b'}' {
+                            Some(
+                                descriptors
+                                    .pop()
+                                    .ok_or_else(|| io::Error::other("interactive relay absent"))?,
+                            )
+                        } else {
+                            None
+                        };
+                        let [image, cwd, input, recipe, source, master, slave]: [File; 7] =
+                            descriptors.try_into().map_err(|_| {
+                                io::Error::other("fresh interactive preparation descriptors absent")
+                            })?;
+                        let plan = fresh_provider::prepare_interactive_k(
+                            &directory,
+                            &binding,
+                            &actor,
+                            &pty_request,
+                            image,
+                            cwd,
+                            input,
+                            recipe,
+                            source,
+                            master.try_clone()?,
+                            slave.try_clone()?,
+                        )?;
+                        if operation == b'{' {
+                            return Ok("fresh-interactive-k-preparation-pre-k\n".into());
+                        }
+                        let relay =
+                            relay.ok_or_else(|| io::Error::other("interactive relay absent"))?;
+                        if !relay.metadata()?.file_type().is_socket() {
+                            return Err(io::Error::other("interactive relay is not a socket"));
+                        }
+                        let relay = unsafe { UnixStream::from_raw_fd(relay.into_raw_fd()) };
+                        let mut relay_peer: libc::ucred = unsafe { std::mem::zeroed() };
+                        let mut relay_peer_len =
+                            std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+                        if unsafe {
+                            libc::getsockopt(
+                                relay.as_raw_fd(),
+                                libc::SOL_SOCKET,
+                                libc::SO_PEERCRED,
+                                (&mut relay_peer as *mut libc::ucred).cast(),
+                                &mut relay_peer_len,
+                            )
+                        } != 0
+                            || relay_peer_len as usize != std::mem::size_of::<libc::ucred>()
+                            || (relay_peer.pid, relay_peer.uid, relay_peer.gid)
+                                != (actor_pid, actor_uid, actor_gid)
+                        {
+                            return Err(io::Error::other(
+                                "interactive relay peer differs from original actor",
+                            ));
+                        }
+                        let grant = fresh_provider::launch_interactive(
+                            &directory, binding, plan, &root, &actor, actor_uid, actor_gid, master,
+                            slave, relay,
+                        )?;
+                        if std::env::var_os(
+                            "OULIPOLY_KERNEL_BROKER_FIXTURE_DROP_INTERACTIVE_K_REPLY_V1",
+                        )
+                        .is_some()
+                        {
+                            drop_interactive_k_reply = true;
+                        }
+                        return Ok(format!("fresh-interactive-k {grant}\n"));
                     }
                     if let Some(route_request) = route_request {
                         let expected_pin = match &held.intent {
@@ -5277,7 +5715,7 @@ fn serve_fresh_v30_at(
                                 "fresh route pin differs from held root intent",
                             ));
                         }
-                        if operation == b'h' {
+                        if matches!(operation, b'h' | b'(') {
                             if instance.is_closed() {
                                 return Err(io::Error::other("fresh route entry gate closed"));
                             }
@@ -5302,23 +5740,37 @@ fn serve_fresh_v30_at(
                             let plan = fresh_provider::plan_from_descriptors(
                                 &image, image_fd, cwd, input, recipe,
                             )?;
-                            fresh_provider::register_route_candidate(
-                                &directory,
-                                &binding,
-                                &route_request,
-                                plan,
-                                fresh_provider::terminal_recognizer_from_source(
+                            if operation == b'h' {
+                                fresh_provider::register_route_candidate(
+                                    &directory,
+                                    &binding,
+                                    &route_request,
+                                    plan,
+                                    fresh_provider::terminal_recognizer_from_source(
+                                        &config_dir,
+                                        &route_request,
+                                    )?,
+                                )?;
+                                if let Some(generation) = provider_readback_v3.as_ref() {
+                                    generation
+                                        .record_route_model(
+                                            &route_request.model,
+                                            &route_request.config_sha256,
+                                        )
+                                        .map_err(io::Error::other)?;
+                                }
+                            } else {
+                                fresh_provider::validate_interactive_plan_source(
                                     &config_dir,
                                     &route_request,
-                                )?,
-                            )?;
-                            if let Some(generation) = provider_readback_v3.as_ref() {
-                                generation
-                                    .record_route_model(
-                                        &route_request.model,
-                                        &route_request.config_sha256,
-                                    )
-                                    .map_err(io::Error::other)?;
+                                    &plan,
+                                )?;
+                                fresh_provider::register_interactive_candidate(
+                                    &directory,
+                                    &binding,
+                                    &route_request,
+                                    plan,
+                                )?;
                             }
                             return Ok("fresh-route-registered\n".into());
                         }
@@ -5333,23 +5785,29 @@ fn serve_fresh_v30_at(
                             &config_dir,
                             false,
                         )?;
-                        let selection = if route_writer_v3 {
+                        let selection = if operation == b')' {
+                            serde_json::to_string(&fresh_provider::select_interactive_plan(
+                                &directory,
+                                &binding,
+                                &route_request,
+                            )?)?
+                        } else if route_writer_v3 {
                             let generation = provider_readback_v3
                                 .as_ref()
                                 .ok_or_else(|| io::Error::other("v3 route admission absent"))?;
-                            fresh_provider::select_route_v3(
+                            serde_json::to_string(&fresh_provider::select_route_v3(
                                 &directory,
                                 &binding,
                                 &route_request,
                                 generation,
-                            )?
+                            )?)?
                         } else {
-                            fresh_provider::select_route_with_index(
+                            serde_json::to_string(&fresh_provider::select_route_with_index(
                                 &directory,
                                 &binding,
                                 &route_request,
                                 route_index.as_ref(),
-                            )?
+                            )?)?
                         };
                         if route_writer_v3
                             && std::env::var_os(
@@ -5363,10 +5821,7 @@ fn serve_fresh_v30_at(
                         {
                             drop_route_reply = true;
                         }
-                        return Ok(format!(
-                            "fresh-route-selected {}\n",
-                            serde_json::to_string(&selection)?
-                        ));
+                        return Ok(format!("fresh-route-selected {selection}\n"));
                     }
                     if let Some(effect_request) = effect_request {
                         if operation == b'm' {
@@ -5650,7 +6105,7 @@ fn serve_fresh_v30_at(
                                 drop_provider_q_reply = true;
                             }
                             if operation == b'8' {
-                                provider_output_files = Some([stdout, stderr]);
+                                provider_output_files = Some(vec![stdout, stderr]);
                                 format!(
                                     "fresh-provider-output {grant} {status} {stdout_len} {stdout_sha256} {stderr_len} {stderr_sha256} {cancelled}\n"
                                 )
@@ -5792,6 +6247,179 @@ fn serve_fresh_v30_at(
                                 .map_err(io::Error::other)?;
                             fresh_payload_reply("recovered_delivery", recovered)?
                         }
+                        FreshRecipientRequest::PrepareNativeF { preparation } => {
+                            if instance.is_closed() {
+                                return Err(io::Error::other("fresh recipient entry gate closed"));
+                            }
+                            if let Some(existing) = lane
+                                .read_native_f_preparation(
+                                    &preparation.preparation_request_id,
+                                    &recipient,
+                                )
+                                .map_err(io::Error::other)?
+                            {
+                                verify_native_f_readback(&lane, &existing)
+                                    .map_err(io::Error::other)?;
+                            }
+                            let prepared = lane
+                                .prepare_native_f_input(
+                                    &preparation,
+                                    &recipient,
+                                    |generation, path, device, inode| {
+                                        verify_native_f_resident(
+                                            generation,
+                                            path,
+                                            device,
+                                            inode,
+                                            &preparation.provider_instance_id,
+                                            &preparation.settings_id,
+                                            generation
+                                                .session_id
+                                                .as_deref()
+                                                .ok_or("native F provider session absent")?,
+                                        )
+                                    },
+                                )
+                                .map_err(io::Error::other)?;
+                            verify_native_f_readback(&lane, &prepared).map_err(io::Error::other)?;
+                            serde_json::json!({"kind":"native_f_preparation", "preparation":prepared})
+                        }
+                        FreshRecipientRequest::ReadNativeFPreparation {
+                            preparation_request_id,
+                        } => {
+                            let prepared = lane
+                                .read_native_f_preparation(&preparation_request_id, &recipient)
+                                .map_err(io::Error::other)?;
+                            if let Some(record) = prepared.as_ref() {
+                                verify_native_f_readback(&lane, record)
+                                    .map_err(io::Error::other)?;
+                            }
+                            serde_json::json!({"kind":"native_f_preparation_readback", "preparation":prepared})
+                        }
+                        FreshRecipientRequest::BeginNativeFSubmission {
+                            preparation_request_id,
+                        } => {
+                            if instance.is_closed() {
+                                return Err(io::Error::other("fresh recipient entry gate closed"));
+                            }
+                            let prepared = lane
+                                .read_native_f_preparation(&preparation_request_id, &recipient)
+                                .map_err(io::Error::other)?
+                                .ok_or_else(|| io::Error::other("native F preparation absent"))?;
+                            let fence = lane
+                                .begin_native_f_submission(
+                                    &preparation_request_id,
+                                    &recipient,
+                                    |generation, path, device, inode| {
+                                        verify_native_f_resident(
+                                            generation,
+                                            path,
+                                            device,
+                                            inode,
+                                            &prepared.provider_instance_id,
+                                            &prepared.settings_id,
+                                            &prepared.provider_session_id,
+                                        )
+                                    },
+                                )
+                                .map_err(io::Error::other)?;
+                            serde_json::json!({"kind":"native_f_submission_fence", "fence":fence})
+                        }
+                        FreshRecipientRequest::ReadNativeFSubmission {
+                            preparation_request_id,
+                        } => {
+                            let fence = lane
+                                .read_native_f_submission(&preparation_request_id, &recipient)
+                                .map_err(io::Error::other)?;
+                            serde_json::json!({"kind":"native_f_submission_readback", "fence":fence})
+                        }
+                        FreshRecipientRequest::RecordNativeFTransport {
+                            preparation_request_id,
+                        } => {
+                            let prepared = lane
+                                .read_native_f_preparation(&preparation_request_id, &recipient)
+                                .map_err(io::Error::other)?
+                                .ok_or_else(|| {
+                                    io::Error::other("native F transport preparation absent")
+                                })?;
+                            verify_native_f_readback(&lane, &prepared).map_err(io::Error::other)?;
+                            let transport = lane
+                                .record_native_f_transport(&preparation_request_id, &recipient)
+                                .map_err(io::Error::other)?;
+                            #[cfg(feature = "age319-private-broker-fixture")]
+                            private_native_f_drop_reply("transport");
+                            serde_json::json!({"kind":"native_f_transport", "transport":transport})
+                        }
+                        FreshRecipientRequest::ReadNativeFTransport {
+                            preparation_request_id,
+                        } => {
+                            let transport = lane
+                                .read_native_f_transport(&preparation_request_id, &recipient)
+                                .map_err(io::Error::other)?;
+                            if transport.is_some() {
+                                let prepared = lane
+                                    .read_native_f_preparation(&preparation_request_id, &recipient)
+                                    .map_err(io::Error::other)?
+                                    .ok_or_else(|| {
+                                        io::Error::other("native F transport preparation absent")
+                                    })?;
+                                verify_native_f_readback(&lane, &prepared)
+                                    .map_err(io::Error::other)?;
+                            }
+                            serde_json::json!({"kind":"native_f_transport_readback", "transport":transport})
+                        }
+                        FreshRecipientRequest::CertifyNativeFReceipt {
+                            preparation_request_id,
+                            observed,
+                        } => {
+                            let receipt = certify_native_f_with_source(
+                                &mut lane,
+                                &preparation_request_id,
+                                &recipient,
+                                &observed,
+                            )
+                            .map_err(io::Error::other)?;
+                            #[cfg(feature = "age319-private-broker-fixture")]
+                            private_native_f_drop_reply("receipt");
+                            serde_json::json!({"kind":"native_f_receipt", "receipt":receipt})
+                        }
+                        FreshRecipientRequest::ReadNativeFReceipt {
+                            preparation_request_id,
+                        } => {
+                            let receipt = read_native_f_receipt_with_source(
+                                &lane,
+                                &preparation_request_id,
+                                &recipient,
+                            )
+                            .map_err(io::Error::other)?;
+                            serde_json::json!({"kind":"native_f_receipt_readback", "receipt":receipt})
+                        }
+                        FreshRecipientRequest::AcknowledgeNativeFReceipt {
+                            preparation_request_id,
+                            delivery_token,
+                        } => {
+                            let grant = acknowledge_native_f_receipt_with_source(
+                                &mut lane,
+                                &preparation_request_id,
+                                &delivery_token,
+                                &recipient,
+                            )
+                            .map_err(io::Error::other)?;
+                            #[cfg(feature = "age319-private-broker-fixture")]
+                            private_native_f_drop_reply("ack");
+                            serde_json::json!({"kind":"native_f_auto_ack", "grant":grant})
+                        }
+                        FreshRecipientRequest::ReadNativeFAutoAck {
+                            preparation_request_id,
+                        } => {
+                            let ack = read_native_f_auto_ack_with_source(
+                                &lane,
+                                &preparation_request_id,
+                                &recipient,
+                            )
+                            .map_err(io::Error::other)?;
+                            serde_json::json!({"kind":"native_f_auto_ack_readback", "ack":ack})
+                        }
                         FreshRecipientRequest::Acknowledge {
                             grant_id,
                             delivery_token,
@@ -5858,12 +6486,15 @@ fn serve_fresh_v30_at(
             || drop_provider_q_reply
             || drop_account_effect_reply
             || drop_route_reply
+            || drop_interactive_k_reply
         {
             if let Some(gate) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1") {
                 let marker = if drop_route_reply {
                     "route-reply-dropped"
                 } else if drop_provider_k_reply {
                     "provider-k-reply-dropped"
+                } else if drop_interactive_k_reply {
+                    "interactive-k-reply-dropped"
                 } else if drop_provider_q_reply {
                     "provider-q-reply-dropped"
                 } else {
@@ -5905,7 +6536,7 @@ fn serve_fresh_v30_at(
         }
         #[cfg(feature = "age319-private-broker-fixture")]
         if let Some(files) = provider_output_files {
-            let fds = [files[0].as_raw_fd(), files[1].as_raw_fd()];
+            let fds: Vec<_> = files.iter().map(AsRawFd::as_raw_fd).collect();
             let mut iov = libc::iovec {
                 iov_base: response.as_ptr().cast_mut().cast(),
                 iov_len: response.len(),
@@ -5916,13 +6547,18 @@ fn serve_fresh_v30_at(
             msg.msg_iovlen = 1;
             msg.msg_control = control.as_mut_ptr().cast();
             msg.msg_controllen =
-                unsafe { libc::CMSG_SPACE(std::mem::size_of_val(&fds) as _) } as usize;
+                unsafe { libc::CMSG_SPACE(std::mem::size_of_val(fds.as_slice()) as _) } as usize;
             unsafe {
                 let header = libc::CMSG_FIRSTHDR(&msg);
                 (*header).cmsg_level = libc::SOL_SOCKET;
                 (*header).cmsg_type = libc::SCM_RIGHTS;
-                (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(&fds) as _) as usize;
-                std::ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(header).cast(), 2);
+                (*header).cmsg_len =
+                    libc::CMSG_LEN(std::mem::size_of_val(fds.as_slice()) as _) as usize;
+                std::ptr::copy_nonoverlapping(
+                    fds.as_ptr(),
+                    libc::CMSG_DATA(header).cast(),
+                    fds.len(),
+                );
                 let sent = libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL);
                 if sent != response.len() as isize {
                     eprintln!(
@@ -6081,6 +6717,78 @@ mod tests {
     use super::*;
     use oulipoly_kernel_broker::installed_launch::capture_from;
     use std::ffi::OsString;
+
+    #[cfg(not(feature = "age319-private-broker-fixture"))]
+    #[test]
+    #[ignore = "requires a retained State receipt exported by the private Broker image"]
+    fn imported_native_f_receipt_cannot_become_default_ack_after_restart() {
+        let marker = std::env::var_os("AGE319_NATIVE_F_EXPORT_MARKER")
+            .expect("private Broker receipt export marker required");
+        let exported: serde_json::Value =
+            serde_json::from_slice(&fs::read(marker).unwrap()).unwrap();
+        let state_root = Path::new(exported["state_root"].as_str().unwrap());
+        let request = exported["request"].as_str().unwrap();
+        let token = exported["token"].as_str().unwrap();
+        let delivery_request = exported["delivery_request"].as_str().unwrap();
+        let recipient: FreshRecipientIdentity =
+            serde_json::from_value(exported["recipient"].clone()).unwrap();
+        let unavailable = "native F provider source verifier unavailable; pending";
+        for _ in 0..2 {
+            // The second open models a default Broker restart after an
+            // uncertain read/ACK reply against the same retained State.
+            let mut lane = FreshV30Lane::open_at(state_root).unwrap();
+            let retained = lane
+                .read_native_f_receipt(request, &recipient)
+                .unwrap()
+                .expect("private image exported a committed receipt");
+            assert_eq!(
+                certify_native_f_with_source(
+                    &mut lane,
+                    request,
+                    &recipient,
+                    &retained.observation,
+                )
+                .unwrap_err(),
+                unavailable
+            );
+            assert_eq!(
+                read_native_f_receipt_with_source(&lane, request, &recipient).unwrap_err(),
+                unavailable
+            );
+            assert_eq!(
+                acknowledge_native_f_receipt_with_source(&mut lane, request, token, &recipient,)
+                    .unwrap_err(),
+                unavailable
+            );
+            assert_eq!(
+                read_native_f_auto_ack_with_source(&lane, request, &recipient).unwrap_err(),
+                unavailable
+            );
+            assert!(
+                lane.read_native_f_auto_ack(request, &recipient)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                lane.read_native_f_receipt(request, &recipient)
+                    .unwrap()
+                    .is_some()
+            );
+            let grant = lane
+                .read_recipient_delivery_by_request(delivery_request, &recipient)
+                .unwrap()
+                .unwrap();
+            assert_ne!(grant.phase, "acked");
+        }
+        let lane = FreshV30Lane::open_at(state_root).unwrap();
+        assert!(read_native_f_receipt_with_source(
+            &lane,
+            &uuid::Uuid::new_v4().to_string(),
+            &recipient,
+        )
+        .unwrap()
+        .is_none());
+    }
 
     #[test]
     fn v30_service_refuses_every_legacy_entry_and_work_operation() {
@@ -6775,6 +7483,102 @@ assert s.send(message) == len(message)
             *(libc::CMSG_DATA(cmsg) as *mut i32) = payload.as_raw_fd();
             assert_eq!(libc::sendmsg(client.as_raw_fd(), &message, 0), 33);
         }
+        server.join().unwrap();
+    }
+
+    #[cfg(feature = "age319-private-broker-fixture")]
+    #[test]
+    fn fresh_interactive_pty_handoff_frame_preserves_peer_and_exact_pair() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("socket");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let mut master_fd = -1;
+        let mut slave_fd = -1;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master_fd,
+                    &mut slave_fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        let master = unsafe { File::from_raw_fd(master_fd) };
+        let slave = unsafe { File::from_raw_fd(slave_fd) };
+        let request = oulipoly_kernel_broker::protocol::PrivateFreshPtyHandoff {
+            d_key: uuid::Uuid::new_v4().to_string(),
+            session_id: format!("v30:{}:{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4()),
+            role: oulipoly_kernel_broker::protocol::FreshPlanRole::Interactive,
+            account: "selected".into(),
+            plan_sha256: "a".repeat(64),
+            control_path: temp.path().join("control.sock"),
+        };
+        let expected_request = request.clone();
+        let client_master = master.try_clone().unwrap();
+        let client_slave = slave.try_clone().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let (operation, payload, peer) = peer_from_request(&mut stream).unwrap();
+            assert_eq!(operation, b'#');
+            assert_eq!(peer.process.host_pid, std::process::id() as i32);
+            let RequestPayload::FreshInteractivePtyHandoff {
+                request,
+                descriptors,
+            } = payload
+            else {
+                panic!("PTY handoff decoded as another operation");
+            };
+            assert_eq!(request.d_key, expected_request.d_key);
+            assert_eq!(request.session_id, expected_request.session_id);
+            assert_eq!(request.account, expected_request.account);
+            assert_eq!(request.plan_sha256, expected_request.plan_sha256);
+            assert_eq!(request.control_path, expected_request.control_path);
+            assert_eq!(descriptors.len(), 2);
+            assert_eq!(
+                descriptors[0].metadata().unwrap().ino(),
+                master.metadata().unwrap().ino()
+            );
+            assert_eq!(
+                descriptors[1].metadata().unwrap().ino(),
+                slave.metadata().unwrap().ino()
+            );
+            stream.write_all(b"fresh-pty-handoff-pre-k\n").unwrap();
+        });
+        let mut client = UnixStream::connect(&socket).unwrap();
+        let mut challenge = [0u8; 16];
+        client.read_exact(&mut challenge).unwrap();
+        let mut frame = vec![b'#'];
+        frame.extend_from_slice(&challenge);
+        frame.extend_from_slice(&serde_json::to_vec(&request).unwrap());
+        let descriptors = [client_master.as_raw_fd(), client_slave.as_raw_fd()];
+        let mut iov = libc::iovec {
+            iov_base: frame.as_mut_ptr().cast(),
+            iov_len: frame.len(),
+        };
+        let mut control = [0u8; 64];
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = &mut iov;
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen =
+            unsafe { libc::CMSG_SPACE(std::mem::size_of_val(&descriptors) as _) } as _;
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&message);
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(&descriptors) as _) as _;
+            std::ptr::copy_nonoverlapping(descriptors.as_ptr(), libc::CMSG_DATA(cmsg).cast(), 2);
+            assert_eq!(
+                libc::sendmsg(client.as_raw_fd(), &message, 0),
+                frame.len() as isize
+            );
+        }
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert_eq!(response, "fresh-pty-handoff-pre-k\n");
         server.join().unwrap();
     }
 

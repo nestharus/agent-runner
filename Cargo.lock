@@ -3210,6 +3210,7 @@ dependencies = [
 name = "oulipoly-state"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "ctor",
  "dirs",

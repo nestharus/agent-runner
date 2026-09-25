@@ -754,17 +754,6 @@ mod tests {
             )
             .unwrap();
         }
-
-        fn set_exit_status(&self, row_id: i64, status: &str, success: bool, exit_code: i32) {
-            let conn = Connection::open(&self.db_path).unwrap();
-            conn.execute(
-                "UPDATE invocations
-                 SET status = ?1, success = ?2, exit_code = ?3
-                 WHERE id = ?4",
-                params![status, success, exit_code, row_id],
-            )
-            .unwrap();
-        }
     }
 
     fn write_sessions_config(config_home: &std::path::Path, body: &str) {
@@ -832,17 +821,18 @@ mod tests {
 
     fn build_resumed_trace_report_with_exit(
         options: TraceOptions,
-        exit_override: Option<(&str, bool, i32)>,
+        exit_override: Option<(&'static str, bool, i32)>,
     ) -> TraceReport {
-        let fixture = TraceFixture::new(&base_rows());
+        let rows = match exit_override {
+            Some((status, success, exit_code)) => root_exit_rows(status, success, exit_code),
+            None => base_rows(),
+        };
+        let fixture = TraceFixture::new(&rows);
         fixture.set_session_capture(
             1,
             Some("5169694d-de0f-40d1-890c-6e28e55bab27"),
             Some("resumed"),
         );
-        if let Some((status, success, exit_code)) = exit_override {
-            fixture.set_exit_status(1, status, success, exit_code);
-        }
         fixture.ingest_session_turns(
             "fixture-provider",
             &[
@@ -899,8 +889,10 @@ mod tests {
                 r#"[fixture-provider]
 turn_script = "ignored"
 transcript_locator = "{}"
+state_dir = "{}"
 "#,
-                locator.display()
+                locator.display(),
+                env_dir.path().join("state").display()
             ),
         );
 
@@ -979,6 +971,18 @@ transcript_locator = "{}"
                 finished_at: Some("2026-04-17T08:00:04Z"),
             },
         ]
+    }
+
+    fn root_exit_rows(
+        status: &'static str,
+        success: bool,
+        exit_code: i32,
+    ) -> Vec<FixtureRow<'static>> {
+        let mut rows = base_rows();
+        rows[0].status = status;
+        rows[0].success = Some(success);
+        rows[0].exit_code = Some(exit_code);
+        rows
     }
 
     fn legacy_root_rows() -> Vec<FixtureRow<'static>> {
@@ -1931,14 +1935,12 @@ transcript_locator = "{}"
         // shows the child failed to attach (non-zero exit). Verifies
         // build_trace_session does NOT short-circuit the resume warning
         // based on success/exit_code.
-        let fixture = TraceFixture::new(&base_rows());
+        let fixture = TraceFixture::new(&root_exit_rows("failed", false, 7));
         fixture.set_session_capture(
             1,
             Some("5169694d-de0f-40d1-890c-6e28e55bab27"),
             Some("resumed"),
         );
-        fixture.set_exit_status(1, "failed", false, 7);
-
         let report = trace_invocation(&fixture.db(), ROOT_UUID, trace_options(64)).unwrap();
 
         assert!(

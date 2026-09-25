@@ -38,9 +38,12 @@ fn age360_registration_rejection_is_unsubmitted_in_every_headless_entry() {
         drop(MailboxDb::open(&sidecar).unwrap());
         let sql = Connection::open(&sidecar).unwrap();
         prepare(&sql);
-        sql.execute_batch("INSERT INTO completion_continuation_owner SELECT 'owner',domain_id,'running','{}','{}','fixture' FROM completion_continuation_domain;
-            INSERT INTO completion_continuation_attempt(attempt_id,domain_id,owner_generation,operation,request_sha256,session_id,claim_token,phase,result_path)
-            SELECT 'attempt',domain_id,'owner','activation','hash','session','claim','reserved','fixture' FROM completion_continuation_domain;").unwrap();
+        sql.execute_batch("INSERT INTO completion_supervisor_authority(authority_id,domain_id,phase,created_by_generation,guardian_identity)
+            SELECT 'fixture-authority',domain_id,'active','owner','{}' FROM completion_continuation_domain;
+            INSERT INTO completion_continuation_owner(generation,domain_id,phase,guardian_identity,driver_identity,endpoint,supervisor_authority_id)
+            SELECT 'owner',domain_id,'running','{}','{}','fixture','fixture-authority' FROM completion_continuation_domain;
+            INSERT INTO completion_continuation_attempt(attempt_id,domain_id,owner_generation,operation,request_sha256,session_id,claim_token,phase,result_path,supervisor_authority_id)
+            SELECT 'attempt',domain_id,'owner','activation','hash','session','claim','reserved','fixture','fixture-authority' FROM completion_continuation_domain;").unwrap();
         let c = context(&sidecar);
         let error = register(&c, path).unwrap_err();
         assert!(

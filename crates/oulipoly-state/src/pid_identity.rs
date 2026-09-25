@@ -72,7 +72,8 @@ fn pid_identity_connection_span(
 /// necessarily the value of getpid() or Child::id(). Persisted readers must
 /// use that same procfs PID namespace; boot/starttime alone do not translate
 /// a PID into another observer's namespace.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProcessIdentity {
     pub os_pid: i64,
     pub os_boot_id: String,

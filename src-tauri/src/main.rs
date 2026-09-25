@@ -33,6 +33,8 @@ mod kernel_entry;
 mod mailbox_delivery;
 mod maintenance_worker;
 mod migration_providers;
+#[cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
+mod native_f_preparation;
 mod native_receipt;
 #[allow(dead_code)]
 #[path = "main/owned_turn_event_ingest.rs"]

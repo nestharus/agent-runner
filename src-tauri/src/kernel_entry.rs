@@ -42,6 +42,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 #[cfg(feature = "age319-private-broker-fixture")]
+mod root_pty_control;
+
+#[cfg(feature = "age319-private-broker-fixture")]
 const PRIVATE_PREPARED_ENTRY: &str = "__age319-private-held-prepared-v30";
 #[cfg(feature = "age319-private-broker-fixture")]
 const PRIVATE_NORMAL_ENTRY: &str = "__age319-private-normal-v30";
@@ -802,6 +805,7 @@ impl PrivatePinnedPlan {
 #[cfg(feature = "age319-private-broker-fixture")]
 fn private_pin_plan(
     plan: &oulipoly_runtime::executor::cli::fresh_remote::FreshProviderPlan,
+    role: oulipoly_kernel_broker::protocol::FreshPlanRole,
 ) -> Result<PrivatePinnedPlan, String> {
     use std::os::unix::fs::OpenOptionsExt;
     let image = std::fs::OpenOptions::new()
@@ -818,6 +822,7 @@ fn private_pin_plan(
     let recipe_bytes = serde_json::to_vec(&serde_json::json!({
         "configured_program": plan.configured_program,
         "argv": plan.argv, "env": plan.environment,
+        "role": role,
     }))
     .map_err(|e| e.to_string())?;
     let recipe = private_sealed_bytes(b"fresh-provider-recipe", &recipe_bytes)?;
@@ -827,6 +832,706 @@ fn private_pin_plan(
         input,
         recipe,
     })
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_interactive_plan(
+    model: &oulipoly_config::ModelConfig,
+    index: usize,
+    cwd: &std::path::Path,
+    session_id: &str,
+) -> Result<oulipoly_runtime::executor::cli::fresh_remote::FreshProviderPlan, String> {
+    let mut plan = oulipoly_runtime::executor::cli::fresh_remote::prepare_fresh_interactive(
+        model, index, cwd,
+    )?;
+    if std::env::var_os("AGE319_PRIVATE_ROOT_PTY_RESIDENT_V1").is_some() {
+        if plan
+            .environment
+            .iter()
+            .any(|(key, _)| key == "AGE319_PRIVATE_NATIVE_SESSION")
+        {
+            return Err("private native session environment already set".into());
+        }
+        plan.environment
+            .push(("AGE319_PRIVATE_NATIVE_SESSION".into(), session_id.into()));
+        plan.environment.sort();
+    }
+    Ok(plan)
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_resident_registry(
+    config_dir: &std::path::Path,
+    model: &oulipoly_config::ModelConfig,
+) -> Result<oulipoly_runtime::provider_registry::ProviderRegistry, String> {
+    let source =
+        std::fs::read_to_string(config_dir.join("providers.toml")).map_err(|e| e.to_string())?;
+    let providers = oulipoly_config::ProvidersConfig::from_toml(&source)?;
+    let data_root = oulipoly_state::paths::data_dir()?;
+    oulipoly_runtime::provider_registry::ProviderRegistry::from_configs(
+        &[model.clone()],
+        &providers,
+        oulipoly_runtime::provider_registry::ProviderRegistryOptions::default()
+            .with_config_root(config_dir.to_owned())
+            .with_data_root(data_root),
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_resident_empty_tail(
+    registry: &oulipoly_runtime::provider_registry::ProviderRegistry,
+    model: &str,
+    account: &str,
+    instance: &str,
+    settings: &str,
+    session: &str,
+    cwd: &std::path::Path,
+) -> Result<serde_json::Value, String> {
+    use oulipoly_runtime::session_provider::{
+        SessionProviderIdentity, SessionProviderPageCursor, SessionProviderReadPageRequest,
+        SessionProviderTurnProjection, read_turn_page,
+    };
+    use sha2::Digest as _;
+    let cancellation = oulipoly_provider::client::CancellationToken::new();
+    let observation_nonce = format!("{:x}", sha2::Sha256::digest(session.as_bytes()));
+    let page = read_turn_page(SessionProviderReadPageRequest {
+        registry,
+        identity: SessionProviderIdentity {
+            model_name: model.into(),
+            provider_name: account.into(),
+            provider_instance_id: Some(instance.into()),
+            settings_id: settings.into(),
+        },
+        session_id: session,
+        effective_cwd: Some(cwd),
+        projection: SessionProviderTurnProjection::UserObservation,
+        expected_delivery_nonce: Some(&observation_nonce),
+        cursor: SessionProviderPageCursor::Tail,
+        expected_page_index: 0,
+        expected_turn_sequence: 0,
+        max_turns: 64,
+        max_response_bytes: 256 * 1024,
+        max_source_bytes: 4 * 1024 * 1024,
+        max_inline_body_bytes: 16 * 1024,
+        cancellation: &cancellation,
+        timeout: std::time::Duration::from_secs(5),
+    })
+    .map_err(|e| e.to_string())?;
+    if page.provider_instance_id != instance
+        || page.settings_id != settings
+        || page.session_id != session
+        || !page.snapshot_complete
+        || !page.turns.is_empty()
+        || page.resume_token.as_deref().is_none_or(str::is_empty)
+    {
+        return Err("selected native store Tail is not complete and empty".into());
+    }
+    Ok(serde_json::json!({
+        "session_id": page.session_id,
+        "provider_instance_id": page.provider_instance_id,
+        "settings_id": page.settings_id,
+        "snapshot_id": page.snapshot_id,
+        "resume_token": page.resume_token,
+        "snapshot_complete": page.snapshot_complete,
+        "turn_count": page.turns.len(),
+        "source_bytes_examined": page.source_bytes_examined,
+    }))
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_resident_fence_pending_f(
+    socket: &std::path::Path,
+    root_d: &str,
+    session_id: &str,
+    registry: &oulipoly_runtime::provider_registry::ProviderRegistry,
+    model: &str,
+    account: &str,
+    instance: &str,
+    settings: &str,
+    cwd: &std::path::Path,
+    generation_id: &str,
+    gate: &std::path::Path,
+    physical_control: Option<&mut root_pty_control::RootPtyControl>,
+) -> Result<(), String> {
+    use base64::Engine as _;
+    use oulipoly_kernel_broker::protocol::FreshRecipientRequest;
+    use oulipoly_runtime::session_provider::{
+        SessionProviderIdentity, SessionProviderPageCursor, SessionProviderReadPageRequest,
+        SessionProviderTurnProjection, read_turn_page,
+    };
+    use oulipoly_state::mailbox::{
+        FreshDeliveryReadback, FreshNativeFObservedTurn, FreshNativeFReceipt, FreshNativeFTransport,
+    };
+    use sha2::{Digest as _, Sha256};
+    let delivery_request_id = uuid::Uuid::new_v4().to_string();
+    let request_path = gate.join("interactive-f-request-id");
+    let mut durable_key = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&request_path)
+        .map_err(|e| e.to_string())?;
+    durable_key
+        .write_all(delivery_request_id.as_bytes())
+        .map_err(|e| e.to_string())?;
+    durable_key.sync_all().map_err(|e| e.to_string())?;
+    File::open(gate)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|e| e.to_string())?;
+    // A broker restart can publish its main control socket before the fresh
+    // recipient listener. Only this no-effect read may wait for readiness.
+    let ready_until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        match protocol::fresh_recipient_request_at(
+            socket,
+            &FreshRecipientRequest::Read {
+                delivery_request_id: delivery_request_id.clone(),
+            },
+        ) {
+            Ok(read) if read["kind"] == "readback" && read["grant"].is_null() => break,
+            Ok(_) => return Err("original interactive F request key already used".into()),
+            Err(_) if std::time::Instant::now() < ready_until => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "original interactive F listener unavailable: {error}"
+                ));
+            }
+        }
+    }
+    let result = protocol::fresh_recipient_request_at(
+        socket,
+        &FreshRecipientRequest::Submit {
+            allocation_request_id: root_d.into(),
+            delivery_request_id: delivery_request_id.clone(),
+        },
+    )
+    .map_err(|e| format!("original interactive F submission unknown: {e}"))?;
+    if result["kind"] != "delivery" {
+        return Err("original interactive F submission reply kind changed".into());
+    }
+    let submitted: FreshDeliveryReadback = serde_json::from_value(result["grant"].clone())
+        .map_err(|e| format!("original interactive F grant absent: {e}"))?;
+    let payload = base64::engine::general_purpose::STANDARD
+        .decode(
+            result["payload_base64"]
+                .as_str()
+                .ok_or("original interactive F bytes absent")?,
+        )
+        .map_err(|e| e.to_string())?;
+    let payload_value: serde_json::Value =
+        serde_json::from_slice(&payload).map_err(|e| e.to_string())?;
+    if submitted.session_id != session_id
+        || payload_value["protocol"] != "fresh-bash-complete-v30"
+        || payload_value["source"]["source_id"] != submitted.source_id
+        || payload_value["source"]["attempt_id"] != submitted.attempt_id
+    {
+        return Err("original interactive F differs from accepted Bash W".into());
+    }
+    let token = result["grant"]["delivery_token"]
+        .as_str()
+        .or_else(|| result["delivery_token"].as_str())
+        .ok_or("original interactive F delivery token absent")?;
+    let read = protocol::fresh_recipient_request_at(
+        socket,
+        &FreshRecipientRequest::Read {
+            delivery_request_id: delivery_request_id.clone(),
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    let grant: FreshDeliveryReadback =
+        serde_json::from_value(read["grant"].clone()).map_err(|e| e.to_string())?;
+    if grant.grant_id != submitted.grant_id
+        || grant.session_id != submitted.session_id
+        || grant.seq != submitted.seq
+        || grant.source_id != submitted.source_id
+        || grant.attempt_id != submitted.attempt_id
+        || grant.payload_sha256 != submitted.payload_sha256
+        || grant.payload_byte_len != submitted.payload_byte_len
+    {
+        return Err("original interactive F readback changed selected grant".into());
+    }
+    let preparation_request_id = uuid::Uuid::new_v4().to_string();
+    let nonce = uuid::Uuid::new_v4().to_string();
+    let prepared = crate::native_f_preparation::prepare_original_recipient_native_f(
+        socket,
+        session_id,
+        &delivery_request_id,
+        &grant,
+        Some(token),
+        Some(
+            crate::native_f_preparation::OriginalRecipientNativeFSource {
+                registry,
+                identity: SessionProviderIdentity {
+                    model_name: model.into(),
+                    provider_name: account.into(),
+                    provider_instance_id: Some(instance.into()),
+                    settings_id: settings.into(),
+                },
+                effective_cwd: cwd,
+                runtime_generation_id: generation_id,
+                preparation_request_id: &preparation_request_id,
+                envelope_nonce: &nonce,
+            },
+        ),
+    )?;
+    let fence = crate::native_f_preparation::fence_original_recipient_native_f(socket, &prepared)?;
+    let duplicate = protocol::fresh_recipient_request_at(
+        socket,
+        &FreshRecipientRequest::BeginNativeFSubmission {
+            preparation_request_id: preparation_request_id.clone(),
+        },
+    );
+    if duplicate.is_ok() {
+        return Err("duplicate native F submission fence accepted".into());
+    }
+    let readback = protocol::fresh_recipient_request_at(
+        socket,
+        &FreshRecipientRequest::ReadNativeFSubmission {
+            preparation_request_id: preparation_request_id.clone(),
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    if readback["fence"] != serde_json::to_value(&fence).map_err(|e| e.to_string())? {
+        return Err("native F submission fence readback changed".into());
+    }
+    std::fs::write(
+        gate.join("interactive-f-fenced.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "delivery_request_id":delivery_request_id,
+            "grant":grant,
+            "preparation":prepared,
+            "fence":fence,
+            "duplicate_error":duplicate.unwrap_err().to_string(),
+        }))
+        .map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    let Some(control) = physical_control else {
+        return Ok(());
+    };
+    let fault = std::env::var("AGE319_PRIVATE_NATIVE_F_FAULT_V1").unwrap_or_default();
+    if fault == "after_fence" {
+        private_native_f_fault_gate(gate, &fault)?;
+        private_native_f_reattest(socket, control, &prepared, &fence)?;
+        return Err("native F fence spent before byte; pending unknown, no replay".into());
+    }
+    let input = format!("{}\n", prepared.envelope_text);
+    let sent = control.send_native_f_once(socket, &fence, input.as_bytes());
+    if fault == "after_partial" {
+        private_native_f_fault_gate(gate, &fault)?;
+        private_native_f_reattest(socket, control, &prepared, &fence)?;
+        return Err("native F partial write unknown; pending, no replay".into());
+    }
+    if std::env::var_os("AGE319_PRIVATE_NATIVE_F_PARTIAL_WRITE_V1").is_some()
+        && sent.is_err()
+        && control
+            .send_native_f_once(socket, &fence, input.as_bytes())
+            .is_ok()
+    {
+        return Err("native F partial write replay accepted".into());
+    }
+    sent?;
+    if fault == "after_write" {
+        private_native_f_fault_gate(gate, &fault)?;
+        private_native_f_reattest(socket, control, &prepared, &fence)?;
+    }
+    if control
+        .send_native_f_once(socket, &fence, input.as_bytes())
+        .is_ok()
+    {
+        return Err("duplicate native F PTY send accepted".into());
+    }
+    let transport_answer = protocol::fresh_recipient_request_at(
+        socket,
+        &FreshRecipientRequest::RecordNativeFTransport {
+            preparation_request_id: preparation_request_id.clone(),
+        },
+    );
+    let transport = if transport_answer.is_err() {
+        private_native_f_reattest(socket, control, &prepared, &fence)?;
+        private_native_f_readback(
+            socket,
+            control,
+            &prepared,
+            &fence,
+            FreshRecipientRequest::ReadNativeFTransport {
+                preparation_request_id: preparation_request_id.clone(),
+            },
+            "transport",
+            "native_f_transport_readback",
+        )?
+    } else {
+        let answer = transport_answer.map_err(|e| e.to_string())?;
+        if answer["kind"] != "native_f_transport" {
+            return Err("native F transport reply changed; pending".into());
+        }
+        answer["transport"].clone()
+    };
+    let transport: FreshNativeFTransport =
+        serde_json::from_value(transport).map_err(|e| e.to_string())?;
+    if transport.preparation_request_id != preparation_request_id
+        || transport.grant_id != fence.grant_id
+        || transport.recipient_identity != fence.recipient_identity
+        || transport.input_sha256 != fence.input_sha256
+        || transport.input_byte_len != fence.input_byte_len
+    {
+        return Err("native F transport readback changed exact fence; pending".into());
+    }
+    let identity = SessionProviderIdentity {
+        model_name: model.into(),
+        provider_name: account.into(),
+        provider_instance_id: Some(instance.into()),
+        settings_id: settings.into(),
+    };
+    let observation_nonce = format!("{:x}", Sha256::digest(prepared.envelope_nonce.as_bytes()));
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let page = loop {
+        let cancellation = oulipoly_provider::client::CancellationToken::new();
+        let page = read_turn_page(SessionProviderReadPageRequest {
+            registry,
+            identity: identity.clone(),
+            session_id,
+            effective_cwd: Some(cwd),
+            projection: SessionProviderTurnProjection::UserObservation,
+            expected_delivery_nonce: Some(&observation_nonce),
+            cursor: SessionProviderPageCursor::Beginning {
+                after_token: Some(prepared.tail_resume_token.clone()),
+            },
+            expected_page_index: 0,
+            expected_turn_sequence: 0,
+            max_turns: 64,
+            max_response_bytes: 256 * 1024,
+            max_source_bytes: 4 * 1024 * 1024,
+            max_inline_body_bytes: 64 * 1024,
+            cancellation: &cancellation,
+            timeout: std::time::Duration::from_secs(2),
+        })
+        .map_err(|e| format!("native F provider readback unknown: {e}"))?;
+        if !page.turns.is_empty() || std::time::Instant::now() >= until {
+            break page;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let turn = page
+        .turns
+        .first()
+        .ok_or("native F provider turn absent; pending")?;
+    let body = turn
+        .body
+        .as_ref()
+        .and_then(|chunks| chunks.as_array())
+        .and_then(|chunks| chunks.first())
+        .and_then(|chunk| chunk["text"].as_str())
+        .ok_or("native F provider body absent; pending")?;
+    if !turn.canonical_text_digest_verified {
+        return Err("native F provider canonical body unverified; pending".into());
+    }
+    let observed = FreshNativeFObservedTurn {
+        provider_instance_id: page.provider_instance_id,
+        settings_id: page.settings_id,
+        provider_session_id: page.session_id,
+        anchor_token: prepared.tail_resume_token.clone(),
+        snapshot_id: page.snapshot_id,
+        page_digest: page.page_digest,
+        page_index: page.page_index,
+        page_start_sequence: page.page_start_sequence,
+        page_turn_count: page.page_turn_count,
+        snapshot_complete: page.snapshot_complete,
+        turn_id: turn.turn_id.clone(),
+        role: turn.role.clone(),
+        nonce: body
+            .lines()
+            .find_map(|line| line.strip_prefix("nonce: "))
+            .unwrap_or_default()
+            .into(),
+        body: body.into(),
+        canonical_text_sha256: turn.canonical_text_sha256.clone().unwrap_or_default(),
+    };
+    if fault == "after_turn" {
+        private_native_f_fault_gate(gate, &fault)?;
+        private_native_f_reattest(socket, control, &prepared, &fence)?;
+    }
+    for changed in ["tail", "turn", "session", "nonce", "body"] {
+        let mut wrong = observed.clone();
+        match changed {
+            "tail" => wrong.anchor_token = "wrong-tail".into(),
+            "turn" => wrong.turn_id = uuid::Uuid::new_v4().to_string(),
+            "session" => wrong.provider_session_id = uuid::Uuid::new_v4().to_string(),
+            "nonce" => wrong.nonce = uuid::Uuid::new_v4().to_string(),
+            "body" => wrong.body.push_str(" wrong-body"),
+            _ => unreachable!(),
+        }
+        if protocol::fresh_recipient_request_at(
+            socket,
+            &FreshRecipientRequest::CertifyNativeFReceipt {
+                preparation_request_id: preparation_request_id.clone(),
+                observed: wrong,
+            },
+        )
+        .is_ok()
+        {
+            return Err(format!("native F {changed} negative receipt was accepted"));
+        }
+    }
+    let receipt_answer = protocol::fresh_recipient_request_at(
+        socket,
+        &FreshRecipientRequest::CertifyNativeFReceipt {
+            preparation_request_id: preparation_request_id.clone(),
+            observed: observed.clone(),
+        },
+    );
+    let receipt = if receipt_answer.is_err() {
+        private_native_f_reattest(socket, control, &prepared, &fence)?;
+        private_native_f_readback(
+            socket,
+            control,
+            &prepared,
+            &fence,
+            FreshRecipientRequest::ReadNativeFReceipt {
+                preparation_request_id: preparation_request_id.clone(),
+            },
+            "receipt",
+            "native_f_receipt_readback",
+        )?
+    } else {
+        let answer = receipt_answer.map_err(|e| e.to_string())?;
+        if answer["kind"] != "native_f_receipt" {
+            return Err("native F receipt reply changed; pending".into());
+        }
+        answer["receipt"].clone()
+    };
+    let receipt: FreshNativeFReceipt =
+        serde_json::from_value(receipt).map_err(|e| e.to_string())?;
+    if receipt.preparation_request_id != preparation_request_id
+        || receipt.grant_id != grant.grant_id
+        || receipt.recipient_identity != fence.recipient_identity
+        || receipt.provider_session_id != prepared.provider_session_id
+        || receipt.envelope_sha256 != prepared.envelope_sha256
+        || receipt.payload_sha256 != prepared.payload_sha256
+        || receipt.observation != observed
+    {
+        return Err("native F receipt readback changed exact native turn; pending".into());
+    }
+    if fault == "after_receipt" {
+        private_native_f_fault_gate(gate, &fault)?;
+        private_native_f_reattest(socket, control, &prepared, &fence)?;
+    }
+    if protocol::fresh_recipient_request_at(
+        socket,
+        &FreshRecipientRequest::CertifyNativeFReceipt {
+            preparation_request_id: preparation_request_id.clone(),
+            observed: observed.clone(),
+        },
+    )
+    .is_ok()
+    {
+        return Err("duplicate native F receipt accepted".into());
+    }
+    if protocol::fresh_recipient_request_at(
+        socket,
+        &FreshRecipientRequest::AcknowledgeNativeFReceipt {
+            preparation_request_id: preparation_request_id.clone(),
+            delivery_token: uuid::Uuid::new_v4().to_string(),
+        },
+    )
+    .is_ok()
+    {
+        return Err("native F wrong-token ACK accepted".into());
+    }
+    let ack_answer = protocol::fresh_recipient_request_at(
+        socket,
+        &FreshRecipientRequest::AcknowledgeNativeFReceipt {
+            preparation_request_id: preparation_request_id.clone(),
+            delivery_token: token.into(),
+        },
+    );
+    let ack = if ack_answer.is_err() {
+        private_native_f_reattest(socket, control, &prepared, &fence)?;
+        private_native_f_readback(
+            socket,
+            control,
+            &prepared,
+            &fence,
+            FreshRecipientRequest::Read {
+                delivery_request_id: delivery_request_id.clone(),
+            },
+            "grant",
+            "readback",
+        )?
+    } else {
+        let answer = ack_answer.map_err(|e| e.to_string())?;
+        if answer["kind"] != "native_f_auto_ack" {
+            return Err("native F ACK reply changed; pending".into());
+        }
+        answer["grant"].clone()
+    };
+    let ack: FreshDeliveryReadback = serde_json::from_value(ack).map_err(|e| e.to_string())?;
+    let mut expected_ack = grant.clone();
+    expected_ack.phase = "acked".into();
+    if ack != expected_ack {
+        return Err("native F ACK readback changed exact grant; pending".into());
+    }
+    let durable_ack: oulipoly_state::mailbox::FreshNativeFAutoAck =
+        serde_json::from_value(private_native_f_readback(
+            socket,
+            control,
+            &prepared,
+            &fence,
+            FreshRecipientRequest::ReadNativeFAutoAck {
+                preparation_request_id: preparation_request_id.clone(),
+            },
+            "ack",
+            "native_f_auto_ack_readback",
+        )?)
+        .map_err(|e| e.to_string())?;
+    if durable_ack.grant_id != grant.grant_id
+        || durable_ack.preparation_request_id != preparation_request_id
+        || durable_ack.delivery_request_id != delivery_request_id
+        || durable_ack.delivery_token_sha256 != prepared.delivery_token_sha256
+        || durable_ack.session_id != grant.session_id
+        || durable_ack.seq != grant.seq
+        || durable_ack.source_id != grant.source_id
+        || durable_ack.attempt_id != grant.attempt_id
+        || durable_ack.recipient_identity_json
+            != serde_json::to_string(&fence.recipient_identity).map_err(|e| e.to_string())?
+        || durable_ack.payload_sha256 != grant.payload_sha256
+        || durable_ack.payload_byte_len != grant.payload_byte_len
+        || durable_ack.turn_id != receipt.turn_id
+        || durable_ack.basis != "native_f_receipt"
+    {
+        return Err("native F automatic ACK row changed exact receipt; pending".into());
+    }
+    if protocol::fresh_recipient_request_at(
+        socket,
+        &FreshRecipientRequest::AcknowledgeNativeFReceipt {
+            preparation_request_id: preparation_request_id.clone(),
+            delivery_token: token.into(),
+        },
+    )
+    .is_ok()
+    {
+        return Err("duplicate native F automatic ACK accepted".into());
+    }
+    std::fs::write(
+        gate.join("interactive-f-physical.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "transport": transport, "receipt": receipt,
+            "ack": ack,
+        }))
+        .map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_native_f_fault_gate(gate: &std::path::Path, stage: &str) -> Result<(), String> {
+    std::fs::write(gate.join("interactive-f-crash-ready"), stage).map_err(|e| e.to_string())?;
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !gate.join("interactive-f-crash-continue").exists() {
+        if std::time::Instant::now() >= until {
+            return Err(format!(
+                "native F {stage} restart gate expired; pending unknown"
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_native_f_reattest(
+    socket: &std::path::Path,
+    control: &root_pty_control::RootPtyControl,
+    prepared: &oulipoly_state::mailbox::FreshNativeFPreparation,
+    fence: &oulipoly_state::mailbox::FreshNativeFSubmission,
+) -> Result<(), String> {
+    use oulipoly_kernel_broker::protocol::{self, FreshRecipientRequest};
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let result: Result<(), String> = (|| {
+            control.broker_resident_readback(socket)?;
+            let key = prepared.preparation_request_id.clone();
+            let read = protocol::fresh_recipient_request_at(
+                socket,
+                &FreshRecipientRequest::ReadNativeFPreparation {
+                    preparation_request_id: key.clone(),
+                },
+            )
+            .map_err(|e| e.to_string())?;
+            let actual: oulipoly_state::mailbox::FreshNativeFPreparation =
+                serde_json::from_value(read["preparation"].clone())
+                    .map_err(|_| "native F preparation absent after crash".to_string())?;
+            if read["kind"] != "native_f_preparation_readback" || actual != *prepared {
+                return Err(
+                    "native F preparation, session, root or source changed after crash".into(),
+                );
+            }
+            let read = protocol::fresh_recipient_request_at(
+                socket,
+                &FreshRecipientRequest::ReadNativeFSubmission {
+                    preparation_request_id: key,
+                },
+            )
+            .map_err(|e| e.to_string())?;
+            let actual: oulipoly_state::mailbox::FreshNativeFSubmission =
+                serde_json::from_value(read["fence"].clone())
+                    .map_err(|_| "native F fence absent after crash".to_string())?;
+            if read["kind"] != "native_f_submission_readback" || actual != *fence {
+                return Err("native F fence changed after crash; no replay".into());
+            }
+            let read = protocol::fresh_recipient_request_at(
+                socket,
+                &FreshRecipientRequest::ReadNativeFReceipt {
+                    preparation_request_id: prepared.preparation_request_id.clone(),
+                },
+            )
+            .map_err(|e| e.to_string())?;
+            if read["kind"] != "native_f_receipt_readback" {
+                return Err("native F receipt readback kind changed".into());
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) if std::time::Instant::now() >= until => {
+                return Err(format!(
+                    "native F reattestation unknown; pending, no replay: {error}"
+                ));
+            }
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_native_f_readback(
+    socket: &std::path::Path,
+    control: &root_pty_control::RootPtyControl,
+    prepared: &oulipoly_state::mailbox::FreshNativeFPreparation,
+    fence: &oulipoly_state::mailbox::FreshNativeFSubmission,
+    request: oulipoly_kernel_broker::protocol::FreshRecipientRequest,
+    field: &str,
+    kind: &str,
+) -> Result<serde_json::Value, String> {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        private_native_f_reattest(socket, control, prepared, fence)?;
+        match oulipoly_kernel_broker::protocol::fresh_recipient_request_at(socket, &request) {
+            Ok(answer) if answer["kind"] == kind && !answer[field].is_null() => {
+                return Ok(answer[field].clone());
+            }
+            Ok(_) => return Err(format!("native F {field} absent after lost reply; pending")),
+            Err(error) if std::time::Instant::now() >= until => {
+                return Err(format!(
+                    "native F {field} readback unknown; pending: {error}"
+                ));
+            }
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]
@@ -842,7 +1547,10 @@ impl oulipoly_runtime::executor::cli::fresh_remote::FreshProviderBackend
         let socket = broker_socket().with_file_name("v30.sock");
         // The broker binds the original descriptor's inode and mount before
         // one-use K. Preflight content observations cannot attest later bytes.
-        let pinned = private_pin_plan(&plan)?;
+        let pinned = private_pin_plan(
+            &plan,
+            oulipoly_kernel_broker::protocol::FreshPlanRole::Headless,
+        )?;
         let submitted = protocol::private_fresh_provider_at(
             &socket,
             &self.authority.receipt.d_key,
@@ -1058,7 +1766,7 @@ fn private_verified_output(
 #[cfg(feature = "age319-private-broker-fixture")]
 fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode, String> {
     use oulipoly_kernel_broker::protocol::{
-        self, FreshAccountEffectKind, FreshAccountEffectRequest, FreshRouteRequest,
+        self, FreshAccountEffectKind, FreshAccountEffectRequest, FreshPlanRole, FreshRouteRequest,
     };
     use oulipoly_runtime::executor::cli::fresh_remote::{
         load_fresh_headless_pool, prepare_fresh_headless, run_prepared_fresh_headless,
@@ -1098,6 +1806,8 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
                     .map_err(|_| "private Bash request absent")?,
                 std::env::var("AGE319_PRIVATE_BASH_EFFECT_MARKER")
                     .map_err(|_| "private Bash marker absent")?,
+                std::env::var("OULIPOLY_DATA_DIR")
+                    .map_err(|_| "private Bash data directory absent")?,
             ]);
             if let Some(mode) = std::env::var_os("AGE319_PRIVATE_BASH_ORDINARY_MODE_V1") {
                 plan.plan.argv.push(mode.to_string_lossy().into_owned());
@@ -1128,15 +1838,54 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
             auth_refresh_command: pool.account_effects[index].1.clone(),
             environment_sha256: None,
         };
-        let pinned = private_pin_plan(&candidate.plan)?;
-        let [image, cwd, input, recipe] = pinned.descriptors();
+        let pinned = private_pin_plan(&candidate.plan, FreshPlanRole::Headless)?;
+        let [image, cwd_fd, input, recipe] = pinned.descriptors();
         protocol::private_fresh_route_at(
             &socket,
             &request,
             b'h',
-            &[image, cwd, input, recipe, config_source.as_raw_fd()],
+            &[image, cwd_fd, input, recipe, config_source.as_raw_fd()],
         )
         .map_err(|e| format!("fresh route candidate refused before K: {e}"))?;
+        if std::env::var_os("AGE319_PRIVATE_ROOT_PTY_CONTROL_V1").is_some() {
+            let interactive =
+                private_interactive_plan(&pool.model, index, &cwd, &authority.session.session_id)?;
+            if std::env::var_os("AGE319_PRIVATE_ROOT_PTY_NEGATIVE_V1").is_some() {
+                let mut mislabeled = interactive.clone();
+                mislabeled.argv = candidate.plan.argv.clone();
+                let wrong = private_pin_plan(&mislabeled, FreshPlanRole::Interactive)?;
+                if protocol::private_fresh_interactive_route_at(
+                    &socket,
+                    &request,
+                    b'(',
+                    &[
+                        wrong.image.as_raw_fd(),
+                        wrong.cwd.as_raw_fd(),
+                        wrong.input.as_raw_fd(),
+                        wrong.recipe.as_raw_fd(),
+                        config_source.as_raw_fd(),
+                    ],
+                )
+                .is_ok()
+                {
+                    return Err("headless argv mislabeled as interactive accepted".into());
+                }
+            }
+            let pinned = private_pin_plan(&interactive, FreshPlanRole::Interactive)?;
+            protocol::private_fresh_interactive_route_at(
+                &socket,
+                &request,
+                b'(',
+                &[
+                    pinned.image.as_raw_fd(),
+                    pinned.cwd.as_raw_fd(),
+                    pinned.input.as_raw_fd(),
+                    pinned.recipe.as_raw_fd(),
+                    config_source.as_raw_fd(),
+                ],
+            )
+            .map_err(|e| format!("interactive route candidate refused before K: {e}"))?;
+        }
     }
     let mut environment = Vec::new();
     for (key, value) in std::env::vars_os() {
@@ -1401,7 +2150,7 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
             .push("--changed-after-selection".into());
     }
     if route_mode.ends_with("physical_bad_actor") {
-        let pinned = private_pin_plan(&selected_plan.plan)?;
+        let pinned = private_pin_plan(&selected_plan.plan, FreshPlanRole::Headless)?;
         let pid = unsafe { libc::fork() };
         if pid < 0 {
             return Err(format!(
@@ -1428,6 +2177,159 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
         }
         return Err("v3 changed actor correctly refused before provider K".into());
     }
+    // The interactive decision is independently durable. The headless plan
+    // stays with the existing K/Q backend; # does not spend an interactive K.
+    let mut selected_interactive = None;
+    let mut root_pty = if std::env::var_os("AGE319_PRIVATE_ROOT_PTY_CONTROL_V1").is_some() {
+        let interactive = protocol::private_fresh_interactive_route_at(
+            &socket,
+            &request,
+            b')',
+            &[config_source.as_raw_fd()],
+        )
+        .map_err(|e| format!("interactive route selection refused before K: {e}"))?
+        .ok_or("interactive route selection absent before K")?;
+        let local_interactive = private_interactive_plan(
+            &pool.model,
+            selected.index,
+            &cwd,
+            &authority.session.session_id,
+        )?;
+        let local_pinned = private_pin_plan(&local_interactive, FreshPlanRole::Interactive)?;
+        let readback = protocol::private_fresh_interactive_route_at(
+            &socket,
+            &request,
+            b')',
+            &[config_source.as_raw_fd()],
+        )
+        .map_err(|e| format!("interactive route readback refused: {e}"))?
+        .ok_or("interactive route readback absent")?;
+        if interactive != readback
+            || interactive.role != FreshPlanRole::Interactive
+            || interactive.model != selected.model
+            || interactive.config_sha256 != selected.config_sha256
+            || interactive.account != selected.account
+            || interactive.index != selected.index
+            || interactive.plan_sha256 == selected.plan_sha256
+        {
+            return Err("interactive selection readback differs from held account".into());
+        }
+        let selected_request = FreshRouteRequest {
+            account: Some(interactive.account.clone()),
+            account_identity: Some(selected.account_identity.clone()),
+            index: Some(interactive.index),
+            quota_script: pool.account_effects[interactive.index].0.clone(),
+            auth_refresh_command: pool.account_effects[interactive.index].1.clone(),
+            ..request.clone()
+        };
+        protocol::private_fresh_interactive_route_at(
+            &socket,
+            &selected_request,
+            b'(',
+            &[
+                local_pinned.image.as_raw_fd(),
+                local_pinned.cwd.as_raw_fd(),
+                local_pinned.input.as_raw_fd(),
+                local_pinned.recipe.as_raw_fd(),
+                config_source.as_raw_fd(),
+            ],
+        )
+        .map_err(|e| format!("selected interactive plan changed before #: {e}"))?;
+        selected_interactive = Some(interactive.clone());
+        let control = root_pty_control::RootPtyControl::offer(
+            &socket,
+            &authority.receipt.d_key,
+            &authority.session.session_id,
+            &selected.account,
+            &interactive.plan_sha256,
+            &std::path::PathBuf::from(
+                std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                    .ok_or("private PTY control directory absent")?,
+            ),
+        )?;
+        if std::env::var_os("AGE319_PRIVATE_ROOT_PTY_NEGATIVE_V1").is_some() {
+            let wrong_role = private_pin_plan(&local_interactive, FreshPlanRole::Headless)?;
+            if control
+                .prepare_interactive_k(
+                    &socket,
+                    [
+                        wrong_role.image.as_raw_fd(),
+                        wrong_role.cwd.as_raw_fd(),
+                        wrong_role.input.as_raw_fd(),
+                        wrong_role.recipe.as_raw_fd(),
+                        config_source.as_raw_fd(),
+                    ],
+                )
+                .is_ok()
+            {
+                return Err("headless recipe accepted as interactive K preparation".into());
+            }
+        }
+        control.prepare_interactive_k(
+            &socket,
+            [
+                local_pinned.image.as_raw_fd(),
+                local_pinned.cwd.as_raw_fd(),
+                local_pinned.input.as_raw_fd(),
+                local_pinned.recipe.as_raw_fd(),
+                config_source.as_raw_fd(),
+            ],
+        )?;
+        Some(control)
+    } else {
+        None
+    };
+    if let Some(control) = &root_pty {
+        if std::env::var_os("AGE319_PRIVATE_ROOT_PTY_NEGATIVE_V1").is_some() {
+            control.probe_wrong_bindings(&socket, &selected.plan_sha256)?;
+        }
+        if std::env::var_os("AGE319_PRIVATE_ROOT_PTY_REPLAY_V1").is_some() {
+            control.rechallenge(&socket)?;
+        }
+        if std::env::var_os("AGE319_PRIVATE_ROOT_PTY_RESTART_V1").is_some() {
+            let gate = std::path::PathBuf::from(
+                std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                    .ok_or("private PTY restart gate absent")?,
+            );
+            std::fs::write(gate.join("root-pty-ready"), b"challenged")
+                .map_err(|e| e.to_string())?;
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !gate.join("root-pty-rechallenge").exists() {
+                if std::time::Instant::now() >= until {
+                    return Err("root PTY broker restart wait expired".into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let readback = protocol::private_fresh_interactive_route_at(
+                &socket,
+                &request,
+                b')',
+                &[config_source.as_raw_fd()],
+            )
+            .map_err(|e| format!("interactive selection restart readback refused: {e}"))?;
+            if readback.as_ref() != selected_interactive.as_ref() {
+                return Err("interactive selection changed after broker restart".into());
+            }
+            control.rechallenge(&socket)?;
+            let interactive = private_interactive_plan(
+                &pool.model,
+                selected.index,
+                &cwd,
+                &authority.session.session_id,
+            )?;
+            let pinned = private_pin_plan(&interactive, FreshPlanRole::Interactive)?;
+            control.prepare_interactive_k(
+                &socket,
+                [
+                    pinned.image.as_raw_fd(),
+                    pinned.cwd.as_raw_fd(),
+                    pinned.input.as_raw_fd(),
+                    pinned.recipe.as_raw_fd(),
+                    config_source.as_raw_fd(),
+                ],
+            )?;
+        }
+    }
     if route_mode.ends_with("physical_source_changed") {
         let gate = std::path::PathBuf::from(
             std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
@@ -1442,12 +2344,206 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
+    if std::env::var_os("AGE319_PRIVATE_ROOT_PTY_PHYSICAL_V1").is_some() {
+        let control = root_pty.as_mut().ok_or("physical PTY control absent")?;
+        if std::env::var_os("AGE319_PRIVATE_ROOT_PTY_PHYSICAL_ACTOR_GATE_V1").is_some() {
+            let gate = std::path::PathBuf::from(
+                std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                    .map_err(|e| e.to_string())?,
+            );
+            std::fs::write(gate.join("physical-before-k"), b"ready").map_err(|e| e.to_string())?;
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !gate.join("physical-continue").exists() {
+                if std::time::Instant::now() >= until {
+                    return Err("physical wrong-actor gate expired".into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        let interactive = private_interactive_plan(
+            &pool.model,
+            selected.index,
+            &cwd,
+            &authority.session.session_id,
+        )?;
+        let pinned = private_pin_plan(&interactive, FreshPlanRole::Interactive)?;
+        let plan_source = [
+            pinned.image.as_raw_fd(),
+            pinned.cwd.as_raw_fd(),
+            pinned.input.as_raw_fd(),
+            pinned.recipe.as_raw_fd(),
+            config_source.as_raw_fd(),
+        ];
+        let resident_mode = std::env::var_os("AGE319_PRIVATE_ROOT_PTY_RESIDENT_V1").is_some();
+        let (q, output) = if resident_mode {
+            let registry = private_resident_registry(&config_dir, &pool.model)?;
+            let endpoint = registry
+                .preflight_account(&selected.account)
+                .map_err(|e| format!("selected resident adapter unavailable before K: {e}"))?;
+            let instance = format!("{}-instance", endpoint.capabilities().provider_id);
+            let settings = endpoint
+                .settings_id()
+                .map_err(|e| e.to_string())?
+                .to_owned();
+            if !endpoint.capabilities().capabilities.session
+                || !endpoint.capabilities().capabilities.session_turn_pages_v1
+            {
+                return Err("selected resident adapter lacks native pages before K".into());
+            }
+            let running = control.start_interactive(&socket, plan_source)?;
+            if let Ok(failure) = std::env::var("AGE319_PRIVATE_RESIDENT_FAILURE_V1") {
+                let gate = std::path::PathBuf::from(
+                    std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                        .map_err(|e| e.to_string())?,
+                );
+                let (q, output) = if failure == "stale_provider" {
+                    let (q, output) = control.finish_interactive(
+                        &socket,
+                        running,
+                        b"fixture-input-through-pty\n",
+                    )?;
+                    let refusal = control.probe_resident_refusal(&socket, &failure)?;
+                    std::fs::write(gate.join("interactive-resident-refusal"), refusal)
+                        .map_err(|e| e.to_string())?;
+                    (q, output)
+                } else {
+                    let refusal = control.probe_resident_refusal(&socket, &failure)?;
+                    std::fs::write(gate.join("interactive-resident-refusal"), refusal)
+                        .map_err(|e| e.to_string())?;
+                    let (q, output) = control.finish_interactive(
+                        &socket,
+                        running,
+                        b"fixture-input-through-pty\n",
+                    )?;
+                    (q, output)
+                };
+                (q, output)
+            } else {
+                let resident = control.register_resident(&socket)?;
+                control.set_selected_adapter(&instance, &settings)?;
+                let challenge = control.challenge_resident()?;
+                if challenge.provider_account != selected.account
+                    || resident["resident"]["registration"]["plan_sha256"]
+                        != selected_interactive
+                            .as_ref()
+                            .ok_or("interactive selection missing for resident")?
+                            .plan_sha256
+                    || challenge.provider_session_id != authority.session.session_id
+                    || challenge.provider_instance_id != instance
+                    || challenge.settings_id != settings
+                    || challenge.generation_id != resident["resident"]["registration"]["grant_id"]
+                {
+                    return Err("resident socket differs from selected adapter or broker K".into());
+                }
+                if private_resident_empty_tail(
+                    &registry,
+                    &pool.model.name,
+                    &selected.account,
+                    &instance,
+                    "wrong-settings",
+                    &authority.session.session_id,
+                    &cwd,
+                )
+                .is_ok()
+                {
+                    return Err("wrong selected adapter settings read native Tail".into());
+                }
+                if private_resident_empty_tail(
+                    &registry,
+                    &pool.model.name,
+                    &selected.account,
+                    &instance,
+                    &settings,
+                    &uuid::Uuid::new_v4().to_string(),
+                    &cwd,
+                )
+                .is_ok()
+                {
+                    return Err("wrong native session read selected Tail".into());
+                }
+                let native = private_resident_empty_tail(
+                    &registry,
+                    &pool.model.name,
+                    &selected.account,
+                    &instance,
+                    &settings,
+                    &authority.session.session_id,
+                    &cwd,
+                )?;
+                let broker_challenged = control.broker_resident_readback(&socket)?;
+                if broker_challenged["resident"] != resident["resident"]
+                    || broker_challenged["generation"] != resident["generation"]
+                    || broker_challenged["socket"]["provider_instance_id"] != instance
+                    || broker_challenged["socket"]["settings_id"] != settings
+                {
+                    return Err("broker resident readback changed after native Tail".into());
+                }
+                let gate = std::path::PathBuf::from(
+                    std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                        .map_err(|e| e.to_string())?,
+                );
+                std::fs::write(
+                    gate.join("interactive-resident-readback.json"),
+                    serde_json::to_vec(&serde_json::json!({
+                        "broker": broker_challenged, "socket": challenge, "native_tail": native,
+                    }))
+                    .map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| e.to_string())?;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+                while !gate.join("interactive-resident-continue").exists() {
+                    if std::time::Instant::now() >= deadline {
+                        return Err("resident live readback gate expired".into());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                if std::env::var_os("AGE319_PRIVATE_ROOT_PTY_NATIVE_F_FENCE_V1").is_some() {
+                    private_resident_fence_pending_f(
+                        &socket,
+                        &authority.receipt.d_key,
+                        &authority.session.session_id,
+                        &registry,
+                        &pool.model.name,
+                        &selected.account,
+                        &instance,
+                        &settings,
+                        &cwd,
+                        challenge.generation_id.as_str(),
+                        &gate,
+                        if std::env::var_os("AGE319_PRIVATE_ROOT_PTY_NATIVE_F_PHYSICAL_V1")
+                            .is_some()
+                        {
+                            Some(control)
+                        } else {
+                            None
+                        },
+                    )?;
+                }
+                control.finish_interactive(&socket, running, b"fixture-input-through-pty\n")?
+            }
+        } else {
+            control.run_interactive(&socket, plan_source, b"fixture-input-through-pty\n")?
+        };
+        let gate = std::path::PathBuf::from(
+            std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                .map_err(|e| e.to_string())?,
+        );
+        std::fs::write(gate.join("interactive-q-readback"), q).map_err(|e| e.to_string())?;
+        std::fs::write(gate.join("interactive-output-readback"), output)
+            .map_err(|e| e.to_string())?;
+        if resident_mode {
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
     let mut backend = PrivateFreshBroker {
         authority,
         grant_id: None,
         raw_result: None,
     };
     let result = run_prepared_fresh_headless(selected_plan, &mut backend)?;
+    if let Some(control) = &root_pty {
+        control.ensure_live()?;
+    }
     let typed_auth_rejection = oulipoly_runtime::diagnostics::non_quota_failure_diagnosis(
         &result.stderr,
         result.exit_code,
@@ -1840,7 +2936,10 @@ fn private_bash_recipient_probe(
     use protocol::FreshRecipientRequest;
     use sha2::Digest as _;
     let mode = std::env::var("AGE319_PRIVATE_BASH_RECIPIENT_MODE_V1").map_err(|e| e.to_string())?;
-    if !matches!(mode.as_str(), "ack" | "lost_pending") {
+    if !matches!(
+        mode.as_str(),
+        "ack" | "lost_pending" | "prepare_unavailable"
+    ) {
         return Err("invalid private Bash recipient mode".into());
     }
     let request_id = std::env::var("AGE319_PRIVATE_BASH_REQUEST_KEY").map_err(|e| e.to_string())?;
@@ -1959,6 +3058,73 @@ fn private_bash_recipient_probe(
     if lookup["payload_base64"] != delivered["payload_base64"] {
         return Err("read-only lookup changed fresh F bytes".into());
     }
+    let preparation_refusal = if mode == "prepare_unavailable" {
+        let read = protocol::fresh_recipient_request_at(
+            socket,
+            &FreshRecipientRequest::Read {
+                delivery_request_id: delivery_request_id.clone(),
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        let exact: oulipoly_state::mailbox::FreshDeliveryReadback =
+            serde_json::from_value(read["grant"].clone()).map_err(|e| e.to_string())?;
+        if exact.grant_id != grant["grant_id"]
+            || exact.session_id != grant["session_id"]
+            || exact.seq != seq
+            || exact.source_id != grant["source_id"]
+            || exact.attempt_id != grant["attempt_id"]
+        {
+            return Err("native F original recipient readback changed F".into());
+        }
+        let token = grant["delivery_token"]
+            .as_str()
+            .ok_or("native F original F token absent")?;
+        let wrong_session = crate::native_f_preparation::prepare_original_recipient_native_f(
+            socket,
+            &uuid::Uuid::new_v4().to_string(),
+            &delivery_request_id,
+            &exact,
+            Some(token),
+            None,
+        )
+        .expect_err("wrong fresh session unexpectedly prepared native F");
+        if wrong_session != "native F original recipient grant or fresh session changed" {
+            return Err(format!(
+                "native F wrong-session refusal changed: {wrong_session}"
+            ));
+        }
+        let lost_token = crate::native_f_preparation::prepare_original_recipient_native_f(
+            socket,
+            &exact.session_id,
+            &delivery_request_id,
+            &exact,
+            None,
+            None,
+        )
+        .expect_err("lost F token unexpectedly prepared native F");
+        if lost_token != "native F delivery token unknown after lost F reply" {
+            return Err(format!("native F lost-token refusal changed: {lost_token}"));
+        }
+        let mut refusal = None;
+        for _ in 0..2 {
+            let error = crate::native_f_preparation::prepare_original_recipient_native_f(
+                socket,
+                &exact.session_id,
+                &delivery_request_id,
+                &exact,
+                Some(token),
+                None,
+            )
+            .expect_err("headless private root unexpectedly prepared native F");
+            if refusal.as_ref().is_some_and(|previous| previous != &error) {
+                return Err("native F unavailable retry changed refusal".into());
+            }
+            refusal = Some(error);
+        }
+        refusal
+    } else {
+        None
+    };
     if mode == "ack" {
         if protocol::fresh_recipient_request_at(
             socket,
@@ -2006,6 +3172,7 @@ fn private_bash_recipient_probe(
         serde_json::to_vec(
             &serde_json::json!({"mode":mode,"listener_policy":"notify_at_admission",
             "delivery_request_id":delivery_request_id,"grant":grant,"readback":read,
+            "native_f_preparation_refusal":preparation_refusal,
             "observed_payload_sha256":format!("{:x}",sha2::Sha256::digest(&bytes))}),
         )
         .map_err(|e| e.to_string())?,

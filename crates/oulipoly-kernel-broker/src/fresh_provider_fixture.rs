@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 
 const CAUSAL_BASH_INTERMEDIARY_DELAY: std::time::Duration = std::time::Duration::from_millis(80);
 
-fn causal_bash(args: &[String]) -> std::io::Result<()> {
+fn causal_bash(args: &[String], hold_survivor: bool, hold_start: bool) -> std::io::Result<()> {
     let marker = std::path::Path::new(&args[0]);
     let gate = marker
         .parent()
@@ -60,6 +60,16 @@ fn causal_bash(args: &[String]) -> std::io::Result<()> {
     std::thread::sleep(CAUSAL_BASH_INTERMEDIARY_DELAY);
     let outcome = (|| -> std::io::Result<()> {
         std::fs::write(gate.join("causal-intermediary-start"), b"started")?;
+        if hold_start {
+            std::fs::write(gate.join("causal-before-c"), b"ready")?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !gate.join("causal-release-c").exists() {
+                if std::time::Instant::now() >= deadline {
+                    return Err(std::io::Error::other("causal C release expired"));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
         let status = std::fs::read_to_string("/proc/self/status")?;
         let proc_pid = status
             .lines()
@@ -67,7 +77,7 @@ fn causal_bash(args: &[String]) -> std::io::Result<()> {
             .ok_or_else(|| std::io::Error::other("intermediary proc PID absent"))?
             .trim();
         std::fs::write(gate.join("causal-intermediary-proc-pid"), proc_pid)?;
-        if args.get(5).map(String::as_str) != Some("ordinary-sync-parent-output") {
+        if hold_survivor && args.get(6).map(String::as_str) != Some("ordinary-sync-parent-output") {
             let survivor = unsafe { libc::fork() };
             if survivor < 0 {
                 return Err(std::io::Error::last_os_error());
@@ -82,17 +92,17 @@ fn causal_bash(args: &[String]) -> std::io::Result<()> {
             }
         }
         if !args
-            .get(5)
+            .get(6)
             .is_some_and(|option| option.starts_with("ordinary-"))
             && unsafe { libc::unshare(libc::CLONE_NEWPID) } != 0
         {
             return Err(std::io::Error::last_os_error());
         }
         if args
-            .get(5)
+            .get(6)
             .is_some_and(|option| option.starts_with("ordinary-"))
         {
-            if args[5] == "ordinary-refuse" {
+            if args[6] == "ordinary-refuse" {
                 use std::os::unix::fs::PermissionsExt;
                 let refused_shebang = gate.join("ordinary-refused-shebang");
                 std::fs::write(&refused_shebang, "#!/bin/sh\nprintf effect > \"$1\"\n")?;
@@ -223,7 +233,7 @@ fn causal_bash(args: &[String]) -> std::io::Result<()> {
                     serde_json::to_vec(&statuses)?,
                 )?;
             } else {
-                let script_case = args[5].starts_with("ordinary-script");
+                let script_case = args[6].starts_with("ordinary-script");
                 let script_path = gate.join("script-bin/scriptcmd");
                 if script_case {
                     use std::os::unix::fs::PermissionsExt;
@@ -234,21 +244,21 @@ fn causal_bash(args: &[String]) -> std::io::Result<()> {
                     )?;
                     std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?;
                 }
-                let mode = if args[5] == "ordinary-async" || args[5] == "ordinary-restart" {
+                let mode = if args[6] == "ordinary-async" || args[6] == "ordinary-restart" {
                     "async"
                 } else {
                     "sync"
                 };
-                let delay = if args[5] == "ordinary-restart" || args[5] == "ordinary-cancel" {
+                let delay = if args[6] == "ordinary-restart" || args[6] == "ordinary-cancel" {
                     "2"
                 } else {
                     "0.3"
                 };
-                let ending = if args[5] == "ordinary-failure" {
+                let ending = if args[6] == "ordinary-failure" {
                     "exit 37"
-                } else if args[5] == "ordinary-sync-signal" {
+                } else if args[6] == "ordinary-sync-signal" {
                     "kill -TERM $$"
-                } else if args[5] == "ordinary-sync-large" {
+                } else if args[6] == "ordinary-sync-large" {
                     "head -c 200000 /dev/zero"
                 } else {
                     ":"
@@ -257,7 +267,7 @@ fn causal_bash(args: &[String]) -> std::io::Result<()> {
                     "test -c /dev/stdin || exit 90; test \"$AGE319_ORDINARY_EFFECTIVE_ENV\" = original-value || exit 91; printf '\\001\\377ordinary\\000'; printf 'err\\000\\376' >&2; printf effect > \"$1\"; (sleep {delay}; printf background > \"$2\") & {ending}"
                 );
                 let image = gate.join("ordinary-elf-image");
-                if args[5] == "ordinary-elf" {
+                if args[6] == "ordinary-elf" {
                     use std::os::unix::ffi::OsStrExt;
                     use std::os::unix::fs::PermissionsExt;
                     std::fs::copy("/bin/sh", &image)?;
@@ -282,7 +292,7 @@ fn causal_bash(args: &[String]) -> std::io::Result<()> {
                 command.args(["run", "--delivery", mode, "--"]);
                 if script_case {
                     command.args(["scriptcmd", "alpha", "beta"]);
-                } else if args[5] == "ordinary-elf" {
+                } else if args[6] == "ordinary-elf" {
                     command.arg(&image).args(["-c", script.as_str(), "sh"]);
                 } else {
                     command.args(["sh", "-c", script.as_str(), "sh"]);
@@ -308,57 +318,57 @@ fn causal_bash(args: &[String]) -> std::io::Result<()> {
                             "age319-secret-must-stay-in-memfd-319",
                         )
                         .envs(
-                            (args[5] == "ordinary-loss" || args[5] == "ordinary-script-loss")
+                            (args[6] == "ordinary-loss" || args[6] == "ordinary-script-loss")
                                 .then_some(("AGE319_PRIVATE_ORDINARY_DROP_C_REPLY_V1", "1")),
                         )
                         .envs(
-                            (args[5] == "ordinary-loss" || args[5] == "ordinary-script-loss")
+                            (args[6] == "ordinary-loss" || args[6] == "ordinary-script-loss")
                                 .then_some(("AGE319_PRIVATE_ORDINARY_DROP_K_REPLY_V1", "1")),
                         )
                         .envs(
-                            (args[5] == "ordinary-loss" || args[5] == "ordinary-script-loss")
+                            (args[6] == "ordinary-loss" || args[6] == "ordinary-script-loss")
                                 .then_some(("AGE319_PRIVATE_ORDINARY_DROP_Q_REPLY_V1", "1")),
                         )
                         .envs(
-                            (args[5] == "ordinary-loss" || args[5] == "ordinary-script-loss")
+                            (args[6] == "ordinary-loss" || args[6] == "ordinary-script-loss")
                                 .then_some(("AGE319_PRIVATE_ORDINARY_DROP_W_REPLY_V1", "1")),
                         )
                         .envs(
-                            (args[5] == "ordinary-cancel")
+                            (args[6] == "ordinary-cancel")
                                 .then_some(("AGE319_PRIVATE_ORDINARY_CANCEL_AFTER_K_V1", "1")),
                         )
                         .envs(
-                            (args[5] == "ordinary-async")
+                            (args[6] == "ordinary-async")
                                 .then_some(("AGE319_PRIVATE_ASYNC_PROBE_SYNC_REFUSAL_V1", "1")),
                         )
                         .envs(
-                            (args[5] == "ordinary-sync-reply-loss")
+                            (args[6] == "ordinary-sync-reply-loss")
                                 .then_some(("AGE319_PRIVATE_SYNC_DROP_BEGIN_REPLY_V1", "1")),
                         )
                         .envs(
-                            (args[5] == "ordinary-sync-partial")
+                            (args[6] == "ordinary-sync-partial")
                                 .then_some(("AGE319_PRIVATE_SYNC_PARTIAL_CALLER_WRITE_V1", "1")),
                         )
                         .envs(
-                            (args[5] == "ordinary-sync-repeat")
+                            (args[6] == "ordinary-sync-repeat")
                                 .then_some(("AGE319_PRIVATE_SYNC_REPEAT_BEGIN_V1", "1")),
                         )
-                        .envs((args[5] == "ordinary-sync-tamper").then_some((
+                        .envs((args[6] == "ordinary-sync-tamper").then_some((
                             "AGE319_PRIVATE_SYNC_PAUSE_AFTER_W_DIR_V1",
                             gate.as_os_str(),
                         )))
-                        .envs((args[5] == "ordinary-sync-post-tamper").then_some((
+                        .envs((args[6] == "ordinary-sync-post-tamper").then_some((
                             "AGE319_PRIVATE_SYNC_PAUSE_AFTER_BEGIN_DIR_V1",
                             gate.as_os_str(),
                         )))
-                        .envs((args[5] == "ordinary-sync-encode-tamper").then_some((
+                        .envs((args[6] == "ordinary-sync-encode-tamper").then_some((
                             "AGE319_PRIVATE_SYNC_PAUSE_AFTER_VERIFY_DIR_V1",
                             gate.as_os_str(),
                         )))
                         .envs(
-                            (args[5] == "ordinary-parent-tamper"
-                                || args[5] == "ordinary-script-replace"
-                                || args[5] == "ordinary-script-remove")
+                            (args[6] == "ordinary-parent-tamper"
+                                || args[6] == "ordinary-script-replace"
+                                || args[6] == "ordinary-script-remove")
                                 .then_some((
                                     "AGE319_PRIVATE_ORDINARY_PAUSE_AFTER_C_DIR_V1",
                                     gate.as_os_str(),
@@ -378,7 +388,7 @@ fn causal_bash(args: &[String]) -> std::io::Result<()> {
                     gate.join("ordinary-bash-status"),
                     status.code().unwrap_or(70).to_string(),
                 )?;
-                if args[5] == "ordinary-copy" && status.success() {
+                if args[6] == "ordinary-copy" && status.success() {
                     let report: serde_json::Value =
                         serde_json::from_slice(&std::fs::read(gate.join("bash-causal-output"))?)?;
                     let copied = report["publication"]["child"]["request_id"]
@@ -439,7 +449,8 @@ fn causal_bash(args: &[String]) -> std::io::Result<()> {
             let child = Command::new(&args[1])
                 .arg("__age319-private-admit-child-v1")
                 .args([&args[2], &args[3], &args[4]])
-                .args(args.get(5))
+                .args(args.get(6))
+                .env("OULIPOLY_DATA_DIR", &args[5])
                 .env_clear()
                 .env("PATH", "/usr/bin:/bin")
                 .stdin(Stdio::null())
@@ -464,6 +475,101 @@ fn causal_bash(args: &[String]) -> std::io::Result<()> {
 
 fn main() -> std::io::Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "--interactive-only") {
+        if args.len() != 2 && args.len() != 7 && args.len() != 8 {
+            return Err(std::io::Error::other(
+                "interactive fixture arguments changed",
+            ));
+        }
+        let tty = unsafe { libc::isatty(0) } == 1
+            && unsafe { libc::isatty(1) } == 1
+            && unsafe { libc::tcgetsid(0) } == unsafe { libc::getsid(0) };
+        let native_store = std::env::var("AGE319_PRIVATE_NATIVE_STORE").ok();
+        if let Some(path) = native_store.as_deref() {
+            let session_id = std::env::var("AGE319_PRIVATE_NATIVE_SESSION")
+                .map_err(|_| std::io::Error::other("broker-minted native session absent"))?;
+            let native = serde_json::json!({
+                "format": "age319-interactive-native-session/v1",
+                "session_id": session_id,
+                "store_nonce": uuid::Uuid::new_v4().to_string(),
+                "provider_local_pid": unsafe { libc::getpid() },
+                "controlling_tty": tty,
+                "turns": [],
+            });
+            let mut store = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)?;
+            store.write_all(&serde_json::to_vec(&native)?)?;
+            store.sync_all()?;
+        }
+        if args.len() >= 7 {
+            causal_bash(&args[1..], false, true)?;
+        }
+        std::io::stdout().write_all(b"interactive-ready\n")?;
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if input == "[Oulipoly native F v1]\n" {
+            let mut envelope = input.clone();
+            loop {
+                let mut line = String::new();
+                if std::io::stdin().read_line(&mut line)? == 0 || envelope.len() > 256 * 1024 {
+                    return Err(std::io::Error::other("native F envelope incomplete"));
+                }
+                let end = line == "[/Oulipoly native F v1]\n";
+                envelope.push_str(&line);
+                if end {
+                    break;
+                }
+            }
+            let path = native_store.ok_or_else(|| std::io::Error::other("native store absent"))?;
+            let mut native: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+            let body = envelope.trim_end_matches('\n');
+            let field = |prefix: &str| -> std::io::Result<String> {
+                body.lines()
+                    .find_map(|line| line.strip_prefix(prefix))
+                    .map(str::to_owned)
+                    .ok_or_else(|| std::io::Error::other("native F field absent"))
+            };
+            let turn = serde_json::json!({
+                "turn_id": uuid::Uuid::new_v4().to_string(),
+                "body": body,
+                "nonce": field("nonce: ")?,
+                "session_id": field("session: ")?,
+                "payload_sha256": field("payload-sha256: ")?,
+                "payload_base64": field("payload-base64: ")?,
+            });
+            native["turns"]
+                .as_array_mut()
+                .ok_or_else(|| std::io::Error::other("native turns absent"))?
+                .push(turn);
+            let staged = format!("{path}.provider-staged");
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&staged)?;
+            file.write_all(&serde_json::to_vec(&native)?)?;
+            file.sync_all()?;
+            std::fs::rename(staged, &path)?;
+            input.clear();
+            std::io::stdin().read_line(&mut input)?;
+        }
+        let evidence = serde_json::json!({
+            "controlling_tty": tty,
+            "input": input,
+            "pid": unsafe { libc::getpid() },
+        });
+        std::fs::write(&args[1], serde_json::to_vec(&evidence)?)?;
+        std::io::stdout().write_all(b"interactive-output:")?;
+        std::io::stdout().write_all(input.as_bytes())?;
+        return if tty {
+            Ok(())
+        } else {
+            Err(std::io::Error::other("no controlling tty"))
+        };
+    }
     let marker = args
         .first()
         .ok_or_else(|| std::io::Error::other("marker absent"))?;
@@ -508,8 +614,8 @@ fn main() -> std::io::Result<()> {
         .open(marker)?;
     file.write_all(b"one-provider-effect\n")?;
     file.sync_all()?;
-    if args.len() == 5 || args.len() == 6 {
-        return causal_bash(&args);
+    if args.len() == 6 || args.len() == 7 {
+        return causal_bash(&args, true, false);
     }
     if args.len() != 1
         && !(args.len() == 2
