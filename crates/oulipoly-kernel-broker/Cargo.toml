@@ -34,6 +34,7 @@ chrono.workspace = true
 uuid.workspace = true
 oulipoly-state = { path = "../oulipoly-state" }
 oulipoly-runtime = { path = "../oulipoly-runtime" }
+rusqlite.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -9210,6 +9210,22 @@ fn inner() {
             );
             if let Some((invocation, session, capability)) = &source_witness {
                 eventually(|| {
+                    gate.join("source-auth-negative").exists()
+                        || entry.try_wait().unwrap().is_some()
+                });
+                assert!(
+                    gate.join("source-auth-negative").exists(),
+                    "source child: {} broker: {}",
+                    fs::read_to_string(&err).unwrap(),
+                    fs::read_to_string(&broker_log).unwrap()
+                );
+                let journal_path = broker_state.join("source-decisions/decisions.db");
+                assert!(
+                    !journal_path.exists(),
+                    "authentication failure created a decision journal"
+                );
+                fs::write(gate.join("source-auth-checked"), b"yes").unwrap();
+                eventually(|| {
                     gate.join("source-witness-positive").exists()
                         || entry.try_wait().unwrap().is_some()
                 });
@@ -9228,6 +9244,72 @@ fn inner() {
                 assert_eq!(marker["owner_generation"], prepared.owner_generation);
                 assert_eq!(marker["invocation_uuid"], *invocation);
                 assert_eq!(marker["session_id"], *session);
+                let read_decisions = || {
+                    rusqlite::Connection::open_with_flags(
+                        &journal_path,
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                    )
+                    .unwrap()
+                };
+                let journal = read_decisions();
+                let count: i64 = journal
+                    .query_row("SELECT count(*) FROM decisions", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(count, 1, "lost reply or retry created another decision");
+                let (request_id, decision_id, claims_bytes): (String, String, Vec<u8>) = journal
+                    .query_row(
+                        "SELECT request_id,decision_id,claims FROM decisions",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .unwrap();
+                assert_eq!(request_id, marker["request_id"]);
+                assert_eq!(decision_id, marker["decision"]["decision_id"]);
+                let claims: serde_json::Value = serde_json::from_slice(&claims_bytes).unwrap();
+                assert_eq!(claims["root_id"], prepared.root_id);
+                assert_eq!(claims["root_init"]["host_pid"], prepared.root_init.host_pid);
+                assert_eq!(claims["owner_generation"], prepared.owner_generation);
+                assert_eq!(claims["owner_invocation_uuid"], *invocation);
+                assert_eq!(claims["owner_session_id"], *session);
+                drop(journal);
+                stop(&mut broker);
+                broker = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
+                    .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                    .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
+                    .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
+                    .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+                    .stderr(Stdio::from(
+                        File::create(temp.path().join("source-broker-restart.log")).unwrap(),
+                    ))
+                    .spawn()
+                    .unwrap();
+                eventually(|| {
+                    protocol::request_at(&socket, Operation::Classify).is_ok()
+                        || broker.try_wait().unwrap().is_some()
+                });
+                assert!(
+                    broker.try_wait().unwrap().is_none(),
+                    "source broker restart: {}",
+                    fs::read_to_string(temp.path().join("source-broker-restart.log")).unwrap()
+                );
+                fs::write(gate.join("source-broker-restarted"), b"yes").unwrap();
+                eventually(|| {
+                    gate.join("source-restart-readback").exists()
+                        || entry.try_wait().unwrap().is_some()
+                });
+                assert!(
+                    gate.join("source-restart-readback").exists(),
+                    "source restart: {} broker: {}",
+                    fs::read_to_string(&err).unwrap(),
+                    fs::read_to_string(temp.path().join("source-broker-restart.log")).unwrap()
+                );
+                assert_eq!(
+                    read_decisions()
+                        .query_row::<i64, _, _>("SELECT count(*) FROM decisions", [], |row| row
+                            .get(0))
+                        .unwrap(),
+                    1
+                );
                 let registration_path =
                     std::path::PathBuf::from(marker["registration_path"].as_str().unwrap());
                 let registration = fs::OpenOptions::new()
@@ -9838,21 +9920,25 @@ fn inner() {
                 assert_eq!(fs::metadata(&out).unwrap().len(), 0);
                 stop(&mut premature_restart);
             }
-            if mode != "held_release_broker_death" {
+            if mode != "held_release_broker_death" && source_witness.is_none() {
                 fs::write(gate.join("child-effect"), b"yes").unwrap();
             }
             if mode == "held_release"
                 || mode == "held_release_lost_reply"
                 || mode == "held_release_prepare_lost_reply"
                 || mode == "held_release_driver_route"
-                || mode == "held_release_source_witness"
             {
                 eventually(|| {
                     fs::metadata(&out).unwrap().len() > 0 || entry.try_wait().unwrap().is_some()
                 });
                 assert_eq!(
                     fs::read_to_string(&out).unwrap(),
-                    format!("OULIPOLY_KERNEL_V30_CHILD_EFFECT={}\n", evidence.release_id)
+                    format!("OULIPOLY_KERNEL_V30_CHILD_EFFECT={}\n", evidence.release_id),
+                    "child: {} broker: {} source-stage: {:?}",
+                    fs::read_to_string(&err).unwrap(),
+                    fs::read_to_string(temp.path().join("source-broker-restart.log"))
+                        .unwrap_or_default(),
+                    fs::read_to_string(gate.join("source-stage")),
                 );
             } else {
                 std::thread::sleep(Duration::from_millis(200));

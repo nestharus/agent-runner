@@ -2074,12 +2074,11 @@ pub struct OwnerWitness {
     pub registration_authority_sha256: Option<String>,
 }
 
-/// Private diagnostic only: asserted fields are checked against the live V
-/// peer, retained held release, received file, and original bound State.
-#[cfg(feature = "age319-private-broker-fixture")]
+/// Asserted fields are checked against the live V peer, retained held release,
+/// received file, and original bound State before an exact decision is issued.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PrivateSourceWitnessProbe {
+pub struct SourceWitnessProbe {
     pub owner: OwnerWitness,
     pub source_generation: String,
     pub owner_generation: String,
@@ -2091,7 +2090,49 @@ pub struct PrivateSourceWitnessProbe {
     pub capability: String,
 }
 
+#[cfg(feature = "age319-private-broker-fixture")]
+pub type PrivateSourceWitnessProbe = SourceWitnessProbe;
+
+/// The request ID is chosen and retained by the original child before its
+/// first challenged request. A retry must present the same live evidence.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExactSourceDecisionRequest {
+    pub request_id: String,
+    pub witness: SourceWitnessProbe,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExactSourceDecisionReadback {
+    pub request_id: String,
+    pub decision_id: String,
+    pub issued_unix_seconds: i64,
+    pub expires_unix_seconds: i64,
+    pub root_id: String,
+    pub root_init: oulipoly_state::mailbox::PreparedProcessStamp,
+    pub source_generation: String,
+    pub owner_generation: String,
+    pub owner_uid: u32,
+    pub domain_id: String,
+    pub supervisor_id: String,
+    pub guardian: ProcessWitness,
+    pub driver: ProcessWitness,
+    pub issuer: crate::entry_registry::ProcessStamp,
+    pub owner_session_id: String,
+    pub owner_invocation_uuid: String,
+    pub capability_digest: String,
+    pub handle: String,
+    pub caller_admission_id: String,
+    pub registration_id: String,
+    pub registration_path: std::path::PathBuf,
+    pub registration_device: u64,
+    pub registration_inode: u64,
+    pub registration_len: u64,
+    pub registration_sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessWitness {
     pub host_pid: i32,
@@ -2445,7 +2486,8 @@ fn send_native_descriptors_frame<T: serde::Serialize, const N: usize>(
     descriptors: [RawFd; N],
 ) -> io::Result<UnixStream> {
     let body = serde_json::to_vec(spec)?;
-    if body.len() > 2048 {
+    let body_limit = if operation == b':' { 8192 } else { 2048 };
+    if body.len() > body_limit {
         return Err(io::Error::other("native prepare request too large"));
     }
     let mut stream = checked_connection(path)?;
@@ -3023,6 +3065,59 @@ pub fn private_source_witness_probe_at(
         return Err(io::Error::other(response));
     }
     Ok(())
+}
+
+/// The v30 issuer accepts the same two descriptors as the diagnostic, but
+/// persists a decision before returning a readback. The caller must retain
+/// `request_id` across an uncertain socket result.
+pub fn issue_exact_source_decision_at(
+    path: &Path,
+    request: &ExactSourceDecisionRequest,
+    owner_fd: RawFd,
+    registration_fd: RawFd,
+) -> io::Result<ExactSourceDecisionReadback> {
+    let stream = send_native_descriptors_frame(path, b':', request, [owner_fd, registration_fd])?;
+    let response = read_exact_source_decision_response(stream)?;
+    if response.request_id != request.request_id
+        || response.root_id != request.witness.owner.root_id
+        || response.registration_sha256 != request.witness.registration_sha256
+    {
+        return Err(io::Error::other("exact source decision reply mismatch"));
+    }
+    Ok(response)
+}
+
+/// Private test seam for a reply lost after the broker has committed.
+#[cfg(feature = "age319-private-broker-fixture")]
+pub fn issue_exact_source_decision_drop_reply_at(
+    path: &Path,
+    request: &ExactSourceDecisionRequest,
+    owner_fd: RawFd,
+    registration_fd: RawFd,
+) -> io::Result<()> {
+    drop(send_native_descriptors_frame(
+        path,
+        b':',
+        request,
+        [owner_fd, registration_fd],
+    )?);
+    Ok(())
+}
+
+fn read_exact_source_decision_response(
+    stream: UnixStream,
+) -> io::Result<ExactSourceDecisionReadback> {
+    let mut response = Vec::new();
+    stream.take(4097).read_to_end(&mut response)?;
+    if response.starts_with(b"error ") {
+        return Err(io::Error::other(
+            String::from_utf8_lossy(&response).trim().to_owned(),
+        ));
+    }
+    if response.len() > 4096 || !response.ends_with(b"\n") {
+        return Err(io::Error::other("invalid exact source decision reply"));
+    }
+    serde_json::from_slice(&response).map_err(io::Error::other)
 }
 
 fn checked_connection(path: &Path) -> io::Result<UnixStream> {

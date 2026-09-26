@@ -659,10 +659,9 @@ impl BrokerSidecar {
         Ok(state)
     }
 
-    /// Diagnostic read of the original, inode-bound State invocation. This
-    /// never registers a source or advances an invocation lifecycle.
-    #[cfg(feature = "age319-private-broker-fixture")]
-    pub fn verify_private_bound_invocation(
+    /// Read of the original, inode-bound State invocation before a broker
+    /// source decision. This never registers a source or advances a lifecycle.
+    pub fn verify_bound_invocation(
         &self,
         invocation_uuid: &str,
         session_id: &str,

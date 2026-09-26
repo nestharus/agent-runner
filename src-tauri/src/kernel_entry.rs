@@ -382,7 +382,7 @@ fn private_v30_source_witness(
     gate_dir: &std::path::Path,
 ) -> Result<(), String> {
     use oulipoly_kernel_broker::protocol::{
-        OwnerWitness, PrivateSourceWitnessProbe, ProcessWitness,
+        ExactSourceDecisionRequest, OwnerWitness, PrivateSourceWitnessProbe, ProcessWitness,
     };
     use sha2::{Digest, Sha256};
     use std::os::unix::fs::OpenOptionsExt;
@@ -509,10 +509,14 @@ fn private_v30_source_witness(
         capability,
     };
     let broker = broker_socket();
+    let request_id = uuid::Uuid::new_v4().to_string();
     let check = |probe: &PrivateSourceWitnessProbe, fd: &File| {
-        protocol::private_source_witness_probe_at(
+        protocol::issue_exact_source_decision_at(
             &broker,
-            probe,
+            &ExactSourceDecisionRequest {
+                request_id: request_id.clone(),
+                witness: probe.clone(),
+            },
             owner_socket.as_raw_fd(),
             fd.as_raw_fd(),
         )
@@ -520,14 +524,13 @@ fn private_v30_source_witness(
     if protocol::verify_owner_at(&broker, &witness, owner_socket.as_raw_fd()).is_ok() {
         return Err("legacy V opened under v30 cutover".into());
     }
-    std::fs::write(gate_dir.join("source-stage"), b"requesting-broker")
-        .map_err(|e| e.to_string())?;
-    check(&probe, &registration).map_err(|e| format!("combined source witness: {e}"))?;
-    std::fs::write(gate_dir.join("source-stage"), b"broker-positive").map_err(|e| e.to_string())?;
     let (wrong_guardian, _peer) = UnixStream::pair().map_err(|e| e.to_string())?;
-    if !protocol::private_source_witness_probe_at(
+    if !protocol::issue_exact_source_decision_at(
         &broker,
-        &probe,
+        &ExactSourceDecisionRequest {
+            request_id: request_id.clone(),
+            witness: probe.clone(),
+        },
         wrong_guardian.as_raw_fd(),
         registration.as_raw_fd(),
     )
@@ -538,7 +541,59 @@ fn private_v30_source_witness(
     }) {
         return Err("unconnected guardian socket accepted".into());
     }
+    std::fs::write(gate_dir.join("source-auth-negative"), b"yes").map_err(|e| e.to_string())?;
+    let auth_deadline = std::time::Instant::now() + PRIVATE_CHILD_EFFECT_WAIT;
+    while !gate_dir.join("source-auth-checked").exists() {
+        if std::time::Instant::now() >= auth_deadline {
+            return Err("source authentication check gate expired".into());
+        }
+        std::thread::sleep(PRIVATE_CHILD_EFFECT_POLL);
+    }
+    std::fs::write(gate_dir.join("source-stage"), b"requesting-broker")
+        .map_err(|e| e.to_string())?;
+    protocol::issue_exact_source_decision_drop_reply_at(
+        &broker,
+        &ExactSourceDecisionRequest {
+            request_id: request_id.clone(),
+            witness: probe.clone(),
+        },
+        owner_socket.as_raw_fd(),
+        registration.as_raw_fd(),
+    )
+    .map_err(|e| format!("source decision lost reply: {e}"))?;
+    let decision =
+        check(&probe, &registration).map_err(|e| format!("combined source decision: {e}"))?;
+    if check(&probe, &registration).map_err(|e| e.to_string())? != decision {
+        return Err("same-request decision replay changed".into());
+    }
+    let duplicate = ExactSourceDecisionRequest {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        witness: probe.clone(),
+    };
+    if !protocol::issue_exact_source_decision_at(
+        &broker,
+        &duplicate,
+        owner_socket.as_raw_fd(),
+        registration.as_raw_fd(),
+    )
+    .is_err_and(|error| {
+        error
+            .to_string()
+            .contains("duplicate exact source registration")
+    }) {
+        return Err("second source decision issued for registration".into());
+    }
+    std::fs::write(gate_dir.join("source-stage"), b"broker-positive").map_err(|e| e.to_string())?;
     let mut wrong = probe.clone();
+    wrong.owner.work_id = Some(uuid::Uuid::new_v4().to_string());
+    if !check(&wrong, &registration).is_err_and(|error| {
+        error
+            .to_string()
+            .contains("consumed-H source decision route unavailable")
+    }) {
+        return Err("unproved consumed-H source decision route accepted".into());
+    }
+    wrong = probe.clone();
     std::fs::write(gate_dir.join("source-stage"), b"other-root").map_err(|e| e.to_string())?;
     wrong.owner.root_id = uuid::Uuid::new_v4().to_string();
     if !check(&wrong, &registration)
@@ -655,12 +710,27 @@ fn private_v30_source_witness(
             "registration_path": path,
             "registration_sha256": probe.registration_sha256,
             "registration_len": probe.registration_len,
+            "request_id": request_id,
+            "decision": decision,
             "invocation_uuid": probe.owner_invocation_uuid,
             "session_id": probe.owner_session_id,
         }))
         .map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
+    let restart_deadline = std::time::Instant::now() + PRIVATE_CHILD_EFFECT_WAIT;
+    while !gate_dir.join("source-broker-restarted").exists() {
+        if std::time::Instant::now() >= restart_deadline {
+            return Err("source broker restart gate expired".into());
+        }
+        std::thread::sleep(PRIVATE_CHILD_EFFECT_POLL);
+    }
+    if check(&probe, &registration).map_err(|e| format!("source restart readback: {e}"))?
+        != decision
+    {
+        return Err("source decision changed after broker restart".into());
+    }
+    std::fs::write(gate_dir.join("source-restart-readback"), b"yes").map_err(|e| e.to_string())?;
     let deadline = std::time::Instant::now() + PRIVATE_CHILD_EFFECT_WAIT;
     while !gate_dir.join("source-state-replaced").exists() {
         if std::time::Instant::now() >= deadline {
@@ -864,6 +934,14 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
         );
         if gate_dir.join("source-witness-request").exists() {
             private_v30_source_witness(&evidence, &gate_dir)?;
+            std::fs::write(
+                gate_dir.join("child-attested"),
+                evidence.release_id.as_bytes(),
+            )
+            .map_err(|e| e.to_string())?;
+            // This issuer fixture has proved the exact decision and has no
+            // source effect to run after the broker restart.
+            return Ok(ExitCode::SUCCESS);
         }
         std::fs::write(
             gate_dir.join("child-attested"),

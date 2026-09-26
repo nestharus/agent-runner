@@ -342,10 +342,9 @@ pub(super) fn completion_obligation_admission_id(
     event_id: &str,
     owner_invocation_uuid: &str,
 ) -> String {
-    format!(
-        "completion:{}:{event_id}:owner:{}:{owner_invocation_uuid}",
-        event_id.len(),
-        owner_invocation_uuid.len()
+    oulipoly_state::completion_continuation::completion_obligation_admission_id(
+        event_id,
+        owner_invocation_uuid,
     )
 }
 

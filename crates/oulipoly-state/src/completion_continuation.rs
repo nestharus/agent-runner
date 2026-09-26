@@ -8,6 +8,17 @@ use std::path::{Component, Path};
 pub const PROTOCOL: &str = "completion-continuation-v2";
 pub const MAX_REGISTRATION_BYTES: usize = 1024 * 1024;
 
+/// Stable length-delimited State admission key for one handle and invocation.
+/// The broker journal uses the same key to refuse a second registration ID
+/// for an already decided original source.
+pub fn completion_obligation_admission_id(handle: &str, owner_invocation_uuid: &str) -> String {
+    format!(
+        "completion:{}:{handle}:owner:{}:{owner_invocation_uuid}",
+        handle.len(),
+        owner_invocation_uuid.len()
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceProcessIdentity {
