@@ -12,8 +12,9 @@ use oulipoly_state::mailbox::{
 };
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
+use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -241,6 +242,13 @@ fn inner() {
         "native_cancel" | "native_drain" | "native_receipt_cancel" | "native_receipt_drain"
     );
     let release_mode = mode.starts_with("held_release") || native_mode;
+    let source_witness = (mode == "held_release_source_witness").then(|| {
+        (
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+            oulipoly_state::CompletionRegistrationAuthority::generate().unwrap(),
+        )
+    });
     let normal_mode = mode.starts_with("normal_");
     let handoff_mode = v3_mode
         || mode.starts_with("normal_model_provider")
@@ -280,6 +288,19 @@ fn inner() {
     fs::create_dir(&broker_state).unwrap();
     fs::set_permissions(&broker_state, fs::Permissions::from_mode(0o700)).unwrap();
     fs::create_dir(&gate).unwrap();
+    fs::set_permissions(&gate, fs::Permissions::from_mode(0o700)).unwrap();
+    if let Some((invocation, session, capability)) = &source_witness {
+        fs::write(
+            gate.join("source-witness-request"),
+            serde_json::to_vec(&serde_json::json!({
+                "invocation": invocation,
+                "session": session,
+                "capability": capability.process_environment_value(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
     let native_store = gate.join("provider-native-session.json");
     let native_adapter = gate.join("resident-native-adapter.py");
     if resident_mode {
@@ -689,6 +710,32 @@ fn inner() {
     }
     if !recipient_mode {
         let mut state = oulipoly_state::StateDb::open(&data.join("state.db")).unwrap();
+        if let Some((invocation, session, capability)) = &source_witness {
+            let started = state
+                .start_invocation_with_prepared_completion_registration_authority(
+                    &oulipoly_state::InvocationStart {
+                        invocation_uuid: invocation.clone(),
+                        model_name: "private-source-witness".into(),
+                        provider_name: "fixture".into(),
+                        provider_index: 0,
+                        parent_invocation_id: None,
+                    },
+                    capability,
+                )
+                .unwrap();
+            state
+                .bind_invocation_provider_session_start(
+                    oulipoly_state::InvocationMutationAuthority::Standalone,
+                    started.invocation_row_id,
+                    &oulipoly_state::ProviderSessionBinding {
+                        provider_session_id: session.clone(),
+                        capture_method: "private-fixture",
+                        resume_input_id: None,
+                        provider_session_resolved_account: None,
+                    },
+                )
+                .unwrap();
+        }
         if let Some(binding) = &pending_binding {
             state
                 .seed_private_pending_completion_source(binding, &sidecar_generation)
@@ -729,7 +776,7 @@ fn inner() {
             fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
             BrokerSidecar::activate_private_fixture_copy(&target, &broker_state, &proof).unwrap()
         };
-        if normal_mode && !recipient_mode {
+        if (normal_mode && !recipient_mode) || source_witness.is_some() {
             let target = sidecar_dir.join("pid-identity.db");
             BrokerSidecar::bind_private_fixture_state_source(&target, &data.join("state.db"))
                 .unwrap();
@@ -9161,14 +9208,208 @@ fn inner() {
                 .unwrap(),
                 1
             );
+            if let Some((invocation, session, capability)) = &source_witness {
+                eventually(|| {
+                    gate.join("source-witness-positive").exists()
+                        || entry.try_wait().unwrap().is_some()
+                });
+                assert!(
+                    gate.join("source-witness-positive").exists(),
+                    "source child: {} broker: {}",
+                    fs::read_to_string(&err).unwrap(),
+                    fs::read_to_string(&broker_log).unwrap()
+                );
+                let marker: serde_json::Value = serde_json::from_slice(
+                    &fs::read(gate.join("source-witness-positive")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(marker["root_id"], prepared.root_id);
+                assert_eq!(marker["source_generation"], generation);
+                assert_eq!(marker["owner_generation"], prepared.owner_generation);
+                assert_eq!(marker["invocation_uuid"], *invocation);
+                assert_eq!(marker["session_id"], *session);
+                let registration_path =
+                    std::path::PathBuf::from(marker["registration_path"].as_str().unwrap());
+                let registration = fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(&registration_path)
+                    .unwrap();
+                assert!(registration.metadata().unwrap().is_file());
+                assert_eq!(registration.metadata().unwrap().nlink(), 1);
+                let bytes = fs::read(&registration_path).unwrap();
+                assert_eq!(
+                    bytes.len() as u64,
+                    marker["registration_len"].as_u64().unwrap()
+                );
+                assert_eq!(
+                    format!("{:x}", Sha256::digest(&bytes)),
+                    marker["registration_sha256"]
+                );
+                let source: oulipoly_state::completion_continuation::SourceRegistration =
+                    serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(source.owner_invocation_uuid, *invocation);
+                assert_eq!(source.owner_session_id, *session);
+                let mut outsider_socket = UnixStream::connect(&evidence.owner.endpoint).unwrap();
+                outsider_socket.write_all(b"hello\n").unwrap();
+                let mut hello = Vec::new();
+                outsider_socket.read_to_end(&mut hello).unwrap();
+                let outsider_owner: oulipoly_state::mailbox::CompletionDomainOwner =
+                    serde_json::from_slice(&hello).unwrap();
+                assert_eq!(outsider_owner, evidence.owner);
+                let stamp = |stamp: &oulipoly_state::mailbox::PreparedProcessStamp| {
+                    protocol::ProcessWitness {
+                        host_pid: stamp.host_pid,
+                        boot_id: stamp.boot_id.clone(),
+                        starttime_ticks: stamp.starttime_ticks,
+                    }
+                };
+                let outsider = protocol::PrivateSourceWitnessProbe {
+                    owner: protocol::OwnerWitness {
+                        root_id: prepared.root_id.clone(),
+                        domain_id: prepared.domain_id.clone(),
+                        supervisor_id: prepared.supervisor_authority_id.clone(),
+                        guardian: stamp(&prepared.guardian),
+                        driver: stamp(&prepared.driver),
+                        owner_generation: Some(prepared.owner_generation.clone()),
+                        work_id: None,
+                        owner_session_id: Some(session.clone()),
+                        owner_invocation_uuid: Some(invocation.clone()),
+                        registration_authority_sha256: Some(format!(
+                            "{:x}",
+                            Sha256::digest(capability.process_environment_value().as_bytes())
+                        )),
+                    },
+                    source_generation: generation.clone(),
+                    owner_generation: prepared.owner_generation.clone(),
+                    registration_path: registration_path.clone(),
+                    registration_len: bytes.len() as u64,
+                    registration_sha256: format!("{:x}", Sha256::digest(&bytes)),
+                    owner_session_id: session.clone(),
+                    owner_invocation_uuid: invocation.clone(),
+                    capability: capability.process_environment_value().into(),
+                };
+                assert!(
+                    protocol::private_source_witness_probe_at(
+                        &socket,
+                        &outsider,
+                        outsider_socket.as_raw_fd(),
+                        registration.as_raw_fd(),
+                    )
+                    .is_err_and(|error| error
+                        .to_string()
+                        .contains("owner witness is outside consumed work"))
+                );
+                let original_state = data.join("state.db");
+                let displaced_state = data.join("state-original.db");
+                let inspect = rusqlite::Connection::open_with_flags(
+                    &original_state,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .unwrap();
+                let original_count: i64 = inspect.query_row(
+                    "SELECT count(*) FROM invocations WHERE invocation_uuid=?1 AND provider_session_id=?2 AND completion_registration_capability_digest IS NOT NULL",
+                    rusqlite::params![invocation, session], |row| row.get(0)).unwrap();
+                assert_eq!(original_count, 1);
+                let effects: i64 = inspect
+                    .query_row(
+                        "SELECT count(*) FROM invocation_completion_obligations",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(effects, 0);
+                let sidecar_effects: i64 = db
+                    .query_row(
+                        "SELECT count(*) FROM broker_source_effect_grant",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(sidecar_effects, 0);
+                let retained = BrokerSidecar::open_existing(
+                    &broker_state.join("sidecar/pid-identity.db"),
+                    &broker_state,
+                )
+                .unwrap()
+                .read_exact_release(&generation, &prepared.root_id, &prepared.owner_generation)
+                .unwrap();
+                assert_eq!(retained, evidence);
+                let decisions: i64 = db.query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name LIKE '%source_decision%'",
+                    [], |row| row.get(0)).unwrap();
+                assert_eq!(decisions, 0);
+                drop(inspect);
+                fs::rename(&original_state, &displaced_state).unwrap();
+                fs::copy(&displaced_state, &original_state).unwrap();
+                assert_ne!(
+                    fs::metadata(&original_state).unwrap().ino(),
+                    fs::metadata(&displaced_state).unwrap().ino()
+                );
+                fs::write(gate.join("source-state-replaced"), b"yes").unwrap();
+                eventually(|| {
+                    gate.join("source-witness-negatives-done").exists()
+                        || entry.try_wait().unwrap().is_some()
+                });
+                assert!(
+                    gate.join("source-witness-negatives-done").exists(),
+                    "source child: {} broker: {}",
+                    fs::read_to_string(&err).unwrap(),
+                    fs::read_to_string(&broker_log).unwrap()
+                );
+                assert_eq!(
+                    db.query_row::<i64, _, _>(
+                        "SELECT count(*) FROM broker_source_effect_grant",
+                        [],
+                        |row| row.get(0)
+                    )
+                    .unwrap(),
+                    0
+                );
+                fs::remove_file(&original_state).unwrap();
+                fs::rename(&displaced_state, &original_state).unwrap();
+                let state_after = rusqlite::Connection::open_with_flags(
+                    &original_state,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .unwrap();
+                assert_eq!(
+                    state_after
+                        .query_row::<i64, _, _>(
+                            "SELECT count(*) FROM invocation_completion_obligations",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap(),
+                    0
+                );
+                assert_eq!(db.query_row::<i64, _, _>(
+                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name LIKE '%source_decision%'",
+                    [], |row| row.get(0),
+                ).unwrap(), 0);
+                drop(state_after);
+                assert_eq!(
+                    BrokerSidecar::open_existing(
+                        &broker_state.join("sidecar/pid-identity.db"),
+                        &broker_state,
+                    )
+                    .unwrap()
+                    .read_exact_release(&generation, &prepared.root_id, &prepared.owner_generation,)
+                    .unwrap(),
+                    evidence,
+                );
+            }
             eventually(|| {
                 gate.join("child-attested").exists() || entry.try_wait().unwrap().is_some()
             });
             assert!(
                 gate.join("child-attested").exists(),
-                "child: {} broker: {}",
+                "child: {} broker: {} source-stage: {:?} guardian-stage: {:?} broker-stage: {:?}",
                 fs::read_to_string(&err).unwrap(),
-                fs::read_to_string(&broker_log).unwrap()
+                fs::read_to_string(&broker_log).unwrap(),
+                fs::read_to_string(gate.join("source-stage")),
+                fs::read_to_string(gate.join("source-guardian-stage")),
+                fs::read_to_string(gate.join("source-broker-stage")),
             );
             assert_eq!(
                 fs::read_to_string(gate.join("child-attested")).unwrap(),
@@ -9604,6 +9845,7 @@ fn inner() {
                 || mode == "held_release_lost_reply"
                 || mode == "held_release_prepare_lost_reply"
                 || mode == "held_release_driver_route"
+                || mode == "held_release_source_witness"
             {
                 eventually(|| {
                     fs::metadata(&out).unwrap().len() > 0 || entry.try_wait().unwrap().is_some()
@@ -10582,6 +10824,33 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
             break;
         }
     }
+}
+
+#[test]
+fn combined_v30_source_witness_uses_held_release_and_original_state() {
+    if std::env::var_os("AGE319_PRIVATE_JOIN_INNER").is_some() {
+        inner();
+        return;
+    }
+    let output = Command::new("unshare")
+        .args(["-Urpfm", "--mount-proc"])
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "combined_v30_source_witness_uses_held_release_and_original_state",
+            "--nocapture",
+        ])
+        .env("AGE319_PRIVATE_JOIN_INNER", "1")
+        .env("AGE319_PRIVATE_JOIN_MODE", "held_release_source_witness")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
 }
 
 #[test]

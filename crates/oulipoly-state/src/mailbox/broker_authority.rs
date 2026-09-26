@@ -659,6 +659,53 @@ impl BrokerSidecar {
         Ok(state)
     }
 
+    /// Diagnostic read of the original, inode-bound State invocation. This
+    /// never registers a source or advances an invocation lifecycle.
+    #[cfg(feature = "age319-private-broker-fixture")]
+    pub fn verify_private_bound_invocation(
+        &self,
+        invocation_uuid: &str,
+        session_id: &str,
+        capability: &crate::CompletionRegistrationAuthority,
+    ) -> Result<(), String> {
+        let state = self.bound_state()?;
+        let row: Option<(Option<String>, Option<String>, Option<String>)> = state
+            .connection()
+            .query_row(
+                "SELECT completion_registration_capability_digest,provider_session_id,session_id
+                 FROM invocations WHERE invocation_uuid=?1",
+                [invocation_uuid],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let source = self
+            .state_source
+            .as_ref()
+            .ok_or("broker StateDb source binding absent")?;
+        verify_bound_state_source(source)?;
+        let (Some(expected), provider_session, fallback_session) =
+            row.ok_or("original State invocation absent")?
+        else {
+            return Err("original State invocation capability absent".into());
+        };
+        let mut digest = Sha256::new();
+        digest.update(b"oulipoly-completion-registration-authority-v1");
+        digest.update(capability.process_environment_value().as_bytes());
+        let observed = format!("{:x}", digest.finalize());
+        if expected.len() != observed.len()
+            || expected
+                .bytes()
+                .zip(observed.bytes())
+                .fold(0_u8, |diff, (a, b)| diff | (a ^ b))
+                != 0
+            || provider_session.or(fallback_session).as_deref() != Some(session_id)
+        {
+            return Err("original State invocation/session/capability mismatch".into());
+        }
+        Ok(())
+    }
+
     /// Read only the current cursor and one bounded unaccepted page. The
     /// server's pinned driver check must precede this call.
     pub fn read_bounded_repair(

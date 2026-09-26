@@ -2074,6 +2074,23 @@ pub struct OwnerWitness {
     pub registration_authority_sha256: Option<String>,
 }
 
+/// Private diagnostic only: asserted fields are checked against the live V
+/// peer, retained held release, received file, and original bound State.
+#[cfg(feature = "age319-private-broker-fixture")]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrivateSourceWitnessProbe {
+    pub owner: OwnerWitness,
+    pub source_generation: String,
+    pub owner_generation: String,
+    pub registration_path: std::path::PathBuf,
+    pub registration_len: u64,
+    pub registration_sha256: String,
+    pub owner_session_id: String,
+    pub owner_invocation_uuid: String,
+    pub capability: String,
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessWitness {
@@ -2990,6 +3007,20 @@ pub fn verify_owner_at(path: &Path, witness: &OwnerWitness, owner_fd: RawFd) -> 
             "host owner verification refused: {}",
             response.trim()
         )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+pub fn private_source_witness_probe_at(
+    path: &Path,
+    probe: &PrivateSourceWitnessProbe,
+    owner_fd: RawFd,
+    registration_fd: RawFd,
+) -> io::Result<()> {
+    let response = send_native_descriptors(path, b'&', probe, [owner_fd, registration_fd])?;
+    if response != format!("private-source-witness {}\n", probe.owner.root_id) {
+        return Err(io::Error::other(response));
     }
     Ok(())
 }

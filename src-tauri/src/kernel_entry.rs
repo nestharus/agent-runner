@@ -376,6 +376,310 @@ pub(crate) fn child_entry() -> Option<ExitCode> {
     })
 }
 
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_v30_source_witness(
+    evidence: &oulipoly_state::mailbox::BrokerReleaseEvidence,
+    gate_dir: &std::path::Path,
+) -> Result<(), String> {
+    use oulipoly_kernel_broker::protocol::{
+        OwnerWitness, PrivateSourceWitnessProbe, ProcessWitness,
+    };
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::write(gate_dir.join("source-stage"), b"building-registration")
+        .map_err(|e| e.to_string())?;
+
+    let request: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(gate_dir.join("source-witness-request")).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    let invocation = request["invocation"]
+        .as_str()
+        .ok_or("private source invocation absent")?
+        .to_owned();
+    let session = request["session"]
+        .as_str()
+        .ok_or("private source session absent")?
+        .to_owned();
+    let capability = request["capability"]
+        .as_str()
+        .ok_or("private source capability absent")?
+        .to_owned();
+    let source_dir = gate_dir.join("spool/ab_source_witness");
+    std::fs::create_dir_all(&source_dir).map_err(|e| e.to_string())?;
+    let path = source_dir.join("source-registration-v2.json");
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../crates/oulipoly-state/tests/fixtures/age360-paired-wire.json"
+    ))
+    .map_err(|e| e.to_string())?;
+    let mut source: serde_json::Value = serde_json::from_str(
+        fixture["registration_bytes_utf8"]
+            .as_str()
+            .ok_or("registration fixture absent")?,
+    )
+    .map_err(|e| e.to_string())?;
+    source["domain_id"] = evidence.prepared.domain_id.clone().into();
+    source["owner_invocation_uuid"] = invocation.clone().into();
+    source["owner_session_id"] = session.clone().into();
+    source["listeners"][0]["listener_id"] = invocation.clone().into();
+    source["listeners"][0]["owner_invocation_uuid"] = invocation.clone().into();
+    source["listeners"][0]["session_id"] = session.clone().into();
+    source["spool_root"] = source_dir
+        .parent()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned()
+        .into();
+    source["handle"] = "ab_source_witness".into();
+    source["handle_dir"] = source_dir.to_string_lossy().into_owned().into();
+    source["helper"]["path"] = source_dir
+        .join("runner")
+        .to_string_lossy()
+        .into_owned()
+        .into();
+    source["recovery"]["path"] = source_dir
+        .join("agent-bash")
+        .to_string_lossy()
+        .into_owned()
+        .into();
+    source["registering_caller"]["pid"] = i64::from(evidence.prepared.joined_child.host_pid).into();
+    source["registering_caller"]["boot_id"] = evidence.prepared.joined_child.boot_id.clone().into();
+    source["registering_caller"]["starttime_ticks"] =
+        i64::try_from(evidence.prepared.joined_child.starttime_ticks)
+            .map_err(|e| e.to_string())?
+            .into();
+    let bytes = serde_json::to_vec(&source).map_err(|e| e.to_string())?;
+    let parsed: oulipoly_state::completion_continuation::SourceRegistration =
+        serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    parsed.validate()?;
+    std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+    let registration = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+        .map_err(|e| e.to_string())?;
+    std::fs::write(gate_dir.join("source-stage"), b"connecting-guardian")
+        .map_err(|e| e.to_string())?;
+    let mut owner_socket =
+        UnixStream::connect(&evidence.owner.endpoint).map_err(|e| e.to_string())?;
+    std::fs::write(gate_dir.join("source-stage"), b"guardian-connected")
+        .map_err(|e| e.to_string())?;
+    owner_socket
+        .write_all(b"hello\n")
+        .map_err(|e| e.to_string())?;
+    let mut hello = Vec::new();
+    (&mut owner_socket)
+        .take(8193)
+        .read_to_end(&mut hello)
+        .map_err(|e| e.to_string())?;
+    let observed: oulipoly_state::mailbox::CompletionDomainOwner =
+        serde_json::from_slice(&hello).map_err(|e| e.to_string())?;
+    if observed != evidence.owner {
+        return Err("private guardian hello changed released owner".into());
+    }
+    std::fs::write(gate_dir.join("source-stage"), b"guardian-hello-complete")
+        .map_err(|e| e.to_string())?;
+    let stamp = |process: &oulipoly_state::mailbox::PreparedProcessStamp| ProcessWitness {
+        host_pid: process.host_pid,
+        boot_id: process.boot_id.clone(),
+        starttime_ticks: process.starttime_ticks,
+    };
+    let witness = OwnerWitness {
+        root_id: evidence.prepared.root_id.clone(),
+        domain_id: evidence.prepared.domain_id.clone(),
+        supervisor_id: evidence.prepared.supervisor_authority_id.clone(),
+        guardian: stamp(&evidence.prepared.guardian),
+        driver: stamp(&evidence.prepared.driver),
+        owner_generation: Some(evidence.prepared.owner_generation.clone()),
+        work_id: None,
+        owner_session_id: Some(session.clone()),
+        owner_invocation_uuid: Some(invocation.clone()),
+        registration_authority_sha256: Some(format!("{:x}", Sha256::digest(capability.as_bytes()))),
+    };
+    let probe = PrivateSourceWitnessProbe {
+        owner: witness.clone(),
+        source_generation: evidence.prepared.source_generation.clone(),
+        owner_generation: evidence.prepared.owner_generation.clone(),
+        registration_path: path.clone(),
+        registration_len: bytes.len() as u64,
+        registration_sha256: format!("{:x}", Sha256::digest(&bytes)),
+        owner_session_id: session,
+        owner_invocation_uuid: invocation,
+        capability,
+    };
+    let broker = broker_socket();
+    let check = |probe: &PrivateSourceWitnessProbe, fd: &File| {
+        protocol::private_source_witness_probe_at(
+            &broker,
+            probe,
+            owner_socket.as_raw_fd(),
+            fd.as_raw_fd(),
+        )
+    };
+    if protocol::verify_owner_at(&broker, &witness, owner_socket.as_raw_fd()).is_ok() {
+        return Err("legacy V opened under v30 cutover".into());
+    }
+    std::fs::write(gate_dir.join("source-stage"), b"requesting-broker")
+        .map_err(|e| e.to_string())?;
+    check(&probe, &registration).map_err(|e| format!("combined source witness: {e}"))?;
+    std::fs::write(gate_dir.join("source-stage"), b"broker-positive").map_err(|e| e.to_string())?;
+    let (wrong_guardian, _peer) = UnixStream::pair().map_err(|e| e.to_string())?;
+    if !protocol::private_source_witness_probe_at(
+        &broker,
+        &probe,
+        wrong_guardian.as_raw_fd(),
+        registration.as_raw_fd(),
+    )
+    .is_err_and(|error| {
+        error
+            .to_string()
+            .contains("owner socket peer is not pinned host guardian")
+    }) {
+        return Err("unconnected guardian socket accepted".into());
+    }
+    let mut wrong = probe.clone();
+    std::fs::write(gate_dir.join("source-stage"), b"other-root").map_err(|e| e.to_string())?;
+    wrong.owner.root_id = uuid::Uuid::new_v4().to_string();
+    if !check(&wrong, &registration)
+        .is_err_and(|error| error.to_string().contains("owner witness root absent"))
+    {
+        return Err("other root source witness accepted".into());
+    }
+    wrong = probe.clone();
+    std::fs::write(gate_dir.join("source-stage"), b"owner-generation")
+        .map_err(|e| e.to_string())?;
+    wrong.owner_generation = uuid::Uuid::new_v4().to_string();
+    wrong.owner.owner_generation = Some(wrong.owner_generation.clone());
+    if !check(&wrong, &registration)
+        .is_err_and(|error| error.to_string().contains("broker prepared owner absent"))
+    {
+        return Err("wrong owner generation accepted".into());
+    }
+    wrong = probe.clone();
+    wrong.source_generation = uuid::Uuid::new_v4().to_string();
+    if !check(&wrong, &registration).is_err_and(|error| {
+        error
+            .to_string()
+            .contains("broker prepared source generation changed")
+    }) {
+        return Err("wrong source generation accepted".into());
+    }
+    wrong = probe.clone();
+    std::fs::write(gate_dir.join("source-stage"), b"wrong-invocation")
+        .map_err(|e| e.to_string())?;
+    wrong.owner_invocation_uuid = uuid::Uuid::new_v4().to_string();
+    wrong.owner.owner_invocation_uuid = Some(wrong.owner_invocation_uuid.clone());
+    let mut changed_source = source.clone();
+    changed_source["owner_invocation_uuid"] = wrong.owner_invocation_uuid.clone().into();
+    changed_source["listeners"][0]["listener_id"] = wrong.owner_invocation_uuid.clone().into();
+    changed_source["listeners"][0]["owner_invocation_uuid"] =
+        wrong.owner_invocation_uuid.clone().into();
+    let changed_bytes = serde_json::to_vec(&changed_source).map_err(|e| e.to_string())?;
+    std::fs::write(&path, &changed_bytes).map_err(|e| e.to_string())?;
+    wrong.registration_len = changed_bytes.len() as u64;
+    wrong.registration_sha256 = format!("{:x}", Sha256::digest(&changed_bytes));
+    let wrong_invocation = check(&wrong, &registration);
+    std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+    if !wrong_invocation.is_err_and(|error| {
+        error
+            .to_string()
+            .contains("original State invocation absent")
+    }) {
+        return Err("wrong invocation accepted".into());
+    }
+    wrong = probe.clone();
+    std::fs::write(gate_dir.join("source-stage"), b"wrong-capability")
+        .map_err(|e| e.to_string())?;
+    wrong.capability = "0".repeat(64);
+    wrong.owner.registration_authority_sha256 =
+        Some(format!("{:x}", Sha256::digest(wrong.capability.as_bytes())));
+    if !check(&wrong, &registration).is_err_and(|error| {
+        error
+            .to_string()
+            .contains("original State invocation/session/capability mismatch")
+    }) {
+        return Err("wrong capability accepted".into());
+    }
+    let different = source_dir.join("different.json");
+    std::fs::write(gate_dir.join("source-stage"), b"different-fd").map_err(|e| e.to_string())?;
+    std::fs::write(&different, &bytes).map_err(|e| e.to_string())?;
+    let different_fd = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&different)
+        .map_err(|e| e.to_string())?;
+    if !check(&probe, &different_fd).is_err_and(|error| {
+        error
+            .to_string()
+            .contains("private registration FD/path identity mismatch")
+    }) {
+        return Err("copied registration FD accepted".into());
+    }
+    let fork = unsafe { libc::fork() };
+    std::fs::write(gate_dir.join("source-stage"), b"copied-child").map_err(|e| e.to_string())?;
+    if fork < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    if fork == 0 {
+        let refused = check(&probe, &registration).is_err_and(|error| {
+            error
+                .to_string()
+                .contains("owner witness is outside consumed work")
+        });
+        unsafe { libc::_exit(if refused { 0 } else { 70 }) }
+    }
+    let mut status = 0;
+    if unsafe { libc::waitpid(fork, &mut status, 0) } != fork
+        || !libc::WIFEXITED(status)
+        || libc::WEXITSTATUS(status) != 0
+    {
+        return Err("copied child process identity accepted".into());
+    }
+    std::fs::write(&path, b"changed registration bytes").map_err(|e| e.to_string())?;
+    std::fs::write(gate_dir.join("source-stage"), b"changed-bytes").map_err(|e| e.to_string())?;
+    if !check(&probe, &registration).is_err_and(|error| {
+        error
+            .to_string()
+            .contains("private registration asserted bytes mismatch")
+    }) {
+        return Err("changed registration bytes accepted".into());
+    }
+    std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+    std::fs::write(
+        gate_dir.join("source-witness-positive"),
+        serde_json::to_vec(&serde_json::json!({
+            "root_id": probe.owner.root_id,
+            "source_generation": probe.source_generation,
+            "owner_generation": probe.owner_generation,
+            "registration_path": path,
+            "registration_sha256": probe.registration_sha256,
+            "registration_len": probe.registration_len,
+            "invocation_uuid": probe.owner_invocation_uuid,
+            "session_id": probe.owner_session_id,
+        }))
+        .map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    let deadline = std::time::Instant::now() + PRIVATE_CHILD_EFFECT_WAIT;
+    while !gate_dir.join("source-state-replaced").exists() {
+        if std::time::Instant::now() >= deadline {
+            return Err("source State replacement gate expired".into());
+        }
+        std::thread::sleep(PRIVATE_CHILD_EFFECT_POLL);
+    }
+    if !check(&probe, &registration).is_err_and(|error| {
+        error
+            .to_string()
+            .contains("broker StateDb source identity changed")
+    }) {
+        return Err("changed original State inode accepted".into());
+    }
+    std::fs::write(gate_dir.join("source-witness-negatives-done"), b"yes")
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
     let fields: Vec<_> = grant.split(' ').collect();
     if fields.len() != 6
@@ -558,6 +862,9 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
             std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
                 .ok_or("private v30 gate directory absent")?,
         );
+        if gate_dir.join("source-witness-request").exists() {
+            private_v30_source_witness(&evidence, &gate_dir)?;
+        }
         std::fs::write(
             gate_dir.join("child-attested"),
             evidence.release_id.as_bytes(),
@@ -3654,8 +3961,9 @@ fn private_guardian_prepared(
         return Err("private guardian bind readback refused".into());
     }
     let endpoint = gate_dir.join("pending-owner.sock");
-    let _pending_endpoint =
+    let pending_endpoint =
         std::os::unix::net::UnixListener::bind(&endpoint).map_err(|e| e.to_string())?;
+    let mut source_probe_owner = None;
     let (mut driver_parent, mut driver_child) = UnixStream::pair().map_err(|e| e.to_string())?;
     let driver_pid = unsafe { libc::fork() };
     if driver_pid < 0 {
@@ -3840,6 +4148,9 @@ fn private_guardian_prepared(
             )
             .map_err(|e| e.to_string())?;
         channel.write_all(b"\n").map_err(|e| e.to_string())?;
+        if gate_dir.join("source-witness-request").exists() {
+            source_probe_owner = Some(readback.owner.clone());
+        }
         if std::env::var_os("AGE319_PRIVATE_DRIVER_ROUTE_V30").is_some() {
             driver_parent.write_all(b"B").map_err(|e| e.to_string())?;
             serde_json::to_writer(&mut driver_parent, &readback.owner)
@@ -3894,7 +4205,55 @@ fn private_guardian_prepared(
             driver_parent.write_all(b"\n").map_err(|e| e.to_string())?;
         }
     }
-    let _ = channel.read_exact(&mut byte);
+    if let Some(owner) = source_probe_owner {
+        pending_endpoint
+            .set_nonblocking(true)
+            .map_err(|e| e.to_string())?;
+        std::fs::write(gate_dir.join("source-guardian-stage"), b"accepting")
+            .map_err(|e| e.to_string())?;
+        channel
+            .set_read_timeout(Some(std::time::Duration::from_millis(20)))
+            .map_err(|e| e.to_string())?;
+        let deadline = std::time::Instant::now() + PRIVATE_PREPARED_FINISH_WAIT;
+        loop {
+            match channel.read_exact(&mut byte) {
+                Ok(()) => break,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(error) => return Err(error.to_string()),
+            }
+            match pending_endpoint.accept() {
+                Ok((mut socket, _)) => {
+                    std::fs::write(gate_dir.join("source-guardian-stage"), b"accepted")
+                        .map_err(|e| e.to_string())?;
+                    socket
+                        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                        .map_err(|e| e.to_string())?;
+                    socket
+                        .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+                        .map_err(|e| e.to_string())?;
+                    let mut hello = [0u8; 6];
+                    socket.read_exact(&mut hello).map_err(|e| e.to_string())?;
+                    if &hello != b"hello\n" {
+                        return Err("private source guardian accepted non-hello request".into());
+                    }
+                    socket
+                        .write_all(&serde_json::to_vec(&owner).map_err(|e| e.to_string())?)
+                        .map_err(|e| e.to_string())?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error.to_string()),
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("private source guardian hello wait expired".into());
+            }
+        }
+    } else {
+        let _ = channel.read_exact(&mut byte);
+    }
     let _ = driver_parent.write_all(b"X");
     unsafe { libc::waitpid(driver_pid, std::ptr::null_mut(), 0) };
     Ok(())

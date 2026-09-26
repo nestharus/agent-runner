@@ -429,7 +429,7 @@ fn require_cutover_entry_route(
         )
     {
         #[cfg(feature = "age319-private-broker-fixture")]
-        if private_fixture() && matches!(operation, b'L' | b'l' | b'M') {
+        if private_fixture() && matches!(operation, b'L' | b'l' | b'M' | b'&') {
             return Ok(());
         }
         return Err(io::Error::other(
@@ -523,6 +523,12 @@ enum RequestPayload {
     VerifyOwner {
         witness: OwnerWitness,
         socket: File,
+    },
+    #[cfg(feature = "age319-private-broker-fixture")]
+    PrivateSourceWitness {
+        probe: oulipoly_kernel_broker::protocol::PrivateSourceWitnessProbe,
+        socket: File,
+        registration: File,
     },
     VerifySourceSocket {
         witness: SourceSocketWitness,
@@ -722,6 +728,8 @@ fn recv_request(
         b'A' | b'a' => read == 33,
         b'J' | b'j' => (18..=48 * 1024 + 17).contains(&read),
         b'L' => (18..=48 * 1024 + 17).contains(&read),
+        #[cfg(feature = "age319-private-broker-fixture")]
+        b'&' => (18..=2048 + 17).contains(&read),
         b'V' | b'S' | b's' | b'T' | b'H' | b'K' | b'B' | b'N' | b'k' | b't' | b'R' | b'W'
         | b'Y' | b'0' | b'1' | b'2' | b'3' | b'4' => (18..=2048 + 17).contains(&read),
         #[cfg(feature = "age319-private-broker-fixture")]
@@ -760,6 +768,8 @@ fn recv_request(
             b'X' | b'^' | b'f' | b')' | b'w' | b'~' | b'?' => descriptors.len() != 1,
             #[cfg(feature = "age319-private-broker-fixture")]
             b'#' => descriptors.len() != 2,
+            #[cfg(feature = "age319-private-broker-fixture")]
+            b'&' => descriptors.len() != 2,
             #[cfg(feature = "age319-private-broker-fixture")]
             b'{' => descriptors.len() != 7,
             #[cfg(feature = "age319-private-broker-fixture")]
@@ -930,6 +940,12 @@ fn recv_request(
         b'V' => RequestPayload::VerifyOwner {
             witness: serde_json::from_slice(&request[17..read as usize])?,
             socket: descriptors.remove(0),
+        },
+        #[cfg(feature = "age319-private-broker-fixture")]
+        b'&' => RequestPayload::PrivateSourceWitness {
+            probe: serde_json::from_slice(&request[17..read as usize])?,
+            socket: descriptors.remove(0),
+            registration: descriptors.remove(0),
         },
         b'S' | b's' => RequestPayload::VerifySourceSocket {
             witness: serde_json::from_slice(&request[17..read as usize])?,
@@ -1907,6 +1923,177 @@ fn verify_owner_socket(
     driver.verify()?;
     peer.process.verify()?;
     Ok(format!("verified-owner {}\n", witness.root_id))
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_registration_snapshot(file: &File, path: &Path) -> io::Result<(u64, u64, Vec<u8>)> {
+    use std::os::unix::fs::FileExt;
+    let fd_meta = file.metadata()?;
+    let path_meta = fs::symlink_metadata(path)?;
+    if !path.is_absolute()
+        || path.components().any(|part| {
+            matches!(
+                part,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+        || !fd_meta.is_file()
+        || !path_meta.is_file()
+        || path_meta.file_type().is_symlink()
+        || fd_meta.nlink() != 1
+        || (fd_meta.dev(), fd_meta.ino(), fd_meta.len())
+            != (path_meta.dev(), path_meta.ino(), path_meta.len())
+        || fd_meta.len() == 0
+        || fd_meta.len() > oulipoly_state::completion_continuation::MAX_REGISTRATION_BYTES as u64
+    {
+        return Err(io::Error::other(
+            "private registration FD/path identity mismatch",
+        ));
+    }
+    let independently_opened = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let opened_meta = independently_opened.metadata()?;
+    if (opened_meta.dev(), opened_meta.ino(), opened_meta.len())
+        != (fd_meta.dev(), fd_meta.ino(), fd_meta.len())
+    {
+        return Err(io::Error::other("private registration path changed"));
+    }
+    let mut bytes = vec![0u8; fd_meta.len() as usize];
+    let mut path_bytes = vec![0u8; bytes.len()];
+    for (source, target) in [(file, &mut bytes), (&independently_opened, &mut path_bytes)] {
+        let mut offset = 0;
+        while offset < target.len() {
+            let read = source.read_at(&mut target[offset..], offset as u64)?;
+            if read == 0 {
+                return Err(io::Error::other("private registration read shortened"));
+            }
+            offset += read;
+        }
+    }
+    if bytes != path_bytes
+        || file.metadata()?.len() != fd_meta.len()
+        || independently_opened.metadata()?.len() != fd_meta.len()
+        || fs::symlink_metadata(path)?.ino() != fd_meta.ino()
+    {
+        return Err(io::Error::other("private registration bytes changed"));
+    }
+    Ok((fd_meta.dev(), fd_meta.ino(), bytes))
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "private diagnostic joins independent live authorities"
+)]
+fn private_source_witness(
+    probe: oulipoly_kernel_broker::protocol::PrivateSourceWitnessProbe,
+    socket: File,
+    registration: File,
+    peer: &PeerIdentity,
+    runner_image: &File,
+    host_namespace: &File,
+    roots: &RootRegistry,
+    works: &WorkRegistry,
+    entries: &EntryRegistry,
+    grants: &GrantRegistry,
+    sidecar: &BrokerSidecar,
+) -> io::Result<String> {
+    if !private_fixture() {
+        return Err(io::Error::other("private source witness unavailable"));
+    }
+    let mark = |stage: &str| {
+        if let Some(gate) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1") {
+            let _ = fs::write(Path::new(&gate).join("source-broker-stage"), stage);
+        }
+    };
+    mark("received");
+    let before = private_registration_snapshot(&registration, &probe.registration_path)?;
+    mark("fd-snapshot");
+    if before.2.len() as u64 != probe.registration_len
+        || format!("{:x}", Sha256::digest(&before.2)) != probe.registration_sha256
+    {
+        return Err(io::Error::other(
+            "private registration asserted bytes mismatch",
+        ));
+    }
+    verify_owner_socket(
+        probe.owner.clone(),
+        socket,
+        peer,
+        runner_image,
+        host_namespace,
+        roots,
+        works,
+        entries,
+        grants,
+    )?;
+    mark("live-v");
+    let source: oulipoly_state::completion_continuation::SourceRegistration =
+        serde_json::from_slice(&before.2)?;
+    source.validate().map_err(io::Error::other)?;
+    if Path::new(&source.handle_dir).join(&source.registration_relative) != probe.registration_path
+        || source.domain_id != probe.owner.domain_id
+        || source.owner_invocation_uuid != probe.owner_invocation_uuid
+        || source.owner_session_id != probe.owner_session_id
+        || source.registering_caller.pid != i64::from(peer.process.host_pid)
+        || source.registering_caller.boot_id != peer.process.boot_id
+        || source.registering_caller.starttime_ticks != peer.process.starttime_ticks as i64
+        || probe.owner.owner_generation.as_deref() != Some(&probe.owner_generation)
+        || probe.owner.owner_invocation_uuid.as_deref() != Some(&probe.owner_invocation_uuid)
+        || probe.owner.owner_session_id.as_deref() != Some(&probe.owner_session_id)
+        || probe.owner.registration_authority_sha256.as_deref()
+            != Some(format!("{:x}", Sha256::digest(probe.capability.as_bytes())).as_str())
+    {
+        return Err(io::Error::other("private source/peer witness mismatch"));
+    }
+    let release = sidecar
+        .read_exact_release(
+            &probe.source_generation,
+            &probe.owner.root_id,
+            &probe.owner_generation,
+        )
+        .map_err(io::Error::other)?;
+    mark("held-release");
+    let prepared = &release.prepared;
+    if prepared.domain_id != probe.owner.domain_id
+        || prepared.supervisor_authority_id != probe.owner.supervisor_id
+        || prepared.joined_child.host_pid != peer.process.host_pid
+        || prepared.joined_child.boot_id != peer.process.boot_id
+        || prepared.joined_child.starttime_ticks != peer.process.starttime_ticks
+        || prepared.guardian.host_pid != probe.owner.guardian.host_pid
+        || prepared.guardian.boot_id != probe.owner.guardian.boot_id
+        || prepared.guardian.starttime_ticks != probe.owner.guardian.starttime_ticks
+        || prepared.driver.host_pid != probe.owner.driver.host_pid
+        || prepared.driver.boot_id != probe.owner.driver.boot_id
+        || prepared.driver.starttime_ticks != probe.owner.driver.starttime_ticks
+    {
+        return Err(io::Error::other(
+            "private source held-release actor mismatch",
+        ));
+    }
+    let capability =
+        oulipoly_state::CompletionRegistrationAuthority::from_process_environment_value(
+            &probe.capability,
+        )
+        .map_err(io::Error::other)?;
+    sidecar
+        .verify_private_bound_invocation(
+            &probe.owner_invocation_uuid,
+            &probe.owner_session_id,
+            &capability,
+        )
+        .map_err(io::Error::other)?;
+    mark("bound-state");
+    if before != private_registration_snapshot(&registration, &probe.registration_path)? {
+        return Err(io::Error::other(
+            "private registration FD/bytes changed across check",
+        ));
+    }
+    peer.process.verify()?;
+    mark("complete");
+    Ok(format!("private-source-witness {}\n", probe.owner.root_id))
 }
 
 #[expect(
@@ -3574,6 +3761,20 @@ fn serve() -> io::Result<()> {
                     &entries,
                     &grants,
                 )
+            } else if cfg!(feature = "age319-private-broker-fixture") && operation == b'&' {
+                #[cfg(feature = "age319-private-broker-fixture")]
+                {
+                    let RequestPayload::PrivateSourceWitness { probe, socket, registration } = payload else {
+                        return Err(io::Error::other("invalid private source witness payload"));
+                    };
+                    private_source_witness(
+                        probe, socket, registration, &peer, &runner_image, &host_namespace,
+                        &registry, &works, &entries, &grants,
+                        broker_sidecar.as_ref().ok_or_else(|| io::Error::other("private source witness requires v30 sidecar"))?,
+                    )
+                }
+                #[cfg(not(feature = "age319-private-broker-fixture"))]
+                unreachable!()
             } else if operation == b'S' || operation == b's' {
                 let RequestPayload::VerifySourceSocket { witness, socket } = payload else {
                     return Err(io::Error::other("invalid source socket witness payload"));
