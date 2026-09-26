@@ -9226,6 +9226,35 @@ fn inner() {
                 );
                 fs::write(gate.join("source-auth-checked"), b"yes").unwrap();
                 eventually(|| {
+                    gate.join("source-verification-ready").exists()
+                        || entry.try_wait().unwrap().is_some()
+                });
+                assert!(
+                    gate.join("source-verification-ready").exists(),
+                    "source decision issuance: {} broker: {}",
+                    fs::read_to_string(&err).unwrap(),
+                    fs::read_to_string(&broker_log).unwrap()
+                );
+                let writer = rusqlite::Connection::open(data.join("state.db")).unwrap();
+                writer
+                    .execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE")
+                    .unwrap();
+                fs::write(gate.join("source-state-writer-held"), b"yes").unwrap();
+                eventually(|| {
+                    gate.join("source-state-writer-verified").exists()
+                        || entry.try_wait().unwrap().is_some()
+                });
+                assert!(
+                    gate.join("source-state-writer-verified").exists(),
+                    "verification waited on State writer: {} broker: {}",
+                    fs::read_to_string(&err).unwrap(),
+                    fs::read_to_string(&broker_log).unwrap()
+                );
+                writer
+                    .execute_batch("ROLLBACK; PRAGMA locking_mode=NORMAL")
+                    .unwrap();
+                drop(writer);
+                eventually(|| {
                     gate.join("source-witness-positive").exists()
                         || entry.try_wait().unwrap().is_some()
                 });

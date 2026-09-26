@@ -1,5 +1,5 @@
-//! Separate, broker-owned exact-source decisions. This is issuance only; State
-//! admission and source effects do not read this journal yet.
+//! Separate, broker-owned exact-source decisions. Issuance and read-only
+//! verification do not themselves admit a State source or authorize an effect.
 use oulipoly_kernel_broker::entry_registry::ProcessStamp;
 use oulipoly_kernel_broker::protocol::{ExactSourceDecisionReadback, ProcessWitness};
 use oulipoly_state::mailbox::PreparedProcessStamp;
@@ -74,6 +74,57 @@ fn exact_file(path: &Path, mode: u32, owner: u32, directory: bool) -> io::Result
 }
 
 impl Journal {
+    /// Exact readback only. This method never begins a writer transaction or
+    /// reads the original State database. A State writer may hold its lock.
+    pub fn verify_decision(
+        &self,
+        request_id: &str,
+        decision_id: &str,
+        claims: &Claims,
+    ) -> io::Result<ExactSourceDecisionReadback> {
+        let canonical = uuid::Uuid::parse_str(request_id)
+            .map_err(|_| error("invalid source decision request ID"))?;
+        if canonical.to_string() != request_id {
+            return Err(error("noncanonical source decision request ID"));
+        }
+        let canonical =
+            uuid::Uuid::parse_str(decision_id).map_err(|_| error("invalid source decision ID"))?;
+        if canonical.to_string() != decision_id {
+            return Err(error("noncanonical source decision ID"));
+        }
+        self.verify()?;
+        let now = i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| error("source decision clock before epoch"))?
+                .as_secs(),
+        )
+        .map_err(|_| error("source decision clock overflow"))?;
+        let floor: i64 = self
+            .connection
+            .query_row(
+                "SELECT unix_seconds FROM clock_floor WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| error(e.to_string()))?;
+        let stored: Option<(String, Vec<u8>, i64, i64)> = self.connection.query_row(
+            "SELECT decision_id,claims,issued_unix_seconds,expires_unix_seconds FROM decisions WHERE request_id=?1",
+            [request_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        ).optional().map_err(|e| error(e.to_string()))?;
+        let (stored_id, stored_claims, issued, expires) =
+            stored.ok_or_else(|| error("exact source decision absent"))?;
+        if stored_id != decision_id
+            || stored_claims != serde_json::to_vec(claims).map_err(|e| error(e.to_string()))?
+            || issued.checked_add(TTL_SECONDS) != Some(expires)
+            || now < floor
+            || now >= expires
+        {
+            return Err(error("exact source decision conflict or expired"));
+        }
+        Ok(readback(request_id, decision_id, claims, issued, expires))
+    }
+
     pub fn open(state: &Path) -> io::Result<Self> {
         let owner = unsafe { libc::geteuid() };
         let directory = state.join("source-decisions");
@@ -311,7 +362,10 @@ impl Journal {
         let claims_bytes = serde_json::to_vec(claims).map_err(|e| error(e.to_string()))?;
         let (decision_id, issued, expires) =
             if let Some((decision_id, prior, issued, expires)) = existing {
-                if prior != claims_bytes || now >= expires || expires != issued + TTL_SECONDS {
+                if prior != claims_bytes
+                    || now >= expires
+                    || issued.checked_add(TTL_SECONDS) != Some(expires)
+                {
                     return Err(error("exact source decision replay conflict or expired"));
                 }
                 (decision_id, issued, expires)
@@ -363,33 +417,43 @@ impl Journal {
             .map_err(|e| error(e.to_string()))?;
         transaction.commit().map_err(|e| error(e.to_string()))?;
         self.verify()?;
-        Ok(ExactSourceDecisionReadback {
-            request_id: request_id.into(),
-            decision_id,
-            issued_unix_seconds: issued,
-            expires_unix_seconds: expires,
-            root_id: claims.root_id.clone(),
-            root_init: claims.root_init.clone(),
-            source_generation: claims.source_generation.clone(),
-            owner_generation: claims.owner_generation.clone(),
-            owner_uid: claims.owner_uid,
-            domain_id: claims.domain_id.clone(),
-            supervisor_id: claims.supervisor_id.clone(),
-            guardian: claims.guardian.clone(),
-            driver: claims.driver.clone(),
-            issuer: claims.peer.clone(),
-            owner_session_id: claims.owner_session_id.clone(),
-            owner_invocation_uuid: claims.owner_invocation_uuid.clone(),
-            capability_digest: claims.capability_digest.clone(),
-            handle: claims.handle.clone(),
-            caller_admission_id: claims.caller_admission_id.clone(),
-            registration_id: claims.registration_id.clone(),
-            registration_path: claims.registration_path.clone(),
-            registration_device: claims.registration_device,
-            registration_inode: claims.registration_inode,
-            registration_len: claims.registration_bytes.len() as u64,
-            registration_sha256: claims.registration_sha256.clone(),
-        })
+        Ok(readback(request_id, &decision_id, claims, issued, expires))
+    }
+}
+
+fn readback(
+    request_id: &str,
+    decision_id: &str,
+    claims: &Claims,
+    issued: i64,
+    expires: i64,
+) -> ExactSourceDecisionReadback {
+    ExactSourceDecisionReadback {
+        request_id: request_id.into(),
+        decision_id: decision_id.into(),
+        issued_unix_seconds: issued,
+        expires_unix_seconds: expires,
+        root_id: claims.root_id.clone(),
+        root_init: claims.root_init.clone(),
+        source_generation: claims.source_generation.clone(),
+        owner_generation: claims.owner_generation.clone(),
+        owner_uid: claims.owner_uid,
+        domain_id: claims.domain_id.clone(),
+        supervisor_id: claims.supervisor_id.clone(),
+        guardian: claims.guardian.clone(),
+        driver: claims.driver.clone(),
+        issuer: claims.peer.clone(),
+        owner_session_id: claims.owner_session_id.clone(),
+        owner_invocation_uuid: claims.owner_invocation_uuid.clone(),
+        capability_digest: claims.capability_digest.clone(),
+        handle: claims.handle.clone(),
+        caller_admission_id: claims.caller_admission_id.clone(),
+        registration_id: claims.registration_id.clone(),
+        registration_path: claims.registration_path.clone(),
+        registration_device: claims.registration_device,
+        registration_inode: claims.registration_inode,
+        registration_len: claims.registration_bytes.len() as u64,
+        registration_sha256: claims.registration_sha256.clone(),
     }
 }
 
@@ -512,6 +576,100 @@ mod tests {
                 .connection
                 .execute("UPDATE decisions SET registration_id='copy'", [])
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn read_only_verification_requires_exact_unexpired_journal_claims() {
+        let temp = tempfile::tempdir().unwrap();
+        let request = uuid::Uuid::new_v4().to_string();
+        let mut journal = Journal::open(temp.path()).unwrap();
+        let issued = journal.issue(&request, &claims()).unwrap();
+        let before: i64 = journal
+            .connection
+            .query_row(
+                "SELECT unix_seconds FROM clock_floor WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            journal
+                .verify_decision(&request, &issued.decision_id, &claims())
+                .unwrap(),
+            issued
+        );
+        let mut wrong = claims();
+        wrong.capability_digest = "other".into();
+        assert!(
+            journal
+                .verify_decision(&request, &issued.decision_id, &wrong)
+                .is_err()
+        );
+        wrong = claims();
+        wrong.registration_bytes.push(0);
+        assert!(
+            journal
+                .verify_decision(&request, &issued.decision_id, &wrong)
+                .is_err()
+        );
+        assert!(
+            journal
+                .verify_decision(&request, &uuid::Uuid::new_v4().to_string(), &claims())
+                .is_err()
+        );
+        assert!(
+            journal
+                .verify_decision(
+                    &uuid::Uuid::new_v4().to_string(),
+                    &issued.decision_id,
+                    &claims()
+                )
+                .is_err()
+        );
+        let after: i64 = journal
+            .connection
+            .query_row(
+                "SELECT unix_seconds FROM clock_floor WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, after);
+        assert_eq!(
+            journal
+                .connection
+                .query_row::<i64, _, _>("SELECT count(*) FROM decisions", [], |row| row.get(0))
+                .unwrap(),
+            1
+        );
+        drop(journal);
+        let reopened = Journal::open(temp.path()).unwrap();
+        assert_eq!(
+            reopened
+                .verify_decision(&request, &issued.decision_id, &claims())
+                .unwrap(),
+            issued
+        );
+
+        let expired = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(expired.path()).unwrap();
+        let past = i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap()
+            - TTL_SECONDS
+            - 2;
+        let old = journal.issue_at(&request, &claims(), past).unwrap();
+        assert!(
+            journal
+                .verify_decision(&request, &old.decision_id, &claims())
+                .unwrap_err()
+                .to_string()
+                .contains("expired")
         );
     }
 

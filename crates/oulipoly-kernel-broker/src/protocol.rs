@@ -2102,6 +2102,17 @@ pub struct ExactSourceDecisionRequest {
     pub witness: SourceWitnessProbe,
 }
 
+/// A challenged, read-only check of an already issued decision. The broker
+/// rechecks the live original child, held release, guardian and file FD; it
+/// does not read State, so this operation can run under a State writer.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExactSourceDecisionVerification {
+    pub request_id: String,
+    pub decision_id: String,
+    pub witness: SourceWitnessProbe,
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ExactSourceDecisionReadback {
@@ -3085,6 +3096,41 @@ pub fn issue_exact_source_decision_at(
         return Err(io::Error::other("exact source decision reply mismatch"));
     }
     Ok(response)
+}
+
+pub fn verify_exact_source_decision_at(
+    path: &Path,
+    request: &ExactSourceDecisionVerification,
+    owner_fd: RawFd,
+    registration_fd: RawFd,
+) -> io::Result<ExactSourceDecisionReadback> {
+    let stream = send_native_descriptors_frame(path, b';', request, [owner_fd, registration_fd])?;
+    let response = read_exact_source_decision_response(stream)?;
+    if response.request_id != request.request_id
+        || response.decision_id != request.decision_id
+        || response.root_id != request.witness.owner.root_id
+        || response.registration_sha256 != request.witness.registration_sha256
+    {
+        return Err(io::Error::other(
+            "exact source decision verification reply mismatch",
+        ));
+    }
+    Ok(response)
+}
+
+/// Production callers use the installed Broker socket; only fixtures select
+/// an alternate path through the `_at` form.
+pub fn verify_exact_source_decision(
+    request: &ExactSourceDecisionVerification,
+    owner_fd: RawFd,
+    registration_fd: RawFd,
+) -> io::Result<ExactSourceDecisionReadback> {
+    verify_exact_source_decision_at(
+        Path::new(INSTALLED_SOCKET),
+        request,
+        owner_fd,
+        registration_fd,
+    )
 }
 
 /// Private test seam for a reply lost after the broker has committed.

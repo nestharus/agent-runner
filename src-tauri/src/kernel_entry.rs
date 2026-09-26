@@ -566,6 +566,86 @@ fn private_v30_source_witness(
     if check(&probe, &registration).map_err(|e| e.to_string())? != decision {
         return Err("same-request decision replay changed".into());
     }
+    let verification = protocol::ExactSourceDecisionVerification {
+        request_id: request_id.clone(),
+        decision_id: decision.decision_id.clone(),
+        witness: probe.clone(),
+    };
+    std::fs::write(gate_dir.join("source-verification-ready"), b"yes")
+        .map_err(|e| e.to_string())?;
+    let writer_deadline = std::time::Instant::now() + PRIVATE_CHILD_EFFECT_WAIT;
+    while !gate_dir.join("source-state-writer-held").exists() {
+        if std::time::Instant::now() >= writer_deadline {
+            return Err("source State writer gate expired".into());
+        }
+        std::thread::sleep(PRIVATE_CHILD_EFFECT_POLL);
+    }
+    let verify = |request: &protocol::ExactSourceDecisionVerification, fd: &File| {
+        protocol::verify_exact_source_decision_at(
+            &broker,
+            request,
+            owner_socket.as_raw_fd(),
+            fd.as_raw_fd(),
+        )
+    };
+    if verify(&verification, &registration).map_err(|e| e.to_string())? != decision {
+        return Err("held-State-writer decision verification changed".into());
+    }
+    let mut altered = verification.clone();
+    altered.decision_id = uuid::Uuid::new_v4().to_string();
+    if !verify(&altered, &registration).is_err_and(|e| e.to_string().contains("decision conflict"))
+    {
+        return Err("altered source decision ID verified".into());
+    }
+    altered = verification.clone();
+    altered.witness.capability = "0".repeat(64);
+    altered.witness.owner.registration_authority_sha256 = Some(format!(
+        "{:x}",
+        Sha256::digest(altered.witness.capability.as_bytes())
+    ));
+    if !verify(&altered, &registration).is_err_and(|e| e.to_string().contains("decision conflict"))
+    {
+        return Err("altered source decision capability verified".into());
+    }
+    altered = verification.clone();
+    altered.witness.owner.root_id = uuid::Uuid::new_v4().to_string();
+    if !verify(&altered, &registration)
+        .is_err_and(|e| e.to_string().contains("owner witness root absent"))
+    {
+        return Err("other-root source decision verified".into());
+    }
+    altered = verification.clone();
+    altered.witness.owner.work_id = Some(uuid::Uuid::new_v4().to_string());
+    if !verify(&altered, &registration).is_err_and(|e| {
+        e.to_string()
+            .contains("consumed-H source decision route unavailable")
+    }) {
+        return Err("consumed-H source decision verified".into());
+    }
+    let copied_path = source_dir.join("verification-copy.json");
+    std::fs::write(&copied_path, &bytes).map_err(|e| e.to_string())?;
+    let copied_fd = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&copied_path)
+        .map_err(|e| e.to_string())?;
+    if !verify(&verification, &copied_fd).is_err_and(|e| {
+        e.to_string()
+            .contains("registration FD/path identity mismatch")
+    }) {
+        return Err("copied registration FD verified".into());
+    }
+    std::fs::write(&path, b"changed registration bytes").map_err(|e| e.to_string())?;
+    let changed_refused = verify(&verification, &registration).is_err_and(|e| {
+        e.to_string()
+            .contains("registration asserted bytes mismatch")
+    });
+    std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+    if !changed_refused {
+        return Err("changed registration bytes verified".into());
+    }
+    std::fs::write(gate_dir.join("source-state-writer-verified"), b"yes")
+        .map_err(|e| e.to_string())?;
     let duplicate = ExactSourceDecisionRequest {
         request_id: uuid::Uuid::new_v4().to_string(),
         witness: probe.clone(),

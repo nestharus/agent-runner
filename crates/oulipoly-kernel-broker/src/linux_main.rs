@@ -59,11 +59,11 @@ use oulipoly_kernel_broker::native_receipt::{
     BoundNativeAuthority, verify as verify_native_receipt,
 };
 use oulipoly_kernel_broker::protocol::{
-    AcceptedWorkSpec, ExactSourceDecisionRequest, FreshChildRequest, FreshRecipientRequest,
-    FreshRootEffectRequest, JoinSpec, JoinedChildWitness, LaunchAcceptedWorkSpec, NativeKSpec,
-    NativePrepareSpec, OwnerWitness, ProcessWitness, SourceControlUse, SourceScope,
-    SourceSocketWitness, SourceTicketUse, SourceWitnessProbe, StateGenerationSpec, StateReadSpec,
-    StateWriteAction, StateWriteSpec,
+    AcceptedWorkSpec, ExactSourceDecisionRequest, ExactSourceDecisionVerification,
+    FreshChildRequest, FreshRecipientRequest, FreshRootEffectRequest, JoinSpec, JoinedChildWitness,
+    LaunchAcceptedWorkSpec, NativeKSpec, NativePrepareSpec, OwnerWitness, ProcessWitness,
+    SourceControlUse, SourceScope, SourceSocketWitness, SourceTicketUse, SourceWitnessProbe,
+    StateGenerationSpec, StateReadSpec, StateWriteAction, StateWriteSpec,
 };
 use oulipoly_kernel_broker::registry::{RootRecord, RootRegistry};
 use oulipoly_kernel_broker::root_drain;
@@ -405,7 +405,7 @@ fn require_cutover_entry_route(
     if gate_closed {
         return Err(io::Error::other("broker entry gate is durably closed"));
     }
-    if operation == b':' && !broker_owned_sidecar {
+    if matches!(operation, b':' | b';') && !broker_owned_sidecar {
         return Err(io::Error::other(
             "exact source decision requires v30 sidecar",
         ));
@@ -434,6 +434,7 @@ fn require_cutover_entry_route(
                 | b'q'
                 | b'z'
                 | b':'
+                | b';'
         )
     {
         #[cfg(feature = "age319-private-broker-fixture")]
@@ -534,6 +535,11 @@ enum RequestPayload {
     },
     ExactSourceDecision {
         request: ExactSourceDecisionRequest,
+        socket: File,
+        registration: File,
+    },
+    VerifyExactSourceDecision {
+        request: ExactSourceDecisionVerification,
         socket: File,
         registration: File,
     },
@@ -741,7 +747,7 @@ fn recv_request(
         b'A' | b'a' => read == 33,
         b'J' | b'j' => (18..=48 * 1024 + 17).contains(&read),
         b'L' => (18..=48 * 1024 + 17).contains(&read),
-        b':' => (18..=8192 + 17).contains(&read),
+        b':' | b';' => (18..=8192 + 17).contains(&read),
         #[cfg(feature = "age319-private-broker-fixture")]
         b'&' => (18..=2048 + 17).contains(&read),
         b'V' | b'S' | b's' | b'T' | b'H' | b'K' | b'B' | b'N' | b'k' | b't' | b'R' | b'W'
@@ -782,7 +788,7 @@ fn recv_request(
             b'X' | b'^' | b'f' | b')' | b'w' | b'~' | b'?' => descriptors.len() != 1,
             #[cfg(feature = "age319-private-broker-fixture")]
             b'#' => descriptors.len() != 2,
-            b':' => descriptors.len() != 2,
+            b':' | b';' => descriptors.len() != 2,
             #[cfg(feature = "age319-private-broker-fixture")]
             b'&' => descriptors.len() != 2,
             #[cfg(feature = "age319-private-broker-fixture")]
@@ -957,6 +963,11 @@ fn recv_request(
             socket: descriptors.remove(0),
         },
         b':' => RequestPayload::ExactSourceDecision {
+            request: serde_json::from_slice(&request[17..read as usize])?,
+            socket: descriptors.remove(0),
+            registration: descriptors.remove(0),
+        },
+        b';' => RequestPayload::VerifyExactSourceDecision {
             request: serde_json::from_slice(&request[17..read as usize])?,
             socket: descriptors.remove(0),
             registration: descriptors.remove(0),
@@ -2023,6 +2034,7 @@ fn verify_exact_source_witness(
     entries: &EntryRegistry,
     grants: &GrantRegistry,
     sidecar: &BrokerSidecar,
+    check_original_state: bool,
 ) -> io::Result<source_decision_journal::Claims> {
     // Consumed-H helpers require their own exact authority proof. This issuer
     // accepts only the original joined child, even when V could verify H.
@@ -2130,14 +2142,16 @@ fn verify_exact_source_witness(
             &probe.capability,
         )
         .map_err(io::Error::other)?;
-    sidecar
-        .verify_bound_invocation(
-            &probe.owner_invocation_uuid,
-            &probe.owner_session_id,
-            &capability,
-        )
-        .map_err(io::Error::other)?;
-    mark("bound-state");
+    if check_original_state {
+        sidecar
+            .verify_bound_invocation(
+                &probe.owner_invocation_uuid,
+                &probe.owner_session_id,
+                &capability,
+            )
+            .map_err(io::Error::other)?;
+        mark("bound-state");
+    }
     if before != exact_registration_snapshot(&registration, &probe.registration_path)? {
         return Err(io::Error::other(
             "private registration FD/bytes changed across check",
@@ -3857,12 +3871,26 @@ fn serve() -> io::Result<()> {
                     .ok_or_else(|| io::Error::other("exact source decision requires v30 sidecar"))?;
                 let claims = verify_exact_source_witness(
                     request.witness, socket, registration, &peer, &runner_image, &host_namespace,
-                    &registry, &works, &entries, &grants, sidecar,
+                    &registry, &works, &entries, &grants, sidecar, true,
                 )?;
                 if source_decision_journal.is_none() {
                     source_decision_journal = Some(source_decision_journal::Journal::open(Path::new(&state))?);
                 }
                 let readback = source_decision_journal.as_mut().unwrap().issue(&request.request_id, &claims)?;
+                Ok(format!("{}\n", serde_json::to_string(&readback)?))
+            } else if operation == b';' {
+                let RequestPayload::VerifyExactSourceDecision { request, socket, registration } = payload else {
+                    return Err(io::Error::other("invalid exact source verification payload"));
+                };
+                let sidecar = broker_sidecar.as_ref()
+                    .ok_or_else(|| io::Error::other("exact source verification requires v30 sidecar"))?;
+                let claims = verify_exact_source_witness(
+                    request.witness, socket, registration, &peer, &runner_image, &host_namespace,
+                    &registry, &works, &entries, &grants, sidecar, false,
+                )?;
+                let journal = source_decision_journal.as_ref()
+                    .ok_or_else(|| io::Error::other("exact source decision absent"))?;
+                let readback = journal.verify_decision(&request.request_id, &request.decision_id, &claims)?;
                 Ok(format!("{}\n", serde_json::to_string(&readback)?))
             } else if cfg!(feature = "age319-private-broker-fixture") && operation == b'&' {
                 #[cfg(feature = "age319-private-broker-fixture")]
@@ -3874,7 +3902,7 @@ fn serve() -> io::Result<()> {
                     let claims = verify_exact_source_witness(
                         probe, socket, registration, &peer, &runner_image, &host_namespace,
                         &registry, &works, &entries, &grants,
-                        broker_sidecar.as_ref().ok_or_else(|| io::Error::other("private source witness requires v30 sidecar"))?,
+                        broker_sidecar.as_ref().ok_or_else(|| io::Error::other("private source witness requires v30 sidecar"))?, true,
                     )?;
                     Ok(format!("private-source-witness {}\n", claims.root_id))
                 }
@@ -7257,6 +7285,9 @@ mod tests {
         assert!(require_cutover_entry_route(b':', true, false).is_ok());
         assert!(require_cutover_entry_route(b':', false, false).is_err());
         assert!(require_cutover_entry_route(b':', true, true).is_err());
+        assert!(require_cutover_entry_route(b';', true, false).is_ok());
+        assert!(require_cutover_entry_route(b';', false, false).is_err());
+        assert!(require_cutover_entry_route(b';', true, true).is_err());
         for operation in [b'i', b'X', b'x'] {
             assert!(require_cutover_entry_route(operation, true, true).is_ok());
         }
