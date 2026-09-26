@@ -76,7 +76,15 @@ if mode == 'source':
 else:
     assert os.getpid() == 1
     open(path + '/root.pid', 'w').write(str(observer_pid()))
-    source = subprocess.Popen([sys.executable, '-c', script, path, 'source', script])
+    if mode == 'root-bash':
+        read_fd, write_fd = os.pipe()
+        source = subprocess.Popen([os.environ['AGE319_BASH_IMAGE'], '__root-original-work-v1', str(read_fd), '0', '0', '0', '0'], pass_fds=(read_fd,))
+        os.close(read_fd)
+        host_children = '/proc/self/task/' + str(observer_pid()) + '/children'
+        source_host_pid = int(open(host_children).read().split()[0])
+        open(path + '/source.pid', 'w').write(str(source_host_pid))
+    else:
+        source = subprocess.Popen([sys.executable, '-c', script, path, 'source', script])
     source.wait()
 "#;
 
@@ -310,7 +318,14 @@ fn send_k_without_reply(path: &Path, spec: &LaunchAcceptedWorkSpec, descriptors:
     drop(stream);
 }
 
-fn inner(kill_case: bool, lost_reply_case: bool, cancel_case: bool, helper_probe: bool) {
+fn inner(
+    kill_case: bool,
+    lost_reply_case: bool,
+    cancel_case: bool,
+    helper_probe: bool,
+    private_source_route: bool,
+    bash_source_probe: bool,
+) {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("broker-state");
     let work_state = temp.path().join("accepted-h");
@@ -327,8 +342,18 @@ fn inner(kill_case: bool, lost_reply_case: bool, cancel_case: bool, helper_probe
         Command::new("unshare")
             .args(["--pid", "--fork", "python3", "-c", ROOT_PROCESS])
             .arg(temp.path())
-            .arg("root")
+            .arg(if bash_source_probe {
+                "root-bash"
+            } else {
+                "root"
+            })
             .arg(ROOT_PROCESS)
+            .envs(bash_source_probe.then(|| {
+                (
+                    "AGE319_BASH_IMAGE",
+                    std::env::var("OULIPOLY_AGE319_BASH_IMAGE").unwrap(),
+                )
+            }))
             .process_group(0)
             .stdout(Stdio::null())
             .spawn()
@@ -415,7 +440,11 @@ fn inner(kill_case: bool, lost_reply_case: bool, cancel_case: bool, helper_probe
 
     let work_id = "accepted-h";
     let cwd = temp.path();
-    let source_image = std::env::current_exe().unwrap();
+    let source_image = if bash_source_probe {
+        std::path::PathBuf::from(std::env::var("OULIPOLY_AGE319_BASH_IMAGE").unwrap())
+    } else {
+        std::env::current_exe().unwrap()
+    };
     let helper = work_state.join("delivery-helper");
     fs::copy(&source_image, &helper).unwrap();
     if helper_probe {
@@ -428,7 +457,7 @@ fn inner(kill_case: bool, lost_reply_case: bool, cancel_case: bool, helper_probe
         "size": fs::metadata(&helper).unwrap().len(),
         "sha256": digest(&fs::read(&helper).unwrap())
     });
-    let intent = serde_json::to_vec(&serde_json::json!({
+    let mut intent_value = serde_json::json!({
         "protocol": "original-work-v1", "work_id": work_id, "root_id": root_id,
         "handle": work_id, "state_root": temp.path(),
         "registration_authority": helper_probe.then(|| registration_authority.as_bytes().to_vec()),
@@ -437,8 +466,43 @@ fn inner(kill_case: bool, lost_reply_case: bool, cancel_case: bool, helper_probe
             "owner_invocation_uuid": helper_probe.then_some(&invocation),
             "delivery_helper": helper_metadata
         }
-    }))
-    .unwrap();
+    });
+    if private_source_route {
+        intent_value["__age319_private_bash_source_gate"] = serde_json::json!(work_state);
+        intent_value["argv"] = serde_json::json!(["/bin/true", "selected workload"]);
+        intent_value["environment"] = serde_json::json!([
+            {"key": b"AGE319_SELECTED_ACCOUNT", "value": b"physical-selected"},
+            {"key": b"AGE319_SELECTED_ENV", "value": b"unchanged"}
+        ]);
+    }
+    if bash_source_probe {
+        let runner = std::env::var("OULIPOLY_AGE319_RUNNER_IMAGE").unwrap();
+        let environment = [
+            ("XDG_STATE_HOME", temp.path().to_str().unwrap()),
+            ("XDG_CONFIG_HOME", temp.path().to_str().unwrap()),
+            ("AGENT_BASH_AGENT_RUNNER_BIN", runner.as_str()),
+            ("OULIPOLY_KERNEL_EXPECTED_ROOT_V1", root_id.as_str()),
+            (
+                "OULIPOLY_KERNEL_OWNER_ENDPOINT_V1",
+                "/absent-v30-guardian.sock",
+            ),
+            (
+                "OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1",
+                "/absent-v30-broker.sock",
+            ),
+        ];
+        intent_value["environment"] = serde_json::Value::Array(
+            environment
+                .iter()
+                .map(|(key, value)| {
+                    serde_json::json!({
+                        "key": key.as_bytes(), "value": value.as_bytes()
+                    })
+                })
+                .collect(),
+        );
+    }
+    let intent = serde_json::to_vec(&intent_value).unwrap();
     fs::write(work_state.join("root-work-intent-v1.json"), &intent).unwrap();
     let accepted = serde_json::to_vec(&Acceptance {
         protocol: "original-work-v1".into(),
@@ -870,7 +934,7 @@ fn inner(kill_case: bool, lost_reply_case: bool, cancel_case: bool, helper_probe
         libc::close(release[1]);
         libc::waitpid(inherited, std::ptr::null_mut(), 0);
     }
-    if !kill_case && !lost_reply_case {
+    if !kill_case && !lost_reply_case && !bash_source_probe {
         let root_witness = SourceSocketWitness {
             root_id: spec.root_id.clone(),
             domain_id: domain.clone(),
@@ -1025,6 +1089,22 @@ open(state + '/worker-done', 'w').write('done')
 "#,
     )
     .unwrap();
+    if private_source_route && !bash_source_probe {
+        // Python is only an argv/environment probe here. H still pins its
+        // genuine live source executable; this does not claim Bash bytes.
+        fs::write(
+            cwd.join("__age319-private-v30-source-prep-v1"),
+            r#"import json, os, sys, time
+state = sys.argv[1]
+exec_environment = dict(item.split(b'=', 1) for item in open('/proc/self/environ', 'rb').read().split(b'\0') if item)
+with open(state + '/private-source-probe.json', 'w') as output:
+    json.dump({'pid': os.getpid(), 'parent': os.getppid(), 'argv': sys.argv[2:], 'environment': {key.decode(): value.decode() for key, value in exec_environment.items()}}, output)
+while not os.path.exists(state + '/private-source-release'):
+    time.sleep(.02)
+"#,
+        )
+        .unwrap();
+    }
     let (guardian_control, worker_control) = UnixStream::pair().unwrap();
     let mut pipe = [-1; 2];
     assert_eq!(
@@ -1125,6 +1205,76 @@ open(state + '/worker-done', 'w').write('done')
         assert_ne!(worker_pid, source_pid);
     }
     assert!(GrantRegistry::open(state.join("grants")).unwrap().records()[0].consumed);
+    if private_source_route {
+        if bash_source_probe {
+            wait_for(&work_state.join("private-source-stderr.log"));
+            let until = Instant::now() + Duration::from_secs(20);
+            loop {
+                let stderr = fs::read_to_string(work_state.join("private-source-stderr.log"))
+                    .unwrap_or_default();
+                if stderr.contains("AGE319_PRIVATE_V30_SOURCE=") {
+                    assert!(
+                        stderr.contains("challenged capability refused"),
+                        "unexpected Bash refusal: {stderr}"
+                    );
+                    eprintln!("expected synthetic Bash K refusal: {}", stderr.trim());
+                    break;
+                }
+                assert!(
+                    Instant::now() < until,
+                    "Bash source refusal absent: {stderr}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(!work_state.join("source-ready").exists());
+            assert!(!temp.path().join("agent-bash").exists());
+            let until = Instant::now() + Duration::from_secs(20);
+            loop {
+                let observed = protocol::observe_accepted_work_at(&socket, grant_id).unwrap();
+                if observed.starts_with(&format!("work-drained {incarnation} ")) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < until,
+                    "synthetic Bash K did not reap: {observed}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            return;
+        }
+        wait_for(&work_state.join("private-source-probe.json"));
+        let observed: serde_json::Value = serde_json::from_slice(
+            &fs::read(work_state.join("private-source-probe.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(observed["pid"], 2);
+        assert_eq!(observed["parent"], 1);
+        assert_eq!(
+            observed["argv"],
+            serde_json::json!(["--", "/bin/true", "selected workload"])
+        );
+        assert_eq!(observed["environment"].as_object().unwrap().len(), 2);
+        assert_eq!(
+            observed["environment"]["AGE319_SELECTED_ACCOUNT"],
+            "physical-selected"
+        );
+        assert_eq!(observed["environment"]["AGE319_SELECTED_ENV"], "unchanged");
+        assert_eq!(
+            protocol::observe_accepted_work_at(&socket, grant_id).unwrap(),
+            format!("work-live {incarnation}\n")
+        );
+        fs::write(work_state.join("private-source-release"), b"R").unwrap();
+        let until = Instant::now() + Duration::from_secs(20);
+        loop {
+            let observed = protocol::observe_accepted_work_at(&socket, grant_id).unwrap();
+            if observed.starts_with(&format!("work-drained {incarnation} ")) {
+                break;
+            }
+            assert!(Instant::now() < until, "private K did not reap: {observed}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        return;
+    }
     if helper_probe {
         let mut entry = historical_entry.take().unwrap();
         entry.kill().unwrap();
@@ -1364,13 +1514,71 @@ open(state + '/worker-done', 'w').write('done')
 }
 
 #[test]
+fn pinned_bash_k_entry_refuses_without_released_jd() {
+    if std::env::var_os("OULIPOLY_AGE319_BASH_IMAGE").is_none()
+        || std::env::var_os("OULIPOLY_AGE319_RUNNER_IMAGE").is_none()
+    {
+        return;
+    }
+    if std::env::var_os("AGE319_PRIVATE_H_INNER").is_some() {
+        inner(false, false, false, false, true, true);
+        return;
+    }
+    let output = Command::new("unshare")
+        .args(["-Urpfm", "--mount-proc"])
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "pinned_bash_k_entry_refuses_without_released_jd",
+            "--nocapture",
+        ])
+        .env("AGE319_PRIVATE_H_INNER", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+}
+
+#[test]
+fn private_h_intent_selects_k_worker_argv_and_environment() {
+    if std::env::var_os("AGE319_PRIVATE_H_INNER").is_some() {
+        inner(false, false, false, false, true, false);
+        return;
+    }
+    let output = Command::new("unshare")
+        .args(["-Urpfm", "--mount-proc"])
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "private_h_intent_selects_k_worker_argv_and_environment",
+            "--nocapture",
+        ])
+        .env("AGE319_PRIVATE_H_INNER", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+}
+
+#[test]
 fn challenged_h_prepares_and_k_launches_one_nested_worker() {
     if std::env::var_os("AGE319_K_SIBLING_SOCKET").is_some() {
         sibling_launch_probe();
         return;
     }
     if std::env::var_os("AGE319_PRIVATE_H_INNER").is_some() {
-        inner(false, false, false, false);
+        inner(false, false, false, false, false, false);
         return;
     }
     let output = Command::new("unshare")
@@ -1395,7 +1603,7 @@ fn challenged_h_prepares_and_k_launches_one_nested_worker() {
 #[test]
 fn killed_work_pid1_is_uncertain_without_terminal_receipt() {
     if std::env::var_os("AGE319_PRIVATE_H_INNER").is_some() {
-        inner(true, false, false, false);
+        inner(true, false, false, false, false, false);
         return;
     }
     let output = Command::new("unshare")
@@ -1420,7 +1628,7 @@ fn killed_work_pid1_is_uncertain_without_terminal_receipt() {
 #[test]
 fn lost_k_response_cannot_replay_accepted_worker() {
     if std::env::var_os("AGE319_PRIVATE_H_INNER").is_some() {
-        inner(false, true, false, false);
+        inner(false, true, false, false, false, false);
         return;
     }
     let output = Command::new("unshare")
@@ -1445,7 +1653,7 @@ fn lost_k_response_cannot_replay_accepted_worker() {
 #[test]
 fn work_specific_cancel_drains_adopted_setsid_descendant() {
     if std::env::var_os("AGE319_PRIVATE_H_INNER").is_some() {
-        inner(false, false, true, false);
+        inner(false, false, true, false, false, false);
         return;
     }
     let output = Command::new("unshare")
@@ -1562,7 +1770,7 @@ fn sealed_helper_from_consumed_work_attests_owner() {
         return;
     }
     if std::env::var_os("AGE319_PRIVATE_H_INNER").is_some() {
-        inner(false, false, false, true);
+        inner(false, false, false, true, false, false);
         return;
     }
     let output = Command::new("unshare")

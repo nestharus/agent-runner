@@ -11,10 +11,16 @@ use oulipoly_kernel_broker::identity::{PeerIdentity, PinnedProcess, observed_inc
 use oulipoly_kernel_broker::registry::RootRegistry;
 use oulipoly_kernel_broker::work_registry::WorkRegistry;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "age319-private-broker-fixture")]
+use std::fs::OpenOptions;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
+#[cfg(feature = "age319-private-broker-fixture")]
+use std::os::unix::fs::FileExt;
 use std::os::unix::fs::FileTypeExt;
+#[cfg(feature = "age319-private-broker-fixture")]
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -23,7 +29,103 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 const EXECUTOR_ARG: &str = "__root-original-work-v1";
+#[cfg(feature = "age319-private-broker-fixture")]
+const PRIVATE_BASH_SOURCE_ARG: &str = "__age319-private-v30-source-prep-v1";
 static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// This choice is read from the H-hashed intent before K is consumed. Its
+/// environment is the selected physical environment, including endpoint
+/// selectors; no later Broker environment can replace that selection.
+#[cfg(feature = "age319-private-broker-fixture")]
+#[derive(Clone, Debug)]
+struct PrivateBashSource {
+    gate: std::path::PathBuf,
+    argv: Vec<String>,
+    environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_bash_source(
+    intent: &File,
+    expected_sha256: &str,
+) -> io::Result<Option<PrivateBashSource>> {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::ffi::OsStringExt;
+    let len = intent.metadata()?.len();
+    if len == 0 || len > 1024 * 1024 {
+        return Err(io::Error::other("private accepted intent size invalid"));
+    }
+    let mut bytes = vec![0; len as usize];
+    intent.read_exact_at(&mut bytes, 0)?;
+    if format!("{:x}", Sha256::digest(&bytes)) != expected_sha256 {
+        return Err(io::Error::other(
+            "private Bash source selection changed after H",
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let Some(gate) = value.get("__age319_private_bash_source_gate") else {
+        return Ok(None);
+    };
+    let gate = gate
+        .as_str()
+        .map(Path::new)
+        .filter(|path| path.is_absolute() && fs::canonicalize(path).ok().as_deref() == Some(*path))
+        .ok_or_else(|| io::Error::other("private Bash source gate is not canonical"))?
+        .to_path_buf();
+    let argv = value["argv"]
+        .as_array()
+        .filter(|argv| !argv.is_empty())
+        .ok_or_else(|| io::Error::other("private Bash source argv absent"))?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.is_empty() && !value.contains('\0'))
+                .map(str::to_owned)
+                .ok_or_else(|| io::Error::other("private Bash source argv invalid"))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let entries = value["environment"]
+        .as_array()
+        .ok_or_else(|| io::Error::other("private Bash source environment absent"))?;
+    let mut environment = Vec::with_capacity(entries.len());
+    let mut names = std::collections::BTreeSet::new();
+    for entry in entries {
+        let field = |name: &str| -> io::Result<Vec<u8>> {
+            entry[name]
+                .as_array()
+                .ok_or_else(|| io::Error::other("private Bash environment field absent"))?
+                .iter()
+                .map(|byte| {
+                    byte.as_u64()
+                        .and_then(|byte| u8::try_from(byte).ok())
+                        .ok_or_else(|| io::Error::other("private Bash environment byte invalid"))
+                })
+                .collect()
+        };
+        let key = field("key")?;
+        let value = field("value")?;
+        if key.is_empty()
+            || key.contains(&0)
+            || key.contains(&b'=')
+            || value.contains(&0)
+            || !names.insert(key.clone())
+        {
+            return Err(io::Error::other(
+                "private Bash environment identity invalid",
+            ));
+        }
+        environment.push((
+            std::ffi::OsString::from_vec(key),
+            std::ffi::OsString::from_vec(value),
+        ));
+    }
+    Ok(Some(PrivateBashSource {
+        gate,
+        argv,
+        environment,
+    }))
+}
 
 extern "C" fn request_cancel(_: libc::c_int) {
     CANCEL_REQUESTED.store(true, Ordering::Relaxed);
@@ -62,6 +164,8 @@ struct InitContext {
     owner_uid: u32,
     owner_gid: u32,
     groups: Vec<libc::gid_t>,
+    #[cfg(feature = "age319-private-broker-fixture")]
+    private_bash_source: Option<PrivateBashSource>,
 }
 
 pub(super) fn close_other_descriptors(keep: &[RawFd]) -> io::Result<()> {
@@ -124,6 +228,8 @@ fn run_init(context: InitContext) -> io::Result<()> {
         owner_uid,
         owner_gid,
         groups,
+        #[cfg(feature = "age319-private-broker-fixture")]
+        private_bash_source,
     } = context;
     close_other_descriptors(&[
         image.as_raw_fd(),
@@ -165,16 +271,42 @@ fn run_init(context: InitContext) -> io::Result<()> {
     }
     let image_path = format!("/proc/self/fd/{}", image.as_raw_fd());
     let mut command = Command::new(image_path);
+    #[cfg(feature = "age319-private-broker-fixture")]
+    if let Some(source) = private_bash_source {
+        let stderr = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(source.gate.join("private-source-stderr.log"))?;
+        command
+            .arg(PRIVATE_BASH_SOURCE_ARG)
+            .arg(source.gate)
+            .arg("--")
+            .args(source.argv)
+            .env_clear()
+            .envs(source.environment)
+            .stderr(Stdio::from(stderr));
+    } else {
+        command
+            .arg(EXECUTOR_ARG)
+            .arg(intent.as_raw_fd().to_string())
+            .arg(cwd.as_raw_fd().to_string())
+            .arg(state_dir.as_raw_fd().to_string())
+            .arg(control_for_worker.as_raw_fd().to_string())
+            .arg(capability.as_raw_fd().to_string())
+            .stderr(Stdio::null());
+    }
+    #[cfg(not(feature = "age319-private-broker-fixture"))]
     command
         .arg(EXECUTOR_ARG)
         .arg(intent.as_raw_fd().to_string())
         .arg(cwd.as_raw_fd().to_string())
         .arg(state_dir.as_raw_fd().to_string())
         .arg(control_for_worker.as_raw_fd().to_string())
-        .arg(capability.as_raw_fd().to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .arg(capability.as_raw_fd().to_string());
+    command.stdin(Stdio::null()).stdout(Stdio::null());
+    #[cfg(not(feature = "age319-private-broker-fixture"))]
+    command.stderr(Stdio::null());
     let worker_fds = [
         intent.as_raw_fd(),
         cwd.as_raw_fd(),
@@ -425,6 +557,12 @@ pub(super) fn launch(
     ] = &descriptors;
     let grant =
         grants.validate_launch_artifacts(grant_id, image, intent, cwd, state_dir, accepted)?;
+    #[cfg(feature = "age319-private-broker-fixture")]
+    let private_bash_source = if super::private_fixture() {
+        private_bash_source(intent, &grant.request_sha256)?
+    } else {
+        None
+    };
     validate_auxiliary(worker_control, capability, peer)?;
     if !peer.process.same_executable_as(runner_image)?
         || !peer.process.in_namespace(host_namespace)?
@@ -486,6 +624,8 @@ pub(super) fn launch(
         owner_uid: peer.uid,
         owner_gid: peer.gid,
         groups: peer.process.supplementary_groups()?,
+        #[cfg(feature = "age319-private-broker-fixture")]
+        private_bash_source,
     };
     let (init_pid, mut control, mut gate) = create_init(&parent_namespace, context)?;
     let init = PinnedProcess::open(init_pid)?;
@@ -691,4 +831,49 @@ pub(super) fn cancel(
         "cancel-signalled {}\n",
         work.record.work_incarnation
     ))
+}
+
+#[cfg(all(test, feature = "age319-private-broker-fixture"))]
+mod private_bash_source_tests {
+    use super::*;
+    use sha2::Digest;
+
+    #[test]
+    fn h_intent_selects_exact_private_bash_argv_and_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let intent = dir.path().join("intent.json");
+        let mut selected = serde_json::json!({
+            "__age319_private_bash_source_gate": dir.path(),
+            "argv": ["/bin/true", "selected argument"],
+            "environment": [
+                {"key": [65, 67, 67, 79, 85, 78, 84], "value": [97]},
+                {"key": [88, 68, 71, 95, 83, 84, 65, 84, 69, 95, 72, 79, 77, 69], "value": [47, 116, 109, 112]}
+            ]
+        });
+        fs::write(&intent, serde_json::to_vec(&selected).unwrap()).unwrap();
+        let mut hash = format!("{:x}", sha2::Sha256::digest(fs::read(&intent).unwrap()));
+        let route = private_bash_source(&File::open(&intent).unwrap(), &hash)
+            .unwrap()
+            .unwrap();
+        assert_eq!(route.gate, dir.path());
+        assert_eq!(route.argv, ["/bin/true", "selected argument"]);
+        assert_eq!(route.environment[0].0, "ACCOUNT");
+        assert_eq!(route.environment[0].1, "a");
+        selected["environment"][1]["key"] = selected["environment"][0]["key"].clone();
+        fs::write(&intent, serde_json::to_vec(&selected).unwrap()).unwrap();
+        assert!(private_bash_source(&File::open(&intent).unwrap(), &hash).is_err());
+        hash = format!("{:x}", sha2::Sha256::digest(fs::read(&intent).unwrap()));
+        assert!(private_bash_source(&File::open(&intent).unwrap(), &hash).is_err());
+        selected
+            .as_object_mut()
+            .unwrap()
+            .remove("__age319_private_bash_source_gate");
+        fs::write(&intent, serde_json::to_vec(&selected).unwrap()).unwrap();
+        hash = format!("{:x}", sha2::Sha256::digest(fs::read(&intent).unwrap()));
+        assert!(
+            private_bash_source(&File::open(&intent).unwrap(), &hash)
+                .unwrap()
+                .is_none()
+        );
+    }
 }
