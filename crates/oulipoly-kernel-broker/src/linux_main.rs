@@ -61,9 +61,10 @@ use oulipoly_kernel_broker::native_receipt::{
 use oulipoly_kernel_broker::protocol::{
     AcceptedWorkSpec, ExactSourceDecisionRequest, ExactSourceDecisionVerification,
     FreshChildRequest, FreshRecipientRequest, FreshRootEffectRequest, JoinSpec, JoinedChildWitness,
-    LaunchAcceptedWorkSpec, NativeKSpec, NativePrepareSpec, OwnerWitness, ProcessWitness,
-    SourceControlUse, SourceScope, SourceSocketWitness, SourceTicketUse, SourceWitnessProbe,
-    StateGenerationSpec, StateReadSpec, StateWriteAction, StateWriteSpec,
+    LaunchAcceptedWorkSpec, NativeKSpec, NativePrepareSpec, OwnerDiscoveryReadback,
+    OwnerDiscoveryRequest, OwnerPidBinding, OwnerWitness, ProcessWitness, SourceControlUse,
+    SourceScope, SourceSocketWitness, SourceTicketUse, SourceWitnessProbe, StateGenerationSpec,
+    StateReadSpec, StateWriteAction, StateWriteSpec,
 };
 use oulipoly_kernel_broker::registry::{RootRecord, RootRegistry};
 use oulipoly_kernel_broker::root_drain;
@@ -421,7 +422,8 @@ fn require_cutover_entry_route(
     if broker_owned_sidecar
         && !matches!(
             operation,
-            b'Y' | b'R'
+            b'=' | b'Y'
+                | b'R'
                 | b'W'
                 | b'I'
                 | b'e'
@@ -531,6 +533,10 @@ enum RequestPayload {
     },
     VerifyOwner {
         witness: OwnerWitness,
+        socket: File,
+    },
+    DiscoverOwner {
+        request: OwnerDiscoveryRequest,
         socket: File,
     },
     ExactSourceDecision {
@@ -750,8 +756,8 @@ fn recv_request(
         b':' | b';' => (18..=8192 + 17).contains(&read),
         #[cfg(feature = "age319-private-broker-fixture")]
         b'&' => (18..=2048 + 17).contains(&read),
-        b'V' | b'S' | b's' | b'T' | b'H' | b'K' | b'B' | b'N' | b'k' | b't' | b'R' | b'W'
-        | b'Y' | b'0' | b'1' | b'2' | b'3' | b'4' => (18..=2048 + 17).contains(&read),
+        b'=' | b'V' | b'S' | b's' | b'T' | b'H' | b'K' | b'B' | b'N' | b'k' | b't' | b'R'
+        | b'W' | b'Y' | b'0' | b'1' | b'2' | b'3' | b'4' => (18..=2048 + 17).contains(&read),
         #[cfg(feature = "age319-private-broker-fixture")]
         b'5' | b'6' | b'7' | b'8' | b'9' => (18..=2048 + 17).contains(&read),
         #[cfg(feature = "age319-private-broker-fixture")]
@@ -798,7 +804,7 @@ fn recv_request(
             #[cfg(feature = "age319-private-broker-fixture")]
             b']' => !matches!(descriptors.len(), 0 | 2),
             b'L' => !(1..=4).contains(&descriptors.len()),
-            b'V' | b'S' | b's' | b'T' => descriptors.len() != 1,
+            b'=' | b'V' | b'S' | b's' | b'T' => descriptors.len() != 1,
             _ => !descriptors.is_empty(),
         }
     {
@@ -960,6 +966,10 @@ fn recv_request(
         },
         b'V' => RequestPayload::VerifyOwner {
             witness: serde_json::from_slice(&request[17..read as usize])?,
+            socket: descriptors.remove(0),
+        },
+        b'=' => RequestPayload::DiscoverOwner {
+            request: serde_json::from_slice(&request[17..read as usize])?,
             socket: descriptors.remove(0),
         },
         b':' => RequestPayload::ExactSourceDecision {
@@ -1954,6 +1964,194 @@ fn verify_owner_socket(
     driver.verify()?;
     peer.process.verify()?;
     Ok(format!("verified-owner {}\n", witness.root_id))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "discovery joins live peer, held release, H/K and original State"
+)]
+fn discover_owner(
+    request: OwnerDiscoveryRequest,
+    socket: File,
+    peer: &PeerIdentity,
+    runner_image: &File,
+    host_namespace: &File,
+    roots: &RootRegistry,
+    works: &WorkRegistry,
+    entries: &EntryRegistry,
+    grants: &GrantRegistry,
+    held: &BTreeMap<String, root_join::HeldRootJoin>,
+    sidecar: &BrokerSidecar,
+) -> io::Result<String> {
+    let root_id = request.root_id.clone();
+    uuid::Uuid::parse_str(&root_id).map_err(|_| io::Error::other("invalid discovery root"))?;
+    let release = sidecar
+        .read_released_owner_for_root(&root_id)
+        .map_err(io::Error::other)?;
+    let owner = &release.owner;
+    if request
+        .expected_owner_generation
+        .as_deref()
+        .is_some_and(|expected| expected != owner.owner_generation)
+    {
+        return Err(io::Error::other("owner discovery stale generation"));
+    }
+    let process = |pid: &oulipoly_state::completion_continuation::SourceProcessIdentity| -> io::Result<ProcessWitness> {
+        Ok(ProcessWitness {
+            host_pid: i32::try_from(pid.pid).map_err(|_| io::Error::other("invalid owner PID"))?,
+            boot_id: pid.boot_id.clone(),
+            starttime_ticks: u64::try_from(pid.starttime_ticks).map_err(|_| io::Error::other("invalid owner starttime"))?,
+        })
+    };
+    let mut witness = OwnerWitness {
+        root_id: root_id.clone(),
+        domain_id: owner.domain_id.clone(),
+        supervisor_id: owner.supervisor_authority_id.clone(),
+        guardian: process(&owner.guardian_identity)?,
+        driver: process(&owner.driver_identity)?,
+        owner_generation: Some(owner.owner_generation.clone()),
+        work_id: None,
+        owner_session_id: None,
+        owner_invocation_uuid: None,
+        registration_authority_sha256: None,
+    };
+    let sealed = if let Scope::Work {
+        root_id: scope_root,
+        work_id,
+        work_incarnation,
+    } = classify_scope(peer, host_namespace, roots, works)
+    {
+        if scope_root != root_id || works.has_debt() || grants.has_debt() {
+            return Err(io::Error::other("owner discovery work root/debt conflict"));
+        }
+        let work = works
+            .live_works()
+            .find(|work| {
+                work.record.root_id == root_id
+                    && work.record.work_id == work_id
+                    && work.record.work_incarnation == work_incarnation
+            })
+            .ok_or_else(|| io::Error::other("owner discovery work absent"))?;
+        let grant = grants
+            .records()
+            .iter()
+            .find(|grant| {
+                grant.consumed
+                    && grant.grant_id == work.record.accepted_grant_id.as_deref().unwrap_or("")
+                    && grant.root_id == root_id
+                    && grant.work_id == work_id
+            })
+            .ok_or_else(|| io::Error::other("owner discovery consumed H/K absent"))?;
+        let helper = grant
+            .sealed_helper
+            .as_ref()
+            .ok_or_else(|| io::Error::other("owner discovery sealed helper absent"))?;
+        witness.work_id = Some(grant.work_id.clone());
+        witness.owner_session_id = Some(helper.owner_session_id.clone());
+        witness.owner_invocation_uuid = Some(helper.owner_invocation_uuid.clone());
+        witness.registration_authority_sha256 = Some(helper.registration_authority_sha256.clone());
+        let capability_digest = helper
+            .state_capability_digest
+            .clone()
+            .ok_or_else(|| io::Error::other("owner discovery H lacks original State digest"))?;
+        Some((
+            helper.owner_invocation_uuid.clone(),
+            helper.owner_session_id.clone(),
+            capability_digest,
+            ProcessStamp::from(&work.init),
+        ))
+    } else {
+        None
+    };
+    verify_owner_socket(
+        witness.clone(),
+        socket,
+        peer,
+        runner_image,
+        host_namespace,
+        roots,
+        works,
+        entries,
+        grants,
+    )?;
+    let owner_generation = owner.owner_generation.as_str();
+    let gate = held
+        .get(&root_id)
+        .ok_or_else(|| io::Error::other("owner discovery held D absent"))?;
+    let release_id = gate
+        .release_id()
+        .ok_or_else(|| io::Error::other("owner discovery D not released"))?;
+    if &release.release_id != release_id
+        || release.owner.domain_id != witness.domain_id
+        || release.owner.supervisor_authority_id != witness.supervisor_id
+        || release.owner.owner_generation != owner_generation
+        || release.prepared.joined_child
+            != prepared_stamp(
+                entries
+                    .record(&root_id)
+                    .and_then(|row| row.joined_child.as_ref())
+                    .ok_or_else(|| io::Error::other("owner discovery joined child absent"))?,
+            )
+    {
+        return Err(io::Error::other("owner discovery released binding changed"));
+    }
+    let joined = PinnedProcess::open(release.prepared.joined_child.host_pid)?;
+    let root = roots
+        .live_roots()
+        .find(|row| row.record.root_id == root_id)
+        .ok_or_else(|| io::Error::other("owner discovery root absent"))?;
+    if prepared_stamp(&ProcessStamp::from(&joined)) != release.prepared.joined_child
+        || !joined.direct_child_of(&root.init)?
+        || !joined.in_namespace(root.init.namespace())?
+        || !joined.same_executable_as(runner_image)?
+    {
+        return Err(io::Error::other("owner discovery joined child changed"));
+    }
+    joined.verify()?;
+    let pid_binding =
+        if let (Some(pid), Some((invocation_uuid, session_id, capability_digest, work_init))) =
+            (request.query_pid, sealed.as_ref())
+        {
+            if pid == work_init.host_pid {
+                let current = PinnedProcess::open(pid)?;
+                if ProcessStamp::from(&current) != *work_init {
+                    return Err(io::Error::other("owner discovery work PID1 changed"));
+                }
+                current.verify()?;
+                sidecar
+                    .read_bound_invocation_session(invocation_uuid, session_id, capability_digest)
+                    .map_err(io::Error::other)?;
+                Some(OwnerPidBinding {
+                    pid,
+                    invocation_uuid: invocation_uuid.clone(),
+                    session_id: session_id.clone(),
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+    // Even a domain-only read checks the original State binding for the H
+    // owner; no copied mailbox or caller-selected path is consulted.
+    if let Some((invocation_uuid, session_id, capability_digest, _)) = sealed {
+        sidecar
+            .read_bound_invocation_session(&invocation_uuid, &session_id, &capability_digest)
+            .map_err(io::Error::other)?;
+    }
+    peer.process.verify()?;
+    let response = OwnerDiscoveryReadback {
+        root_id,
+        source_generation: sidecar.source_generation().into(),
+        release_id: release.release_id,
+        owner: release.owner,
+        pid_binding,
+    };
+    let encoded = serde_json::to_string(&response)?;
+    if encoded.len() > 4096 {
+        return Err(io::Error::other("owner discovery reply too large"));
+    }
+    Ok(format!("{encoded}\n"))
 }
 
 fn exact_registration_snapshot(file: &File, path: &Path) -> io::Result<(u64, u64, Vec<u8>)> {
@@ -3876,6 +4074,15 @@ fn serve() -> io::Result<()> {
                     &works,
                     &entries,
                     &grants,
+                )
+            } else if operation == b'=' {
+                let RequestPayload::DiscoverOwner { request, socket } = payload else {
+                    return Err(io::Error::other("invalid owner discovery payload"));
+                };
+                discover_owner(
+                    request, socket, &peer, &runner_image, &host_namespace,
+                    &registry, &works, &entries, &grants, &held_joins,
+                    broker_sidecar.as_ref().ok_or_else(|| io::Error::other("v30 owner sidecar absent"))?,
                 )
             } else if operation == b':' {
                 let RequestPayload::ExactSourceDecision { request, socket, registration } = payload else {

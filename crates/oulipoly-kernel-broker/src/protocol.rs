@@ -2074,6 +2074,36 @@ pub struct OwnerWitness {
     pub registration_authority_sha256: Option<String>,
 }
 
+/// Read-only pre-registration discovery. The broker derives any consumed-work
+/// fields from the challenged peer. The root and generation are comparison
+/// keys; the connected guardian and retained Broker release supply authority.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerDiscoveryRequest {
+    pub root_id: String,
+    pub query_pid: Option<i32>,
+    pub expected_owner_generation: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerDiscoveryReadback {
+    pub root_id: String,
+    pub source_generation: String,
+    pub release_id: String,
+    pub owner: oulipoly_state::mailbox::CompletionDomainOwner,
+    pub pid_binding: Option<OwnerPidBinding>,
+}
+
+/// Only a live consumed work PID1 can be associated with H's owner binding.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerPidBinding {
+    pub pid: i32,
+    pub invocation_uuid: String,
+    pub session_id: String,
+}
+
 /// Asserted fields are checked against the live V peer, retained held release,
 /// received file, and original bound State before an exact decision is issued.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -3032,6 +3062,38 @@ fn join_versioned_at(
 /// an authority merely because the caller supplied it.
 pub fn verify_owner_at(path: &Path, witness: &OwnerWitness, owner_fd: RawFd) -> io::Result<()> {
     let body = serde_json::to_vec(witness)?;
+    let response = owner_socket_request_at(path, b'V', &body, owner_fd)?;
+    if response != format!("verified-owner {}\n", witness.root_id) {
+        return Err(io::Error::other(format!(
+            "host owner verification refused: {}",
+            response.trim()
+        )));
+    }
+    Ok(())
+}
+
+pub fn discover_owner_at(
+    path: &Path,
+    request: &OwnerDiscoveryRequest,
+    owner_fd: RawFd,
+) -> io::Result<OwnerDiscoveryReadback> {
+    let body = serde_json::to_vec(request)?;
+    let response = owner_socket_request_at(path, b'=', &body, owner_fd)?;
+    if !response.starts_with('{') {
+        return Err(io::Error::other(format!(
+            "owner discovery refused: {}",
+            response.trim()
+        )));
+    }
+    serde_json::from_str(&response).map_err(io::Error::other)
+}
+
+fn owner_socket_request_at(
+    path: &Path,
+    operation: u8,
+    body: &[u8],
+    owner_fd: RawFd,
+) -> io::Result<String> {
     if body.len() > 2048 {
         return Err(io::Error::other("owner witness too large"));
     }
@@ -3039,7 +3101,7 @@ pub fn verify_owner_at(path: &Path, witness: &OwnerWitness, owner_fd: RawFd) -> 
     let mut challenge = [0u8; 16];
     stream.read_exact(&mut challenge)?;
     let mut request = Vec::with_capacity(17 + body.len());
-    request.push(b'V');
+    request.push(operation);
     request.extend_from_slice(&challenge);
     request.extend_from_slice(&body);
     let mut iov = libc::iovec {
@@ -3064,14 +3126,17 @@ pub fn verify_owner_at(path: &Path, witness: &OwnerWitness, owner_fd: RawFd) -> 
     {
         return Err(io::Error::other("short owner verification request"));
     }
-    let response = read_response(stream)?;
-    if response != format!("verified-owner {}\n", witness.root_id) {
-        return Err(io::Error::other(format!(
-            "host owner verification refused: {}",
-            response.trim()
-        )));
+    if operation == b'=' {
+        let mut response = Vec::new();
+        stream.take(4097).read_to_end(&mut response)?;
+        if response.len() > 4096 || !response.ends_with(b"\n") {
+            return Err(io::Error::other("invalid owner discovery response"));
+        }
+        String::from_utf8(response)
+            .map_err(|_| io::Error::other("non-UTF8 owner discovery response"))
+    } else {
+        read_response(stream)
     }
-    Ok(())
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]

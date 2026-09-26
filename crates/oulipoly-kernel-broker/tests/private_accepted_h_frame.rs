@@ -722,6 +722,19 @@ fn inner(kill_case: bool, lost_reply_case: bool, cancel_case: bool, helper_probe
         grants.records()[0].version,
         if helper_probe { 3 } else { 2 }
     );
+    if helper_probe {
+        let mut state_input = b"oulipoly-completion-registration-authority-v1".to_vec();
+        state_input.extend_from_slice(registration_authority.as_bytes());
+        assert_eq!(
+            grants.records()[0]
+                .sealed_helper
+                .as_ref()
+                .unwrap()
+                .state_capability_digest
+                .as_deref(),
+            Some(digest(&state_input).as_str()),
+        );
+    }
     assert_eq!(fs::read_dir(state.join("works")).unwrap().count(), 0);
     assert!(root.verify().is_ok());
     assert!(source.verify().is_ok());

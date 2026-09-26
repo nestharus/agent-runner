@@ -62,6 +62,12 @@ pub(super) fn retained_direct_child_identity(
 }
 
 pub(super) fn require_owner(domain_id: &str) -> Result<CompletionDomainOwner, String> {
+    if let Some(discovered) = read_v30_owner_if_present(None)? {
+        if discovered.owner.domain_id != domain_id {
+            return Err("completion owner domain/protocol conflict".into());
+        }
+        return Ok(discovered.owner);
+    }
     let endpoint =
         std::env::var_os(ENDPOINT_ENV).ok_or("native continuation endpoint was not inherited")?;
     let owner = hello(Path::new(&endpoint))?;
@@ -84,6 +90,137 @@ pub(super) fn require_owner(domain_id: &str) -> Result<CompletionDomainOwner, St
         return Err("completion owner handshake does not match current authority".into());
     }
     Ok(owner)
+}
+
+pub(super) fn read_v30_owner_if_present(
+    query_pid: Option<i32>,
+) -> Result<Option<protocol::OwnerDiscoveryReadback>, String> {
+    if std::env::var_os(super::EXPECTED_KERNEL_ROOT_ENV).is_none() {
+        return Ok(None);
+    }
+    let v30_endpoint = std::env::var_os(super::V30_OWNER_ENDPOINT_ENV).is_some();
+    if !v30_endpoint && std::env::var_os(ENDPOINT_ENV).is_none() {
+        return Err("pinned completion endpoint was not inherited".into());
+    }
+    match discover_v30_owner(query_pid) {
+        Ok(readback) => Ok(Some(readback)),
+        // A legacy broker has no retained sidecar. This exact challenged
+        // reply preserves its historical owner path; any other refusal is
+        // fail-closed and cannot turn v30 into a copied-sidecar fallback.
+        Err(error)
+            if !v30_endpoint
+                && error == "owner discovery refused: error v30 owner sidecar absent" =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub(super) fn discover_v30_owner(
+    query_pid: Option<i32>,
+) -> Result<protocol::OwnerDiscoveryReadback, String> {
+    let root = std::env::var(super::EXPECTED_KERNEL_ROOT_ENV)
+        .map_err(|_| "v30 root was not inherited".to_string())?;
+    let endpoint = std::env::var_os(super::V30_OWNER_ENDPOINT_ENV)
+        .or_else(|| std::env::var_os(ENDPOINT_ENV))
+        .ok_or("v30 completion endpoint was not inherited")?;
+    let socket = UnixStream::connect(Path::new(&endpoint)).map_err(|e| e.to_string())?;
+    // v30's guardian keeps the listener bound during held D but does not
+    // serve the historical hello. Broker V checks this connected FD.
+    let request = protocol::OwnerDiscoveryRequest {
+        root_id: root.clone(),
+        query_pid,
+        expected_owner_generation: None,
+    };
+    let readback =
+        protocol::discover_owner_at(&owner_broker_socket(), &request, socket.as_raw_fd())
+            .map_err(|e| e.to_string())?;
+    if readback.root_id != root
+        || readback.owner.endpoint != endpoint.to_string_lossy()
+        || readback.owner.protocol != PROTOCOL
+    {
+        return Err("v30 owner discovery readback conflict".into());
+    }
+    Ok(readback)
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+pub(super) fn private_discovery_probe(
+    release: &oulipoly_state::mailbox::BrokerReleaseEvidence,
+    gate: &Path,
+) -> Result<(), String> {
+    let exact = discover_v30_owner(Some(
+        i32::try_from(std::process::id()).map_err(|e| e.to_string())?,
+    ))?;
+    if exact.root_id != release.prepared.root_id
+        || exact.source_generation != release.prepared.source_generation
+        || exact.release_id != release.release_id
+        || exact.owner != release.owner
+        || exact.pid_binding.is_some()
+    {
+        return Err("private owner discovery changed held D or invented PID session".into());
+    }
+    if require_owner(&release.owner.domain_id)? != release.owner {
+        return Err("Runner owner lookup changed held D owner".into());
+    }
+    if !super::bootstrap_service()
+        .unwrap_err()
+        .contains("v30 completion service join is unavailable")
+    {
+        return Err("v30 service entry passed the closed source route".into());
+    }
+    let socket = UnixStream::connect(&release.owner.endpoint).map_err(|e| e.to_string())?;
+    let mut request = protocol::OwnerDiscoveryRequest {
+        root_id: release.prepared.root_id.clone(),
+        query_pid: None,
+        expected_owner_generation: Some(uuid::Uuid::new_v4().to_string()),
+    };
+    if protocol::discover_owner_at(&owner_broker_socket(), &request, socket.as_raw_fd()).is_ok() {
+        return Err("stale owner generation returned discovery".into());
+    }
+    request.expected_owner_generation = Some(release.owner.owner_generation.clone());
+    request.root_id = uuid::Uuid::new_v4().to_string();
+    if protocol::discover_owner_at(&owner_broker_socket(), &request, socket.as_raw_fd()).is_ok() {
+        return Err("other root returned discovery".into());
+    }
+    request.root_id = release.prepared.root_id.clone();
+    let (wrong, _other) = UnixStream::pair().map_err(|e| e.to_string())?;
+    if protocol::discover_owner_at(&owner_broker_socket(), &request, wrong.as_raw_fd()).is_ok() {
+        return Err("unconnected guardian FD returned discovery".into());
+    }
+    let outsider = std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
+        .args(["notify", "agent-bash-capability", "--json"])
+        .env_remove("OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1")
+        .env_remove("OULIPOLY_KERNEL_CHILD_JOIN_FD_V1")
+        .env_remove("OULIPOLY_KERNEL_V30_PRIVATE_CHILD_V1")
+        .output()
+        .map_err(|e| e.to_string())?;
+    let outsider_error = String::from_utf8_lossy(&outsider.stderr);
+    if outsider.status.success() || !outsider_error.contains("outside consumed work") {
+        return Err(format!(
+            "helper outside consumed H/K work did not receive broker V refusal: {outsider_error}"
+        ));
+    }
+    let stripped = std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
+        .args(["notify", "agent-bash-capability", "--json"])
+        .env_remove("OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1")
+        .env_remove("OULIPOLY_KERNEL_CHILD_JOIN_FD_V1")
+        .env_remove(super::V30_OWNER_ENDPOINT_ENV)
+        .env_remove(ENDPOINT_ENV)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if stripped.status.success()
+        || !String::from_utf8_lossy(&stripped.stderr)
+            .contains("pinned completion endpoint was not inherited")
+    {
+        return Err("stripped v30 endpoint fell back to retired owner copy".into());
+    }
+    std::fs::write(
+        gate.join("owner-discovery"),
+        serde_json::to_vec(&exact).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())
 }
 
 fn hello(endpoint: &Path) -> Result<CompletionDomainOwner, String> {
@@ -123,6 +260,15 @@ pub(super) fn verify_kernel_owner_socket(
     owner: &CompletionDomainOwner,
     socket: &UnixStream,
 ) -> Result<(), String> {
+    let witness = kernel_owner_witness(root_id, owner)?;
+    protocol::verify_owner_at(&owner_broker_socket(), &witness, socket.as_raw_fd())
+        .map_err(|error| error.to_string())
+}
+
+fn kernel_owner_witness(
+    root_id: &str,
+    owner: &CompletionDomainOwner,
+) -> Result<OwnerWitness, String> {
     let process = |identity: &SourceProcessIdentity| -> Result<ProcessWitness, String> {
         Ok(ProcessWitness {
             host_pid: i32::try_from(identity.pid).map_err(|_| "invalid host PID")?,
@@ -146,8 +292,7 @@ pub(super) fn verify_kernel_owner_socket(
         )
         .map(|value| format!("{:x}", Sha256::digest(value.as_bytes()))),
     };
-    protocol::verify_owner_at(&owner_broker_socket(), &witness, socket.as_raw_fd())
-        .map_err(|error| error.to_string())
+    Ok(witness)
 }
 
 pub(super) fn owner_broker_socket() -> PathBuf {
@@ -274,8 +419,16 @@ fn connect_context(
 }
 
 pub(super) fn bootstrap() -> Result<(), super::BootstrapError> {
-    if std::env::var_os(ENDPOINT_ENV).is_some() {
+    if std::env::var_os(ENDPOINT_ENV).is_some()
+        || std::env::var_os(super::V30_OWNER_ENDPOINT_ENV).is_some()
+    {
         // Wake-producing entry joins existing authority; read/ACK never bootstrap.
+        if read_v30_owner_if_present(None)?.is_some() {
+            return Err(
+                "v30 completion service join is unavailable before source registration route"
+                    .into(),
+            );
+        }
         let mailbox = MailboxDb::open_existing_native_authority(&MailboxDb::default_path()?)?;
         let domain = mailbox
             .completion_continuation_domain()?

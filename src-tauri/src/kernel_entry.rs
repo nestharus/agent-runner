@@ -1288,6 +1288,16 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
     {
         return Err("v30 child attestation does not match physical gate".into());
     }
+    // Publish only the broker-attested release into this root's descendants.
+    // These values select discovery; the challenged peer and retained sidecar
+    // remain the authority for every read.
+    unsafe {
+        std::env::set_var(
+            crate::completion_owner::V30_OWNER_ENDPOINT_ENV,
+            &evidence.owner.endpoint,
+        );
+        std::env::set_var(crate::completion_owner::EXPECTED_KERNEL_ROOT_ENV, fields[2]);
+    }
     #[cfg(feature = "age319-private-broker-fixture")]
     let private_help = private_v30_child_mode()
         && std::env::var_os("AGE319_PRIVATE_OFFLINE_ROOT_V1").is_some()
@@ -1437,6 +1447,9 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
             std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
                 .ok_or("private v30 gate directory absent")?,
         );
+        if std::env::var_os("AGE319_PRIVATE_OWNER_DISCOVERY_PROBE_V1").is_some() {
+            crate::completion_owner::private_discovery_probe(&evidence, &gate_dir)?;
+        }
         if gate_dir.join("source-witness-request").exists() {
             private_v30_source_witness(&evidence, &gate_dir)?;
             std::fs::write(
@@ -4284,7 +4297,6 @@ fn private_drop_fresh_reply(
 #[cfg(feature = "age319-private-broker-fixture")]
 fn private_bash_work() -> Result<ExitCode, String> {
     crate::completion_owner::join_private_accepted_work_fixture()?;
-    use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRecord};
     use oulipoly_state::{InvocationStart, ProviderSessionBinding, StateDb};
 
     // The joined Runner child is the actual owner Bash will inspect through
@@ -4311,16 +4323,8 @@ fn private_bash_work() -> Result<ExitCode, String> {
             provider_session_resolved_account: None,
         },
     )?;
-    let identity = oulipoly_state::pid_identity::read_current_process_identity()?;
-    PidIdentityDb::open(&PidIdentityDb::default_path()?)?.record_identity(PidIdentityRecord {
-        identity: &identity,
-        os_pgid: None,
-        invocation_uuid: &invocation_uuid,
-        session_id: Some(&session_id),
-        provider_name: Some("agent-bash"),
-        model_name: Some("age319-private-bash-work"),
-        recorded_at: &chrono::Utc::now().to_rfc3339(),
-    })?;
+    // The retired user-side mailbox is deliberately invalid in this fixture.
+    // Parent lookup must obtain live authority through the broker.
     let parent_marker = started
         .completion_registration_authority
         .invocation_launch_environment(

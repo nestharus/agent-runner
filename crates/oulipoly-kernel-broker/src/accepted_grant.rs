@@ -97,6 +97,8 @@ pub struct SealedHelper {
     pub owner_session_id: String,
     pub owner_invocation_uuid: String,
     pub registration_authority_sha256: String,
+    #[serde(default)]
+    pub state_capability_digest: Option<String>,
 }
 
 impl SealedHelper {
@@ -394,6 +396,12 @@ fn sealed_helper(
         owner_session_id: session.clone(),
         owner_invocation_uuid: invocation.clone(),
         registration_authority_sha256: digest(authority),
+        state_capability_digest: Some({
+            let mut hash = Sha256::new();
+            hash.update(b"oulipoly-completion-registration-authority-v1");
+            hash.update(authority);
+            format!("{:x}", hash.finalize())
+        }),
     }))
 }
 
@@ -647,6 +655,10 @@ impl GrantRegistry {
                         || helper.owner_session_id.is_empty()
                         || uuid::Uuid::parse_str(&helper.owner_invocation_uuid).is_err()
                         || !valid_digest(&helper.registration_authority_sha256)
+                        || helper
+                            .state_capability_digest
+                            .as_deref()
+                            .is_some_and(|digest| !valid_digest(digest))
                 })
                 || record
                     .parent_work_incarnation

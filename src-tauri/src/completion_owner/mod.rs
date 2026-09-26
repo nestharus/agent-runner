@@ -36,6 +36,7 @@ pub(crate) const ENDPOINT_ENV: &str = "OULIPOLY_COMPLETION_ENDPOINT";
 pub(crate) const ROOT_AUTHORITY_ENV: &str = "OULIPOLY_ROOT_AUTHORITY_V1";
 pub(crate) const ORIGINAL_WORK_REQUIRED_ENV: &str = "OULIPOLY_ORIGINAL_WORK_REQUIRED_V1";
 pub(crate) const EXPECTED_KERNEL_ROOT_ENV: &str = "OULIPOLY_KERNEL_EXPECTED_ROOT_V1";
+pub(crate) const V30_OWNER_ENDPOINT_ENV: &str = "OULIPOLY_KERNEL_OWNER_ENDPOINT_V1";
 
 #[cfg(target_os = "linux")]
 pub(crate) struct PinnedGuardian {
@@ -205,6 +206,28 @@ pub(crate) fn require_owner(
         let _ = domain_id;
         Err("completion-continuation-v2 requires supported Linux independent entry".into())
     }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn discover_v30_owner(
+    query_pid: Option<i32>,
+) -> Result<oulipoly_kernel_broker::protocol::OwnerDiscoveryReadback, String> {
+    linux::discover_v30_owner(query_pid)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn read_v30_owner_if_present(
+    query_pid: Option<i32>,
+) -> Result<Option<oulipoly_kernel_broker::protocol::OwnerDiscoveryReadback>, String> {
+    linux::read_v30_owner_if_present(query_pid)
+}
+
+#[cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
+pub(crate) fn private_discovery_probe(
+    release: &oulipoly_state::mailbox::BrokerReleaseEvidence,
+    gate: &std::path::Path,
+) -> Result<(), String> {
+    linux::private_discovery_probe(release, gate)
 }
 
 #[cfg(target_os = "linux")]

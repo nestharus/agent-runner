@@ -485,6 +485,11 @@ fn add_completion_projection(
 }
 
 pub(crate) fn capability() -> Result<i32, String> {
+    #[cfg(target_os = "linux")]
+    if let Some(readback) = crate::completion_owner::read_v30_owner_if_present(None)? {
+        return emit(&json!({"protocol":PROTOCOL,"status":"available",
+            "domain_id":readback.owner.domain_id,"owner":readback.owner}));
+    }
     let path = MailboxDb::default_path()?;
     if !path.exists() {
         return emit(&json!({"protocol":PROTOCOL,"status":"unavailable"}));

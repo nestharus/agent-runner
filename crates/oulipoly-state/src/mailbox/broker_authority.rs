@@ -936,6 +936,36 @@ impl BrokerSidecar {
         self.bound_state_file_identity()
     }
 
+    /// A bounded pre-registration read of the original State binding. The
+    /// caller must first authenticate the H/K grant and the released owner;
+    /// the UUID and session here are only comparison keys.
+    pub fn read_bound_invocation_session(
+        &self,
+        invocation_uuid: &str,
+        session_id: &str,
+        capability_digest: &str,
+    ) -> Result<BoundStateFileIdentity, String> {
+        let state = self.bound_state()?;
+        let row: Option<(Option<String>, Option<String>, Option<String>)> = state
+            .connection()
+            .query_row(
+                "SELECT completion_registration_capability_digest,provider_session_id,session_id
+                 FROM invocations WHERE invocation_uuid=?1",
+                [invocation_uuid],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let (capability, provider_session, fallback_session) =
+            row.ok_or("original State invocation absent")?;
+        if capability.as_deref() != Some(capability_digest)
+            || provider_session.or(fallback_session).as_deref() != Some(session_id)
+        {
+            return Err("original State invocation/session binding changed".into());
+        }
+        self.bound_state_file_identity()
+    }
+
     /// Read only the current cursor and one bounded unaccepted page. The
     /// server's pinned driver check must precede this call.
     pub fn read_bounded_repair(
@@ -2108,6 +2138,34 @@ impl BrokerSidecar {
             release_id,
             owner: readback.owner,
         })
+    }
+
+    /// Resolve the one released owner for a live root from the retained
+    /// connection. A textual root selector cannot choose an owner generation.
+    pub fn read_released_owner_for_root(
+        &self,
+        root_id: &str,
+    ) -> Result<BrokerReleaseEvidence, String> {
+        self.check_mailbox_read(&self.source_generation)?;
+        let mut statement = self
+            .mailbox
+            .conn
+            .prepare(
+                "SELECT owner_generation FROM broker_owner_release
+             WHERE source_generation=?1 AND root_id=?2 LIMIT 2",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map(params![self.source_generation, root_id], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        let [generation] = rows.as_slice() else {
+            return Err("broker released owner absent or ambiguous".into());
+        };
+        self.read_exact_release(&self.source_generation, root_id, generation)
     }
     #[cfg(unix)]
     pub fn open_existing(path: &Path, broker_state_root: &Path) -> Result<Self, String> {
@@ -4460,6 +4518,17 @@ mod tests {
         let released = broker.commit_exact_prepared_release(&prepared).unwrap();
         assert_eq!(released.prepared, prepared);
         assert_eq!(released.owner.owner_generation, prepared.owner_generation);
+        assert_eq!(
+            broker
+                .read_released_owner_for_root(&prepared.root_id)
+                .unwrap(),
+            released
+        );
+        assert!(
+            broker
+                .read_released_owner_for_root(&uuid::Uuid::new_v4().to_string())
+                .is_err()
+        );
         assert!(broker.commit_exact_prepared_release(&prepared).is_err());
         broker
             .mailbox

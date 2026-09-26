@@ -1160,7 +1160,10 @@ fn inner() {
                 Vec::new()
             })
             .env("OULIPOLY_DATA_DIR", &data)
-            .envs(provider_mode.then_some(("OULIPOLY_CONFIG_HOME", &config_home)))
+            .envs(
+                (provider_mode || mode == "normal_owner_discovery")
+                    .then_some(("OULIPOLY_CONFIG_HOME", &config_home)),
+            )
             .env("OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1", "1")
             .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
             .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
@@ -1436,6 +1439,10 @@ fn inner() {
             )
             .envs(real_source.then_some(("AGE319_PRIVATE_SOURCE_LAUNCH_REPLAY_V1", "1")))
             .envs(
+                (mode == "normal_owner_discovery")
+                    .then_some(("AGE319_PRIVATE_OWNER_DISCOVERY_PROBE_V1", "1")),
+            )
+            .envs(
                 (mode == "normal_bash_source_lost_reply")
                     .then_some(("AGE319_PRIVATE_SOURCE_LAUNCH_REPLY_LOSS_V1", "1")),
             )
@@ -1615,14 +1622,52 @@ fn inner() {
                 stop(&mut broker);
                 return;
             }
-            eventually(|| {
-                gate.join("child-attested").exists() || entry.try_wait().unwrap().is_some()
-            });
+            if mode == "normal_owner_discovery" {
+                let deadline = Instant::now() + Duration::from_secs(20);
+                while !gate.join("child-attested").exists() && entry.try_wait().unwrap().is_none() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "owner discovery stalled: entry={} broker={} gate={:?}",
+                        fs::read_to_string(&err).unwrap_or_default(),
+                        fs::read_to_string(&broker_log).unwrap_or_default(),
+                        fs::read_dir(&gate)
+                            .unwrap()
+                            .filter_map(Result::ok)
+                            .map(|e| e.file_name())
+                            .collect::<Vec<_>>()
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            } else {
+                eventually(|| {
+                    gate.join("child-attested").exists() || entry.try_wait().unwrap().is_some()
+                });
+            }
             assert!(
                 gate.join("child-attested").exists(),
                 "{}",
                 fs::read_to_string(&err).unwrap()
             );
+            if mode == "normal_owner_discovery" {
+                let discovered: protocol::OwnerDiscoveryReadback =
+                    serde_json::from_slice(&fs::read(gate.join("owner-discovery")).unwrap())
+                        .unwrap();
+                assert_eq!(discovered.root_id, prepared.root_id);
+                assert_eq!(discovered.source_generation, generation);
+                assert_eq!(discovered.release_id, released.release_id);
+                assert_eq!(discovered.owner, released.owner);
+                assert!(discovered.pid_binding.is_none());
+                assert_eq!(
+                    fs::read(data.join("pid-identity.db")).unwrap(),
+                    b"retired copied owner"
+                );
+                fs::write(gate.join("child-effect"), b"yes").unwrap();
+                eventually(|| entry.try_wait().unwrap().is_some());
+                let _ = entry.wait();
+                stop(&mut broker);
+                unsafe { libc::kill(prepared.root_init.host_pid, libc::SIGKILL) };
+                return;
+            }
             if mode == "normal_handoff_bash_child" {
                 let refusals: serde_json::Value =
                     serde_json::from_slice(&fs::read(gate.join("bash-child-refused")).unwrap())
@@ -11193,6 +11238,7 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "native_pid1_loss",
         "native_receipt_pid1_loss",
         "normal_release",
+        "normal_owner_discovery",
         "normal_handoff",
         "normal_handoff_bash_child",
         "normal_handoff_fsync",
