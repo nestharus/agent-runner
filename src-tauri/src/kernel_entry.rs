@@ -649,6 +649,161 @@ fn private_v30_source_witness(
     }
     std::fs::write(gate_dir.join("source-state-writer-verified"), b"yes")
         .map_err(|e| e.to_string())?;
+    while !gate_dir.join("source-state-writer-released").exists() {
+        if std::time::Instant::now() >= writer_deadline {
+            return Err("source State writer release gate expired".into());
+        }
+        std::thread::sleep(PRIVATE_CHILD_EFFECT_POLL);
+    }
+    let binding = oulipoly_state::completion_continuation::AdmittedSourceBinding::new(
+        &oulipoly_state::completion_continuation::completion_obligation_admission_id(
+            &source["handle"].as_str().ok_or("source handle absent")?,
+            &source["owner_invocation_uuid"]
+                .as_str()
+                .ok_or("source invocation absent")?,
+        ),
+        &bytes,
+    )?;
+    let inspection_request: oulipoly_state::SourceDecisionVerification =
+        serde_json::from_value(serde_json::to_value(&verification).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    let original_state_path = gate_dir
+        .parent()
+        .ok_or("private gate has no parent")?
+        .join("data/state.db");
+    let mut state = oulipoly_state::StateDb::open_existing(&original_state_path)?;
+    let inspected = state.inspect_original_child_decision_at(
+        &broker,
+        &inspection_request,
+        owner_socket.as_raw_fd(),
+        registration.as_raw_fd(),
+        &binding,
+    )?;
+    if inspected.decision_id != decision.decision_id
+        || inspected.original_state_device != decision.original_state_device
+        || inspected.original_state_inode != decision.original_state_inode
+    {
+        return Err("State decision inspection changed original identity".into());
+    }
+    if state.inspect_original_child_decision_at(
+        &broker,
+        &inspection_request,
+        owner_socket.as_raw_fd(),
+        registration.as_raw_fd(),
+        &binding,
+    )? != inspected
+    {
+        return Err("State decision inspection retry changed".into());
+    }
+    let mut wrong_inspection = inspection_request.clone();
+    wrong_inspection.decision_id = uuid::Uuid::new_v4().to_string();
+    if state
+        .inspect_original_child_decision_at(
+            &broker,
+            &wrong_inspection,
+            owner_socket.as_raw_fd(),
+            registration.as_raw_fd(),
+            &binding,
+        )
+        .is_ok()
+    {
+        return Err("State inspection accepted wrong decision".into());
+    }
+    wrong_inspection = inspection_request.clone();
+    wrong_inspection.witness["owner"]["root_id"] = uuid::Uuid::new_v4().to_string().into();
+    if state
+        .inspect_original_child_decision_at(
+            &broker,
+            &wrong_inspection,
+            owner_socket.as_raw_fd(),
+            registration.as_raw_fd(),
+            &binding,
+        )
+        .is_ok()
+    {
+        return Err("State inspection accepted wrong root".into());
+    }
+    wrong_inspection = inspection_request.clone();
+    wrong_inspection.witness["capability"] = "0".repeat(64).into();
+    if state
+        .inspect_original_child_decision_at(
+            &broker,
+            &wrong_inspection,
+            owner_socket.as_raw_fd(),
+            registration.as_raw_fd(),
+            &binding,
+        )
+        .is_ok()
+    {
+        return Err("State inspection accepted wrong capability".into());
+    }
+    let wrong_binding = oulipoly_state::completion_continuation::AdmittedSourceBinding::new(
+        "wrong-admission-id",
+        &bytes,
+    )?;
+    if state
+        .inspect_original_child_decision_at(
+            &broker,
+            &inspection_request,
+            owner_socket.as_raw_fd(),
+            registration.as_raw_fd(),
+            &wrong_binding,
+        )
+        .is_ok()
+    {
+        return Err("State inspection accepted wrong admission binding".into());
+    }
+    if state
+        .inspect_original_child_decision_at(
+            &broker,
+            &inspection_request,
+            owner_socket.as_raw_fd(),
+            copied_fd.as_raw_fd(),
+            &binding,
+        )
+        .is_ok()
+    {
+        return Err("State inspection accepted copied registration FD".into());
+    }
+    std::fs::write(&path, b"changed registration bytes").map_err(|e| e.to_string())?;
+    let changed_accepted = state
+        .inspect_original_child_decision_at(
+            &broker,
+            &inspection_request,
+            owner_socket.as_raw_fd(),
+            registration.as_raw_fd(),
+            &binding,
+        )
+        .is_ok();
+    std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+    if changed_accepted {
+        return Err("State inspection accepted changed registration bytes".into());
+    }
+    drop(state);
+    let copied_state_path = gate_dir.join("copied-source-state.db");
+    rusqlite::Connection::open(&original_state_path)
+        .map_err(|e| e.to_string())?
+        .execute(
+            "VACUUM INTO ?1",
+            [copied_state_path
+                .to_str()
+                .ok_or("copied State path is not UTF-8")?],
+        )
+        .map_err(|e| e.to_string())?;
+    let mut copied_state = oulipoly_state::StateDb::open_existing(&copied_state_path)?;
+    if copied_state
+        .inspect_original_child_decision_at(
+            &broker,
+            &inspection_request,
+            owner_socket.as_raw_fd(),
+            registration.as_raw_fd(),
+            &binding,
+        )
+        .is_ok()
+    {
+        return Err("State inspection accepted copied State DB".into());
+    }
+    drop(copied_state);
     let duplicate = ExactSourceDecisionRequest {
         request_id: uuid::Uuid::new_v4().to_string(),
         witness: probe.clone(),

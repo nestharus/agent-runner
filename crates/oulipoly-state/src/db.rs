@@ -97,6 +97,10 @@ mod chain_segments_import;
 mod chain_segments_open;
 mod cli_providers;
 mod discovered_models;
+#[cfg(target_os = "linux")]
+mod exact_source_decision;
+#[cfg(target_os = "linux")]
+pub use exact_source_decision::{SourceDecisionInspection, SourceDecisionVerification};
 mod discovery_types;
 mod fresh_continuation;
 mod imported_session_display_metadata;

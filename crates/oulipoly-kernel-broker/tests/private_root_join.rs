@@ -9306,6 +9306,7 @@ fn inner() {
                     .execute_batch("ROLLBACK; PRAGMA locking_mode=NORMAL")
                     .unwrap();
                 drop(writer);
+                fs::write(gate.join("source-state-writer-released"), b"yes").unwrap();
                 eventually(|| {
                     gate.join("source-witness-positive").exists()
                         || entry.try_wait().unwrap().is_some()

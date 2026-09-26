@@ -128,6 +128,8 @@ pub use db::{
 pub use db::{
     SessionTurnReplacement, SessionTurnRestoreRow, SessionTurnsReplacement, SessionTurnsRestore,
 };
+#[cfg(target_os = "linux")]
+pub use db::{SourceDecisionInspection, SourceDecisionVerification};
 pub use db::{StateTerminalTimestampRepair, StateTimestampRecordFamily};
 pub use diagnostic_producer::shutdown_process_event_sink;
 pub use invocation_marker::CompositeInvocationId;
