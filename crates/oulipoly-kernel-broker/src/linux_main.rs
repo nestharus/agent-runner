@@ -440,7 +440,12 @@ fn require_cutover_entry_route(
         )
     {
         #[cfg(feature = "age319-private-broker-fixture")]
-        if private_fixture() && matches!(operation, b'L' | b'l' | b'M' | b'&') {
+        if private_fixture()
+            && matches!(
+                operation,
+                b'L' | b'l' | b'M' | b'&' | b's' | b'T' | b'H' | b'K' | b'B' | b'Q' | b'Z'
+            )
+        {
             return Ok(());
         }
         return Err(io::Error::other(

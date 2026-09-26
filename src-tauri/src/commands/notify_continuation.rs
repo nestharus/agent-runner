@@ -487,6 +487,13 @@ fn add_completion_projection(
 pub(crate) fn capability() -> Result<i32, String> {
     #[cfg(target_os = "linux")]
     if let Some(readback) = crate::completion_owner::read_v30_owner_if_present(None)? {
+        #[cfg(feature = "age319-private-broker-fixture")]
+        if std::env::var_os("AGE319_PRIVATE_PRE_K_H_SOURCE_V1").is_some() {
+            return emit(&json!({"protocol":PROTOCOL,"status":"available",
+                "domain_id":readback.owner.domain_id,"owner":readback.owner,
+                "root_id":readback.root_id,"source_generation":readback.source_generation,
+                "release_id":readback.release_id}));
+        }
         return emit(&json!({"protocol":PROTOCOL,"status":"available",
             "domain_id":readback.owner.domain_id,"owner":readback.owner}));
     }

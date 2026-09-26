@@ -1447,6 +1447,82 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
             std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
                 .ok_or("private v30 gate directory absent")?,
         );
+        if std::env::var_os("AGE319_PRIVATE_PRE_K_H_SOURCE_V1").is_some() {
+            let (receipt, session) = effect_binding
+                .as_ref()
+                .ok_or("private pre-K source has no original D binding")?;
+            if private_receipt.as_ref() != Some(receipt) {
+                return Err("private pre-K source changed original handoff".into());
+            }
+            // The released J/D lane persists its invocation in fresh State.
+            // H's original-work guardian remains bound to the original State
+            // inode. Seed that inode with the same broker-minted D identity
+            // before the Bash source can submit H; this is invocation start,
+            // never source registration or a source decision.
+            let original_state = gate_dir
+                .parent()
+                .ok_or("private gate parent absent")?
+                .join("data/state.db");
+            let authority =
+                oulipoly_state::CompletionRegistrationAuthority::from_process_environment_value(
+                    receipt.registration_authority.clone(),
+                )?;
+            let state = oulipoly_state::StateDb::open_existing(&original_state)?;
+            let started = state.start_invocation_with_prepared_completion_registration_authority(
+                &oulipoly_state::InvocationStart {
+                    invocation_uuid: receipt.invocation_uuid.clone(),
+                    model_name: "agent-runner-root".into(),
+                    provider_name: "agent-runner".into(),
+                    provider_index: 0,
+                    parent_invocation_id: None,
+                },
+                &authority,
+            )?;
+            state.bind_invocation_provider_session_start(
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                started.invocation_row_id,
+                &oulipoly_state::ProviderSessionBinding {
+                    provider_session_id: session.session_id.clone(),
+                    capture_method: "private-released-j-d-original-state",
+                    resume_input_id: None,
+                    provider_session_resolved_account: None,
+                },
+            )?;
+            let runner = std::env::current_exe().map_err(|e| e.to_string())?;
+            let bash = std::env::var("AGE319_PRIVATE_BASH_IMAGE")
+                .map_err(|_| "private pre-K Bash image absent")?;
+            let account = format!("{}:{}", unsafe { libc::geteuid() }, unsafe {
+                libc::getegid()
+            });
+            std::fs::write(
+                gate_dir.join("child-attested"),
+                evidence.release_id.as_bytes(),
+            )
+            .map_err(|e| e.to_string())?;
+            let status = std::process::Command::new(bash)
+                .arg("__age319-private-pre-k-h-source-v1")
+                .arg(&gate_dir)
+                .args(["--", "/bin/true", "selected workload"])
+                .env("AGENT_BASH_AGENT_RUNNER_BIN", runner)
+                .env("XDG_STATE_HOME", &gate_dir)
+                .env("XDG_CONFIG_HOME", &gate_dir)
+                .env("OULIPOLY_COMPLETION_ENDPOINT", &evidence.owner.endpoint)
+                .env("OULIPOLY_ORIGINAL_WORK_REQUIRED_V1", "1")
+                .env("AGENT_BASH_OWNER_SESSION_ID", &session.session_id)
+                .env("AGENT_BASH_OWNER_INVOCATION_UUID", &receipt.invocation_uuid)
+                .env(
+                    "OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY",
+                    &receipt.registration_authority,
+                )
+                .env("AGE319_SELECTED_ACCOUNT", account)
+                .env("AGE319_SELECTED_ENV", "held-d-pre-k")
+                .status()
+                .map_err(|e| e.to_string())?;
+            if !status.success() {
+                return Err(format!("private pre-K Bash source exited {status}"));
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
         if std::env::var_os("AGE319_PRIVATE_OWNER_DISCOVERY_PROBE_V1").is_some() {
             crate::completion_owner::private_discovery_probe(&evidence, &gate_dir)?;
         }

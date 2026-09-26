@@ -665,13 +665,26 @@ pub(crate) fn run_pinned_guardian_v30(
         .map_err(|e| e.to_string())?;
     let endpoint = directory.join("owner.sock");
     let listener = UnixListener::bind(&endpoint).map_err(|e| e.to_string())?;
+    #[cfg(feature = "age319-private-broker-fixture")]
+    if std::env::var_os("AGE319_PRIVATE_PRE_K_H_SOURCE_V1").is_some() {
+        let enabled: libc::c_int = 1;
+        if unsafe {
+            libc::setsockopt(
+                listener.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PASSCRED,
+                (&enabled as *const libc::c_int).cast(),
+                std::mem::size_of_val(&enabled) as _,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+    }
     let (owner, mut driver_gate) = start_v30_driver(&endpoint, pin, listener.as_raw_fd())?;
     let context = identity(peer_pid(&entry)?)?;
-    let grant = super::original_work::RootAuthorities::default().fresh_with_root_id(
-        &owner,
-        context,
-        pin.root_id.clone(),
-    )?;
+    let mut authorities = super::original_work::RootAuthorities::default();
+    let grant = authorities.fresh_with_root_id(&owner, context, pin.root_id.clone())?;
     let proposal = serde_json::json!({
         "driver_pid": owner.driver_identity.pid,
         "owner_generation": owner.owner_generation,
@@ -704,6 +717,19 @@ pub(crate) fn run_pinned_guardian_v30(
     serde_json::to_writer(&mut entry, &released).map_err(|e| e.to_string())?;
     entry.write_all(b"\n").map_err(|e| e.to_string())?;
     publish_driver_owner(&mut driver_gate, &released.owner)?;
+    #[cfg(feature = "age319-private-broker-fixture")]
+    if std::env::var_os("AGE319_PRIVATE_PRE_K_H_SOURCE_V1").is_some() {
+        return run_private_v30_original_work(
+            &listener,
+            &owner,
+            pin,
+            &mut entry,
+            &mut driver_gate,
+            &mut authorities,
+        );
+    }
+    #[cfg(not(feature = "age319-private-broker-fixture"))]
+    let _ = authorities;
     // Keep the original guardian alive while the released child performs its
     // post-gate broker attestation. EOF or death is refusal, never succession.
     entry.read_exact(&mut receipt).map_err(|e| e.to_string())?;
@@ -712,6 +738,72 @@ pub(crate) fn run_pinned_guardian_v30(
     }
     driver_gate.write_all(b"D").map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// The private released-root fixture retains the v30 guardian as the actual
+/// original-work acceptor while J and the Bash source are live. It owns the
+/// same ControlService and OriginalWorkSupervisor used by the ordinary root,
+/// without opening the retired user mailbox or creating a second guardian.
+#[cfg(feature = "age319-private-broker-fixture")]
+fn run_private_v30_original_work(
+    listener: &UnixListener,
+    owner: &CompletionDomainOwner,
+    pin: &super::PinnedGuardian,
+    entry: &mut UnixStream,
+    driver_gate: &mut UnixStream,
+    authorities: &mut super::original_work::RootAuthorities,
+) -> Result<(), String> {
+    let control = ControlService::start_pinned(listener, owner, &pin.root_id)?;
+    let mut original = super::original_work::OriginalWorkSupervisor::default();
+    original.set_kernel_pinned(true);
+    entry.set_nonblocking(true).map_err(|e| e.to_string())?;
+    let mut child_done = false;
+    loop {
+        for request in control.pending() {
+            match request {
+                ControlRequest::Work(request) => {
+                    let authorized = matches!(
+                        request.submission.registration,
+                        super::original_work::WorkRegistration::Root
+                    ) && authorities
+                        .authorize_capability(owner, &request.submission.root_authority)
+                        .is_ok()
+                        && request.submission.root_authority.root_id == pin.root_id;
+                    if authorized {
+                        original.submit(owner, request);
+                    } else {
+                        reject_work(
+                            owner,
+                            request,
+                            "private v30 root work authority refused".into(),
+                        );
+                    }
+                }
+                ControlRequest::Cancel(request) => {
+                    original.cancel(owner, request);
+                }
+                ControlRequest::Join(mut request) => {
+                    JoinRefusal::new(owner, RefusalReason::Identity).send(&mut request.socket);
+                }
+            }
+        }
+        original.tick(owner);
+        if !child_done {
+            let mut receipt = [0];
+            match entry.read(&mut receipt) {
+                Ok(1) if receipt == [b'D'] => child_done = true,
+                Ok(0) => return Err("private v30 child completion channel closed".into()),
+                Ok(_) => return Err("private v30 child completion marker changed".into()),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        if child_done && original.is_empty() {
+            driver_gate.write_all(b"D").map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+        std::thread::sleep(GUARDIAN_POLL_INTERVAL);
+    }
 }
 
 fn start_v30_driver(

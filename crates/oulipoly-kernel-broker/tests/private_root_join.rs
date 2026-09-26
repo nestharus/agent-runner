@@ -302,6 +302,7 @@ fn inner() {
             mode.as_str(),
             "normal_handoff"
                 | "normal_handoff_bash_child"
+                | "normal_handoff_pre_k_h_source"
                 | "normal_handoff_fsync"
                 | "normal_handoff_effect_reply_loss"
                 | "normal_help"
@@ -314,6 +315,7 @@ fn inner() {
     let runner =
         std::env::var("OULIPOLY_AGE319_RUNNER_IMAGE").expect("built Runner image required");
     let bash = (mode == "normal_handoff_bash_child"
+        || mode == "normal_handoff_pre_k_h_source"
         || mode.starts_with("normal_model_provider_bash_causal")
         || mode.starts_with("normal_model_provider_bash_ordinary")
         || mode.starts_with("normal_model_provider_pty_physical_resident_bash_"))
@@ -1443,6 +1445,10 @@ fn inner() {
                     .then_some(("AGE319_PRIVATE_OWNER_DISCOVERY_PROBE_V1", "1")),
             )
             .envs(
+                (mode == "normal_handoff_pre_k_h_source")
+                    .then_some(("AGE319_PRIVATE_PRE_K_H_SOURCE_V1", "1")),
+            )
+            .envs(
                 (mode == "normal_bash_source_lost_reply")
                     .then_some(("AGE319_PRIVATE_SOURCE_LAUNCH_REPLY_LOSS_V1", "1")),
             )
@@ -1666,6 +1672,392 @@ fn inner() {
                 let _ = entry.wait();
                 stop(&mut broker);
                 unsafe { libc::kill(prepared.root_init.host_pid, libc::SIGKILL) };
+                return;
+            }
+            if mode == "normal_handoff_pre_k_h_source" {
+                let until = Instant::now() + Duration::from_secs(90);
+                while !gate.join("source-ready").exists()
+                    && entry.try_wait().unwrap().is_none()
+                    && Instant::now() < until
+                {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                let source_ready = gate.join("source-ready").exists();
+                let h_ready = gate.join("h-source-ready").exists();
+                let source_error =
+                    fs::read_to_string(gate.join("private-source-stderr.log")).unwrap_or_default();
+                let entry_error = fs::read_to_string(&err).unwrap_or_default();
+                let broker_error = fs::read_to_string(&broker_log).unwrap_or_default();
+                let restarted_error =
+                    fs::read_to_string(temp.path().join("normal-restart.log")).unwrap_or_default();
+                let guardian_control =
+                    fs::read_to_string(gate.join("guardian-pre-k-control.log")).unwrap_or_default();
+                let guardian_environment =
+                    fs::read(format!("/proc/{}/environ", prepared.guardian.host_pid))
+                        .unwrap_or_default();
+                let guardian_environment = String::from_utf8_lossy(&guardian_environment)
+                    .split('\0')
+                    .filter(|entry| {
+                        entry.starts_with("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1=")
+                            || entry.starts_with("AGE319_PRIVATE_PRE_K_H_SOURCE_V1=")
+                    })
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                let bash_state = fs::read_dir(gate.join("agent-bash"))
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Result::ok)
+                    .map(|entry| {
+                        let dir = entry.path();
+                        (
+                            dir.display().to_string(),
+                            fs::read_to_string(dir.join("root-work-diagnostic-v1.jsonl"))
+                                .unwrap_or_default(),
+                            fs::read_to_string(dir.join("root-work-accepted-v1.json"))
+                                .unwrap_or_default(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let grants = fs::read_dir(broker_state.join("grants"))
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Result::ok)
+                    .map(|entry| fs::read_to_string(entry.path()).unwrap_or_default())
+                    .collect::<Vec<_>>();
+                let works = fs::read_dir(broker_state.join("works"))
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Result::ok)
+                    .map(|entry| fs::read_to_string(entry.path()).unwrap_or_default())
+                    .collect::<Vec<_>>();
+                let work_processes = works
+                    .iter()
+                    .filter_map(|record| {
+                        let value: serde_json::Value = serde_json::from_str(record).ok()?;
+                        let pid = value["init_host_pid"].as_i64()?;
+                        let children =
+                            fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+                                .unwrap_or_default();
+                        let wchan =
+                            fs::read_to_string(format!("/proc/{pid}/wchan")).unwrap_or_default();
+                        let child_states = children
+                            .split_whitespace()
+                            .map(|child| {
+                                (
+                                    child.to_owned(),
+                                    fs::read_to_string(format!("/proc/{child}/wchan"))
+                                        .unwrap_or_default(),
+                                    fs::read(format!("/proc/{child}/cmdline")).unwrap_or_default(),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        Some((pid, wchan, children, child_states))
+                    })
+                    .collect::<Vec<_>>();
+                let h_path = fs::read_to_string(gate.join("h-source-ready")).unwrap_or_default();
+                if !source_ready {
+                    let _ = fs::write(gate.join("source-release"), b"done");
+                    let _ = fs::write(gate.join("h-source-release"), b"done");
+                    stop(&mut entry);
+                    stop(&mut broker);
+                    unsafe { libc::kill(prepared.root_init.host_pid, libc::SIGKILL) };
+                    panic!(
+                        "paired pre-K source failed: H={h_ready} K={source_ready} h_path={h_path:?} entry={entry_error} source={source_error} broker={broker_error} restarted={restarted_error} guardian={guardian_control} guardian_env={guardian_environment:?} bash_state={bash_state:?} grants={grants:?} works={works:?} work_processes={work_processes:?}"
+                    );
+                }
+                let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    assert!(entry.try_wait().unwrap().is_none(), "J must retain held D");
+                    assert_eq!(
+                        fs::read(data.join("pid-identity.db")).unwrap(),
+                        b"retired copied owner"
+                    );
+                    let grant: serde_json::Value = grants
+                        .iter()
+                        .filter_map(|g| serde_json::from_str(g).ok())
+                        .find(|g: &serde_json::Value| g["consumed"] == true)
+                        .expect("consumed H grant absent");
+                    assert_eq!(grant["version"], 3);
+                    assert_eq!(grant["root_id"], prepared.root_id);
+                    assert_eq!(
+                        grant["sealed_helper"]["sha256"],
+                        format!("{:x}", Sha256::digest(fs::read(&runner).unwrap()))
+                    );
+                    let h_pid = grant["initiator"]["pid"].as_i64().unwrap();
+                    let bash_image = fs::metadata(bash.as_ref().unwrap()).unwrap();
+                    let live_h = fs::metadata(format!("/proc/{h_pid}/exe")).unwrap();
+                    assert_eq!(
+                        (live_h.dev(), live_h.ino()),
+                        (bash_image.dev(), bash_image.ino()),
+                        "H source image changed"
+                    );
+                    let h_dir = fs::read_dir(gate.join("agent-bash"))
+                        .unwrap()
+                        .filter_map(Result::ok)
+                        .map(|entry| entry.path())
+                        .find(|path| path.join("root-work-accepted-v1.json").exists())
+                        .expect("Bash H acceptance artifact absent");
+                    let intent: serde_json::Value = serde_json::from_slice(
+                        &fs::read(h_dir.join("root-work-intent-v1.json")).unwrap(),
+                    )
+                    .unwrap();
+                    let h_meta: serde_json::Value =
+                        serde_json::from_slice(&fs::read(h_dir.join("meta.json")).unwrap())
+                            .unwrap();
+                    assert_eq!(
+                        h_meta["delivery_helper"]["sha256"],
+                        grant["sealed_helper"]["sha256"]
+                    );
+                    let work: serde_json::Value = works
+                        .iter()
+                        .filter_map(|w| serde_json::from_str(w).ok())
+                        .find(|w: &serde_json::Value| w["accepted_grant_id"] == grant["grant_id"])
+                        .expect("consumed K work absent");
+                    let k_pid = work["init_host_pid"].as_i64().unwrap();
+                    let children =
+                        fs::read_to_string(format!("/proc/{k_pid}/task/{k_pid}/children")).unwrap();
+                    let child_pids: Vec<i64> = children
+                        .split_whitespace()
+                        .map(|pid| pid.parse().unwrap())
+                        .collect();
+                    assert_eq!(child_pids.len(), 1, "K must have one direct Bash worker");
+                    let worker_pid = child_pids[0];
+                    let live_worker = fs::metadata(format!("/proc/{worker_pid}/exe")).unwrap();
+                    assert_eq!(
+                        (live_worker.dev(), live_worker.ino()),
+                        (bash_image.dev(), bash_image.ino()),
+                        "K worker image changed"
+                    );
+                    let status = fs::read_to_string(format!("/proc/{worker_pid}/status")).unwrap();
+                    assert!(status.lines().any(|line| line == format!("PPid:\t{k_pid}")));
+                    let physical = |name: &str| -> u32 {
+                        status
+                            .lines()
+                            .find_map(|line| line.strip_prefix(name))
+                            .and_then(|fields| fields.split_whitespace().next())
+                            .and_then(|field| field.parse().ok())
+                            .unwrap()
+                    };
+                    assert_eq!(
+                        physical("Uid:"),
+                        unsafe { libc::geteuid() },
+                        "C/K physical UID changed"
+                    );
+                    assert_eq!(
+                        physical("Gid:"),
+                        unsafe { libc::getegid() },
+                        "C/K physical GID changed"
+                    );
+                    let actual_env = fs::read(format!("/proc/{worker_pid}/environ")).unwrap();
+                    let actual_env: Vec<&[u8]> = actual_env.split(|b| *b == 0).collect();
+                    let selected_env: std::collections::BTreeSet<Vec<u8>> = intent["environment"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|entry| {
+                            let key = entry["key"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .map(|n| n.as_u64().unwrap() as u8)
+                                .collect::<Vec<_>>();
+                            let value = entry["value"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .map(|n| n.as_u64().unwrap() as u8)
+                                .collect::<Vec<_>>();
+                            [key, b"=".to_vec(), value].concat()
+                        })
+                        .collect();
+                    let physical_env: std::collections::BTreeSet<Vec<u8>> = actual_env
+                        .iter()
+                        .filter(|entry| !entry.is_empty())
+                        .map(|entry| entry.to_vec())
+                        .collect();
+                    assert_eq!(
+                        physical_env, selected_env,
+                        "H-selected and K-actual environment differ"
+                    );
+                    for selected in [
+                        b"AGE319_SELECTED_ENV=held-d-pre-k".as_slice(),
+                        format!(
+                            "AGE319_SELECTED_ACCOUNT={}:{}",
+                            unsafe { libc::geteuid() },
+                            unsafe { libc::getegid() }
+                        )
+                        .as_bytes(),
+                    ] {
+                        assert!(
+                            actual_env.contains(&selected),
+                            "C environment/account changed at K"
+                        );
+                        assert!(
+                            intent["environment"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .any(|entry| {
+                                    let key = entry["key"]
+                                        .as_array()
+                                        .unwrap()
+                                        .iter()
+                                        .map(|n| n.as_u64().unwrap() as u8)
+                                        .collect::<Vec<_>>();
+                                    let value = entry["value"]
+                                        .as_array()
+                                        .unwrap()
+                                        .iter()
+                                        .map(|n| n.as_u64().unwrap() as u8)
+                                        .collect::<Vec<_>>();
+                                    [key, b"=".to_vec(), value].concat() == selected
+                                }),
+                            "H did not select C environment/account"
+                        );
+                    }
+                    let registration_path = fs::read_to_string(gate.join("source-ready")).unwrap();
+                    let registration_path = Path::new(registration_path.trim());
+                    assert_eq!(
+                        registration_path.file_name().unwrap(),
+                        "source-registration-v2.json"
+                    );
+                    let registration_bytes = fs::read(registration_path).unwrap();
+                    let registration: serde_json::Value =
+                        serde_json::from_slice(&registration_bytes).unwrap();
+                    let registration_stat = fs::metadata(registration_path).unwrap();
+                    assert_eq!(registration["registering_caller"]["pid"], worker_pid);
+                    assert_eq!(
+                        registration["helper"]["sha256"],
+                        grant["sealed_helper"]["sha256"]
+                    );
+                    let worker_dir = registration_path.parent().unwrap();
+                    let h_env: std::collections::BTreeMap<String, String> = serde_json::from_slice(
+                        &fs::read(h_dir.join("delivery-helper-environment.json")).unwrap(),
+                    )
+                    .unwrap();
+                    let k_env: std::collections::BTreeMap<String, String> = serde_json::from_slice(
+                        &fs::read(worker_dir.join("delivery-helper-environment.json")).unwrap(),
+                    )
+                    .unwrap();
+                    let different_keys: Vec<_> = h_env
+                        .keys()
+                        .chain(k_env.keys())
+                        .filter(|key| h_env.get(*key) != k_env.get(*key))
+                        .collect();
+                    assert_eq!(
+                        registration["helper"]["environment_sha256"],
+                        h_meta["delivery_helper"]["environment_sha256"],
+                        "H/K helper environment differs at keys: {different_keys:?}"
+                    );
+                    assert_eq!(
+                        registration["owner_session_id"],
+                        grant["sealed_helper"]["owner_session_id"]
+                    );
+                    assert_eq!(
+                        registration["owner_invocation_uuid"],
+                        grant["sealed_helper"]["owner_invocation_uuid"]
+                    );
+                    assert_eq!(registration_stat.nlink(), 1);
+                    assert_eq!(fs::read(registration_path).unwrap(), registration_bytes);
+                    let original = rusqlite::Connection::open_with_flags(
+                        data.join("state.db"),
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                    )
+                    .unwrap();
+                    let invocation = grant["sealed_helper"]["owner_invocation_uuid"]
+                        .as_str()
+                        .unwrap();
+                    let (session, capability): (String, String) = original.query_row(
+                        "SELECT provider_session_id,completion_registration_capability_digest FROM invocations WHERE invocation_uuid=?1",
+                        [invocation], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+                    assert_eq!(session, grant["sealed_helper"]["owner_session_id"]);
+                    assert_eq!(
+                        capability,
+                        grant["sealed_helper"]["state_capability_digest"]
+                    );
+                    let decisions: i64 = original
+                        .query_row(
+                            "SELECT count(*) FROM invocation_completion_exact_source_decisions",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        decisions, 0,
+                        "private source must stop before State decision"
+                    );
+                    let challenged: serde_json::Value = serde_json::from_slice(
+                        &fs::read(gate.join("challenged-owner-readback.json")).unwrap(),
+                    )
+                    .unwrap();
+                    let readback = &challenged["readback"];
+                    assert_eq!(challenged["query_pid"], k_pid);
+                    assert_eq!(readback["root_id"], prepared.root_id);
+                    assert_eq!(
+                        readback["owner"],
+                        serde_json::to_value(&released.owner).unwrap()
+                    );
+                    assert_eq!(readback["domain_id"], released.owner.domain_id);
+                    assert_eq!(
+                        readback["owner_generation"],
+                        released.owner.owner_generation
+                    );
+                    assert_eq!(readback["source_generation"], generation);
+                    assert_eq!(readback["release_id"], released.release_id);
+                    assert_eq!(readback["session_id"], session);
+                    assert_eq!(readback["invocation_uuid"], invocation);
+                    let guardian = UnixStream::connect(&released.owner.endpoint).unwrap();
+                    let mut request = protocol::OwnerDiscoveryRequest {
+                        root_id: prepared.root_id.clone(),
+                        query_pid: Some(k_pid as i32),
+                        expected_owner_generation: Some(released.owner.owner_generation.clone()),
+                    };
+                    assert!(
+                        protocol::discover_owner_at(&socket, &request, guardian.as_raw_fd())
+                            .is_err(),
+                        "outside source copied a live K binding"
+                    );
+                    request.expected_owner_generation = Some(uuid::Uuid::new_v4().to_string());
+                    assert!(
+                        protocol::discover_owner_at(&socket, &request, guardian.as_raw_fd())
+                            .is_err()
+                    );
+                    request.expected_owner_generation =
+                        Some(released.owner.owner_generation.clone());
+                    request.root_id = uuid::Uuid::new_v4().to_string();
+                    assert!(
+                        protocol::discover_owner_at(&socket, &request, guardian.as_raw_fd())
+                            .is_err()
+                    );
+                    request.root_id = prepared.root_id.clone();
+                    let (wrong_guardian, _other) = UnixStream::pair().unwrap();
+                    assert!(
+                        protocol::discover_owner_at(&socket, &request, wrong_guardian.as_raw_fd())
+                            .is_err()
+                    );
+                    request.query_pid = Some(h_pid as i32);
+                    assert!(
+                        protocol::discover_owner_at(&socket, &request, guardian.as_raw_fd())
+                            .is_err(),
+                        "outside H source copied K binding"
+                    );
+                }));
+                fs::write(gate.join("source-release"), b"done").unwrap();
+                eventually(|| entry.try_wait().unwrap().is_some());
+                let _ = entry.wait();
+                stop(&mut broker);
+                unsafe { libc::kill(prepared.root_init.host_pid, libc::SIGKILL) };
+                if let Err(panic) = verified {
+                    std::panic::resume_unwind(panic);
+                }
+                assert!(
+                    fs::read_to_string(&err)
+                        .unwrap_or_default()
+                        .contains("original H acceptance uncertain; no replay"),
+                    "pre-register H response unexpectedly claimed completion"
+                );
                 return;
             }
             if mode == "normal_handoff_bash_child" {
