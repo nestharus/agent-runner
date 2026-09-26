@@ -273,7 +273,195 @@ pub(crate) fn private_consumed_h_source_decision_entry() -> Option<ExitCode> {
         {
             return Err("private consumed H second request accepted".into());
         }
+        let binding = oulipoly_state::completion_continuation::AdmittedSourceBinding::new(
+            &oulipoly_state::completion_continuation::completion_obligation_admission_id(
+                &source.handle,
+                &source.owner_invocation_uuid,
+            ),
+            &bytes,
+        )?;
+        let state_request = oulipoly_state::SourceDecisionVerification {
+            request_id,
+            decision_id: first.decision_id.clone(),
+            witness: serde_json::to_value(&witness).map_err(|e| e.to_string())?,
+            committed_retry: false,
+        };
+        let actor =
+            oulipoly_state::CompletionRegistrationAuthority::from_process_environment_value(
+                witness.capability.clone(),
+            )?;
+        let mut state =
+            oulipoly_state::StateDb::open_existing(&oulipoly_state::StateDb::default_path()?)?;
+        let submit =
+            |state: &mut oulipoly_state::StateDb,
+             request: &oulipoly_state::SourceDecisionVerification,
+             fd: i32,
+             bound: &oulipoly_state::completion_continuation::AdmittedSourceBinding| {
+                state.register_completion_continuation_with_broker_decision_at(
+                    &broker,
+                    oulipoly_state::InvocationMutationAuthority::Standalone,
+                    &actor,
+                    bound,
+                    oulipoly_state::ExactSourceDecisionReference {
+                        verification: request,
+                        guardian_fd: guardian.as_raw_fd(),
+                        registration_fd: fd,
+                    },
+                )
+            };
+        let mut wrong = state_request.clone();
+        wrong.decision_id = uuid::Uuid::new_v4().to_string();
+        if submit(&mut state, &wrong, registration.as_raw_fd(), &binding).is_ok() {
+            return Err("consumed H State accepted changed decision".into());
+        }
+        wrong = state_request.clone();
+        wrong.witness["owner"]["root_id"] = uuid::Uuid::new_v4().to_string().into();
+        if submit(&mut state, &wrong, registration.as_raw_fd(), &binding).is_ok() {
+            return Err("consumed H State accepted other root".into());
+        }
+        wrong = state_request.clone();
+        wrong.witness["capability"] = "0".repeat(64).into();
+        if submit(&mut state, &wrong, registration.as_raw_fd(), &binding).is_ok() {
+            return Err("consumed H State accepted changed capability".into());
+        }
+        if submit(&mut state, &state_request, copied.as_raw_fd(), &binding).is_ok() {
+            return Err("consumed H State accepted copied registration FD".into());
+        }
+        let wrong_binding = oulipoly_state::completion_continuation::AdmittedSourceBinding::new(
+            "wrong-admission-id",
+            &bytes,
+        )?;
+        if submit(
+            &mut state,
+            &state_request,
+            registration.as_raw_fd(),
+            &wrong_binding,
+        )
+        .is_ok()
+        {
+            return Err("consumed H State accepted changed binding".into());
+        }
+        if state
+            .register_completion_continuation_with_broker_decision_at(
+                &broker,
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                &actor,
+                &binding,
+                oulipoly_state::ExactSourceDecisionReference {
+                    verification: &state_request,
+                    guardian_fd: wrong_guardian.as_raw_fd(),
+                    registration_fd: registration.as_raw_fd(),
+                },
+            )
+            .is_ok()
+        {
+            return Err("consumed H State accepted unrelated guardian FD".into());
+        }
+        std::fs::write(&registration_path, b"changed registration bytes")
+            .map_err(|e| e.to_string())?;
+        let changed_accepted = submit(
+            &mut state,
+            &state_request,
+            registration.as_raw_fd(),
+            &binding,
+        )
+        .is_ok();
+        std::fs::write(&registration_path, &bytes).map_err(|e| e.to_string())?;
+        if changed_accepted {
+            return Err("consumed H State accepted changed registration bytes".into());
+        }
+        let copied_state_path = registration_path.with_file_name("copied-source-state.db");
+        let original_state_path = oulipoly_state::StateDb::default_path()?;
+        rusqlite::Connection::open(&original_state_path)
+            .map_err(|e| e.to_string())?
+            .execute(
+                "VACUUM INTO ?1",
+                [copied_state_path
+                    .to_str()
+                    .ok_or("consumed H copied State path is not UTF-8")?],
+            )
+            .map_err(|e| e.to_string())?;
+        let mut copied_state = oulipoly_state::StateDb::open_existing(&copied_state_path)?;
+        if submit(
+            &mut copied_state,
+            &state_request,
+            registration.as_raw_fd(),
+            &binding,
+        )
+        .is_ok()
+        {
+            return Err("consumed H State accepted copied State inode".into());
+        }
+        let gate = PathBuf::from(
+            std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                .ok_or("consumed H State gate absent")?,
+        );
+        std::fs::write(gate.join("source-state-ready"), b"yes").map_err(|e| e.to_string())?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        while !gate.join("source-state-stale").exists() {
+            if std::time::Instant::now() >= deadline {
+                return Err("consumed H State stale gate expired".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if !submit(
+            &mut state,
+            &state_request,
+            registration.as_raw_fd(),
+            &binding,
+        )
+        .is_err_and(|error| error.contains("expired"))
+        {
+            return Err("consumed H State did not refuse the expired decision".into());
+        }
+        std::fs::write(gate.join("source-state-stale-refused"), b"yes")
+            .map_err(|e| e.to_string())?;
+        while !gate.join("source-state-commit").exists() {
+            if std::time::Instant::now() >= deadline {
+                return Err("consumed H State commit gate expired".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let first_state = submit(
+            &mut state,
+            &state_request,
+            registration.as_raw_fd(),
+            &binding,
+        )?;
+        if !first_state.inserted
+            || first_state.projection_available
+            || first_state.decision_id != first.decision_id
+        {
+            return Err("consumed H first State commit did not remain unavailable".into());
+        }
+        drop(state); // The first committed response is deliberately lost.
+        let mut state =
+            oulipoly_state::StateDb::open_existing(&oulipoly_state::StateDb::default_path()?)?;
+        let retry_state = submit(
+            &mut state,
+            &state_request,
+            registration.as_raw_fd(),
+            &binding,
+        )?;
+        if retry_state.inserted
+            || retry_state.projection_available
+            || retry_state.decision_id != first.decision_id
+        {
+            return Err("consumed H lost State response retried another decision".into());
+        }
+        std::fs::write(gate.join("source-state-admitted"), b"yes").map_err(|e| e.to_string())?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+        while !gate.join("source-projection-done").exists() {
+            if std::time::Instant::now() >= deadline {
+                return Err("consumed H projection gate expired".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         Ok(serde_json::json!({"decision": first, "retry": second,
+            "state_first": {"inserted": first_state.inserted, "decision_id": first_state.decision_id,
+                "projection_available": first_state.projection_available},
+            "state_retry": {"inserted": retry_state.inserted, "decision_id": retry_state.decision_id,
+                "projection_available": retry_state.projection_available},
             "negatives": ["changed_source", "other_root", "wrong_guardian", "copied_fd", "second_request"]}))
     })();
     Some(match result {

@@ -159,8 +159,13 @@ impl BrokerReadback {
     pub(super) fn issuer_json(&self) -> Result<String, String> {
         serde_json::to_string(&self.issuer).map_err(|e| e.to_string())
     }
-    pub(super) fn issuer(&self) -> &PreparedProcessStamp {
-        &self.issuer
+    pub(super) fn registration_actors_match(&self, source: &SourceProcessIdentity) -> bool {
+        matches_registration_actors(
+            &self.issuer_kind,
+            &self.issuer,
+            &self.registration_worker,
+            source,
+        )
     }
     pub(super) fn original_state_device(&self) -> u64 {
         self.original_state_device

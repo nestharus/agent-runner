@@ -2078,6 +2078,229 @@ fn inner() {
                         "outside H source copied K binding"
                     );
                     fs::write(gate.join("source-decision-request"), b"issue").unwrap();
+                    let state_deadline = Instant::now() + Duration::from_secs(180);
+                    while !gate.join("source-state-ready").exists()
+                        && entry.try_wait().unwrap().is_none()
+                        && Instant::now() < state_deadline
+                    {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    assert!(
+                        gate.join("source-state-ready").exists(),
+                        "Bash decision did not reach State: {}",
+                        fs::read_to_string(gate.join("private-source-stderr.log"))
+                            .unwrap_or_default()
+                    );
+                    let state_count: i64 = original
+                        .query_row(
+                            "SELECT count(*) FROM invocation_completion_exact_source_decisions",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(state_count, 0, "Bash decision committed before State gate");
+                    fs::write(gate.join("source-clock-offset"), b"240").unwrap();
+                    stop(&mut broker);
+                    broker = restart_source_broker(
+                        &socket,
+                        &broker_state,
+                        &runner,
+                        &gate,
+                        &temp.path().join("consumed-h-expired-before-state.log"),
+                    );
+                    fs::write(gate.join("source-state-stale"), b"yes").unwrap();
+                    while !gate.join("source-state-stale-refused").exists()
+                        && entry.try_wait().unwrap().is_none()
+                        && Instant::now() < state_deadline
+                    {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    assert!(
+                        gate.join("source-state-stale-refused").exists(),
+                        "expired H decision was not refused by State: {}",
+                        fs::read_to_string(gate.join("private-source-stderr.log"))
+                            .unwrap_or_default()
+                    );
+                    let still_zero: i64 = original
+                        .query_row(
+                            "SELECT count(*) FROM invocation_completion_exact_source_decisions",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(still_zero, 0, "expired H decision changed State");
+                    stop(&mut broker);
+                    fs::remove_file(gate.join("source-clock-offset")).unwrap();
+                    broker = restart_source_broker(
+                        &socket,
+                        &broker_state,
+                        &runner,
+                        &gate,
+                        &temp.path().join("consumed-h-unexpired-state.log"),
+                    );
+                    fs::write(gate.join("source-state-commit"), b"yes").unwrap();
+                    while !gate.join("source-state-admitted").exists()
+                        && entry.try_wait().unwrap().is_none()
+                        && Instant::now() < state_deadline
+                    {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    assert!(
+                        gate.join("source-state-admitted").exists(),
+                        "Bash decision State commit/retry failed: {}",
+                        fs::read_to_string(gate.join("private-source-stderr.log"))
+                            .unwrap_or_default()
+                    );
+                    assert!(
+                        entry.try_wait().unwrap().is_none(),
+                        "J exited before H projection"
+                    );
+                    let attribution: (String, String, String, String, String, i64, i64, Vec<u8>) = original.query_row(
+                        "SELECT request_id,decision_id,registration_id,registration_sha256,projection_state,original_state_device,original_state_inode,broker_readback_json FROM invocation_completion_exact_source_decisions",
+                        [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?))
+                    ).unwrap();
+                    let original_stat = fs::metadata(data.join("state.db")).unwrap();
+                    assert_eq!(
+                        (attribution.5, attribution.6),
+                        (original_stat.dev() as i64, original_stat.ino() as i64)
+                    );
+                    assert_eq!(attribution.2, registration["registration_id"]);
+                    assert_eq!(
+                        attribution.3,
+                        format!("{:x}", Sha256::digest(&registration_bytes))
+                    );
+                    assert_eq!(attribution.4, "unavailable");
+                    let state_readback: serde_json::Value =
+                        serde_json::from_slice(&attribution.7).unwrap();
+                    assert_eq!(state_readback["issuer_kind"], "consumed_h_sealed_helper");
+                    assert_eq!(
+                        state_readback["registration_worker"]["host_pid"],
+                        worker_pid
+                    );
+                    assert_ne!(
+                        state_readback["issuer"]["host_pid"],
+                        state_readback["registration_worker"]["host_pid"]
+                    );
+                    assert_eq!(state_readback["owner_invocation_uuid"], invocation);
+                    assert_eq!(state_readback["owner_session_id"], session);
+                    let retained_path = broker_state.join("sidecar/pid-identity.db");
+                    let mut retained =
+                        BrokerSidecar::open_existing(&retained_path, &broker_state).unwrap();
+                    assert!(
+                        retained
+                            .read_bounded_source_selection(
+                                &generation,
+                                &prepared.root_id,
+                                &released.owner
+                            )
+                            .is_err(),
+                        "unprojected H source became selectable"
+                    );
+                    assert!(
+                        retained
+                            .reserve_source_effect_grant(
+                                &generation,
+                                &prepared.root_id,
+                                &released.owner
+                            )
+                            .is_err(),
+                        "W reserved before H projection"
+                    );
+                    let receipt_count: i64 = sidecar
+                        .query_row(
+                            "SELECT count(*) FROM broker_exact_source_projection",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(receipt_count, 0, "H receipt preceded projection");
+                    drop(retained);
+                    stop(&mut broker);
+                    broker = restart_source_broker(
+                        &socket,
+                        &broker_state,
+                        &runner,
+                        &gate,
+                        &temp.path().join("consumed-h-before-projection.log"),
+                    );
+                    stop(&mut broker);
+                    let mut retained =
+                        BrokerSidecar::open_existing(&retained_path, &broker_state).unwrap();
+                    let projected = retained
+                        .repair_bounded_suffix(&generation, &prepared.root_id, &released.owner, 0)
+                        .unwrap();
+                    assert_eq!(projected.authority_ordinal, 1);
+                    drop(retained); // Simulate loss of the sidecar commit response.
+                    broker = restart_source_broker(
+                        &socket,
+                        &broker_state,
+                        &runner,
+                        &gate,
+                        &temp.path().join("consumed-h-after-projection.log"),
+                    );
+                    let mut retained =
+                        BrokerSidecar::open_existing(&retained_path, &broker_state).unwrap();
+                    let replay = retained
+                        .repair_bounded_suffix(&generation, &prepared.root_id, &released.owner, 0)
+                        .unwrap();
+                    assert_eq!(replay, projected, "H projection retry changed receipt");
+                    let selected = retained
+                        .read_bounded_source_selection(
+                            &generation,
+                            &prepared.root_id,
+                            &released.owner,
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        selected.candidate.as_ref().unwrap().registration_id,
+                        attribution.2
+                    );
+                    assert!(
+                        retained
+                            .read_bounded_source_selection(
+                                &uuid::Uuid::new_v4().to_string(),
+                                &prepared.root_id,
+                                &released.owner
+                            )
+                            .is_err()
+                    );
+                    assert!(
+                        retained
+                            .read_bounded_source_selection(
+                                &generation,
+                                &uuid::Uuid::new_v4().to_string(),
+                                &released.owner
+                            )
+                            .is_err()
+                    );
+                    let mut stale_owner = released.owner.clone();
+                    stale_owner.owner_generation = uuid::Uuid::new_v4().to_string();
+                    assert!(
+                        retained
+                            .read_bounded_source_selection(
+                                &generation,
+                                &prepared.root_id,
+                                &stale_owner
+                            )
+                            .is_err()
+                    );
+                    let receipt: (String, String, String, String, String, Vec<u8>) = sidecar.query_row(
+                        "SELECT request_id,decision_id,registration_id,registration_sha256,root_id,broker_readback_json FROM broker_exact_source_projection",
+                        [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
+                    ).unwrap();
+                    assert_eq!(
+                        (&receipt.0, &receipt.1, &receipt.2, &receipt.3, &receipt.4),
+                        (
+                            &attribution.0,
+                            &attribution.1,
+                            &attribution.2,
+                            &attribution.3,
+                            &prepared.root_id
+                        )
+                    );
+                    assert_eq!(receipt.5, attribution.7);
+                    drop(retained);
+                    fs::write(gate.join("source-projection-done"), b"yes").unwrap();
                     let decision_deadline = Instant::now() + Duration::from_secs(180);
                     while !gate.join("source-decision-readback.json").exists()
                         && entry.try_wait().unwrap().is_none()
@@ -2194,7 +2417,10 @@ fn inner() {
                             |row| row.get(0),
                         )
                         .unwrap();
-                    assert_eq!(still_zero, 0, "source-only decision consumed by State");
+                    assert_eq!(
+                        still_zero, 1,
+                        "actual Bash-byte decision did not commit to original State"
+                    );
                 }));
                 fs::write(gate.join("source-release"), b"done").unwrap();
                 eventually(|| entry.try_wait().unwrap().is_some());

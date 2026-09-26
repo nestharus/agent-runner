@@ -451,10 +451,7 @@ impl StateDb {
                 != std::path::Path::new(&source.handle_dir).join(&source.registration_relative)
             || readback.registration_len() != binding.registration_bytes().len() as u64
             || Some(readback.capability_digest()) != capability_digest.as_deref()
-            || i64::from(readback.issuer().host_pid) != source.registering_caller.pid
-            || readback.issuer().boot_id != source.registering_caller.boot_id
-            || i64::try_from(readback.issuer().starttime_ticks).ok()
-                != Some(source.registering_caller.starttime_ticks)
+            || !readback.registration_actors_match(&source.registering_caller)
             || readback.issuer_json()? != issuer_stamp_json
             || i64::try_from(readback.original_state_device()).ok() != Some(device)
             || i64::try_from(readback.original_state_inode()).ok() != Some(inode)
