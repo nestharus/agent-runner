@@ -50,6 +50,7 @@ pub struct SourceDecisionInspection {
     pub decision_id: String,
     pub root_id: String,
     pub source_generation: String,
+    pub sidecar_generation: String,
     pub owner_generation: String,
     pub owner_invocation_uuid: String,
     pub owner_session_id: String,
@@ -69,6 +70,7 @@ pub(super) struct BrokerReadback {
     root_id: String,
     root_init: PreparedProcessStamp,
     source_generation: String,
+    sidecar_generation: String,
     owner_generation: String,
     owner_uid: u32,
     domain_id: String,
@@ -115,14 +117,44 @@ impl BrokerReadback {
     pub(super) fn source_generation(&self) -> &str {
         &self.source_generation
     }
+    pub(super) fn sidecar_generation(&self) -> &str {
+        &self.sidecar_generation
+    }
     pub(super) fn owner_generation(&self) -> &str {
         &self.owner_generation
     }
     pub(super) fn supervisor_id(&self) -> &str {
         &self.supervisor_id
     }
+    pub(super) fn domain_id(&self) -> &str {
+        &self.domain_id
+    }
+    pub(super) fn owner_invocation_uuid(&self) -> &str {
+        &self.owner_invocation_uuid
+    }
+    pub(super) fn owner_session_id(&self) -> &str {
+        &self.owner_session_id
+    }
+    pub(super) fn handle(&self) -> &str {
+        &self.handle
+    }
+    pub(super) fn caller_admission_id(&self) -> &str {
+        &self.caller_admission_id
+    }
+    pub(super) fn registration_path(&self) -> &Path {
+        &self.registration_path
+    }
+    pub(super) fn registration_len(&self) -> u64 {
+        self.registration_len
+    }
+    pub(super) fn capability_digest(&self) -> &str {
+        &self.capability_digest
+    }
     pub(super) fn issuer_json(&self) -> Result<String, String> {
         serde_json::to_string(&self.issuer).map_err(|e| e.to_string())
+    }
+    pub(super) fn issuer(&self) -> &PreparedProcessStamp {
+        &self.issuer
     }
     pub(super) fn original_state_device(&self) -> u64 {
         self.original_state_device
@@ -238,6 +270,7 @@ pub(super) fn verify_decision_in_transaction(
         || readback.original_state_inode != opened_inode
         || readback.root_id != witness_string(witness, &["owner", "root_id"])?
         || readback.source_generation != witness_string(witness, &["source_generation"])?
+        || readback.sidecar_generation.is_empty()
         || readback.owner_generation != witness_string(witness, &["owner_generation"])?
         || readback.domain_id != source.domain_id
         || readback.domain_id != witness_string(witness, &["owner", "domain_id"])?
@@ -308,6 +341,7 @@ pub(super) fn verify_decision_in_transaction(
         decision_id: readback.decision_id.clone(),
         root_id: readback.root_id.clone(),
         source_generation: readback.source_generation.clone(),
+        sidecar_generation: readback.sidecar_generation.clone(),
         owner_generation: readback.owner_generation.clone(),
         owner_invocation_uuid: readback.owner_invocation_uuid.clone(),
         owner_session_id: readback.owner_session_id.clone(),

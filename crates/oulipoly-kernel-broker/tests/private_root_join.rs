@@ -9742,6 +9742,188 @@ fn inner() {
                     unavailable.is_err_and(|error| error.contains("complete State projection")),
                     "new decision source became selectable"
                 );
+                // Crash after the State writer committed, before any retained
+                // sidecar source/receipt was written. The restarted broker must
+                // recover solely from the immutable State suffix.
+                stop(&mut broker);
+                broker = restart_source_broker(
+                    &socket,
+                    &broker_state,
+                    &runner,
+                    &gate,
+                    &temp.path().join("source-broker-before-projection.log"),
+                );
+                let retained_path = broker_state.join("sidecar/pid-identity.db");
+                let mut retained =
+                    BrokerSidecar::open_existing(&retained_path, &broker_state).unwrap();
+                assert!(
+                    retained
+                        .reserve_source_effect_grant(
+                            &generation,
+                            &prepared.root_id,
+                            &evidence.owner,
+                        )
+                        .is_err(),
+                    "W reserved before exact sidecar projection"
+                );
+                let projected = retained
+                    .repair_bounded_suffix(&generation, &prepared.root_id, &evidence.owner, 0)
+                    .unwrap();
+                assert_eq!(projected.authority_ordinal, 1);
+                drop(retained);
+                stop(&mut broker);
+                broker = restart_source_broker(
+                    &socket,
+                    &broker_state,
+                    &runner,
+                    &gate,
+                    &temp.path().join("source-broker-after-projection.log"),
+                );
+                let mut retained =
+                    BrokerSidecar::open_existing(&retained_path, &broker_state).unwrap();
+                let replay = retained
+                    .repair_bounded_suffix(&generation, &prepared.root_id, &evidence.owner, 0)
+                    .unwrap();
+                assert_eq!(replay, projected, "lost reply replay changed projection");
+                drop(retained);
+                let mut retained =
+                    BrokerSidecar::open_existing(&retained_path, &broker_state).unwrap();
+                let selected = retained
+                    .read_bounded_source_selection(&generation, &prepared.root_id, &evidence.owner)
+                    .unwrap();
+                assert_eq!(
+                    selected.candidate.as_ref().unwrap().registration_id,
+                    source.registration_id
+                );
+                assert!(
+                    retained
+                        .read_bounded_source_selection(
+                            &uuid::Uuid::new_v4().to_string(),
+                            &prepared.root_id,
+                            &evidence.owner,
+                        )
+                        .is_err(),
+                    "wrong source generation selected"
+                );
+                assert!(
+                    retained
+                        .read_bounded_source_selection(
+                            &generation,
+                            &uuid::Uuid::new_v4().to_string(),
+                            &evidence.owner,
+                        )
+                        .is_err(),
+                    "wrong root selected"
+                );
+                let mut wrong_owner = evidence.owner.clone();
+                wrong_owner.owner_generation = uuid::Uuid::new_v4().to_string();
+                assert!(retained.read_bounded_source_selection(
+                    &generation, &prepared.root_id, &wrong_owner,
+                ).is_err(), "wrong owner generation selected");
+                let reserved = retained
+                    .reserve_source_effect_grant(&generation, &prepared.root_id, &evidence.owner)
+                    .unwrap();
+                assert_eq!(reserved.phase, "reserved");
+                let before_mismatch: i64 = db
+                    .query_row(
+                        "SELECT count(*) FROM broker_source_effect_grant",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(before_mismatch, 1);
+                let tamper = rusqlite::Connection::open(&retained_path).unwrap();
+                let immutable_trigger: String = tamper.query_row(
+                    "SELECT sql FROM sqlite_master WHERE name='broker_exact_source_projection_immutable'",
+                    [], |row| row.get(0),
+                ).unwrap();
+                tamper
+                    .execute_batch("DROP TRIGGER broker_exact_source_projection_immutable;")
+                    .unwrap();
+                for (column, wrong) in [
+                    ("root_id", "wrong-root"),
+                    ("source_generation", "wrong-source"),
+                    ("owner_generation", "wrong-owner"),
+                    ("decision_id", "wrong-decision"),
+                    ("issuer_stamp_json", "wrong-issuer"),
+                    ("registration_sha256", "wrong-registration-digest"),
+                ] {
+                    let original: String = tamper
+                        .query_row(
+                            &format!("SELECT {column} FROM broker_exact_source_projection"),
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    tamper
+                        .execute(
+                            &format!("UPDATE broker_exact_source_projection SET {column}=?1"),
+                            [wrong],
+                        )
+                        .unwrap();
+                    assert!(
+                        retained
+                            .read_source_effect_grant(
+                                &generation,
+                                &prepared.root_id,
+                                &evidence.owner,
+                            )
+                            .is_err(),
+                        "{column} mismatch still returned W"
+                    );
+                    tamper
+                        .execute(
+                            &format!("UPDATE broker_exact_source_projection SET {column}=?1"),
+                            [&original],
+                        )
+                        .unwrap();
+                }
+                for column in [
+                    "registration_bytes",
+                    "binding_bytes",
+                    "broker_readback_json",
+                ] {
+                    let original: Vec<u8> = tamper
+                        .query_row(
+                            &format!("SELECT {column} FROM broker_exact_source_projection"),
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    tamper
+                        .execute(
+                            &format!("UPDATE broker_exact_source_projection SET {column}=?1"),
+                            [b"changed bytes".as_slice()],
+                        )
+                        .unwrap();
+                    assert!(
+                        retained
+                            .read_source_effect_grant(
+                                &generation,
+                                &prepared.root_id,
+                                &evidence.owner,
+                            )
+                            .is_err(),
+                        "{column} mismatch still returned W"
+                    );
+                    tamper
+                        .execute(
+                            &format!("UPDATE broker_exact_source_projection SET {column}=?1"),
+                            [&original],
+                        )
+                        .unwrap();
+                }
+                tamper.execute_batch(&immutable_trigger).unwrap();
+                drop(tamper);
+                assert!(
+                    retained
+                        .read_source_effect_grant(&generation, &prepared.root_id, &evidence.owner,)
+                        .unwrap()
+                        .is_some(),
+                    "restored exact receipt lost W"
+                );
+                drop(retained);
+                fs::write(gate.join("source-projection-done"), b"yes").unwrap();
                 let immutable = rusqlite::Connection::open(&original_state).unwrap();
                 assert!(immutable.execute(
                     "UPDATE invocation_completion_exact_source_decisions SET root_id='changed'",
@@ -9758,6 +9940,59 @@ fn inner() {
                 assert_eq!(
                     fs::read(data.join("pid-identity.db")).unwrap(),
                     b"retired copied owner"
+                );
+                // Simulate an externally corrupted State attribution while the
+                // sidecar receipt and source remain. The selector must reject
+                // this sidecar-only source even though its continuity matches.
+                let decision_trigger: String = immutable.query_row(
+                    "SELECT sql FROM sqlite_master WHERE name='invocation_completion_exact_source_decisions_no_delete'",
+                    [], |row| row.get(0),
+                ).unwrap();
+                immutable
+                    .execute_batch(
+                        "DROP TRIGGER invocation_completion_exact_source_decisions_no_delete;",
+                    )
+                    .unwrap();
+                immutable
+                    .execute(
+                        "DELETE FROM invocation_completion_exact_source_decisions",
+                        [],
+                    )
+                    .unwrap();
+                immutable.execute_batch(&decision_trigger).unwrap();
+                drop(immutable);
+                let retained = BrokerSidecar::open_existing(&retained_path, &broker_state).unwrap();
+                assert!(
+                    retained
+                        .read_source_effect_grant(&generation, &prepared.root_id, &evidence.owner,)
+                        .is_err(),
+                    "orphan sidecar receipt still returned W"
+                );
+                drop(retained);
+                let orphan_state = rusqlite::Connection::open(&original_state).unwrap();
+                orphan_state
+                    .execute_batch("PRAGMA foreign_keys=OFF;")
+                    .unwrap();
+                let obligation_trigger: String = orphan_state.query_row(
+                    "SELECT sql FROM sqlite_master WHERE name='trg_invocation_completion_obligations_append_only_delete'",
+                    [], |row| row.get(0),
+                ).unwrap();
+                orphan_state
+                    .execute_batch(
+                        "DROP TRIGGER trg_invocation_completion_obligations_append_only_delete;",
+                    )
+                    .unwrap();
+                orphan_state
+                    .execute("DELETE FROM invocation_completion_obligations", [])
+                    .unwrap();
+                orphan_state.execute_batch(&obligation_trigger).unwrap();
+                drop(orphan_state);
+                let retained = BrokerSidecar::open_existing(&retained_path, &broker_state).unwrap();
+                assert!(
+                    retained
+                        .read_source_effect_grant(&generation, &prepared.root_id, &evidence.owner,)
+                        .is_err(),
+                    "sidecar-only source still returned W"
                 );
                 stop(&mut broker);
                 fs::remove_file(gate.join("source-clock-offset")).unwrap();

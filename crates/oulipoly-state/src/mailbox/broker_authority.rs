@@ -3,6 +3,7 @@
 //! is initialized separately by `fresh_lane` and never uses this copy path.
 use super::*;
 use crate::StateDb;
+use crate::db::ExactSourceProjection;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Component;
@@ -622,6 +623,212 @@ pub struct BrokerNativeGrantReadback {
 }
 
 impl BrokerSidecar {
+    pub fn retained_mailbox_generation(&self) -> Result<String, String> {
+        self.check_mailbox_read(&self.source_generation)?;
+        self.mailbox.sidecar_generation()
+    }
+
+    fn verify_exact_source_owner(
+        &self,
+        exact: &ExactSourceProjection,
+        root_id: &str,
+        owner: &CompletionDomainOwner,
+    ) -> Result<(), String> {
+        if exact.source_generation != self.source_generation
+            || exact.root_id != root_id
+            || exact.owner_generation != owner.owner_generation
+            || exact.supervisor_id != owner.supervisor_authority_id
+            || exact.binding.registration()?.domain_id != owner.domain_id
+        {
+            return Err("exact source root/generation/owner conflict".into());
+        }
+        let release = self.read_exact_release(
+            &exact.source_generation,
+            &exact.root_id,
+            &exact.owner_generation,
+        )?;
+        if release.owner != *owner {
+            return Err("exact source prepared/released owner changed".into());
+        }
+        let claims: serde_json::Value =
+            serde_json::from_slice(&exact.readback_json).map_err(|e| e.to_string())?;
+        let witness = |stamp: &PreparedProcessStamp| {
+            serde_json::json!({
+                "host_pid": stamp.host_pid, "boot_id": stamp.boot_id,
+                "starttime_ticks": stamp.starttime_ticks,
+            })
+        };
+        if claims["root_init"]
+            != serde_json::to_value(&release.prepared.root_init).map_err(|e| e.to_string())?
+            || claims["sidecar_generation"] != self.mailbox.sidecar_generation()?
+            || exact.continuity.sidecar_generation != self.mailbox.sidecar_generation()?
+            || claims["guardian"] != witness(&release.prepared.guardian)
+            || claims["driver"] != witness(&release.prepared.driver)
+            || claims["domain_id"] != owner.domain_id
+            || claims["owner_invocation_uuid"]
+                != exact.binding.registration()?.owner_invocation_uuid
+            || claims["owner_session_id"] != exact.binding.registration()?.owner_session_id
+        {
+            return Err("exact source decision/prepared incarnation conflict".into());
+        }
+        for stamp in [
+            &release.prepared.root_init,
+            &release.prepared.guardian,
+            &release.prepared.driver,
+        ] {
+            let expected = crate::pid_identity::ProcessIdentity {
+                os_pid: i64::from(stamp.host_pid),
+                os_boot_id: stamp.boot_id.clone(),
+                os_pid_starttime_ticks: i64::try_from(stamp.starttime_ticks)
+                    .map_err(|e| e.to_string())?,
+            };
+            if crate::pid_identity::read_live_process_identity(expected.os_pid)? != Some(expected) {
+                return Err("exact source prepared/released owner is not live".into());
+            }
+        }
+        Ok(())
+    }
+
+    fn exact_source_receipt_matches(&self, exact: &ExactSourceProjection) -> Result<bool, String> {
+        let row: Option<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+            i64,
+        )> = self
+            .mailbox
+            .conn
+            .query_row(
+                "SELECT admission_id,request_id,decision_id,root_id,source_generation,
+                 owner_generation,supervisor_id,issuer_stamp_json,registration_sha256,
+                 registration_bytes,binding_bytes,broker_readback_json,authority_ordinal
+                 FROM broker_exact_source_projection WHERE registration_id=?1",
+                [&exact.registration_id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                        r.get(9)?,
+                        r.get(10)?,
+                        r.get(11)?,
+                        r.get(12)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        if row.0 != exact.admission_id
+            || row.1 != exact.request_id
+            || row.2 != exact.decision_id
+            || row.3 != exact.root_id
+            || row.4 != exact.source_generation
+            || row.5 != exact.owner_generation
+            || row.6 != exact.supervisor_id
+            || row.7 != exact.issuer_stamp_json
+            || row.8 != exact.registration_sha256
+            || row.9 != exact.binding.registration_bytes()
+            || row.10 != exact.binding.encoded()?
+            || row.11 != exact.readback_json
+            || row.12 != exact.continuity.authority_ordinal
+        {
+            return Err("exact source retained receipt/State mismatch".into());
+        }
+        if !self
+            .mailbox
+            .exact_source_materialization_matches(&exact.binding)?
+        {
+            return Err("exact source retained registration projection mismatch".into());
+        }
+        Ok(true)
+    }
+
+    fn project_next_exact_source(
+        &mut self,
+        state: &StateDb,
+        root_id: &str,
+        owner: &CompletionDomainOwner,
+        expected_ordinal: i64,
+    ) -> Result<bool, String> {
+        let head = self.mailbox.completion_continuity_head()?;
+        let current = head.as_ref().map_or(0, |h| h.authority_ordinal);
+        if current != expected_ordinal {
+            // A committed sidecar with a lost response is reconciled by its
+            // exact State decision, receipt, and materialization readback.
+            if expected_ordinal >= 0 && current == expected_ordinal + 1 {
+                if let Some(exact) = state.exact_source_projection_at(current)? {
+                    self.verify_exact_source_owner(&exact, root_id, owner)?;
+                    if self.exact_source_receipt_matches(&exact)? {
+                        return Ok(true);
+                    }
+                }
+            }
+            return Err("broker exact projection cursor changed".into());
+        }
+        state.completion_repair_has_suffix(head.as_ref())?;
+        let Some(exact) = state.exact_source_projection_at(current + 1)? else {
+            return Ok(false);
+        };
+        self.verify_exact_source_owner(&exact, root_id, owner)?;
+        if exact.continuity.previous_continuity_digest
+            != head
+                .as_ref()
+                .map_or(super::COMPLETION_CONTINUITY_GENESIS_DIGEST, |h| {
+                    h.continuity_digest.as_str()
+                })
+        {
+            return Err("exact source continuity predecessor changed".into());
+        }
+        let source = exact.binding.registration()?;
+        let paths = source.paths();
+        let listener = exact.binding.admission_listener()?;
+        let input = CompletionEventRegistrationInput {
+            event_id: &source.handle,
+            delivery_mode: &source.delivery_mode,
+            owner_session_id: Some(&listener.session_id),
+            owner_invocation_uuid: Some(&listener.owner_invocation_uuid),
+            state_dir: &source.handle_dir,
+            meta_path: &paths[0],
+            log_path: &paths[1],
+            rc_path: &paths[2],
+        };
+        exact
+            .binding
+            .validate_input(exact.binding.caller_admission_id(), &input)?;
+        let fence = self.mailbox.begin_completion_authority_fence()?;
+        if fence.sidecar_generation()? != exact.continuity.sidecar_generation
+            || fence.completion_continuity_head()?.as_ref() != head.as_ref()
+        {
+            return Err("exact source retained generation/cursor changed".into());
+        }
+        fence.preflight_continuation_binding(&exact.binding, true)?;
+        fence.require_continuation_binding(&source.handle, true)?;
+        fence.preflight_completion_event_registration(&input)?;
+        fence.register_exact_source_projection(input, &exact)?;
+        if !self.exact_source_receipt_matches(&exact)? {
+            return Err("exact source projection commit readback absent".into());
+        }
+        Ok(true)
+    }
+
     /// Read the source-effect grants on this retained connection for one
     /// broker-persisted root/PID1 incarnation. The caller must first check the
     /// exact RootRecord and admission fence. This is only a positive blocker;
@@ -786,10 +993,24 @@ impl BrokerSidecar {
                 if source.domain_id != owner.domain_id {
                     return Err("broker selected source domain conflict".into());
                 }
-                if state.exact_source_projection_unavailable(&source.registration_id)? {
-                    return Err(
-                        "exact source decision projection unavailable for source selection".into(),
-                    );
+                if state.admitted_completion_continuation(&binding)?.as_ref() != Some(&binding) {
+                    return Err("broker selected sidecar-only source lacks State admission".into());
+                }
+                if let Some(exact) = state.exact_source_projection_for_registration(&source.registration_id)? {
+                    self.verify_exact_source_owner(&exact, root_id, owner)?;
+                    if !self.exact_source_receipt_matches(&exact)?
+                        || exact.binding.encoded()? != binding.encoded()?
+                    {
+                        return Err("exact source decision projection unavailable for source selection".into());
+                    }
+                } else {
+                    let orphan: bool = self.mailbox.conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM broker_exact_source_projection WHERE registration_id=?1)",
+                        [&source.registration_id], |r| r.get(0)
+                    ).map_err(|e| e.to_string())?;
+                    if orphan || state.exact_source_projection_unavailable(&source.registration_id)? {
+                        return Err("orphan or unavailable exact source projection".into());
+                    }
                 }
                 Ok(BrokerSourceCandidate {
                     registration_id: source.registration_id,
@@ -1488,6 +1709,10 @@ impl BrokerSidecar {
     ) -> Result<BrokerRepairReadback, String> {
         self.check_mailbox_read(source_generation)?;
         let mut state = self.bound_state()?;
+        if self.project_next_exact_source(&state, root_id, owner, expected_ordinal)? {
+            let readback = self.read_bounded_repair(source_generation, root_id, owner)?;
+            return Ok(readback);
+        }
         let (authority_ordinal, has_more, pending_registration_ids) = state
             .repair_pending_domain_completion_continuations_on(
                 &mut self.mailbox,
@@ -2988,10 +3213,30 @@ fn require_host_root() -> Result<(), String> {
 fn open_with_owner(path: &Path, owner: u32, anchor: &Path) -> Result<BrokerSidecar, String> {
     check_storage(path, owner, anchor)?;
     let authority = MailboxAuthorityFence::acquire(path).map_err(|e| e.to_string())?;
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+    let mut conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
         .map_err(|error| format!("Failed to open broker sidecar: {error}"))?;
     authority.validate_opened_target()?;
     configure_writable_sidecar_connection(&conn)?;
+    if schema::sidecar_version(&conn)? == 32 {
+        schema::validate_broker_owned(&conn)?;
+        // Serialize a v32 upgrade on the retained connection. A second opener
+        // sees the committed v33 shape and does not repeat the DDL.
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        if schema::sidecar_version(&tx)? == 32 {
+            for definition in [
+                schema::BROKER_EXACT_SOURCE_PROJECTION_SCHEMA,
+                schema::BROKER_EXACT_SOURCE_PROJECTION_IMMUTABLE,
+                schema::BROKER_EXACT_SOURCE_PROJECTION_RETAIN,
+            ] {
+                tx.execute_batch(definition).map_err(|e| e.to_string())?;
+            }
+            tx.pragma_update(None, "user_version", schema::BROKER_OWNED_VERSION)
+                .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+    }
     let generation = schema::validate_broker_owned(&conn)?;
     super::broker_payload_custody::check_manifest_marker(path, owner)?;
     let mode: String = conn
@@ -3057,6 +3302,9 @@ pub(super) fn activate_with_owner(
         schema::BROKER_PREPARED_OWNER_RETAIN,
         schema::BROKER_OWNER_RELEASE_SCHEMA,
         schema::BROKER_SOURCE_EFFECT_GRANT_SCHEMA,
+        schema::BROKER_EXACT_SOURCE_PROJECTION_SCHEMA,
+        schema::BROKER_EXACT_SOURCE_PROJECTION_IMMUTABLE,
+        schema::BROKER_EXACT_SOURCE_PROJECTION_RETAIN,
         schema::BROKER_SOURCE_EVIDENCE_SCHEMA,
         schema::BROKER_FRESH_SOURCE_ADMISSION_SCHEMA,
         schema::BROKER_SOURCE_EVIDENCE_UPDATE_GUARD,
@@ -4374,6 +4622,44 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         symlink(&other, path_with_storage_suffix(&path, "-wal")).unwrap();
         assert!(check_storage(&path, uid, root.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_v32_upgrade_adds_exact_projection_without_losing_wal() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("sidecar");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join("pid-identity.db");
+        drop(MailboxDb::open(&path).unwrap());
+        for artifact in [path.clone(), mailbox_authority_path(&path)] {
+            fs::set_permissions(artifact, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let uid = unsafe { libc::geteuid() };
+        let generation = activate_with_owner(&path, uid, root.path()).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "PRAGMA wal_autocheckpoint=0;
+             DROP TRIGGER broker_exact_source_projection_immutable;
+             DROP TRIGGER broker_exact_source_projection_retain;
+             DROP TABLE broker_exact_source_projection;
+             CREATE TABLE retained_v32_wal(value TEXT NOT NULL);
+             INSERT INTO retained_v32_wal VALUES('committed');
+             PRAGMA user_version=32;",
+        )
+        .unwrap();
+        assert_eq!(schema::sidecar_version(&conn).unwrap(), 32);
+        let upgraded = open_with_owner(&path, uid, root.path()).unwrap();
+        assert_eq!(upgraded.source_generation(), generation);
+        assert_eq!(schema::sidecar_version(&upgraded.mailbox.conn).unwrap(), 33);
+        let value: String = upgraded
+            .mailbox
+            .conn
+            .query_row("SELECT value FROM retained_v32_wal", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(value, "committed");
+        schema::validate_broker_owned(&upgraded.mailbox.conn).unwrap();
     }
 
     #[cfg(unix)]

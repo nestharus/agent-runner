@@ -132,6 +132,7 @@ mod opening_write;
 mod owned_turn_event_read;
 mod owned_turn_event_write;
 mod ownership_authority;
+pub(crate) use ownership_authority::ExactSourceProjection;
 mod provider_launch_lifecycle;
 mod provider_launch_publication;
 mod provider_quota_reads;

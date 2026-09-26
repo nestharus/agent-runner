@@ -202,11 +202,12 @@ impl StateDb {
             return Err("broker repair requires current StateDb schema".into());
         }
         crate::completion_continuation::validate_admission_schema(&conn)?;
+        let completion_authority_state = Self::durable_completion_authority_path(&source, &source);
         Ok(Self {
             retained_launch_owners: Default::default(),
             conn,
             db_path: source,
-            completion_authority_state: None,
+            completion_authority_state,
             lifecycle_sink: Mutex::new(Box::new(NoopLifecycleEventSink)),
             access_scope: crate::live_history::AccessScope::live(
                 "state.broker_repair.live",

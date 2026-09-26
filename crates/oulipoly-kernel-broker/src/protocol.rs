@@ -2127,6 +2127,7 @@ pub struct ExactSourceDecisionReadback {
     pub root_id: String,
     pub root_init: oulipoly_state::mailbox::PreparedProcessStamp,
     pub source_generation: String,
+    pub sidecar_generation: String,
     pub owner_generation: String,
     pub owner_uid: u32,
     pub domain_id: String,

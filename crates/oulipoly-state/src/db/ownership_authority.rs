@@ -295,6 +295,189 @@ impl fmt::Display for OwnershipAuthorityError {
 impl std::error::Error for OwnershipAuthorityError {}
 
 impl StateDb {
+    pub(crate) fn exact_source_projection_for_registration(
+        &self,
+        registration_id: &str,
+    ) -> Result<Option<ExactSourceProjection>, String> {
+        let ordinal: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT c.authority_ordinal FROM invocation_completion_exact_source_decisions d
+             JOIN invocation_completion_continuity c ON c.admission_id=d.admission_id
+             WHERE d.registration_id=?1",
+                [registration_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        ordinal
+            .map(|ordinal| self.exact_source_projection_at(ordinal))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    /// One immutable State obligation, its decision and its append-only cursor.
+    /// This is read from the broker-bound original State file, never from a
+    /// caller-supplied registration or a copied sidecar row.
+    pub(crate) fn exact_source_projection_at(
+        &self,
+        ordinal: i64,
+    ) -> Result<Option<ExactSourceProjection>, String> {
+        let row: Option<(
+            String,
+            Vec<u8>,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            i64,
+            i64,
+            Vec<u8>,
+        )> = self
+            .conn
+            .query_row(
+                "SELECT o.admission_id,o.completion_v2_binding,d.request_id,d.decision_id,
+                    d.registration_id,d.registration_sha256,d.root_id,d.source_generation,
+                    d.owner_generation,d.supervisor_id,d.issuer_stamp_json,
+                    d.original_state_device,d.original_state_inode,d.broker_readback_json
+             FROM invocation_completion_continuity c
+             JOIN invocation_completion_obligations o ON o.admission_id=c.admission_id
+             JOIN invocation_completion_exact_source_decisions d ON d.admission_id=o.admission_id
+             WHERE c.authority_ordinal=?1 AND d.projection_state='unavailable'",
+                [ordinal],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                        r.get(9)?,
+                        r.get(10)?,
+                        r.get(11)?,
+                        r.get(12)?,
+                        r.get(13)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some((
+            admission_id,
+            bytes,
+            request_id,
+            decision_id,
+            registration_id,
+            registration_sha256,
+            root_id,
+            source_generation,
+            owner_generation,
+            supervisor_id,
+            issuer_stamp_json,
+            device,
+            inode,
+            readback_json,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        let opened = self
+            .completion_authority_state
+            .as_ref()
+            .ok_or("exact source projection requires opened original State")?;
+        if self.completion_authority_state_path().is_none()
+            || i64::try_from(opened.file.volume).ok() != Some(device)
+            || i64::try_from(opened.file.file).ok() != Some(inode)
+        {
+            return Err("exact source projection original State identity changed".into());
+        }
+        let binding = AdmittedSourceBinding::decode(&bytes)?;
+        let source = binding.registration()?;
+        let continuity = completion_continuity_by_admission_on(&self.conn, &admission_id)
+            .map_err(|e| e.to_string())?
+            .ok_or("exact source projection continuity absent")?;
+        let obligation: (String, String, String, String) = self
+            .conn
+            .query_row(
+                "SELECT event_id,owner_invocation_uuid,owner_session_id,expected_sidecar_generation
+             FROM invocation_completion_obligations WHERE admission_id=?1",
+                [&admission_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .map_err(|e| e.to_string())?;
+        let readback: super::exact_source_decision::BrokerReadback =
+            serde_json::from_slice(&readback_json).map_err(|e| e.to_string())?;
+        let capability_digest: Option<String> = self.conn.query_row(
+            "SELECT completion_registration_capability_digest FROM invocations WHERE invocation_uuid=?1",
+            [&source.owner_invocation_uuid], |r| r.get(0)
+        ).map_err(|e| e.to_string())?;
+        if binding.is_late_listener()
+            || source.registration_id != registration_id
+            || format!("{:x}", Sha256::digest(binding.registration_bytes())) != registration_sha256
+            || source.handle != obligation.0
+            || source.owner_invocation_uuid != obligation.1
+            || source.owner_session_id != obligation.2
+            || obligation.3 != readback.sidecar_generation()
+            || continuity.sidecar_generation != readback.sidecar_generation()
+            || continuity.admission_id != admission_id
+            || continuity.authority_ordinal != ordinal
+            || continuity.invocation_uuid != source.owner_invocation_uuid
+            || continuity.event_id != source.handle
+            || continuity.owner_invocation_uuid != source.owner_invocation_uuid
+            || continuity.owner_session_id != source.owner_session_id
+            || readback.request_id() != request_id
+            || readback.decision_id() != decision_id
+            || readback.registration_id() != registration_id
+            || readback.registration_sha256() != registration_sha256
+            || readback.root_id() != root_id
+            || readback.source_generation() != source_generation
+            || readback.owner_generation() != owner_generation
+            || readback.supervisor_id() != supervisor_id
+            || readback.domain_id() != source.domain_id
+            || readback.owner_invocation_uuid() != source.owner_invocation_uuid
+            || readback.owner_session_id() != source.owner_session_id
+            || readback.handle() != source.handle
+            || readback.caller_admission_id() != binding.caller_admission_id()
+            || readback.registration_path()
+                != std::path::Path::new(&source.handle_dir).join(&source.registration_relative)
+            || readback.registration_len() != binding.registration_bytes().len() as u64
+            || Some(readback.capability_digest()) != capability_digest.as_deref()
+            || i64::from(readback.issuer().host_pid) != source.registering_caller.pid
+            || readback.issuer().boot_id != source.registering_caller.boot_id
+            || i64::try_from(readback.issuer().starttime_ticks).ok()
+                != Some(source.registering_caller.starttime_ticks)
+            || readback.issuer_json()? != issuer_stamp_json
+            || i64::try_from(readback.original_state_device()).ok() != Some(device)
+            || i64::try_from(readback.original_state_inode()).ok() != Some(inode)
+        {
+            return Err("exact source projection State attribution conflict".into());
+        }
+        Ok(Some(ExactSourceProjection {
+            admission_id,
+            binding,
+            continuity,
+            request_id,
+            decision_id,
+            registration_id,
+            registration_sha256,
+            root_id,
+            source_generation,
+            owner_generation,
+            supervisor_id,
+            issuer_stamp_json,
+            readback_json,
+        }))
+    }
+
     pub(crate) fn exact_source_projection_unavailable(
         &self,
         registration_id: &str,
@@ -469,12 +652,10 @@ impl StateDb {
             &source_path,
             &canonical_path,
         )?;
-        // The broker owns the v30 sidecar. Its historical user-sidecar file
-        // may be an invalid retired copy, and no projection is committed here.
-        let generation = format!(
-            "unprojected-broker-source-decision:{}",
-            verified.readback.source_generation(),
-        );
+        // The real generation is needed by the append-only continuity chain.
+        // The immutable decision row remains unavailable until the broker's
+        // retained sidecar commits and reads back its exact projection.
+        let generation = verified.readback.sidecar_generation().to_owned();
         let state_head = completion_continuity_head_on(&tx).map_err(|e| e.to_string())?;
         let owner_authorization = completion_owner_authorization(
             &tx,
@@ -1745,6 +1926,22 @@ impl StateDb {
             None => OwnerLineageRelationship::OutsideRecursiveLineage,
         })
     }
+}
+
+pub(crate) struct ExactSourceProjection {
+    pub admission_id: String,
+    pub binding: AdmittedSourceBinding,
+    pub continuity: CompletionContinuityHead,
+    pub request_id: String,
+    pub decision_id: String,
+    pub registration_id: String,
+    pub registration_sha256: String,
+    pub root_id: String,
+    pub source_generation: String,
+    pub owner_generation: String,
+    pub supervisor_id: String,
+    pub issuer_stamp_json: String,
+    pub readback_json: Vec<u8>,
 }
 
 fn decode_admitted_completion_row(

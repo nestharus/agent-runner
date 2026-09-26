@@ -1251,6 +1251,7 @@ fn private_v30_source_witness(
     }
     std::fs::write(gate_dir.join("source-state-admission-done"), b"yes")
         .map_err(|e| e.to_string())?;
+    wait_for("source-projection-done")?;
     Ok(())
 }
 

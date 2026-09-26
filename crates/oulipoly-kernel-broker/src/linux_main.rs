@@ -2180,6 +2180,9 @@ fn verify_exact_source_witness(
         root_id: probe.owner.root_id,
         root_init: prepared.root_init.clone(),
         source_generation: probe.source_generation,
+        sidecar_generation: sidecar
+            .retained_mailbox_generation()
+            .map_err(io::Error::other)?,
         owner_generation: probe.owner_generation,
         owner_uid: prepared.owner_uid,
         domain_id: source.domain_id,

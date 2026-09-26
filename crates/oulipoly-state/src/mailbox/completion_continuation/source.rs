@@ -545,6 +545,17 @@ impl MailboxDb {
         projection_matches_on(&tx, binding)
     }
 
+    pub(crate) fn exact_source_materialization_matches(
+        &self,
+        binding: &AdmittedSourceBinding,
+    ) -> Result<bool, String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
+        projection_matches_on(&tx, binding)
+    }
+
     pub fn completion_continuation_acceptance(
         &self,
         registration_id: &str,

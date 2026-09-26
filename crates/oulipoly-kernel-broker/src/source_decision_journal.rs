@@ -50,6 +50,7 @@ pub struct Claims {
     pub root_id: String,
     pub root_init: PreparedProcessStamp,
     pub source_generation: String,
+    pub sidecar_generation: String,
     pub owner_generation: String,
     pub owner_uid: u32,
     pub domain_id: String,
@@ -249,7 +250,7 @@ impl Journal {
             }
             journal
                 .connection
-                .pragma_update(None, "user_version", 2)
+                .pragma_update(None, "user_version", 3)
                 .map_err(|e| error(e.to_string()))?;
             journal
                 .connection
@@ -321,9 +322,9 @@ impl Journal {
             .connection
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .map_err(|e| error(e.to_string()))?;
-        // v1 rows predate original State file identity. They cannot be
-        // migrated without guessing an inode, so refuse the whole artifact.
-        if version != 2 {
+        // Earlier rows lack either original State identity or the distinct
+        // retained mailbox generation. Neither can be inferred from a copy.
+        if version != 3 {
             return Err(error("exact source journal schema version mismatch"));
         }
         let application_id: i64 = self
@@ -472,6 +473,7 @@ fn readback(
         root_id: claims.root_id.clone(),
         root_init: claims.root_init.clone(),
         source_generation: claims.source_generation.clone(),
+        sidecar_generation: claims.sidecar_generation.clone(),
         owner_generation: claims.owner_generation.clone(),
         owner_uid: claims.owner_uid,
         domain_id: claims.domain_id.clone(),
@@ -511,6 +513,7 @@ mod tests {
             root_id: "root".into(),
             root_init: stamp,
             source_generation: "source".into(),
+            sidecar_generation: "sidecar".into(),
             owner_generation: "owner".into(),
             owner_uid: 0,
             domain_id: "domain".into(),

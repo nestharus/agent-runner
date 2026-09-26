@@ -1415,7 +1415,21 @@ impl CompletionAuthorityFence<'_> {
         continuity: &CompletionContinuityHead,
         binding: &crate::completion_continuation::AdmittedSourceBinding,
     ) -> Result<CompletionEventRegistrationResult, String> {
-        self.register_completion_event_inner(input, continuity, Some(binding), None)
+        self.register_completion_event_inner(input, continuity, Some(binding), None, None)
+    }
+
+    pub(crate) fn register_exact_source_projection(
+        self,
+        input: CompletionEventRegistrationInput<'_>,
+        projection: &crate::db::ExactSourceProjection,
+    ) -> Result<CompletionEventRegistrationResult, String> {
+        self.register_completion_event_inner(
+            input,
+            &projection.continuity,
+            Some(&projection.binding),
+            Some(projection),
+            None,
+        )
     }
 
     pub(crate) fn sidecar_generation(&self) -> Result<String, String> {
@@ -1449,7 +1463,7 @@ impl CompletionAuthorityFence<'_> {
         binding: Option<&crate::completion_continuation::AdmittedSourceBinding>,
         phases: &mut TransactionPhaseGuard<'_>,
     ) -> Result<CompletionEventRegistrationResult, String> {
-        self.register_completion_event_inner(input, continuity, binding, Some(phases))
+        self.register_completion_event_inner(input, continuity, binding, None, Some(phases))
     }
 
     fn register_completion_event_inner(
@@ -1457,6 +1471,7 @@ impl CompletionAuthorityFence<'_> {
         input: CompletionEventRegistrationInput<'_>,
         continuity: &CompletionContinuityHead,
         binding: Option<&crate::completion_continuation::AdmittedSourceBinding>,
+        exact: Option<&crate::db::ExactSourceProjection>,
         mut phases: Option<&mut TransactionPhaseGuard<'_>>,
     ) -> Result<CompletionEventRegistrationResult, String> {
         let inserted = register_completion_event_on(&self.tx, &input, &now_rfc3339())?;
@@ -1472,6 +1487,38 @@ impl CompletionAuthorityFence<'_> {
             )?;
         }
         append_completion_continuity_on(&self.tx, continuity)?;
+        if let Some(exact) = exact {
+            if exact.continuity != *continuity
+                || input.event_id != exact.binding.registration()?.handle
+            {
+                return Err("exact source projection receipt input conflict".into());
+            }
+            self.tx
+                .execute(
+                    "INSERT INTO broker_exact_source_projection (
+                 registration_id,admission_id,request_id,decision_id,root_id,
+                 source_generation,owner_generation,supervisor_id,issuer_stamp_json,
+                 registration_sha256,registration_bytes,binding_bytes,broker_readback_json,
+                 authority_ordinal) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                    params![
+                        exact.registration_id,
+                        exact.admission_id,
+                        exact.request_id,
+                        exact.decision_id,
+                        exact.root_id,
+                        exact.source_generation,
+                        exact.owner_generation,
+                        exact.supervisor_id,
+                        exact.issuer_stamp_json,
+                        exact.registration_sha256,
+                        exact.binding.registration_bytes(),
+                        exact.binding.encoded()?,
+                        exact.readback_json,
+                        exact.continuity.authority_ordinal
+                    ],
+                )
+                .map_err(|e| format!("exact source projection receipt conflict: {e}"))?;
+        }
         let result = completion_event_registration_on(&self.tx, input.event_id, inserted)?;
         if let Some(phases) = phases.as_mut() {
             phases.commit_started();

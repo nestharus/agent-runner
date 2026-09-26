@@ -318,7 +318,7 @@ fn classify_completion_summary(summary: CompletionProtocolSummary) -> Option<&'s
 // v30 was assigned to the broker-owned sidecar. Keep that ordinal reserved so
 // an ordinary opener can never mistake an old broker cutover for an upgrade.
 pub(super) const CURRENT_VERSION: i64 = 31;
-pub(super) const BROKER_OWNED_VERSION: i64 = 32;
+pub(super) const BROKER_OWNED_VERSION: i64 = 33;
 const MAX_SUPPORTED_VERSION: i64 = CURRENT_VERSION;
 const SCHEMA_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -754,12 +754,16 @@ pub(super) fn validate_broker_owned(conn: &Connection) -> Result<String, String>
     if version == 30 {
         return Err("persisted broker-owned v30 sidecar requires separate disposition; in-place migration is unsupported".into());
     }
-    if version != BROKER_OWNED_VERSION {
+    if version != 32 && version != BROKER_OWNED_VERSION {
         return Err(format!(
             "broker sidecar requires schema version {BROKER_OWNED_VERSION}"
         ));
     }
-    super::completion_continuation::validate_broker_schema_on(&tx)?;
+    if version == 32 {
+        super::completion_continuation::validate_broker_v32_schema_on(&tx)?;
+    } else {
+        super::completion_continuation::validate_broker_schema_on(&tx)?;
+    }
     let definition: String = tx
         .query_row(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='broker_sidecar_authority'",
@@ -809,6 +813,33 @@ pub(super) fn validate_broker_owned(conn: &Connection) -> Result<String, String>
         .map_err(|error| format!("broker source grant schema missing: {error}"))?;
     if grant_definition != BROKER_SOURCE_EFFECT_GRANT_SCHEMA {
         return Err("broker source grant schema changed".into());
+    }
+    if version == BROKER_OWNED_VERSION {
+        for (name, expected) in [
+            (
+                "broker_exact_source_projection",
+                BROKER_EXACT_SOURCE_PROJECTION_SCHEMA,
+            ),
+            (
+                "broker_exact_source_projection_immutable",
+                BROKER_EXACT_SOURCE_PROJECTION_IMMUTABLE,
+            ),
+            (
+                "broker_exact_source_projection_retain",
+                BROKER_EXACT_SOURCE_PROJECTION_RETAIN,
+            ),
+        ] {
+            let actual: String = tx
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE name=?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("broker exact projection schema missing: {e}"))?;
+            if actual != expected {
+                return Err("broker exact projection schema changed".into());
+            }
+        }
     }
     for (name, expected) in [
         ("broker_source_evidence", BROKER_SOURCE_EVIDENCE_SCHEMA),
@@ -976,6 +1007,35 @@ pub(super) const BROKER_SOURCE_EFFECT_GRANT_SCHEMA: &str =
     phase TEXT NOT NULL CHECK(phase IN ('reserved','consumed','unknown')),
     revision INTEGER NOT NULL CHECK(revision>=1)
 )";
+
+/// This row is a projection receipt, never independent source authority. The
+/// selector compares every field with the original State decision and current
+/// prepared/released owner before W can reserve.
+pub(super) const BROKER_EXACT_SOURCE_PROJECTION_SCHEMA: &str =
+    "CREATE TABLE broker_exact_source_projection (
+    registration_id TEXT PRIMARY KEY,
+    admission_id TEXT NOT NULL UNIQUE,
+    request_id TEXT NOT NULL UNIQUE,
+    decision_id TEXT NOT NULL UNIQUE,
+    root_id TEXT NOT NULL,
+    source_generation TEXT NOT NULL,
+    owner_generation TEXT NOT NULL,
+    supervisor_id TEXT NOT NULL,
+    issuer_stamp_json TEXT NOT NULL,
+    registration_sha256 TEXT NOT NULL,
+    registration_bytes BLOB NOT NULL,
+    binding_bytes BLOB NOT NULL,
+    broker_readback_json BLOB NOT NULL,
+    authority_ordinal INTEGER NOT NULL UNIQUE
+)";
+pub(super) const BROKER_EXACT_SOURCE_PROJECTION_IMMUTABLE: &str =
+    "CREATE TRIGGER broker_exact_source_projection_immutable
+BEFORE UPDATE ON broker_exact_source_projection
+BEGIN SELECT RAISE(ABORT,'exact source projection immutable'); END";
+pub(super) const BROKER_EXACT_SOURCE_PROJECTION_RETAIN: &str =
+    "CREATE TRIGGER broker_exact_source_projection_retain
+BEFORE DELETE ON broker_exact_source_projection
+BEGIN SELECT RAISE(ABORT,'exact source projection retained'); END";
 
 // An evidence row remains debt until an exact fresh-lane source admission is
 // present. This branch deliberately has no writer for that provenance table:

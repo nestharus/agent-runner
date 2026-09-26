@@ -631,6 +631,10 @@ pub(super) fn validate_broker_schema_on(conn: &Connection) -> Result<(), String>
     validate_schema_version_on(conn, super::schema::BROKER_OWNED_VERSION, true)
 }
 
+pub(super) fn validate_broker_v32_schema_on(conn: &Connection) -> Result<(), String> {
+    validate_schema_version_on(conn, 32, true)
+}
+
 // Historical v29 sources are still read for staged cutover. Their fingerprint
 // must not move when the ordinary current schema advances.
 pub(super) fn validate_v29_schema_on(conn: &Connection) -> Result<(), String> {
