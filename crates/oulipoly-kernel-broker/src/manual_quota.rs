@@ -1835,6 +1835,7 @@ mod tests {
                     image,
                     None,
                     None,
+                    std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
                 )
                 .unwrap();
             });
@@ -2002,6 +2003,7 @@ mod tests {
                 image,
                 None,
                 None,
+                std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             )
             .unwrap();
         });

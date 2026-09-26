@@ -15,6 +15,7 @@ const BROKER_RESPONSE_READ_BYTES: u64 = 257;
 const FRESH_ROUTE_REPLY_READ_BYTES: u64 = 4097;
 
 use crate::installed_launch::InstalledLaunchSpec;
+use crate::registry::RootRecord;
 use std::io::{self, Read, Write};
 #[cfg(feature = "age319-private-broker-fixture")]
 use std::os::fd::FromRawFd;
@@ -24,6 +25,36 @@ use std::path::Path;
 
 pub const INSTALLED_SOCKET: &str = "/run/oulipoly-kernel-broker/control.sock";
 pub const INSTALLED_FRESH_V30_SOCKET: &str = "/run/oulipoly-kernel-broker/v30.sock";
+
+/// Host-root diagnostic only. The broker requires the complete persisted PID1
+/// incarnation. Fencing is durable, but the reply never authorizes close.
+pub fn root_drain_readback_at(
+    path: &Path,
+    expected: &RootRecord,
+    fence: bool,
+) -> io::Result<String> {
+    let mut stream = checked_connection(path)?;
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let mut frame = Vec::with_capacity(256);
+    frame.push(if fence { b'@' } else { b'[' });
+    frame.extend_from_slice(&challenge);
+    frame.extend_from_slice(&serde_json::to_vec(expected)?);
+    if frame.len() > 2048 {
+        return Err(io::Error::other("root drain request too large"));
+    }
+    stream.write_all(&frame)?;
+    let mut response = Vec::new();
+    stream.take(4097).read_to_end(&mut response)?;
+    if response.len() > 4096 || !response.ends_with(b"\n") {
+        return Err(io::Error::other("root drain response uncertain"));
+    }
+    let response = String::from_utf8(response).map_err(io::Error::other)?;
+    if !response.starts_with("root-drain-v1 ") {
+        return Err(io::Error::other(response));
+    }
+    Ok(response)
+}
 
 /// The fresh lane has a fixed, versioned endpoint. Callers cannot provide a
 /// State path or select a ledger by an environment string.

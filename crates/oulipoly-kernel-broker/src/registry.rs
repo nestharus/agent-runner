@@ -3,6 +3,7 @@ use crate::json_artifact;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
+use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -30,6 +31,7 @@ pub struct RootRegistry {
     directory: PathBuf,
     live: Vec<LiveRoot>,
     debt: Vec<RootRecord>,
+    admission_fences: Vec<RootRecord>,
     poisoned: bool,
 }
 
@@ -58,6 +60,7 @@ impl RootRegistry {
             directory,
             live: Vec::new(),
             debt: Vec::new(),
+            admission_fences: Vec::new(),
             poisoned: false,
         };
         for entry in fs::read_dir(&registry.directory)? {
@@ -77,6 +80,9 @@ impl RootRegistry {
             // The work registry is opened separately by the broker before it
             // serves requests. Never silently skip an arbitrary directory.
             if name == "works" && entry.file_type()?.is_dir() {
+                continue;
+            }
+            if name == "root-drains" && entry.file_type()?.is_dir() {
                 continue;
             }
             if name == "entries" && entry.file_type()?.is_dir() {
@@ -142,6 +148,42 @@ impl RootRegistry {
             }
         }
         registry.check_unique()?;
+        let fences = registry.directory.join("root-drains");
+        if !fences.exists() {
+            fs::DirBuilder::new().mode(0o700).create(&fences)?;
+            fs::File::open(&registry.directory)?.sync_all()?;
+        }
+        let fence_meta = fs::symlink_metadata(&fences)?;
+        if !fence_meta.is_dir()
+            || fence_meta.file_type().is_symlink()
+            || fence_meta.uid() != unsafe { libc::geteuid() }
+            || fence_meta.mode() & 0o077 != 0
+        {
+            return Err(io::Error::other("unsafe root drain fence directory"));
+        }
+        for entry in fs::read_dir(&fences)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !entry.file_type()?.is_file() || !name.ends_with(".json") {
+                return Err(io::Error::other("unrecognized root drain fence"));
+            }
+            let record: RootRecord = json_artifact::read(&entry.path(), "root_drain_fence_open")?;
+            if name != format!("{}.json", record.root_id)
+                || !registry
+                    .live
+                    .iter()
+                    .map(|root| &root.record)
+                    .chain(registry.debt.iter())
+                    .any(|root| root == &record)
+                || registry
+                    .admission_fences
+                    .iter()
+                    .any(|fence| fence.root_id == record.root_id)
+            {
+                return Err(io::Error::other("root drain fence identity conflict"));
+            }
+            registry.admission_fences.push(record);
+        }
         Ok(registry)
     }
 
@@ -169,6 +211,77 @@ impl RootRegistry {
 
     pub fn live_roots(&self) -> impl Iterator<Item = &LiveRoot> {
         self.live.iter()
+    }
+
+    /// Durable exact-incarnation admission stop. A consumed grant can still
+    /// finish its one-use launch; this fence never settles physical or State
+    /// obligations. The serving broker serializes this write with the fresh
+    /// Bash-child admission lane.
+    pub fn fence_admission(&mut self, expected: &RootRecord) -> io::Result<()> {
+        if self.poisoned {
+            return Err(io::Error::other("uncertain root registry"));
+        }
+        let root = self
+            .live
+            .iter()
+            .find(|root| root.record.root_id == expected.root_id)
+            .ok_or_else(|| io::Error::other("exact live root absent"))?;
+        if root.record != *expected || root.init.verify().is_err() {
+            return Err(io::Error::other("root incarnation changed"));
+        }
+        if let Some(fence) = self
+            .admission_fences
+            .iter()
+            .find(|fence| fence.root_id == expected.root_id)
+        {
+            return if fence == expected {
+                Ok(())
+            } else {
+                Err(io::Error::other("root fence incarnation changed"))
+            };
+        }
+        let result = json_artifact::create_new(
+            &self.directory.join("root-drains"),
+            &format!("{}.json", expected.root_id),
+            expected,
+        );
+        if let Err(error) = result {
+            self.poisoned = true;
+            return Err(error);
+        }
+        self.admission_fences.push(expected.clone());
+        Ok(())
+    }
+
+    pub fn admission_fenced(&self, root_id: &str) -> bool {
+        self.poisoned
+            || self
+                .admission_fences
+                .iter()
+                .any(|fence| fence.root_id == root_id)
+    }
+
+    pub fn fenced_root_ids(&self) -> impl Iterator<Item = &str> {
+        self.admission_fences
+            .iter()
+            .map(|fence| fence.root_id.as_str())
+    }
+
+    pub fn exact_record(&self, expected: &RootRecord) -> io::Result<()> {
+        if self.poisoned {
+            return Err(io::Error::other("uncertain root registry"));
+        }
+        if self
+            .live
+            .iter()
+            .map(|root| &root.record)
+            .chain(self.debt.iter())
+            .any(|record| record == expected)
+        {
+            Ok(())
+        } else {
+            Err(io::Error::other("root incarnation changed or absent"))
+        }
     }
 
     /// Observe only the exact PID1 child pinned by this broker incarnation.
@@ -288,6 +401,61 @@ mod tests {
     }
 
     #[test]
+    fn exact_root_fence_persists_and_other_root_remains_unfenced() {
+        let temp = tempfile::tempdir().unwrap();
+        let (first_init, first_gate) = gated_child();
+        let (second_init, second_gate) = gated_child();
+        let first = record(&uuid::Uuid::new_v4().to_string(), &first_init);
+        let second = record(&uuid::Uuid::new_v4().to_string(), &second_init);
+        for root in [&first, &second] {
+            json_artifact::create_new(temp.path(), &format!("{}.json", root.root_id), root)
+                .unwrap();
+        }
+        let mut roots = RootRegistry {
+            directory: temp.path().into(),
+            live: vec![
+                LiveRoot {
+                    record: first.clone(),
+                    init: first_init,
+                },
+                LiveRoot {
+                    record: second.clone(),
+                    init: second_init,
+                },
+            ],
+            debt: Vec::new(),
+            admission_fences: Vec::new(),
+            poisoned: false,
+        };
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(temp.path().join("root-drains"))
+            .unwrap();
+        let mut stale = first.clone();
+        stale.init_starttime_ticks += 1;
+        assert!(roots.fence_admission(&stale).is_err());
+        assert!(!roots.admission_fenced(&first.root_id));
+        roots.fence_admission(&first).unwrap();
+        roots.fence_admission(&first).unwrap();
+        assert!(roots.admission_fenced(&first.root_id));
+        assert!(!roots.admission_fenced(&second.root_id));
+        assert!(roots.exact_record(&first).is_ok());
+        assert!(roots.exact_record(&stale).is_err());
+        // These test children are not namespace PID1. Restart therefore
+        // classifies them as debt, but must retain the exact durable fence.
+        let restarted = RootRegistry::open(temp.path()).unwrap();
+        assert!(restarted.has_debt());
+        assert!(restarted.admission_fenced(&first.root_id));
+        assert!(!restarted.admission_fenced(&second.root_id));
+        assert!(restarted.exact_record(&first).is_ok());
+        let pending = temp.path().join("root-drains/.json-pending-crashed-fence");
+        fs::write(&pending, b"{\"incomplete\":").unwrap();
+        assert!(RootRegistry::open(temp.path()).is_err());
+        drop(first_gate);
+        drop(second_gate);
+    }
+
+    #[test]
     fn exact_init_exit_readback_distinguishes_other_root_crash_and_restart() {
         let temp = tempfile::tempdir().unwrap();
         let (first_init, mut first_gate) = gated_child();
@@ -307,6 +475,7 @@ mod tests {
                 },
             ],
             debt: Vec::new(),
+            admission_fences: Vec::new(),
             poisoned: false,
         };
         assert_eq!(

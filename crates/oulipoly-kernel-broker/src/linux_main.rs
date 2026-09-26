@@ -62,7 +62,8 @@ use oulipoly_kernel_broker::protocol::{
     ProcessWitness, SourceControlUse, SourceScope, SourceSocketWitness, SourceTicketUse,
     StateGenerationSpec, StateReadSpec, StateWriteAction, StateWriteSpec,
 };
-use oulipoly_kernel_broker::registry::RootRegistry;
+use oulipoly_kernel_broker::registry::{RootRecord, RootRegistry};
+use oulipoly_kernel_broker::root_drain;
 use oulipoly_kernel_broker::source_acceptance::capture_and_stage_v2_evidence;
 use oulipoly_kernel_broker::source_physical::{SourceObservation, SourcePhysicalRegistry};
 use oulipoly_kernel_broker::work_registry::{Scope, WorkRegistry, classify_scope};
@@ -87,6 +88,7 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 const SOCKET: &str = "/run/oulipoly-kernel-broker/control.sock";
@@ -395,7 +397,7 @@ fn require_cutover_entry_route(
     broker_owned_sidecar: bool,
     gate_closed: bool,
 ) -> io::Result<()> {
-    if matches!(operation, b'i' | b'v' | b'X' | b'x') {
+    if matches!(operation, b'i' | b'v' | b'X' | b'x' | b'@' | b'[') {
         return Ok(());
     }
     if gate_closed {
@@ -440,6 +442,9 @@ fn require_cutover_entry_route(
 #[derive(Debug)]
 enum RequestPayload {
     None,
+    RootDrain {
+        expected: RootRecord,
+    },
     FreshChildRequest {
         request: FreshChildRequest,
     },
@@ -727,6 +732,7 @@ fn recv_request(
         }
         #[cfg(feature = "age319-private-broker-fixture")]
         b'#' | b'{' | b'}' | b']' | b'|' | b'~' | b'?' => (18..=2048 + 17).contains(&read),
+        b'@' | b'[' => (18..=2048 + 17).contains(&read),
         b'F' => (18..=8192 + 17).contains(&read),
         b'O' => (18..=1024 + 17).contains(&read),
         b'U' => (18..=512 + 17).contains(&read),
@@ -782,6 +788,9 @@ fn recv_request(
     }
     process.verify()?;
     let payload = match request[0] {
+        b'@' | b'[' => RequestPayload::RootDrain {
+            expected: serde_json::from_slice(&request[17..read as usize])?,
+        },
         b'U' => RequestPayload::FreshChildRequest {
             request: serde_json::from_slice(&request[17..read as usize])?,
         },
@@ -3199,6 +3208,12 @@ fn serve() -> io::Result<()> {
     }
     let host_namespace = host_proc_file("self/ns/pid")?;
     let mut registry = RootRegistry::open(&state)?;
+    let admission_fences = Arc::new(Mutex::new(
+        registry
+            .fenced_root_ids()
+            .map(str::to_owned)
+            .collect::<HashSet<_>>(),
+    ));
     let mut works = WorkRegistry::open(&works_path, &registry)?;
     let entries_path = Path::new(&state).join("entries");
     if !entries_path.exists() {
@@ -3282,6 +3297,7 @@ fn serve() -> io::Result<()> {
         let fresh_runner_image = runner_image.try_clone()?;
         let fresh_handoff_tx = handoff_tx.clone();
         let fresh_terminal_tx = terminal_tx.clone();
+        let fresh_admission_fences = Arc::clone(&admission_fences);
         let fresh_socket = if fixture {
             Path::new(&socket).with_file_name("v30.sock")
         } else {
@@ -3296,6 +3312,7 @@ fn serve() -> io::Result<()> {
                     fresh_runner_image,
                     Some(fresh_handoff_tx),
                     Some(fresh_terminal_tx),
+                    fresh_admission_fences,
                 ) {
                     eprintln!("fresh v30 lane closed: {error}");
                 }
@@ -3356,7 +3373,28 @@ fn serve() -> io::Result<()> {
                 broker_sidecar.is_some(),
                 entry_gate.is_closed(),
             )?;
-            if operation == b'i' {
+            if operation == b'@' || operation == b'[' {
+                if peer.uid != 0 || !peer.process.in_namespace(&host_namespace)? {
+                    return Err(io::Error::other("host-root drain readback required"));
+                }
+                let RequestPayload::RootDrain { expected } = payload else {
+                    return Err(io::Error::other("root drain identity absent"));
+                };
+                registry.exact_record(&expected)?;
+                if operation == b'@' {
+                    let mut fences = admission_fences.lock()
+                        .map_err(|_| io::Error::other("root admission fence poisoned"))?;
+                    let persisted = registry.fence_admission(&expected);
+                    // A partial fence write must also stop the fresh lane in
+                    // this broker incarnation; restart rejects pending files.
+                    fences.insert(expected.root_id.clone());
+                    persisted?;
+                }
+                let inventory = root_drain::readback(
+                    &expected, &registry, &entries, &works, &grants, &source_physical,
+                )?;
+                Ok(format!("root-drain-v1 {}\n", serde_json::to_string(&inventory)?))
+            } else if operation == b'i' {
                 let route = if entry_gate.is_closed() {
                     "draining"
                 } else if broker_sidecar.is_some() {
@@ -3490,6 +3528,9 @@ fn serve() -> io::Result<()> {
                 let RequestPayload::Join { spec, descriptors } = payload else {
                     return Err(io::Error::other("invalid root join payload"));
                 };
+                if registry.admission_fenced(&spec.root_id) {
+                    return Err(io::Error::other("exact root admission fenced"));
+                }
                 if operation == b'j' {
                     if held_joins.contains_key(&spec.root_id) {
                         return Err(io::Error::other("root join gate already held"));
@@ -3584,6 +3625,9 @@ fn serve() -> io::Result<()> {
                 let RequestPayload::PrepareAcceptedWork { spec, descriptors } = payload else {
                     return Err(io::Error::other("invalid accepted-work payload"));
                 };
+                if registry.admission_fenced(&spec.root_id) {
+                    return Err(io::Error::other("exact root admission fenced"));
+                }
                 let [executable, intent, cwd, state_dir, accepted] = descriptors;
                 let grant = grants.prepare(
                     &registry,
@@ -3608,6 +3652,9 @@ fn serve() -> io::Result<()> {
                 let RequestPayload::PrepareNative { spec, descriptors } = payload else {
                     return Err(io::Error::other("invalid native prepare payload"));
                 };
+                if registry.admission_fenced(&spec.root_id) {
+                    return Err(io::Error::other("exact root admission fenced"));
+                }
                 let [directory, request, receipt] = descriptors;
                 if let Some(sidecar) = broker_sidecar.as_mut() {
                     if spec.protocol != "native-continuation-v30" {
@@ -4012,6 +4059,9 @@ fn serve() -> io::Result<()> {
                     )?;
                     encode_repair_readback(&readback)
                 } else if spec.protocol == "broker-source-grant-reserve-v30" {
+                    if registry.admission_fenced(&spec.root_id) {
+                        return Err(io::Error::other("exact root admission fenced"));
+                    }
                     let grant = reserve_source_effect_grant(
                         spec,
                         &peer,
@@ -4251,12 +4301,20 @@ fn serve_fresh_v30() -> io::Result<()> {
         let image = File::open(&runner)?;
         pair.verify_file(Path::new(&runner), &pair.runner_sha256, true, &image)?;
     }
+    let roots = RootRegistry::open(&state_root)?;
+    let admission_fences = Arc::new(Mutex::new(
+        roots
+            .fenced_root_ids()
+            .map(str::to_owned)
+            .collect::<HashSet<_>>(),
+    ));
     serve_fresh_v30_at(
         Path::new(&state_root),
         Path::new(&socket),
         File::open(&runner)?,
         None,
         None,
+        admission_fences,
     )
 }
 
@@ -4413,6 +4471,7 @@ fn serve_fresh_v30_at(
     runner_image: File,
     handoff_tx: Option<SyncSender<FreshHandoffBridgeRequest>>,
     terminal_tx: Option<SyncSender<FreshTerminalBridgeRequest>>,
+    admission_fences: Arc<Mutex<HashSet<String>>>,
 ) -> io::Result<()> {
     // A missing or incomplete publication cannot bind the new endpoint.
     let mut lane = FreshV30Lane::open_at(state_root).map_err(io::Error::other)?;
@@ -4828,6 +4887,18 @@ fn serve_fresh_v30_at(
                     let (root, root_actor, parent_work) =
                         fresh_bash_parent(state_root, &lane, &peer, bash_image.as_ref())?;
                     let directory = state_root.join("v30/fresh-provider");
+                    let _admission_guard =
+                        if matches!(operation, b'C' | b'X') && !instance.is_closed() {
+                            let guard = admission_fences
+                                .lock()
+                                .map_err(|_| io::Error::other("root admission fence poisoned"))?;
+                            if guard.contains(&root.old_release.prepared.root_id) {
+                                return Err(io::Error::other("exact root admission fenced"));
+                            }
+                            Some(guard)
+                        } else {
+                            None
+                        };
                     let ordinary_plan = if operation == b'X' {
                         ordinary_command
                             .as_ref()
@@ -5317,6 +5388,12 @@ fn serve_fresh_v30_at(
                                     "fresh root effect entry gate closed",
                                 ));
                             }
+                            let guard = admission_fences
+                                .lock()
+                                .map_err(|_| io::Error::other("root admission fence poisoned"))?;
+                            if guard.contains(&receipt.old_release.prepared.root_id) {
+                                return Err(io::Error::other("exact root admission fenced"));
+                            }
                             Some(
                                 lane.begin_root_effect(&receipt, &recipient, &session)
                                     .map_err(io::Error::other)?,
@@ -5386,6 +5463,12 @@ fn serve_fresh_v30_at(
                     let preparation = if operation == b'3' {
                         if instance.is_closed() {
                             return Err(io::Error::other("normal work preparation gate closed"));
+                        }
+                        let guard = admission_fences
+                            .lock()
+                            .map_err(|_| io::Error::other("root admission fence poisoned"))?;
+                        if guard.contains(&receipt.old_release.prepared.root_id) {
+                            return Err(io::Error::other("exact root admission fenced"));
                         }
                         Some(
                             lane.prepare_normal_work(&receipt, &recipient, &session)
@@ -5498,6 +5581,23 @@ fn serve_fresh_v30_at(
                     let binding =
                         fresh_provider::binding_from_held(&receipt, &held, &actor, &root)?;
                     let directory = state_root.join("v30/fresh-provider");
+                    // The release-attestation bridge above is served by the
+                    // old loop. Acquire the admission lock only after that
+                    // bridge reply, before any provider admission mutation.
+                    let _admission_guard = if matches!(
+                        operation,
+                        b'5' | b'h' | b'(' | b'f' | b')' | b'm' | b'#' | b'{'
+                    ) {
+                        let guard = admission_fences
+                            .lock()
+                            .map_err(|_| io::Error::other("root admission fence poisoned"))?;
+                        if guard.contains(&receipt.old_release.prepared.root_id) {
+                            return Err(io::Error::other("exact root admission fenced"));
+                        }
+                        Some(guard)
+                    } else {
+                        None
+                    };
                     if provider_readback_v3.is_some()
                         && pty_request.is_none()
                         && !(matches!(operation, b'6' | b'8' | b'9' | b'h' | b'm' | b'n' | b'o')

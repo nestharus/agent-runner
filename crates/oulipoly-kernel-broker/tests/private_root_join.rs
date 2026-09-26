@@ -1,6 +1,7 @@
 //! Source-only private user-namespace exercise of the actual broker launch and
 //! opt-in Runner entry. It never exercises installed host-root sudo authority.
 #![cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
+use oulipoly_kernel_broker::RootRecord;
 use oulipoly_kernel_broker::protocol::{
     self, AcceptedWorkSpec, JoinSpec, Operation, ProcessWitness, SourceScope, SourceSocketWitness,
 };
@@ -6486,6 +6487,35 @@ fn inner() {
                     eventually(|| grant_file.exists());
                     let grant: serde_json::Value =
                         serde_json::from_slice(&fs::read(&grant_file).unwrap()).unwrap();
+                    if mode == "normal_model_provider_pty_physical" {
+                        // The provider has produced its marker and has not
+                        // received the release/cancel signal. Its root PID1
+                        // must remain a blocker even though this inventory
+                        // does not enumerate fresh-provider sidecar work.
+                        let exact: RootRecord = serde_json::from_slice(
+                            &fs::read(broker_state.join(format!("{}.json", prepared.root_id)))
+                                .unwrap(),
+                        )
+                        .unwrap();
+                        let observed =
+                            protocol::root_drain_readback_at(&socket, &exact, false).unwrap();
+                        let observed: serde_json::Value = serde_json::from_str(
+                            observed.strip_prefix("root-drain-v1 ").unwrap().trim_end(),
+                        )
+                        .unwrap();
+                        assert_eq!(observed["root_id"], prepared.root_id);
+                        oulipoly_kernel_broker::identity::PinnedProcess::open(exact.init_host_pid)
+                            .unwrap()
+                            .verify()
+                            .unwrap();
+                        // This mode restarts Broker before provider K, so
+                        // parent-child wait authority is correctly unknown
+                        // even while the exact root and provider remain live.
+                        assert_eq!(observed["pid1"], "unknown");
+                        assert_eq!(observed["state"], "blocked");
+                        assert_eq!(observed["state_sidecar_outstanding_unknown"], true);
+                        assert_eq!(observed["close_eligible"], false);
+                    }
                     if path_mode {
                         assert_eq!(
                             grant["configured_program"],
@@ -9885,7 +9915,7 @@ fn inner() {
     let err = temp.path().join("runner.err");
     let args: &[&str] = if mode == "diagnostics" {
         &["diagnostics", "metrics", "--minutes", "1", "--json"]
-    } else if mode == "join_only" {
+    } else if mode == "join_only" || mode == "root_drain_fence" {
         &["__age319-private-join-only-v1"]
     } else {
         &["--help"]
@@ -10027,10 +10057,40 @@ fn inner() {
     let output = fs::read_to_string(&out).unwrap();
     if mode == "diagnostics" {
         assert!(output.trim_start().starts_with('{'), "{output}");
-    } else if mode == "join_only" {
+    } else if mode == "join_only" || mode == "root_drain_fence" {
         assert!(output.is_empty(), "{output}");
     } else {
         assert!(output.contains("Usage:"));
+    }
+    if mode == "root_drain_fence" {
+        let exact: RootRecord = serde_json::from_value(root_record.clone()).unwrap();
+        let before = protocol::root_drain_readback_at(&socket, &exact, false).unwrap();
+        let before: serde_json::Value =
+            serde_json::from_str(before.strip_prefix("root-drain-v1 ").unwrap().trim_end())
+                .unwrap();
+        assert_eq!(before["root_id"], root);
+        assert_eq!(before["fenced"], false);
+        assert_eq!(before["state"], "blocked");
+        assert_eq!(before["state_sidecar_outstanding_unknown"], true);
+        assert_eq!(before["close_eligible"], false);
+        let mut stale = exact.clone();
+        stale.init_starttime_ticks += 1;
+        assert!(protocol::root_drain_readback_at(&socket, &stale, true).is_err());
+        let mut other = exact.clone();
+        other.root_id = uuid::Uuid::new_v4().to_string();
+        assert!(protocol::root_drain_readback_at(&socket, &other, true).is_err());
+        let fenced = protocol::root_drain_readback_at(&socket, &exact, true).unwrap();
+        let fenced: serde_json::Value =
+            serde_json::from_str(fenced.strip_prefix("root-drain-v1 ").unwrap().trim_end())
+                .unwrap();
+        assert_eq!(fenced["fenced"], true);
+        assert_eq!(fenced["state"], "blocked");
+        assert_eq!(fenced["close_eligible"], false);
+        assert!(
+            broker_state
+                .join(format!("root-drains/{root}.json"))
+                .exists()
+        );
     }
     let sibling = Command::new(&runner)
         .arg("--help")
@@ -10074,6 +10134,12 @@ fn inner() {
     )
     .unwrap();
     assert!(false_grant.starts_with("error "), "{false_grant}");
+    if mode == "root_drain_fence" {
+        assert!(
+            false_grant.contains("exact root admission fenced"),
+            "{false_grant}"
+        );
+    }
     assert_eq!(
         fs::read_dir(broker_state.join("grants")).unwrap().count(),
         0
@@ -10098,12 +10164,52 @@ fn inner() {
     )
     .unwrap();
     assert!(replay.starts_with("error "), "{replay}");
+    if mode == "root_drain_fence" {
+        assert!(replay.contains("exact root admission fenced"), "{replay}");
+    }
     assert!(
         protocol::request_at(&socket, Operation::ReserveEntry)
             .unwrap()
             .starts_with("error ")
     );
     stop(&mut broker);
+    if mode == "root_drain_fence" {
+        // The consumed bit is the durable boundary before a namespace fork.
+        // A restart must surface a spent record with no WorkRegistry child.
+        let grant_id = uuid::Uuid::new_v4().to_string();
+        let stamp = serde_json::json!({"device": 1, "inode": 1});
+        let grant = serde_json::json!({
+            "version": 2,
+            "grant_id": grant_id,
+            "root_id": root,
+            "root_init": {
+                "host_pid": root_record["init_host_pid"],
+                "boot_id": root_record["boot_id"],
+                "starttime_ticks": root_record["init_starttime_ticks"],
+                "pidns_dev": root_record["pidns_dev"],
+                "pidns_ino": root_record["pidns_ino"]
+            },
+            "owner_uid": 0,
+            "supervisor_authority_id": owner.supervisor_authority_id,
+            "owner_generation": owner.owner_generation,
+            "guardian": record["guardian"],
+            "joined_child": record["joined_child"],
+            "work_id": "accepted-before-fork",
+            "parent_grant_id": null,
+            "parent_work_incarnation": null,
+            "accepted_sha256": "a".repeat(64),
+            "request_sha256": "b".repeat(64),
+            "initiator": {"pid": child_pid, "boot_id": root_record["boot_id"], "starttime_ticks": 1},
+            "artifacts": {"executable": stamp, "intent": stamp, "cwd": stamp, "state_dir": stamp, "accepted": stamp},
+            "sealed_helper": null,
+            "consumed": true
+        });
+        fs::write(
+            broker_state.join(format!("grants/{grant_id}.json")),
+            serde_json::to_vec(&grant).unwrap(),
+        )
+        .unwrap();
+    }
     // Restart reads the same root PID1 and spent join record. An uncertain
     // response cannot fork another original entry.
     assert!(Path::new(&format!("/proc/{init_pid}")).exists());
@@ -10125,6 +10231,18 @@ fn inner() {
         "restart: {}",
         fs::read_to_string(&restart_log).unwrap()
     );
+    if mode == "root_drain_fence" {
+        let exact: RootRecord = serde_json::from_value(root_record.clone()).unwrap();
+        let after = protocol::root_drain_readback_at(&socket, &exact, false).unwrap();
+        let after: serde_json::Value =
+            serde_json::from_str(after.strip_prefix("root-drain-v1 ").unwrap().trim_end()).unwrap();
+        assert_eq!(after["fenced"], true);
+        assert_eq!(after["pid1"], "unknown");
+        assert_eq!(after["spent_without_work"], 1);
+        assert_eq!(after["state"], "blocked");
+        assert_eq!(after["state_sidecar_outstanding_unknown"], true);
+        assert_eq!(after["close_eligible"], false);
+    }
     assert!(
         protocol::request_at(&socket, Operation::ReserveEntry)
             .unwrap()
@@ -10195,6 +10313,7 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "help",
         "diagnostics",
         "join_only",
+        "root_drain_fence",
         "held_death",
         "broker_state",
         "held_prepared",

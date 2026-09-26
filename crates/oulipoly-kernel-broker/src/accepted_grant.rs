@@ -1882,6 +1882,11 @@ mod tests {
         assert!(consumed.consumed);
         let mut restarted = GrantRegistry::open(dir.path()).unwrap();
         assert!(restarted.records()[0].consumed);
+        assert_eq!(
+            crate::root_drain::spent_without_work(&[&restarted.records()[0]], &[], &[]),
+            1,
+            "a spent grant before fork remains visible after Broker restart"
+        );
         assert!(
             restarted
                 .consume_record(&record.grant_id, &guardian)
