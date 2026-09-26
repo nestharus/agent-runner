@@ -786,6 +786,11 @@ impl BrokerSidecar {
                 if source.domain_id != owner.domain_id {
                     return Err("broker selected source domain conflict".into());
                 }
+                if state.exact_source_projection_unavailable(&source.registration_id)? {
+                    return Err(
+                        "exact source decision projection unavailable for source selection".into(),
+                    );
+                }
                 Ok(BrokerSourceCandidate {
                     registration_id: source.registration_id,
                     registration_digest: binding.registration_digest().into(),

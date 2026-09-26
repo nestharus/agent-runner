@@ -45,14 +45,20 @@ fn restart_source_broker(
     gate: &Path,
     log: &Path,
 ) -> Child {
-    let mut broker = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"));
+    command
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", socket)
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", broker_state)
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", runner)
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", gate)
-        .stderr(Stdio::from(File::create(log).unwrap()))
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::from(File::create(log).unwrap()));
+    if let Ok(offset) = fs::read_to_string(gate.join("source-clock-offset")) {
+        command.env(
+            "OULIPOLY_KERNEL_BROKER_FIXTURE_SOURCE_CLOCK_OFFSET_SECONDS_V1",
+            offset.trim(),
+        );
+    }
+    let mut broker = command.spawn().unwrap();
     eventually(|| {
         protocol::request_at(socket, Operation::Classify).is_ok()
             || broker.try_wait().unwrap().is_some()
@@ -9611,6 +9617,156 @@ fn inner() {
                     .read_exact_release(&generation, &prepared.root_id, &prepared.owner_generation,)
                     .unwrap(),
                     evidence,
+                );
+                stop(&mut broker);
+                fs::write(gate.join("source-clock-offset"), b"240").unwrap();
+                broker = restart_source_broker(
+                    &socket,
+                    &broker_state,
+                    &runner,
+                    &gate,
+                    &temp.path().join("source-broker-expired-first.log"),
+                );
+                fs::write(gate.join("source-expired-before-first"), b"yes").unwrap();
+                eventually(|| {
+                    gate.join("source-expired-first-refused").exists()
+                        || entry.try_wait().unwrap().is_some()
+                });
+                assert!(
+                    gate.join("source-expired-first-refused").exists(),
+                    "expired first consumption: {}",
+                    fs::read_to_string(&err).unwrap()
+                );
+                stop(&mut broker);
+                fs::remove_file(gate.join("source-clock-offset")).unwrap();
+                broker = restart_source_broker(
+                    &socket,
+                    &broker_state,
+                    &runner,
+                    &gate,
+                    &temp.path().join("source-broker-unexpired-first.log"),
+                );
+                fs::write(gate.join("source-state-restored"), b"yes").unwrap();
+                eventually(|| {
+                    gate.join("source-admission-first").exists()
+                        || entry.try_wait().unwrap().is_some()
+                });
+                assert!(
+                    gate.join("source-admission-first").exists(),
+                    "first State admission: {}",
+                    fs::read_to_string(&err).unwrap()
+                );
+                stop(&mut broker);
+                fs::write(gate.join("source-clock-offset"), b"240").unwrap();
+                broker = restart_source_broker(
+                    &socket,
+                    &broker_state,
+                    &runner,
+                    &gate,
+                    &temp.path().join("source-broker-expired-retry.log"),
+                );
+                fs::write(gate.join("source-expired-after-commit"), b"yes").unwrap();
+                eventually(|| {
+                    gate.join("source-state-admission-done").exists()
+                        || entry.try_wait().unwrap().is_some()
+                });
+                assert!(
+                    gate.join("source-state-admission-done").exists(),
+                    "State decision admission: entry={} broker={}",
+                    fs::read_to_string(&err).unwrap(),
+                    fs::read_to_string(&broker_log).unwrap()
+                );
+                let admitted = rusqlite::Connection::open_with_flags(
+                    &original_state,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .unwrap();
+                for table in [
+                    "invocation_completion_obligations",
+                    "invocation_completion_continuity",
+                    "invocation_completion_exact_source_decisions",
+                ] {
+                    let count: i64 = admitted
+                        .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                            row.get(0)
+                        })
+                        .unwrap();
+                    assert_eq!(count, 1, "{table} first insert/retry");
+                }
+                let attributed: (String, String, String, String, String) = admitted
+                    .query_row(
+                        "SELECT request_id,decision_id,root_id,source_generation,owner_generation
+                     FROM invocation_completion_exact_source_decisions",
+                        [],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                            ))
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(
+                    attributed,
+                    (
+                        request_id.clone(),
+                        decision_id.clone(),
+                        prepared.root_id.clone(),
+                        generation.clone(),
+                        prepared.owner_generation.clone(),
+                    )
+                );
+                assert_eq!(
+                    db.query_row::<i64, _, _>(
+                        "SELECT count(*) FROM broker_source_effect_grant",
+                        [],
+                        |row| row.get(0)
+                    )
+                    .unwrap(),
+                    0
+                );
+                let unavailable = BrokerSidecar::open_existing(
+                    &broker_state.join("sidecar/pid-identity.db"),
+                    &broker_state,
+                )
+                .unwrap()
+                .read_bounded_source_selection(
+                    &generation,
+                    &prepared.root_id,
+                    &evidence.owner,
+                );
+                assert!(
+                    unavailable.is_err_and(|error| error.contains("complete State projection")),
+                    "new decision source became selectable"
+                );
+                let immutable = rusqlite::Connection::open(&original_state).unwrap();
+                assert!(immutable.execute(
+                    "UPDATE invocation_completion_exact_source_decisions SET root_id='changed'",
+                    [],
+                ).is_err_and(|error| error.to_string().contains("attribution immutable")));
+                assert!(
+                    immutable
+                        .execute(
+                            "DELETE FROM invocation_completion_exact_source_decisions",
+                            [],
+                        )
+                        .is_err_and(|error| error.to_string().contains("attribution immutable"))
+                );
+                assert_eq!(
+                    fs::read(data.join("pid-identity.db")).unwrap(),
+                    b"retired copied owner"
+                );
+                stop(&mut broker);
+                fs::remove_file(gate.join("source-clock-offset")).unwrap();
+                broker = restart_source_broker(
+                    &socket,
+                    &broker_state,
+                    &runner,
+                    &gate,
+                    &temp.path().join("source-broker-after-retry.log"),
                 );
             }
             eventually(|| {

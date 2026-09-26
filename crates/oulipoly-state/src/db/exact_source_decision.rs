@@ -1,7 +1,6 @@
-//! Read-only Broker decision inspection under a State writer reservation.
-//!
-//! This is deliberately not registration authority: no decision is consumed,
-//! no obligation is recorded, and the public registration path does not call it.
+//! Broker decision verification under a State writer reservation. The public
+//! inspection rolls back; explicit registration consumes the same verification
+//! in its own admission transaction.
 
 use super::{RusqliteOptionalExtension, StateDb, sqlite};
 use crate::completion_continuation::{AdmittedSourceBinding, completion_obligation_admission_id};
@@ -23,6 +22,25 @@ pub struct SourceDecisionVerification {
     pub request_id: String,
     pub decision_id: String,
     pub witness: serde_json::Value,
+    #[serde(default)]
+    pub committed_retry: bool,
+}
+
+/// Actual descriptors and the reference to an already issued Broker decision.
+/// The request's root and generations remain assertions until Broker readback.
+pub struct ExactSourceDecisionReference<'a> {
+    pub verification: &'a SourceDecisionVerification,
+    pub guardian_fd: RawFd,
+    pub registration_fd: RawFd,
+}
+
+/// State admission is durable. Projection remains deliberately unavailable to
+/// source selection until a cross-database attribution protocol is installed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExactSourceAdmissionResult {
+    pub inserted: bool,
+    pub decision_id: String,
+    pub projection_available: bool,
 }
 
 /// An observation only. Holding this value never permits effect promotion.
@@ -42,13 +60,21 @@ pub struct SourceDecisionInspection {
     pub original_state_inode: u64,
 }
 
-#[derive(Deserialize)]
-struct BrokerReadback {
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(super) struct BrokerReadback {
     request_id: String,
     decision_id: String,
+    issued_unix_seconds: i64,
+    expires_unix_seconds: i64,
     root_id: String,
+    root_init: PreparedProcessStamp,
     source_generation: String,
     owner_generation: String,
+    owner_uid: u32,
+    domain_id: String,
+    supervisor_id: String,
+    guardian: serde_json::Value,
+    driver: serde_json::Value,
     owner_invocation_uuid: String,
     owner_session_id: String,
     issuer: PreparedProcessStamp,
@@ -57,10 +83,56 @@ struct BrokerReadback {
     handle: String,
     registration_id: String,
     registration_path: PathBuf,
+    registration_device: u64,
+    registration_inode: u64,
     registration_len: u64,
     registration_sha256: String,
     original_state_device: u64,
     original_state_inode: u64,
+}
+
+pub(super) struct VerifiedSourceDecision {
+    pub inspection: SourceDecisionInspection,
+    pub readback: BrokerReadback,
+}
+
+impl BrokerReadback {
+    pub(super) fn request_id(&self) -> &str {
+        &self.request_id
+    }
+    pub(super) fn decision_id(&self) -> &str {
+        &self.decision_id
+    }
+    pub(super) fn registration_id(&self) -> &str {
+        &self.registration_id
+    }
+    pub(super) fn registration_sha256(&self) -> &str {
+        &self.registration_sha256
+    }
+    pub(super) fn root_id(&self) -> &str {
+        &self.root_id
+    }
+    pub(super) fn source_generation(&self) -> &str {
+        &self.source_generation
+    }
+    pub(super) fn owner_generation(&self) -> &str {
+        &self.owner_generation
+    }
+    pub(super) fn supervisor_id(&self) -> &str {
+        &self.supervisor_id
+    }
+    pub(super) fn issuer_json(&self) -> Result<String, String> {
+        serde_json::to_string(&self.issuer).map_err(|e| e.to_string())
+    }
+    pub(super) fn original_state_device(&self) -> u64 {
+        self.original_state_device
+    }
+    pub(super) fn original_state_inode(&self) -> u64 {
+        self.original_state_inode
+    }
+    pub(super) fn encoded(&self) -> Result<Vec<u8>, String> {
+        serde_json::to_vec(self).map_err(|e| e.to_string())
+    }
 }
 
 impl StateDb {
@@ -119,98 +191,169 @@ impl StateDb {
         if self.completion_authority_state_path().is_none() {
             return Err("exact source inspection State file identity changed".into());
         }
-        let source = binding.registration()?;
-        if binding.is_late_listener() {
-            return Err("exact source inspection requires original listener".into());
-        }
         let tx = self
             .conn
             .transaction_with_behavior(sqlite::TransactionBehavior::Immediate)
             .map_err(|error| format!("exact source inspection writer reservation: {error}"))?;
-        let readback = verify_broker_decision(socket, request, guardian_fd, registration_fd)?;
-        let witness = &request.witness;
-        if readback.request_id != request.request_id
-            || readback.decision_id != request.decision_id
-            || readback.original_state_device != opened_file.volume
-            || readback.original_state_inode != opened_file.file
-            || readback.root_id != witness_string(witness, &["owner", "root_id"])?
-            || readback.source_generation != witness_string(witness, &["source_generation"])?
-            || readback.owner_generation != witness_string(witness, &["owner_generation"])?
-            || readback.owner_invocation_uuid != source.owner_invocation_uuid
-            || readback.owner_session_id != source.owner_session_id
-            || i64::from(readback.issuer.host_pid) != source.registering_caller.pid
-            || readback.issuer.boot_id != source.registering_caller.boot_id
-            || i64::try_from(readback.issuer.starttime_ticks).ok()
-                != Some(source.registering_caller.starttime_ticks)
-            || readback.handle != source.handle
-            || readback.registration_id != source.registration_id
-            || readback.registration_path
-                != Path::new(&source.handle_dir).join(&source.registration_relative)
-            || readback.registration_len != binding.registration_bytes().len() as u64
-            || readback.registration_sha256 != binding.registration_digest()
-            || readback.caller_admission_id != binding.caller_admission_id()
-            || readback.caller_admission_id
-                != completion_obligation_admission_id(&source.handle, &source.owner_invocation_uuid)
-        {
-            return Err("exact source inspection decision/State/registration mismatch".into());
-        }
-        let capability = witness_string(witness, &["capability"])?;
-        let mut hasher = Sha256::new();
-        hasher.update(b"oulipoly-completion-registration-authority-v1");
-        hasher.update(capability.as_bytes());
-        let digest = format!("{:x}", hasher.finalize());
-        let row: Option<(Option<String>, Option<String>, Option<String>)> = tx
-            .query_row(
-                "SELECT completion_registration_capability_digest,provider_session_id,session_id
-                 FROM invocations WHERE invocation_uuid=?1",
-                [&source.owner_invocation_uuid],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?;
-        let (Some(expected), provider_session, fallback_session) =
-            row.ok_or("exact source inspection original invocation absent")?
-        else {
-            return Err("exact source inspection invocation capability absent".into());
-        };
-        if expected != digest
-            || readback.capability_digest != digest
-            || provider_session.or(fallback_session).as_deref() != Some(&source.owner_session_id)
-        {
-            return Err("exact source inspection invocation/session/capability mismatch".into());
-        }
-        let canonical_now = std::fs::canonicalize(&source_path).map_err(|e| e.to_string())?;
-        let metadata = std::fs::metadata(&canonical_now).map_err(|e| e.to_string())?;
-        let identity = crate::filesystem_identity::path_file_identity(&canonical_now, &metadata)
-            .map_err(|e| e.to_string())?;
-        if canonical_now != canonical_path
-            || !metadata.is_file()
-            || identity.links != 1
-            || identity.storage != opened_file.volume
-            || identity.file != opened_file.file
-        {
-            return Err("exact source inspection State file changed during verification".into());
-        }
-        // The transaction is rolled back on drop. A later registration cannot
-        // treat this observation as a consumed decision.
-        Ok(SourceDecisionInspection {
-            request_id: readback.request_id,
-            decision_id: readback.decision_id,
-            root_id: readback.root_id,
-            source_generation: readback.source_generation,
-            owner_generation: readback.owner_generation,
-            owner_invocation_uuid: readback.owner_invocation_uuid,
-            owner_session_id: readback.owner_session_id,
-            issuer: readback.issuer,
-            registration_id: readback.registration_id,
-            registration_sha256: readback.registration_sha256,
-            original_state_device: readback.original_state_device,
-            original_state_inode: readback.original_state_inode,
-        })
+        let verified = verify_decision_in_transaction(
+            &tx,
+            socket,
+            request,
+            guardian_fd,
+            registration_fd,
+            binding,
+            opened_file.volume,
+            opened_file.file,
+            &source_path,
+            &canonical_path,
+        )?;
+        Ok(verified.inspection)
     }
 }
 
-fn witness_string<'a>(value: &'a serde_json::Value, path: &[&str]) -> Result<&'a str, String> {
+/// One verifier for inspection and first consumption. It performs no State
+/// transaction of its own and never reads State through the Broker.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn verify_decision_in_transaction(
+    tx: &sqlite::Transaction<'_>,
+    socket: &Path,
+    request: &SourceDecisionVerification,
+    guardian_fd: RawFd,
+    registration_fd: RawFd,
+    binding: &AdmittedSourceBinding,
+    opened_volume: u64,
+    opened_inode: u64,
+    source_path: &Path,
+    canonical_path: &Path,
+) -> Result<VerifiedSourceDecision, String> {
+    let source = binding.registration()?;
+    if binding.is_late_listener() {
+        return Err("exact source decision requires original listener".into());
+    }
+    let readback = verify_broker_decision(socket, request, guardian_fd, registration_fd)?;
+    let witness = &request.witness;
+    if readback.request_id != request.request_id
+        || readback.decision_id != request.decision_id
+        || readback.original_state_device != opened_volume
+        || readback.original_state_inode != opened_inode
+        || readback.root_id != witness_string(witness, &["owner", "root_id"])?
+        || readback.source_generation != witness_string(witness, &["source_generation"])?
+        || readback.owner_generation != witness_string(witness, &["owner_generation"])?
+        || readback.domain_id != source.domain_id
+        || readback.domain_id != witness_string(witness, &["owner", "domain_id"])?
+        || readback.supervisor_id != witness_string(witness, &["owner", "supervisor_id"])?
+        || readback.owner_invocation_uuid != source.owner_invocation_uuid
+        || readback.owner_session_id != source.owner_session_id
+        || i64::from(readback.issuer.host_pid) != source.registering_caller.pid
+        || readback.issuer.boot_id != source.registering_caller.boot_id
+        || i64::try_from(readback.issuer.starttime_ticks).ok()
+            != Some(source.registering_caller.starttime_ticks)
+        || readback.handle != source.handle
+        || readback.registration_id != source.registration_id
+        || readback.registration_path
+            != Path::new(&source.handle_dir).join(&source.registration_relative)
+        || readback.registration_len != binding.registration_bytes().len() as u64
+        || readback.registration_sha256 != binding.registration_digest()
+        || readback.caller_admission_id != binding.caller_admission_id()
+        || readback.caller_admission_id
+            != completion_obligation_admission_id(&source.handle, &source.owner_invocation_uuid)
+    {
+        return Err("exact source inspection decision/State/registration mismatch".into());
+    }
+    // The Broker compared the FD to its retained exact journal bytes. State
+    // also compares its caller binding against the descriptor it supplied.
+    let actual = read_registration_fd(registration_fd, binding.registration_bytes().len())?;
+    if actual != binding.registration_bytes() {
+        return Err("exact source registration FD/binding bytes conflict".into());
+    }
+    let capability = witness_string(witness, &["capability"])?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"oulipoly-completion-registration-authority-v1");
+    hasher.update(capability.as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    let row: Option<(Option<String>, Option<String>, Option<String>)> = tx
+        .query_row(
+            "SELECT completion_registration_capability_digest,provider_session_id,session_id
+                 FROM invocations WHERE invocation_uuid=?1",
+            [&source.owner_invocation_uuid],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let (Some(expected), provider_session, fallback_session) =
+        row.ok_or("exact source inspection original invocation absent")?
+    else {
+        return Err("exact source inspection invocation capability absent".into());
+    };
+    if expected != digest
+        || readback.capability_digest != digest
+        || provider_session.or(fallback_session).as_deref() != Some(&source.owner_session_id)
+    {
+        return Err("exact source inspection invocation/session/capability mismatch".into());
+    }
+    let canonical_now = std::fs::canonicalize(source_path).map_err(|e| e.to_string())?;
+    let metadata = std::fs::metadata(&canonical_now).map_err(|e| e.to_string())?;
+    let identity = crate::filesystem_identity::path_file_identity(&canonical_now, &metadata)
+        .map_err(|e| e.to_string())?;
+    if canonical_now != canonical_path
+        || !metadata.is_file()
+        || identity.links != 1
+        || identity.storage != opened_volume
+        || identity.file != opened_inode
+    {
+        return Err("exact source inspection State file changed during verification".into());
+    }
+    let inspection = SourceDecisionInspection {
+        request_id: readback.request_id.clone(),
+        decision_id: readback.decision_id.clone(),
+        root_id: readback.root_id.clone(),
+        source_generation: readback.source_generation.clone(),
+        owner_generation: readback.owner_generation.clone(),
+        owner_invocation_uuid: readback.owner_invocation_uuid.clone(),
+        owner_session_id: readback.owner_session_id.clone(),
+        issuer: readback.issuer.clone(),
+        registration_id: readback.registration_id.clone(),
+        registration_sha256: readback.registration_sha256.clone(),
+        original_state_device: readback.original_state_device,
+        original_state_inode: readback.original_state_inode,
+    };
+    Ok(VerifiedSourceDecision {
+        inspection,
+        readback,
+    })
+}
+
+fn read_registration_fd(fd: RawFd, expected_len: usize) -> Result<Vec<u8>, String> {
+    if expected_len > crate::completion_continuation::MAX_REGISTRATION_BYTES {
+        return Err("exact source registration exceeds bound".into());
+    }
+    let mut bytes = vec![0_u8; expected_len + 1];
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let count = unsafe {
+            libc::pread(
+                fd,
+                bytes[offset..].as_mut_ptr().cast(),
+                bytes.len() - offset,
+                offset as libc::off_t,
+            )
+        };
+        if count < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        if count == 0 {
+            break;
+        }
+        offset += count as usize;
+    }
+    bytes.truncate(offset);
+    Ok(bytes)
+}
+
+pub(super) fn witness_string<'a>(
+    value: &'a serde_json::Value,
+    path: &[&str],
+) -> Result<&'a str, String> {
     path.iter()
         .try_fold(value, |current, key| current.get(*key))
         .and_then(serde_json::Value::as_str)

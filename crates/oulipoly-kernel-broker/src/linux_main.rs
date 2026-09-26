@@ -3901,7 +3901,11 @@ fn serve() -> io::Result<()> {
                 )?;
                 let journal = source_decision_journal.as_ref()
                     .ok_or_else(|| io::Error::other("exact source decision absent"))?;
-                let readback = journal.verify_decision(&request.request_id, &request.decision_id, &claims)?;
+                let readback = if request.committed_retry {
+                    journal.verify_committed_retry(&request.request_id, &request.decision_id, &claims)?
+                } else {
+                    journal.verify_decision(&request.request_id, &request.decision_id, &claims)?
+                };
                 Ok(format!("{}\n", serde_json::to_string(&readback)?))
             } else if cfg!(feature = "age319-private-broker-fixture") && operation == b'&' {
                 #[cfg(feature = "age319-private-broker-fixture")]

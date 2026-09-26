@@ -171,6 +171,12 @@ static MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0028_completed_turn_recovery_targets.sql"),
         post_sql_hook: Some(validate_completed_turn_recovery_targets),
     },
+    Migration {
+        target_version: 29,
+        id: "0029_exact_source_decision_admission",
+        sql: include_str!("../migrations/0029_exact_source_decision_admission.sql"),
+        post_sql_hook: None,
+    },
 ];
 
 fn validate_completed_turn_recovery_targets(conn: &Connection) -> Result<(), rusqlite::Error> {

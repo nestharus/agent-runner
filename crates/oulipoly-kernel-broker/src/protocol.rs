@@ -2111,6 +2111,10 @@ pub struct ExactSourceDecisionVerification {
     pub request_id: String,
     pub decision_id: String,
     pub witness: SourceWitnessProbe,
+    /// Only State's exact committed replay may use an expired readback. The
+    /// broker still authenticates the live issuer and all immutable claims.
+    #[serde(default)]
+    pub committed_retry: bool,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]

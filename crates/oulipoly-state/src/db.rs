@@ -100,7 +100,10 @@ mod discovered_models;
 #[cfg(target_os = "linux")]
 mod exact_source_decision;
 #[cfg(target_os = "linux")]
-pub use exact_source_decision::{SourceDecisionInspection, SourceDecisionVerification};
+pub use exact_source_decision::{
+    ExactSourceAdmissionResult, ExactSourceDecisionReference, SourceDecisionInspection,
+    SourceDecisionVerification,
+};
 mod discovery_types;
 mod fresh_continuation;
 mod imported_session_display_metadata;

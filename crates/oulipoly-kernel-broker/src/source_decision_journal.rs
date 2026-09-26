@@ -12,6 +12,31 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const TTL_SECONDS: i64 = 120;
+
+fn decision_now() -> io::Result<i64> {
+    let now = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| error("source decision clock before epoch"))?
+            .as_secs(),
+    )
+    .map_err(|_| error("source decision clock overflow"))?;
+    #[cfg(feature = "age319-private-broker-fixture")]
+    if std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1").is_some() {
+        if let Some(offset) =
+            std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_SOURCE_CLOCK_OFFSET_SECONDS_V1")
+        {
+            let offset = offset
+                .to_string_lossy()
+                .parse::<i64>()
+                .map_err(|_| error("invalid private source decision clock offset"))?;
+            return now
+                .checked_add(offset)
+                .ok_or_else(|| error("private source decision clock overflow"));
+        }
+    }
+    Ok(now)
+}
 const OBJECTS: [&str; 4] = [
     "CREATE TABLE clock_floor (id INTEGER PRIMARY KEY CHECK(id=1), unix_seconds INTEGER NOT NULL)",
     "CREATE TABLE decisions (request_id TEXT PRIMARY KEY NOT NULL, registration_id TEXT NOT NULL UNIQUE, caller_admission_id TEXT NOT NULL UNIQUE, decision_id TEXT NOT NULL UNIQUE, claims BLOB NOT NULL, issued_unix_seconds INTEGER NOT NULL, expires_unix_seconds INTEGER NOT NULL)",
@@ -84,6 +109,25 @@ impl Journal {
         decision_id: &str,
         claims: &Claims,
     ) -> io::Result<ExactSourceDecisionReadback> {
+        self.verify_decision_on(request_id, decision_id, claims, false)
+    }
+
+    pub fn verify_committed_retry(
+        &self,
+        request_id: &str,
+        decision_id: &str,
+        claims: &Claims,
+    ) -> io::Result<ExactSourceDecisionReadback> {
+        self.verify_decision_on(request_id, decision_id, claims, true)
+    }
+
+    fn verify_decision_on(
+        &self,
+        request_id: &str,
+        decision_id: &str,
+        claims: &Claims,
+        committed_retry: bool,
+    ) -> io::Result<ExactSourceDecisionReadback> {
         let canonical = uuid::Uuid::parse_str(request_id)
             .map_err(|_| error("invalid source decision request ID"))?;
         if canonical.to_string() != request_id {
@@ -95,13 +139,7 @@ impl Journal {
             return Err(error("noncanonical source decision ID"));
         }
         self.verify()?;
-        let now = i64::try_from(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|_| error("source decision clock before epoch"))?
-                .as_secs(),
-        )
-        .map_err(|_| error("source decision clock overflow"))?;
+        let now = decision_now()?;
         let floor: i64 = self
             .connection
             .query_row(
@@ -120,7 +158,7 @@ impl Journal {
             || stored_claims != serde_json::to_vec(claims).map_err(|e| error(e.to_string()))?
             || issued.checked_add(TTL_SECONDS) != Some(expires)
             || now < floor
-            || now >= expires
+            || (!committed_retry && now >= expires)
         {
             return Err(error("exact source decision conflict or expired"));
         }
@@ -325,13 +363,7 @@ impl Journal {
         request_id: &str,
         claims: &Claims,
     ) -> io::Result<ExactSourceDecisionReadback> {
-        let now = i64::try_from(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|_| error("source decision clock before epoch"))?
-                .as_secs(),
-        )
-        .map_err(|_| error("source decision clock overflow"))?;
+        let now = decision_now()?;
         self.issue_at(request_id, claims, now)
     }
 

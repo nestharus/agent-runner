@@ -506,7 +506,7 @@ fn private_v30_source_witness(
         registration_sha256: format!("{:x}", Sha256::digest(&bytes)),
         owner_session_id: session,
         owner_invocation_uuid: invocation,
-        capability,
+        capability: capability.clone(),
     };
     let broker = broker_socket();
     let request_id = uuid::Uuid::new_v4().to_string();
@@ -570,6 +570,7 @@ fn private_v30_source_witness(
         request_id: request_id.clone(),
         decision_id: decision.decision_id.clone(),
         witness: probe.clone(),
+        committed_retry: false,
     };
     std::fs::write(
         gate_dir.join("source-verification-ready"),
@@ -1023,6 +1024,232 @@ fn private_v30_source_witness(
         return Err("changed original State inode verified".into());
     }
     std::fs::write(gate_dir.join("source-witness-negatives-done"), b"yes")
+        .map_err(|e| e.to_string())?;
+    wait_for("source-expired-before-first")?;
+    let actor = oulipoly_state::CompletionRegistrationAuthority::from_process_environment_value(
+        capability.clone(),
+    )?;
+    let submit =
+        |state: &mut oulipoly_state::StateDb,
+         request: &oulipoly_state::SourceDecisionVerification,
+         fd: i32,
+         bound: &oulipoly_state::completion_continuation::AdmittedSourceBinding| {
+            state.register_completion_continuation_with_broker_decision_at(
+                &broker,
+                oulipoly_state::InvocationMutationAuthority::Standalone,
+                &actor,
+                bound,
+                oulipoly_state::ExactSourceDecisionReference {
+                    verification: request,
+                    guardian_fd: owner_socket.as_raw_fd(),
+                    registration_fd: fd,
+                },
+            )
+        };
+    let mut state = oulipoly_state::StateDb::open_existing(&original_state_path)?;
+    if !submit(
+        &mut state,
+        &inspection_request,
+        registration.as_raw_fd(),
+        &binding,
+    )
+    .is_err_and(|e| e.contains("expired"))
+    {
+        return Err("expired decision admitted before first consumption".into());
+    }
+    std::fs::write(gate_dir.join("source-expired-first-refused"), b"yes")
+        .map_err(|e| e.to_string())?;
+    wait_for("source-state-restored")?;
+    std::fs::write(gate_dir.join("source-stage"), b"state-decision-admission")
+        .map_err(|e| e.to_string())?;
+    let mut bad = inspection_request.clone();
+    bad.decision_id = uuid::Uuid::new_v4().to_string();
+    if submit(&mut state, &bad, registration.as_raw_fd(), &binding).is_ok() {
+        return Err("State registration consumed wrong decision".into());
+    }
+    bad = inspection_request.clone();
+    bad.witness["owner"]["root_id"] = uuid::Uuid::new_v4().to_string().into();
+    if submit(&mut state, &bad, registration.as_raw_fd(), &binding).is_ok() {
+        return Err("State registration consumed wrong root".into());
+    }
+    bad = inspection_request.clone();
+    bad.witness["capability"] = "0".repeat(64).into();
+    if submit(&mut state, &bad, registration.as_raw_fd(), &binding).is_ok() {
+        return Err("State registration consumed wrong capability".into());
+    }
+    if submit(
+        &mut state,
+        &inspection_request,
+        copied_fd.as_raw_fd(),
+        &binding,
+    )
+    .is_ok()
+    {
+        return Err("State registration consumed copied FD".into());
+    }
+    std::fs::write(&path, b"changed registration bytes").map_err(|e| e.to_string())?;
+    let changed_accepted = submit(
+        &mut state,
+        &inspection_request,
+        registration.as_raw_fd(),
+        &binding,
+    )
+    .is_ok();
+    std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+    if changed_accepted {
+        return Err("State registration consumed changed registration bytes".into());
+    }
+    if submit(
+        &mut state,
+        &inspection_request,
+        registration.as_raw_fd(),
+        &wrong_binding,
+    )
+    .is_ok()
+    {
+        return Err("State registration consumed wrong bytes/admission".into());
+    }
+    let mut copied_state = oulipoly_state::StateDb::open_existing(&copied_state_path)?;
+    if submit(
+        &mut copied_state,
+        &inspection_request,
+        registration.as_raw_fd(),
+        &binding,
+    )
+    .is_ok()
+    {
+        return Err("State registration consumed copied State inode".into());
+    }
+    drop(copied_state);
+    let fork = unsafe { libc::fork() };
+    if fork < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    if fork == 0 {
+        let refused = oulipoly_state::StateDb::open_existing(&original_state_path)
+            .and_then(|mut copied_caller| {
+                submit(
+                    &mut copied_caller,
+                    &inspection_request,
+                    registration.as_raw_fd(),
+                    &binding,
+                )
+                .map(|_| ())
+            })
+            .is_err();
+        unsafe { libc::_exit(if refused { 0 } else { 72 }) }
+    }
+    let mut status = 0;
+    if unsafe { libc::waitpid(fork, &mut status, 0) } != fork
+        || !libc::WIFEXITED(status)
+        || libc::WEXITSTATUS(status) != 0
+    {
+        return Err("different process consumed State decision".into());
+    }
+    let fault = rusqlite::Connection::open(&original_state_path).map_err(|e| e.to_string())?;
+    fault.execute_batch("CREATE TRIGGER age319_exact_source_fault BEFORE INSERT ON invocation_completion_exact_source_decisions BEGIN SELECT RAISE(ABORT, 'fixture State fault'); END")
+        .map_err(|e| e.to_string())?;
+    if !submit(
+        &mut state,
+        &inspection_request,
+        registration.as_raw_fd(),
+        &binding,
+    )
+    .is_err_and(|e| e.contains("fixture State fault"))
+    {
+        return Err("State registration did not roll back faulted decision".into());
+    }
+    fault
+        .execute_batch("DROP TRIGGER age319_exact_source_fault")
+        .map_err(|e| e.to_string())?;
+    drop(fault);
+    let inspect = rusqlite::Connection::open(&original_state_path).map_err(|e| e.to_string())?;
+    for table in [
+        "invocation_completion_obligations",
+        "invocation_completion_continuity",
+        "invocation_completion_exact_source_decisions",
+    ] {
+        let count: i64 = inspect
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .map_err(|e| e.to_string())?;
+        if count != 0 {
+            return Err(format!("{table} survived refusal/rollback"));
+        }
+    }
+    drop(inspect);
+    drop(state);
+    let outcomes = std::thread::scope(|scope| -> Result<_, String> {
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let run = |barrier: std::sync::Arc<std::sync::Barrier>| {
+            let mut contender = oulipoly_state::StateDb::open_existing(&original_state_path)?;
+            barrier.wait();
+            submit(
+                &mut contender,
+                &inspection_request,
+                registration.as_raw_fd(),
+                &binding,
+            )
+        };
+        let left = scope.spawn({
+            let barrier = barrier.clone();
+            move || run(barrier)
+        });
+        let right = scope.spawn({
+            let barrier = barrier.clone();
+            move || run(barrier)
+        });
+        barrier.wait();
+        let left = left
+            .join()
+            .map_err(|_| "first State caller panicked".to_string())??;
+        let right = right
+            .join()
+            .map_err(|_| "second State caller panicked".to_string())??;
+        Ok([left, right])
+    })?;
+    if outcomes.iter().filter(|outcome| outcome.inserted).count() != 1
+        || outcomes.iter().any(|outcome| {
+            outcome.projection_available || outcome.decision_id != decision.decision_id
+        })
+    {
+        return Err("two State callers did not consume one exact decision".into());
+    }
+    let mut state = oulipoly_state::StateDb::open_existing(&original_state_path)?;
+    let retry = submit(
+        &mut state,
+        &inspection_request,
+        registration.as_raw_fd(),
+        &binding,
+    )?;
+    if retry.inserted || retry.projection_available || retry.decision_id != decision.decision_id {
+        return Err("State lost-response retry was not exact".into());
+    }
+    if state
+        .repair_admitted_completion_continuation(
+            oulipoly_state::InvocationMutationAuthority::Standalone,
+            &binding,
+        )
+        .is_ok()
+    {
+        return Err("unavailable exact source was projected by historical repair".into());
+    }
+    std::fs::write(gate_dir.join("source-admission-first"), b"yes").map_err(|e| e.to_string())?;
+    wait_for("source-expired-after-commit")?;
+    drop(state);
+    let mut restarted = oulipoly_state::StateDb::open_existing(&original_state_path)?;
+    if submit(
+        &mut restarted,
+        &inspection_request,
+        registration.as_raw_fd(),
+        &binding,
+    )?
+    .inserted
+    {
+        return Err("State restart repeated decision consumption".into());
+    }
+    std::fs::write(gate_dir.join("source-state-admission-done"), b"yes")
         .map_err(|e| e.to_string())?;
     Ok(())
 }
