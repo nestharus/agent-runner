@@ -571,8 +571,11 @@ fn private_v30_source_witness(
         decision_id: decision.decision_id.clone(),
         witness: probe.clone(),
     };
-    std::fs::write(gate_dir.join("source-verification-ready"), b"yes")
-        .map_err(|e| e.to_string())?;
+    std::fs::write(
+        gate_dir.join("source-verification-ready"),
+        serde_json::to_vec(&decision).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
     let writer_deadline = std::time::Instant::now() + PRIVATE_CHILD_EFFECT_WAIT;
     while !gate_dir.join("source-state-writer-held").exists() {
         if std::time::Instant::now() >= writer_deadline {
@@ -811,6 +814,38 @@ fn private_v30_source_witness(
         return Err("source decision changed after broker restart".into());
     }
     std::fs::write(gate_dir.join("source-restart-readback"), b"yes").map_err(|e| e.to_string())?;
+    let wait_for = |name: &str| -> Result<(), String> {
+        let deadline = std::time::Instant::now() + PRIVATE_CHILD_EFFECT_WAIT;
+        while !gate_dir.join(name).exists() {
+            if std::time::Instant::now() >= deadline {
+                return Err(format!("source journal {name} gate expired"));
+            }
+            std::thread::sleep(PRIVATE_CHILD_EFFECT_POLL);
+        }
+        Ok(())
+    };
+    wait_for("source-journal-stale")?;
+    if !verify(&verification, &registration)
+        .is_err_and(|error| error.to_string().contains("decision conflict"))
+    {
+        return Err("stale original State identity row verified".into());
+    }
+    std::fs::write(gate_dir.join("source-journal-stale-refused"), b"yes")
+        .map_err(|e| e.to_string())?;
+    wait_for("source-journal-malformed")?;
+    if !verify(&verification, &registration)
+        .is_err_and(|error| error.to_string().contains("decision conflict"))
+    {
+        return Err("malformed source decision row verified".into());
+    }
+    std::fs::write(gate_dir.join("source-journal-malformed-refused"), b"yes")
+        .map_err(|e| e.to_string())?;
+    wait_for("source-journal-restored")?;
+    if verify(&verification, &registration).map_err(|e| e.to_string())? != decision {
+        return Err("restored source decision changed".into());
+    }
+    std::fs::write(gate_dir.join("source-journal-restored-readback"), b"yes")
+        .map_err(|e| e.to_string())?;
     let deadline = std::time::Instant::now() + PRIVATE_CHILD_EFFECT_WAIT;
     while !gate_dir.join("source-state-replaced").exists() {
         if std::time::Instant::now() >= deadline {
@@ -824,6 +859,13 @@ fn private_v30_source_witness(
             .contains("broker StateDb source identity changed")
     }) {
         return Err("changed original State inode accepted".into());
+    }
+    if !verify(&verification, &registration).is_err_and(|error| {
+        error
+            .to_string()
+            .contains("broker StateDb source identity changed")
+    }) {
+        return Err("changed original State inode verified".into());
     }
     std::fs::write(gate_dir.join("source-witness-negatives-done"), b"yes")
         .map_err(|e| e.to_string())?;

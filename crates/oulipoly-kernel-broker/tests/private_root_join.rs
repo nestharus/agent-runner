@@ -38,6 +38,46 @@ fn stop(child: &mut Child) {
     let _ = child.wait();
 }
 
+fn restart_source_broker(
+    socket: &Path,
+    broker_state: &Path,
+    runner: &str,
+    gate: &Path,
+    log: &Path,
+) -> Child {
+    let mut broker = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
+        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", socket)
+        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", broker_state)
+        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", runner)
+        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", gate)
+        .stderr(Stdio::from(File::create(log).unwrap()))
+        .spawn()
+        .unwrap();
+    eventually(|| {
+        protocol::request_at(socket, Operation::Classify).is_ok()
+            || broker.try_wait().unwrap().is_some()
+    });
+    assert!(
+        broker.try_wait().unwrap().is_none(),
+        "source broker restart: {}",
+        fs::read_to_string(log).unwrap()
+    );
+    broker
+}
+
+fn replace_source_decision_claims(journal_path: &Path, claims: &[u8]) {
+    let journal = rusqlite::Connection::open(journal_path).unwrap();
+    journal
+        .execute_batch("DROP TRIGGER decisions_no_update")
+        .unwrap();
+    journal
+        .execute("UPDATE decisions SET claims=?1", [claims])
+        .unwrap();
+    journal
+        .execute_batch("CREATE TRIGGER decisions_no_update BEFORE UPDATE ON decisions BEGIN SELECT RAISE(ABORT, 'immutable source decision'); END")
+        .unwrap();
+}
+
 fn assert_old_debt_and_no_f_ack(broker_state: &Path) {
     let old = rusqlite::Connection::open_with_flags(
         broker_state.join("sidecar/pid-identity.db"),
@@ -9235,6 +9275,13 @@ fn inner() {
                     fs::read_to_string(&err).unwrap(),
                     fs::read_to_string(&broker_log).unwrap()
                 );
+                let original_state_meta = fs::metadata(data.join("state.db")).unwrap();
+                let issued: protocol::ExactSourceDecisionReadback = serde_json::from_slice(
+                    &fs::read(gate.join("source-verification-ready")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(issued.original_state_device, original_state_meta.dev());
+                assert_eq!(issued.original_state_inode, original_state_meta.ino());
                 let writer = rusqlite::Connection::open(data.join("state.db")).unwrap();
                 writer
                     .execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE")
@@ -9249,6 +9296,11 @@ fn inner() {
                     "verification waited on State writer: {} broker: {}",
                     fs::read_to_string(&err).unwrap(),
                     fs::read_to_string(&broker_log).unwrap()
+                );
+                assert_eq!(
+                    issued.original_state_inode,
+                    fs::metadata(data.join("state.db")).unwrap().ino(),
+                    "read-only verification changed the original State identity under BEGIN EXCLUSIVE"
                 );
                 writer
                     .execute_batch("ROLLBACK; PRAGMA locking_mode=NORMAL")
@@ -9273,6 +9325,7 @@ fn inner() {
                 assert_eq!(marker["owner_generation"], prepared.owner_generation);
                 assert_eq!(marker["invocation_uuid"], *invocation);
                 assert_eq!(marker["session_id"], *session);
+                assert_eq!(marker["decision"], serde_json::to_value(&issued).unwrap());
                 let read_decisions = || {
                     rusqlite::Connection::open_with_flags(
                         &journal_path,
@@ -9300,26 +9353,16 @@ fn inner() {
                 assert_eq!(claims["owner_generation"], prepared.owner_generation);
                 assert_eq!(claims["owner_invocation_uuid"], *invocation);
                 assert_eq!(claims["owner_session_id"], *session);
+                assert_eq!(claims["original_state_device"], original_state_meta.dev());
+                assert_eq!(claims["original_state_inode"], original_state_meta.ino());
                 drop(journal);
                 stop(&mut broker);
-                broker = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
-                    .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
-                    .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &broker_state)
-                    .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
-                    .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
-                    .stderr(Stdio::from(
-                        File::create(temp.path().join("source-broker-restart.log")).unwrap(),
-                    ))
-                    .spawn()
-                    .unwrap();
-                eventually(|| {
-                    protocol::request_at(&socket, Operation::Classify).is_ok()
-                        || broker.try_wait().unwrap().is_some()
-                });
-                assert!(
-                    broker.try_wait().unwrap().is_none(),
-                    "source broker restart: {}",
-                    fs::read_to_string(temp.path().join("source-broker-restart.log")).unwrap()
+                broker = restart_source_broker(
+                    &socket,
+                    &broker_state,
+                    &runner,
+                    &gate,
+                    &temp.path().join("source-broker-restart.log"),
                 );
                 fs::write(gate.join("source-broker-restarted"), b"yes").unwrap();
                 eventually(|| {
@@ -9338,6 +9381,65 @@ fn inner() {
                             .get(0))
                         .unwrap(),
                     1
+                );
+                let mut stale: serde_json::Value = serde_json::from_slice(&claims_bytes).unwrap();
+                stale["original_state_inode"] = (original_state_meta.ino() + 1).into();
+                stop(&mut broker);
+                replace_source_decision_claims(&journal_path, &serde_json::to_vec(&stale).unwrap());
+                broker = restart_source_broker(
+                    &socket,
+                    &broker_state,
+                    &runner,
+                    &gate,
+                    &temp.path().join("source-broker-stale.log"),
+                );
+                fs::write(gate.join("source-journal-stale"), b"yes").unwrap();
+                eventually(|| {
+                    gate.join("source-journal-stale-refused").exists()
+                        || entry.try_wait().unwrap().is_some()
+                });
+                assert!(
+                    gate.join("source-journal-stale-refused").exists(),
+                    "stale journal row: {}",
+                    fs::read_to_string(&err).unwrap()
+                );
+                stop(&mut broker);
+                replace_source_decision_claims(&journal_path, b"{");
+                broker = restart_source_broker(
+                    &socket,
+                    &broker_state,
+                    &runner,
+                    &gate,
+                    &temp.path().join("source-broker-malformed.log"),
+                );
+                fs::write(gate.join("source-journal-malformed"), b"yes").unwrap();
+                eventually(|| {
+                    gate.join("source-journal-malformed-refused").exists()
+                        || entry.try_wait().unwrap().is_some()
+                });
+                assert!(
+                    gate.join("source-journal-malformed-refused").exists(),
+                    "malformed journal row: {}",
+                    fs::read_to_string(&err).unwrap()
+                );
+                stop(&mut broker);
+                replace_source_decision_claims(&journal_path, &claims_bytes);
+                broker = restart_source_broker(
+                    &socket,
+                    &broker_state,
+                    &runner,
+                    &gate,
+                    &temp.path().join("source-broker-restored.log"),
+                );
+                fs::write(gate.join("source-journal-restored"), b"yes").unwrap();
+                eventually(|| {
+                    gate.join("source-journal-restored-readback").exists()
+                        || entry.try_wait().unwrap().is_some()
+                });
+                assert!(
+                    gate.join("source-journal-restored-readback").exists(),
+                    "restored journal row: {}",
+                    fs::read_to_string(&err).unwrap()
                 );
                 let registration_path =
                     std::path::PathBuf::from(marker["registration_path"].as_str().unwrap());

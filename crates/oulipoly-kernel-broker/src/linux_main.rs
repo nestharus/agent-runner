@@ -2142,14 +2142,23 @@ fn verify_exact_source_witness(
             &probe.capability,
         )
         .map_err(io::Error::other)?;
-    if check_original_state {
+    let original_state = if check_original_state {
         sidecar
             .verify_bound_invocation(
                 &probe.owner_invocation_uuid,
                 &probe.owner_session_id,
                 &capability,
             )
-            .map_err(io::Error::other)?;
+            .map_err(io::Error::other)?
+    } else {
+        // Metadata validation is nonwaiting under an exclusive SQLite State
+        // writer. The future consumer must compare this journal identity to
+        // the database it has already opened in its own transaction.
+        sidecar
+            .bound_state_file_identity()
+            .map_err(io::Error::other)?
+    };
+    if check_original_state {
         mark("bound-state");
     }
     if before != exact_registration_snapshot(&registration, &probe.registration_path)? {
@@ -2188,6 +2197,8 @@ fn verify_exact_source_witness(
         registration_device: before.0,
         registration_inode: before.1,
         registration_bytes: before.2,
+        original_state_device: original_state.device,
+        original_state_inode: original_state.inode,
         registration_sha256: probe.registration_sha256,
     })
 }

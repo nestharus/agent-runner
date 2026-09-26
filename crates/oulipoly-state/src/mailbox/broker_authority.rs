@@ -18,6 +18,15 @@ pub struct BrokerSidecar {
     state_source: Option<BoundStateSource>,
 }
 
+/// Identity of the original State file selected by the broker-owned source
+/// binding. A later State transaction must compare these values to its own
+/// opened database before consuming a source decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BoundStateFileIdentity {
+    pub device: u64,
+    pub inode: u64,
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct BoundStateSource {
     pub(super) path: std::path::PathBuf,
@@ -659,6 +668,21 @@ impl BrokerSidecar {
         Ok(state)
     }
 
+    /// Uses the broker's persisted source authority, never a caller path.
+    /// This only checks file metadata and does not open or read State, so the
+    /// decision verifier can call it while a State writer holds its lock.
+    pub fn bound_state_file_identity(&self) -> Result<BoundStateFileIdentity, String> {
+        let source = self
+            .state_source
+            .as_ref()
+            .ok_or("broker StateDb source binding absent")?;
+        verify_bound_state_source(source)?;
+        Ok(BoundStateFileIdentity {
+            device: source.device,
+            inode: source.inode,
+        })
+    }
+
     /// Read of the original, inode-bound State invocation before a broker
     /// source decision. This never registers a source or advances a lifecycle.
     pub fn verify_bound_invocation(
@@ -666,7 +690,7 @@ impl BrokerSidecar {
         invocation_uuid: &str,
         session_id: &str,
         capability: &crate::CompletionRegistrationAuthority,
-    ) -> Result<(), String> {
+    ) -> Result<BoundStateFileIdentity, String> {
         let state = self.bound_state()?;
         let row: Option<(Option<String>, Option<String>, Option<String>)> = state
             .connection()
@@ -702,7 +726,7 @@ impl BrokerSidecar {
         {
             return Err("original State invocation/session/capability mismatch".into());
         }
-        Ok(())
+        self.bound_state_file_identity()
     }
 
     /// Read only the current cursor and one bounded unaccepted page. The

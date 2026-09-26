@@ -2139,6 +2139,11 @@ pub struct ExactSourceDecisionReadback {
     pub registration_path: std::path::PathBuf,
     pub registration_device: u64,
     pub registration_inode: u64,
+    /// Compare these with the State transaction's own opened database before
+    /// consuming the decision. The source_generation above is its authority
+    /// generation; a matching path or copied database does not suffice.
+    pub original_state_device: u64,
+    pub original_state_inode: u64,
     pub registration_len: u64,
     pub registration_sha256: String,
 }

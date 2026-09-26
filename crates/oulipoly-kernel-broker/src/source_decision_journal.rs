@@ -41,6 +41,8 @@ pub struct Claims {
     pub registration_path: PathBuf,
     pub registration_device: u64,
     pub registration_inode: u64,
+    pub original_state_device: u64,
+    pub original_state_inode: u64,
     pub registration_bytes: Vec<u8>,
     pub registration_sha256: String,
 }
@@ -209,7 +211,7 @@ impl Journal {
             }
             journal
                 .connection
-                .pragma_update(None, "user_version", 1)
+                .pragma_update(None, "user_version", 2)
                 .map_err(|e| error(e.to_string()))?;
             journal
                 .connection
@@ -281,7 +283,9 @@ impl Journal {
             .connection
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .map_err(|e| error(e.to_string()))?;
-        if version != 1 {
+        // v1 rows predate original State file identity. They cannot be
+        // migrated without guessing an inode, so refuse the whole artifact.
+        if version != 2 {
             return Err(error("exact source journal schema version mismatch"));
         }
         let application_id: i64 = self
@@ -452,6 +456,8 @@ fn readback(
         registration_path: claims.registration_path.clone(),
         registration_device: claims.registration_device,
         registration_inode: claims.registration_inode,
+        original_state_device: claims.original_state_device,
+        original_state_inode: claims.original_state_inode,
         registration_len: claims.registration_bytes.len() as u64,
         registration_sha256: claims.registration_sha256.clone(),
     }
@@ -503,6 +509,8 @@ mod tests {
             registration_path: "/tmp/registration".into(),
             registration_device: 1,
             registration_inode: 2,
+            original_state_device: 3,
+            original_state_inode: 4,
             registration_bytes: b"exact bytes".to_vec(),
             registration_sha256: "sha256".into(),
         }
@@ -607,6 +615,13 @@ mod tests {
                 .is_err()
         );
         wrong = claims();
+        wrong.original_state_inode += 1;
+        assert!(
+            journal
+                .verify_decision(&request, &issued.decision_id, &wrong)
+                .is_err()
+        );
+        wrong = claims();
         wrong.registration_bytes.push(0);
         assert!(
             journal
@@ -674,6 +689,47 @@ mod tests {
     }
 
     #[test]
+    fn malformed_or_stale_identity_rows_cannot_verify() {
+        let temp = tempfile::tempdir().unwrap();
+        let request = uuid::Uuid::new_v4().to_string();
+        let mut journal = Journal::open(temp.path()).unwrap();
+        let issued = journal.issue(&request, &claims()).unwrap();
+        let replace_claims = |journal: &Journal, bytes: Vec<u8>| {
+            journal
+                .connection
+                .execute_batch("DROP TRIGGER decisions_no_update")
+                .unwrap();
+            journal
+                .connection
+                .execute(
+                    "UPDATE decisions SET claims=?1 WHERE request_id=?2",
+                    params![bytes, request],
+                )
+                .unwrap();
+            journal.connection.execute_batch(OBJECTS[2]).unwrap();
+        };
+        let mut stale = claims();
+        stale.original_state_inode += 1;
+        replace_claims(&journal, serde_json::to_vec(&stale).unwrap());
+        assert!(
+            journal
+                .verify_decision(&request, &issued.decision_id, &claims())
+                .is_err()
+        );
+        drop(journal);
+        let journal = Journal::open(temp.path()).unwrap();
+        replace_claims(
+            &journal,
+            br#"{"missing":"original-state-identity"}"#.to_vec(),
+        );
+        assert!(
+            journal
+                .verify_decision(&request, &issued.decision_id, &claims())
+                .is_err()
+        );
+    }
+
+    #[test]
     fn journal_refuses_incomplete_schema_inode_mode_and_wal_artifacts() {
         for fault in [
             "schema",
@@ -693,7 +749,7 @@ mod tests {
                     drop(journal);
                     Connection::open(&path)
                         .unwrap()
-                        .pragma_update(None, "user_version", 2)
+                        .pragma_update(None, "user_version", 1)
                         .unwrap();
                     assert!(Journal::open(temp.path()).is_err());
                 }
