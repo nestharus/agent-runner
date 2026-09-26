@@ -111,6 +111,13 @@ pub struct PinnedProcess {
     pidns: File,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum ChildExit {
+    Running,
+    ExitedZero,
+    ExitedAbnormally,
+}
+
 fn proc_starttime(pid: i32) -> io::Result<(u64, u8)> {
     let stat = host_proc_read(&format!("{pid}/stat"))?;
     // comm is parenthesized and may itself contain spaces and parentheses.
@@ -268,6 +275,40 @@ impl PinnedProcess {
             1 if pollfd.revents & libc::POLLIN != 0 => Ok(true),
             -1 => Err(io::Error::last_os_error()),
             _ => Err(io::Error::other("pidfd state uncertain")),
+        }
+    }
+
+    /// Read an exact child exit without reaping it. Only the broker that
+    /// forked this pinned process can use this witness; ECHILD after a restart
+    /// or another reaper is uncertainty, never a successful exit.
+    pub fn peek_child_exit(&self) -> io::Result<ChildExit> {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PIDFD,
+                self.pidfd.as_raw_fd() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if info.si_signo == 0 {
+            return Ok(ChildExit::Running);
+        }
+        if info.si_signo != libc::SIGCHLD || unsafe { info.si_pid() } != self.host_pid {
+            return Err(io::Error::other("pinned child exit identity uncertain"));
+        }
+        if info.si_code == libc::CLD_EXITED && unsafe { info.si_status() } == 0 {
+            Ok(ChildExit::ExitedZero)
+        } else if matches!(
+            info.si_code,
+            libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+        ) {
+            Ok(ChildExit::ExitedAbnormally)
+        } else {
+            Err(io::Error::other("pinned child exit status uncertain"))
         }
     }
 

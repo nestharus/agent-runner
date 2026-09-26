@@ -1,4 +1,4 @@
-use crate::identity::{PinnedProcess, boot_id};
+use crate::identity::{ChildExit, PinnedProcess, boot_id};
 use crate::json_artifact;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -6,7 +6,7 @@ use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RootRecord {
     pub version: u32,
@@ -171,6 +171,25 @@ impl RootRegistry {
         self.live.iter()
     }
 
+    /// Observe only the exact PID1 child pinned by this broker incarnation.
+    /// Zero exit is a physical process observation, not proof that ECHILD was
+    /// reached, that accepted work or effects settled, or that an owner closed.
+    /// A restart cannot reconstruct the parent/child wait status from a PID.
+    pub fn observe_init_exit(&self, expected: &RootRecord) -> io::Result<ChildExit> {
+        if self.poisoned || !self.debt.is_empty() {
+            return Err(io::Error::other("uncertain root registry"));
+        }
+        let root = self
+            .live
+            .iter()
+            .find(|root| root.record.root_id == expected.root_id)
+            .ok_or_else(|| io::Error::other("exact live root absent"))?;
+        if root.record != *expected {
+            return Err(io::Error::other("root PID1 incarnation changed"));
+        }
+        root.init.peek_child_exit()
+    }
+
     pub fn insert(&mut self, record: RootRecord) -> io::Result<()> {
         if self.has_debt() {
             return Err(io::Error::other("uncertain root debt"));
@@ -212,4 +231,125 @@ fn is_fresh_staging_name(name: &str) -> bool {
     suffix.len() == 32
         && uuid::Uuid::parse_str(suffix)
             .is_ok_and(|id| id.get_version_num() == 4 && id.simple().to_string() == suffix)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::ChildExit;
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    use std::time::{Duration, Instant};
+
+    fn gated_child() -> (PinnedProcess, UnixStream) {
+        let (parent, mut child_gate) = UnixStream::pair().unwrap();
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            drop(parent);
+            let mut release = [0u8; 1];
+            let code = if child_gate.read_exact(&mut release).is_ok() {
+                0
+            } else {
+                70
+            };
+            unsafe { libc::_exit(code) }
+        }
+        assert!(pid > 0);
+        drop(child_gate);
+        (PinnedProcess::open(pid).unwrap(), parent)
+    }
+
+    fn record(id: &str, init: &PinnedProcess) -> RootRecord {
+        RootRecord {
+            version: 1,
+            boot_id: init.boot_id.clone(),
+            root_id: id.into(),
+            owner_uid: unsafe { libc::getuid() },
+            init_host_pid: init.host_pid,
+            init_starttime_ticks: init.starttime_ticks,
+            pidns_dev: init.pidns_dev,
+            pidns_ino: init.pidns_ino,
+        }
+    }
+
+    fn await_exit(registry: &RootRegistry, root: &RootRecord) -> ChildExit {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let status = registry.observe_init_exit(root).unwrap();
+            if status != ChildExit::Running {
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "child exit observation timed out"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn exact_init_exit_readback_distinguishes_other_root_crash_and_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let (first_init, mut first_gate) = gated_child();
+        let (second_init, second_gate) = gated_child();
+        let first = record(&uuid::Uuid::new_v4().to_string(), &first_init);
+        let second = record(&uuid::Uuid::new_v4().to_string(), &second_init);
+        let registry = RootRegistry {
+            directory: temp.path().into(),
+            live: vec![
+                LiveRoot {
+                    record: first.clone(),
+                    init: first_init,
+                },
+                LiveRoot {
+                    record: second.clone(),
+                    init: second_init,
+                },
+            ],
+            debt: Vec::new(),
+            poisoned: false,
+        };
+        assert_eq!(
+            registry.observe_init_exit(&first).unwrap(),
+            ChildExit::Running
+        );
+        assert_eq!(
+            registry.observe_init_exit(&second).unwrap(),
+            ChildExit::Running
+        );
+        let mut wrong_incarnation = first.clone();
+        wrong_incarnation.init_starttime_ticks += 1;
+        assert!(registry.observe_init_exit(&wrong_incarnation).is_err());
+        let mut unknown_root = first.clone();
+        unknown_root.root_id = uuid::Uuid::new_v4().to_string();
+        assert!(registry.observe_init_exit(&unknown_root).is_err());
+
+        first_gate.write_all(b"go").unwrap();
+        assert_eq!(await_exit(&registry, &first), ChildExit::ExitedZero);
+        assert_eq!(
+            registry.observe_init_exit(&second).unwrap(),
+            ChildExit::Running
+        );
+        assert_eq!(
+            unsafe { libc::kill(second.init_host_pid, libc::SIGKILL) },
+            0
+        );
+        assert_eq!(await_exit(&registry, &second), ChildExit::ExitedAbnormally);
+        drop(second_gate);
+
+        // WNOWAIT preserved both statuses until this broker reaps them.
+        for pid in [first.init_host_pid, second.init_host_pid] {
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        }
+        assert!(registry.observe_init_exit(&first).is_err());
+        fs::write(
+            temp.path().join(format!("{}.json", first.root_id)),
+            serde_json::to_vec(&first).unwrap(),
+        )
+        .unwrap();
+        let restarted = RootRegistry::open(temp.path()).unwrap();
+        assert_eq!(restarted.debt_records().len(), 1);
+        assert!(restarted.observe_init_exit(&first).is_err());
+    }
 }
