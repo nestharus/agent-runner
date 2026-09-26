@@ -1988,6 +1988,40 @@ fn inner() {
                         decisions, 0,
                         "private source must stop before State decision"
                     );
+                    let sidecar = rusqlite::Connection::open_with_flags(
+                        broker_state.join("sidecar/pid-identity.db"),
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                    )
+                    .unwrap();
+                    for table in [
+                        "completion_continuation_source",
+                        "broker_source_effect_grant",
+                        "broker_exact_source_projection",
+                        "broker_fresh_source_admission",
+                    ] {
+                        let count: i64 = sidecar
+                            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                                row.get(0)
+                            })
+                            .unwrap();
+                        assert_eq!(count, 0, "private pre-register source changed {table}");
+                    }
+                    let fresh = rusqlite::Connection::open_with_flags(
+                        broker_state.join("v30/state.db"),
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                    )
+                    .unwrap();
+                    let fresh_sources: i64 = fresh
+                        .query_row(
+                            "SELECT count(*) FROM fresh_bash_source_registration",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        fresh_sources, 0,
+                        "private pre-register source changed fresh State"
+                    );
                     let challenged: serde_json::Value = serde_json::from_slice(
                         &fs::read(gate.join("challenged-owner-readback.json")).unwrap(),
                     )
