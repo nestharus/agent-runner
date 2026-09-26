@@ -6513,6 +6513,8 @@ fn inner() {
                         // even while the exact root and provider remain live.
                         assert_eq!(observed["pid1"], "unknown");
                         assert_eq!(observed["state"], "blocked");
+                        assert_eq!(observed["source_effect_readback_uncertain"], false);
+                        assert_eq!(observed["source_effect"]["consumed_without_evidence"], 0);
                         assert_eq!(observed["state_sidecar_outstanding_unknown"], true);
                         assert_eq!(observed["close_eligible"], false);
                     }
@@ -10071,6 +10073,8 @@ fn inner() {
         assert_eq!(before["root_id"], root);
         assert_eq!(before["fenced"], false);
         assert_eq!(before["state"], "blocked");
+        assert_eq!(before["source_effect_readback_uncertain"], true);
+        assert!(before["source_effect"].is_null());
         assert_eq!(before["state_sidecar_outstanding_unknown"], true);
         assert_eq!(before["close_eligible"], false);
         let mut stale = exact.clone();
@@ -10240,6 +10244,8 @@ fn inner() {
         assert_eq!(after["pid1"], "unknown");
         assert_eq!(after["spent_without_work"], 1);
         assert_eq!(after["state"], "blocked");
+        assert_eq!(after["source_effect_readback_uncertain"], true);
+        assert!(after["source_effect"].is_null());
         assert_eq!(after["state_sidecar_outstanding_unknown"], true);
         assert_eq!(after["close_eligible"], false);
     }

@@ -7,6 +7,7 @@ use crate::identity::ChildExit;
 use crate::registry::{RootRecord, RootRegistry};
 use crate::source_physical::SourcePhysicalRegistry;
 use crate::work_registry::{LiveWork, WorkRecord, WorkRegistry};
+use oulipoly_state::mailbox::{BrokerSidecar, BrokerSourceEffectObligations, PreparedProcessStamp};
 use serde::Serialize;
 use std::io;
 
@@ -31,6 +32,10 @@ pub struct RootDrainInventory {
     pub native_prepared: usize,
     pub native_spent: usize,
     pub source_physical_records: usize,
+    /// Positive debt from the retained broker sidecar only. `None` means its
+    /// exact owner/incarnation could not be read, including an absent sidecar.
+    pub source_effect: Option<BrokerSourceEffectObligations>,
+    pub source_effect_readback_uncertain: bool,
     pub uncertain_registry_or_incarnation: bool,
     pub state_sidecar_outstanding_unknown: bool,
     /// No State/sidecar atomic close or source-admission proof is supplied by
@@ -48,6 +53,7 @@ fn classify_counts(
     native_prepared: usize,
     native_spent: usize,
     source_physical_records: usize,
+    source_effect_unsettled: usize,
 ) -> DrainState {
     if pid1 == "live"
         || entry_unsettled
@@ -58,6 +64,7 @@ fn classify_counts(
         || native_prepared > 0
         || native_spent > 0
         || source_physical_records > 0
+        || source_effect_unsettled > 0
     {
         DrainState::Blocked
     } else {
@@ -92,6 +99,7 @@ pub fn readback(
     works: &WorkRegistry,
     grants: &GrantRegistry,
     sources: &SourcePhysicalRegistry,
+    sidecar: Option<&BrokerSidecar>,
 ) -> io::Result<RootDrainInventory> {
     roots.exact_record(expected)?;
     let stamp = ProcessStamp {
@@ -101,6 +109,19 @@ pub fn readback(
         pidns_dev: expected.pidns_dev,
         pidns_ino: expected.pidns_ino,
     };
+    let source_effect = sidecar.and_then(|sidecar| {
+        let root_init = PreparedProcessStamp {
+            host_pid: expected.init_host_pid,
+            boot_id: expected.boot_id.clone(),
+            starttime_ticks: expected.init_starttime_ticks,
+            pidns_dev: expected.pidns_dev,
+            pidns_ino: expected.pidns_ino,
+        };
+        sidecar
+            .read_root_source_effect_obligations(&expected.root_id, &root_init)
+            .ok()
+    });
+    let source_effect_readback_uncertain = source_effect.is_none();
     let root_grants: Vec<_> = grants
         .records()
         .iter()
@@ -179,6 +200,9 @@ pub fn readback(
             native_prepared,
             native_spent,
             source_records.len(),
+            source_effect
+                .as_ref()
+                .map_or(0, BrokerSourceEffectObligations::unsettled),
         ),
         pid1,
         entry_unsettled,
@@ -189,6 +213,8 @@ pub fn readback(
         native_prepared,
         native_spent,
         source_physical_records: source_records.len(),
+        source_effect,
+        source_effect_readback_uncertain,
         uncertain_registry_or_incarnation,
         state_sidecar_outstanding_unknown: true,
         close_eligible: false,
@@ -202,19 +228,19 @@ mod tests {
     #[test]
     fn accepted_pre_fork_and_adopted_work_never_look_empty() {
         assert_eq!(
-            classify_counts("exited_zero_unreaped", false, 0, 1, 0, 0, 0, 0, 0),
+            classify_counts("exited_zero_unreaped", false, 0, 1, 0, 0, 0, 0, 0, 0),
             DrainState::Blocked
         );
         assert_eq!(
-            classify_counts("exited_zero_unreaped", false, 0, 0, 1, 0, 0, 0, 0),
+            classify_counts("exited_zero_unreaped", false, 0, 0, 1, 0, 0, 0, 0, 0),
             DrainState::Blocked
         );
         assert_eq!(
-            classify_counts("exited_zero_unreaped", false, 0, 0, 0, 1, 0, 0, 0),
+            classify_counts("exited_zero_unreaped", false, 0, 0, 0, 1, 0, 0, 0, 0),
             DrainState::Blocked
         );
         assert_eq!(
-            classify_counts("exited_zero_unreaped", false, 0, 0, 0, 0, 0, 1, 0),
+            classify_counts("exited_zero_unreaped", false, 0, 0, 0, 0, 0, 1, 0, 0),
             DrainState::Blocked
         );
     }
@@ -222,15 +248,19 @@ mod tests {
     #[test]
     fn zero_visible_records_and_restart_uncertainty_do_not_certify_close() {
         assert_eq!(
-            classify_counts("unknown", false, 0, 0, 0, 0, 0, 0, 0),
+            classify_counts("unknown", false, 0, 0, 0, 0, 0, 0, 0, 0),
             DrainState::Unknown
         );
         assert_eq!(
-            classify_counts("exited_zero_unreaped", false, 0, 0, 0, 0, 0, 0, 0),
+            classify_counts("exited_zero_unreaped", false, 0, 0, 0, 0, 0, 0, 0, 0),
             DrainState::Unknown
         );
         assert_eq!(
-            classify_counts("live", false, 0, 0, 0, 0, 0, 0, 0),
+            classify_counts("live", false, 0, 0, 0, 0, 0, 0, 0, 0),
+            DrainState::Blocked
+        );
+        assert_eq!(
+            classify_counts("exited_zero_unreaped", false, 0, 0, 0, 0, 0, 0, 0, 1),
             DrainState::Blocked
         );
     }

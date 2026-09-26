@@ -239,6 +239,113 @@ pub struct BrokerSourceEvidenceReadback {
     pub revision: i64,
 }
 
+/// A positive-only inventory of the retained broker's source-effect ledger.
+/// Zero rows do not certify that State, the fresh lane, or copied v29 WAL has
+/// no obligations. In particular, `consumed_without_evidence` preserves the
+/// gap between spending W and recording its physical result.
+#[derive(Debug, Clone, Default, serde::Serialize, PartialEq, Eq)]
+pub struct BrokerSourceEffectObligations {
+    pub reserved: usize,
+    pub consumed_without_evidence: usize,
+    pub unknown: usize,
+    pub captured: usize,
+    pub accepted: usize,
+}
+
+impl BrokerSourceEffectObligations {
+    pub fn unsettled(&self) -> usize {
+        self.reserved + self.consumed_without_evidence + self.unknown + self.captured
+    }
+}
+
+fn source_effect_obligations_on(
+    conn: &Connection,
+    source_generation: &str,
+    root_id: &str,
+    owner_generation: &str,
+) -> Result<BrokerSourceEffectObligations, String> {
+    let orphan_grant: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM broker_source_effect_grant g
+         LEFT JOIN broker_prepared_owner p ON p.root_id=g.root_id
+         WHERE p.owner_generation IS NULL OR p.owner_generation!=g.owner_generation
+            OR p.source_generation!=g.source_generation)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if orphan_grant {
+        return Err("orphan broker source grant row".into());
+    }
+    // A foreign/orphan evidence row has no trustworthy root attribution. It
+    // invalidates this readback rather than disappearing in the join.
+    let orphan: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM broker_source_evidence e
+         LEFT JOIN broker_source_effect_grant g ON g.grant_id=e.grant_id
+         WHERE g.grant_id IS NULL OR e.source_generation!=g.source_generation
+            OR e.registration_id!=g.registration_id)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if orphan {
+        return Err("orphan broker source evidence row".into());
+    }
+    let mut statement = conn
+        .prepare(
+            "SELECT g.source_generation,g.owner_generation,g.phase,e.phase,
+                    g.registration_id,e.source_generation,e.registration_id
+         FROM broker_source_effect_grant g
+         LEFT JOIN broker_source_evidence e ON e.grant_id=g.grant_id
+         WHERE g.root_id=?1 ORDER BY g.grant_id",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([root_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut result = BrokerSourceEffectObligations::default();
+    for row in rows {
+        let (
+            generation,
+            owner,
+            phase,
+            evidence,
+            registration,
+            evidence_generation,
+            evidence_registration,
+        ) = row.map_err(|e| e.to_string())?;
+        if generation != source_generation || owner != owner_generation {
+            return Err("source effect grant has wrong root owner or generation".into());
+        }
+        if evidence.is_some()
+            && (evidence_generation.as_deref() != Some(generation.as_str())
+                || evidence_registration.as_deref() != Some(registration.as_str()))
+        {
+            return Err("source effect evidence attribution changed".into());
+        }
+        match (phase.as_str(), evidence.as_deref()) {
+            ("reserved", None) => result.reserved += 1,
+            ("consumed", None) => result.consumed_without_evidence += 1,
+            ("unknown", None) | ("consumed", Some("unknown")) => result.unknown += 1,
+            ("consumed", Some("captured")) => result.captured += 1,
+            ("consumed", Some("accepted")) => result.accepted += 1,
+            _ => return Err("source effect grant/evidence phase conflict".into()),
+        }
+    }
+    Ok(result)
+}
+
 fn consume_source_grant_row(
     conn: &Connection,
     material: &BrokerSourceMaterial,
@@ -506,6 +613,41 @@ pub struct BrokerNativeGrantReadback {
 }
 
 impl BrokerSidecar {
+    /// Read the source-effect grants on this retained connection for one
+    /// broker-persisted root/PID1 incarnation. The caller must first check the
+    /// exact RootRecord and admission fence. This is only a positive blocker;
+    /// the old State WAL and fresh v30 stores have separate writers.
+    pub fn read_root_source_effect_obligations(
+        &self,
+        root_id: &str,
+        root_init: &PreparedProcessStamp,
+    ) -> Result<BrokerSourceEffectObligations, String> {
+        self.check_mailbox_read(&self.source_generation)?;
+        let owner: Option<String> = self
+            .mailbox
+            .conn
+            .query_row(
+                "SELECT owner_generation FROM broker_prepared_owner WHERE root_id=?1",
+                [root_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let owner = owner.ok_or("broker prepared owner absent for root source readback")?;
+        let prepared = self.read_exact_prepared_owner(&self.source_generation, root_id, &owner)?;
+        if &prepared.root_init != root_init {
+            return Err("broker source root PID1 incarnation changed".into());
+        }
+        let obligations = source_effect_obligations_on(
+            &self.mailbox.conn,
+            &self.source_generation,
+            root_id,
+            &owner,
+        )?;
+        self.check_mailbox_read(&self.source_generation)?;
+        Ok(obligations)
+    }
+
     pub(super) fn bound_state(&self) -> Result<StateDb, String> {
         let source = self
             .state_source
@@ -3614,6 +3756,128 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn source_effect_obligations_retain_spent_gap_restart_wal_and_orphans() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
+            .unwrap();
+        conn.execute_batch("CREATE TABLE broker_prepared_owner(root_id TEXT PRIMARY KEY,owner_generation TEXT NOT NULL,source_generation TEXT NOT NULL);")
+            .unwrap();
+        conn.execute_batch(schema::BROKER_SOURCE_EFFECT_GRANT_SCHEMA)
+            .unwrap();
+        conn.execute_batch(schema::BROKER_SOURCE_EVIDENCE_SCHEMA)
+            .unwrap();
+        let root = uuid::Uuid::new_v4().to_string();
+        let other = uuid::Uuid::new_v4().to_string();
+        let generation = uuid::Uuid::new_v4().to_string();
+        let owner = uuid::Uuid::new_v4().to_string();
+        for id in [&root, &other] {
+            conn.execute("INSERT INTO broker_prepared_owner(root_id,owner_generation,source_generation) VALUES(?1,?2,?3)", params![id,owner,generation]).unwrap();
+        }
+        let insert = |root_id: &str, phase: &str| {
+            let grant = uuid::Uuid::new_v4().to_string();
+            let registration = uuid::Uuid::new_v4().to_string();
+            conn.execute(
+                "INSERT INTO broker_source_effect_grant
+                 (grant_id,source_generation,root_id,owner_generation,driver_identity,
+                  authority_ordinal,registration_id,registration_digest,registration_bytes,
+                  listener_revision,listener_json,phase,revision)
+                 VALUES(?1,?2,?3,?4,'{}',1,?5,'digest',X'01',1,'{}',?6,1)",
+                params![grant, generation, root_id, owner, registration, phase],
+            )
+            .unwrap();
+            (grant, registration)
+        };
+        let (_reserved, _) = insert(&root, "reserved");
+        let (spent, registration) = insert(&root, "consumed");
+        let _sibling = insert(&other, "consumed");
+        let before = source_effect_obligations_on(&conn, &generation, &root, &owner).unwrap();
+        assert_eq!(before.reserved, 1);
+        assert_eq!(before.consumed_without_evidence, 1);
+        assert_eq!(before.unsettled(), 2);
+        assert!(source_effect_obligations_on(&conn, "stale", &root, &owner).is_err());
+        assert_eq!(
+            source_effect_obligations_on(&conn, &generation, &other, &owner)
+                .unwrap()
+                .consumed_without_evidence,
+            1
+        );
+        let wal_reader = Connection::open(&path).unwrap();
+        assert_eq!(
+            source_effect_obligations_on(&wal_reader, &generation, &root, &owner)
+                .unwrap()
+                .consumed_without_evidence,
+            1
+        );
+        drop(wal_reader);
+        drop(conn);
+        let conn = Connection::open(&path).unwrap();
+        let after = source_effect_obligations_on(&conn, &generation, &root, &owner).unwrap();
+        assert_eq!(after.consumed_without_evidence, 1);
+        conn.execute(
+            "INSERT INTO broker_source_evidence
+             (grant_id,source_generation,registration_id,seal_json,phase,revision)
+             VALUES(?1,?2,?3,NULL,'unknown',1)",
+            params![spent, generation, registration],
+        )
+        .unwrap();
+        assert_eq!(
+            source_effect_obligations_on(&conn, &generation, &root, &owner)
+                .unwrap()
+                .unknown,
+            1
+        );
+        conn.execute(
+            "UPDATE broker_source_evidence SET source_generation='stale' WHERE grant_id=?1",
+            [&spent],
+        )
+        .unwrap();
+        assert!(source_effect_obligations_on(&conn, &generation, &root, &owner).is_err());
+        conn.execute(
+            "UPDATE broker_source_evidence SET source_generation=?2 WHERE grant_id=?1",
+            params![spent, generation],
+        )
+        .unwrap();
+        let orphan_grant = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO broker_source_effect_grant
+             (grant_id,source_generation,root_id,owner_generation,driver_identity,
+              authority_ordinal,registration_id,registration_digest,registration_bytes,
+              listener_revision,listener_json,phase,revision)
+             VALUES(?1,?2,?3,?4,'{}',1,?5,'digest',X'01',1,'{}','consumed',2)",
+            params![
+                orphan_grant,
+                generation,
+                uuid::Uuid::new_v4().to_string(),
+                owner,
+                uuid::Uuid::new_v4().to_string()
+            ],
+        )
+        .unwrap();
+        assert!(source_effect_obligations_on(&conn, &generation, &root, &owner).is_err());
+        conn.execute(
+            "DELETE FROM broker_source_effect_grant WHERE grant_id=?1",
+            [&orphan_grant],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        conn.execute(
+            "INSERT INTO broker_source_evidence
+             (grant_id,source_generation,registration_id,seal_json,phase,revision)
+             VALUES(?1,?2,?3,NULL,'unknown',1)",
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                generation,
+                uuid::Uuid::new_v4().to_string()
+            ],
+        )
+        .unwrap();
+        assert!(source_effect_obligations_on(&conn, &generation, &root, &owner).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn prepared_owner_requires_atomic_exact_release_before_running() {
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("sidecar");
@@ -3684,6 +3948,27 @@ mod tests {
         reused_pid.driver.host_pid = reused_pid.guardian.host_pid;
         assert!(broker.prepare_exact_owner(&reused_pid).is_err());
         assert_eq!(broker.prepare_exact_owner(&prepared).unwrap(), prepared);
+        assert_eq!(
+            broker
+                .read_root_source_effect_obligations(&prepared.root_id, &prepared.root_init)
+                .unwrap(),
+            BrokerSourceEffectObligations::default()
+        );
+        let mut stale_init = prepared.root_init.clone();
+        stale_init.starttime_ticks += 1;
+        assert!(
+            broker
+                .read_root_source_effect_obligations(&prepared.root_id, &stale_init)
+                .is_err()
+        );
+        assert!(
+            broker
+                .read_root_source_effect_obligations(
+                    &uuid::Uuid::new_v4().to_string(),
+                    &prepared.root_init
+                )
+                .is_err()
+        );
         assert!(broker.prepare_exact_owner(&prepared).is_err());
         let mut same_root = prepared.clone();
         same_root.owner_generation = uuid::Uuid::new_v4().to_string();
@@ -3853,8 +4138,33 @@ mod tests {
         assert_eq!(released.prepared, prepared);
         assert_eq!(released.owner.owner_generation, prepared.owner_generation);
         assert!(broker.commit_exact_prepared_release(&prepared).is_err());
+        broker
+            .mailbox
+            .conn
+            .execute(
+                "INSERT INTO broker_source_effect_grant
+             (grant_id,source_generation,root_id,owner_generation,driver_identity,
+              authority_ordinal,registration_id,registration_digest,registration_bytes,
+              listener_revision,listener_json,phase,revision)
+             VALUES(?1,?2,?3,?4,'{}',1,?5,'digest',X'01',1,'{}','consumed',2)",
+                params![
+                    uuid::Uuid::new_v4().to_string(),
+                    source_generation,
+                    prepared.root_id,
+                    prepared.owner_generation,
+                    uuid::Uuid::new_v4().to_string()
+                ],
+            )
+            .unwrap();
         drop(broker);
         let broker = open_with_owner(&path, uid, root.path()).unwrap();
+        assert_eq!(
+            broker
+                .read_root_source_effect_obligations(&prepared.root_id, &prepared.root_init)
+                .unwrap()
+                .consumed_without_evidence,
+            1
+        );
         assert_eq!(
             broker
                 .read_exact_prepared_owner(

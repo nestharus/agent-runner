@@ -3392,6 +3392,7 @@ fn serve() -> io::Result<()> {
                 }
                 let inventory = root_drain::readback(
                     &expected, &registry, &entries, &works, &grants, &source_physical,
+                    broker_sidecar.as_ref(),
                 )?;
                 Ok(format!("root-drain-v1 {}\n", serde_json::to_string(&inventory)?))
             } else if operation == b'i' {
