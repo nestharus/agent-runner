@@ -2118,13 +2118,17 @@ pub struct SourceWitnessProbe {
     pub owner_session_id: String,
     pub owner_invocation_uuid: String,
     pub capability: String,
+    /// H's accepted intent, independently opened and matched to its pinned
+    /// grant artifact. Original joined-child decisions leave this absent.
+    #[serde(default)]
+    pub accepted_intent_path: Option<std::path::PathBuf>,
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]
 pub type PrivateSourceWitnessProbe = SourceWitnessProbe;
 
-/// The request ID is chosen and retained by the original child before its
-/// first challenged request. A retry must present the same live evidence.
+/// The requesting J child or consumed-H sealed helper retains this ID across
+/// an uncertain reply. A retry must present the same live evidence.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExactSourceDecisionRequest {
@@ -2133,8 +2137,8 @@ pub struct ExactSourceDecisionRequest {
 }
 
 /// A challenged, read-only check of an already issued decision. The broker
-/// rechecks the live original child, held release, guardian and file FD; it
-/// does not read State, so this operation can run under a State writer.
+/// rechecks the live issuer, registration worker, held release, guardian and
+/// file FD; it does not read State, so it can run under a State writer.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExactSourceDecisionVerification {
@@ -2165,6 +2169,10 @@ pub struct ExactSourceDecisionReadback {
     pub guardian: ProcessWitness,
     pub driver: ProcessWitness,
     pub issuer: crate::entry_registry::ProcessStamp,
+    pub issuer_kind: ExactSourceIssuerKind,
+    /// The creator named in the immutable registration. For original J this
+    /// is the issuer; for consumed H it is the live Bash worker.
+    pub registration_worker: crate::entry_registry::ProcessStamp,
     pub owner_session_id: String,
     pub owner_invocation_uuid: String,
     pub capability_digest: String,
@@ -2181,6 +2189,13 @@ pub struct ExactSourceDecisionReadback {
     pub original_state_inode: u64,
     pub registration_len: u64,
     pub registration_sha256: String,
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExactSourceIssuerKind {
+    OriginalJoinedChild,
+    ConsumedHSealedHelper,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

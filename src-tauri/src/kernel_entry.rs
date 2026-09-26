@@ -75,6 +75,220 @@ fn private_normal_mode() -> bool {
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]
+pub(crate) fn private_consumed_h_source_decision_entry() -> Option<ExitCode> {
+    if std::env::args().nth(1).as_deref() != Some("__age319-private-consumed-h-source-decision-v1")
+    {
+        return None;
+    }
+    let result = (|| -> Result<serde_json::Value, String> {
+        use oulipoly_kernel_broker::protocol::{
+            ExactSourceDecisionRequest, ExactSourceDecisionVerification, OwnerWitness,
+            ProcessWitness, SourceWitnessProbe,
+        };
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::OpenOptionsExt;
+        let args: Vec<_> = std::env::args_os().collect();
+        if args.len() != 4 {
+            return Err("private consumed H helper arguments invalid".into());
+        }
+        let registration_path = PathBuf::from(&args[2]);
+        let intent_path = PathBuf::from(&args[3]);
+        let registration = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&registration_path)
+            .map_err(|e| e.to_string())?;
+        let bytes = std::fs::read(&registration_path).map_err(|e| e.to_string())?;
+        let source: oulipoly_state::completion_continuation::SourceRegistration =
+            serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        source.validate()?;
+        // /proc is mounted from the observer namespace; libc PIDs are local
+        // to K. The registration and Broker use observer (host) PIDs.
+        let observer_stat = |path: &std::path::Path| -> Result<(i32, i32), String> {
+            let stat = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+            let (head, tail) = stat
+                .rsplit_once(") ")
+                .ok_or("private decision proc stat malformed")?;
+            let pid: i32 = head
+                .split(' ')
+                .next()
+                .ok_or("private decision proc PID absent")?
+                .parse()
+                .map_err(|_| "private decision proc PID invalid")?;
+            let ppid: i32 = tail
+                .split_ascii_whitespace()
+                .nth(1)
+                .ok_or("private decision proc parent absent")?
+                .parse()
+                .map_err(|_| "private decision proc parent invalid")?;
+            Ok((pid, ppid))
+        };
+        let (helper_pid, worker_pid) = observer_stat(std::path::Path::new("/proc/self/stat"))?;
+        if source.registering_caller.pid != i64::from(worker_pid) {
+            return Err("private decision helper is not child of Bash registration worker".into());
+        }
+        let (_, k_pid) = observer_stat(std::path::Path::new(&format!("/proc/{worker_pid}/stat")))?;
+        let discovery = crate::completion_owner::discover_v30_owner(Some(k_pid))?;
+        let endpoint = &discovery.owner.endpoint;
+        let guardian = UnixStream::connect(endpoint).map_err(|e| e.to_string())?;
+        let stamp = |source: &oulipoly_state::completion_continuation::SourceProcessIdentity| -> Result<ProcessWitness, String> {
+            Ok(ProcessWitness {
+                host_pid: i32::try_from(source.pid).map_err(|e| e.to_string())?,
+                boot_id: source.boot_id.clone(),
+                starttime_ticks: u64::try_from(source.starttime_ticks).map_err(|e| e.to_string())?,
+            })
+        };
+        let capability = std::env::var(oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV)
+            .map_err(|_| "private decision capability absent")?;
+        let work_id = std::env::var("AGENT_BASH_OWNER_WORK_ID_V1")
+            .map_err(|_| "private decision work ID absent")?;
+        let owner = OwnerWitness {
+            root_id: discovery.root_id.clone(),
+            domain_id: discovery.owner.domain_id.clone(),
+            supervisor_id: discovery.owner.supervisor_authority_id.clone(),
+            guardian: stamp(&discovery.owner.guardian_identity)?,
+            driver: stamp(&discovery.owner.driver_identity)?,
+            owner_generation: Some(discovery.owner.owner_generation.clone()),
+            work_id: Some(work_id),
+            owner_session_id: Some(source.owner_session_id.clone()),
+            owner_invocation_uuid: Some(source.owner_invocation_uuid.clone()),
+            registration_authority_sha256: Some(format!(
+                "{:x}",
+                Sha256::digest(capability.as_bytes())
+            )),
+        };
+        let witness = SourceWitnessProbe {
+            owner,
+            source_generation: discovery.source_generation.clone(),
+            owner_generation: discovery.owner.owner_generation.clone(),
+            registration_path: registration_path.clone(),
+            registration_len: bytes.len() as u64,
+            registration_sha256: format!("{:x}", Sha256::digest(&bytes)),
+            owner_session_id: source.owner_session_id.clone(),
+            owner_invocation_uuid: source.owner_invocation_uuid.clone(),
+            capability,
+            accepted_intent_path: Some(intent_path),
+        };
+        let broker = broker_socket();
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let request = ExactSourceDecisionRequest {
+            request_id: request_id.clone(),
+            witness: witness.clone(),
+        };
+        protocol::issue_exact_source_decision_drop_reply_at(
+            &broker,
+            &request,
+            guardian.as_raw_fd(),
+            registration.as_raw_fd(),
+        )
+        .map_err(|e| format!("private consumed H lost reply: {e}"))?;
+        let first = protocol::issue_exact_source_decision_at(
+            &broker,
+            &request,
+            guardian.as_raw_fd(),
+            registration.as_raw_fd(),
+        )
+        .map_err(|e| format!("private consumed H issue/retry: {e}"))?;
+        let verify = ExactSourceDecisionVerification {
+            request_id: request_id.clone(),
+            decision_id: first.decision_id.clone(),
+            witness: witness.clone(),
+            committed_retry: false,
+        };
+        let second = protocol::verify_exact_source_decision_at(
+            &broker,
+            &verify,
+            guardian.as_raw_fd(),
+            registration.as_raw_fd(),
+        )
+        .map_err(|e| format!("private consumed H readback: {e}"))?;
+        if first != second
+            || first.issuer_kind != protocol::ExactSourceIssuerKind::ConsumedHSealedHelper
+            || first.registration_worker.host_pid != worker_pid
+            || first.issuer.host_pid != helper_pid
+        {
+            return Err("private consumed H actor/readback changed".into());
+        }
+        let mut changed = request.clone();
+        changed.witness.source_generation = uuid::Uuid::new_v4().to_string();
+        if protocol::issue_exact_source_decision_at(
+            &broker,
+            &changed,
+            guardian.as_raw_fd(),
+            registration.as_raw_fd(),
+        )
+        .is_ok()
+        {
+            return Err("private consumed H changed source accepted".into());
+        }
+        let mut changed = request.clone();
+        changed.witness.owner.root_id = uuid::Uuid::new_v4().to_string();
+        if protocol::issue_exact_source_decision_at(
+            &broker,
+            &changed,
+            guardian.as_raw_fd(),
+            registration.as_raw_fd(),
+        )
+        .is_ok()
+        {
+            return Err("private consumed H other root accepted".into());
+        }
+        let (wrong_guardian, _other) = UnixStream::pair().map_err(|e| e.to_string())?;
+        if protocol::issue_exact_source_decision_at(
+            &broker,
+            &request,
+            wrong_guardian.as_raw_fd(),
+            registration.as_raw_fd(),
+        )
+        .is_ok()
+        {
+            return Err("private consumed H wrong guardian accepted".into());
+        }
+        let copied_path = registration_path.with_file_name("copied-source-registration-v2.json");
+        std::fs::write(&copied_path, &bytes).map_err(|e| e.to_string())?;
+        let copied = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&copied_path)
+            .map_err(|e| e.to_string())?;
+        if protocol::issue_exact_source_decision_at(
+            &broker,
+            &request,
+            guardian.as_raw_fd(),
+            copied.as_raw_fd(),
+        )
+        .is_ok()
+        {
+            return Err("private consumed H copied registration accepted".into());
+        }
+        let mut changed = request.clone();
+        changed.request_id = uuid::Uuid::new_v4().to_string();
+        if protocol::issue_exact_source_decision_at(
+            &broker,
+            &changed,
+            guardian.as_raw_fd(),
+            registration.as_raw_fd(),
+        )
+        .is_ok()
+        {
+            return Err("private consumed H second request accepted".into());
+        }
+        Ok(serde_json::json!({"decision": first, "retry": second,
+            "negatives": ["changed_source", "other_root", "wrong_guardian", "copied_fd", "second_request"]}))
+    })();
+    Some(match result {
+        Ok(value) => {
+            println!("{}", value);
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("private consumed H decision: {error}");
+            ExitCode::FAILURE
+        }
+    })
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
 fn private_v30_child_mode() -> bool {
     std::env::var_os("OULIPOLY_KERNEL_V30_PRIVATE_CHILD_V1").is_some()
         && std::env::var_os(CHILD_FD_ENV).is_some()
@@ -507,6 +721,7 @@ fn private_v30_source_witness(
         owner_session_id: session,
         owner_invocation_uuid: invocation,
         capability: capability.clone(),
+        accepted_intent_path: None,
     };
     let broker = broker_socket();
     let request_id = uuid::Uuid::new_v4().to_string();
@@ -563,6 +778,11 @@ fn private_v30_source_witness(
     .map_err(|e| format!("source decision lost reply: {e}"))?;
     let decision =
         check(&probe, &registration).map_err(|e| format!("combined source decision: {e}"))?;
+    if decision.issuer_kind != protocol::ExactSourceIssuerKind::OriginalJoinedChild
+        || decision.registration_worker != decision.issuer
+    {
+        return Err("original J decision actor readback changed".into());
+    }
     if check(&probe, &registration).map_err(|e| e.to_string())? != decision {
         return Err("same-request decision replay changed".into());
     }
@@ -620,10 +840,9 @@ fn private_v30_source_witness(
     }
     altered = verification.clone();
     altered.witness.owner.work_id = Some(uuid::Uuid::new_v4().to_string());
-    if !verify(&altered, &registration).is_err_and(|e| {
-        e.to_string()
-            .contains("consumed-H source decision route unavailable")
-    }) {
+    if !verify(&altered, &registration)
+        .is_err_and(|e| e.to_string().contains("consumed H work absent"))
+    {
         return Err("consumed-H source decision verified".into());
     }
     let copied_path = source_dir.join("verification-copy.json");
@@ -825,11 +1044,9 @@ fn private_v30_source_witness(
     std::fs::write(gate_dir.join("source-stage"), b"broker-positive").map_err(|e| e.to_string())?;
     let mut wrong = probe.clone();
     wrong.owner.work_id = Some(uuid::Uuid::new_v4().to_string());
-    if !check(&wrong, &registration).is_err_and(|error| {
-        error
-            .to_string()
-            .contains("consumed-H source decision route unavailable")
-    }) {
+    if !check(&wrong, &registration)
+        .is_err_and(|error| error.to_string().contains("consumed H work absent"))
+    {
         return Err("unproved consumed-H source decision route accepted".into());
     }
     wrong = probe.clone();

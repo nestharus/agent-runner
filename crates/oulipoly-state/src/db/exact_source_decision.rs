@@ -3,7 +3,9 @@
 //! in its own admission transaction.
 
 use super::{RusqliteOptionalExtension, StateDb, sqlite};
-use crate::completion_continuation::{AdmittedSourceBinding, completion_obligation_admission_id};
+use crate::completion_continuation::{
+    AdmittedSourceBinding, SourceProcessIdentity, completion_obligation_admission_id,
+};
 use crate::mailbox::PreparedProcessStamp;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -55,6 +57,8 @@ pub struct SourceDecisionInspection {
     pub owner_invocation_uuid: String,
     pub owner_session_id: String,
     pub issuer: PreparedProcessStamp,
+    pub issuer_kind: String,
+    pub registration_worker: PreparedProcessStamp,
     pub registration_id: String,
     pub registration_sha256: String,
     pub original_state_device: u64,
@@ -80,6 +84,8 @@ pub(super) struct BrokerReadback {
     owner_invocation_uuid: String,
     owner_session_id: String,
     issuer: PreparedProcessStamp,
+    issuer_kind: String,
+    registration_worker: PreparedProcessStamp,
     capability_digest: String,
     caller_admission_id: String,
     handle: String,
@@ -168,7 +174,7 @@ impl BrokerReadback {
 }
 
 impl StateDb {
-    /// Probe an already issued original-child decision while this opened State
+    /// Probe an already issued exact-source decision while this opened State
     /// database holds BEGIN IMMEDIATE. This does not commit or grant admission.
     pub fn inspect_original_child_decision(
         &mut self,
@@ -277,10 +283,12 @@ pub(super) fn verify_decision_in_transaction(
         || readback.supervisor_id != witness_string(witness, &["owner", "supervisor_id"])?
         || readback.owner_invocation_uuid != source.owner_invocation_uuid
         || readback.owner_session_id != source.owner_session_id
-        || i64::from(readback.issuer.host_pid) != source.registering_caller.pid
-        || readback.issuer.boot_id != source.registering_caller.boot_id
-        || i64::try_from(readback.issuer.starttime_ticks).ok()
-            != Some(source.registering_caller.starttime_ticks)
+        || !matches_registration_actors(
+            &readback.issuer_kind,
+            &readback.issuer,
+            &readback.registration_worker,
+            &source.registering_caller,
+        )
         || readback.handle != source.handle
         || readback.registration_id != source.registration_id
         || readback.registration_path
@@ -346,6 +354,8 @@ pub(super) fn verify_decision_in_transaction(
         owner_invocation_uuid: readback.owner_invocation_uuid.clone(),
         owner_session_id: readback.owner_session_id.clone(),
         issuer: readback.issuer.clone(),
+        issuer_kind: readback.issuer_kind.clone(),
+        registration_worker: readback.registration_worker.clone(),
         registration_id: readback.registration_id.clone(),
         registration_sha256: readback.registration_sha256.clone(),
         original_state_device: readback.original_state_device,
@@ -355,6 +365,87 @@ pub(super) fn verify_decision_in_transaction(
         inspection,
         readback,
     })
+}
+
+fn matches_registration_actors(
+    kind: &str,
+    issuer: &PreparedProcessStamp,
+    worker: &PreparedProcessStamp,
+    registration: &SourceProcessIdentity,
+) -> bool {
+    let custody = match kind {
+        "original_joined_child" => issuer == worker,
+        "consumed_h_sealed_helper" => issuer != worker,
+        _ => false,
+    };
+    custody
+        && i64::from(worker.host_pid) == registration.pid
+        && worker.boot_id == registration.boot_id
+        && i64::try_from(worker.starttime_ticks).ok() == Some(registration.starttime_ticks)
+}
+
+#[cfg(test)]
+mod actor_tests {
+    use super::*;
+
+    #[test]
+    fn distinct_consumed_h_worker_and_original_j_identity_are_explicit() {
+        let issuer = PreparedProcessStamp {
+            host_pid: 11,
+            boot_id: "boot".into(),
+            starttime_ticks: 21,
+            pidns_dev: 31,
+            pidns_ino: 41,
+        };
+        let mut worker = issuer.clone();
+        let mut registration = SourceProcessIdentity {
+            pid: 11,
+            boot_id: "boot".into(),
+            starttime_ticks: 21,
+        };
+        assert!(matches_registration_actors(
+            "original_joined_child",
+            &issuer,
+            &worker,
+            &registration
+        ));
+        assert!(!matches_registration_actors(
+            "consumed_h_sealed_helper",
+            &issuer,
+            &worker,
+            &registration
+        ));
+        worker.host_pid = 12;
+        worker.starttime_ticks = 22;
+        registration.pid = 12;
+        registration.starttime_ticks = 22;
+        assert!(matches_registration_actors(
+            "consumed_h_sealed_helper",
+            &issuer,
+            &worker,
+            &registration
+        ));
+        assert!(!matches_registration_actors(
+            "original_joined_child",
+            &issuer,
+            &worker,
+            &registration
+        ));
+        registration.starttime_ticks += 1;
+        assert!(!matches_registration_actors(
+            "consumed_h_sealed_helper",
+            &issuer,
+            &worker,
+            &registration
+        ));
+        registration.starttime_ticks -= 1;
+        assert!(!matches_registration_actors(
+            "legacy",
+            &issuer,
+            &worker,
+            &registration
+        ));
+    }
 }
 
 fn read_registration_fd(fd: RawFd, expected_len: usize) -> Result<Vec<u8>, String> {

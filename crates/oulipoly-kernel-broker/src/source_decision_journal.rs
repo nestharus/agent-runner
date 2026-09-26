@@ -1,7 +1,9 @@
 //! Separate, broker-owned exact-source decisions. Issuance and read-only
 //! verification do not themselves admit a State source or authorize an effect.
 use oulipoly_kernel_broker::entry_registry::ProcessStamp;
-use oulipoly_kernel_broker::protocol::{ExactSourceDecisionReadback, ProcessWitness};
+use oulipoly_kernel_broker::protocol::{
+    ExactSourceDecisionReadback, ExactSourceIssuerKind, ProcessWitness,
+};
 use oulipoly_state::mailbox::PreparedProcessStamp;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -58,6 +60,8 @@ pub struct Claims {
     pub guardian: ProcessWitness,
     pub driver: ProcessWitness,
     pub peer: ProcessStamp,
+    pub issuer_kind: ExactSourceIssuerKind,
+    pub registration_worker: ProcessStamp,
     pub owner_session_id: String,
     pub owner_invocation_uuid: String,
     pub capability_digest: String,
@@ -250,7 +254,7 @@ impl Journal {
             }
             journal
                 .connection
-                .pragma_update(None, "user_version", 3)
+                .pragma_update(None, "user_version", 4)
                 .map_err(|e| error(e.to_string()))?;
             journal
                 .connection
@@ -324,7 +328,7 @@ impl Journal {
             .map_err(|e| error(e.to_string()))?;
         // Earlier rows lack either original State identity or the distinct
         // retained mailbox generation. Neither can be inferred from a copy.
-        if version != 3 {
+        if version != 4 {
             return Err(error("exact source journal schema version mismatch"));
         }
         let application_id: i64 = self
@@ -481,6 +485,8 @@ fn readback(
         guardian: claims.guardian.clone(),
         driver: claims.driver.clone(),
         issuer: claims.peer.clone(),
+        issuer_kind: claims.issuer_kind,
+        registration_worker: claims.registration_worker.clone(),
         owner_session_id: claims.owner_session_id.clone(),
         owner_invocation_uuid: claims.owner_invocation_uuid.clone(),
         capability_digest: claims.capability_digest.clone(),
@@ -535,6 +541,14 @@ mod tests {
                 pidns_dev: 51,
                 pidns_ino: 62,
             },
+            issuer_kind: ExactSourceIssuerKind::OriginalJoinedChild,
+            registration_worker: ProcessStamp {
+                host_pid: 34,
+                boot_id: "boot".into(),
+                starttime_ticks: 44,
+                pidns_dev: 51,
+                pidns_ino: 62,
+            },
             owner_session_id: "session".into(),
             owner_invocation_uuid: "invocation".into(),
             capability_digest: "digest".into(),
@@ -549,6 +563,40 @@ mod tests {
             registration_bytes: b"exact bytes".to_vec(),
             registration_sha256: "sha256".into(),
         }
+    }
+
+    #[test]
+    fn consumed_h_keeps_distinct_worker_on_lost_reply_and_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let request = uuid::Uuid::new_v4().to_string();
+        let mut h = claims();
+        h.issuer_kind = ExactSourceIssuerKind::ConsumedHSealedHelper;
+        h.registration_worker.host_pid = 35;
+        h.registration_worker.starttime_ticks = 45;
+        let mut journal = Journal::open(temp.path()).unwrap();
+        let now = decision_now().unwrap();
+        let first = journal.issue_at(&request, &h, now).unwrap();
+        assert_ne!(first.issuer, first.registration_worker);
+        assert_eq!(
+            first.issuer_kind,
+            ExactSourceIssuerKind::ConsumedHSealedHelper
+        );
+        assert_eq!(journal.issue_at(&request, &h, now).unwrap(), first);
+        drop(journal);
+        let journal = Journal::open(temp.path()).unwrap();
+        assert_eq!(
+            journal
+                .verify_decision(&request, &first.decision_id, &h)
+                .unwrap(),
+            first
+        );
+        let mut changed = h.clone();
+        changed.registration_worker.host_pid += 1;
+        assert!(
+            journal
+                .verify_decision(&request, &first.decision_id, &changed)
+                .is_err()
+        );
     }
 
     #[test]
@@ -784,7 +832,7 @@ mod tests {
                     drop(journal);
                     Connection::open(&path)
                         .unwrap()
-                        .pragma_update(None, "user_version", 1)
+                        .pragma_update(None, "user_version", 3)
                         .unwrap();
                     assert!(Journal::open(temp.path()).is_err());
                 }

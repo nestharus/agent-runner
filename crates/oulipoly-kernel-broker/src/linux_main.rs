@@ -60,11 +60,11 @@ use oulipoly_kernel_broker::native_receipt::{
 };
 use oulipoly_kernel_broker::protocol::{
     AcceptedWorkSpec, ExactSourceDecisionRequest, ExactSourceDecisionVerification,
-    FreshChildRequest, FreshRecipientRequest, FreshRootEffectRequest, JoinSpec, JoinedChildWitness,
-    LaunchAcceptedWorkSpec, NativeKSpec, NativePrepareSpec, OwnerDiscoveryReadback,
-    OwnerDiscoveryRequest, OwnerPidBinding, OwnerWitness, ProcessWitness, SourceControlUse,
-    SourceScope, SourceSocketWitness, SourceTicketUse, SourceWitnessProbe, StateGenerationSpec,
-    StateReadSpec, StateWriteAction, StateWriteSpec,
+    ExactSourceIssuerKind, FreshChildRequest, FreshRecipientRequest, FreshRootEffectRequest,
+    JoinSpec, JoinedChildWitness, LaunchAcceptedWorkSpec, NativeKSpec, NativePrepareSpec,
+    OwnerDiscoveryReadback, OwnerDiscoveryRequest, OwnerPidBinding, OwnerWitness, ProcessWitness,
+    SourceControlUse, SourceScope, SourceSocketWitness, SourceTicketUse, SourceWitnessProbe,
+    StateGenerationSpec, StateReadSpec, StateWriteAction, StateWriteSpec,
 };
 use oulipoly_kernel_broker::registry::{RootRecord, RootRegistry};
 use oulipoly_kernel_broker::root_drain;
@@ -85,7 +85,6 @@ use std::io::{self, Write};
 use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::IntoRawFd;
 use std::os::fd::{AsRawFd, FromRawFd};
-#[cfg(feature = "age319-private-broker-fixture")]
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -2221,6 +2220,263 @@ fn exact_registration_snapshot(file: &File, path: &Path) -> io::Result<(u64, u64
     Ok((fd_meta.dev(), fd_meta.ino(), bytes))
 }
 
+/// Bind the creator in Bash's immutable registration to the *different*
+/// sealed Runner issuer. A copied registration or a helper in another work
+/// cannot manufacture the accepted H initiator, one-use K and direct worker.
+fn exact_consumed_h_worker(
+    probe: &SourceWitnessProbe,
+    source: &oulipoly_state::completion_continuation::SourceRegistration,
+    peer: &PeerIdentity,
+    roots: &RootRegistry,
+    works: &WorkRegistry,
+    grants: &GrantRegistry,
+) -> io::Result<ProcessStamp> {
+    use std::io::Read;
+    use std::os::unix::fs::FileExt;
+    let work_id = probe
+        .owner
+        .work_id
+        .as_deref()
+        .ok_or_else(|| io::Error::other("consumed H work ID absent"))?;
+    if works.has_debt() || grants.has_debt() {
+        return Err(io::Error::other("consumed H work/grant debt"));
+    }
+    let work = works
+        .live_works()
+        .find(|work| work.record.root_id == probe.owner.root_id && work.record.work_id == work_id)
+        .ok_or_else(|| io::Error::other("consumed H work absent"))?;
+    let grant = grants
+        .records()
+        .iter()
+        .find(|grant| {
+            grant.grant_id == work.record.accepted_grant_id.as_deref().unwrap_or("")
+                && grant.root_id == probe.owner.root_id
+                && grant.work_id == work_id
+                && grant.consumed
+                && grant.version == 3
+        })
+        .ok_or_else(|| io::Error::other("consumed H grant absent"))?;
+    let root = roots
+        .live_roots()
+        .find(|root| root.record.root_id == probe.owner.root_id)
+        .ok_or_else(|| io::Error::other("consumed H root absent"))?;
+    let helper = grant
+        .sealed_helper
+        .as_ref()
+        .ok_or_else(|| io::Error::other("consumed H helper absent"))?;
+    if grant.owner_uid != peer.uid
+        || grant.root_init != ProcessStamp::from(&root.init)
+        || grant.supervisor_authority_id != probe.owner.supervisor_id
+        || grant.owner_generation != probe.owner_generation
+        || grant.guardian.host_pid != probe.owner.guardian.host_pid
+        || grant.guardian.boot_id != probe.owner.guardian.boot_id
+        || grant.guardian.starttime_ticks != probe.owner.guardian.starttime_ticks
+        || helper.sha256 != source.helper.sha256
+        || helper.owner_session_id != source.owner_session_id
+        || helper.owner_invocation_uuid != source.owner_invocation_uuid
+        || probe.owner.work_id.as_deref() != Some(grant.work_id.as_str())
+    {
+        return Err(io::Error::other("consumed H helper/grant binding changed"));
+    }
+    // verify_owner_socket already checked this exact peer against the sealed
+    // executable; repeating a full image digest here would widen the gap
+    // before the final live-process recheck.
+    let initiator = PinnedProcess::open(
+        i32::try_from(grant.initiator.pid)
+            .map_err(|_| io::Error::other("consumed H initiator PID invalid"))?,
+    )?;
+    if grant.initiator.boot_id != initiator.boot_id
+        || u64::try_from(grant.initiator.starttime_ticks).ok() != Some(initiator.starttime_ticks)
+        || !initiator.in_namespace(root.init.namespace())?
+    {
+        return Err(io::Error::other("consumed H initiator incarnation changed"));
+    }
+    let worker = PinnedProcess::open(
+        i32::try_from(source.registering_caller.pid)
+            .map_err(|_| io::Error::other("consumed H registration worker PID invalid"))?,
+    )?;
+    if worker.boot_id != source.registering_caller.boot_id
+        || i64::try_from(worker.starttime_ticks).ok()
+            != Some(source.registering_caller.starttime_ticks)
+        || !worker.direct_child_of(&work.init)?
+        || !worker.in_namespace(work.init.namespace())?
+        || !worker.same_executable_as(&host_proc_file(&format!("{}/exe", initiator.host_pid))?)?
+        || !peer.process.direct_child_of(&worker)?
+    {
+        return Err(io::Error::other(
+            "consumed H Bash worker/helper parentage changed",
+        ));
+    }
+    let image = host_proc_file(&format!("{}/exe", initiator.host_pid))?;
+    let image_meta = image.metadata()?;
+    if (image_meta.dev(), image_meta.ino())
+        != (
+            grant.artifacts.executable.device,
+            grant.artifacts.executable.inode,
+        )
+    {
+        return Err(io::Error::other("consumed H Bash image changed"));
+    }
+    let path = probe
+        .accepted_intent_path
+        .as_ref()
+        .ok_or_else(|| io::Error::other("consumed H accepted intent path absent"))?;
+    if !path.is_absolute()
+        || path.components().any(|part| {
+            matches!(
+                part,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err(io::Error::other("consumed H accepted intent path invalid"));
+    }
+    let mut intent = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let meta = intent.metadata()?;
+    let named = fs::symlink_metadata(path)?;
+    if !meta.is_file()
+        || !named.is_file()
+        || named.file_type().is_symlink()
+        || (meta.dev(), meta.ino()) != (grant.artifacts.intent.device, grant.artifacts.intent.inode)
+        || (named.dev(), named.ino()) != (meta.dev(), meta.ino())
+        || meta.len() == 0
+        || meta.len() > 1024 * 1024
+    {
+        return Err(io::Error::other("consumed H accepted intent inode changed"));
+    }
+    let mut bytes = Vec::new();
+    intent.read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != meta.len()
+        || format!("{:x}", Sha256::digest(&bytes)) != grant.request_sha256
+    {
+        return Err(io::Error::other("consumed H accepted intent bytes changed"));
+    }
+    let selected: serde_json::Value = serde_json::from_slice(&bytes)?;
+    if selected["work_id"] != work_id || selected["root_id"] != probe.owner.root_id {
+        return Err(io::Error::other(
+            "consumed H accepted intent work/root changed",
+        ));
+    }
+    if selected["meta"]["delivery_helper"]["environment_sha256"] != source.helper.environment_sha256
+    {
+        return Err(io::Error::other(
+            "consumed H/K helper environment selection changed",
+        ));
+    }
+    let helper_environment_path =
+        Path::new(&source.handle_dir).join("delivery-helper-environment.json");
+    let mut helper_environment = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&helper_environment_path)?;
+    let helper_environment_meta = helper_environment.metadata()?;
+    if !helper_environment_meta.is_file()
+        || helper_environment_meta.len() == 0
+        || helper_environment_meta.len() > 1024 * 1024
+        || fs::symlink_metadata(&helper_environment_path)?.ino() != helper_environment_meta.ino()
+    {
+        return Err(io::Error::other(
+            "consumed H/K helper environment file changed",
+        ));
+    }
+    let mut helper_environment_bytes = Vec::new();
+    helper_environment.read_to_end(&mut helper_environment_bytes)?;
+    if helper_environment_bytes.len() as u64 != helper_environment_meta.len()
+        || format!("{:x}", Sha256::digest(&helper_environment_bytes))
+            != source.helper.environment_sha256
+    {
+        return Err(io::Error::other(
+            "consumed H/K helper environment bytes changed",
+        ));
+    }
+    let entries = selected["environment"]
+        .as_array()
+        .ok_or_else(|| io::Error::other("consumed H selected environment absent"))?;
+    let mut expected = std::collections::BTreeSet::new();
+    for entry in entries {
+        let field = |name: &str| -> io::Result<Vec<u8>> {
+            entry[name]
+                .as_array()
+                .ok_or_else(|| io::Error::other("consumed H environment field absent"))?
+                .iter()
+                .map(|v| {
+                    v.as_u64()
+                        .and_then(|n| u8::try_from(n).ok())
+                        .ok_or_else(|| io::Error::other("consumed H environment byte invalid"))
+                })
+                .collect()
+        };
+        let key = field("key")?;
+        let value = field("value")?;
+        if key.is_empty()
+            || key.contains(&0)
+            || key.contains(&b'=')
+            || value.contains(&0)
+            || !expected.insert([key, b"=".to_vec(), value].concat())
+        {
+            return Err(io::Error::other("consumed H selected environment invalid"));
+        }
+    }
+    let actual = fs::read(format!("/proc/{}/environ", worker.host_pid))?;
+    let actual_count = actual
+        .split(|b| *b == 0)
+        .filter(|entry| !entry.is_empty())
+        .count();
+    let actual: std::collections::BTreeSet<Vec<u8>> = actual
+        .split(|b| *b == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| entry.to_vec())
+        .collect();
+    let worker_status = fs::read_to_string(format!("/proc/{}/status", worker.host_pid))?;
+    let worker_gid = worker_status
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("Gid:")
+                .and_then(|fields| fields.split_whitespace().next())
+                .and_then(|gid| gid.parse::<u32>().ok())
+        })
+        .ok_or_else(|| io::Error::other("consumed H worker physical GID absent"))?;
+    if actual != expected
+        || actual_count != expected.len()
+        || host_proc_uid(worker.host_pid)? != grant.owner_uid
+        || worker_gid != peer.gid
+        || host_proc_uid(work.init.host_pid)? != 0
+    {
+        return Err(io::Error::other(
+            "consumed H selected physical environment/account changed",
+        ));
+    }
+    if cfg!(feature = "age319-private-broker-fixture") {
+        let selected_account =
+            format!("AGE319_SELECTED_ACCOUNT={}:{}", grant.owner_uid, worker_gid);
+        if !actual.contains(selected_account.as_bytes()) {
+            return Err(io::Error::other("consumed H selected C account changed"));
+        }
+    }
+    let mut intent_again = vec![0; bytes.len()];
+    let mut helper_environment_again = vec![0; helper_environment_bytes.len()];
+    intent.read_exact_at(&mut intent_again, 0)?;
+    helper_environment.read_exact_at(&mut helper_environment_again, 0)?;
+    if intent_again != bytes
+        || helper_environment_again != helper_environment_bytes
+        || fs::symlink_metadata(path)?.ino() != meta.ino()
+        || intent.metadata()?.len() != meta.len()
+        || fs::symlink_metadata(&helper_environment_path)?.ino() != helper_environment_meta.ino()
+        || helper_environment.metadata()?.len() != helper_environment_meta.len()
+    {
+        return Err(io::Error::other(
+            "consumed H intent/helper environment changed during check",
+        ));
+    }
+    initiator.verify()?;
+    worker.verify()?;
+    work.init.verify()?;
+    Ok(ProcessStamp::from(&worker))
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "source decision joins independent live authorities"
@@ -2239,13 +2495,6 @@ fn verify_exact_source_witness(
     sidecar: &BrokerSidecar,
     check_original_state: bool,
 ) -> io::Result<source_decision_journal::Claims> {
-    // Consumed-H helpers require their own exact authority proof. This issuer
-    // accepts only the original joined child, even when V could verify H.
-    if probe.owner.work_id.is_some() {
-        return Err(io::Error::other(
-            "consumed-H source decision route unavailable",
-        ));
-    }
     let mark = |stage: &str| {
         if let Some(gate) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1") {
             let _ = fs::write(Path::new(&gate).join("source-broker-stage"), stage);
@@ -2276,13 +2525,27 @@ fn verify_exact_source_witness(
     let source: oulipoly_state::completion_continuation::SourceRegistration =
         serde_json::from_slice(&before.2)?;
     source.validate().map_err(io::Error::other)?;
+    let (issuer_kind, registration_worker) = if probe.owner.work_id.is_some() {
+        (
+            ExactSourceIssuerKind::ConsumedHSealedHelper,
+            exact_consumed_h_worker(&probe, &source, peer, roots, works, grants)?,
+        )
+    } else {
+        if probe.accepted_intent_path.is_some() {
+            return Err(io::Error::other("original J supplied an H intent"));
+        }
+        (
+            ExactSourceIssuerKind::OriginalJoinedChild,
+            ProcessStamp::from(&peer.process),
+        )
+    };
     if Path::new(&source.handle_dir).join(&source.registration_relative) != probe.registration_path
         || source.domain_id != probe.owner.domain_id
         || source.owner_invocation_uuid != probe.owner_invocation_uuid
         || source.owner_session_id != probe.owner_session_id
-        || source.registering_caller.pid != i64::from(peer.process.host_pid)
-        || source.registering_caller.boot_id != peer.process.boot_id
-        || source.registering_caller.starttime_ticks != peer.process.starttime_ticks as i64
+        || source.registering_caller.pid != i64::from(registration_worker.host_pid)
+        || source.registering_caller.boot_id != registration_worker.boot_id
+        || source.registering_caller.starttime_ticks != registration_worker.starttime_ticks as i64
         || probe.owner.owner_generation.as_deref() != Some(&probe.owner_generation)
         || probe.owner.owner_invocation_uuid.as_deref() != Some(&probe.owner_invocation_uuid)
         || probe.owner.owner_session_id.as_deref() != Some(&probe.owner_session_id)
@@ -2313,19 +2576,29 @@ fn verify_exact_source_witness(
             && prepared.pidns_dev == observed.pidns_dev
             && prepared.pidns_ino == observed.pidns_ino
     };
+    let peer_stamp = ProcessStamp::from(&peer.process);
+    let joined_stamp = if issuer_kind == ExactSourceIssuerKind::OriginalJoinedChild {
+        &peer_stamp
+    } else {
+        entries
+            .record(&probe.owner.root_id)
+            .and_then(|entry| entry.joined_child.as_ref())
+            .ok_or_else(|| io::Error::other("consumed H original joined child absent"))?
+    };
     if prepared.root_id != probe.owner.root_id
         || prepared.source_generation != probe.source_generation
         || prepared.owner_generation != probe.owner_generation
         || prepared.owner_uid != peer.uid
         || !matches_stamp(&prepared.root_init, &ProcessStamp::from(&root.init))
-        || !matches_stamp(&prepared.joined_child, &ProcessStamp::from(&peer.process))
+        || !matches_stamp(&prepared.joined_child, joined_stamp)
         || !matches_stamp(&prepared.guardian, &ProcessStamp::from(&guardian))
         || !matches_stamp(&prepared.driver, &ProcessStamp::from(&driver))
         || prepared.domain_id != probe.owner.domain_id
         || prepared.supervisor_authority_id != probe.owner.supervisor_id
-        || prepared.joined_child.host_pid != peer.process.host_pid
-        || prepared.joined_child.boot_id != peer.process.boot_id
-        || prepared.joined_child.starttime_ticks != peer.process.starttime_ticks
+        || (issuer_kind == ExactSourceIssuerKind::OriginalJoinedChild
+            && (prepared.joined_child.host_pid != peer.process.host_pid
+                || prepared.joined_child.boot_id != peer.process.boot_id
+                || prepared.joined_child.starttime_ticks != peer.process.starttime_ticks))
         || prepared.guardian.host_pid != probe.owner.guardian.host_pid
         || prepared.guardian.boot_id != probe.owner.guardian.boot_id
         || prepared.guardian.starttime_ticks != probe.owner.guardian.starttime_ticks
@@ -2370,6 +2643,15 @@ fn verify_exact_source_witness(
         ));
     }
     peer.process.verify()?;
+    if issuer_kind == ExactSourceIssuerKind::ConsumedHSealedHelper {
+        let worker = PinnedProcess::open(registration_worker.host_pid)?;
+        if ProcessStamp::from(&worker) != registration_worker {
+            return Err(io::Error::other(
+                "consumed H worker incarnation changed after check",
+            ));
+        }
+        worker.verify()?;
+    }
     mark("complete");
     let mut digest = Sha256::new();
     digest.update(b"oulipoly-completion-registration-authority-v1");
@@ -2393,6 +2675,8 @@ fn verify_exact_source_witness(
         guardian: probe.owner.guardian,
         driver: probe.owner.driver,
         peer: ProcessStamp::from(&peer.process),
+        issuer_kind,
+        registration_worker,
         owner_session_id: source.owner_session_id,
         owner_invocation_uuid: source.owner_invocation_uuid,
         capability_digest: format!("{:x}", digest.finalize()),

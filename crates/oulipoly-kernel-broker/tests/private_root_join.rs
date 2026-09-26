@@ -2077,6 +2077,124 @@ fn inner() {
                             .is_err(),
                         "outside H source copied K binding"
                     );
+                    fs::write(gate.join("source-decision-request"), b"issue").unwrap();
+                    let decision_deadline = Instant::now() + Duration::from_secs(180);
+                    while !gate.join("source-decision-readback.json").exists()
+                        && entry.try_wait().unwrap().is_none()
+                        && Instant::now() < decision_deadline
+                    {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    let issued: serde_json::Value = serde_json::from_slice(
+                        &fs::read(gate.join("source-decision-readback.json")).unwrap_or_else(
+                            |_| {
+                                panic!(
+                                    "actual Bash helper issuance absent: {}",
+                                    fs::read_to_string(gate.join("private-source-stderr.log"))
+                                        .unwrap_or_default()
+                                )
+                            },
+                        ),
+                    )
+                    .unwrap();
+                    assert_eq!(issued["decision"], issued["retry"]);
+                    assert_eq!(
+                        issued["decision"]["issuer_kind"],
+                        "consumed_h_sealed_helper"
+                    );
+                    assert_eq!(
+                        issued["decision"]["registration_worker"]["host_pid"],
+                        worker_pid
+                    );
+                    assert_eq!(
+                        issued["decision"]["registration_sha256"],
+                        format!("{:x}", Sha256::digest(&registration_bytes))
+                    );
+                    assert_eq!(
+                        issued["decision"]["registration_device"],
+                        registration_stat.dev()
+                    );
+                    assert_eq!(
+                        issued["decision"]["registration_inode"],
+                        registration_stat.ino()
+                    );
+                    assert_eq!(issued["negatives"].as_array().unwrap().len(), 5);
+                    let decisions = rusqlite::Connection::open_with_flags(
+                        broker_state.join("source-decisions/decisions.db"),
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                    )
+                    .unwrap();
+                    let count: i64 = decisions
+                        .query_row("SELECT count(*) FROM decisions", [], |row| row.get(0))
+                        .unwrap();
+                    assert_eq!(count, 1, "lost reply/retry wrote another decision");
+                    let capability: Vec<u8> = intent["registration_authority"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|byte| byte.as_u64().unwrap() as u8)
+                        .collect();
+                    let capability = String::from_utf8(capability).unwrap();
+                    let stamp = |identity: &oulipoly_state::completion_continuation::SourceProcessIdentity| {
+                        ProcessWitness { host_pid: identity.pid as i32,
+                            boot_id: identity.boot_id.clone(),
+                            starttime_ticks: identity.starttime_ticks as u64 }
+                    };
+                    let outsider_request = protocol::ExactSourceDecisionRequest {
+                        request_id: issued["decision"]["request_id"].as_str().unwrap().into(),
+                        witness: protocol::SourceWitnessProbe {
+                            owner: protocol::OwnerWitness {
+                                root_id: prepared.root_id.clone(),
+                                domain_id: released.owner.domain_id.clone(),
+                                supervisor_id: released.owner.supervisor_authority_id.clone(),
+                                guardian: stamp(&released.owner.guardian_identity),
+                                driver: stamp(&released.owner.driver_identity),
+                                owner_generation: Some(released.owner.owner_generation.clone()),
+                                work_id: Some(work["work_id"].as_str().unwrap().into()),
+                                owner_session_id: Some(session.clone()),
+                                owner_invocation_uuid: Some(invocation.into()),
+                                registration_authority_sha256: Some(format!(
+                                    "{:x}",
+                                    Sha256::digest(capability.as_bytes())
+                                )),
+                            },
+                            source_generation: generation.clone(),
+                            owner_generation: released.owner.owner_generation.clone(),
+                            registration_path: registration_path.to_path_buf(),
+                            registration_len: registration_bytes.len() as u64,
+                            registration_sha256: format!(
+                                "{:x}",
+                                Sha256::digest(&registration_bytes)
+                            ),
+                            owner_session_id: session.clone(),
+                            owner_invocation_uuid: invocation.into(),
+                            capability,
+                            accepted_intent_path: Some(h_dir.join("root-work-intent-v1.json")),
+                        },
+                    };
+                    let source_fd = fs::OpenOptions::new()
+                        .read(true)
+                        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                        .open(registration_path)
+                        .unwrap();
+                    assert!(
+                        protocol::issue_exact_source_decision_at(
+                            &socket,
+                            &outsider_request,
+                            guardian.as_raw_fd(),
+                            source_fd.as_raw_fd()
+                        )
+                        .is_err(),
+                        "outside caller replayed the Bash decision with its exact file and strings"
+                    );
+                    let still_zero: i64 = original
+                        .query_row(
+                            "SELECT count(*) FROM invocation_completion_exact_source_decisions",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(still_zero, 0, "source-only decision consumed by State");
                 }));
                 fs::write(gate.join("source-release"), b"done").unwrap();
                 eventually(|| entry.try_wait().unwrap().is_some());
@@ -9979,6 +10097,7 @@ fn inner() {
                     owner_session_id: session.clone(),
                     owner_invocation_uuid: invocation.clone(),
                     capability: capability.process_environment_value().into(),
+                    accepted_intent_path: None,
                 };
                 assert!(
                     protocol::private_source_witness_probe_at(
@@ -11667,6 +11786,7 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_owner_discovery",
         "normal_handoff",
         "normal_handoff_bash_child",
+        "normal_handoff_pre_k_h_source",
         "normal_handoff_fsync",
         "normal_handoff_effect_reply_loss",
         "normal_help",
