@@ -737,6 +737,7 @@ pub(crate) fn run_pinned_guardian_v30(
             Disposition::Closed { .. } => b'C',
             Disposition::AwaitingH { .. } => {
                 if std::env::var_os("AGE319_PRIVATE_PRE_K_H_SOURCE_V1").is_none()
+                    && std::env::var_os("AGE319_PRIVATE_SELECTED_K_ROOT_H_V1").is_none()
                     || !disposition.valid_h_identity()
                 {
                     return Err("v30 H disposition has no exact released J/D intent".into());

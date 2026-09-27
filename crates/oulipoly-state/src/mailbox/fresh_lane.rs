@@ -1140,7 +1140,7 @@ impl FreshV30Lane {
                 .delegated_h_listener_policy
                 .as_deref()
                 .is_some_and(|policy| {
-                    policy != "response_only"
+                    !matches!(policy, "response_only" | "notify")
                         || !matches!(receipt.root_work_intent, FreshRootWorkIntent::NormalCli(_))
                 })
             || receipt.delegated_h_listener_policy.is_some()

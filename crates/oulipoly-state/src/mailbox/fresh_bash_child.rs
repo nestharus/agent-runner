@@ -93,7 +93,8 @@ impl FreshV30Lane {
         &self, root: &FreshReleasedHandoff, root_actor: &FreshRecipientIdentity,
         child: &FreshBashChild, selected_k: FreshRootHSelectedK,
     ) -> Result<FreshRootHDelegation, String> {
-        if root.delegated_h_listener_policy.as_deref() != Some("response_only")
+        if !matches!(root.delegated_h_listener_policy.as_deref(), Some("response_only" | "notify"))
+            || root.delegated_h_listener_policy.as_deref() != Some(child.listener_policy.as_str())
             || !matches!(root.root_work_intent, FreshRootWorkIntent::NormalCli(_))
             || child.root_handoff_id != root.handoff_id
             || child.parent_work_grant_id != selected_k.grant_id
@@ -122,7 +123,7 @@ impl FreshV30Lane {
             registration_authority_digest: authority.digest(),
             root_work_authority_digest: format!("{:x}", Sha256::digest(work_authority.as_bytes())),
             root_endpoint: root.old_release.owner.endpoint.clone(),
-            listener_policy: "response_only".into(),
+            listener_policy: root.delegated_h_listener_policy.clone().unwrap(),
             child_actor: child.actor.clone(), selected_k,
         };
         let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_WRITE)?;
@@ -189,7 +190,7 @@ impl FreshV30Lane {
             || receipt.root_work_authority_digest != format!("{:x}", Sha256::digest(work_authority.as_bytes()))
             || receipt.root_endpoint != root.old_release.owner.endpoint
             || root.delegated_h_listener_policy.as_deref() != Some(receipt.listener_policy.as_str())
-            || receipt.listener_policy != "response_only"
+            || receipt.listener_policy != child.listener_policy
         {
             return Err("consumed root H delegation binding changed".into());
         }

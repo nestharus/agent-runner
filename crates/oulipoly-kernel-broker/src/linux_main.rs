@@ -1243,6 +1243,7 @@ fn verify_delegated_root_h_grant(
     Ok(DelegatedRootHGrant {
         proof: proof.clone(),
         selected_k: delegation.selected_k,
+        listener_policy: delegation.listener_policy,
     })
 }
 
@@ -2417,6 +2418,16 @@ fn exact_consumed_h_worker(
         || probe.owner.work_id.as_deref() != Some(grant.work_id.as_str())
     {
         return Err(io::Error::other("consumed H helper/grant binding changed"));
+    }
+    if let Some(delegated) = &grant.delegated_root_h {
+        let expected_mode = match delegated.listener_policy.as_str() {
+            "notify" => "async",
+            "response_only" => "sync",
+            _ => return Err(io::Error::other("consumed H listener policy invalid")),
+        };
+        if source.delivery_mode != expected_mode {
+            return Err(io::Error::other("consumed H source delivery mode changed"));
+        }
     }
     // verify_owner_socket already checked this exact peer against the sealed
     // executable; repeating a full image digest here would widen the gap
@@ -4138,7 +4149,14 @@ fn released_child_handoff(
             old_release: evidence,
             fresh_lane: request.lane,
             registration_authority: authority.process_environment_value().into(),
-            delegated_h_listener_policy: delegate_h.then(|| "response_only".into()),
+            delegated_h_listener_policy: delegate_h.then(|| {
+                if std::env::var_os("AGE319_PRIVATE_BASH_ORIGINAL_NOTIFY_V1").is_some() {
+                    "notify"
+                } else {
+                    "response_only"
+                }
+                .into()
+            }),
             delegated_root_work_authority: root_work_authority,
         };
         registry.persist(receipt)
@@ -4198,7 +4216,12 @@ fn capture_terminal_sources(
                                     // relationship exact at the serving
                                     // boundary. This is not recipient grant,
                                     // submission or ACK authority.
-                                    if sidecar.read_v2_recipient_grant(&grant.grant_id)?.is_none() {
+                                    let binding = sidecar.read_consumed_source_candidate(&grant)?;
+                                    if binding.registration()?.delivery_mode == "async"
+                                        && sidecar
+                                            .read_v2_recipient_grant(&grant.grant_id)?
+                                            .is_none()
+                                    {
                                         read_v2_recipient_custody(
                                             sidecar,
                                             physical,

@@ -449,7 +449,7 @@ fn causal_bash(args: &[String], hold_survivor: bool, hold_start: bool) -> std::i
             let child = Command::new(&args[1])
                 .arg("__age319-private-admit-child-v1")
                 .args([&args[2], &args[3], &args[4]])
-                .args(args.get(6))
+                .args(args.iter().skip(6))
                 .env_clear()
                 .env("OULIPOLY_DATA_DIR", &args[5])
                 .env("PATH", "/usr/bin:/bin")
@@ -615,7 +615,7 @@ fn main() -> std::io::Result<()> {
         .open(marker)?;
     file.write_all(b"one-provider-effect\n")?;
     file.sync_all()?;
-    if args.len() == 6 || args.len() == 7 {
+    if (6..=8).contains(&args.len()) {
         return causal_bash(&args, true, false);
     }
     if args.len() != 1
