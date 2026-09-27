@@ -1465,8 +1465,15 @@ fn terminate_postcommit_original_owner(broker_state: &Path) {
 
 fn inner() {
     let mode = std::env::var("AGE319_PRIVATE_JOIN_MODE").unwrap_or_else(|_| "help".into());
+    let root_terminal_drain = matches!(
+        mode.as_str(),
+        "normal_model_provider_bash_causal_root_h_delegate_drain"
+            | "normal_model_provider_bash_causal_root_h_notify_row_drain"
+            | "normal_model_provider_bash_causal_root_h_notify_wake_drain"
+    );
     let caller_mode = mode.starts_with("normal_model_provider_caller_")
-        || mode == "normal_model_provider_bash_ordinary_sync_parent_output";
+        || mode == "normal_model_provider_bash_ordinary_sync_parent_output"
+        || root_terminal_drain;
     let physical_mode = mode.starts_with("normal_model_provider_pty_physical");
     let resident_mode = mode.starts_with("normal_model_provider_pty_physical_resident_");
     let resident_bash = mode.starts_with("normal_model_provider_pty_physical_resident_bash_");
@@ -1632,6 +1639,9 @@ fn inner() {
     fs::set_permissions(&broker_state, fs::Permissions::from_mode(0o700)).unwrap();
     fs::create_dir(&gate).unwrap();
     fs::set_permissions(&gate, fs::Permissions::from_mode(0o700)).unwrap();
+    if root_terminal_drain {
+        fs::write(gate.join("terminal-drain-mode"), b"held").unwrap();
+    }
     if completed_v2_source {
         fs::write(gate.join("source-v2-workload"), b"selected").unwrap();
         if wake_v2_source {
@@ -1647,9 +1657,12 @@ fn inner() {
     let root_h_delegate = matches!(
         mode.as_str(),
         "normal_model_provider_bash_causal_root_h_delegate"
+            | "normal_model_provider_bash_causal_root_h_delegate_drain"
             | "normal_model_provider_bash_causal_root_h_lost"
             | "normal_model_provider_bash_causal_root_h_notify_row"
+            | "normal_model_provider_bash_causal_root_h_notify_row_drain"
             | "normal_model_provider_bash_causal_root_h_notify_wake"
+            | "normal_model_provider_bash_causal_root_h_notify_wake_drain"
             | "normal_model_provider_bash_causal_root_h_notify_wake_lost"
             | "normal_model_provider_bash_causal_root_h_notify_wake_unknown"
     );
@@ -1869,7 +1882,10 @@ fn inner() {
             format!("{marker}, \"--binary\"")
         } else if mode == "normal_model_provider_caller_nonzero" {
             format!("{marker}, \"--fail-clean\"")
-        } else if caller_mode && mode != "normal_model_provider_bash_ordinary_sync_parent_output" {
+        } else if caller_mode
+            && !root_terminal_drain
+            && mode != "normal_model_provider_bash_ordinary_sync_parent_output"
+        {
             format!("{marker}, \"--clean\"")
         } else {
             marker.clone()
@@ -2613,7 +2629,8 @@ fn inner() {
                     .then_some(("AGE319_PRIVATE_ROOT_PTY_RESTART_AFTER_K_V1", "1")),
             )
             .envs(
-                (terminal_v3
+                (root_terminal_drain
+                    || terminal_v3
                     || caller_mode
                     || shared_mode
                     || matches!(
@@ -2637,6 +2654,7 @@ fn inner() {
                 (caller_mode || terminal_v3 || shared_mode)
                     .then_some(("AGE319_PRIVATE_CALLER_OUTPUT_V1", "1")),
             )
+            .envs(root_terminal_drain.then_some(("AGE319_PRIVATE_ROOT_DRAIN_V1", "1")))
             .envs(
                 (mode == "normal_model_provider_caller_partial")
                     .then_some(("AGE319_PRIVATE_CALLER_PARTIAL_WRITE_V1", "1")),
@@ -6126,14 +6144,16 @@ fn inner() {
                                 .contains("Bash child image changed"),
                                 "wrong Bash image control lost before wake restart"
                             );
-                            stop(&mut broker);
-                            broker = restart_source_broker(
-                                &socket,
-                                &broker_state,
-                                &runner,
-                                &gate,
-                                &temp.path().join("selected-h-wake-restart.log"),
-                            );
+                            if !root_terminal_drain {
+                                stop(&mut broker);
+                                broker = restart_source_broker(
+                                    &socket,
+                                    &broker_state,
+                                    &runner,
+                                    &gate,
+                                    &temp.path().join("selected-h-wake-restart.log"),
+                                );
+                            }
                             assert_eq!(
                                 retained
                                     .read_v2_recipient_grant(&source_grant.grant_id)
@@ -6328,6 +6348,111 @@ fn inner() {
                     lane.require_bash_child(&wrong_d, &root, &root_actor, &child.actor)
                         .is_err()
                 );
+                if root_terminal_drain {
+                    fs::write(gate.join("terminal-drain-release"), b"verified-w").unwrap();
+                    eventually(|| entry.try_wait().unwrap().is_some());
+                    assert!(
+                        entry.wait().unwrap().success(),
+                        "root output failed: {} / {}",
+                        fs::read_to_string(&err).unwrap_or_default(),
+                        fs::read_to_string(&broker_log).unwrap_or_default()
+                    );
+                    let terminal = lane
+                        .read_private_root_terminal(&pre_q_root, &pre_q_actor, &pre_q_session)
+                        .unwrap();
+                    let original: oulipoly_state::mailbox::FreshRootTerminalReadback =
+                        serde_json::from_slice(
+                            &fs::read(gate.join("root-terminal-readback.json")).unwrap(),
+                        )
+                        .unwrap();
+                    assert_eq!(terminal.execution, original.execution);
+                    assert_eq!(terminal.execution_state, "success");
+                    assert_eq!(terminal.publication_state, "unknown");
+                    let entry_record: serde_json::Value = serde_json::from_slice(
+                        &fs::read(
+                            broker_state
+                                .join("entries")
+                                .join(format!("{}.json", prepared.root_id)),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        entry_record["terminal_settlement"]["d_key"],
+                        pre_q_root.d_key
+                    );
+                    assert_eq!(
+                        entry_record["terminal_settlement"]["publication_sha256"],
+                        terminal.publication_sha256.as_deref().unwrap()
+                    );
+                    let parent = &terminal.execution.as_ref().unwrap().parent;
+                    assert_eq!(
+                        fs::read(&out).unwrap(),
+                        fs::read(physical_dir.join(format!("{}.stdout", parent.grant_id))).unwrap()
+                    );
+                    assert_eq!(
+                        fs::read(&err).unwrap(),
+                        fs::read(physical_dir.join(format!("{}.stderr", parent.grant_id))).unwrap()
+                    );
+                    assert_eq!(terminal.native_receipt_state, "not_observed");
+                    assert_eq!(terminal.unresolved_child_request_ids.len(), 0);
+                    assert_eq!(
+                        terminal.execution.as_ref().unwrap().child_event,
+                        Some(source)
+                    );
+                    assert_eq!(
+                        terminal.notification_state,
+                        if root_h_notify {
+                            "pending_f"
+                        } else {
+                            "response_only"
+                        }
+                    );
+                    // The old original H wake ACK is separate from the fresh
+                    // W-derived F row. It cannot settle that row or imply a
+                    // provider-native input receipt.
+                    assert_eq!(terminal.ack_basis, None);
+                    let inventory: serde_json::Value = serde_json::from_slice(
+                        &fs::read(gate.join("root-drain-terminal.json")).unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(inventory["root_id"], prepared.root_id);
+                    assert_eq!(inventory["fenced"], true);
+                    assert_eq!(inventory["close_eligible"], false);
+                    assert!(
+                        broker_state
+                            .join("root-drains")
+                            .join(format!("{}.json", prepared.root_id))
+                            .exists()
+                    );
+                    assert!(
+                        oulipoly_kernel_broker::registry::RootRegistry::open(&broker_state)
+                            .unwrap()
+                            .admission_fenced(&prepared.root_id)
+                    );
+                    if !root_h_notify {
+                        assert_old_debt_and_no_f_ack(&broker_state);
+                    } else {
+                        let old = rusqlite::Connection::open(
+                            broker_state.join("sidecar/pid-identity.db"),
+                        )
+                        .unwrap();
+                        let pending: i64 = old.query_row(
+                            "SELECT count(*) FROM mailbox WHERE session_id='old-pending' AND handle='old-unacked' AND delivered_at IS NULL",
+                            [], |row| row.get(0),
+                        ).unwrap();
+                        assert_eq!(pending, 1, "old v29 debt changed by fresh terminal fence");
+                    }
+                    stop(&mut broker);
+                    assert!(
+                        oulipoly_kernel_broker::registry::RootRegistry::open(&broker_state)
+                            .unwrap()
+                            .admission_fenced(&prepared.root_id),
+                        "root drain fence was lost across Broker restart readback"
+                    );
+                    unsafe { libc::kill(prepared.root_init.host_pid, libc::SIGKILL) };
+                    return;
+                }
                 let mut partial = child.clone();
                 partial.request_id = uuid::Uuid::new_v4().to_string();
                 partial.d_key = uuid::Uuid::new_v4().to_string();
@@ -14498,9 +14623,12 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_model_provider_bash_causal",
         "normal_model_provider_bash_causal_success",
         "normal_model_provider_bash_causal_root_h_delegate",
+        "normal_model_provider_bash_causal_root_h_delegate_drain",
         "normal_model_provider_bash_causal_root_h_lost",
         "normal_model_provider_bash_causal_root_h_notify_row",
+        "normal_model_provider_bash_causal_root_h_notify_row_drain",
         "normal_model_provider_bash_causal_root_h_notify_wake",
+        "normal_model_provider_bash_causal_root_h_notify_wake_drain",
         "normal_model_provider_bash_causal_root_h_notify_wake_lost",
         "normal_model_provider_bash_causal_root_h_notify_wake_unknown",
         "normal_model_provider_bash_causal_w_debt",

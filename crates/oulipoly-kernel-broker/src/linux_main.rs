@@ -81,7 +81,9 @@ use oulipoly_kernel_broker::source_acceptance::{
     read_v2_recipient_custody,
 };
 use oulipoly_kernel_broker::source_physical::{SourceObservation, SourcePhysicalRegistry};
-use oulipoly_kernel_broker::work_registry::{Scope, WorkRegistry, classify_scope};
+use oulipoly_kernel_broker::work_registry::{
+    Scope, WorkRegistry, classify_scope, classify_scope_readback,
+};
 use oulipoly_state::mailbox::{
     BrokerReleaseEvidence, BrokerSidecar, BrokerSourceEffectGrant, ExactProcessEvidence,
     FreshBashListenerPolicy, FreshDeliverySubmission, FreshNativeFPreparation,
@@ -3917,14 +3919,19 @@ fn attest_released_child(
     held: &BTreeMap<String, root_join::HeldRootJoin>,
     sidecar: &BrokerSidecar,
     retained_gate_required: bool,
+    require_clean_work_registry: bool,
 ) -> io::Result<BrokerReleaseEvidence> {
     if spec.protocol != "broker-release-attest-v30"
         || spec.attempt_id.is_some()
         || roots.has_debt()
-        || works.has_debt()
+        || require_clean_work_registry && works.has_debt()
         || entries.has_uncertain_write()
         || !matches!(
-            classify_scope(peer, host_namespace, roots, works),
+            if require_clean_work_registry {
+                classify_scope(peer, host_namespace, roots, works)
+            } else {
+                classify_scope_readback(peer, host_namespace, roots, works)
+            },
             Scope::Root(ref root) if root == &spec.root_id
         )
     {
@@ -4017,6 +4024,56 @@ struct FreshTerminalBridgeRequest {
     reply: SyncSender<io::Result<()>>,
 }
 
+struct FreshDrainBridgeRequest {
+    root: RootRecord,
+    reply: SyncSender<io::Result<root_drain::RootDrainInventory>>,
+}
+
+fn fence_root_from_terminal(
+    bridge: &SyncSender<FreshDrainBridgeRequest>,
+    root: &FreshReleasedHandoff,
+    read: &FreshRootTerminalReadback,
+) -> io::Result<root_drain::RootDrainInventory> {
+    let execution = read
+        .execution
+        .as_ref()
+        .ok_or_else(|| io::Error::other("root execution absent before drain fence"))?;
+    if read.execution_state == "unknown"
+        || !read.unresolved_child_request_ids.is_empty()
+        || execution.handoff_id != root.handoff_id
+        || execution.d_key != root.d_key
+        || execution.invocation_uuid != root.invocation_uuid
+        || execution.root_id != root.old_release.prepared.root_id
+        || execution.owner_generation != root.old_release.prepared.owner_generation
+        || execution.actor != read.actor
+    {
+        return Err(io::Error::other(
+            "root terminal lineage unresolved before drain fence",
+        ));
+    }
+    let prepared = &root.old_release.prepared;
+    let init = &prepared.root_init;
+    let (reply, answer) = mpsc::sync_channel(1);
+    bridge
+        .send(FreshDrainBridgeRequest {
+            root: RootRecord {
+                version: 1,
+                boot_id: init.boot_id.clone(),
+                root_id: prepared.root_id.clone(),
+                owner_uid: prepared.owner_uid,
+                init_host_pid: init.host_pid,
+                init_starttime_ticks: init.starttime_ticks,
+                pidns_dev: init.pidns_dev,
+                pidns_ino: init.pidns_ino,
+            },
+            reply,
+        })
+        .map_err(|_| io::Error::other("root drain authority unavailable"))?;
+    answer
+        .recv_timeout(RELEASED_HANDOFF_REPLY_TIMEOUT)
+        .map_err(|_| io::Error::other("root drain fence response uncertain"))?
+}
+
 fn settle_entry_from_terminal(
     bridge: &SyncSender<FreshTerminalBridgeRequest>,
     read: &FreshRootTerminalReadback,
@@ -4104,6 +4161,7 @@ fn released_child_handoff(
             held,
             sidecar,
             existing.is_none(),
+            !request.read_only,
         )?;
         if let Some(receipt) = existing {
             if receipt.old_release != evidence || receipt.fresh_lane != request.lane {
@@ -4564,6 +4622,10 @@ fn serve() -> io::Result<()> {
         SyncSender<FreshTerminalBridgeRequest>,
         Receiver<FreshTerminalBridgeRequest>,
     ) = mpsc::sync_channel(FRESH_HANDOFF_QUEUE_CAPACITY);
+    let (drain_tx, drain_rx): (
+        SyncSender<FreshDrainBridgeRequest>,
+        Receiver<FreshDrainBridgeRequest>,
+    ) = mpsc::sync_channel(FRESH_HANDOFF_QUEUE_CAPACITY);
     // The old loop alone owns the release gate and mutable kernel registries.
     // Fresh storage stays on another thread and is opened only at the fixed
     // broker-owned v30 directory. Neither handler can wait on the other's
@@ -4574,6 +4636,7 @@ fn serve() -> io::Result<()> {
         let fresh_runner_image = runner_image.try_clone()?;
         let fresh_handoff_tx = handoff_tx.clone();
         let fresh_terminal_tx = terminal_tx.clone();
+        let fresh_drain_tx = drain_tx.clone();
         let fresh_admission_fences = Arc::clone(&admission_fences);
         let fresh_socket = if fixture {
             Path::new(&socket).with_file_name("v30.sock")
@@ -4589,6 +4652,7 @@ fn serve() -> io::Result<()> {
                     fresh_runner_image,
                     Some(fresh_handoff_tx),
                     Some(fresh_terminal_tx),
+                    Some(fresh_drain_tx),
                     fresh_admission_fences,
                 ) {
                     eprintln!("fresh v30 lane closed: {error}");
@@ -4596,6 +4660,28 @@ fn serve() -> io::Result<()> {
             })?;
     }
     loop {
+        if let Ok(request) = drain_rx.try_recv() {
+            let result = (|| {
+                registry.exact_record(&request.root)?;
+                let mut fences = admission_fences
+                    .lock()
+                    .map_err(|_| io::Error::other("root admission fence poisoned"))?;
+                let persisted = registry.fence_admission(&request.root);
+                fences.insert(request.root.root_id.clone());
+                persisted?;
+                drop(fences);
+                root_drain::readback(
+                    &request.root,
+                    &registry,
+                    &entries,
+                    &works,
+                    &grants,
+                    &source_physical,
+                    broker_sidecar.as_ref(),
+                )
+            })();
+            let _ = request.reply.send(result);
+        }
         if let Ok(request) = terminal_rx.try_recv() {
             let result = entries.settle_join(&request.root_id, request.settlement);
             let _ = request.reply.send(result);
@@ -5354,6 +5440,7 @@ fn serve() -> io::Result<()> {
                         &held_joins,
                         sidecar,
                         true,
+                        true,
                     )?;
                     encode_release_evidence(&evidence)
                 } else if spec.protocol == "broker-repair-read-v30" {
@@ -5719,6 +5806,7 @@ fn serve_fresh_v30() -> io::Result<()> {
         File::open(&runner)?,
         None,
         None,
+        None,
         admission_fences,
     )
 }
@@ -5876,6 +5964,7 @@ fn serve_fresh_v30_at(
     runner_image: File,
     handoff_tx: Option<SyncSender<FreshHandoffBridgeRequest>>,
     terminal_tx: Option<SyncSender<FreshTerminalBridgeRequest>>,
+    drain_tx: Option<SyncSender<FreshDrainBridgeRequest>>,
     admission_fences: Arc<Mutex<HashSet<String>>>,
 ) -> io::Result<()> {
     // A missing or incomplete publication cannot bind the new endpoint.
@@ -6809,12 +6898,16 @@ fn serve_fresh_v30_at(
                     let bridge = handoff_tx.as_ref().ok_or_else(|| {
                         io::Error::other("in-process release authority unavailable")
                     })?;
+                    // Reading or returning an already prepared root effect
+                    // may follow a child PID1 exit. Preparing a new effect
+                    // still requires a clean work registry.
+                    let read_only = operation != b'0';
                     if bridge_released_handoff(
                         bridge,
                         spec,
                         peer,
                         lane.identity(),
-                        true,
+                        read_only,
                         &runner_image,
                     )? != receipt
                     {
@@ -7710,6 +7803,23 @@ fn serve_fresh_v30_at(
                         return Err(io::Error::other("fresh recipient request absent"));
                     };
                     let reply = match request {
+                        FreshRecipientRequest::FenceRootTerminal { ref d_key } => {
+                            let root = lane
+                                .released_handoff_for_child(d_key, &recipient)
+                                .map_err(io::Error::other)?;
+                            let session = lane
+                                .read_session(d_key)
+                                .map_err(io::Error::other)?
+                                .ok_or_else(|| io::Error::other("root drain D session absent"))?;
+                            let read = lane
+                                .read_private_root_terminal(&root, &recipient, &session)
+                                .map_err(io::Error::other)?;
+                            let bridge = drain_tx
+                                .as_ref()
+                                .ok_or_else(|| io::Error::other("root drain bridge absent"))?;
+                            let inventory = fence_root_from_terminal(bridge, &root, &read)?;
+                            serde_json::json!({"kind":"root_drain_readback", "inventory":inventory})
+                        }
                         FreshRecipientRequest::ReadRootTerminal { ref d_key }
                         | FreshRecipientRequest::SettleRootTerminal { ref d_key }
                         | FreshRecipientRequest::RepairRootTerminal { ref d_key }

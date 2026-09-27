@@ -365,7 +365,33 @@ pub fn classify_scope(
     roots: &RootRegistry,
     works: &WorkRegistry,
 ) -> Scope {
-    if peer.process.verify().is_err() || roots.has_debt() || works.has_debt() {
+    classify_scope_inner(peer, host_namespace, roots, works, true)
+}
+
+/// Exact readback may outlive a child work PID1. It still refuses incomplete
+/// registry writes and orphaned records; it grants no new work admission.
+pub fn classify_scope_readback(
+    peer: &PeerIdentity,
+    host_namespace: &File,
+    roots: &RootRegistry,
+    works: &WorkRegistry,
+) -> Scope {
+    classify_scope_inner(peer, host_namespace, roots, works, false)
+}
+
+fn classify_scope_inner(
+    peer: &PeerIdentity,
+    host_namespace: &File,
+    roots: &RootRegistry,
+    works: &WorkRegistry,
+    require_all_live: bool,
+) -> Scope {
+    if peer.process.verify().is_err()
+        || roots.has_debt()
+        || works.poisoned
+        || !works.debt.is_empty()
+        || require_all_live && works.has_debt()
+    {
         return Scope::Uncertain;
     }
     let Ok(mut namespace) = peer.process.namespace().try_clone() else {

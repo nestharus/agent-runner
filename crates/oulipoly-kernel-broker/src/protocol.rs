@@ -1324,6 +1324,11 @@ pub enum FreshRecipientRequest {
     RepairRootTerminal {
         d_key: String,
     },
+    /// Fence further admissions for the exact terminal root. The reply is a
+    /// physical inventory, not a PID1 or owner close certificate.
+    FenceRootTerminal {
+        d_key: String,
+    },
     /// The caller retains its exact bounded artifact bytes. This stores only
     /// their hash/length as publication unknown, never a delivered assertion.
     BeginRootPublication {
@@ -1460,6 +1465,19 @@ pub fn fresh_root_terminal_request_at(
         return Err(io::Error::other("fresh root terminal reply kind changed"));
     }
     serde_json::from_value(value["terminal"].clone()).map_err(io::Error::other)
+}
+
+pub fn fresh_root_drain_at(path: &Path, d_key: &str) -> io::Result<serde_json::Value> {
+    let value = fresh_recipient_request_at(
+        path,
+        &FreshRecipientRequest::FenceRootTerminal {
+            d_key: d_key.to_owned(),
+        },
+    )?;
+    if value["kind"] != "root_drain_readback" || value["inventory"]["fenced"] != true {
+        return Err(io::Error::other("root drain fence reply changed"));
+    }
+    Ok(value["inventory"].clone())
 }
 
 fn fresh_v30_session_request_at(

@@ -23,4 +23,4 @@ pub mod writer_census;
 
 pub use identity::{Classification, PeerIdentity, PinnedProcess, classify_peer};
 pub use registry::{RootRecord, RootRegistry};
-pub use work_registry::{Scope, WorkRecord, WorkRegistry, classify_scope};
+pub use work_registry::{Scope, WorkRecord, WorkRegistry, classify_scope, classify_scope_readback};
