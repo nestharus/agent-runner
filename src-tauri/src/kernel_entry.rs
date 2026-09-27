@@ -1878,17 +1878,30 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
         if std::env::var_os("AGE319_PRIVATE_PRE_K_H_SOURCE_V1").is_none() {
             private_v30_marker("child-attested", &evidence.release_id)?;
         }
-        let mut disposition = if std::env::var_os("AGE319_PRIVATE_PRE_K_H_SOURCE_V1").is_some() {
+        let selected_h_notify = std::env::var_os("AGE319_PRIVATE_SELECTED_K_ROOT_H_V1").is_some()
+            && std::env::var_os("AGE319_PRIVATE_BASH_ORIGINAL_NOTIFY_V1").is_some();
+        let mut disposition = if std::env::var_os("AGE319_PRIVATE_PRE_K_H_SOURCE_V1").is_some()
+            || selected_h_notify
+        {
             let (receipt, session) = effect_binding
                 .as_ref()
                 .ok_or("H custody claim has no released J/D binding")?;
             if receipt.old_release != evidence || session.request_id != receipt.d_key {
                 return Err("H custody claim changed released J/D".into());
             }
-            if !matches!(
-                receipt.root_work_intent,
-                oulipoly_state::mailbox::FreshRootWorkIntent::PrivateProbe(_)
-            ) {
+            let valid_intent = if selected_h_notify {
+                matches!(
+                    receipt.root_work_intent,
+                    oulipoly_state::mailbox::FreshRootWorkIntent::NormalCli(_)
+                ) && receipt.delegated_h_listener_policy.as_deref() == Some("notify")
+                    && receipt.delegated_root_work_authority.is_some()
+            } else {
+                matches!(
+                    receipt.root_work_intent,
+                    oulipoly_state::mailbox::FreshRootWorkIntent::PrivateProbe(_)
+                )
+            };
+            if !valid_intent {
                 return Err("H custody claim has no released H intent".into());
             }
             Disposition::AwaitingH {
@@ -3304,10 +3317,13 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
             ]);
             if let Some(mode) = std::env::var_os("AGE319_PRIVATE_BASH_ORDINARY_MODE_V1") {
                 plan.plan.argv.push(mode.to_string_lossy().into_owned());
-            } else if std::env::var_os("AGE319_PRIVATE_BASH_SOURCE_SUCCESS_V1").is_some() {
-                plan.plan.argv.push("no-cancel".into());
-            } else if std::env::var_os("AGE319_PRIVATE_BASH_ORIGINAL_NOTIFY_V1").is_some() {
-                plan.plan.argv.push("notify".into());
+            } else {
+                if std::env::var_os("AGE319_PRIVATE_BASH_SOURCE_SUCCESS_V1").is_some() {
+                    plan.plan.argv.push("no-cancel".into());
+                }
+                if std::env::var_os("AGE319_PRIVATE_BASH_ORIGINAL_NOTIFY_V1").is_some() {
+                    plan.plan.argv.push("notify".into());
+                }
             }
         }
         prepared.push(plan);
@@ -6067,6 +6083,7 @@ fn v30_host_entry() -> Result<ExitCode, String> {
             }
             if let Disposition::AwaitingH { .. } = &disposition {
                 if std::env::var_os("AGE319_PRIVATE_PRE_K_H_SOURCE_V1").is_none()
+                    && std::env::var_os("AGE319_PRIVATE_SELECTED_K_ROOT_H_V1").is_none()
                     || !disposition.valid_h_identity()
                 {
                     return Err("v30 H custody claim is not exact J/D intent".into());

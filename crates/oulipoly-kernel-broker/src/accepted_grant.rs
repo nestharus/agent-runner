@@ -64,6 +64,7 @@ pub struct Acceptance {
 pub struct DelegatedRootHGrant {
     pub proof: DelegatedRootHProof,
     pub selected_k: FreshRootHSelectedK,
+    pub listener_policy: String,
 }
 
 #[derive(Deserialize)]
@@ -81,6 +82,8 @@ struct IntentIdentity {
 #[derive(Deserialize)]
 struct IntentMeta {
     cwd: PathBuf,
+    #[serde(default)]
+    delivery_mode: Option<String>,
     #[serde(default)]
     owner_session_id: Option<String>,
     #[serde(default)]
@@ -1400,6 +1403,16 @@ impl GrantRegistry {
             return Err(io::Error::other("delegated H acceptance or ticket changed"));
         }
         let intent_identity: IntentIdentity = serde_json::from_slice(&intent_bytes)?;
+        if let Some(binding) = &delegated_root_h {
+            let expected_mode = match binding.listener_policy.as_str() {
+                "notify" => "async",
+                "response_only" => "sync",
+                _ => return Err(io::Error::other("delegated H listener policy invalid")),
+            };
+            if intent_identity.meta.delivery_mode.as_deref() != Some(expected_mode) {
+                return Err(io::Error::other("delegated H source delivery mode changed"));
+            }
+        }
         let helper = sealed_helper(state_dir, &intent_identity, runner_image)?;
         let expected_state =
             fs::metadata(intent_identity.state_root.join(&intent_identity.handle))?;
@@ -1652,6 +1665,7 @@ fn valid_delegated_grant(record: &GrantRecord, binding: &DelegatedRootHGrant) ->
     let guardian = &proof.witness.guardian;
     let selected = &binding.selected_k;
     matches!(proof.witness.scope, SourceScope::Root)
+        && matches!(binding.listener_policy.as_str(), "response_only" | "notify")
         && uuid::Uuid::parse_str(&proof.ticket_id).is_ok()
         && proof.work_id == record.work_id
         && proof.witness.root_id == record.root_id
@@ -1729,6 +1743,7 @@ mod tests {
             state_root: PathBuf::from("/not-opened"),
             meta: IntentMeta {
                 cwd: PathBuf::from("/"),
+                delivery_mode: None,
                 owner_session_id: None,
                 owner_invocation_uuid: None,
                 delivery_helper: Some(HelperProvenance {
@@ -1774,6 +1789,7 @@ mod tests {
                 state_root: PathBuf::from("/not-opened"),
                 meta: IntentMeta {
                     cwd: PathBuf::from("/"),
+                    delivery_mode: None,
                     delivery_helper: (fields & 1 != 0).then(|| provenance.clone()),
                     owner_session_id: (fields & 2 != 0).then(|| "session".into()),
                     owner_invocation_uuid: (fields & 4 != 0)

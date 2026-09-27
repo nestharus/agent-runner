@@ -1648,10 +1648,31 @@ fn inner() {
         mode.as_str(),
         "normal_model_provider_bash_causal_root_h_delegate"
             | "normal_model_provider_bash_causal_root_h_lost"
+            | "normal_model_provider_bash_causal_root_h_notify_row"
+            | "normal_model_provider_bash_causal_root_h_notify_wake"
+            | "normal_model_provider_bash_causal_root_h_notify_wake_lost"
+            | "normal_model_provider_bash_causal_root_h_notify_wake_unknown"
     );
     let root_h_lost = mode == "normal_model_provider_bash_causal_root_h_lost";
+    let root_h_notify = root_h_delegate && mode.contains("_notify_");
+    let root_h_wake = mode.contains("root_h_notify_wake");
+    let root_h_wake_lost = mode.ends_with("root_h_notify_wake_lost");
+    let root_h_wake_unknown = mode.ends_with("root_h_notify_wake_unknown");
     if root_h_delegate {
         fs::write(gate.join("selected-k-root-h"), b"intent").unwrap();
+        if root_h_notify {
+            fs::write(gate.join("source-production-registration-cli"), b"yes").unwrap();
+            fs::write(gate.join("source-production-postcommit-h"), b"schedule").unwrap();
+        }
+        if root_h_wake {
+            fs::write(gate.join("v2-wake-enabled"), b"enabled").unwrap();
+            if root_h_wake_lost {
+                fs::write(gate.join("v2-wake-lost"), b"lost").unwrap();
+            }
+            if root_h_wake_unknown {
+                fs::write(gate.join("v2-wake-unknown"), b"unknown").unwrap();
+            }
+        }
         if root_h_lost {
             fs::write(gate.join("selected-k-root-h-lost"), b"lost").unwrap();
         }
@@ -2219,6 +2240,15 @@ fn inner() {
                 .then_some(("AGE319_PRIVATE_BASH_SOURCE_SUCCESS_V1", "1")),
         )
         .envs(root_h_delegate.then_some(("AGE319_PRIVATE_SELECTED_K_ROOT_H_V1", "1")))
+        .envs(root_h_notify.then_some(("AGE319_PRIVATE_BASH_ORIGINAL_NOTIFY_V1", "1")))
+        .envs(root_h_wake.then_some(("OULIPOLY_KERNEL_BROKER_FIXTURE_V2_WAKE_V1", "1")))
+        .envs(
+            root_h_wake_lost.then_some(("OULIPOLY_KERNEL_BROKER_FIXTURE_V2_WAKE_DROP_ACK_V1", "1")),
+        )
+        .envs(
+            root_h_wake_unknown
+                .then_some(("OULIPOLY_KERNEL_BROKER_FIXTURE_V2_WAKE_DROP_WRITE_V1", "1")),
+        )
         .envs(root_h_lost.then_some(("AGE319_PRIVATE_DROP_ROOT_H_REPLY_V1", "1")))
         .envs(
             (mode == "normal_model_provider_bash_causal_w_debt"
@@ -2593,6 +2623,10 @@ fn inner() {
                             | "normal_model_provider_bash_causal_success"
                             | "normal_model_provider_bash_causal_root_h_delegate"
                             | "normal_model_provider_bash_causal_root_h_lost"
+                            | "normal_model_provider_bash_causal_root_h_notify_row"
+                            | "normal_model_provider_bash_causal_root_h_notify_wake"
+                            | "normal_model_provider_bash_causal_root_h_notify_wake_lost"
+                            | "normal_model_provider_bash_causal_root_h_notify_wake_unknown"
                             | "normal_model_provider_bash_causal_notify_ack"
                             | "normal_model_provider_bash_causal_notify_prepare_unavailable"
                             | "normal_model_provider_bash_causal_notify_lost_pending"
@@ -2781,11 +2815,14 @@ fn inner() {
             )
             .envs(root_h_delegate.then_some(("AGE319_PRIVATE_SELECTED_K_ROOT_H_V1", "1")))
             .envs(
-                (mode == "normal_empty" || bad_disposition || production_source)
+                (mode == "normal_empty" || bad_disposition || production_source || root_h_notify)
                     .then_some(("AGE319_PRIVATE_PRE_EFFECT_DISPOSITION_V1", "1")),
             )
-            .envs(postcommit_source.then_some(("AGE319_PRIVATE_POSTCOMMIT_H_V1", "1")))
-            .envs(postcommit_source.then_some((
+            .envs(
+                (postcommit_source || root_h_notify)
+                    .then_some(("AGE319_PRIVATE_POSTCOMMIT_H_V1", "1")),
+            )
+            .envs((postcommit_source || root_h_notify).then_some((
                 "AGE319_PRIVATE_SOURCE_Q_MARKER_V1",
                 gate.join("source-adopted-started"),
             )))
@@ -4971,6 +5008,46 @@ fn inner() {
             if mode.starts_with("normal_model_provider_bash_causal") {
                 let success_source = mode.ends_with("_success") || root_h_delegate;
                 fs::write(gate.join("child-effect"), b"yes").unwrap();
+                if root_h_notify {
+                    let until = Instant::now() + Duration::from_secs(90);
+                    while !gate.join("source-postcommit-ready").exists()
+                        && entry.try_wait().unwrap().is_none()
+                        && Instant::now() < until
+                    {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    assert!(
+                        gate.join("source-postcommit-ready").exists(),
+                        "selected-K original W did not reach postcommit: entry={} broker={} bash={} guardian={} driver={}",
+                        fs::read_to_string(&err).unwrap_or_default(),
+                        fs::read_to_string(&broker_log).unwrap_or_default(),
+                        fs::read_to_string(gate.join("bash-causal-error")).unwrap_or_default(),
+                        fs::read_to_string(gate.join("source-guardian-postcommit-stage"))
+                            .unwrap_or_default(),
+                        fs::read_to_string(gate.join("source-driver-postcommit-stage"))
+                            .unwrap_or_default()
+                    );
+                    assert!(
+                        SourcePhysicalRegistry::open(broker_state.join("source-physical"))
+                            .unwrap()
+                            .records()
+                            .is_empty(),
+                        "pending original W already spent source Q"
+                    );
+                    let pending_rows: i64 = rusqlite::Connection::open_with_flags(
+                        broker_state.join("sidecar/pid-identity.db"),
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                    )
+                    .unwrap()
+                    .query_row(
+                        "SELECT count(*) FROM mailbox WHERE session_id!='old-pending'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                    assert_eq!(pending_rows, 0, "pending original W created a row");
+                    fs::write(gate.join("source-postcommit-notify"), b"schedule").unwrap();
+                }
                 if mode.ends_with("_w_debt") {
                     eventually(|| {
                         fs::read_to_string(gate.join("bash-causal-error"))
@@ -5137,12 +5214,28 @@ fn inner() {
                         .read_root_h_delegation(&root.handoff_id)
                         .unwrap()
                         .unwrap();
+                    assert_eq!(
+                        root.delegated_h_listener_policy.as_deref(),
+                        Some(if root_h_notify {
+                            "notify"
+                        } else {
+                            "response_only"
+                        })
+                    );
                     let mut child = lane
                         .read_bash_child(&delegation.child_request_id)
                         .unwrap()
                         .unwrap();
                     child.session = lane.read_session(&child.d_key).unwrap().unwrap();
                     assert_eq!(delegation.child_actor, child.actor);
+                    assert_eq!(
+                        delegation.listener_policy,
+                        if root_h_notify {
+                            "notify"
+                        } else {
+                            "response_only"
+                        }
+                    );
                     assert_eq!(delegation.root_invocation_uuid, root.invocation_uuid);
                     assert_eq!(accepted["owner_generation"], delegation.owner_generation);
                     assert_eq!(accepted["initiator"]["pid"], child.actor.host_pid);
@@ -5198,6 +5291,25 @@ fn inner() {
                             &delegation.selected_k,
                         )
                         .is_err()
+                    );
+                    let mut wrong_policy = root.clone();
+                    wrong_policy.delegated_h_listener_policy = Some(
+                        if root_h_notify {
+                            "response_only"
+                        } else {
+                            "notify"
+                        }
+                        .into(),
+                    );
+                    assert!(
+                        lane.require_consumed_root_h_delegation(
+                            &wrong_policy,
+                            &actor,
+                            &child,
+                            &delegation.selected_k,
+                        )
+                        .is_err(),
+                        "late policy change acquired consumed H"
                     );
                     eventually(|| {
                         fs::read_dir(broker_state.join("grants"))
@@ -5300,6 +5412,14 @@ fn inner() {
                     );
                     assert_eq!(delegation.selected_k.grant_id, child.parent_work_grant_id);
                     assert_eq!(delegation.selected_k.work_id, child.parent_work_id);
+                    assert_eq!(
+                        delegation.listener_policy,
+                        if root_h_notify {
+                            "notify"
+                        } else {
+                            "response_only"
+                        }
+                    );
                     assert_eq!(
                         lane.read_root_h_delegation(&delegation.handoff_id).unwrap(),
                         Some(delegation)
@@ -5678,6 +5798,13 @@ fn inner() {
                     let h_state = std::path::PathBuf::from(
                         fs::read_to_string(gate.join("h-source-intent-dir")).unwrap(),
                     );
+                    let original_meta: serde_json::Value =
+                        serde_json::from_slice(&fs::read(h_state.join("meta.json")).unwrap())
+                            .unwrap();
+                    assert_eq!(
+                        original_meta["delivery_mode"],
+                        if root_h_notify { "async" } else { "sync" }
+                    );
                     let w_replies = fs::read_dir(&h_state)
                         .unwrap()
                         .filter_map(Result::ok)
@@ -5736,6 +5863,14 @@ fn inner() {
                             .is_some_and(|pid| pid > 0)
                     );
                     assert_eq!(fs::read(h_state.join("rc")).unwrap(), b"0\n");
+                    if root_h_notify {
+                        eventually(|| {
+                            h_state.join("completion-snapshot-v2.json").exists()
+                                && h_state.join("source-outcome-v2.json").exists()
+                                && gate.join("source-adopted-started").exists()
+                        });
+                        fs::write(gate.join("source-adopted-started.release"), b"drain").unwrap();
+                    }
                     let original_session = FreshV30Lane::open_at(&broker_state)
                         .unwrap()
                         .read_session(&root.d_key)
@@ -5746,6 +5881,31 @@ fn inner() {
                         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
                     )
                     .unwrap();
+                    if root_h_notify {
+                        let until = Instant::now() + Duration::from_secs(20);
+                        loop {
+                            if original_sidecar
+                                .query_row(
+                                    "SELECT count(*) FROM mailbox WHERE session_id=?1",
+                                    [&original_session.session_id],
+                                    |row| row.get::<_, i64>(0),
+                                )
+                                .is_ok_and(|count| count == 1)
+                            {
+                                break;
+                            }
+                            assert!(
+                                Instant::now() < until,
+                                "selected-K original notification absent: broker={} bash={} source_physical={:?}",
+                                fs::read_to_string(&broker_log).unwrap_or_default(),
+                                fs::read_to_string(gate.join("bash-causal-error"))
+                                    .unwrap_or_default(),
+                                SourcePhysicalRegistry::open(broker_state.join("source-physical"))
+                                    .map(|registry| registry.records().len())
+                            );
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                    }
                     let rows: i64 = original_sidecar
                         .query_row(
                             "SELECT count(*) FROM mailbox WHERE session_id=?1",
@@ -5753,7 +5913,254 @@ fn inner() {
                             |row| row.get(0),
                         )
                         .unwrap();
-                    assert_eq!(rows, 0, "response-only original W invented a listener row");
+                    assert_eq!(
+                        rows,
+                        if root_h_notify { 1 } else { 0 },
+                        "original H listener policy did not control row materialization"
+                    );
+                    let old_pending: i64 = original_sidecar
+                        .query_row(
+                            "SELECT count(*) FROM mailbox WHERE session_id='old-pending' AND handle='old-unacked' AND delivered_at IS NULL",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(old_pending, 1, "selected-K source changed old v29 debt");
+                    if root_h_notify {
+                        let physical =
+                            SourcePhysicalRegistry::open(broker_state.join("source-physical"))
+                                .unwrap();
+                        assert_eq!(
+                            physical.records().len(),
+                            1,
+                            "selected-K H did not retain one original source Q"
+                        );
+                        let source_grant = &physical.records()[0].grant;
+                        let mut retained = BrokerSidecar::open_existing(
+                            &broker_state.join("sidecar/pid-identity.db"),
+                            &broker_state,
+                        )
+                        .unwrap();
+                        let original_binding = retained
+                            .read_consumed_source_candidate(source_grant)
+                            .unwrap();
+                        let original_source = original_binding.registration().unwrap();
+                        assert_eq!(original_source.delivery_mode, "async");
+                        assert_eq!(
+                            original_source.owner_session_id,
+                            original_session.session_id
+                        );
+                        assert_eq!(original_source.owner_invocation_uuid, root.invocation_uuid);
+                        let custody =
+                            oulipoly_kernel_broker::source_acceptance::read_v2_recipient_custody(
+                                &mut retained,
+                                &physical,
+                                &source_grant.grant_id,
+                            )
+                            .unwrap();
+                        assert_eq!(custody.root_id, prepared.root_id);
+                        assert_eq!(custody.owner_generation, prepared.owner_generation);
+                        assert_eq!(custody.session_id, original_session.session_id);
+                        assert_eq!(custody.owner_invocation_uuid, root.invocation_uuid);
+                        let payload = retained
+                            .mailbox()
+                            .completion_recovery_payload(&original_source.handle)
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(
+                            custody.payload_sha256,
+                            format!("{:x}", Sha256::digest(&payload))
+                        );
+                        assert_eq!(custody.payload_byte_len, payload.len() as i64);
+                        let snapshot_path = std::path::Path::new(&original_source.handle_dir)
+                            .join(&original_source.snapshot_relative);
+                        let saved_snapshot = fs::read(&snapshot_path).unwrap();
+                        fs::write(&snapshot_path, b"changed original source").unwrap();
+                        assert!(
+                            oulipoly_kernel_broker::source_acceptance::read_v2_recipient_custody(
+                                &mut retained,
+                                &physical,
+                                &source_grant.grant_id,
+                            )
+                            .is_err(),
+                            "changed selected-K original source passed custody readback"
+                        );
+                        fs::write(&snapshot_path, saved_snapshot).unwrap();
+                        let payload_path: String = original_sidecar
+                            .query_row(
+                                "SELECT payload_file_path FROM mailbox WHERE seq=?1",
+                                [custody.row_seq],
+                                |row| row.get(0),
+                            )
+                            .unwrap();
+                        let payload_json: serde_json::Value =
+                            serde_json::from_slice(&payload).unwrap();
+                        let output_path = std::path::Path::new(
+                            payload_json["output_artifact"]["path"].as_str().unwrap(),
+                        );
+                        let saved_output = fs::read(output_path).unwrap();
+                        fs::write(output_path, b"changed retained output").unwrap();
+                        assert!(
+                            oulipoly_kernel_broker::source_acceptance::read_v2_recipient_custody(
+                                &mut retained,
+                                &physical,
+                                &source_grant.grant_id,
+                            )
+                            .is_err(),
+                            "changed selected-K retained output passed custody readback"
+                        );
+                        fs::write(output_path, saved_output).unwrap();
+                        fs::write(&payload_path, b"changed retained payload").unwrap();
+                        assert!(
+                            oulipoly_kernel_broker::source_acceptance::read_v2_recipient_custody(
+                                &mut retained,
+                                &physical,
+                                &source_grant.grant_id,
+                            )
+                            .is_err(),
+                            "changed selected-K payload passed custody readback"
+                        );
+                        fs::write(&payload_path, &payload).unwrap();
+                        assert_eq!(
+                            oulipoly_kernel_broker::source_acceptance::read_v2_recipient_custody(
+                                &mut retained,
+                                &physical,
+                                &source_grant.grant_id,
+                            )
+                            .unwrap(),
+                            custody,
+                        );
+                        let again = oulipoly_kernel_broker::source_acceptance::trigger_v2_completion_source(
+                            &mut retained, &physical, &source_grant.grant_id,
+                        ).unwrap();
+                        assert_eq!(
+                            again.mailbox_rows.len(),
+                            1,
+                            "duplicate trigger created another original row"
+                        );
+                        assert_eq!(again.mailbox_rows[0].seq, custody.row_seq);
+                        if root_h_wake {
+                            fs::write(gate.join("v2-wake-activate"), b"activate").unwrap();
+                            eventually(|| {
+                                retained
+                                    .read_v2_recipient_grant(&source_grant.grant_id)
+                                    .is_ok_and(|grant| {
+                                        grant.as_ref().is_some_and(|grant| {
+                                            grant.phase
+                                                == if root_h_wake_unknown {
+                                                    "unknown"
+                                                } else if root_h_wake_lost {
+                                                    "submitted"
+                                                } else {
+                                                    "acked"
+                                                }
+                                        })
+                                    })
+                            });
+                            let grant = retained
+                                .read_v2_recipient_grant(&source_grant.grant_id)
+                                .unwrap()
+                                .unwrap();
+                            assert_eq!(grant.binding.row_seq, custody.row_seq);
+                            assert_eq!(grant.binding.payload_sha256, custody.payload_sha256);
+                            assert_eq!(grant.binding.session_id, original_session.session_id);
+                            assert_eq!(
+                                grant.ack_response_sha256.is_some(),
+                                !root_h_wake_lost && !root_h_wake_unknown,
+                            );
+                            assert!(retained.begin_v2_recipient_send(&grant).is_err());
+                            assert!(
+                                retained
+                                    .acknowledge_v2_recipient(
+                                        &source_grant.grant_id,
+                                        "wrong-process",
+                                        &grant.delivery_token,
+                                        &"0".repeat(64),
+                                    )
+                                    .is_err(),
+                                "wrong actor ACKed selected-K original wake"
+                            );
+                            if root_h_wake_lost || root_h_wake_unknown {
+                                let mut stale: oulipoly_kernel_broker::entry_registry::ProcessStamp =
+                                    serde_json::from_str(&grant.recipient_identity).unwrap();
+                                stale.starttime_ticks += 1;
+                                assert!(
+                                    retained
+                                        .acknowledge_v2_recipient(
+                                            &source_grant.grant_id,
+                                            &serde_json::to_string(&stale).unwrap(),
+                                            &grant.delivery_token,
+                                            &"0".repeat(64),
+                                        )
+                                        .is_err(),
+                                    "stale recipient incarnation ACKed selected-K wake"
+                                );
+                            } else {
+                                assert!(
+                                    retained
+                                        .acknowledge_v2_recipient(
+                                            &source_grant.grant_id,
+                                            &grant.recipient_identity,
+                                            &grant.delivery_token,
+                                            &"0".repeat(64),
+                                        )
+                                        .is_err(),
+                                    "duplicate ACK changed selected-K wake settlement"
+                                );
+                            }
+                            let grant_count: i64 = original_sidecar
+                                .query_row(
+                                    "SELECT count(*) FROM broker_v2_recipient_grant",
+                                    [],
+                                    |row| row.get(0),
+                                )
+                                .unwrap();
+                            assert_eq!(grant_count, 1, "selected-K wake duplicated a grant");
+                            let phase = grant.phase.clone();
+                            assert!(
+                                raw_fresh_id_request(
+                                    &socket.with_file_name("v30.sock"),
+                                    b'C',
+                                    uuid::Uuid::new_v4(),
+                                )
+                                .contains("Bash child image changed"),
+                                "wrong Bash image control lost before wake restart"
+                            );
+                            stop(&mut broker);
+                            broker = restart_source_broker(
+                                &socket,
+                                &broker_state,
+                                &runner,
+                                &gate,
+                                &temp.path().join("selected-h-wake-restart.log"),
+                            );
+                            assert_eq!(
+                                retained
+                                    .read_v2_recipient_grant(&source_grant.grant_id)
+                                    .unwrap()
+                                    .unwrap(),
+                                grant,
+                                "restart changed original selected-K wake grant"
+                            );
+                            assert_eq!(
+                                phase,
+                                if root_h_wake_unknown {
+                                    "unknown"
+                                } else if root_h_wake_lost {
+                                    "submitted"
+                                } else {
+                                    "acked"
+                                }
+                            );
+                        } else {
+                            assert!(
+                                retained
+                                    .read_v2_recipient_grant(&source_grant.grant_id)
+                                    .unwrap()
+                                    .is_none()
+                            );
+                        }
+                    }
                     let release = BrokerSidecar::open_existing(
                         &broker_state.join("sidecar/pid-identity.db"),
                         &broker_state,
@@ -5968,7 +6375,11 @@ fn inner() {
                     uuid::Uuid::new_v4(),
                 );
                 assert!(
-                    image_probe.contains("Bash child image changed"),
+                    image_probe.contains(if root_h_wake {
+                        "installed Bash image absent"
+                    } else {
+                        "Bash child image changed"
+                    }),
                     "{image_probe}"
                 );
                 assert!(
@@ -6013,11 +6424,21 @@ fn inner() {
                     sibling_result["stderr"]
                         .as_str()
                         .unwrap()
-                        .contains("Bash is outside exact consumed parent work"),
+                        .contains("Bash is outside exact consumed parent work")
+                        || (root_h_notify
+                            && sibling_result["stderr"]
+                                .as_str()
+                                .unwrap()
+                                .contains("Bash child scope uncertain"))
+                        || (root_h_wake
+                            && sibling_result["stderr"]
+                                .as_str()
+                                .unwrap()
+                                .contains("installed Bash image absent")),
                     "same-root sibling namespace refusal: {sibling_result}"
                 );
                 assert!(!gate.join("sibling-effect").exists());
-                if mode.contains("notify_") {
+                if mode.contains("notify_") && !root_h_notify {
                     eventually(|| {
                         gate.join("bash-recipient-output").exists()
                             || entry.try_wait().unwrap().is_some()
@@ -14078,6 +14499,10 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_model_provider_bash_causal_success",
         "normal_model_provider_bash_causal_root_h_delegate",
         "normal_model_provider_bash_causal_root_h_lost",
+        "normal_model_provider_bash_causal_root_h_notify_row",
+        "normal_model_provider_bash_causal_root_h_notify_wake",
+        "normal_model_provider_bash_causal_root_h_notify_wake_lost",
+        "normal_model_provider_bash_causal_root_h_notify_wake_unknown",
         "normal_model_provider_bash_causal_w_debt",
         "normal_model_provider_bash_causal_notify_w_debt",
         "normal_model_provider_bash_causal_notify_ack",
@@ -14233,6 +14658,7 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
             || mode == "normal_handoff_pre_k_h_source_postcommit_w_v2_wake"
             || mode == "normal_handoff_pre_k_h_source_postcommit_w_v2_wake_lost"
             || mode == "normal_handoff_pre_k_h_source_postcommit_w_v2_wake_unknown"
+            || mode.starts_with("normal_model_provider_bash_causal_root_h_notify_wake")
         {
             command.args([
                 "-Upfm",
