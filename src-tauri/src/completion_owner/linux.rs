@@ -718,6 +718,52 @@ pub(crate) fn run_pinned_guardian_v30(
     entry.write_all(b"\n").map_err(|e| e.to_string())?;
     publish_driver_owner(&mut driver_gate, &released.owner)?;
     #[cfg(feature = "age319-private-broker-fixture")]
+    if std::env::var_os("AGE319_PRIVATE_PRE_EFFECT_DISPOSITION_V1").is_some() {
+        use super::V30PreEffectDisposition as Disposition;
+        let disposition = read_v30_pre_effect_disposition(&mut entry)?;
+        if disposition.identity()
+            != (
+                pin.root_id.as_str(),
+                released.owner.owner_generation.as_str(),
+                released.release_id.as_str(),
+            )
+        {
+            return Err("v30 disposition changed exact released root/owner".into());
+        }
+        route.read_running(&released.owner, None)?;
+        let expected = match &disposition {
+            Disposition::Closed { .. } => b'C',
+            Disposition::AwaitingH { .. } => {
+                if std::env::var_os("AGE319_PRIVATE_PRE_K_H_SOURCE_V1").is_none()
+                    || !disposition.valid_h_identity()
+                {
+                    return Err("v30 H disposition has no exact released J/D intent".into());
+                }
+                b'H'
+            }
+        };
+        driver_gate
+            .write_all(&[expected])
+            .map_err(|e| e.to_string())?;
+        let mut driver_ack = [0];
+        driver_gate
+            .read_exact(&mut driver_ack)
+            .map_err(|e| e.to_string())?;
+        if driver_ack != [expected] {
+            return Err("v30 driver disposition acknowledgement changed".into());
+        }
+        entry.write_all(&[expected]).map_err(|e| e.to_string())?;
+        return run_private_v30_original_work(
+            &listener,
+            &owner,
+            pin,
+            &mut entry,
+            &mut driver_gate,
+            &mut authorities,
+            expected == b'C',
+        );
+    }
+    #[cfg(feature = "age319-private-broker-fixture")]
     if std::env::var_os("AGE319_PRIVATE_PRE_K_H_SOURCE_V1").is_some() {
         return run_private_v30_original_work(
             &listener,
@@ -726,6 +772,7 @@ pub(crate) fn run_pinned_guardian_v30(
             &mut entry,
             &mut driver_gate,
             &mut authorities,
+            false,
         );
     }
     #[cfg(not(feature = "age319-private-broker-fixture"))]
@@ -752,6 +799,7 @@ fn run_private_v30_original_work(
     entry: &mut UnixStream,
     driver_gate: &mut UnixStream,
     authorities: &mut super::original_work::RootAuthorities,
+    driver_closed: bool,
 ) -> Result<(), String> {
     let control = ControlService::start_pinned(listener, owner, &pin.root_id)?;
     let mut original = super::original_work::OriginalWorkSupervisor::default();
@@ -762,6 +810,14 @@ fn run_private_v30_original_work(
         for request in control.pending() {
             match request {
                 ControlRequest::Work(request) => {
+                    if driver_closed {
+                        reject_work(
+                            owner,
+                            request,
+                            "private v30 H closed before child effect".into(),
+                        );
+                        continue;
+                    }
                     let authorized = matches!(
                         request.submission.registration,
                         super::original_work::WorkRegistration::Root
@@ -799,10 +855,31 @@ fn run_private_v30_original_work(
             }
         }
         if child_done && original.is_empty() {
-            driver_gate.write_all(b"D").map_err(|e| e.to_string())?;
+            if !driver_closed {
+                driver_gate.write_all(b"D").map_err(|e| e.to_string())?;
+            }
             return Ok(());
         }
         std::thread::sleep(GUARDIAN_POLL_INTERVAL);
+    }
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn read_v30_pre_effect_disposition(
+    entry: &mut UnixStream,
+) -> Result<super::V30PreEffectDisposition, String> {
+    let mut bytes = Vec::new();
+    loop {
+        if bytes.len() >= 1024 {
+            return Err("v30 disposition frame too large".into());
+        }
+        let mut byte = [0];
+        entry.read_exact(&mut byte).map_err(|e| e.to_string())?;
+        if byte == [b'\n'] {
+            return serde_json::from_slice(&bytes)
+                .map_err(|e| format!("v30 disposition malformed: {e}"));
+        }
+        bytes.push(byte[0]);
     }
 }
 

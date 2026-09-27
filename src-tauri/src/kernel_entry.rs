@@ -1661,6 +1661,26 @@ fn private_v30_source_witness(
 }
 
 fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
+    #[cfg(feature = "age319-private-broker-fixture")]
+    let mut disposition_channel = if std::env::var_os("AGE319_PRIVATE_PRE_EFFECT_DISPOSITION_V1")
+        .is_some()
+    {
+        let fd: i32 = std::env::var(crate::completion_owner::V30_DISPOSITION_FD_ENV)
+            .map_err(|_| "J disposition socket absent")?
+            .parse()
+            .map_err(|_| "J disposition socket invalid")?;
+        if fd < 0 {
+            return Err("J disposition socket invalid".into());
+        }
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+            return Err("J disposition socket cannot be sealed from descendants".into());
+        }
+        unsafe { std::env::remove_var(crate::completion_owner::V30_DISPOSITION_FD_ENV) };
+        Some(unsafe { UnixStream::from_raw_fd(fd) })
+    } else {
+        None
+    };
     let fields: Vec<_> = grant.split(' ').collect();
     if fields.len() != 6
         || fields[..5].iter().any(|field| {
@@ -1755,17 +1775,23 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
                     ("AGE319_PRIVATE_HANDOFF_PROBE_SPEC", release_json.as_str()),
                     ("AGE319_PRIVATE_HANDOFF_PROBE_D_KEY", receipt.d_key.as_str()),
                 ] {
-                    let outcome = std::process::Command::new(&child)
+                    let mut probe = std::process::Command::new(&child);
+                    probe
                         .arg("__age319-private-handoff-probe-v1")
                         .env_remove(REQUIRED_ENV)
                         .env_remove(CHILD_FD_ENV)
                         .env_remove("AGE319_PRIVATE_HANDOFF_PROBE_SPEC")
                         .env_remove("AGE319_PRIVATE_HANDOFF_PROBE_D_KEY")
-                        .env(key, value)
-                        .status()
-                        .map_err(|e| e.to_string())?;
+                        .env(key, value);
+                    if let Some(disposition) = disposition_channel.as_ref() {
+                        probe.env(
+                            "AGE319_PRIVATE_DISPOSITION_PROBE_FD_V1",
+                            disposition.as_raw_fd().to_string(),
+                        );
+                    }
+                    let outcome = probe.status().map_err(|e| e.to_string())?;
                     if outcome.success() {
-                        return Err("unregistered later root descendant reused root U/D".into());
+                        return Err("unregistered later root descendant reused U/D or inherited disposition socket".into());
                     }
                 }
             }
@@ -1844,6 +1870,66 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
             }
         }
         effect_binding = Some((receipt, session));
+    }
+    #[cfg(feature = "age319-private-broker-fixture")]
+    if std::env::var_os("AGE319_PRIVATE_PRE_EFFECT_DISPOSITION_V1").is_some() {
+        use crate::completion_owner::V30PreEffectDisposition as Disposition;
+        if std::env::var_os("AGE319_PRIVATE_PRE_K_H_SOURCE_V1").is_none() {
+            private_v30_marker("child-attested", &evidence.release_id)?;
+        }
+        let mut disposition = if std::env::var_os("AGE319_PRIVATE_PRE_K_H_SOURCE_V1").is_some() {
+            let (receipt, session) = effect_binding
+                .as_ref()
+                .ok_or("H custody claim has no released J/D binding")?;
+            if receipt.old_release != evidence || session.request_id != receipt.d_key {
+                return Err("H custody claim changed released J/D".into());
+            }
+            if !matches!(
+                receipt.root_work_intent,
+                oulipoly_state::mailbox::FreshRootWorkIntent::PrivateProbe(_)
+            ) {
+                return Err("H custody claim has no released H intent".into());
+            }
+            Disposition::AwaitingH {
+                root_id: fields[2].into(),
+                owner_generation: fields[1].into(),
+                release_id: evidence.release_id.clone(),
+                handoff_id: receipt.handoff_id.clone(),
+                d_key: receipt.d_key.clone(),
+                invocation_uuid: receipt.invocation_uuid.clone(),
+                session_id: session.session_id.clone(),
+            }
+        } else {
+            Disposition::Closed {
+                root_id: fields[2].into(),
+                owner_generation: fields[1].into(),
+                release_id: evidence.release_id.clone(),
+            }
+        };
+        if std::env::var_os("AGE319_PRIVATE_BAD_DISPOSITION_ROOT_V1").is_some() {
+            match &mut disposition {
+                Disposition::Closed { root_id, .. } | Disposition::AwaitingH { root_id, .. } => {
+                    *root_id = uuid::Uuid::new_v4().to_string()
+                }
+            }
+        }
+        let channel = disposition_channel
+            .as_mut()
+            .ok_or("J disposition socket absent")?;
+        serde_json::to_writer(&mut *channel, &disposition).map_err(|e| e.to_string())?;
+        channel.write_all(b"\n").map_err(|e| e.to_string())?;
+        let mut acknowledgement = [0];
+        channel
+            .read_exact(&mut acknowledgement)
+            .map_err(|e| e.to_string())?;
+        match (&disposition, acknowledgement) {
+            (Disposition::AwaitingH { .. }, [b'H']) => {}
+            (Disposition::Closed { .. }, [b'C']) => {
+                return Err("v30 closed H/no-source disposition refused child effect".into());
+            }
+            _ => return Err("J disposition acknowledgement changed".into()),
+        }
+        drop(disposition_channel.take());
     }
     drop(gate);
     #[cfg(feature = "age319-private-broker-fixture")]
@@ -4849,6 +4935,12 @@ pub(crate) fn host_entry() -> Option<ExitCode> {
         && std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1").is_some()
     {
         let result = (|| -> Result<(), String> {
+            if let Ok(raw) = std::env::var("AGE319_PRIVATE_DISPOSITION_PROBE_FD_V1") {
+                let fd: i32 = raw.parse().map_err(|_| "invalid disposition probe FD")?;
+                if unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0 {
+                    return Ok(());
+                }
+            }
             let socket = broker_socket().with_file_name("v30.sock");
             if let Ok(d_key) = std::env::var("AGE319_PRIVATE_HANDOFF_PROBE_D_KEY") {
                 protocol::allocate_fresh_v30_session_at(&socket, &d_key)
@@ -5940,6 +6032,46 @@ fn v30_host_entry() -> Result<ExitCode, String> {
         #[cfg(feature = "age319-private-broker-fixture")]
         if private_normal_mode() {
             private_v30_marker("released", &evidence)?;
+        }
+        #[cfg(feature = "age319-private-broker-fixture")]
+        if std::env::var_os("AGE319_PRIVATE_PRE_EFFECT_DISPOSITION_V1").is_some() {
+            use crate::completion_owner::V30PreEffectDisposition as Disposition;
+            let disposition: Disposition = serde_json::from_str(&read_v30_frame(&mut receipt)?)
+                .map_err(|e| format!("v30 child disposition malformed: {e}"))?;
+            if disposition.identity()
+                != (
+                    root.as_str(),
+                    owner_generation,
+                    evidence.release_id.as_str(),
+                )
+            {
+                return Err("v30 child disposition changed released root/owner".into());
+            }
+            if let Disposition::AwaitingH { .. } = &disposition {
+                if std::env::var_os("AGE319_PRIVATE_PRE_K_H_SOURCE_V1").is_none()
+                    || !disposition.valid_h_identity()
+                {
+                    return Err("v30 H custody claim is not exact J/D intent".into());
+                }
+            }
+            serde_json::to_writer(&mut entry, &disposition).map_err(|e| e.to_string())?;
+            entry.write_all(b"\n").map_err(|e| e.to_string())?;
+            let mut acknowledgement = [0];
+            entry
+                .read_exact(&mut acknowledgement)
+                .map_err(|e| e.to_string())?;
+            if acknowledgement
+                != [if matches!(disposition, Disposition::AwaitingH { .. }) {
+                    b'H'
+                } else {
+                    b'C'
+                }]
+            {
+                return Err("v30 guardian disposition acknowledgement changed".into());
+            }
+            receipt
+                .write_all(&acknowledgement)
+                .map_err(|e| e.to_string())?;
         }
         let status = read_v30_frame(&mut receipt)?;
         entry.write_all(b"D").map_err(|e| e.to_string())?;

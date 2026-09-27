@@ -289,6 +289,7 @@ fn inner() {
     );
     let release_mode = mode.starts_with("held_release") || native_mode;
     let production_source = mode == "normal_handoff_pre_k_h_source_registration_cli";
+    let bad_disposition = mode == "normal_empty_bad_disposition";
     let source_witness = (mode == "held_release_source_witness").then(|| {
         (
             uuid::Uuid::new_v4().to_string(),
@@ -645,8 +646,12 @@ fn inner() {
     }
     let mailbox =
         MailboxDb::open_completion_continuation_domain(&data.join("pid-identity.db")).unwrap();
-    let pending_binding =
-        (normal_mode && !recipient_mode && mode != "normal_empty" && !handoff_mode).then(|| {
+    let pending_binding = (normal_mode
+        && !recipient_mode
+        && mode != "normal_empty"
+        && !bad_disposition
+        && !handoff_mode)
+        .then(|| {
             if real_source {
                 let registration =
                     fs::read(std::env::var("AGE319_PRIVATE_BASH_REGISTRATION").unwrap()).unwrap();
@@ -1452,6 +1457,11 @@ fn inner() {
                     .then_some(("AGE319_PRIVATE_PRE_K_H_SOURCE_V1", "1")),
             )
             .envs(
+                (mode == "normal_empty" || bad_disposition || production_source)
+                    .then_some(("AGE319_PRIVATE_PRE_EFFECT_DISPOSITION_V1", "1")),
+            )
+            .envs(bad_disposition.then_some(("AGE319_PRIVATE_BAD_DISPOSITION_ROOT_V1", "1")))
+            .envs(
                 (mode == "normal_bash_source_lost_reply")
                     .then_some(("AGE319_PRIVATE_SOURCE_LAUNCH_REPLY_LOSS_V1", "1")),
             )
@@ -1657,6 +1667,21 @@ fn inner() {
                 "{}",
                 fs::read_to_string(&err).unwrap()
             );
+            if bad_disposition {
+                eventually(|| entry.try_wait().unwrap().is_some());
+                assert!(!entry.wait().unwrap().success());
+                assert!(
+                    fs::read_to_string(&err)
+                        .unwrap_or_default()
+                        .contains("v30 child disposition changed released root/owner")
+                );
+                assert!(fs::read(&out).unwrap().is_empty());
+                assert!(!gate.join("source-launched").exists());
+                assert!(!gate.join("child-effect").exists());
+                stop(&mut broker);
+                unsafe { libc::kill(prepared.root_init.host_pid, libc::SIGKILL) };
+                return;
+            }
             if mode == "normal_owner_discovery" {
                 let discovered: protocol::OwnerDiscoveryReadback =
                     serde_json::from_slice(&fs::read(gate.join("owner-discovery")).unwrap())
@@ -12251,6 +12276,7 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_recipient_driver_post",
         "normal_recipient_broker_post",
         "normal_empty",
+        "normal_empty_bad_disposition",
         "normal_guardian_post",
         "normal_driver_post",
         "normal_broker_post",

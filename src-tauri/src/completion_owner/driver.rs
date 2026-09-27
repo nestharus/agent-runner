@@ -18,6 +18,8 @@ use oulipoly_state::StateDb;
 use oulipoly_state::mailbox::{CompletionDomainOwner, ContinuationAttempt, MailboxDb};
 use std::collections::{BTreeSet, HashMap};
 use std::io::Read;
+#[cfg(feature = "age319-private-broker-fixture")]
+use std::io::Write;
 use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -89,6 +91,30 @@ fn run_with_root(
                 )?;
                 route.read_running(owner, None)?;
                 #[cfg(feature = "age319-private-broker-fixture")]
+                let mut h_awaiting = false;
+                #[cfg(feature = "age319-private-broker-fixture")]
+                if std::env::var_os("AGE319_PRIVATE_PRE_EFFECT_DISPOSITION_V1").is_some() {
+                    let channel = v30_channel
+                        .as_mut()
+                        .ok_or("v30 driver disposition gate absent")?;
+                    let mut disposition = [0];
+                    channel
+                        .read_exact(&mut disposition)
+                        .map_err(|e| e.to_string())?;
+                    match disposition {
+                        [b'C'] => {
+                            let refusal = run_v30_closed_boundary(&route, owner)?;
+                            channel.write_all(b"C").map_err(|e| e.to_string())?;
+                            return Err(refusal);
+                        }
+                        [b'H'] => {
+                            channel.write_all(b"H").map_err(|e| e.to_string())?;
+                            h_awaiting = true;
+                        }
+                        _ => return Err("v30 driver disposition changed".into()),
+                    }
+                }
+                #[cfg(feature = "age319-private-broker-fixture")]
                 if std::env::var_os("AGE319_PRIVATE_EXEC_DRIVER_ROUTE_V30").is_some() {
                     let gate_dir = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
                         .ok_or("private exec driver gate directory missing")?;
@@ -104,9 +130,17 @@ fn run_with_root(
                         "v30 driver bounded State repair and wake route is not available".into(),
                     );
                 }
-                // Project while the guardian/driver incarnation is still
-                // pinned. The guardian keeps this channel open until the
-                // joined child has reported its terminal receipt.
+                // Ordinary routes project while guardian/driver are pinned.
+                // The H-awaiting route holds this exact channel without
+                // source selection until the joined child completes.
+                #[cfg(feature = "age319-private-broker-fixture")]
+                let repair_result = if h_awaiting {
+                    // H retains custody, but cannot select, reserve, or launch W.
+                    Err("v30 H awaiting custody; postcommit wake unavailable".into())
+                } else {
+                    run_v30_repair_boundary(&route, owner)
+                };
+                #[cfg(not(feature = "age319-private-broker-fixture"))]
                 let repair_result = run_v30_repair_boundary(&route, owner);
                 // The broker's child attestation reopens this exact driver.
                 // Stay pinned until the original guardian reports the joined
@@ -132,6 +166,25 @@ fn run_with_root(
     #[cfg(test)]
     super::root_supervisor::clear_driver_channel();
     result
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn run_v30_closed_boundary(
+    route: &super::broker_route::V30OwnerRoute,
+    owner: &CompletionDomainOwner,
+) -> Result<String, String> {
+    loop {
+        let page = route.repair_page(owner)?;
+        if page.has_more {
+            continue;
+        }
+        if route.source_selection(owner, &page)?.candidate.is_some()
+            || route.recipient_selection(owner, &page)?.candidate.is_some()
+        {
+            return Err("v30 closed H disposition encountered a source or recipient".into());
+        }
+        return Ok("v30 no pending broker recipient; wake effect refused".into());
+    }
 }
 
 fn run_v30_repair_boundary(

@@ -287,6 +287,19 @@ fn run_init(context: InitContext) -> io::Result<()> {
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
     #[cfg(feature = "age319-private-broker-fixture")]
+    let disposition_enabled = held_v30
+        && spec
+            .environment
+            .iter()
+            .any(|(name, _)| name == "AGE319_PRIVATE_PRE_EFFECT_DISPOSITION_V1");
+    #[cfg(feature = "age319-private-broker-fixture")]
+    if disposition_enabled {
+        command.env(
+            "OULIPOLY_KERNEL_V30_DISPOSITION_FD_V1",
+            status.as_raw_fd().to_string(),
+        );
+    }
+    #[cfg(feature = "age319-private-broker-fixture")]
     if held_v30 && super::private_fixture() {
         command.env("OULIPOLY_KERNEL_V30_PRIVATE_CHILD_V1", "1");
         if let Some(directory) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1") {
@@ -303,6 +316,8 @@ fn run_init(context: InitContext) -> io::Result<()> {
     }
     let control_fd = control.as_raw_fd();
     let gate_fd = gate.as_raw_fd();
+    #[cfg(feature = "age319-private-broker-fixture")]
+    let status_fd = status.as_raw_fd();
     let fixture = super::private_fixture();
     unsafe {
         command.pre_exec(move || {
@@ -313,6 +328,10 @@ fn run_init(context: InitContext) -> io::Result<()> {
                 return Err(io::Error::last_os_error());
             }
             if libc::fcntl(gate_fd, libc::F_SETFD, 0) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            #[cfg(feature = "age319-private-broker-fixture")]
+            if disposition_enabled && libc::fcntl(status_fd, libc::F_SETFD, 0) != 0 {
                 return Err(io::Error::last_os_error());
             }
             if libc::send(control_fd, b"C".as_ptr().cast(), 1, libc::MSG_NOSIGNAL) != 1 {

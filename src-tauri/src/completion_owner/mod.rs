@@ -37,6 +37,74 @@ pub(crate) const ROOT_AUTHORITY_ENV: &str = "OULIPOLY_ROOT_AUTHORITY_V1";
 pub(crate) const ORIGINAL_WORK_REQUIRED_ENV: &str = "OULIPOLY_ORIGINAL_WORK_REQUIRED_V1";
 pub(crate) const EXPECTED_KERNEL_ROOT_ENV: &str = "OULIPOLY_KERNEL_EXPECTED_ROOT_V1";
 pub(crate) const V30_OWNER_ENDPOINT_ENV: &str = "OULIPOLY_KERNEL_OWNER_ENDPOINT_V1";
+#[cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
+pub(crate) const V30_DISPOSITION_FD_ENV: &str = "OULIPOLY_KERNEL_V30_DISPOSITION_FD_V1";
+
+/// A declaration by the released J child, relayed on the original J/guardian
+/// connection. It carries custody intent only; it cannot select a source or W.
+#[cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum V30PreEffectDisposition {
+    Closed {
+        root_id: String,
+        owner_generation: String,
+        release_id: String,
+    },
+    AwaitingH {
+        root_id: String,
+        owner_generation: String,
+        release_id: String,
+        handoff_id: String,
+        d_key: String,
+        invocation_uuid: String,
+        session_id: String,
+    },
+}
+
+#[cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
+impl V30PreEffectDisposition {
+    pub(crate) fn identity(&self) -> (&str, &str, &str) {
+        match self {
+            Self::Closed {
+                root_id,
+                owner_generation,
+                release_id,
+            }
+            | Self::AwaitingH {
+                root_id,
+                owner_generation,
+                release_id,
+                ..
+            } => (root_id, owner_generation, release_id),
+        }
+    }
+
+    pub(crate) fn valid_h_identity(&self) -> bool {
+        let Self::AwaitingH {
+            handoff_id,
+            d_key,
+            invocation_uuid,
+            session_id,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        let canonical = |id: &str| {
+            uuid::Uuid::parse_str(id)
+                .is_ok_and(|parsed| !parsed.is_nil() && parsed.to_string() == id)
+        };
+        let session = session_id
+            .strip_prefix("v30:")
+            .and_then(|rest| rest.split_once(':'))
+            .is_some_and(|(lane, allocation)| canonical(lane) && canonical(allocation));
+        [handoff_id, d_key, invocation_uuid]
+            .iter()
+            .all(|id| canonical(id))
+            && session
+    }
+}
 
 #[cfg(target_os = "linux")]
 pub(crate) struct PinnedGuardian {
