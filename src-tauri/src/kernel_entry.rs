@@ -1893,6 +1893,11 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
                     provider_session_resolved_account: None,
                 },
             )?;
+            state.mark_fresh_v30_exact_registration(
+                &receipt.invocation_uuid,
+                "private-released-j-d-original-state",
+                &authority,
+            )?;
             let runner = std::env::current_exe().map_err(|e| e.to_string())?;
             let bash = std::env::var("AGE319_PRIVATE_BASH_IMAGE")
                 .map_err(|_| "private pre-K Bash image absent")?;

@@ -288,6 +288,7 @@ fn inner() {
         "native_cancel" | "native_drain" | "native_receipt_cancel" | "native_receipt_drain"
     );
     let release_mode = mode.starts_with("held_release") || native_mode;
+    let production_source = mode == "normal_handoff_pre_k_h_source_registration_cli";
     let source_witness = (mode == "held_release_source_witness").then(|| {
         (
             uuid::Uuid::new_v4().to_string(),
@@ -303,6 +304,7 @@ fn inner() {
             "normal_handoff"
                 | "normal_handoff_bash_child"
                 | "normal_handoff_pre_k_h_source"
+                | "normal_handoff_pre_k_h_source_registration_cli"
                 | "normal_handoff_fsync"
                 | "normal_handoff_effect_reply_loss"
                 | "normal_help"
@@ -316,6 +318,7 @@ fn inner() {
         std::env::var("OULIPOLY_AGE319_RUNNER_IMAGE").expect("built Runner image required");
     let bash = (mode == "normal_handoff_bash_child"
         || mode == "normal_handoff_pre_k_h_source"
+        || production_source
         || mode.starts_with("normal_model_provider_bash_causal")
         || mode.starts_with("normal_model_provider_bash_ordinary")
         || mode.starts_with("normal_model_provider_pty_physical_resident_bash_"))
@@ -1445,7 +1448,7 @@ fn inner() {
                     .then_some(("AGE319_PRIVATE_OWNER_DISCOVERY_PROBE_V1", "1")),
             )
             .envs(
-                (mode == "normal_handoff_pre_k_h_source")
+                (mode == "normal_handoff_pre_k_h_source" || production_source)
                     .then_some(("AGE319_PRIVATE_PRE_K_H_SOURCE_V1", "1")),
             )
             .envs(
@@ -1674,7 +1677,7 @@ fn inner() {
                 unsafe { libc::kill(prepared.root_init.host_pid, libc::SIGKILL) };
                 return;
             }
-            if mode == "normal_handoff_pre_k_h_source" {
+            if mode == "normal_handoff_pre_k_h_source" || production_source {
                 let until = Instant::now() + Duration::from_secs(90);
                 while !gate.join("source-ready").exists()
                     && entry.try_wait().unwrap().is_none()
@@ -2077,80 +2080,124 @@ fn inner() {
                             .is_err(),
                         "outside H source copied K binding"
                     );
+                    if production_source {
+                        let marked: i64 = original.query_row(
+                            "SELECT count(*) FROM invocation_completion_exact_required WHERE invocation_uuid=?1",
+                            [invocation], |row| row.get(0),
+                        ).unwrap();
+                        assert_eq!(marked, 1, "fresh v30 original-State route marker absent");
+                    }
+                    if production_source {
+                        fs::write(gate.join("source-production-registration-cli"), b"yes").unwrap();
+                    }
                     fs::write(gate.join("source-decision-request"), b"issue").unwrap();
-                    let state_deadline = Instant::now() + Duration::from_secs(180);
-                    while !gate.join("source-state-ready").exists()
-                        && entry.try_wait().unwrap().is_none()
-                        && Instant::now() < state_deadline
-                    {
-                        std::thread::sleep(Duration::from_millis(20));
-                    }
-                    assert!(
-                        gate.join("source-state-ready").exists(),
-                        "Bash decision did not reach State: {}",
-                        fs::read_to_string(gate.join("private-source-stderr.log"))
-                            .unwrap_or_default()
-                    );
-                    let state_count: i64 = original
-                        .query_row(
-                            "SELECT count(*) FROM invocation_completion_exact_source_decisions",
-                            [],
-                            |row| row.get(0),
+                    if production_source {
+                        let deadline = Instant::now() + Duration::from_secs(180);
+                        while !gate.join("source-decision-readback.json").exists()
+                            && entry.try_wait().unwrap().is_none()
+                            && Instant::now() < deadline
+                        {
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        let reply: serde_json::Value = serde_json::from_slice(
+                            &fs::read(gate.join("source-decision-readback.json")).unwrap_or_else(
+                                |_| {
+                                    panic!(
+                                        "production Bash-byte registration absent: {}",
+                                        fs::read_to_string(gate.join("private-source-stderr.log"))
+                                            .unwrap_or_default()
+                                    )
+                                },
+                            ),
                         )
                         .unwrap();
-                    assert_eq!(state_count, 0, "Bash decision committed before State gate");
-                    fs::write(gate.join("source-clock-offset"), b"240").unwrap();
-                    stop(&mut broker);
-                    broker = restart_source_broker(
-                        &socket,
-                        &broker_state,
-                        &runner,
-                        &gate,
-                        &temp.path().join("consumed-h-expired-before-state.log"),
-                    );
-                    fs::write(gate.join("source-state-stale"), b"yes").unwrap();
-                    while !gate.join("source-state-stale-refused").exists()
-                        && entry.try_wait().unwrap().is_none()
-                        && Instant::now() < state_deadline
-                    {
-                        std::thread::sleep(Duration::from_millis(20));
-                    }
-                    assert!(
-                        gate.join("source-state-stale-refused").exists(),
-                        "expired H decision was not refused by State: {}",
-                        fs::read_to_string(gate.join("private-source-stderr.log"))
-                            .unwrap_or_default()
-                    );
-                    let still_zero: i64 = original
-                        .query_row(
-                            "SELECT count(*) FROM invocation_completion_exact_source_decisions",
-                            [],
-                            |row| row.get(0),
+                        assert_eq!(reply["status"], "registered");
+                        assert_eq!(reply["registration_committed"], true);
+                        assert_eq!(reply["exact_source_projection_available"], false);
+                        assert!(reply["exact_source_decision_id"].is_string());
+                        let probes: serde_json::Value = serde_json::from_slice(
+                            &fs::read(gate.join("source-production-probes.json")).unwrap(),
                         )
                         .unwrap();
-                    assert_eq!(still_zero, 0, "expired H decision changed State");
-                    stop(&mut broker);
-                    fs::remove_file(gate.join("source-clock-offset")).unwrap();
-                    broker = restart_source_broker(
-                        &socket,
-                        &broker_state,
-                        &runner,
-                        &gate,
-                        &temp.path().join("consumed-h-unexpired-state.log"),
-                    );
-                    fs::write(gate.join("source-state-commit"), b"yes").unwrap();
-                    while !gate.join("source-state-admitted").exists()
-                        && entry.try_wait().unwrap().is_none()
-                        && Instant::now() < state_deadline
-                    {
-                        std::thread::sleep(Duration::from_millis(20));
+                        assert_eq!(probes["broker_exact_retry"], true);
+                        assert_eq!(probes["state_exact_retry"], true);
+                        assert_eq!(probes["public_api_bypass_refused"], true);
+                        assert_eq!(probes["refusals"].as_array().unwrap().len(), 6);
+                    } else {
+                        let state_deadline = Instant::now() + Duration::from_secs(180);
+                        while !gate.join("source-state-ready").exists()
+                            && entry.try_wait().unwrap().is_none()
+                            && Instant::now() < state_deadline
+                        {
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        assert!(
+                            gate.join("source-state-ready").exists(),
+                            "Bash decision did not reach State: {}",
+                            fs::read_to_string(gate.join("private-source-stderr.log"))
+                                .unwrap_or_default()
+                        );
+                        let state_count: i64 = original
+                            .query_row(
+                                "SELECT count(*) FROM invocation_completion_exact_source_decisions",
+                                [],
+                                |row| row.get(0),
+                            )
+                            .unwrap();
+                        assert_eq!(state_count, 0, "Bash decision committed before State gate");
+                        fs::write(gate.join("source-clock-offset"), b"240").unwrap();
+                        stop(&mut broker);
+                        broker = restart_source_broker(
+                            &socket,
+                            &broker_state,
+                            &runner,
+                            &gate,
+                            &temp.path().join("consumed-h-expired-before-state.log"),
+                        );
+                        fs::write(gate.join("source-state-stale"), b"yes").unwrap();
+                        while !gate.join("source-state-stale-refused").exists()
+                            && entry.try_wait().unwrap().is_none()
+                            && Instant::now() < state_deadline
+                        {
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        assert!(
+                            gate.join("source-state-stale-refused").exists(),
+                            "expired H decision was not refused by State: {}",
+                            fs::read_to_string(gate.join("private-source-stderr.log"))
+                                .unwrap_or_default()
+                        );
+                        let still_zero: i64 = original
+                            .query_row(
+                                "SELECT count(*) FROM invocation_completion_exact_source_decisions",
+                                [],
+                                |row| row.get(0),
+                            )
+                            .unwrap();
+                        assert_eq!(still_zero, 0, "expired H decision changed State");
+                        stop(&mut broker);
+                        fs::remove_file(gate.join("source-clock-offset")).unwrap();
+                        broker = restart_source_broker(
+                            &socket,
+                            &broker_state,
+                            &runner,
+                            &gate,
+                            &temp.path().join("consumed-h-unexpired-state.log"),
+                        );
+                        fs::write(gate.join("source-state-commit"), b"yes").unwrap();
+                        while !gate.join("source-state-admitted").exists()
+                            && entry.try_wait().unwrap().is_none()
+                            && Instant::now() < state_deadline
+                        {
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        assert!(
+                            gate.join("source-state-admitted").exists(),
+                            "Bash decision State commit/retry failed: {}",
+                            fs::read_to_string(gate.join("private-source-stderr.log"))
+                                .unwrap_or_default()
+                        );
                     }
-                    assert!(
-                        gate.join("source-state-admitted").exists(),
-                        "Bash decision State commit/retry failed: {}",
-                        fs::read_to_string(gate.join("private-source-stderr.log"))
-                            .unwrap_or_default()
-                    );
                     assert!(
                         entry.try_wait().unwrap().is_none(),
                         "J exited before H projection"
@@ -2320,28 +2367,35 @@ fn inner() {
                         ),
                     )
                     .unwrap();
-                    assert_eq!(issued["decision"], issued["retry"]);
-                    assert_eq!(
-                        issued["decision"]["issuer_kind"],
-                        "consumed_h_sealed_helper"
-                    );
-                    assert_eq!(
-                        issued["decision"]["registration_worker"]["host_pid"],
-                        worker_pid
-                    );
-                    assert_eq!(
-                        issued["decision"]["registration_sha256"],
-                        format!("{:x}", Sha256::digest(&registration_bytes))
-                    );
-                    assert_eq!(
-                        issued["decision"]["registration_device"],
-                        registration_stat.dev()
-                    );
-                    assert_eq!(
-                        issued["decision"]["registration_inode"],
-                        registration_stat.ino()
-                    );
-                    assert_eq!(issued["negatives"].as_array().unwrap().len(), 5);
+                    if production_source {
+                        assert_eq!(issued["status"], "registered");
+                        assert_eq!(issued["exact_source_decision_id"], attribution.1);
+                        assert_eq!(issued["exact_source_request_id"], attribution.0);
+                        assert_eq!(issued["exact_source_projection_available"], false);
+                    } else {
+                        assert_eq!(issued["decision"], issued["retry"]);
+                        assert_eq!(
+                            issued["decision"]["issuer_kind"],
+                            "consumed_h_sealed_helper"
+                        );
+                        assert_eq!(
+                            issued["decision"]["registration_worker"]["host_pid"],
+                            worker_pid
+                        );
+                        assert_eq!(
+                            issued["decision"]["registration_sha256"],
+                            format!("{:x}", Sha256::digest(&registration_bytes))
+                        );
+                        assert_eq!(
+                            issued["decision"]["registration_device"],
+                            registration_stat.dev()
+                        );
+                        assert_eq!(
+                            issued["decision"]["registration_inode"],
+                            registration_stat.ino()
+                        );
+                        assert_eq!(issued["negatives"].as_array().unwrap().len(), 5);
+                    }
                     let decisions = rusqlite::Connection::open_with_flags(
                         broker_state.join("source-decisions/decisions.db"),
                         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -2364,7 +2418,7 @@ fn inner() {
                             starttime_ticks: identity.starttime_ticks as u64 }
                     };
                     let outsider_request = protocol::ExactSourceDecisionRequest {
-                        request_id: issued["decision"]["request_id"].as_str().unwrap().into(),
+                        request_id: attribution.0.clone(),
                         witness: protocol::SourceWitnessProbe {
                             owner: protocol::OwnerWitness {
                                 root_id: prepared.root_id.clone(),
@@ -12013,6 +12067,7 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_handoff",
         "normal_handoff_bash_child",
         "normal_handoff_pre_k_h_source",
+        "normal_handoff_pre_k_h_source_registration_cli",
         "normal_handoff_fsync",
         "normal_handoff_effect_reply_loss",
         "normal_help",
@@ -12269,6 +12324,36 @@ fn combined_v30_source_witness_uses_held_release_and_original_state() {
         ])
         .env("AGE319_PRIVATE_JOIN_INNER", "1")
         .env("AGE319_PRIVATE_JOIN_MODE", "held_release_source_witness")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+}
+
+#[test]
+fn consumed_h_bash_bytes_reach_production_registration_cli() {
+    if std::env::var_os("AGE319_PRIVATE_JOIN_INNER").is_some() {
+        inner();
+        return;
+    }
+    let output = Command::new("unshare")
+        .args(["-Urpfm", "--mount-proc"])
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "consumed_h_bash_bytes_reach_production_registration_cli",
+            "--nocapture",
+        ])
+        .env("AGE319_PRIVATE_JOIN_INNER", "1")
+        .env(
+            "AGE319_PRIVATE_JOIN_MODE",
+            "normal_handoff_pre_k_h_source_registration_cli",
+        )
         .output()
         .unwrap();
     assert!(

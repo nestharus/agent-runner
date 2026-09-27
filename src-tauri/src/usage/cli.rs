@@ -503,6 +503,10 @@ pub(crate) enum NotifySubcommands {
         #[arg(long)]
         registration_file: Option<PathBuf>,
 
+        /// Broker-bound consumed-H intent for exact v30 source admission.
+        #[arg(long, requires = "registration_file")]
+        accepted_intent_file: Option<PathBuf>,
+
         /// Emit structured JSON.
         #[arg(long)]
         json: bool,

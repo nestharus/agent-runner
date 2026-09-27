@@ -1154,6 +1154,11 @@ impl FreshV30Lane {
                 provider_session_resolved_account: None,
             },
         )?;
+        state.mark_fresh_v30_exact_registration(
+            &receipt.invocation_uuid,
+            "broker-released-root-v30",
+            &authority,
+        )?;
         let owner = self.state_connection(OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         owner
             .execute_batch("PRAGMA synchronous=FULL")

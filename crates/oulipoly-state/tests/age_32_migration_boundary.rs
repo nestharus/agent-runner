@@ -171,6 +171,12 @@ fn schema_18_migration_installs_the_running_projection_index() {
     connection
         .execute_batch(
             "PRAGMA foreign_keys=OFF;
+             DROP TRIGGER invocation_completion_exact_required_no_update;
+             DROP TRIGGER invocation_completion_exact_required_no_delete;
+             DROP TABLE invocation_completion_exact_required;
+             DROP TRIGGER invocation_completion_exact_source_decisions_no_update;
+             DROP TRIGGER invocation_completion_exact_source_decisions_no_delete;
+             DROP TABLE invocation_completion_exact_source_decisions;
              DROP TRIGGER trg_invocation_completion_v2_identity_append_only_update;
              DROP TRIGGER trg_invocation_completion_v2_identity_append_only_delete;
              DROP TABLE invocation_completion_v2_identity;
@@ -468,6 +474,8 @@ fn ti_10_age_54_schema4_plan_contains_only_schema5_step() {
             25,
             26,
             27,
+            28,
+            29,
             CURRENT_SCHEMA_VERSION,
         ],
         "schema-4 DBs must take every ordered migration through the current schema"
@@ -499,6 +507,8 @@ fn ti_10_age_54_schema4_plan_contains_only_schema5_step() {
             "0026_live_history_barrier",
             "0027_record_timestamp_contract",
             "0028_completed_turn_recovery_targets",
+            "0029_exact_source_decision_admission",
+            "0030_fresh_exact_registration_route",
         ]
     );
 }

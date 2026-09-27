@@ -144,8 +144,10 @@ fn requires_service(cli: &crate::usage::cli::Cli) -> bool {
             None | Some(Subcommands::Repl { .. })
                 | Some(Subcommands::Resume { .. })
                 | Some(Subcommands::Notify {
-                    command: NotifySubcommands::Register { .. }
-                        | NotifySubcommands::Listen { .. }
+                    command: NotifySubcommands::Register {
+                        accepted_intent_file: None,
+                        ..
+                    } | NotifySubcommands::Listen { .. }
                         | NotifySubcommands::Activate { .. }
                         | NotifySubcommands::Complete { .. }
                 })
@@ -213,6 +215,11 @@ pub(crate) fn discover_v30_owner(
     query_pid: Option<i32>,
 ) -> Result<oulipoly_kernel_broker::protocol::OwnerDiscoveryReadback, String> {
     linux::discover_v30_owner(query_pid)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn v30_broker_socket() -> std::path::PathBuf {
+    linux::owner_broker_socket()
 }
 
 #[cfg(target_os = "linux")]
@@ -413,6 +420,27 @@ mod entry_tests {
             ],
             vec!["runner", "mailbox", "pause", "--session-id", "fixture"],
             vec!["runner", "notify", "agent-bash-capability"],
+            vec![
+                "runner",
+                "notify",
+                "agent-bash-register",
+                "--handle",
+                "fixture",
+                "--delivery-mode",
+                "async",
+                "--state-dir",
+                "/fixture",
+                "--meta",
+                "/fixture/meta",
+                "--log",
+                "/fixture/log",
+                "--rc",
+                "/fixture/rc",
+                "--registration-file",
+                "/fixture/source.json",
+                "--accepted-intent-file",
+                "/fixture/intent.json",
+            ],
             vec![
                 "runner",
                 "notify",

@@ -32,6 +32,7 @@ pub(crate) struct AgentBashRegisterArgs<'a> {
     pub repair_admitted: bool,
     pub completion_protocol: Option<&'a str>,
     pub registration_file: Option<&'a Path>,
+    pub accepted_intent_file: Option<&'a Path>,
     pub json: bool,
 }
 

@@ -552,6 +552,7 @@ fn dispatch_notify_subcommand(command: NotifySubcommands) -> Result<i32, String>
             repair_admitted,
             completion_protocol,
             registration_file,
+            accepted_intent_file,
             json,
         } => crate::commands::notify::run_agent_bash_register(
             crate::commands::notify::AgentBashRegisterArgs {
@@ -564,6 +565,7 @@ fn dispatch_notify_subcommand(command: NotifySubcommands) -> Result<i32, String>
                 repair_admitted,
                 completion_protocol: completion_protocol.as_deref(),
                 registration_file: registration_file.as_deref(),
+                accepted_intent_file: accepted_intent_file.as_deref(),
                 json,
             },
         ),

@@ -794,6 +794,57 @@ impl StateDb {
         .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())
     }
+    /// Broker D/child custody fixes the exact route in the original State DB.
+    /// The marker is append-only and survives later session metadata changes.
+    pub fn mark_fresh_v30_exact_registration(
+        &self,
+        invocation_uuid: &str,
+        capture_method: &str,
+        authority: &super::CompletionRegistrationAuthority,
+    ) -> Result<(), String> {
+        let allowed = matches!(
+            capture_method,
+            "broker-released-root-v30" | "broker-bash-child-v30"
+        );
+        #[cfg(feature = "age319-private-broker-fixture")]
+        let allowed = allowed || capture_method == "private-released-j-d-original-state";
+        if !allowed {
+            return Err("fresh exact registration capture method invalid".into());
+        }
+        let row: Option<(Option<String>, Option<String>, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT provider_session_capture_method,provider_session_id,
+                    completion_registration_capability_digest
+             FROM invocations WHERE invocation_uuid=?1",
+                [invocation_uuid],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some((Some(method), Some(_session), Some(digest))) = row else {
+            return Err("fresh exact registration State actor absent".into());
+        };
+        if method != capture_method || digest != authority.digest() {
+            return Err("fresh exact registration State actor changed".into());
+        }
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO invocation_completion_exact_required
+             (invocation_uuid,route,capability_digest) VALUES (?1,'broker-v30',?2)",
+                sqlite::params![invocation_uuid, &digest],
+            )
+            .map_err(|e| e.to_string())?;
+        let stored: String = self.conn.query_row(
+            "SELECT capability_digest FROM invocation_completion_exact_required WHERE invocation_uuid=?1",
+            [invocation_uuid], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        if stored != digest {
+            return Err("fresh exact registration route attribution conflict".into());
+        }
+        Ok(())
+    }
+
     /// Admission still uses the original actor capability and continuity ledger.
     /// Source bytes are inserted atomically with that authority, before sidecar IO.
     pub fn register_completion_continuation_with_authority(
@@ -802,6 +853,46 @@ impl StateDb {
         authority: &super::CompletionRegistrationAuthority,
         binding: &AdmittedSourceBinding,
     ) -> Result<CompletionEventRegistrationResult, String> {
+        let source = binding.registration()?;
+        // The append-only marker is established by Broker D/child custody in
+        // the original State file. Copied capability/source bytes alone cannot
+        // authorize an unattributed first admission.
+        let exact_required: bool = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM invocation_completion_exact_required
+             WHERE invocation_uuid=?1)",
+                [&source.owner_invocation_uuid],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        // The Broker commits this capture method before inserting the
+        // immutable marker. Keep the short crash/retry gap closed too.
+        let capture_method: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT provider_session_capture_method FROM invocations WHERE invocation_uuid=?1",
+                [&source.owner_invocation_uuid],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let fresh_actor = matches!(
+            capture_method.as_ref().and_then(Option::as_deref),
+            Some("broker-released-root-v30" | "broker-bash-child-v30")
+        );
+        #[cfg(feature = "age319-private-broker-fixture")]
+        let fresh_actor = fresh_actor
+            || matches!(
+                capture_method.as_ref().and_then(Option::as_deref),
+                Some("private-released-j-d-original-state")
+            );
+        if !binding.is_late_listener()
+            && (exact_required || fresh_actor)
+            && self.admitted_completion_continuation(binding)?.is_none()
+        {
+            return Err("fresh v30 exact Broker decision required".into());
+        }
         self.register_bound_completion(mutation_authority, Some(authority), false, binding)
     }
 
@@ -4876,6 +4967,158 @@ mod completion_continuation_tests {
                 || assert!(!after, "after State commit fault"),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn fresh_v30_public_registration_refuses_copied_capability_and_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.db");
+        let binding = binding();
+        let mut state = StateDb::open(&path).unwrap();
+        seed_domain(&path);
+        let authority = crate::CompletionRegistrationAuthority::generate().unwrap();
+        let source = binding.registration().unwrap();
+        let started = state
+            .start_invocation_with_prepared_completion_registration_authority(
+                &InvocationStart {
+                    invocation_uuid: source.owner_invocation_uuid.clone(),
+                    model_name: "agent-runner-root".into(),
+                    provider_name: "agent-runner".into(),
+                    provider_index: 0,
+                    parent_invocation_id: None,
+                },
+                &authority,
+            )
+            .unwrap();
+        state
+            .bind_invocation_provider_session_start(
+                crate::InvocationMutationAuthority::Standalone,
+                started.invocation_row_id,
+                &crate::ProviderSessionBinding {
+                    provider_session_id: source.owner_session_id,
+                    capture_method: "broker-released-root-v30",
+                    resume_input_id: None,
+                    provider_session_resolved_account: None,
+                },
+            )
+            .unwrap();
+        state
+            .mark_fresh_v30_exact_registration(
+                &source.owner_invocation_uuid,
+                "broker-released-root-v30",
+                &authority,
+            )
+            .unwrap();
+        let error = state
+            .register_completion_continuation_with_authority(
+                crate::InvocationMutationAuthority::Standalone,
+                &authority,
+                &binding,
+            )
+            .unwrap_err();
+        assert!(
+            error.contains("fresh v30 exact Broker decision required"),
+            "{error}"
+        );
+        assert!(
+            state
+                .admitted_completion_continuation(&binding)
+                .unwrap()
+                .is_none()
+        );
+        state.conn.execute(
+            "UPDATE invocations SET provider_session_capture_method='broker-bash-child-v30' WHERE invocation_uuid=?1",
+            [&source.owner_invocation_uuid],
+        ).unwrap();
+        assert!(
+            state
+                .register_completion_continuation_with_authority(
+                    crate::InvocationMutationAuthority::Standalone,
+                    &authority,
+                    &binding,
+                )
+                .unwrap_err()
+                .contains("fresh v30 exact Broker decision required")
+        );
+        state.conn.execute(
+            "UPDATE invocations SET provider_session_capture_method='provider_live_report' WHERE invocation_uuid=?1",
+            [&source.owner_invocation_uuid],
+        ).unwrap();
+        assert!(
+            state
+                .register_completion_continuation_with_authority(
+                    crate::InvocationMutationAuthority::Standalone,
+                    &authority,
+                    &binding,
+                )
+                .unwrap_err()
+                .contains("fresh v30 exact Broker decision required")
+        );
+        assert!(
+            state
+                .admitted_completion_continuation(&binding)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn admitted_historical_binding_repairs_after_v30_capture_label() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.db");
+        let binding = binding();
+        let mut state = StateDb::open(&path).unwrap();
+        seed_domain(&path);
+        let authority = crate::CompletionRegistrationAuthority::generate().unwrap();
+        let source = binding.registration().unwrap();
+        let started = state
+            .start_invocation_with_prepared_completion_registration_authority(
+                &InvocationStart {
+                    invocation_uuid: source.owner_invocation_uuid.clone(),
+                    model_name: "fixture".into(),
+                    provider_name: "fixture".into(),
+                    provider_index: 0,
+                    parent_invocation_id: None,
+                },
+                &authority,
+            )
+            .unwrap();
+        state
+            .bind_invocation_provider_session_start(
+                crate::InvocationMutationAuthority::Standalone,
+                started.invocation_row_id,
+                &crate::ProviderSessionBinding {
+                    provider_session_id: source.owner_session_id,
+                    capture_method: "provider_live_report",
+                    resume_input_id: None,
+                    provider_session_resolved_account: None,
+                },
+            )
+            .unwrap();
+        assert!(
+            state
+                .register_completion_continuation_with_authority(
+                    crate::InvocationMutationAuthority::Standalone,
+                    &authority,
+                    &binding,
+                )
+                .unwrap()
+                .inserted
+        );
+        state.conn.execute(
+            "UPDATE invocations SET provider_session_capture_method='broker-released-root-v30' WHERE invocation_uuid=?1",
+            [&source.owner_invocation_uuid],
+        ).unwrap();
+        assert!(
+            !state
+                .register_completion_continuation_with_authority(
+                    crate::InvocationMutationAuthority::Standalone,
+                    &authority,
+                    &binding,
+                )
+                .unwrap()
+                .inserted
+        );
     }
 
     #[cfg(feature = "age319-private-broker-fixture")]

@@ -75,7 +75,10 @@ fn invocations_schema_sql_keeps_raw_io_sidecar_based_with_completion_authority()
     );
     assert!(
         oulipoly_state::CURRENT_SCHEMA_VERSION >= 27
-            && schema_source().contains("pub const CURRENT_SCHEMA_VERSION: i32 = 28;"),
+            && schema_source().contains(&format!(
+                "pub const CURRENT_SCHEMA_VERSION: i32 = {};",
+                oulipoly_state::CURRENT_SCHEMA_VERSION
+            )),
         "schema version must include immutable completion recovery binding"
     );
     assert!(
@@ -135,6 +138,8 @@ fn invocations_schema_sql_keeps_raw_io_sidecar_based_with_completion_authority()
             "0026_live_history_barrier.sql",
             "0027_record_timestamp_contract.sql",
             "0028_completed_turn_recovery_targets.sql",
+            "0029_exact_source_decision_admission.sql",
+            "0030_fresh_exact_registration_route.sql",
         ],
         "migration inventory must include only sanctioned state-db migrations"
     );

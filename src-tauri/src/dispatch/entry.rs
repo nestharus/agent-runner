@@ -16,25 +16,30 @@ pub(crate) fn preflight_entry(cli: &Cli) -> Result<Option<i32>, String> {
         || std::env::var_os("AGENT_BASH_OWNER_WORK_ID_V1").is_some()
     {
         if let Some(Subcommands::Notify { command }) = &cli.command {
-            let (handle, registration_file) = match command {
+            let (handle, registration_file, exact_source_candidate) = match command {
                 NotifySubcommands::Register {
                     handle,
                     registration_file,
+                    accepted_intent_file,
                     ..
-                }
-                | NotifySubcommands::Complete {
+                } => (
+                    Some(handle.as_str()),
+                    registration_file.as_deref(),
+                    accepted_intent_file.is_some(),
+                ),
+                NotifySubcommands::Complete {
                     handle,
                     registration_file,
                     ..
-                } => (Some(handle.as_str()), registration_file.as_deref()),
-                NotifySubcommands::Activate { handle, .. } => (Some(handle.as_str()), None),
+                } => (Some(handle.as_str()), registration_file.as_deref(), false),
+                NotifySubcommands::Activate { handle, .. } => (Some(handle.as_str()), None, false),
                 NotifySubcommands::Registration {
                     registration_file, ..
                 }
                 | NotifySubcommands::CompletionState {
                     registration_file, ..
-                } => (None, Some(registration_file.as_path())),
-                _ => (None, None),
+                } => (None, Some(registration_file.as_path()), true),
+                _ => (None, None, false),
             };
             if let Some(path) = registration_file {
                 let binding = crate::commands::notify_continuation::load_binding(path)?;
@@ -42,7 +47,9 @@ pub(crate) fn preflight_entry(cli: &Cli) -> Result<Option<i32>, String> {
                 if handle.is_some_and(|handle| handle != source.handle) {
                     return Err("pinned owner work ID conflict".into());
                 }
-                crate::commands::notify::require_pinned_owner_work_id(&source.handle)?;
+                if !exact_source_candidate {
+                    crate::commands::notify::require_pinned_owner_work_id(&source.handle)?;
+                }
             } else if let Some(handle) = handle {
                 crate::commands::notify::require_pinned_owner_work_id(handle)?;
             }

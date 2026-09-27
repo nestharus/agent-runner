@@ -10,10 +10,15 @@ use oulipoly_state::{InvocationMutationAuthority, StateDb};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 
 const COMPLETION_REGISTRATION_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
+#[cfg(target_os = "linux")]
+#[path = "notify_exact_v30.rs"]
+mod exact_v30;
 
 pub(crate) fn recovery_list(session_id: Option<&str>, cursor: Option<&str>) -> Result<i32, String> {
     let decoded = cursor
@@ -312,12 +317,28 @@ pub(super) fn register_with_backpressure<T>(
 }
 
 pub(crate) fn load_binding(path: &Path) -> Result<AdmittedSourceBinding, String> {
+    load_binding_with_fd(path).map(|(binding, _)| binding)
+}
+
+fn load_binding_with_fd(path: &Path) -> Result<(AdmittedSourceBinding, fs::File), String> {
     let directory = path.parent().ok_or("registration has no directory")?;
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or("invalid registration filename")?;
-    let bytes = read_source_file(directory, name, MAX_REGISTRATION_BYTES)?;
+    let mut file = oulipoly_state::completion_continuation::open_source_file(
+        directory,
+        name,
+        MAX_REGISTRATION_BYTES,
+    )?;
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(MAX_REGISTRATION_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() > MAX_REGISTRATION_BYTES {
+        return Err("source grew beyond bound".into());
+    }
     let source: SourceRegistration = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
     source.validate()?;
     if Path::new(&source.handle_dir).join(&source.registration_relative) != path {
@@ -327,7 +348,7 @@ pub(crate) fn load_binding(path: &Path) -> Result<AdmittedSourceBinding, String>
         &source.handle,
         &source.owner_invocation_uuid,
     );
-    AdmittedSourceBinding::new(&admission_id, &bytes)
+    Ok((AdmittedSourceBinding::new(&admission_id, &bytes)?, file))
 }
 
 pub(crate) fn response(binding: &AdmittedSourceBinding, status: &str) -> Result<Value, String> {
@@ -357,9 +378,16 @@ pub(crate) fn register(
     args: super::notify::AgentBashRegisterArgs<'_>,
     path: &Path,
 ) -> Result<i32, String> {
-    let binding = load_binding(path)?;
+    let (binding, registration_fd) = load_binding_with_fd(path)?;
     let source = binding.registration()?;
     let result = (|| {
+        #[cfg(target_os = "linux")]
+        let v30_owner = crate::completion_owner::read_v30_owner_if_present(None)?;
+        #[cfg(target_os = "linux")]
+        if v30_owner.is_none() {
+            super::notify::require_pinned_owner_work_id(&source.handle)?;
+        }
+        #[cfg(not(target_os = "linux"))]
         super::notify::require_pinned_owner_work_id(&source.handle)?;
         if args.completion_protocol != Some(PROTOCOL) || args.repair_admitted {
             return Err(
@@ -371,6 +399,40 @@ pub(crate) fn register(
         crate::completion_owner::require_owner(&source.domain_id)?;
         let authority =
             oulipoly_state::CompletionRegistrationAuthority::from_process_environment()?;
+        #[cfg(target_os = "linux")]
+        if let Some(discovery) = v30_owner {
+            let intent = args
+                .accepted_intent_file
+                .ok_or("fresh v30 exact source requires accepted intent file")?;
+            let (exact, request_id) = exact_v30::register(
+                &binding,
+                &registration_fd,
+                path,
+                intent,
+                &discovery,
+                &authority,
+            )?;
+            let mut value = response(
+                &binding,
+                if exact.inserted {
+                    "registered"
+                } else {
+                    "already_registered"
+                },
+            )?;
+            value["registration_committed"] = true.into();
+            value["exact_source_decision_id"] = exact.decision_id.into();
+            value["exact_source_request_id"] = request_id.into();
+            value["exact_source_projection_available"] = exact.projection_available.into();
+            value["continuation_owner_domain"] = source.domain_id.clone().into();
+            value["listener_revision"] = json!(source.listeners.len());
+            value["listeners"] =
+                serde_json::to_value(&source.listeners).map_err(|e| e.to_string())?;
+            return Ok(value);
+        }
+        if args.accepted_intent_file.is_some() {
+            return Err("accepted v30 intent has no challenged Broker owner".into());
+        }
         let registration = register_with_backpressure(|| {
             let mut state = StateDb::open_default()?;
             state.register_completion_continuation_with_authority(
@@ -422,6 +484,11 @@ fn operation_result(
 pub(crate) fn readback(path: &Path, completion: bool) -> Result<i32, String> {
     let binding = load_binding(path)?;
     let result = (|| {
+        #[cfg(target_os = "linux")]
+        if crate::completion_owner::read_v30_owner_if_present(None)?.is_none() {
+            super::notify::require_pinned_owner_work_id(&binding.registration()?.handle)?;
+        }
+        #[cfg(not(target_os = "linux"))]
         super::notify::require_pinned_owner_work_id(&binding.registration()?.handle)?;
         let state =
             StateDb::open_read_only(&StateDb::default_path()?).map_err(|e| format!("{e:?}"))?;

@@ -177,7 +177,38 @@ static MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0029_exact_source_decision_admission.sql"),
         post_sql_hook: None,
     },
+    Migration {
+        target_version: 30,
+        id: "0030_fresh_exact_registration_route",
+        sql: include_str!("../migrations/0030_fresh_exact_registration_route.sql"),
+        post_sql_hook: Some(backfill_fresh_exact_registration_route),
+    },
 ];
+
+fn backfill_fresh_exact_registration_route(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let mut statement = conn.prepare("PRAGMA table_info(invocations)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if [
+        "provider_session_capture_method",
+        "completion_registration_capability_digest",
+        "provider_session_id",
+    ]
+    .iter()
+    .all(|column| columns.iter().any(|present| present == column))
+    {
+        conn.execute_batch(
+            "INSERT INTO invocation_completion_exact_required(invocation_uuid,route,capability_digest)
+             SELECT invocation_uuid,'broker-v30',completion_registration_capability_digest
+             FROM invocations WHERE provider_session_capture_method IN
+                ('broker-released-root-v30','broker-bash-child-v30')
+               AND completion_registration_capability_digest IS NOT NULL
+               AND provider_session_id IS NOT NULL",
+        )?;
+    }
+    Ok(())
+}
 
 fn validate_completed_turn_recovery_targets(conn: &Connection) -> Result<(), rusqlite::Error> {
     let missing: bool = conn.query_row(

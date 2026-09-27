@@ -306,6 +306,9 @@ impl FreshV30Lane {
                 provider_session_resolved_account: None,
             },
         )?;
+        state.mark_fresh_v30_exact_registration(
+            &child.invocation_uuid, "broker-bash-child-v30", &authority,
+        )?;
         self.require_bash_child_invocation(child, root, session, &authority)
     }
 

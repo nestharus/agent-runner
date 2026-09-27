@@ -236,6 +236,12 @@ fn schema_26_upgrade_preserves_evidence_and_does_not_invent_legacy_age() {
     drop(StateDb::open(&path).unwrap());
     let connection = Connection::open(&path).unwrap();
     timestamp_fixture::remove_v27_timestamp_contract(&connection);
+    connection
+        .execute_batch(
+            "DROP TABLE invocation_completion_exact_required;
+             DROP TABLE invocation_completion_exact_source_decisions;",
+        )
+        .unwrap();
     connection.pragma_update(None, "user_version", 26).unwrap();
 
     let authoritative_uuid = uuid::Uuid::new_v4().to_string();

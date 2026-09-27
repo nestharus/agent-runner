@@ -104,6 +104,8 @@ fn schema_22_migrates_provider_ownership_once_to_current() {
     timestamp_fixture::remove_v27_timestamp_contract(&conn);
     conn.execute_batch(
         "PRAGMA foreign_keys=OFF;
+         DROP TABLE invocation_completion_exact_required;
+         DROP TABLE invocation_completion_exact_source_decisions;
          DROP TRIGGER trg_invocation_completion_v2_identity_append_only_update;
          DROP TRIGGER trg_invocation_completion_v2_identity_append_only_delete;
          DROP TABLE invocation_completion_v2_identity;
@@ -211,6 +213,8 @@ fn schema_25_backfills_all_live_history_projections_from_explicit_evidence() {
     .unwrap();
     conn.execute_batch(
         "PRAGMA foreign_keys=OFF;
+         DROP TABLE invocation_completion_exact_required;
+         DROP TABLE invocation_completion_exact_source_decisions;
          DROP TRIGGER trg_invocation_completion_v2_identity_append_only_update;
          DROP TRIGGER trg_invocation_completion_v2_identity_append_only_delete;
          DROP TABLE invocation_completion_v2_identity;

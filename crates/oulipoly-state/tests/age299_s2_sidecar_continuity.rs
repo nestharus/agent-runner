@@ -665,6 +665,8 @@ fn schema_17_upgrade_backfills_only_an_exact_proven_materialization_summary() {
     connection
         .execute_batch(
             "PRAGMA foreign_keys=OFF;
+             DROP TABLE invocation_completion_exact_required;
+             DROP TABLE invocation_completion_exact_source_decisions;
              DROP TRIGGER trg_invocation_completion_v2_identity_append_only_update;
              DROP TRIGGER trg_invocation_completion_v2_identity_append_only_delete;
              DROP TABLE invocation_completion_v2_identity;
