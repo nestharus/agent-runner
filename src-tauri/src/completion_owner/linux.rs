@@ -666,7 +666,9 @@ pub(crate) fn run_pinned_guardian_v30(
     let endpoint = directory.join("owner.sock");
     let listener = UnixListener::bind(&endpoint).map_err(|e| e.to_string())?;
     #[cfg(feature = "age319-private-broker-fixture")]
-    if std::env::var_os("AGE319_PRIVATE_PRE_K_H_SOURCE_V1").is_some() {
+    if std::env::var_os("AGE319_PRIVATE_PRE_K_H_SOURCE_V1").is_some()
+        || std::env::var_os("AGE319_PRIVATE_SELECTED_K_ROOT_H_V1").is_some()
+    {
         let enabled: libc::c_int = 1;
         if unsafe {
             libc::setsockopt(
@@ -767,7 +769,9 @@ pub(crate) fn run_pinned_guardian_v30(
         );
     }
     #[cfg(feature = "age319-private-broker-fixture")]
-    if std::env::var_os("AGE319_PRIVATE_PRE_K_H_SOURCE_V1").is_some() {
+    if std::env::var_os("AGE319_PRIVATE_PRE_K_H_SOURCE_V1").is_some()
+        || std::env::var_os("AGE319_PRIVATE_SELECTED_K_ROOT_H_V1").is_some()
+    {
         return run_private_v30_original_work(
             &listener,
             &owner,
@@ -815,6 +819,8 @@ fn run_private_v30_original_work(
     let mut child_done = false;
     let mut woken: Option<(String, String, String)> = None;
     let mut postcommit_retry: Option<control::PostcommitHRequest> = None;
+    let delegated_h = std::env::var_os("AGE319_PRIVATE_SELECTED_K_ROOT_H_V1").is_some();
+    let mut delegated_h_seen = false;
     loop {
         for request in control.pending() {
             match request {
@@ -835,6 +841,17 @@ fn run_private_v30_original_work(
                         .is_ok()
                         && request.submission.root_authority.root_id == pin.root_id;
                     if authorized {
+                        if delegated_h && delegated_h_seen {
+                            reject_work(
+                                owner,
+                                request,
+                                "delegated original H already submitted".into(),
+                            );
+                            continue;
+                        }
+                        if delegated_h {
+                            delegated_h_seen = true;
+                        }
                         original.submit(owner, request);
                     } else {
                         reject_work(

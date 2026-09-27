@@ -824,6 +824,7 @@ fn inner(
         starttime_ticks: guardian.starttime_ticks,
     };
     let cancel_witness = SourceSocketWitness {
+        delegated_root_h_request_id: None,
         root_id: spec.root_id.clone(),
         domain_id: domain.clone(),
         supervisor_id: grants.records()[0].supervisor_authority_id.clone(),
@@ -946,6 +947,7 @@ fn inner(
                 starttime_ticks: source.starttime_ticks,
             },
             scope: SourceScope::Root,
+            delegated_root_h_request_id: None,
         };
         fs::write(
             temp.path().join("source-command.json"),

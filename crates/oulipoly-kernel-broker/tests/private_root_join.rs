@@ -2779,6 +2779,7 @@ fn inner() {
                 (mode == "normal_handoff_pre_k_h_source" || production_source)
                     .then_some(("AGE319_PRIVATE_PRE_K_H_SOURCE_V1", "1")),
             )
+            .envs(root_h_delegate.then_some(("AGE319_PRIVATE_SELECTED_K_ROOT_H_V1", "1")))
             .envs(
                 (mode == "normal_empty" || bad_disposition || production_source)
                     .then_some(("AGE319_PRIVATE_PRE_EFFECT_DISPOSITION_V1", "1")),
@@ -5099,6 +5100,124 @@ fn inner() {
                     fs::read_to_string(&broker_log).unwrap_or_default(),
                     fs::read_to_string(gate.join("bash-causal-error")).unwrap_or_default()
                 );
+                if root_h_delegate && !root_h_lost {
+                    // Acting milestone: the selected-K Bash child submitted
+                    // original H, while accepted-work grant preparation still
+                    // requires an exact-root namespace source. Never infer W
+                    // or Q from the accepted H artifact.
+                    eventually(|| gate.join("h-source-intent-dir").exists());
+                    let intent_dir = std::path::PathBuf::from(
+                        fs::read_to_string(gate.join("h-source-intent-dir")).unwrap(),
+                    );
+                    eventually(|| intent_dir.join("root-work-accepted-v1.json").exists());
+                    let accepted: serde_json::Value = serde_json::from_slice(
+                        &fs::read(intent_dir.join("root-work-accepted-v1.json")).unwrap(),
+                    )
+                    .unwrap();
+                    let root_id = accepted["root_id"].as_str().unwrap();
+                    let lane = FreshV30Lane::open_at(&broker_state).unwrap();
+                    let (root, actor) = lane.released_handoff_for_root(root_id).unwrap();
+                    let delegation = lane
+                        .read_root_h_delegation(&root.handoff_id)
+                        .unwrap()
+                        .unwrap();
+                    let mut child = lane
+                        .read_bash_child(&delegation.child_request_id)
+                        .unwrap()
+                        .unwrap();
+                    child.session = lane.read_session(&child.d_key).unwrap().unwrap();
+                    assert_eq!(delegation.child_actor, child.actor);
+                    assert_eq!(delegation.root_invocation_uuid, root.invocation_uuid);
+                    assert_eq!(accepted["owner_generation"], delegation.owner_generation);
+                    assert_eq!(accepted["initiator"]["pid"], child.actor.host_pid);
+                    assert_eq!(accepted["registration"]["kind"], "root");
+                    lane.require_consumed_root_h_delegation(
+                        &root,
+                        &actor,
+                        &child,
+                        &delegation.selected_k,
+                    )
+                    .unwrap();
+                    let mut wrong_child = child.clone();
+                    wrong_child.actor.starttime_ticks += 1;
+                    assert!(
+                        lane.require_consumed_root_h_delegation(
+                            &root,
+                            &actor,
+                            &wrong_child,
+                            &delegation.selected_k,
+                        )
+                        .is_err()
+                    );
+                    let mut wrong_plan = delegation.selected_k.clone();
+                    wrong_plan.plan_sha256 = "0".repeat(64);
+                    assert!(
+                        lane.require_consumed_root_h_delegation(&root, &actor, &child, &wrong_plan)
+                            .is_err()
+                    );
+                    let mut wrong_session = root.clone();
+                    wrong_session.d_key = uuid::Uuid::new_v4().to_string();
+                    assert!(
+                        lane.require_consumed_root_h_delegation(
+                            &wrong_session,
+                            &actor,
+                            &child,
+                            &delegation.selected_k,
+                        )
+                        .is_err()
+                    );
+                    let mut stale_owner = root.clone();
+                    stale_owner.old_release.prepared.owner_generation =
+                        uuid::Uuid::new_v4().to_string();
+                    assert!(
+                        lane.require_consumed_root_h_delegation(
+                            &stale_owner,
+                            &actor,
+                            &child,
+                            &delegation.selected_k,
+                        )
+                        .is_err()
+                    );
+                    assert_eq!(
+                        fs::read_to_string(gate.join("delegated-h-broker-stage")).unwrap(),
+                        "ticket-consumed"
+                    );
+                    assert_eq!(
+                        fs::read_to_string(gate.join("delegated-h-guardian-stage")).unwrap(),
+                        "ticket-accepted"
+                    );
+                    eventually(|| gate.join("bash-causal-terminal-status").exists());
+                    assert_eq!(
+                        fs::read(gate.join("bash-causal-terminal-status")).unwrap(),
+                        b"70"
+                    );
+                    assert!(
+                        fs::read_to_string(gate.join("bash-causal-error"))
+                            .unwrap()
+                            .contains("original H acceptance uncertain; no replay")
+                    );
+                    assert!(
+                        fs::read_to_string(intent_dir.join("root-work-diagnostic-v1.jsonl"))
+                            .unwrap()
+                            .contains("source is outside exact root namespace")
+                    );
+                    let state =
+                        rusqlite::Connection::open(broker_state.join("v30/state.db")).unwrap();
+                    assert_eq!(
+                        state
+                            .query_row(
+                                "SELECT count(*) FROM fresh_lane_accepted_source",
+                                [],
+                                |row| row.get::<_, i64>(0)
+                            )
+                            .unwrap(),
+                        0
+                    );
+                    assert!(!gate.join("bash-effect").exists());
+                    assert!(!gate.join("source-ready").exists());
+                    stop(&mut broker);
+                    return;
+                }
                 let report: serde_json::Value = serde_json::from_slice(
                     &fs::read(gate.join("bash-causal-output")).unwrap(),
                 )
@@ -5106,11 +5225,28 @@ fn inner() {
                     let output = fs::read(gate.join("bash-causal-output")).unwrap_or_default();
                     let prefix = if output.starts_with(b"{") { "json-object" } else { "other-or-empty" };
                     panic!(
-                        "causal Bash: {error}; stdout_bytes={} stdout_newline={} stdout_prefix={prefix} terminal_intent={} effect_marker={} stderr: {}; entry: {}; broker: {}; helper: {}",
+                        "causal Bash: {error}; stdout_bytes={} stdout_newline={} stdout_prefix={prefix} terminal_intent={} effect_marker={} h_ready={} h_client_stage={} h_broker_stage={} h_guardian_stage={} guardian_wchan={} guardian_env={} h_intent={} h_diagnostic={} h_accepted={} stderr: {}; entry: {}; broker: {}; helper: {}",
                         output.len(),
                         output.ends_with(b"\n"),
                         fs::read_to_string(gate.join("bash-causal-terminal-status")).unwrap_or_else(|_| "absent".into()),
                         gate.join("bash-effect").exists(),
+                        gate.join("h-source-ready").exists(),
+                        fs::read_to_string(gate.join("delegated-h-client-stage")).unwrap_or_default(),
+                        fs::read_to_string(gate.join("delegated-h-broker-stage")).unwrap_or_default(),
+                        fs::read_to_string(gate.join("delegated-h-guardian-stage")).unwrap_or_default(),
+                        fs::read_to_string(format!("/proc/{}/wchan", prepared.guardian.host_pid)).unwrap_or_default(),
+                        String::from_utf8_lossy(&fs::read(format!("/proc/{}/environ", prepared.guardian.host_pid)).unwrap_or_default())
+                            .split('\0').filter(|item| item.contains("FIXTURE_GATE_DIR") || item.contains("SELECTED_K_ROOT_H"))
+                            .collect::<Vec<_>>().join(","),
+                        fs::read_to_string(gate.join("h-source-intent-dir")).unwrap_or_default(),
+                        fs::read_to_string(
+                            std::path::PathBuf::from(fs::read_to_string(gate.join("h-source-intent-dir")).unwrap_or_default())
+                                .join("root-work-diagnostic-v1.jsonl")
+                        ).unwrap_or_default(),
+                        fs::read_to_string(
+                            std::path::PathBuf::from(fs::read_to_string(gate.join("h-source-intent-dir")).unwrap_or_default())
+                                .join("root-work-accepted-v1.json")
+                        ).unwrap_or_default(),
                         fs::read_to_string(gate.join("bash-causal-error")).unwrap_or_default(),
                         fs::read_to_string(&err).unwrap_or_default(),
                         fs::read_to_string(&broker_log).unwrap_or_default(),
@@ -13670,6 +13806,7 @@ fn inner() {
             starttime_ticks: record["joined_child"]["starttime_ticks"].as_u64().unwrap(),
         },
         scope: SourceScope::Root,
+        delegated_root_h_request_id: None,
     };
     // Restart cannot turn the dead joined child's old host identity into the
     // current caller, even while its root PID1 and grant record remain live.

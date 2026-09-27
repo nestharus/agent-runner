@@ -704,6 +704,7 @@ pub(crate) fn child_entry() -> Option<ExitCode> {
                         .map_err(|_| "invalid source starttime")?,
                 },
                 scope: SourceScope::Root,
+                delegated_root_h_request_id: None,
             };
             let broker = PathBuf::from(
                 std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1")
@@ -1938,7 +1939,9 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
             std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
                 .ok_or("private v30 gate directory absent")?,
         );
-        if std::env::var_os("AGE319_PRIVATE_PRE_K_H_SOURCE_V1").is_some() {
+        if std::env::var_os("AGE319_PRIVATE_PRE_K_H_SOURCE_V1").is_some()
+            || gate_dir.join("selected-k-root-h").exists()
+        {
             let (receipt, session) = effect_binding
                 .as_ref()
                 .ok_or("private pre-K source has no original D binding")?;
@@ -1984,40 +1987,55 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
                 "private-released-j-d-original-state",
                 &authority,
             )?;
-            let runner = std::env::current_exe().map_err(|e| e.to_string())?;
-            let bash = std::env::var("AGE319_PRIVATE_BASH_IMAGE")
-                .map_err(|_| "private pre-K Bash image absent")?;
-            let account = format!("{}:{}", unsafe { libc::geteuid() }, unsafe {
-                libc::getegid()
-            });
-            std::fs::write(
-                gate_dir.join("child-attested"),
-                evidence.release_id.as_bytes(),
-            )
-            .map_err(|e| e.to_string())?;
-            let status = std::process::Command::new(bash)
-                .arg("__age319-private-pre-k-h-source-v1")
-                .arg(&gate_dir)
-                .args(["--", "/bin/true", "selected workload"])
-                .env("AGENT_BASH_AGENT_RUNNER_BIN", runner)
-                .env("XDG_STATE_HOME", &gate_dir)
-                .env("XDG_CONFIG_HOME", &gate_dir)
-                .env("OULIPOLY_COMPLETION_ENDPOINT", &evidence.owner.endpoint)
-                .env("OULIPOLY_ORIGINAL_WORK_REQUIRED_V1", "1")
-                .env("AGENT_BASH_OWNER_SESSION_ID", &session.session_id)
-                .env("AGENT_BASH_OWNER_INVOCATION_UUID", &receipt.invocation_uuid)
-                .env(
-                    "OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY",
-                    &receipt.registration_authority,
+            if gate_dir.join("selected-k-root-h").exists() {
+                // D/J is bound before K. The selected Bash child alone may
+                // later submit original H using its consumed delegation.
+                std::fs::write(gate_dir.join("original-d-j-bound"), b"bound")
+                    .map_err(|e| e.to_string())?;
+                std::fs::write(
+                    gate_dir.join("original-h-runner-image"),
+                    std::env::current_exe()
+                        .map_err(|e| e.to_string())?
+                        .as_os_str()
+                        .as_encoded_bytes(),
                 )
-                .env("AGE319_SELECTED_ACCOUNT", account)
-                .env("AGE319_SELECTED_ENV", "held-d-pre-k")
-                .status()
                 .map_err(|e| e.to_string())?;
-            if !status.success() {
-                return Err(format!("private pre-K Bash source exited {status}"));
+            } else {
+                let runner = std::env::current_exe().map_err(|e| e.to_string())?;
+                let bash = std::env::var("AGE319_PRIVATE_BASH_IMAGE")
+                    .map_err(|_| "private pre-K Bash image absent")?;
+                let account = format!("{}:{}", unsafe { libc::geteuid() }, unsafe {
+                    libc::getegid()
+                });
+                std::fs::write(
+                    gate_dir.join("child-attested"),
+                    evidence.release_id.as_bytes(),
+                )
+                .map_err(|e| e.to_string())?;
+                let status = std::process::Command::new(bash)
+                    .arg("__age319-private-pre-k-h-source-v1")
+                    .arg(&gate_dir)
+                    .args(["--", "/bin/true", "selected workload"])
+                    .env("AGENT_BASH_AGENT_RUNNER_BIN", runner)
+                    .env("XDG_STATE_HOME", &gate_dir)
+                    .env("XDG_CONFIG_HOME", &gate_dir)
+                    .env("OULIPOLY_COMPLETION_ENDPOINT", &evidence.owner.endpoint)
+                    .env("OULIPOLY_ORIGINAL_WORK_REQUIRED_V1", "1")
+                    .env("AGENT_BASH_OWNER_SESSION_ID", &session.session_id)
+                    .env("AGENT_BASH_OWNER_INVOCATION_UUID", &receipt.invocation_uuid)
+                    .env(
+                        "OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY",
+                        &receipt.registration_authority,
+                    )
+                    .env("AGE319_SELECTED_ACCOUNT", account)
+                    .env("AGE319_SELECTED_ENV", "held-d-pre-k")
+                    .status()
+                    .map_err(|e| e.to_string())?;
+                if !status.success() {
+                    return Err(format!("private pre-K Bash source exited {status}"));
+                }
+                return Ok(ExitCode::SUCCESS);
             }
-            return Ok(ExitCode::SUCCESS);
         }
         if std::env::var_os("AGE319_PRIVATE_OWNER_DISCOVERY_PROBE_V1").is_some() {
             crate::completion_owner::private_discovery_probe(&evidence, &gate_dir)?;

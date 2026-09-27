@@ -6,6 +6,16 @@ const PINNED_EOF_DEADLINE: std::time::Duration = std::time::Duration::from_secs(
 
 const CREDENTIAL_READ_BUFFER_BYTES: usize = 4096;
 
+#[cfg(feature = "age319-private-broker-fixture")]
+fn delegated_h_guardian_stage(stage: &str) {
+    if let Some(gate) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1") {
+        let gate = std::path::Path::new(&gate);
+        if gate.join("selected-k-root-h").exists() {
+            let _ = std::fs::write(gate.join("delegated-h-guardian-stage"), stage);
+        }
+    }
+}
+
 use super::original_work::{
     CancelSubmission, FD_COUNT, InboundCancel, InboundWork, RootJoinRequest, WorkSubmission,
 };
@@ -390,6 +400,8 @@ fn serve_request(
     requests: &SyncSender<ControlRequest>,
     pinned_root_id: Option<&str>,
 ) {
+    #[cfg(feature = "age319-private-broker-fixture")]
+    delegated_h_guardian_stage("accepted-connection");
     let peer = if pinned_root_id.is_some() {
         let Ok(credentials) = peer_credentials(&socket) else {
             return;
@@ -413,6 +425,11 @@ fn serve_request(
         Some(_) => receive_pinned_request(&socket, &context),
         None => receive_request(&socket, &context).map(|(frame, fds)| (frame, fds, None)),
     };
+    #[cfg(feature = "age319-private-broker-fixture")]
+    match &incoming {
+        Ok(_) => delegated_h_guardian_stage("frame-received"),
+        Err((_, error)) => delegated_h_guardian_stage(&format!("frame-error: {error}")),
+    }
     let (request, descriptors, ticket) = match incoming {
         Ok(request) => request,
         Err((Some(b'w' | b'c'), _)) => {
@@ -490,8 +507,12 @@ fn serve_request(
             || receive_pinned_eof(&socket, &context).is_err()
         {
             super::record_control_gap(owner, peer, "original_work_control_source_ticket_refused");
+            #[cfg(feature = "age319-private-broker-fixture")]
+            delegated_h_guardian_stage("ticket-refused");
             return;
         }
+        #[cfg(feature = "age319-private-broker-fixture")]
+        delegated_h_guardian_stage("ticket-accepted");
     } else if ticket.is_some() {
         return;
     }
