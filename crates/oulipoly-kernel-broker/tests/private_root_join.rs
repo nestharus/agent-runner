@@ -186,6 +186,239 @@ impl Drop for SnapshotRestore {
     }
 }
 
+fn assert_postcommit_source_physical_after_owner(
+    socket: &Path,
+    broker_state: &Path,
+    gate: &Path,
+    bash: &str,
+) {
+    // J, guardian and driver have exited. Reopen only the Broker's
+    // retained one-use physical record after a Broker restart.
+    let physical_dir = broker_state.join("source-physical");
+    let pending = SourcePhysicalRegistry::open(&physical_dir).unwrap();
+    assert_eq!(pending.records().len(), 1);
+    let grant = &pending.records()[0].grant;
+    assert_eq!((grant.phase.as_str(), grant.revision), ("consumed", 2));
+    let replay = protocol::StateWriteSpec {
+        protocol: "broker-source-effect-launch-v30".into(),
+        source_generation: grant.source_generation.clone(),
+        root_id: grant.root_id.clone(),
+        owner_generation: grant.owner_generation.clone(),
+        action: protocol::StateWriteAction::LaunchSourceGrant,
+    };
+    assert!(protocol::launch_source_effect_grant_at(socket, &replay).is_err());
+    assert_eq!(
+        SourcePhysicalRegistry::open(&physical_dir)
+            .unwrap()
+            .records()
+            .len(),
+        1
+    );
+    let gone = |stamp: &oulipoly_kernel_broker::entry_registry::ProcessStamp| {
+        oulipoly_kernel_broker::identity::observed_incarnation_gone(
+            stamp.host_pid,
+            &stamp.boot_id,
+            stamp.starttime_ticks,
+            (stamp.pidns_dev, stamp.pidns_ino),
+        )
+        .unwrap()
+    };
+    eventually(|| gone(&pending.records()[0].worker));
+    assert!(gone(&pending.records()[0].guardian));
+    assert!(gone(&pending.records()[0].driver));
+    assert!(!gone(&pending.records()[0].pid1));
+    assert!(matches!(
+        pending
+            .observe(&pending.records()[0].grant.grant_id)
+            .unwrap(),
+        SourceObservation::Live { .. } | SourceObservation::DrainPending { .. }
+    ));
+    assert!(
+        !physical_dir
+            .join(format!(
+                "{}.terminal.json",
+                pending.records()[0].grant.grant_id
+            ))
+            .exists()
+    );
+    fs::write(gate.join("source-adopted-started.release"), b"release").unwrap();
+    eventually(|| {
+        let physical = SourcePhysicalRegistry::open(&physical_dir).unwrap();
+        physical.records().len() == 1
+            && matches!(
+                physical
+                    .observe(&physical.records()[0].grant.grant_id)
+                    .unwrap(),
+                SourceObservation::Drained { .. }
+            )
+    });
+    let physical = SourcePhysicalRegistry::open(&physical_dir).unwrap();
+    let record = &physical.records()[0];
+    let registration_path = fs::read_to_string(gate.join("source-ready")).unwrap();
+    let registration_bytes = fs::read(registration_path.trim()).unwrap();
+    let registration: serde_json::Value = serde_json::from_slice(&registration_bytes).unwrap();
+    assert_eq!(
+        registration["recovery"]["sha256"],
+        format!("{:x}", Sha256::digest(fs::read(bash).unwrap()))
+    );
+    assert_eq!(
+        registration["registration_id"],
+        record.grant.candidate.registration_id
+    );
+    assert_eq!(
+        record.grant.candidate.registration_digest,
+        format!("{:x}", Sha256::digest(&registration_bytes))
+    );
+    let id = &record.grant.grant_id;
+    let observation = physical.observe(id).unwrap();
+    let SourceObservation::Drained {
+        worker_wait_status,
+        stdout,
+        stderr,
+        cancel_requested: false,
+    } = observation
+    else {
+        panic!("source Q not physically drained: {observation:?}");
+    };
+    assert_eq!(worker_wait_status, 0);
+    let output = fs::read(physical_dir.join(format!("{id}.stdout"))).unwrap();
+    let errors = fs::read(physical_dir.join(format!("{id}.stderr"))).unwrap();
+    assert_eq!(stdout.byte_len, output.len() as u64);
+    assert_eq!(stdout.sha256, format!("{:x}", Sha256::digest(&output)));
+    assert_eq!(stderr.byte_len, errors.len() as u64);
+    assert_eq!(stderr.sha256, format!("{:x}", Sha256::digest(&errors)));
+    assert!(
+        errors
+            .windows(b"adopted-stderr\n".len())
+            .any(|w| w == b"adopted-stderr\n")
+    );
+    let terminal: serde_json::Value = serde_json::from_slice(
+        &physical
+            .read_witness(id, "terminal.json", 16 * 1024)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(terminal["grant_id"], *id);
+    assert_eq!(terminal["adopted_tree_drained"], true);
+    assert_eq!(terminal["worker_local_pid"], record.worker_local_pid);
+    // The restarted serving Broker must read its own retained W
+    // record and persist an assessment, even though the caller that
+    // launched W and the original owner are gone.
+    eventually(|| {
+        let _ = protocol::request_at(&socket, Operation::Classify);
+        BrokerSidecar::open_existing(&broker_state.join("sidecar/pid-identity.db"), &broker_state)
+            .unwrap()
+            .read_source_evidence(&record.grant)
+            .unwrap()
+            .is_some()
+    });
+    let retained =
+        BrokerSidecar::open_existing(&broker_state.join("sidecar/pid-identity.db"), &broker_state)
+            .unwrap();
+    let evidence = retained
+        .read_source_evidence(&record.grant)
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(evidence.phase.as_str(), "unknown" | "captured"),
+        "physical Q alone must not manufacture v2 acceptance: {evidence:?}"
+    );
+    let reply_status = serde_json::from_slice::<serde_json::Value>(&output)
+        .ok()
+        .and_then(|reply| reply["status"].as_str().map(str::to_owned));
+    eprintln!(
+        "age319 real H-W-Q: grant={} worker_wait={} stdout={} stderr={} reply_status={:?} evidence_phase={}",
+        id, worker_wait_status, stdout.byte_len, stderr.byte_len, reply_status, evidence.phase
+    );
+    let source_phase: String = rusqlite::Connection::open_with_flags(
+        broker_state.join("sidecar/pid-identity.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap()
+    .query_row(
+        "SELECT phase FROM completion_continuation_source WHERE registration_id=?1",
+        [&record.grant.candidate.registration_id],
+        |row| row.get(0),
+    )
+    .unwrap();
+    assert_eq!(source_phase, "registered");
+    // Missing, partial and contradictory retained witnesses cannot
+    // authorize Q after the original actors are gone.
+    let terminal_path = physical_dir.join(format!("{id}.terminal.json"));
+    let original = fs::read(&terminal_path).unwrap();
+    fs::remove_file(&terminal_path).unwrap();
+    assert!(matches!(
+        SourcePhysicalRegistry::open(&physical_dir)
+            .unwrap()
+            .observe(id)
+            .unwrap(),
+        SourceObservation::Unknown {
+            reason: "missing-terminal-receipt",
+            ..
+        }
+    ));
+    fs::write(&terminal_path, &original).unwrap();
+    let stderr_path = physical_dir.join(format!("{id}.stderr"));
+    fs::write(&stderr_path, &errors[..errors.len() - 1]).unwrap();
+    assert!(matches!(
+        SourcePhysicalRegistry::open(&physical_dir)
+            .unwrap()
+            .observe(id)
+            .unwrap(),
+        SourceObservation::Unknown {
+            reason: "incomplete-or-changed-output",
+            ..
+        }
+    ));
+    fs::write(&stderr_path, &errors).unwrap();
+    let mut changed: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    changed["worker_local_pid"] = serde_json::json!(record.worker_local_pid + 1);
+    fs::write(&terminal_path, serde_json::to_vec(&changed).unwrap()).unwrap();
+    assert!(matches!(
+        SourcePhysicalRegistry::open(&physical_dir)
+            .unwrap()
+            .observe(id)
+            .unwrap(),
+        SourceObservation::Unknown {
+            reason: "conflicting-terminal-receipt",
+            ..
+        }
+    ));
+    fs::write(&terminal_path, &original).unwrap();
+    assert!(matches!(
+        SourcePhysicalRegistry::open(&physical_dir)
+            .unwrap()
+            .observe(id)
+            .unwrap(),
+        SourceObservation::Drained { .. }
+    ));
+}
+
+fn terminate_postcommit_original_owner(broker_state: &Path) {
+    let physical = SourcePhysicalRegistry::open(broker_state.join("source-physical")).unwrap();
+    assert_eq!(physical.records().len(), 1);
+    let record = &physical.records()[0];
+    for stamp in [&record.driver, &record.guardian] {
+        if oulipoly_kernel_broker::identity::observed_incarnation_gone(
+            stamp.host_pid,
+            &stamp.boot_id,
+            stamp.starttime_ticks,
+            (stamp.pidns_dev, stamp.pidns_ino),
+        )
+        .unwrap()
+        {
+            continue;
+        }
+        let process =
+            oulipoly_kernel_broker::identity::PinnedProcess::open(stamp.host_pid).unwrap();
+        assert_eq!(
+            oulipoly_kernel_broker::entry_registry::ProcessStamp::from(&process),
+            *stamp
+        );
+        process.signal(libc::SIGKILL).unwrap();
+    }
+}
+
 fn inner() {
     let mode = std::env::var("AGE319_PRIVATE_JOIN_MODE").unwrap_or_else(|_| "help".into());
     let caller_mode = mode.starts_with("normal_model_provider_caller_")
@@ -1464,6 +1697,10 @@ fn inner() {
                     .then_some(("AGE319_PRIVATE_PRE_EFFECT_DISPOSITION_V1", "1")),
             )
             .envs(postcommit_source.then_some(("AGE319_PRIVATE_POSTCOMMIT_H_V1", "1")))
+            .envs(postcommit_source.then_some((
+                "AGE319_PRIVATE_SOURCE_Q_MARKER_V1",
+                gate.join("source-adopted-started"),
+            )))
             .envs(bad_disposition.then_some(("AGE319_PRIVATE_BAD_DISPOSITION_ROOT_V1", "1")))
             .envs(
                 (mode == "normal_bash_source_lost_reply")
@@ -2394,13 +2631,39 @@ fn inner() {
                             )
                             .unwrap();
                         assert_eq!(grant, ("consumed".into(), 2));
-                        assert_eq!(
+                        let physical =
                             SourcePhysicalRegistry::open(broker_state.join("source-physical"))
-                                .unwrap()
-                                .records()
-                                .len(),
+                                .unwrap();
+                        assert_eq!(
+                            physical.records().len(),
                             1,
                             "one W must create one physical custody tree"
+                        );
+                        let record = &physical.records()[0];
+                        assert_eq!(record.grant.root_id, prepared.root_id);
+                        assert_eq!(record.grant.source_generation, generation);
+                        assert_eq!(record.grant.owner_generation, prepared.owner_generation);
+                        assert_eq!(record.grant.candidate.registration_id, attribution.2);
+                        assert_eq!(record.grant.candidate.registration_digest, attribution.3);
+                        assert_eq!(record.grant.phase, "consumed");
+                        eventually(|| gate.join("source-adopted-started").exists());
+                        assert_eq!(
+                            fs::read(gate.join("source-adopted-started")).unwrap(),
+                            b"adopted\n"
+                        );
+                        assert!(
+                            matches!(
+                                physical.observe(&record.grant.grant_id).unwrap(),
+                                SourceObservation::Live { .. }
+                                    | SourceObservation::DrainPending { .. }
+                            ),
+                            "delayed adopted child must keep Q pending"
+                        );
+                        assert!(
+                            !broker_state
+                                .join("source-physical")
+                                .join(format!("{}.terminal.json", record.grant.grant_id))
+                                .exists()
                         );
                     } else {
                         stop(&mut broker);
@@ -2631,9 +2894,9 @@ fn inner() {
                 fs::write(gate.join("source-release"), b"done").unwrap();
                 eventually(|| entry.try_wait().unwrap().is_some());
                 let _ = entry.wait();
-                stop(&mut broker);
-                unsafe { libc::kill(prepared.root_init.host_pid, libc::SIGKILL) };
                 if let Err(panic) = verified {
+                    stop(&mut broker);
+                    unsafe { libc::kill(prepared.root_init.host_pid, libc::SIGKILL) };
                     std::panic::resume_unwind(panic);
                 }
                 assert!(
@@ -2642,6 +2905,33 @@ fn inner() {
                         .contains("original H acceptance uncertain; no replay"),
                     "pre-register H response unexpectedly claimed completion"
                 );
+                if postcommit_source {
+                    stop(&mut broker);
+                    terminate_postcommit_original_owner(&broker_state);
+                    let mut restarted = restart_source_broker(
+                        &socket,
+                        &broker_state,
+                        &runner,
+                        &gate,
+                        &temp.path().join("real-h-w-q-post-owner-restart.log"),
+                    );
+                    let observed = std::panic::catch_unwind(|| {
+                        assert_postcommit_source_physical_after_owner(
+                            &socket,
+                            &broker_state,
+                            &gate,
+                            bash.as_ref().unwrap(),
+                        );
+                    });
+                    stop(&mut restarted);
+                    unsafe { libc::kill(prepared.root_init.host_pid, libc::SIGKILL) };
+                    if let Err(panic) = observed {
+                        std::panic::resume_unwind(panic);
+                    }
+                } else {
+                    stop(&mut broker);
+                    unsafe { libc::kill(prepared.root_init.host_pid, libc::SIGKILL) };
+                }
                 return;
             }
             if mode == "normal_handoff_bash_child" {
@@ -12445,7 +12735,8 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
-        if mode == "normal_model_provider_pty_physical"
+        if mode == "normal_handoff_pre_k_h_source_postcommit_w"
+            || mode == "normal_model_provider_pty_physical"
             || mode == "normal_model_provider_pty_physical_resident_tail"
             || mode == "normal_model_provider_pty_physical_resident_bash_notify"
         {
@@ -12540,6 +12831,7 @@ fn consumed_h_postcommit_wakes_exact_source_once() {
         )
         .output()
         .unwrap();
+    eprint!("{}", String::from_utf8_lossy(&output.stderr));
     assert!(
         output.status.success(),
         "stdout={} stderr={}",
