@@ -8,9 +8,10 @@ use crate::entry_registry::{EntryRegistry, ProcessStamp};
 use crate::identity::{PeerIdentity, PinnedProcess, host_proc_file};
 use crate::native_receipt::{BoundNativeAuthority, verify as verify_native_receipt};
 use crate::protocol::NativeKSpec;
+use crate::protocol::{DelegatedRootHProof, SourceScope};
 use crate::registry::RootRegistry;
 use crate::work_registry::WorkRegistry;
-use oulipoly_state::mailbox::{BrokerSidecar, MailboxDb, NativeGrantBinding};
+use oulipoly_state::mailbox::{BrokerSidecar, FreshRootHSelectedK, MailboxDb, NativeGrantBinding};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -54,6 +55,15 @@ pub struct Acceptance {
     pub initiator: SourceIdentity,
     pub registration: Registration,
     pub cancel_capability_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegated_root_h: Option<DelegatedRootHProof>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegatedRootHGrant {
+    pub proof: DelegatedRootHProof,
+    pub selected_k: FreshRootHSelectedK,
 }
 
 #[derive(Deserialize)]
@@ -156,6 +166,8 @@ pub struct GrantRecord {
     pub accepted_sha256: String,
     pub request_sha256: String,
     pub initiator: SourceIdentity,
+    #[serde(default)]
+    pub delegated_root_h: Option<DelegatedRootHGrant>,
     pub artifacts: GrantArtifacts,
     /// Present only for a v3 grant whose accepted intent pinned the exact
     /// native Runner helper image and owner session before K was consumed.
@@ -412,7 +424,7 @@ fn valid_stamp(stamp: &ProcessStamp) -> bool {
         && stamp.pidns_ino > 0
 }
 
-fn read_bounded(file: &File) -> io::Result<Vec<u8>> {
+pub fn read_bounded(file: &File) -> io::Result<Vec<u8>> {
     let size = file.metadata()?.len();
     if size > MAX_ARTIFACT {
         return Err(io::Error::other("accepted-work artifact too large"));
@@ -539,7 +551,13 @@ impl GrantRegistry {
             &record.owner_generation,
             &record.supervisor_authority_id,
         )?;
-        if receipt.initiator != record.initiator {
+        if receipt.initiator != record.initiator
+            || receipt.delegated_root_h
+                != record
+                    .delegated_root_h
+                    .as_ref()
+                    .map(|binding| binding.proof.clone())
+        {
             return Err(io::Error::other("accepted source identity changed"));
         }
         Ok(record.clone())
@@ -669,6 +687,10 @@ impl GrantRegistry {
                     .as_ref()
                     .is_some_and(|parent| uuid::Uuid::parse_str(parent).is_err())
                 || record.parent_grant_id.is_some() != record.parent_work_incarnation.is_some()
+                || record
+                    .delegated_root_h
+                    .as_ref()
+                    .is_some_and(|binding| !valid_delegated_grant(&record, binding))
                 || !ids.insert(record.grant_id.clone())
                 || !works.insert((record.root_id.clone(), record.work_id.clone()))
             {
@@ -1315,6 +1337,7 @@ impl GrantRegistry {
         request_sha256: &str,
         accepted_sha256: &str,
         owner_generation: &str,
+        delegated_root_h: Option<DelegatedRootHGrant>,
     ) -> io::Result<GrantRecord> {
         if self.has_debt()
             || roots.has_debt()
@@ -1369,6 +1392,13 @@ impl GrantRegistry {
             owner_generation,
             supervisor,
         )?;
+        if receipt.delegated_root_h
+            != delegated_root_h
+                .as_ref()
+                .map(|binding| binding.proof.clone())
+        {
+            return Err(io::Error::other("delegated H acceptance or ticket changed"));
+        }
         let intent_identity: IntentIdentity = serde_json::from_slice(&intent_bytes)?;
         let helper = sealed_helper(state_dir, &intent_identity, runner_image)?;
         let expected_state =
@@ -1398,12 +1428,26 @@ impl GrantRegistry {
         }
         let parent = match &receipt.registration {
             Registration::Root => {
-                if !source.in_namespace(root.init.namespace())? {
+                if let Some(binding) = &delegated_root_h {
+                    if !matches!(binding.proof.witness.scope, SourceScope::Root)
+                        || binding.proof.work_id != work_id
+                        || binding.proof.witness.root_id != root_id
+                        || binding.proof.witness.source.host_pid != source.host_pid
+                        || binding.proof.witness.source.boot_id != source.boot_id
+                        || binding.proof.witness.source.starttime_ticks != source.starttime_ticks
+                        || binding.proof.witness.delegated_root_h_request_id.is_none()
+                    {
+                        return Err(io::Error::other("delegated H source binding changed"));
+                    }
+                } else if !source.in_namespace(root.init.namespace())? {
                     return Err(io::Error::other("source is outside exact root namespace"));
                 }
                 None
             }
             Registration::Nested { parent_work_id, .. } => {
+                if delegated_root_h.is_some() {
+                    return Err(io::Error::other("delegated H cannot register nested work"));
+                }
                 let parent = self
                     .records
                     .iter()
@@ -1457,6 +1501,7 @@ impl GrantRegistry {
             accepted_sha256: digest(&accepted_bytes),
             request_sha256: request_sha256.to_owned(),
             initiator: receipt.initiator,
+            delegated_root_h,
             artifacts: GrantArtifacts::pinned(executable, intent, cwd, state_dir, accepted)?,
             sealed_helper: helper,
             consumed: false,
@@ -1599,6 +1644,39 @@ impl GrantRegistry {
         self.records[index] = consumed.clone();
         Ok(consumed)
     }
+}
+
+fn valid_delegated_grant(record: &GrantRecord, binding: &DelegatedRootHGrant) -> bool {
+    let proof = &binding.proof;
+    let source = &proof.witness.source;
+    let guardian = &proof.witness.guardian;
+    let selected = &binding.selected_k;
+    matches!(proof.witness.scope, SourceScope::Root)
+        && uuid::Uuid::parse_str(&proof.ticket_id).is_ok()
+        && proof.work_id == record.work_id
+        && proof.witness.root_id == record.root_id
+        && proof.witness.supervisor_id == record.supervisor_authority_id
+        && proof
+            .witness
+            .delegated_root_h_request_id
+            .as_ref()
+            .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+        && i64::from(source.host_pid) == record.initiator.pid
+        && source.boot_id == record.initiator.boot_id
+        && i64::try_from(source.starttime_ticks).ok() == Some(record.initiator.starttime_ticks)
+        && guardian.host_pid == record.guardian.host_pid
+        && guardian.boot_id == record.guardian.boot_id
+        && guardian.starttime_ticks == record.guardian.starttime_ticks
+        && uuid::Uuid::parse_str(&selected.grant_id).is_ok()
+        && selected.work_id.len() <= 256
+        && !selected.work_id.is_empty()
+        && valid_digest(&selected.plan_sha256)
+        && !selected.account.is_empty()
+        && !selected.model.is_empty()
+        && selected.provider_pid > 0
+        && selected.provider_starttime > 0
+        && !selected.provider_boot_id.is_empty()
+        && record.parent_grant_id.is_none()
 }
 
 #[cfg(test)]
@@ -1866,6 +1944,7 @@ mod tests {
                 boot_id: "boot".into(),
                 starttime_ticks: 7,
             },
+            delegated_root_h: None,
             artifacts: GrantArtifacts::pinned(
                 &File::open("/proc/self/exe").unwrap(),
                 &File::open("/dev/null").unwrap(),

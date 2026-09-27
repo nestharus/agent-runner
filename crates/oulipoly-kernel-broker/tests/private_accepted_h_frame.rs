@@ -518,6 +518,7 @@ fn inner(
         },
         registration: Registration::Root,
         cancel_capability_sha256: digest(b"fixture cancel capability"),
+        delegated_root_h: None,
     })
     .unwrap();
     fs::write(work_state.join("root-work-accepted-v1.json"), &accepted).unwrap();

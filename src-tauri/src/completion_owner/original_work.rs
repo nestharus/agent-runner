@@ -220,6 +220,8 @@ struct AcceptanceReceipt {
     initiator: SourceProcessIdentity,
     registration: RegistrationReceipt,
     cancel_capability_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delegated_root_h: Option<oulipoly_kernel_broker::protocol::DelegatedRootHProof>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -298,6 +300,7 @@ pub(super) struct InboundWork {
     pub peer: SourceProcessIdentity,
     pub submission: WorkSubmission,
     pub descriptors: [OwnedFd; FD_COUNT],
+    pub delegated_root_h: Option<oulipoly_kernel_broker::protocol::DelegatedRootHProof>,
 }
 
 pub(super) struct InboundCancel {
@@ -926,6 +929,7 @@ impl OriginalWorkSupervisor {
             initiator: request.peer.clone(),
             registration: RegistrationReceipt::from(&request.submission.registration),
             cancel_capability_sha256: hex_digest(request.submission.cancel_capability.as_bytes()),
+            delegated_root_h: request.delegated_root_h.clone(),
         };
         match create_artifact(&state_dir, ACCEPTED_FILE, &acceptance) {
             Ok(()) => *effects_possible = true,
@@ -2979,6 +2983,7 @@ mod tests {
             initiator: identity.clone(),
             registration: RegistrationReceipt::Root,
             cancel_capability_sha256: hex_digest(b"cancel-secret"),
+            delegated_root_h: None,
         };
         create_artifact(&directory, ACCEPTED_FILE, &acceptance).unwrap();
         assert!(

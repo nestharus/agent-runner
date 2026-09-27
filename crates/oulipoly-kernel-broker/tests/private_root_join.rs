@@ -5079,7 +5079,8 @@ fn inner() {
                     stop(&mut broker);
                     return;
                 }
-                let until = Instant::now() + Duration::from_secs(20);
+                let until =
+                    Instant::now() + Duration::from_secs(if root_h_delegate { 90 } else { 20 });
                 while fs::read(gate.join("bash-causal-output"))
                     .ok()
                     .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
@@ -5101,11 +5102,26 @@ fn inner() {
                     fs::read_to_string(gate.join("bash-causal-error")).unwrap_or_default()
                 );
                 if root_h_delegate && !root_h_lost {
-                    // Acting milestone: the selected-K Bash child submitted
-                    // original H, while accepted-work grant preparation still
-                    // requires an exact-root namespace source. Never infer W
-                    // or Q from the accepted H artifact.
-                    eventually(|| gate.join("h-source-intent-dir").exists());
+                    // The accepted original H must carry the consumed ticket
+                    // and selected-K child through W preparation.
+                    let h_source_until = Instant::now() + Duration::from_secs(20);
+                    while !gate.join("h-source-intent-dir").exists()
+                        && Instant::now() < h_source_until
+                    {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    assert!(
+                        gate.join("h-source-intent-dir").exists(),
+                        "delegated H source absent: gate={:?} bash={} entry={} broker={}",
+                        fs::read_dir(&gate)
+                            .unwrap()
+                            .flatten()
+                            .map(|e| e.file_name())
+                            .collect::<Vec<_>>(),
+                        fs::read_to_string(gate.join("bash-causal-error")).unwrap_or_default(),
+                        fs::read_to_string(&err).unwrap_or_default(),
+                        fs::read_to_string(&broker_log).unwrap_or_default()
+                    );
                     let intent_dir = std::path::PathBuf::from(
                         fs::read_to_string(gate.join("h-source-intent-dir")).unwrap(),
                     );
@@ -5131,6 +5147,11 @@ fn inner() {
                     assert_eq!(accepted["owner_generation"], delegation.owner_generation);
                     assert_eq!(accepted["initiator"]["pid"], child.actor.host_pid);
                     assert_eq!(accepted["registration"]["kind"], "root");
+                    assert_eq!(accepted["delegated_root_h"]["work_id"], accepted["work_id"]);
+                    assert_eq!(
+                        accepted["delegated_root_h"]["witness"]["delegated_root_h_request_id"],
+                        child.request_id
+                    );
                     lane.require_consumed_root_h_delegation(
                         &root,
                         &actor,
@@ -5178,50 +5199,37 @@ fn inner() {
                         )
                         .is_err()
                     );
-                    assert_eq!(
-                        fs::read_to_string(gate.join("delegated-h-broker-stage")).unwrap(),
-                        "ticket-consumed"
-                    );
-                    assert_eq!(
-                        fs::read_to_string(gate.join("delegated-h-guardian-stage")).unwrap(),
-                        "ticket-accepted"
-                    );
-                    eventually(|| gate.join("bash-causal-terminal-status").exists());
-                    assert_eq!(
-                        fs::read(gate.join("bash-causal-terminal-status")).unwrap(),
-                        b"70"
-                    );
-                    assert!(
-                        fs::read_to_string(gate.join("bash-causal-error"))
+                    eventually(|| {
+                        fs::read_dir(broker_state.join("grants"))
                             .unwrap()
-                            .contains("original H acceptance uncertain; no replay")
-                    );
-                    assert!(
-                        fs::read_to_string(intent_dir.join("root-work-diagnostic-v1.jsonl"))
-                            .unwrap()
-                            .contains("source is outside exact root namespace")
-                    );
-                    let state =
-                        rusqlite::Connection::open(broker_state.join("v30/state.db")).unwrap();
-                    assert_eq!(
-                        state
-                            .query_row(
-                                "SELECT count(*) FROM fresh_lane_accepted_source",
-                                [],
-                                |row| row.get::<_, i64>(0)
-                            )
-                            .unwrap(),
-                        0
-                    );
-                    assert!(!gate.join("bash-effect").exists());
-                    assert!(!gate.join("source-ready").exists());
-                    stop(&mut broker);
-                    return;
+                            .flatten()
+                            .any(|entry| {
+                                fs::read(entry.path())
+                                    .ok()
+                                    .and_then(|bytes| {
+                                        serde_json::from_slice::<serde_json::Value>(&bytes).ok()
+                                    })
+                                    .is_some_and(|grant| grant["work_id"] == accepted["work_id"])
+                            })
+                    });
                 }
                 let report: serde_json::Value = serde_json::from_slice(
                     &fs::read(gate.join("bash-causal-output")).unwrap(),
                 )
                 .unwrap_or_else(|error| {
+                    if root_h_delegate {
+                        let state_dir = std::path::PathBuf::from(fs::read_to_string(gate.join("h-source-intent-dir")).unwrap_or_default());
+                        for entry in fs::read_dir(&state_dir).ok().into_iter().flatten().flatten() {
+                            if entry.file_name().to_string_lossy().ends_with(".stderr") || entry.file_name().to_string_lossy().ends_with(".stdout") {
+                                eprintln!("delegated H helper {}: {}", entry.path().display(), fs::read_to_string(entry.path()).unwrap_or_default());
+                            }
+                        }
+                        eprintln!("delegated H worker meta={} rc={} grant={} files={:?}",
+                            fs::read_to_string(state_dir.join("meta.json")).unwrap_or_default(),
+                            fs::read_to_string(state_dir.join("rc")).unwrap_or_default(),
+                            fs::read_to_string(state_dir.join("root-work-broker-grant-v1.json")).unwrap_or_default(),
+                            fs::read_dir(&state_dir).ok().into_iter().flatten().filter_map(Result::ok).map(|e| e.file_name()).collect::<Vec<_>>());
+                    }
                     let output = fs::read(gate.join("bash-causal-output")).unwrap_or_default();
                     let prefix = if output.starts_with(b"{") { "json-object" } else { "other-or-empty" };
                     panic!(
@@ -5645,6 +5653,119 @@ fn inner() {
                 assert_eq!(report["no_new_privs"], 0);
                 assert_eq!(report["seccomp"], 0);
                 assert_eq!(fs::read(gate.join("bash-effect")).unwrap(), b"ran\n");
+                if root_h_delegate && !root_h_lost {
+                    let original = rusqlite::Connection::open_with_flags(
+                        data.join("state.db"),
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                    )
+                    .unwrap();
+                    let decisions: i64 = original
+                        .query_row(
+                            "SELECT count(*) FROM invocation_completion_exact_source_decisions",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(decisions, 1, "delegated original Bash W absent");
+                    let registrations: i64 = original
+                        .query_row(
+                            "SELECT count(*) FROM invocation_completion_v2_identity",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(registrations, 1, "original W registration absent");
+                    let h_state = std::path::PathBuf::from(
+                        fs::read_to_string(gate.join("h-source-intent-dir")).unwrap(),
+                    );
+                    let w_replies = fs::read_dir(&h_state)
+                        .unwrap()
+                        .filter_map(Result::ok)
+                        .filter(|entry| {
+                            let name = entry.file_name();
+                            let name = name.to_string_lossy();
+                            name.starts_with("continuation-register-") && name.ends_with(".stdout")
+                        })
+                        .filter_map(|entry| fs::read(entry.path()).ok())
+                        .filter_map(|bytes| {
+                            serde_json::from_slice::<serde_json::Value>(&bytes).ok()
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(w_replies.len(), 1, "original Bash W helper reply absent");
+                    assert_eq!(w_replies[0]["status"], "registered");
+                    assert_eq!(w_replies[0]["registration_committed"], true);
+                    let h_grant: serde_json::Value = serde_json::from_slice(
+                        &fs::read(h_state.join("root-work-broker-grant-v1.json")).unwrap(),
+                    )
+                    .unwrap();
+                    let durable_grant: serde_json::Value = serde_json::from_slice(
+                        &fs::read(
+                            broker_state
+                                .join("grants")
+                                .join(format!("{}.json", h_grant["grant_id"].as_str().unwrap())),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        durable_grant["consumed"], true,
+                        "original H grant did not launch Q"
+                    );
+                    assert_eq!(
+                        durable_grant["delegated_root_h"]["proof"]["work_id"],
+                        h_grant["work_id"]
+                    );
+                    let q_records = fs::read_dir(broker_state.join("works"))
+                        .unwrap()
+                        .filter_map(Result::ok)
+                        .filter_map(|entry| fs::read(entry.path()).ok())
+                        .filter_map(|bytes| {
+                            serde_json::from_slice::<serde_json::Value>(&bytes).ok()
+                        })
+                        .filter(|work| work["accepted_grant_id"] == h_grant["grant_id"])
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        q_records.len(),
+                        1,
+                        "original H did not launch one physical Q"
+                    );
+                    assert_eq!(q_records[0]["work_id"], h_grant["work_id"]);
+                    assert!(
+                        q_records[0]["init_host_pid"]
+                            .as_i64()
+                            .is_some_and(|pid| pid > 0)
+                    );
+                    assert_eq!(fs::read(h_state.join("rc")).unwrap(), b"0\n");
+                    let original_session = FreshV30Lane::open_at(&broker_state)
+                        .unwrap()
+                        .read_session(&root.d_key)
+                        .unwrap()
+                        .unwrap();
+                    let original_sidecar = rusqlite::Connection::open_with_flags(
+                        broker_state.join("sidecar/pid-identity.db"),
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                    )
+                    .unwrap();
+                    let rows: i64 = original_sidecar
+                        .query_row(
+                            "SELECT count(*) FROM mailbox WHERE session_id=?1",
+                            [&original_session.session_id],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(rows, 0, "response-only original W invented a listener row");
+                    let release = BrokerSidecar::open_existing(
+                        &broker_state.join("sidecar/pid-identity.db"),
+                        &broker_state,
+                    )
+                    .unwrap()
+                    .read_exact_release(&generation, &prepared.root_id, &prepared.owner_generation)
+                    .unwrap();
+                    assert_eq!(
+                        release, root.old_release,
+                        "original D/J release readback changed"
+                    );
+                }
                 let fresh = rusqlite::Connection::open_with_flags(
                     broker_state.join("v30/state.db"),
                     rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -5971,6 +6092,16 @@ fn inner() {
                             .unwrap();
                         assert_eq!(generation_count, 0);
                     }
+                }
+                if root_h_delegate && !root_h_lost {
+                    // Original W and Q have completed. The parent selected-K
+                    // fixture deliberately remains an unresolved root result;
+                    // it is outside this delegated H/W/Q admission assertion.
+                    fs::write(gate.join("provider-cancel"), b"yes").unwrap();
+                    stop(&mut entry);
+                    stop(&mut broker);
+                    unsafe { libc::kill(prepared.root_init.host_pid, libc::SIGKILL) };
+                    return;
                 }
                 fs::write(gate.join("provider-cancel"), b"yes").unwrap();
                 let until = Instant::now() + Duration::from_secs(20);

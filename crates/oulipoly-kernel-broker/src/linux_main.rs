@@ -48,7 +48,9 @@ mod v2_wake;
 #[path = "work_launch.rs"]
 mod work_launch;
 use base64::Engine as _;
-use oulipoly_kernel_broker::accepted_grant::GrantRegistry;
+#[cfg(feature = "age319-private-broker-fixture")]
+use oulipoly_kernel_broker::accepted_grant::DelegatedRootHGrant;
+use oulipoly_kernel_broker::accepted_grant::{Acceptance, GrantRegistry};
 use oulipoly_kernel_broker::cutover_gate::EntryGate;
 use oulipoly_kernel_broker::entry_registry::{
     EntryRegistry, EntryTerminalSettlement, ProcessStamp,
@@ -62,13 +64,14 @@ use oulipoly_kernel_broker::native_receipt::{
     BoundNativeAuthority, verify as verify_native_receipt,
 };
 use oulipoly_kernel_broker::protocol::{
-    AcceptedWorkSpec, ExactSourceDecisionRequest, ExactSourceDecisionVerification,
-    ExactSourceIssuerKind, FreshChildRequest, FreshRecipientRequest, FreshRootEffectRequest,
-    JoinSpec, JoinedChildWitness, LaunchAcceptedWorkSpec, NativeKSpec, NativePrepareSpec,
-    OwnerDiscoveryReadback, OwnerDiscoveryRequest, OwnerPidBinding, OwnerWitness,
-    PostcommitHChallenge, PostcommitHReadback, ProcessWitness, SourceControlUse, SourceScope,
-    SourceSocketWitness, SourceTicketUse, SourceWitnessProbe, StateGenerationSpec, StateReadSpec,
-    StateWriteAction, StateWriteSpec,
+    AcceptedWorkSpec, DelegatedRootHProof, ExactSourceDecisionRequest,
+    ExactSourceDecisionVerification, ExactSourceIssuerKind, FreshChildRequest,
+    FreshRecipientRequest, FreshRootEffectRequest, JoinSpec, JoinedChildWitness,
+    LaunchAcceptedWorkSpec, NativeKSpec, NativePrepareSpec, OwnerDiscoveryReadback,
+    OwnerDiscoveryRequest, OwnerPidBinding, OwnerWitness, PostcommitHChallenge,
+    PostcommitHReadback, ProcessWitness, SourceControlUse, SourceScope, SourceSocketWitness,
+    SourceTicketUse, SourceWitnessProbe, StateGenerationSpec, StateReadSpec, StateWriteAction,
+    StateWriteSpec,
 };
 use oulipoly_kernel_broker::registry::{RootRecord, RootRegistry};
 use oulipoly_kernel_broker::root_drain;
@@ -1133,7 +1136,7 @@ fn verify_delegated_root_h_source(
     peer: &PeerIdentity,
     root_id: &str,
     request_id: &str,
-) -> io::Result<String> {
+) -> io::Result<(String, oulipoly_state::mailbox::FreshRootHDelegation)> {
     if !private_fixture() {
         return Err(io::Error::other("delegated root H is private only"));
     }
@@ -1170,7 +1173,8 @@ fn verify_delegated_root_h_source(
             "delegated root H child actor or K changed",
         ));
     }
-    lane.require_consumed_root_h_delegation(&root, &root_actor, &child, &selected)
+    let delegation = lane
+        .require_consumed_root_h_delegation(&root, &root_actor, &child, &selected)
         .map_err(io::Error::other)?;
     peer.process.verify()?;
     if let Some(gate) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1") {
@@ -1179,7 +1183,67 @@ fn verify_delegated_root_h_source(
             b"source-verified",
         );
     }
-    Ok(parent.work_id().to_owned())
+    Ok((parent.work_id().to_owned(), delegation))
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn verify_delegated_root_h_grant(
+    proof: &DelegatedRootHProof,
+    receipt: &Acceptance,
+    spec: &AcceptedWorkSpec,
+    consumed: &BTreeMap<String, DelegatedRootHProof>,
+    state_root: &Path,
+) -> io::Result<DelegatedRootHGrant> {
+    if !private_fixture()
+        || consumed.get(&proof.ticket_id) != Some(proof)
+        || receipt.delegated_root_h.as_ref() != Some(proof)
+        || proof.work_id != spec.work_id
+        || proof.witness.root_id != spec.root_id
+        || proof.witness.supervisor_id != receipt.supervisor_authority_id
+        || !matches!(proof.witness.scope, SourceScope::Root)
+        || receipt.initiator.pid != i64::from(proof.witness.source.host_pid)
+        || receipt.initiator.boot_id != proof.witness.source.boot_id
+        || receipt.initiator.starttime_ticks
+            != i64::try_from(proof.witness.source.starttime_ticks)
+                .map_err(|_| io::Error::other("delegated H source starttime overflow"))?
+    {
+        return Err(io::Error::other("delegated H ticket or acceptance changed"));
+    }
+    let source = PinnedProcess::open(proof.witness.source.host_pid)?;
+    if !witness_matches(&proof.witness.source, &source)? {
+        return Err(io::Error::other("delegated H source incarnation changed"));
+    }
+    let peer = PeerIdentity {
+        uid: host_proc_uid(source.host_pid)?,
+        gid: 0,
+        process: source,
+    };
+    let (work_id, delegation) = verify_delegated_root_h_source(
+        state_root,
+        &peer,
+        &spec.root_id,
+        proof
+            .witness
+            .delegated_root_h_request_id
+            .as_deref()
+            .ok_or_else(|| io::Error::other("delegated H child selector absent"))?,
+    )?;
+    if work_id != delegation.selected_k.work_id
+        || delegation.root_id != spec.root_id
+        || delegation.owner_generation != spec.owner_generation
+        || delegation.child_actor.host_pid != peer.process.host_pid
+        || delegation.child_actor.boot_id != peer.process.boot_id
+        || delegation.child_actor.starttime_ticks != peer.process.starttime_ticks
+        || delegation.root_endpoint.is_empty()
+    {
+        return Err(io::Error::other(
+            "delegated H selected K or original owner changed",
+        ));
+    }
+    Ok(DelegatedRootHGrant {
+        proof: proof.clone(),
+        selected_k: delegation.selected_k,
+    })
 }
 
 #[expect(
@@ -2361,9 +2425,17 @@ fn exact_consumed_h_worker(
         i32::try_from(grant.initiator.pid)
             .map_err(|_| io::Error::other("consumed H initiator PID invalid"))?,
     )?;
+    let initiator_namespace_matches = if let Some(binding) = &grant.delegated_root_h {
+        // The accepted source was the selected K-owned Bash child. Its
+        // namespace was proved against the consumed K at H preparation and
+        // is carried by the immutable, one-use grant across Q admission.
+        witness_matches(&binding.proof.witness.source, &initiator)?
+    } else {
+        initiator.in_namespace(root.init.namespace())?
+    };
     if grant.initiator.boot_id != initiator.boot_id
         || u64::try_from(grant.initiator.starttime_ticks).ok() != Some(initiator.starttime_ticks)
-        || !initiator.in_namespace(root.init.namespace())?
+        || !initiator_namespace_matches
     {
         return Err(io::Error::other("consumed H initiator incarnation changed"));
     }
@@ -2496,7 +2568,8 @@ fn exact_consumed_h_worker(
             return Err(io::Error::other("consumed H selected environment invalid"));
         }
     }
-    let actual = fs::read(format!("/proc/{}/environ", worker.host_pid))?;
+    let mut actual = Vec::new();
+    host_proc_file(&format!("{}/environ", worker.host_pid))?.read_to_end(&mut actual)?;
     let actual_count = actual
         .split(|b| *b == 0)
         .filter(|entry| !entry.is_empty())
@@ -2506,7 +2579,8 @@ fn exact_consumed_h_worker(
         .filter(|entry| !entry.is_empty())
         .map(|entry| entry.to_vec())
         .collect();
-    let worker_status = fs::read_to_string(format!("/proc/{}/status", worker.host_pid))?;
+    let mut worker_status = String::new();
+    host_proc_file(&format!("{}/status", worker.host_pid))?.read_to_string(&mut worker_status)?;
     let worker_gid = worker_status
         .lines()
         .find_map(|line| {
@@ -2515,8 +2589,12 @@ fn exact_consumed_h_worker(
                 .and_then(|gid| gid.parse::<u32>().ok())
         })
         .ok_or_else(|| io::Error::other("consumed H worker physical GID absent"))?;
-    if actual != expected
-        || actual_count != expected.len()
+    // Delegated H restores the selected environment in the Q worker after
+    // exec. procfs environ retains the exec-time block, so it cannot attest
+    // that restoration. The sealed intent and helper environment bytes above
+    // carry the immutable selection; the exact worker/work/grant checks carry
+    // its physical identity. Keep the legacy procfs check for ordinary H.
+    if (grant.delegated_root_h.is_none() && (actual != expected || actual_count != expected.len()))
         || host_proc_uid(worker.host_pid)? != grant.owner_uid
         || worker_gid != peer.gid
         || host_proc_uid(work.init.host_pid)? != 0
@@ -2525,7 +2603,7 @@ fn exact_consumed_h_worker(
             "consumed H selected physical environment/account changed",
         ));
     }
-    if cfg!(feature = "age319-private-broker-fixture") {
+    if cfg!(feature = "age319-private-broker-fixture") && grant.delegated_root_h.is_none() {
         let selected_account =
             format!("AGE319_SELECTED_ACCOUNT={}:{}", grant.owner_uid, worker_gid);
         if !actual.contains(selected_account.as_bytes()) {
@@ -2945,7 +3023,8 @@ fn verify_source_socket(
                 peer,
                 &root_id,
                 witness.delegated_root_h_request_id.as_deref().unwrap(),
-            )?;
+            )?
+            .0;
             delegated_proof_work_id = Some(work_id.clone());
             Scope::Work {
                 root_id,
@@ -2983,12 +3062,15 @@ fn verify_source_socket(
         ) if root_id == witness.root_id && witness.delegated_root_h_request_id.is_some() => {
             let proved_work_id = match delegated_proof_work_id {
                 Some(id) => id,
-                None => verify_delegated_root_h_source(
-                    state_root,
-                    peer,
-                    &root_id,
-                    witness.delegated_root_h_request_id.as_deref().unwrap(),
-                )?,
+                None => {
+                    verify_delegated_root_h_source(
+                        state_root,
+                        peer,
+                        &root_id,
+                        witness.delegated_root_h_request_id.as_deref().unwrap(),
+                    )?
+                    .0
+                }
             };
             if proved_work_id != work_id {
                 return Err(io::Error::other("delegated root H work scope changed"));
@@ -3203,6 +3285,7 @@ fn consume_source_ticket(
     entries: &EntryRegistry,
     grants: &GrantRegistry,
     tickets: &mut BTreeMap<String, SourceTicket>,
+    consumed_delegated: &mut BTreeMap<String, DelegatedRootHProof>,
     state_root: &Path,
 ) -> io::Result<String> {
     let ticket = tickets
@@ -3300,6 +3383,7 @@ fn consume_source_ticket(
     };
     #[cfg(feature = "age319-private-broker-fixture")]
     let delegated = ticket.witness.delegated_root_h_request_id.is_some();
+    let witness = ticket.witness.clone();
     verify_source_socket(
         ticket.witness,
         ticket.source_socket,
@@ -3314,13 +3398,38 @@ fn consume_source_ticket(
     )?;
     #[cfg(feature = "age319-private-broker-fixture")]
     if private_fixture() && delegated {
+        let SourceControlUse::WorkRoot { work_id, .. } = &spec.request else {
+            return Err(io::Error::other("delegated H ticket is not a root work H"));
+        };
+        let request_id = witness.delegated_root_h_request_id.as_ref().unwrap();
+        if consumed_delegated
+            .values()
+            .any(|proof| proof.witness.delegated_root_h_request_id.as_ref() == Some(request_id))
+        {
+            return Err(io::Error::other(
+                "delegated H ticket already consumed for child",
+            ));
+        }
+        let proof = DelegatedRootHProof {
+            ticket_id: spec.ticket,
+            work_id: work_id.clone(),
+            witness,
+        };
+        consumed_delegated.insert(proof.ticket_id.clone(), proof.clone());
         if let Some(gate) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1") {
             let _ = fs::write(
                 Path::new(&gate).join("delegated-h-broker-stage"),
                 b"ticket-consumed",
             );
         }
+        guardian_peer.process.verify()?;
+        return Ok(format!(
+            "verified-control {root_id} {}\n",
+            serde_json::to_string(&proof)?
+        ));
     }
+    #[cfg(not(feature = "age319-private-broker-fixture"))]
+    let _ = (consumed_delegated, witness);
     guardian_peer.process.verify()?;
     Ok(format!("verified-control {root_id}\n"))
 }
@@ -4391,6 +4500,7 @@ fn serve() -> io::Result<()> {
     // Ephemeral by design: a broker restart invalidates every pre-wire source
     // decision. No work/cancel action can be authorized by a lost ticket.
     let mut source_tickets = BTreeMap::<String, SourceTicket>::new();
+    let mut consumed_delegated_h_tickets = BTreeMap::<String, DelegatedRootHProof>::new();
     // Only this serving incarnation owns the pre-exec gate. A restart opens
     // durable J/prepared debt but cannot recreate or release a lost gate.
     let mut held_joins = BTreeMap::<String, root_join::HeldRootJoin>::new();
@@ -4851,6 +4961,7 @@ fn serve() -> io::Result<()> {
                     &entries,
                     &grants,
                     &mut source_tickets,
+                    &mut consumed_delegated_h_tickets,
                     Path::new(&state),
                 )
             } else if operation == b'B' {
@@ -4873,6 +4984,32 @@ fn serve() -> io::Result<()> {
                     return Err(io::Error::other("exact root admission fenced"));
                 }
                 let [executable, intent, cwd, state_dir, accepted] = descriptors;
+                let receipt: Acceptance = serde_json::from_slice(
+                    &oulipoly_kernel_broker::accepted_grant::read_bounded(&accepted)?,
+                )?;
+                let delegated_root_h = match receipt.delegated_root_h.as_ref() {
+                    Some(proof) => {
+                        #[cfg(feature = "age319-private-broker-fixture")]
+                        {
+                            if !witness_matches(&proof.witness.guardian, &peer.process)?
+                                || proof.witness.domain_id != entries.record(&spec.root_id)
+                                    .and_then(|entry| entry.domain_id.as_ref()).map(String::as_str).unwrap_or("")
+                            {
+                                return Err(io::Error::other("delegated H guardian or domain changed"));
+                            }
+                            Some(verify_delegated_root_h_grant(
+                                proof, &receipt, &spec, &consumed_delegated_h_tickets,
+                                Path::new(&state),
+                            )?)
+                        }
+                        #[cfg(not(feature = "age319-private-broker-fixture"))]
+                        {
+                            let _ = proof;
+                            return Err(io::Error::other("delegated H grant is private only"));
+                        }
+                    }
+                    None => None,
+                };
                 let grant = grants.prepare(
                     &registry,
                     &entries,
@@ -4890,6 +5027,7 @@ fn serve() -> io::Result<()> {
                     &spec.request_sha256,
                     &spec.accepted_sha256,
                     &spec.owner_generation,
+                    delegated_root_h,
                 )?;
                 Ok(format!("prepared-work {}\n", grant.grant_id))
             } else if operation == b'N' {
