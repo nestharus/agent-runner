@@ -64,6 +64,15 @@ fn restart_source_broker(
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", runner)
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", gate)
         .stderr(Stdio::from(File::create(log).unwrap()));
+    if gate.join("v2-wake-enabled").exists() {
+        command.env("OULIPOLY_KERNEL_BROKER_FIXTURE_V2_WAKE_V1", "1");
+    }
+    if gate.join("v2-wake-lost").exists() {
+        command.env("OULIPOLY_KERNEL_BROKER_FIXTURE_V2_WAKE_DROP_ACK_V1", "1");
+    }
+    if gate.join("v2-wake-unknown").exists() {
+        command.env("OULIPOLY_KERNEL_BROKER_FIXTURE_V2_WAKE_DROP_WRITE_V1", "1");
+    }
     if let Ok(offset) = fs::read_to_string(gate.join("source-clock-offset")) {
         command.env(
             "OULIPOLY_KERNEL_BROKER_FIXTURE_SOURCE_CLOCK_OFFSET_SECONDS_V1",
@@ -204,6 +213,9 @@ fn assert_postcommit_source_physical_after_owner(
     gate: &Path,
     bash: &str,
     completed_v2: bool,
+    wake: bool,
+    wake_lost: bool,
+    wake_unknown: bool,
 ) {
     // J, guardian and driver have exited. Reopen only the Broker's
     // retained one-use physical record after a Broker restart.
@@ -851,7 +863,7 @@ fn assert_postcommit_source_physical_after_owner(
                 .is_none(),
             "a different session saw the original recipient row"
         );
-        let copied_db = broker_state.join("recipient-copy.db");
+        let copied_db = gate.join("recipient-copy.db");
         fs::copy(broker_state.join("sidecar/pid-identity.db"), &copied_db).unwrap();
         assert!(
             BrokerSidecar::open_existing(&copied_db, broker_state).is_err(),
@@ -984,7 +996,7 @@ fn assert_postcommit_source_physical_after_owner(
         assert!(!local_release.exists());
     }
     if completed_v2 {
-        let custody = recipient_custody.unwrap();
+        let custody = recipient_custody.clone().unwrap();
         assert_eq!(
             oulipoly_kernel_broker::source_acceptance::read_v2_recipient_custody(
                 &mut retained,
@@ -1245,6 +1257,185 @@ fn assert_postcommit_source_physical_after_owner(
             .unwrap(),
         SourceObservation::Drained { .. }
     ));
+    if wake {
+        let original_payload = retained
+            .mailbox()
+            .completion_recovery_payload(registration["handle"].as_str().unwrap())
+            .unwrap()
+            .unwrap();
+        let custody = recipient_custody.unwrap();
+        let binding = oulipoly_state::mailbox::BrokerV2RecipientBinding {
+            source_grant_id: custody.source_grant_id.clone(),
+            source_id: custody.source_id.clone(),
+            registration_id: custody.registration_id.clone(),
+            source_generation: custody.source_generation.clone(),
+            root_id: custody.root_id.clone(),
+            owner_generation: custody.owner_generation.clone(),
+            listener_id: custody.listener_id.clone(),
+            session_id: custody.session_id.clone(),
+            owner_invocation_uuid: custody.owner_invocation_uuid.clone(),
+            row_seq: custody.row_seq,
+            payload_sha256: custody.payload_sha256.clone(),
+            payload_byte_len: custody.payload_byte_len,
+        };
+        let root_stamp = serde_json::to_string(&record.root_init).unwrap();
+        let historical_child_stamp = serde_json::to_string(&record.joined_child).unwrap();
+        for mutated in [
+            oulipoly_state::mailbox::BrokerV2RecipientBinding {
+                root_id: uuid::Uuid::new_v4().to_string(),
+                ..binding.clone()
+            },
+            oulipoly_state::mailbox::BrokerV2RecipientBinding {
+                session_id: uuid::Uuid::new_v4().to_string(),
+                ..binding.clone()
+            },
+            oulipoly_state::mailbox::BrokerV2RecipientBinding {
+                source_generation: uuid::Uuid::new_v4().to_string(),
+                ..binding.clone()
+            },
+        ] {
+            assert!(
+                retained
+                    .reserve_v2_recipient_grant(&mutated, &root_stamp, &historical_child_stamp)
+                    .is_err(),
+                "wrong source, root or session reserved a grant"
+            );
+        }
+        assert!(retained.read_v2_recipient_grant(id).unwrap().is_none());
+        fs::write(gate.join("v2-wake-activate"), b"activate").unwrap();
+        let until = Instant::now() + Duration::from_secs(20);
+        loop {
+            let read = retained.read_v2_recipient_grant(id);
+            if read.as_ref().is_ok_and(|g| {
+                g.as_ref().is_some_and(|g| {
+                    g.phase
+                        == if wake_unknown {
+                            "unknown"
+                        } else if wake_lost {
+                            "submitted"
+                        } else {
+                            "acked"
+                        }
+                })
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < until,
+                "v2 wake did not settle: grant={read:?} broker={}",
+                fs::read_to_string(
+                    broker_state
+                        .parent()
+                        .unwrap()
+                        .join("real-h-w-q-post-owner-restart.log")
+                )
+                .unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let grant = retained.read_v2_recipient_grant(id).unwrap().unwrap();
+        assert_eq!(grant.binding, binding);
+        assert_eq!(
+            grant.phase,
+            if wake_unknown {
+                "unknown"
+            } else if wake_lost {
+                "submitted"
+            } else {
+                "acked"
+            }
+        );
+        assert_eq!(
+            grant.ack_response_sha256.is_some(),
+            !wake_lost && !wake_unknown
+        );
+        assert_eq!(
+            retained.v2_recipient_payload(&grant).unwrap(),
+            original_payload
+        );
+        let actor: oulipoly_kernel_broker::entry_registry::ProcessStamp =
+            serde_json::from_str(&grant.recipient_identity).unwrap();
+        let root: oulipoly_kernel_broker::entry_registry::ProcessStamp =
+            serde_json::from_str(&grant.root_init_identity).unwrap();
+        assert_eq!(root, record.root_init);
+        assert_eq!(
+            (actor.pidns_dev, actor.pidns_ino),
+            (root.pidns_dev, root.pidns_ino)
+        );
+        assert_ne!(actor.host_pid, record.joined_child.host_pid);
+        assert!(retained.begin_v2_recipient_send(&grant).is_err());
+        assert!(
+            retained
+                .mark_v2_recipient_submitted(id, "wrong-process")
+                .is_err()
+        );
+        assert!(
+            retained
+                .acknowledge_v2_recipient(
+                    id,
+                    "wrong-process",
+                    &grant.delivery_token,
+                    &"0".repeat(64)
+                )
+                .is_err()
+        );
+        if wake_lost || wake_unknown {
+            let mut stale: oulipoly_kernel_broker::entry_registry::ProcessStamp =
+                serde_json::from_str(&grant.recipient_identity).unwrap();
+            stale.starttime_ticks += 1;
+            assert!(
+                retained
+                    .acknowledge_v2_recipient(
+                        id,
+                        &serde_json::to_string(&stale).unwrap(),
+                        &grant.delivery_token,
+                        &"0".repeat(64)
+                    )
+                    .is_err(),
+                "stale incarnation ACKed a submitted grant"
+            );
+        }
+        if !wake_lost && !wake_unknown {
+            assert!(
+                retained
+                    .acknowledge_v2_recipient(
+                        id,
+                        &grant.recipient_identity,
+                        &grant.delivery_token,
+                        &"0".repeat(64)
+                    )
+                    .is_err(),
+                "duplicate ACK changed exact settlement"
+            );
+        }
+        let counts: (i64, i64, i64) = rusqlite::Connection::open_with_flags(
+            broker_state.join("sidecar/pid-identity.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap()
+        .query_row(
+            "SELECT (SELECT count(*) FROM broker_v2_recipient_grant),
+                    (SELECT count(*) FROM mailbox WHERE seq=?1 AND delivered_at IS NOT NULL),
+                    (SELECT count(*) FROM completion_event_listener
+                     WHERE mailbox_seq=?1 AND acknowledged_at IS NOT NULL
+                       AND acknowledgement_reason='explicit_v2_wake_ack')",
+            [custody.row_seq],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+        assert_eq!(
+            counts,
+            if wake_lost || wake_unknown {
+                (1, 0, 0)
+            } else {
+                (1, 1, 1)
+            }
+        );
+        assert_eq!(
+            retained.read_v2_recipient_grant(id).unwrap().unwrap(),
+            grant
+        );
+    }
 }
 
 fn terminate_postcommit_original_owner(broker_state: &Path) {
@@ -1374,7 +1565,12 @@ fn inner() {
         "native_cancel" | "native_drain" | "native_receipt_cancel" | "native_receipt_drain"
     );
     let release_mode = mode.starts_with("held_release") || native_mode;
-    let completed_v2_source = mode == "normal_handoff_pre_k_h_source_postcommit_w_v2";
+    let wake_lost = mode == "normal_handoff_pre_k_h_source_postcommit_w_v2_wake_lost";
+    let wake_unknown = mode == "normal_handoff_pre_k_h_source_postcommit_w_v2_wake_unknown";
+    let wake_v2_source =
+        mode == "normal_handoff_pre_k_h_source_postcommit_w_v2_wake" || wake_lost || wake_unknown;
+    let completed_v2_source =
+        mode == "normal_handoff_pre_k_h_source_postcommit_w_v2" || wake_v2_source;
     let postcommit_source =
         mode == "normal_handoff_pre_k_h_source_postcommit_w" || completed_v2_source;
     let production_source =
@@ -1398,6 +1594,9 @@ fn inner() {
                 | "normal_handoff_pre_k_h_source_registration_cli"
                 | "normal_handoff_pre_k_h_source_postcommit_w"
                 | "normal_handoff_pre_k_h_source_postcommit_w_v2"
+                | "normal_handoff_pre_k_h_source_postcommit_w_v2_wake"
+                | "normal_handoff_pre_k_h_source_postcommit_w_v2_wake_lost"
+                | "normal_handoff_pre_k_h_source_postcommit_w_v2_wake_unknown"
                 | "normal_handoff_fsync"
                 | "normal_handoff_effect_reply_loss"
                 | "normal_help"
@@ -1435,6 +1634,15 @@ fn inner() {
     fs::set_permissions(&gate, fs::Permissions::from_mode(0o700)).unwrap();
     if completed_v2_source {
         fs::write(gate.join("source-v2-workload"), b"selected").unwrap();
+        if wake_v2_source {
+            fs::write(gate.join("v2-wake-enabled"), b"enabled").unwrap();
+            if wake_lost {
+                fs::write(gate.join("v2-wake-lost"), b"lost").unwrap();
+            }
+            if wake_unknown {
+                fs::write(gate.join("v2-wake-unknown"), b"unknown").unwrap();
+            }
+        }
     }
     if let Some((invocation, session, capability)) = &source_witness {
         fs::write(
@@ -3807,13 +4015,49 @@ fn inner() {
                             &gate,
                             bash.as_ref().unwrap(),
                             completed_v2_source,
+                            wake_v2_source,
+                            wake_lost,
+                            wake_unknown,
                         );
                     });
                     stop(&mut restarted);
-                    unsafe { libc::kill(prepared.root_init.host_pid, libc::SIGKILL) };
                     if let Err(panic) = observed {
+                        unsafe { libc::kill(prepared.root_init.host_pid, libc::SIGKILL) };
                         std::panic::resume_unwind(panic);
                     }
+                    if wake_v2_source {
+                        let physical =
+                            SourcePhysicalRegistry::open(broker_state.join("source-physical"))
+                                .unwrap();
+                        let id = &physical.records()[0].grant.grant_id;
+                        let before = BrokerSidecar::open_existing(
+                            &broker_state.join("sidecar/pid-identity.db"),
+                            &broker_state,
+                        )
+                        .unwrap()
+                        .read_v2_recipient_grant(id)
+                        .unwrap()
+                        .unwrap();
+                        let mut second = restart_source_broker(
+                            &socket,
+                            &broker_state,
+                            &runner,
+                            &gate,
+                            &temp.path().join("real-h-w-q-recipient-restart.log"),
+                        );
+                        std::thread::sleep(Duration::from_millis(400));
+                        let after = BrokerSidecar::open_existing(
+                            &broker_state.join("sidecar/pid-identity.db"),
+                            &broker_state,
+                        )
+                        .unwrap()
+                        .read_v2_recipient_grant(id)
+                        .unwrap()
+                        .unwrap();
+                        assert_eq!(after, before, "restart regranted or resent v2 row");
+                        stop(&mut second);
+                    }
+                    unsafe { libc::kill(prepared.root_init.host_pid, libc::SIGKILL) };
                 } else {
                     stop(&mut broker);
                     unsafe { libc::kill(prepared.root_init.host_pid, libc::SIGKILL) };
@@ -13419,6 +13663,9 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_handoff_pre_k_h_source_registration_cli",
         "normal_handoff_pre_k_h_source_postcommit_w",
         "normal_handoff_pre_k_h_source_postcommit_w_v2",
+        "normal_handoff_pre_k_h_source_postcommit_w_v2_wake",
+        "normal_handoff_pre_k_h_source_postcommit_w_v2_wake_lost",
+        "normal_handoff_pre_k_h_source_postcommit_w_v2_wake_unknown",
         "normal_handoff_fsync",
         "normal_handoff_effect_reply_loss",
         "normal_help",
@@ -13626,7 +13873,11 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
             continue;
         }
         let mut command = Command::new("unshare");
-        if mode == "normal_handoff_pre_k_h_source_postcommit_w_v2" {
+        if mode == "normal_handoff_pre_k_h_source_postcommit_w_v2"
+            || mode == "normal_handoff_pre_k_h_source_postcommit_w_v2_wake"
+            || mode == "normal_handoff_pre_k_h_source_postcommit_w_v2_wake_lost"
+            || mode == "normal_handoff_pre_k_h_source_postcommit_w_v2_wake_unknown"
+        {
             command.args([
                 "-Upfm",
                 "--map-root-user",

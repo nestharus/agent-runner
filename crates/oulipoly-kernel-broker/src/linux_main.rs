@@ -42,6 +42,9 @@ mod root_join;
 mod source_decision_journal;
 #[path = "source_launch.rs"]
 mod source_launch;
+#[cfg(feature = "age319-private-broker-fixture")]
+#[path = "v2_wake.rs"]
+mod v2_wake;
 #[path = "work_launch.rs"]
 mod work_launch;
 use base64::Engine as _;
@@ -3909,7 +3912,13 @@ fn capture_terminal_sources(
                                     // relationship exact at the serving
                                     // boundary. This is not recipient grant,
                                     // submission or ACK authority.
-                                    read_v2_recipient_custody(sidecar, physical, &grant.grant_id)?;
+                                    if sidecar.read_v2_recipient_grant(&grant.grant_id)?.is_none() {
+                                        read_v2_recipient_custody(
+                                            sidecar,
+                                            physical,
+                                            &grant.grant_id,
+                                        )?;
+                                    }
                                     deliver_v2_source_retention_release(
                                         sidecar,
                                         physical,
@@ -4200,6 +4209,8 @@ fn serve() -> io::Result<()> {
     let mut grants = GrantRegistry::open(&grants_path)?;
     let broker_incarnation = uuid::Uuid::new_v4().to_string();
     let mut settled_native_q = HashSet::new();
+    #[cfg(feature = "age319-private-broker-fixture")]
+    let mut attempted_v2_wakes = HashSet::<String>::new();
     // Ephemeral by design: a broker restart invalidates every pre-wire source
     // decision. No work/cancel action can be authorized by a lost ticket.
     let mut source_tickets = BTreeMap::<String, SourceTicket>::new();
@@ -4302,6 +4313,31 @@ fn serve() -> io::Result<()> {
                         &source_physical,
                         &mut pending_source_evidence,
                     );
+                    #[cfg(feature = "age319-private-broker-fixture")]
+                    if fixture
+                        && std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_V2_WAKE_V1").is_some()
+                        && std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                            .is_some_and(|dir| Path::new(&dir).join("v2-wake-activate").exists())
+                    {
+                        for record in source_physical.records() {
+                            if sidecar
+                                .read_source_evidence(&record.grant)
+                                .is_ok_and(|row| row.is_some_and(|row| row.phase == "accepted"))
+                                && attempted_v2_wakes.insert(record.grant.grant_id.clone())
+                                && let Err(error) = v2_wake::activate(
+                                    sidecar,
+                                    &source_physical,
+                                    &registry,
+                                    &record.grant.grant_id,
+                                )
+                            {
+                                eprintln!(
+                                    "v2 recipient wake debt {}: {error}",
+                                    record.grant.grant_id
+                                );
+                            }
+                        }
+                    }
                     native_work::reconcile_after_restart(
                         &grants,
                         &works,
@@ -7771,6 +7807,19 @@ fn serve_fresh_v30_at(
 pub fn run() {
     let args: Vec<_> = std::env::args_os().collect();
     let result = match args.as_slice() {
+        #[cfg(feature = "age319-private-broker-fixture")]
+        [_, mode, namespace_fd, socket_fd] if mode == "--age319-v2-wake-launcher" => {
+            if !private_fixture() {
+                Err(io::Error::other("private v2 wake launcher unavailable"))
+            } else {
+                let namespace_fd = namespace_fd.to_string_lossy().parse::<i32>();
+                let socket_fd = socket_fd.to_string_lossy().parse::<i32>();
+                match (namespace_fd, socket_fd) {
+                    (Ok(namespace_fd), Ok(socket_fd)) => v2_wake::launcher(namespace_fd, socket_fd),
+                    _ => Err(io::Error::other("invalid v2 wake inherited descriptors")),
+                }
+            }
+        }
         [_] => serve(),
         [_, mode] if mode == "--initialize-fresh-v30" => {
             FreshV30Lane::initialize_at(Path::new(STATE))
