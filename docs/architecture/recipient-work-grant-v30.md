@@ -97,18 +97,26 @@ fixture proves noncontiguous batch ACK, but there is no pagination or
 aggregate delegation flow for an arbitrarily large backlog. This remains a
 mass-ACK usability gate; the bound must not be presented as unlimited ACK.
 
-There is **no production writer** for `fresh_lane_accepted_source`,
-`fresh_lane_recipient_attachment`, `fresh_recipient_source`,
-`fresh_recipient_row_source`, or the recipient process binding. The private
-executable fixture inserts synthetic accepted rows and tests the real broker
-socket and storage transitions. Consequently
-ordinary v30 entry cannot submit a positive recipient delivery on this
-branch. The binding record also does not yet prove that a live PTY/provider or
-headless wake successor belongs to the pinned root tree. The broker's native
-K handler remains closed; v30 has no pinned provider K or broker-owned PTY or
-headless wake transport route. A socket write proves submission to that
-connected process only, never provider consumption or ACK. Source acceptance,
-physical K/Q, Runner result and recipient ACK remain separate facts.
+The private fresh Bash route can write those source, attachment and row
+records after its exact D/W admission and original root actor request. The
+older socket fixture also exercises synthetic records. Neither route attaches
+the separate completed-v2 H/W/Q source to a live recipient. Ordinary v30 entry
+still cannot submit positive recipient delivery: the binding record does not
+prove that a live PTY/provider or headless wake successor belongs to the pinned
+root tree. The broker's native K handler remains closed; v30 has no pinned
+provider K or broker-owned PTY or headless wake transport route. A socket write
+proves submission to that connected process only, never provider consumption
+or ACK. Source acceptance, physical K/Q, Runner result and recipient ACK remain
+separate facts.
+
+For the completed-v2 H/W/Q route, the Broker now revalidates the original
+source, physical Q, accepted seal, triggered event, original listener and
+retained payload bytes, then reads back their exact source-grant/listener/row
+identity. This readback is repeatable after Broker restart and cannot mint a
+recipient grant. The paired original owner has exited, and its session and
+invocation UUID do not name a live recipient incarnation or an admitted wake
+successor. Recipient grant, transport submission and token ACK remain closed
+on that route.
 
 Legacy `mailbox_delivery` and `wake_coordinator` act on the user sidecar and
 cannot consume this protocol. Existing v29 recipient/session/ACK continue on

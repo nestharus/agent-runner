@@ -743,6 +743,111 @@ pub fn trigger_v2_completion_source(
     Ok(result)
 }
 
+/// The exact source-to-recipient-row boundary for a completed v2 source.
+/// This is a Broker readback, not a process attachment, work grant, socket
+/// submission, or ACK. In particular, the original listener's session and
+/// invocation UUID are not a live recipient process identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct V2RecipientCustody {
+    pub source_grant_id: String,
+    pub source_id: String,
+    pub registration_id: String,
+    pub source_generation: String,
+    pub root_id: String,
+    pub owner_generation: String,
+    pub listener_id: String,
+    pub session_id: String,
+    pub owner_invocation_uuid: String,
+    pub row_seq: i64,
+    pub payload_sha256: String,
+    pub payload_byte_len: i64,
+}
+
+pub fn read_v2_recipient_custody(
+    sidecar: &mut BrokerSidecar,
+    physical: &SourcePhysicalRegistry,
+    id: &str,
+) -> Result<V2RecipientCustody, String> {
+    // Revalidate the original files, physical Q, immutable Broker acceptance,
+    // stable selected output, and State trigger even on a restart readback.
+    let publication = trigger_v2_completion_source(sidecar, physical, id)?;
+    let (grant, receipt) = accepted_source_receipt(sidecar, physical, id)?;
+    let binding = sidecar.read_consumed_source_candidate(&grant)?;
+    let source = binding.registration()?;
+    let expected = &grant.candidate.listener;
+    let listener = publication
+        .listeners
+        .iter()
+        .find(|listener| listener.listener_id == expected.listener_id)
+        .ok_or("original accepted listener absent from triggered event")?;
+    if publication.event.state != "triggered"
+        || source.source_id.is_empty()
+        || source.registration_id != receipt.registration_id
+        || source.owner_session_id != expected.session_id
+        || source.owner_invocation_uuid != expected.owner_invocation_uuid
+        || listener.event_id != source.handle
+        || listener.session_id != expected.session_id
+        || listener.owner_invocation_uuid != expected.owner_invocation_uuid
+        || !listener.active
+        || listener.acknowledged_at.is_some()
+    {
+        return Err("original recipient listener binding changed".into());
+    }
+    let seq = listener
+        .mailbox_seq
+        .ok_or("original listener has no materialized recipient row")?;
+    let row = publication
+        .mailbox_rows
+        .iter()
+        .find(|row| row.seq == seq)
+        .ok_or("original recipient row absent from triggered event")?;
+    let sha = publication
+        .event
+        .payload_sha256
+        .as_deref()
+        .ok_or("triggered event has no retained payload digest")?;
+    let len = publication
+        .event
+        .payload_byte_len
+        .ok_or("triggered event has no retained payload length")?;
+    if row.session_id != listener.session_id
+        || row.kind != "agent_bash_complete"
+        || row.owner_invocation_uuid.as_deref() != Some(listener.owner_invocation_uuid.as_str())
+        || row.payload_sha256.as_deref() != Some(sha)
+        || row.payload_byte_len != Some(len)
+        || row.payload_file_path != publication.event.payload_file_path
+        || row.delivered_at.is_some()
+        || row.payload_retention_policy.as_deref() != Some("until_terminal_disposition")
+    {
+        return Err("original recipient row or payload identity changed".into());
+    }
+    sidecar
+        .mailbox()
+        .payloads()
+        .verify_mailbox_row_payload(row)?;
+    let payload = sidecar
+        .mailbox()
+        .completion_recovery_payload(&source.handle)?
+        .ok_or("accepted completion payload absent")?;
+    if payload.len() as i64 != len || sha256(&payload) != sha {
+        return Err("recipient row bytes differ from accepted completion".into());
+    }
+    Ok(V2RecipientCustody {
+        source_grant_id: grant.grant_id,
+        source_id: source.source_id,
+        registration_id: source.registration_id,
+        source_generation: grant.source_generation,
+        root_id: grant.root_id,
+        owner_generation: grant.owner_generation,
+        listener_id: listener.listener_id.clone(),
+        session_id: listener.session_id.clone(),
+        owner_invocation_uuid: listener.owner_invocation_uuid.clone(),
+        row_seq: seq,
+        payload_sha256: sha.into(),
+        payload_byte_len: len,
+    })
+}
+
 const BASH_RELEASE_RECEIPT: &str = "broker-source-retention-release-v1.json";
 
 /// Publish a root-owned receipt at the original source handle. The retained

@@ -72,6 +72,7 @@ use oulipoly_kernel_broker::root_drain;
 use oulipoly_kernel_broker::source_acceptance::{
     accept_v2_completion_source, capture_and_stage_v2_evidence, commit_v2_evidence,
     decide_v2_source_retention_release, deliver_v2_source_retention_release,
+    read_v2_recipient_custody,
 };
 use oulipoly_kernel_broker::source_physical::{SourceObservation, SourcePhysicalRegistry};
 use oulipoly_kernel_broker::work_registry::{Scope, WorkRegistry, classify_scope};
@@ -3904,6 +3905,11 @@ fn capture_terminal_sources(
                                         physical,
                                         &grant.grant_id,
                                     )?;
+                                    // Keep the original source/listener/row
+                                    // relationship exact at the serving
+                                    // boundary. This is not recipient grant,
+                                    // submission or ACK authority.
+                                    read_v2_recipient_custody(sidecar, physical, &grant.grant_id)?;
                                     deliver_v2_source_retention_release(
                                         sidecar,
                                         physical,
