@@ -4260,6 +4260,23 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
             serde_json::to_vec(&read).map_err(|e| e.to_string())?,
         )
         .map_err(|e| e.to_string())?;
+        if std::env::var_os("AGE319_PRIVATE_ROOT_DRAIN_V1").is_some() {
+            let inventory = protocol::fresh_root_drain_at(&socket, &read.d_key)
+                .map_err(|e| format!("private root drain fence failed: {e}"))?;
+            let repeated = protocol::fresh_root_drain_at(&socket, &read.d_key)
+                .map_err(|e| format!("private root drain readback failed: {e}"))?;
+            if repeated["root_id"] != inventory["root_id"] || repeated["fenced"] != true {
+                return Err("private root drain duplicate changed identity or fence".into());
+            }
+            if protocol::fresh_root_drain_at(&socket, &uuid::Uuid::new_v4().to_string()).is_ok() {
+                return Err("private root drain accepted a wrong D".into());
+            }
+            std::fs::write(
+                std::path::Path::new(&gate).join("root-drain-terminal.json"),
+                serde_json::to_vec(&inventory).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+        }
         if std::env::var_os("AGE319_PRIVATE_CALLER_OUTPUT_V1").is_some() {
             let raw = backend
                 .raw_result

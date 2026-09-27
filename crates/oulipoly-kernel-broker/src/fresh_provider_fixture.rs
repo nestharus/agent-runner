@@ -84,9 +84,21 @@ fn causal_bash(args: &[String], hold_survivor: bool, hold_start: bool) -> std::i
             }
             if survivor == 0 {
                 unsafe {
-                    libc::signal(libc::SIGTERM, libc::SIG_IGN);
-                    loop {
-                        libc::pause();
+                    if gate.join("terminal-drain-mode").exists() {
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(120);
+                        while !gate.join("terminal-drain-release").exists() {
+                            if std::time::Instant::now() >= deadline {
+                                libc::_exit(74);
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                        }
+                        libc::_exit(0);
+                    } else {
+                        libc::signal(libc::SIGTERM, libc::SIG_IGN);
+                        loop {
+                            libc::pause();
+                        }
                     }
                 }
             }
