@@ -97,26 +97,26 @@ fixture proves noncontiguous batch ACK, but there is no pagination or
 aggregate delegation flow for an arbitrarily large backlog. This remains a
 mass-ACK usability gate; the bound must not be presented as unlimited ACK.
 
-The private fresh Bash route can write those source, attachment and row
-records after its exact D/W admission and original root actor request. The
-older socket fixture also exercises synthetic records. Neither route attaches
-the separate completed-v2 H/W/Q source to a live recipient. Ordinary v30 entry
-still cannot submit positive recipient delivery: the binding record does not
-prove that a live PTY/provider or headless wake successor belongs to the pinned
-root tree. The broker's native K handler remains closed; v30 has no pinned
-provider K or broker-owned PTY or headless wake transport route. A socket write
-proves submission to that connected process only, never provider consumption
-or ACK. Source acceptance, physical K/Q, Runner result and recipient ACK remain
-separate facts.
+The private fresh Bash route can write its own source, attachment and row
+records after exact D/W admission. The separate completed-v2 H/W/Q route now
+has a **private fixture-only** Broker wake path. It revalidates physical Q,
+accepted source, original listener and retained payload, pins the original
+root PID1, and launches a separate wake process into that PID namespace over
+an inherited Broker-only socket. Kernel sender credentials and a live process
+stamp establish the wake incarnation. The old sidecar's
+`broker_v2_recipient_grant` binds that incarnation and the exact row/payload
+before send. A send attempt becomes durable `unknown` before any write;
+a complete socket write records `submitted` only. The wake's explicit
+response must carry the grant token and a digest of the bytes it read. The
+Broker checks the same sender incarnation and atomically records ACK with the
+mailbox row and listener. Restart readback of any grant phase never resends.
 
-For the completed-v2 H/W/Q route, the Broker now revalidates the original
-source, physical Q, accepted seal, triggered event, original listener and
-retained payload bytes, then reads back their exact source-grant/listener/row
-identity. This readback is repeatable after Broker restart and cannot mint a
-recipient grant. The paired original owner has exited, and its session and
-invocation UUID do not name a live recipient incarnation or an admitted wake
-successor. Recipient grant, transport submission and token ACK remain closed
-on that route.
+This path uses a Broker-image test wake, not a provider-native session or
+normal product recipient. It proves real process socket submission and
+explicit wake ACK for the completed-v2 Bash-byte source, while provider-native
+input receipt, pinned provider K, normal root close and caller result remain
+open. The product selector stays closed. The separate private F fixture still
+has no authority over this completed-v2 source.
 
 Legacy `mailbox_delivery` and `wake_coordinator` act on the user sidecar and
 cannot consume this protocol. Existing v29 recipient/session/ACK continue on
