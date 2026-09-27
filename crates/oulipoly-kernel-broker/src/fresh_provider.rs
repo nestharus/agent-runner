@@ -33,7 +33,7 @@ use oulipoly_runtime::executor::cli::fresh_remote::FreshTerminalRecognizer;
 use oulipoly_runtime::executor::terminal_signal::TerminalSignalKind;
 use oulipoly_state::mailbox::{
     FreshBashChild, FreshBashSourceEvent, FreshNormalWorkPreparation, FreshReleasedHandoff,
-    FreshRootTerminalReadback, FreshRootWorkIntent,
+    FreshRootHSelectedK, FreshRootTerminalReadback, FreshRootWorkIntent,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -6805,6 +6805,89 @@ pub(super) fn parent_for_bash(
             pidns_ino: init.pidns_ino,
         },
         init,
+    })
+}
+
+/// Reopen the original selected route, consumed K and live provider process
+/// before allowing its Bash child to receive original root H authority.
+pub(super) fn selected_root_h_k(
+    directory: &Path,
+    release: &FreshReleasedHandoff,
+    parent: &ParentWork,
+) -> io::Result<FreshRootHSelectedK> {
+    let grant = root_parent_grant(directory, &release.handoff_id)?;
+    let decision: RouteDecision = exact_file(directory, &decision_name(&release.handoff_id))?
+        .ok_or_else(|| io::Error::other("root H selected route absent"))?;
+    let candidate: RouteCandidate = exact_file(
+        directory,
+        &candidate_name(&release.handoff_id, decision.selection.index),
+    )?
+    .ok_or_else(|| io::Error::other("root H selected candidate absent"))?;
+    let consumed: Grant = exact_file(directory, &format!("{}.consumed.json", grant.id))?
+        .ok_or_else(|| io::Error::other("root H selected K unconsumed"))?;
+    let attach: Attach = exact_file(directory, &format!("{}.attach.json", grant.id))?
+        .ok_or_else(|| io::Error::other("root H selected work attach absent"))?;
+    let provider_live = match PinnedProcess::open(attach.provider_pid) {
+        Ok(provider) => Some(provider),
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ESRCH) | Some(libc::ENOENT)) => {
+            None
+        }
+        Err(error) => return Err(error),
+    };
+    let provider_exited = if provider_live.is_none() {
+        let exit: ProviderExit = exact_file(directory, &format!("{}.exit.json", grant.id))?
+            .ok_or_else(|| io::Error::other("root H provider exit evidence absent"))?;
+        exit.grant_id == grant.id
+            && exit.work_id == attach.work_id
+            && exit.provider_local_pid == attach.provider_local_pid
+            && observed_incarnation_gone(
+                attach.provider_pid,
+                &grant.binding.actor_boot_id,
+                attach.provider_starttime,
+                (attach.pidns_dev, attach.pidns_ino),
+            )?
+    } else {
+        false
+    };
+    if decision.version != 1
+        || decision.binding != grant.binding
+        || candidate.version != 3
+        || candidate.binding != grant.binding
+        || candidate.role != FreshPlanRole::Headless
+        || candidate.model != decision.selection.model
+        || candidate.account != decision.selection.account
+        || candidate.account_identity != decision.selection.account_identity
+        || candidate.config_sha256 != decision.selection.config_sha256
+        || candidate.plan_sha256 != decision.selection.plan_sha256
+        || grant.plan_sha256 != decision.selection.plan_sha256
+        || consumed != grant
+        || grant.id != parent.grant_id()
+        || attach.grant_id != grant.id
+        || attach.work_id != parent.work_id()
+        || !provider_exited
+            && provider_live.as_ref().is_none_or(|provider| {
+                provider.host_pid != attach.provider_pid
+                    || provider.starttime_ticks != attach.provider_starttime
+                    || provider.boot_id != grant.binding.actor_boot_id
+                    || !provider.direct_child_of(&parent.init).unwrap_or(false)
+            })
+    {
+        return Err(io::Error::other(
+            "root H selected K, plan or provider changed",
+        ));
+    }
+    if let Some(provider) = provider_live {
+        provider.verify()?;
+    }
+    Ok(FreshRootHSelectedK {
+        grant_id: grant.id,
+        work_id: attach.work_id,
+        plan_sha256: decision.selection.plan_sha256,
+        account: decision.selection.account,
+        model: decision.selection.model,
+        provider_pid: attach.provider_pid,
+        provider_starttime: attach.provider_starttime,
+        provider_boot_id: grant.binding.actor_boot_id,
     })
 }
 

@@ -32,6 +32,8 @@ const FRESH_BASH_SOURCE_SCHEMA: &str = include_str!("migrations/0035_fresh_bash_
 const FRESH_BASH_NOTIFY_SCHEMA: &str = include_str!("migrations/0036_fresh_bash_notify.sql");
 const FRESH_BASH_LISTENER_SCHEMA: &str = include_str!("migrations/0037_fresh_bash_listener.sql");
 const FRESH_ROOT_TERMINAL_SCHEMA: &str = include_str!("migrations/0038_fresh_root_terminal.sql");
+const FRESH_ROOT_H_DELEGATION_SCHEMA: &str =
+    include_str!("migrations/0044_fresh_root_h_delegation.sql");
 const FRESH_BASH_SYNC_PUBLICATION_SCHEMA: &str =
     include_str!("migrations/0040_fresh_bash_sync_publication.sql");
 const FRESH_NORMAL_WORK_SCHEMA: &str = include_str!("migrations/0034_fresh_normal_work.sql");
@@ -194,6 +196,33 @@ pub struct FreshReleasedHandoff {
     pub old_release: super::BrokerReleaseEvidence,
     pub fresh_lane: FreshV30LaneIdentity,
     pub registration_authority: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegated_h_listener_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegated_root_work_authority: Option<String>,
+}
+
+fn valid_delegated_root_work_authority(receipt: &FreshReleasedHandoff, raw: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return false;
+    };
+    let prepared = &receipt.old_release.prepared;
+    let capability = value["capability"].as_str().unwrap_or("");
+    value["protocol"] == "root-authority-v1"
+        && value["control_protocol"] == "source-control-v2"
+        && value["root_id"] == prepared.root_id
+        && value["domain_id"] == prepared.domain_id
+        && value["supervisor_authority_id"] == prepared.supervisor_authority_id
+        && value["root_identity"]["pid"] == prepared.entry.host_pid
+        && value["root_identity"]["boot_id"] == prepared.entry.boot_id
+        && value["root_identity"]["starttime_ticks"] == prepared.entry.starttime_ticks
+        && value["guardian_identity"]["pid"] == prepared.guardian.host_pid
+        && value["guardian_identity"]["boot_id"] == prepared.guardian.boot_id
+        && value["guardian_identity"]["starttime_ticks"] == prepared.guardian.starttime_ticks
+        && capability.len() == 64
+        && capability
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -435,7 +464,7 @@ impl FreshV30Lane {
         let state_conn = Connection::open(&state_path).map_err(|e| e.to_string())?;
         state_conn
             .execute_batch(&format!(
-                "{FRESH_STATE_SCHEMA}\n{FRESH_RECIPIENT_STATE_SCHEMA}\n{FRESH_CHILD_REQUEST_SCHEMA}\n{FRESH_HANDOFF_SCHEMA}\n{FRESH_ROOT_EFFECT_SCHEMA}\n{FRESH_BASH_CHILD_SCHEMA}\n{FRESH_BASH_SOURCE_SCHEMA}\n{FRESH_BASH_NOTIFY_SCHEMA}\n{FRESH_ROOT_TERMINAL_SCHEMA}\n{FRESH_BASH_SYNC_PUBLICATION_SCHEMA}"
+                "{FRESH_STATE_SCHEMA}\n{FRESH_RECIPIENT_STATE_SCHEMA}\n{FRESH_CHILD_REQUEST_SCHEMA}\n{FRESH_HANDOFF_SCHEMA}\n{FRESH_ROOT_EFFECT_SCHEMA}\n{FRESH_BASH_CHILD_SCHEMA}\n{FRESH_ROOT_H_DELEGATION_SCHEMA}\n{FRESH_BASH_SOURCE_SCHEMA}\n{FRESH_BASH_NOTIFY_SCHEMA}\n{FRESH_ROOT_TERMINAL_SCHEMA}\n{FRESH_BASH_SYNC_PUBLICATION_SCHEMA}"
             ))
             .map_err(|e| e.to_string())?;
         state_conn
@@ -888,6 +917,31 @@ impl FreshV30Lane {
             return Err("fresh Bash child schema is incomplete".into());
         }
         verify_fresh_bash_child_schema(&state_conn)?;
+        let delegation_objects: i64 = state_conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name IN
+             ('fresh_root_h_delegation','fresh_root_h_delegation_no_update','fresh_root_h_delegation_no_delete',
+              'fresh_root_h_consumption','fresh_root_h_consumption_no_update','fresh_root_h_consumption_no_delete')",
+            [], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        match delegation_objects {
+            0 => state_conn
+                .execute_batch(FRESH_ROOT_H_DELEGATION_SCHEMA)
+                .map_err(|e| e.to_string())?,
+            6 => {}
+            _ => return Err("fresh root H delegation schema incomplete".into()),
+        }
+        verify_fresh_sql_objects(
+            &state_conn,
+            FRESH_ROOT_H_DELEGATION_SCHEMA,
+            "fresh_root_h_delegation",
+            &[
+                "fresh_root_h_delegation_no_update",
+                "fresh_root_h_delegation_no_delete",
+                "fresh_root_h_consumption",
+                "fresh_root_h_consumption_no_update",
+                "fresh_root_h_consumption_no_delete",
+            ],
+        )?;
         match fresh_bash_source_schema_count(&state_conn)? {
             0 => state_conn
                 .execute_batch(FRESH_BASH_SOURCE_SCHEMA)
@@ -1082,6 +1136,19 @@ impl FreshV30Lane {
                 receipt.registration_authority.clone(),
             )
             .is_err()
+            || receipt
+                .delegated_h_listener_policy
+                .as_deref()
+                .is_some_and(|policy| {
+                    policy != "response_only"
+                        || !matches!(receipt.root_work_intent, FreshRootWorkIntent::NormalCli(_))
+                })
+            || receipt.delegated_h_listener_policy.is_some()
+                != receipt.delegated_root_work_authority.is_some()
+            || receipt
+                .delegated_root_work_authority
+                .as_deref()
+                .is_some_and(|authority| !valid_delegated_root_work_authority(receipt, authority))
         {
             return Err("fresh released handoff identity conflict".into());
         }

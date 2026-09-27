@@ -1644,6 +1644,18 @@ fn inner() {
             }
         }
     }
+    let root_h_delegate = matches!(
+        mode.as_str(),
+        "normal_model_provider_bash_causal_root_h_delegate"
+            | "normal_model_provider_bash_causal_root_h_lost"
+    );
+    let root_h_lost = mode == "normal_model_provider_bash_causal_root_h_lost";
+    if root_h_delegate {
+        fs::write(gate.join("selected-k-root-h"), b"intent").unwrap();
+        if root_h_lost {
+            fs::write(gate.join("selected-k-root-h-lost"), b"lost").unwrap();
+        }
+    }
     if let Some((invocation, session, capability)) = &source_witness {
         fs::write(
             gate.join("source-witness-request"),
@@ -2203,9 +2215,11 @@ fn inner() {
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
         .envs(native_lost_reply.map(|stage| ("AGE319_PRIVATE_NATIVE_F_DROP_REPLY_V1", stage)))
         .envs(
-            (mode == "normal_model_provider_bash_causal_success")
+            (mode == "normal_model_provider_bash_causal_success" || root_h_delegate)
                 .then_some(("AGE319_PRIVATE_BASH_SOURCE_SUCCESS_V1", "1")),
         )
+        .envs(root_h_delegate.then_some(("AGE319_PRIVATE_SELECTED_K_ROOT_H_V1", "1")))
+        .envs(root_h_lost.then_some(("AGE319_PRIVATE_DROP_ROOT_H_REPLY_V1", "1")))
         .envs(
             (mode == "normal_model_provider_bash_causal_w_debt"
                 || mode == "normal_model_provider_bash_causal_notify_w_debt"
@@ -2577,6 +2591,8 @@ fn inner() {
                         "normal_model_provider"
                             | "normal_model_provider_bash_causal"
                             | "normal_model_provider_bash_causal_success"
+                            | "normal_model_provider_bash_causal_root_h_delegate"
+                            | "normal_model_provider_bash_causal_root_h_lost"
                             | "normal_model_provider_bash_causal_notify_ack"
                             | "normal_model_provider_bash_causal_notify_prepare_unavailable"
                             | "normal_model_provider_bash_causal_notify_lost_pending"
@@ -2687,7 +2703,7 @@ fn inner() {
                     .then_some(("AGE319_PRIVATE_BASH_ORIGINAL_NOTIFY_V1", "1")),
             )
             .envs(
-                (mode == "normal_model_provider_bash_causal_success")
+                (mode == "normal_model_provider_bash_causal_success" || root_h_delegate)
                     .then_some(("AGE319_PRIVATE_BASH_SOURCE_SUCCESS_V1", "1")),
             )
             .envs(
@@ -4952,7 +4968,7 @@ fn inner() {
                 return;
             }
             if mode.starts_with("normal_model_provider_bash_causal") {
-                let success_source = mode.ends_with("_success");
+                let success_source = mode.ends_with("_success") || root_h_delegate;
                 fs::write(gate.join("child-effect"), b"yes").unwrap();
                 if mode.ends_with("_w_debt") {
                     eventually(|| {
@@ -5121,6 +5137,55 @@ fn inner() {
                 );
                 let child: oulipoly_state::mailbox::FreshBashChild =
                     serde_json::from_value(report["child"].clone()).unwrap();
+                if root_h_delegate {
+                    let lane = FreshV30Lane::open_at(&broker_state).unwrap();
+                    let delegation: oulipoly_state::mailbox::FreshRootHDelegation = if root_h_lost {
+                        assert!(report["root_h_consumption"].is_null());
+                        let (root, _) = lane.released_handoff_for_root(&child.root_id).unwrap();
+                        lane.read_root_h_delegation(&root.handoff_id)
+                            .unwrap()
+                            .unwrap()
+                    } else {
+                        serde_json::from_value(report["root_h_consumption"].clone()).unwrap()
+                    };
+                    assert_eq!(delegation.child_request_id, child.request_id);
+                    assert_eq!(delegation.root_id, child.root_id);
+                    assert_eq!(
+                        delegation.root_invocation_uuid,
+                        child.parent_invocation_uuid
+                    );
+                    assert_eq!(delegation.selected_k.grant_id, child.parent_work_grant_id);
+                    assert_eq!(delegation.selected_k.work_id, child.parent_work_id);
+                    assert_eq!(
+                        lane.read_root_h_delegation(&delegation.handoff_id).unwrap(),
+                        Some(delegation)
+                    );
+                    let state =
+                        rusqlite::Connection::open(broker_state.join("v30/state.db")).unwrap();
+                    let (issued, consumed): (i64, i64) = (
+                        state
+                            .query_row("SELECT count(*) FROM fresh_root_h_delegation", [], |r| {
+                                r.get(0)
+                            })
+                            .unwrap(),
+                        state
+                            .query_row("SELECT count(*) FROM fresh_root_h_consumption", [], |r| {
+                                r.get(0)
+                            })
+                            .unwrap(),
+                    );
+                    assert_eq!((issued, consumed), (1, 1));
+                    assert_eq!(
+                        state
+                            .query_row(
+                                "SELECT count(*) FROM invocation_completion_v2_identity",
+                                [],
+                                |r| r.get::<_, i64>(0)
+                            )
+                            .unwrap(),
+                        0
+                    );
+                }
                 assert_eq!(
                     child.listener_policy,
                     if mode.contains("_notify_") {
@@ -5959,6 +6024,27 @@ fn inner() {
                     .unwrap();
                 eventually(|| protocol::request_at(&socket, Operation::Classify).is_ok());
                 let reopened = FreshV30Lane::open_at(&broker_state).unwrap();
+                if root_h_delegate {
+                    let delegated = reopened
+                        .read_root_h_delegation(&terminal_root.handoff_id)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(delegated.child_request_id, child.request_id);
+                    assert_eq!(delegated.selected_k.grant_id, parent_grant_id);
+                    let state =
+                        rusqlite::Connection::open(broker_state.join("v30/state.db")).unwrap();
+                    assert_eq!(
+                        state
+                            .query_row(
+                                "SELECT count(*) FROM fresh_root_h_consumption WHERE handoff_id=?1",
+                                [&terminal_root.handoff_id],
+                                |r| r.get::<_, i64>(0),
+                            )
+                            .unwrap(),
+                        1,
+                        "restart replayed or lost one-use H consumption"
+                    );
+                }
                 let replay = reopened
                     .read_private_root_terminal(&terminal_root, &terminal_actor, &terminal_session)
                     .unwrap();
@@ -13722,6 +13808,8 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_model_provider_pty_root_exit",
         "normal_model_provider_bash_causal",
         "normal_model_provider_bash_causal_success",
+        "normal_model_provider_bash_causal_root_h_delegate",
+        "normal_model_provider_bash_causal_root_h_lost",
         "normal_model_provider_bash_causal_w_debt",
         "normal_model_provider_bash_causal_notify_w_debt",
         "normal_model_provider_bash_causal_notify_ack",
