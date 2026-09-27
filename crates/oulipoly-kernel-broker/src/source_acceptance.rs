@@ -12,6 +12,7 @@ use oulipoly_state::mailbox::{
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
@@ -740,6 +741,257 @@ pub fn trigger_v2_completion_source(
         return Err("Broker completion source changed across trigger".into());
     }
     Ok(result)
+}
+
+const BASH_RELEASE_RECEIPT: &str = "broker-source-retention-release-v1.json";
+
+/// Publish a root-owned receipt at the original source handle. The retained
+/// sidecar is re-openable after W exits, and this call can be retried after a
+/// lost reply. A release decision alone cannot reach this boundary: the real
+/// source/event/listener transaction must already have committed.
+pub fn deliver_v2_source_retention_release(
+    sidecar: &mut BrokerSidecar,
+    physical: &SourcePhysicalRegistry,
+    id: &str,
+) -> Result<(), String> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Err("Broker release publication requires root".into());
+    }
+    let publication = trigger_v2_completion_source(sidecar, physical, id)?;
+    if publication.event.state != "triggered" || publication.mailbox_rows.is_empty() {
+        return Err("original State event/notification has not committed".into());
+    }
+    let (grant, acceptance) = accepted_source_receipt(sidecar, physical, id)?;
+    let (stored_acceptance, acceptance_sha256) = sidecar
+        .read_completion_source_acceptance(&grant)?
+        .ok_or("Broker source acceptance absent")?;
+    let (release, release_sha256) = sidecar
+        .read_source_retention_release(&grant)?
+        .ok_or("Broker source release decision absent")?;
+    if stored_acceptance != acceptance || release.acceptance_sha256 != acceptance_sha256 {
+        return Err("Broker release/acceptance link changed".into());
+    }
+    let binding = sidecar.read_consumed_source_candidate(&grant)?;
+    let source = binding.registration()?;
+    let manifest_bytes = physical
+        .read_witness(id, "evidence.json", MAX_MANIFEST)
+        .map_err(|e| e.to_string())?;
+    let manifest: Evidence = serde_json::from_slice(&manifest_bytes).map_err(|e| e.to_string())?;
+    if sha256(&manifest_bytes) != acceptance.evidence_seal.manifest_sha256
+        || manifest.grant != grant
+        || manifest.registration != binding.registration_bytes()
+    {
+        return Err("Broker release manifest changed".into());
+    }
+    let directory = Path::new(&source.handle_dir);
+    let dir = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(directory)
+        .map_err(|e| e.to_string())?;
+    let dir_meta = dir.metadata().map_err(|e| e.to_string())?;
+    if !dir_meta.is_dir()
+        || fs::canonicalize(directory).map_err(|e| e.to_string())? != directory
+        || dir_meta.uid() != sidecar.original_source_owner_uid()?
+        || dir_meta.uid()
+            != open_source_file(
+                directory,
+                &source.registration_relative,
+                MAX_REGISTRATION_BYTES,
+            )?
+            .metadata()
+            .map_err(|e| e.to_string())?
+            .uid()
+    {
+        return Err("original Bash handle directory changed".into());
+    }
+    let payload_sha256 = publication
+        .event
+        .payload_sha256
+        .as_deref()
+        .ok_or("committed State payload digest absent")?;
+    let payload_byte_len = publication
+        .event
+        .payload_byte_len
+        .ok_or("committed State payload length absent")?;
+    let payload_path = publication
+        .event
+        .payload_file_path
+        .as_deref()
+        .ok_or("committed State payload file absent")?;
+    let mut payload_file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(payload_path)
+        .map_err(|e| e.to_string())?;
+    let payload_meta = payload_file.metadata().map_err(|e| e.to_string())?;
+    if payload_byte_len < 0
+        || payload_byte_len as u64 > MAX_MANIFEST
+        || !payload_meta.is_file()
+        || payload_meta.uid() != 0
+        || payload_meta.nlink() != 1
+        || payload_meta.mode() & 0o077 != 0
+        || payload_meta.len() != payload_byte_len as u64
+    {
+        return Err("committed State payload identity changed".into());
+    }
+    let mut payload = Vec::new();
+    payload_file
+        .read_to_end(&mut payload)
+        .map_err(|e| e.to_string())?;
+    if payload.len() as i64 != payload_byte_len || sha256(&payload) != payload_sha256 {
+        return Err("committed State payload changed".into());
+    }
+    let payload_value: serde_json::Value =
+        serde_json::from_slice(&payload).map_err(|e| e.to_string())?;
+    let stable_output = &payload_value["output_artifact"];
+    if stable_output.is_null() != manifest.artifact_original.is_none()
+        || stable_output["sha256"] != acceptance.selected_output["sha256"]
+        || stable_output["byte_len"] != acceptance.selected_output["byte_len"]
+    {
+        return Err("stable selected output differs from original".into());
+    }
+    let acceptance_json = serde_json::to_string(&acceptance).map_err(|e| e.to_string())?;
+    let release_json = serde_json::to_string(&release).map_err(|e| e.to_string())?;
+    if sha256(acceptance_json.as_bytes()) != acceptance_sha256
+        || sha256(release_json.as_bytes()) != release_sha256
+    {
+        return Err("Broker release readback JSON changed".into());
+    }
+    let receipt = serde_json::json!({
+        "protocol": "broker-bash-source-release-v1",
+        "registration_id": source.registration_id,
+        "registration_digest": binding.registration_digest(),
+        "handle": source.handle,
+        "event_id": publication.event.event_id,
+        "listener_revision": source.listener_revision,
+        "notification_count": publication.mailbox_rows.len(),
+        "source_generation": grant.source_generation,
+        "root_id": grant.root_id,
+        "owner_generation": grant.owner_generation,
+        "grant_id": grant.grant_id,
+        "source_directory": {"device":dir_meta.dev(), "inode":dir_meta.ino(), "owner_uid":dir_meta.uid()},
+        "registration_file": manifest.registration_file,
+        "snapshot_file": manifest.snapshot_file,
+        "outcome_file": manifest.outcome_file,
+        "artifact_original": manifest.artifact_original,
+        "selected_output": acceptance.selected_output,
+        "stable_output": stable_output,
+        "manifest_sha256": acceptance.evidence_seal.manifest_sha256,
+        "payload_sha256": payload_sha256,
+        "payload_byte_len": payload_byte_len,
+        "payload_json": std::str::from_utf8(&payload).map_err(|e| e.to_string())?,
+        "acceptance_json": acceptance_json,
+        "acceptance_sha256": acceptance_sha256,
+        "release_json": release_json,
+        "release_sha256": release_sha256,
+    });
+    let mut bytes = serde_json::to_vec(&receipt).map_err(|e| e.to_string())?;
+    bytes.push(b'\n');
+    publish_root_receipt(&dir, directory, &bytes)?;
+    if read_captured_v2_evidence(sidecar, physical, id)?
+        .manifest
+        .sha256
+        != acceptance.evidence_seal.manifest_sha256
+    {
+        return Err("original source changed across release publication".into());
+    }
+    Ok(())
+}
+
+fn publish_root_receipt(dir: &File, path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::ffi::CString;
+    let final_name = CString::new(BASH_RELEASE_RECEIPT).unwrap();
+    let verify = || -> Result<bool, String> {
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                final_name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            )
+        };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return Ok(false);
+            }
+            return Err(error.to_string());
+        }
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        let before = file.metadata().map_err(|e| e.to_string())?;
+        if !before.is_file()
+            || before.uid() != 0
+            || before.nlink() != 1
+            || before.mode() & 0o222 != 0
+            || before.len() != bytes.len() as u64
+        {
+            return Err(
+                "existing Broker release receipt is not root-owned immutable material".into(),
+            );
+        }
+        let mut actual = Vec::new();
+        file.read_to_end(&mut actual).map_err(|e| e.to_string())?;
+        if actual != bytes {
+            return Err("existing Broker release receipt conflicts".into());
+        }
+        Ok(true)
+    };
+    if verify()? {
+        return Ok(());
+    }
+    let temp = CString::new(format!(".broker-release-{}", uuid::Uuid::new_v4())).unwrap();
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            temp.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o444,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    let result = (|| -> Result<(), String> {
+        file.write_all(bytes).map_err(|e| e.to_string())?;
+        if unsafe { libc::fchmod(file.as_raw_fd(), 0o444) } != 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        file.sync_all().map_err(|e| e.to_string())?;
+        let meta = file.metadata().map_err(|e| e.to_string())?;
+        if meta.uid() != 0 || meta.mode() & 0o222 != 0 {
+            return Err("Broker release temporary file ownership changed".into());
+        }
+        let renamed = unsafe {
+            libc::renameat2(
+                dir.as_raw_fd(),
+                temp.as_ptr(),
+                dir.as_raw_fd(),
+                final_name.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if renamed != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(error.to_string());
+            }
+        }
+        dir.sync_all().map_err(|e| e.to_string())?;
+        if fs::symlink_metadata(path).map_err(|e| e.to_string())?.ino()
+            != dir.metadata().map_err(|e| e.to_string())?.ino()
+        {
+            return Err("original Bash handle path changed during release".into());
+        }
+        if !verify()? {
+            return Err("Broker release receipt publication absent".into());
+        }
+        Ok(())
+    })();
+    unsafe {
+        libc::unlinkat(dir.as_raw_fd(), temp.as_ptr(), 0);
+    }
+    result
 }
 
 #[cfg(all(test, target_os = "linux"))]

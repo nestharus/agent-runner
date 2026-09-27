@@ -39,6 +39,17 @@ fn stop(child: &mut Child) {
     let _ = child.wait();
 }
 
+fn bash_retention_check(bash: &str, registration: &str) -> String {
+    let output = Command::new(bash)
+        .args(["__age319-private-source-retention-check-v1", registration])
+        .output()
+        .unwrap();
+    if !output.status.success() {
+        return "error".into();
+    }
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
 fn restart_source_broker(
     socket: &Path,
     broker_state: &Path,
@@ -753,8 +764,120 @@ fn assert_postcommit_source_physical_after_owner(
         if completed_v2 { (1, 1, 0) } else { (0, 0, 0) },
         "source trigger and notification custody differ from accepted source"
     );
+    let source_dir = Path::new(registration_path.trim()).parent().unwrap();
+    let broker_receipt = source_dir.join("broker-source-retention-release-v1.json");
+    let local_release = source_dir.join("source-retention-release-v1.json");
     if completed_v2 {
-        let source_dir = Path::new(registration_path.trim()).parent().unwrap();
+        eventually(|| broker_receipt.exists());
+        assert!(
+            !local_release.exists(),
+            "Broker publication is not a Bash local release"
+        );
+        let mut reopened = BrokerSidecar::open_existing(
+            &broker_state.join("sidecar/pid-identity.db"),
+            broker_state,
+        )
+        .unwrap();
+        oulipoly_kernel_broker::source_acceptance::deliver_v2_source_retention_release(
+            &mut reopened,
+            &physical,
+            id,
+        )
+        .unwrap();
+        assert_eq!(
+            bash_retention_check(bash, registration_path.trim()),
+            "released"
+        );
+        assert!(local_release.exists());
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&fs::read(&broker_receipt).unwrap()).unwrap();
+        let local: serde_json::Value =
+            serde_json::from_slice(&fs::read(&local_release).unwrap()).unwrap();
+        assert_eq!(
+            local["broker_receipt_sha256"],
+            format!("{:x}", Sha256::digest(fs::read(&broker_receipt).unwrap()))
+        );
+        assert_eq!(local["acceptance_sha256"], receipt["acceptance_sha256"]);
+        assert_eq!(local["release_sha256"], receipt["release_sha256"]);
+        let original_receipt = fs::read(&broker_receipt).unwrap();
+        fs::write(&broker_receipt, b"changed root receipt").unwrap();
+        assert_ne!(
+            bash_retention_check(bash, registration_path.trim()),
+            "released"
+        );
+        fs::write(&broker_receipt, &original_receipt).unwrap();
+        for (field, changed) in [
+            ("source_generation", serde_json::json!("wrong-generation")),
+            ("owner_generation", serde_json::json!("wrong-owner")),
+            ("root_id", serde_json::json!("wrong-root")),
+            (
+                "stable_output",
+                serde_json::json!({"sha256":"0".repeat(64),"byte_len":0}),
+            ),
+            ("payload_sha256", serde_json::json!("0".repeat(64))),
+        ] {
+            let mut altered = receipt.clone();
+            altered[field] = changed;
+            fs::write(&broker_receipt, serde_json::to_vec(&altered).unwrap()).unwrap();
+            assert_ne!(
+                bash_retention_check(bash, registration_path.trim()),
+                "released",
+                "changed {field} receipt passed Bash"
+            );
+            fs::write(&broker_receipt, &original_receipt).unwrap();
+        }
+        let swapped = source_dir.join("broker-source-retention-release-v1.swapped");
+        fs::rename(&broker_receipt, &swapped).unwrap();
+        fs::copy(&swapped, &broker_receipt).unwrap();
+        let status = Command::new("chown")
+            .arg("1:1")
+            .arg(&broker_receipt)
+            .status()
+            .unwrap();
+        assert!(status.success(), "mapped nonroot receipt copy required");
+        assert_ne!(
+            bash_retention_check(bash, registration_path.trim()),
+            "released"
+        );
+        fs::remove_file(&broker_receipt).unwrap();
+        fs::rename(&swapped, &broker_receipt).unwrap();
+        assert_eq!(
+            bash_retention_check(bash, registration_path.trim()),
+            "released"
+        );
+        let owner_change = Command::new("chown")
+            .arg("1:1")
+            .arg(registration_path.trim())
+            .status()
+            .unwrap();
+        assert!(owner_change.success());
+        assert_ne!(
+            bash_retention_check(bash, registration_path.trim()),
+            "released",
+            "changed original source owner passed Bash"
+        );
+        assert!(
+            Command::new("chown")
+                .arg("0:0")
+                .arg(registration_path.trim())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(
+            bash_retention_check(bash, registration_path.trim()),
+            "released"
+        );
+    } else {
+        assert!(!broker_receipt.exists());
+        assert!(!local_release.exists());
+        assert_eq!(
+            bash_retention_check(bash, registration_path.trim()),
+            "retained"
+        );
+        assert!(!local_release.exists());
+    }
+    if completed_v2 {
         let accepted = || {
             assess_v2_candidate(&retained, &physical, id)
                 .expect("exact completed Bash source must remain assessable")
@@ -773,6 +896,11 @@ fn assert_postcommit_source_physical_after_owner(
             let path = source_dir.join(name);
             let original = fs::read(&path).unwrap();
             fs::write(&path, changed).unwrap();
+            assert_ne!(
+                bash_retention_check(bash, registration_path.trim()),
+                "released",
+                "{name} mutation retained Bash release"
+            );
             assert!(
                 assess_v2_candidate(&retained, &physical, id).is_err(),
                 "{name} mutation was accepted"
@@ -874,6 +1002,11 @@ fn assert_postcommit_source_physical_after_owner(
         let saved_registration = source_dir.join("source-registration-v2.copy-test-original");
         fs::rename(&original_registration, &saved_registration).unwrap();
         fs::copy(&saved_registration, &original_registration).unwrap();
+        assert_ne!(
+            bash_retention_check(bash, registration_path.trim()),
+            "released",
+            "copied registration inode passed Bash"
+        );
         assert!(
             read_captured_v2_evidence(&retained, &physical, id).is_err(),
             "copied registration inode kept captured custody"
@@ -13368,8 +13501,19 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         {
             continue;
         }
-        let output = Command::new("unshare")
-            .args(["-Urpfm", "--mount-proc"])
+        let mut command = Command::new("unshare");
+        if mode == "normal_handoff_pre_k_h_source_postcommit_w_v2" {
+            command.args([
+                "-Upfm",
+                "--map-root-user",
+                "--map-users=1:100000:65535",
+                "--map-groups=1:100000:65535",
+                "--mount-proc",
+            ]);
+        } else {
+            command.args(["-Urpfm", "--mount-proc"]);
+        }
+        let output = command
             .arg(std::env::current_exe().unwrap())
             .args([
                 "--exact",
