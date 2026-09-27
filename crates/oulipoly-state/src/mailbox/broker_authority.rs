@@ -1588,7 +1588,11 @@ impl BrokerSidecar {
         let binding = crate::completion_continuation::AdmittedSourceBinding::decode(&retained.0)?;
         let prepared_driver: PreparedProcessStamp =
             serde_json::from_str(&scope.2).map_err(|e| e.to_string())?;
-        if retained.1 != "registered"
+        if !(retained.1 == "registered"
+            || (retained.1 == "accepted"
+                && self
+                    .read_completion_source_acceptance(physical_grant)?
+                    .is_some()))
             || retained.2 != scope.1
             || binding.registration()?.domain_id != scope.0
             || i64::from(prepared_driver.host_pid) != physical_grant.driver_identity.pid
@@ -2110,7 +2114,11 @@ impl BrokerSidecar {
             .map_err(|e| e.to_string())?;
         let encoded_binding = binding.encoded()?;
         if !retained.is_some_and(|(bytes, phase, snapshot)| {
-            bytes == encoded_binding && phase == "registered" && snapshot.is_none()
+            bytes == encoded_binding
+                && ((phase == "registered" && snapshot.is_none())
+                    || (phase == "accepted"
+                        && snapshot.as_deref()
+                            == Some(receipt.evidence_seal.snapshot_sha256.as_str())))
         }) {
             return Err("original completion source projection changed".into());
         }
@@ -2194,6 +2202,390 @@ impl BrokerSidecar {
             },
         )
         .transpose()
+    }
+
+    #[cfg(unix)]
+    fn open_source_evidence(
+        &self,
+        grant: &BrokerSourceEffectGrant,
+        suffix: &str,
+    ) -> Result<(std::fs::File, std::path::PathBuf, std::fs::Metadata), String> {
+        self.check_mailbox_read(&grant.source_generation)?;
+        let id = uuid::Uuid::parse_str(&grant.grant_id).map_err(|e| e.to_string())?;
+        if id.to_string() != grant.grant_id
+            || !matches!(suffix, "evidence.json" | "evidence-artifact")
+        {
+            return Err("invalid Broker source evidence address".into());
+        }
+        let directory = self.storage_anchor.join("source-physical");
+        let directory_meta = std::fs::symlink_metadata(&directory).map_err(|e| e.to_string())?;
+        if !directory_meta.is_dir()
+            || directory_meta.file_type().is_symlink()
+            || directory_meta.uid() != self.storage_owner
+            || directory_meta.mode() & 0o077 != 0
+        {
+            return Err("Broker source evidence directory identity changed".into());
+        }
+        let path = directory.join(format!("{}.{suffix}", grant.grant_id));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)
+            .map_err(|e| e.to_string())?;
+        let metadata = file.metadata().map_err(|e| e.to_string())?;
+        let named = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+        if !metadata.is_file()
+            || named.file_type().is_symlink()
+            || metadata.uid() != self.storage_owner
+            || metadata.mode() & 0o077 != 0
+            || metadata.nlink() != 1
+            || (metadata.dev(), metadata.ino()) != (named.dev(), named.ino())
+        {
+            return Err("Broker source evidence file identity changed".into());
+        }
+        Ok((file, path, metadata))
+    }
+
+    #[cfg(unix)]
+    fn read_sealed_source_manifest(
+        &self,
+        grant: &BrokerSourceEffectGrant,
+        receipt: &BrokerCompletionSourceAcceptance,
+    ) -> Result<Vec<u8>, String> {
+        let (mut file, path, before) = self.open_source_evidence(grant, "evidence.json")?;
+        let seal = &receipt.evidence_seal;
+        if before.dev() != seal.manifest_device
+            || before.ino() != seal.manifest_inode
+            || before.len() != seal.manifest_byte_len
+            || seal.manifest_byte_len > 32 * 1024 * 1024
+        {
+            return Err("original Broker manifest stamp changed".into());
+        }
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut file)
+            .take(seal.manifest_byte_len + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        if bytes.len() as u64 != seal.manifest_byte_len
+            || crate::completion_continuation::sha256(&bytes) != seal.manifest_sha256
+        {
+            return Err("original Broker manifest bytes changed".into());
+        }
+        crate::completion_continuation::require_unchanged_output(
+            &before,
+            &std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?,
+        )?;
+        Ok(bytes)
+    }
+
+    #[cfg(unix)]
+    fn verify_original_manifest_source(
+        &self,
+        binding: &crate::completion_continuation::AdmittedSourceBinding,
+        manifest_bytes: &[u8],
+    ) -> Result<(), String> {
+        let manifest: serde_json::Value =
+            serde_json::from_slice(manifest_bytes).map_err(|e| e.to_string())?;
+        let source = binding.registration()?;
+        let directory = Path::new(&source.handle_dir);
+        let owner = self
+            .state_source
+            .as_ref()
+            .ok_or("Broker original State owner absent")?
+            .owner;
+        for (field, relative, limit) in [
+            (
+                "registration",
+                source.registration_relative.as_str(),
+                crate::completion_continuation::MAX_REGISTRATION_BYTES,
+            ),
+            (
+                "snapshot",
+                source.snapshot_relative.as_str(),
+                16 * 1024 * 1024,
+            ),
+            (
+                "outcome",
+                source.outcome_relative.as_str(),
+                crate::completion_continuation::MAX_REGISTRATION_BYTES,
+            ),
+        ] {
+            let expected = base64::engine::general_purpose::STANDARD
+                .decode(
+                    manifest[field]
+                        .as_str()
+                        .ok_or("sealed original bytes absent")?,
+                )
+                .map_err(|e| e.to_string())?;
+            let stamp = &manifest[format!("{field}_file")];
+            let mut file =
+                crate::completion_continuation::open_source_file(directory, relative, limit)?;
+            let before = file.metadata().map_err(|e| e.to_string())?;
+            if before.uid() != owner
+                || before.nlink() != 1
+                || stamp["device"].as_u64() != Some(before.dev())
+                || stamp["inode"].as_u64() != Some(before.ino())
+                || stamp["byte_len"].as_u64() != Some(before.len())
+                || stamp["sha256"].as_str()
+                    != Some(crate::completion_continuation::sha256(&expected).as_str())
+            {
+                return Err("original source file stamp changed".into());
+            }
+            let mut actual = Vec::new();
+            Read::by_ref(&mut file)
+                .take(limit as u64 + 1)
+                .read_to_end(&mut actual)
+                .map_err(|e| e.to_string())?;
+            if actual != expected {
+                return Err("original source bytes changed".into());
+            }
+            let named =
+                crate::completion_continuation::open_source_file(directory, relative, limit)?
+                    .metadata()
+                    .map_err(|e| e.to_string())?;
+            crate::completion_continuation::require_unchanged_output(&before, &named)?;
+        }
+        if let Some(artifact) = manifest["artifact_original"].as_object() {
+            let selected: crate::completion_continuation::CompletionSnapshot =
+                serde_json::from_slice(
+                    &base64::engine::general_purpose::STANDARD
+                        .decode(
+                            manifest["snapshot"]
+                                .as_str()
+                                .ok_or("sealed snapshot absent")?,
+                        )
+                        .map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| e.to_string())?;
+            let crate::completion_continuation::CompletionOutput::Artifact(output) =
+                selected.output
+            else {
+                return Err("original artifact stamp without raw selection".into());
+            };
+            let mut file =
+                crate::completion_continuation::open_source_output(directory, &output.relative)?;
+            let before = file.metadata().map_err(|e| e.to_string())?;
+            if before.uid() != owner
+                || before.nlink() != 1
+                || artifact.get("device").and_then(|v| v.as_u64()) != Some(before.dev())
+                || artifact.get("inode").and_then(|v| v.as_u64()) != Some(before.ino())
+                || artifact.get("byte_len").and_then(|v| v.as_u64()) != Some(output.byte_len)
+                || artifact.get("sha256").and_then(|v| v.as_str()) != Some(output.sha256.as_str())
+            {
+                return Err("original selected output stamp changed".into());
+            }
+            crate::completion_continuation::copy_verified_raw(
+                &mut file,
+                output.byte_len,
+                &output.sha256,
+                &mut std::io::sink(),
+            )?;
+            let named =
+                crate::completion_continuation::open_source_output(directory, &output.relative)?
+                    .metadata()
+                    .map_err(|e| e.to_string())?;
+            crate::completion_continuation::require_unchanged_output(&before, &named)?;
+        } else if !manifest["artifact_original"].is_null() {
+            return Err("invalid original artifact stamp".into());
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn verify_sealed_source_artifact(
+        &self,
+        grant: &BrokerSourceEffectGrant,
+        receipt: &BrokerCompletionSourceAcceptance,
+        artifact: &crate::completion_continuation::OutputArtifact,
+    ) -> Result<(), String> {
+        let stamp = receipt
+            .owned_artifact
+            .as_ref()
+            .ok_or("sealed Broker artifact identity absent")?;
+        let (mut file, path, before) = self.open_source_evidence(grant, "evidence-artifact")?;
+        if stamp["device"].as_u64() != Some(before.dev())
+            || stamp["inode"].as_u64() != Some(before.ino())
+            || stamp["byte_len"].as_u64() != Some(artifact.byte_len)
+            || stamp["sha256"].as_str() != Some(artifact.sha256.as_str())
+            || before.len() != artifact.byte_len
+        {
+            return Err("sealed Broker artifact stamp changed".into());
+        }
+        crate::completion_continuation::copy_verified_raw(
+            &mut file,
+            artifact.byte_len,
+            &artifact.sha256,
+            &mut std::io::sink(),
+        )?;
+        crate::completion_continuation::require_unchanged_output(
+            &before,
+            &std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?,
+        )?;
+        Ok(())
+    }
+
+    /// Fixed, root-owned address for a selected raw output. The Broker copies
+    /// the sealed evidence artifact here before it calls the publication API.
+    #[cfg(unix)]
+    pub fn completion_output_path(
+        &self,
+        grant: &BrokerSourceEffectGrant,
+        digest: &str,
+    ) -> Result<std::path::PathBuf, String> {
+        self.check_mailbox_read(&grant.source_generation)?;
+        validate_sha256_hex(digest)?;
+        if digest.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            return Err("completion output digest must be lowercase".into());
+        }
+        Ok(self
+            .mailbox
+            .path
+            .parent()
+            .ok_or("broker sidecar directory absent")?
+            .join("completion-outputs")
+            .join(digest))
+    }
+
+    /// Broker-authenticated entry to the ordinary source/event/listener
+    /// transaction. Every value comes from the original consumed grant,
+    /// immutable acceptance, sealed manifest, and admitted projection.
+    #[cfg(unix)]
+    pub fn trigger_accepted_completion_source(
+        &mut self,
+        grant: &BrokerSourceEffectGrant,
+        receipt: &BrokerCompletionSourceAcceptance,
+    ) -> Result<CompletionEventTriggerResult, String> {
+        let binding = self.read_consumed_source_candidate(grant)?;
+        let admission = self.require_exact_fresh_source_admission(grant, &binding)?;
+        let accepted = self
+            .read_completion_source_acceptance(grant)?
+            .ok_or("broker source acceptance absent")?;
+        let release = self
+            .read_source_retention_release(grant)?
+            .ok_or("broker source release decision absent")?;
+        if accepted.0 != *receipt
+            || release.0.acceptance_sha256 != accepted.1
+            || release.0.grant_id != grant.grant_id
+            || release.0.root_id != grant.root_id
+            || release.0.owner_generation != grant.owner_generation
+            || receipt.state_admission_id != admission.state_admission_id
+            || receipt.registration_digest != binding.registration_digest()
+        {
+            return Err("broker source publication receipt conflict".into());
+        }
+        let manifest_bytes = self.read_sealed_source_manifest(grant, receipt)?;
+        verify_acceptance_manifest_material(grant, receipt, &manifest_bytes)?;
+        self.verify_original_manifest_source(&binding, &manifest_bytes)?;
+        let source = binding.registration()?;
+        let evidence =
+            crate::completion_continuation::VerifiedCompletion::from_source_files(&binding)?;
+        if evidence.snapshot_sha256 != receipt.evidence_seal.snapshot_sha256
+            || evidence.outcome_sha256 != receipt.evidence_seal.outcome_sha256
+            || serde_json::to_value(&evidence.snapshot.output).map_err(|e| e.to_string())?
+                != receipt.selected_output
+            || !self
+                .mailbox
+                .exact_source_materialization_matches(&binding)?
+        {
+            return Err("original completion material differs from Broker acceptance".into());
+        }
+        let listeners = self.mailbox.completion_event_listeners(&source.handle)?;
+        if listeners.len() != source.listeners.len()
+            || source.listeners.iter().any(|expected| {
+                !listeners.iter().any(|actual| {
+                    actual.listener_id == expected.listener_id
+                        && actual.session_id == expected.session_id
+                        && actual.owner_invocation_uuid == expected.owner_invocation_uuid
+                })
+            })
+        {
+            return Err("original admitted completion listeners changed".into());
+        }
+        let output_artifact = match &evidence.snapshot.output {
+            crate::completion_continuation::CompletionOutput::Artifact(artifact) => {
+                self.verify_sealed_source_artifact(grant, receipt, artifact)?;
+                let path = self.completion_output_path(grant, &artifact.sha256)?;
+                let before = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+                if !before.is_file()
+                    || before.file_type().is_symlink()
+                    || before.uid() != self.storage_owner
+                    || before.nlink() != 1
+                    || before.mode() & 0o077 != 0
+                    || before.len() != artifact.byte_len
+                {
+                    return Err("retained Broker completion output identity conflict".into());
+                }
+                let mut file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(&path)
+                    .map_err(|e| e.to_string())?;
+                crate::completion_continuation::copy_verified_raw(
+                    &mut file,
+                    artifact.byte_len,
+                    &artifact.sha256,
+                    &mut std::io::sink(),
+                )?;
+                crate::completion_continuation::require_unchanged_output(
+                    &before,
+                    &std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?,
+                )?;
+                serde_json::json!({"path":path,"sha256":artifact.sha256,
+                    "byte_len":artifact.byte_len,"encoding":artifact.encoding})
+            }
+            _ => {
+                if receipt.owned_artifact.is_some() {
+                    return Err("unexpected Broker raw output artifact".into());
+                }
+                serde_json::Value::Null
+            }
+        };
+        let paths = source.paths();
+        let payload = serde_json::to_string(&serde_json::json!({
+            "schema_version":2, "kind":"agent_bash_complete",
+            "event_id":source.handle, "handle":source.handle,
+            "rc":evidence.snapshot.rc, "state_dir":source.handle_dir,
+            "meta_path":paths[0], "log_path":paths[1], "rc_path":paths[2],
+            "completion_protocol":crate::completion_continuation::PROTOCOL,
+            "source_id":source.source_id, "registration_id":source.registration_id,
+            "registration_digest":binding.registration_digest(),
+            "snapshot":evidence.snapshot, "outcome":evidence.outcome,
+            "output_artifact":output_artifact,
+        }))
+        .map_err(|e| e.to_string())?;
+        let result = self.mailbox.trigger_completion_continuation(
+            CompletionEventTriggerInput {
+                event_id: &source.handle,
+                payload_json: &payload,
+                state_dir: &source.handle_dir,
+                meta_path: &paths[0],
+                log_path: &paths[1],
+                rc_path: &paths[2],
+                rc: evidence.snapshot.rc,
+            },
+            &binding,
+            &evidence,
+        )?;
+        let projection = self
+            .mailbox
+            .completion_continuation_acceptance(&source.registration_id)?
+            .ok_or("committed completion source absent")?;
+        if projection["phase"] != "accepted"
+            || projection["snapshot_sha256"] != evidence.snapshot_sha256
+            || projection["outcome_sha256"] != evidence.outcome_sha256
+            || result.event.state != "triggered"
+            || result.event.payload_sha256.as_deref()
+                != Some(crate::completion_continuation::sha256(payload.as_bytes()).as_str())
+            || self
+                .mailbox
+                .completion_recovery_payload(&source.handle)?
+                .as_deref()
+                != Some(payload.as_bytes())
+        {
+            return Err("Broker completion publication readback conflict".into());
+        }
+        self.check_mailbox_read(&grant.source_generation)?;
+        Ok(result)
     }
 
     /// A distinct durable Broker release decision. Bash receives no receipt

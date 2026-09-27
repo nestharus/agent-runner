@@ -451,6 +451,107 @@ fn assert_postcommit_source_physical_after_owner(
         let exact_manifest = physical
             .read_witness(id, "evidence.json", 32 * 1024 * 1024)
             .unwrap();
+        let publication = oulipoly_kernel_broker::source_acceptance::trigger_v2_completion_source(
+            &mut retained,
+            &physical,
+            id,
+        )
+        .unwrap();
+        let listener = &registration["listeners"][0];
+        assert_eq!(publication.event.state, "triggered");
+        assert_eq!(publication.listeners.len(), 1);
+        assert_eq!(
+            publication.listeners[0].listener_id,
+            listener["listener_id"]
+        );
+        assert_eq!(publication.listeners[0].session_id, listener["session_id"]);
+        assert_eq!(publication.mailbox_rows.len(), 1);
+        assert_eq!(
+            publication.mailbox_rows[0].session_id,
+            listener["session_id"]
+        );
+        assert_eq!(
+            publication.mailbox_rows[0].owner_invocation_uuid.as_deref(),
+            listener["owner_invocation_uuid"].as_str()
+        );
+        assert!(publication.mailbox_rows[0].delivered_at.is_none());
+        assert!(publication.listeners[0].acknowledged_at.is_none());
+        let payload: serde_json::Value = serde_json::from_slice(
+            &fs::read(publication.event.payload_file_path.as_ref().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["schema_version"], 2);
+        assert_eq!(
+            payload["completion_protocol"],
+            oulipoly_state::completion_continuation::PROTOCOL
+        );
+        assert_eq!(payload["registration_id"], accepted.registration_id);
+        assert_eq!(payload["registration_digest"], accepted.registration_digest);
+        assert_eq!(payload["snapshot"]["output"], accepted.selected_output);
+        let output_path = Path::new(payload["output_artifact"]["path"].as_str().unwrap());
+        assert_eq!(
+            fs::read(output_path).unwrap(),
+            fs::read(
+                Path::new(registration_path.trim())
+                    .parent()
+                    .unwrap()
+                    .join("completion-output-v2.bin")
+            )
+            .unwrap()
+        );
+        let duplicate = oulipoly_kernel_broker::source_acceptance::trigger_v2_completion_source(
+            &mut BrokerSidecar::open_existing(
+                &broker_state.join("sidecar/pid-identity.db"),
+                broker_state,
+            )
+            .unwrap(),
+            &physical,
+            id,
+        )
+        .unwrap();
+        assert!(!duplicate.triggered);
+        assert_eq!(duplicate.mailbox_rows, publication.mailbox_rows);
+        let saved_output = fs::read(output_path).unwrap();
+        fs::write(output_path, b"changed retained Broker output").unwrap();
+        assert!(
+            oulipoly_kernel_broker::source_acceptance::trigger_v2_completion_source(
+                &mut retained,
+                &physical,
+                id,
+            )
+            .is_err(),
+            "changed retained Broker bytes passed trigger retry"
+        );
+        fs::write(output_path, saved_output).unwrap();
+        let evidence_artifact = physical_dir.join(format!("{id}.evidence-artifact"));
+        let saved_evidence_artifact = fs::read(&evidence_artifact).unwrap();
+        fs::write(&evidence_artifact, b"changed sealed Broker artifact").unwrap();
+        assert!(
+            oulipoly_kernel_broker::source_acceptance::trigger_v2_completion_source(
+                &mut retained,
+                &physical,
+                id,
+            )
+            .is_err(),
+            "changed sealed Broker artifact passed trigger retry"
+        );
+        fs::write(&evidence_artifact, saved_evidence_artifact).unwrap();
+        let sidecar_path = broker_state.join("sidecar/pid-identity.db");
+        let tamper = rusqlite::Connection::open(&sidecar_path).unwrap();
+        assert!(
+            tamper
+                .execute(
+                    "UPDATE completion_event_listener SET session_id='changed-session'
+                 WHERE event_id=?1 AND listener_id=?2",
+                    rusqlite::params![
+                        registration["handle"].as_str().unwrap(),
+                        listener["listener_id"].as_str().unwrap()
+                    ],
+                )
+                .is_err(),
+            "original listener/session identity must be immutable"
+        );
+        drop(tamper);
         let mut changed_seal = accepted.clone();
         changed_seal.evidence_seal.manifest_sha256 = "0".repeat(64);
         assert!(
@@ -490,6 +591,11 @@ fn assert_postcommit_source_physical_after_owner(
             },
             {
                 let mut g = record.grant.clone();
+                g.root_id = "wrong-root".into();
+                g
+            },
+            {
+                let mut g = record.grant.clone();
                 g.source_generation = "wrong-generation".into();
                 g
             },
@@ -503,6 +609,12 @@ fn assert_postcommit_source_physical_after_owner(
                 retained
                     .decide_source_retention_release(&changed, &accepted)
                     .is_err()
+            );
+            assert!(
+                retained
+                    .trigger_accepted_completion_source(&changed, &accepted)
+                    .is_err(),
+                "wrong source/root/owner/generation passed Broker trigger"
             );
         }
         let state_source: serde_json::Value = serde_json::from_slice(
@@ -618,8 +730,15 @@ fn assert_postcommit_source_physical_after_owner(
         |row| row.get(0),
     )
     .unwrap();
-    assert_eq!(source_phase, "registered");
-    let no_publication: (i64, i64, i64) = rusqlite::Connection::open_with_flags(
+    assert_eq!(
+        source_phase,
+        if completed_v2 {
+            "accepted"
+        } else {
+            "registered"
+        }
+    );
+    let publication_counts: (i64, i64, i64) = rusqlite::Connection::open_with_flags(
         broker_state.join("sidecar/pid-identity.db"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     ).unwrap().query_row(
@@ -630,9 +749,9 @@ fn assert_postcommit_source_physical_after_owner(
         |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
     ).unwrap();
     assert_eq!(
-        no_publication,
-        (0, 0, 0),
-        "source custody did not notify or ACK"
+        publication_counts,
+        if completed_v2 { (1, 1, 0) } else { (0, 0, 0) },
+        "source trigger and notification custody differ from accepted source"
     );
     if completed_v2 {
         let source_dir = Path::new(registration_path.trim()).parent().unwrap();
@@ -687,6 +806,13 @@ fn assert_postcommit_source_physical_after_owner(
                 )
                 .is_err(),
                 "{name} mutation passed release retry"
+            );
+            assert!(
+                oulipoly_kernel_broker::source_acceptance::trigger_v2_completion_source(
+                    &mut retry, &physical, id,
+                )
+                .is_err(),
+                "{name} mutation passed trigger retry"
             );
             fs::write(&path, original).unwrap();
             accepted();
@@ -10532,6 +10658,9 @@ fn inner() {
                             assert!(oulipoly_kernel_broker::source_acceptance::decide_v2_source_retention_release(
                                 &mut retained, &custody, &grant_id,
                             ).is_err(), "old v29 row acquired Broker release");
+                            assert!(oulipoly_kernel_broker::source_acceptance::trigger_v2_completion_source(
+                                &mut retained, &custody, &grant_id,
+                            ).is_err(), "old v29 row triggered a Broker completion");
                             assert!(
                                 retained
                                     .read_source_retention_release(&custody.records()[0].grant)

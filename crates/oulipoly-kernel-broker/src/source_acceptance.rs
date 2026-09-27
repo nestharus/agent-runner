@@ -12,7 +12,7 @@ use oulipoly_state::mailbox::{
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
 const MAX_SNAPSHOT: usize = 16 * 1024 * 1024;
@@ -639,6 +639,107 @@ pub fn decide_v2_source_retention_release(
         return Err("broker source release changed across readback".into());
     }
     Ok(released)
+}
+
+fn retain_completion_output(
+    sidecar: &BrokerSidecar,
+    physical: &SourcePhysicalRegistry,
+    id: &str,
+    receipt: &BrokerCompletionSourceAcceptance,
+) -> Result<(), String> {
+    let output: CompletionOutput =
+        serde_json::from_value(receipt.selected_output.clone()).map_err(|e| e.to_string())?;
+    let CompletionOutput::Artifact(artifact) = output else {
+        if receipt.owned_artifact.is_some() {
+            return Err("Broker artifact identity without selected raw output".into());
+        }
+        return Ok(());
+    };
+    let expected: FileIdentity = serde_json::from_value(
+        receipt
+            .owned_artifact
+            .clone()
+            .ok_or("Broker artifact identity absent")?,
+    )
+    .map_err(|e| e.to_string())?;
+    let source = physical
+        .evidence_path(id, "evidence-artifact")
+        .map_err(|e| e.to_string())?;
+    if owned_artifact(&source, &artifact.sha256, artifact.byte_len)? != expected {
+        return Err("sealed Broker artifact changed before output retention".into());
+    }
+    let grant = &record(physical, id)?.grant;
+    let destination = sidecar.completion_output_path(grant, &artifact.sha256)?;
+    let directory = destination.parent().ok_or("Broker output parent absent")?;
+    match fs::DirBuilder::new().mode(0o700).create(directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    let dir_meta = fs::symlink_metadata(directory).map_err(|e| e.to_string())?;
+    if !dir_meta.is_dir()
+        || dir_meta.file_type().is_symlink()
+        || dir_meta.uid() != 0
+        || dir_meta.mode() & 0o077 != 0
+    {
+        return Err("Broker output directory identity conflict".into());
+    }
+    if !destination.exists() {
+        let temporary = directory.join(format!(".pending-{}", uuid::Uuid::new_v4()));
+        let result = (|| {
+            let mut input = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&source)
+                .map_err(|e| e.to_string())?;
+            let mut output = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&temporary)
+                .map_err(|e| e.to_string())?;
+            copy_verified_raw(&mut input, artifact.byte_len, &artifact.sha256, &mut output)?;
+            output.sync_all().map_err(|e| e.to_string())?;
+            if owned_artifact(&source, &artifact.sha256, artifact.byte_len)? != expected {
+                return Err("sealed Broker artifact changed while retaining output".into());
+            }
+            // Rename publishes one link atomically. A crash on either side
+            // leaves an absent or complete address, both safe to retry.
+            fs::rename(&temporary, &destination).map_err(|e| e.to_string())?;
+            File::open(directory)
+                .and_then(|file| file.sync_all())
+                .map_err(|e| e.to_string())
+        })();
+        let _ = fs::remove_file(&temporary);
+        result?;
+    }
+    let retained = owned_artifact(&destination, &artifact.sha256, artifact.byte_len)?;
+    if retained.sha256 != expected.sha256
+        || retained.byte_len != expected.byte_len
+        || owned_artifact(&source, &artifact.sha256, artifact.byte_len)? != expected
+    {
+        return Err("retained Broker output changed after publication".into());
+    }
+    Ok(())
+}
+
+/// Publish the real accepted source, event and admitted listener obligations
+/// through the retained sidecar's single trigger transaction. Exact retry
+/// revalidates original and Broker-owned evidence before returning readback.
+pub fn trigger_v2_completion_source(
+    sidecar: &mut BrokerSidecar,
+    physical: &SourcePhysicalRegistry,
+    id: &str,
+) -> Result<oulipoly_state::mailbox::CompletionEventTriggerResult, String> {
+    let (grant, receipt) = accepted_source_receipt(sidecar, physical, id)?;
+    retain_completion_output(sidecar, physical, id, &receipt)?;
+    let result = sidecar.trigger_accepted_completion_source(&grant, &receipt)?;
+    let (_, again) = accepted_source_receipt(sidecar, physical, id)?;
+    if again != receipt {
+        return Err("Broker completion source changed across trigger".into());
+    }
+    Ok(result)
 }
 
 #[cfg(all(test, target_os = "linux"))]

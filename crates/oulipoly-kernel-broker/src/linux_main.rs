@@ -71,7 +71,7 @@ use oulipoly_kernel_broker::registry::{RootRecord, RootRegistry};
 use oulipoly_kernel_broker::root_drain;
 use oulipoly_kernel_broker::source_acceptance::{
     accept_v2_completion_source, capture_and_stage_v2_evidence, commit_v2_evidence,
-    decide_v2_source_retention_release,
+    decide_v2_source_retention_release, trigger_v2_completion_source,
 };
 use oulipoly_kernel_broker::source_physical::{SourceObservation, SourcePhysicalRegistry};
 use oulipoly_kernel_broker::work_registry::{Scope, WorkRegistry, classify_scope};
@@ -3869,8 +3869,9 @@ fn encode_release_evidence(evidence: &BrokerReleaseEvidence) -> io::Result<Strin
 // restart. A source can finish after its W reply with no further socket
 // traffic, so capture cannot depend on a later caller request. An exact
 // independently admitted capture may advance Broker evidence to accepted.
-// The source acceptance and Broker release decision are separate commits;
-// delivery of the release to Bash, notification and ACK remain closed.
+// The source acceptance and Broker release decision are separate commits.
+// Broker publication then atomically triggers the source and notifications;
+// Bash release delivery and recipient ACK remain closed.
 fn capture_terminal_sources(
     sidecar: &mut BrokerSidecar,
     physical: &SourcePhysicalRegistry,
@@ -3902,7 +3903,8 @@ fn capture_terminal_sources(
                                         sidecar,
                                         physical,
                                         &grant.grant_id,
-                                    )
+                                    )?;
+                                    trigger_v2_completion_source(sidecar, physical, &grant.grant_id)
                                 });
                         match result {
                             Ok(_) => {
