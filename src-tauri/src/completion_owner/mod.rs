@@ -1,19 +1,173 @@
-//! Pre-provider independent notification ownership. No workload argv crosses this
-//! endpoint; original Bash supervisor/guardian/workload ancestry is unchanged.
+//! Pre-provider root process-tree ownership. Completion-continuation operations
+//! retain their existing State/mailbox authority; original-work-v1 requests use
+//! a separate capability, acceptance, cancellation, and result protocol on the
+//! same inherited endpoint and guardian.
 //! Declared roles: orchestration, validator, accessor, parser, mapper.
+#[cfg(target_os = "linux")]
+#[allow(
+    dead_code,
+    reason = "v30 bootstrap uses only the prepared, released and running subset"
+)]
+pub(crate) mod broker_route;
 #[cfg(target_os = "linux")]
 mod custody;
 #[cfg(target_os = "linux")]
 mod driver;
+#[cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
+pub(crate) const PRIVATE_DRIVER_ARG: &str = driver::DRIVER_ARG;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
+mod original_work;
+#[cfg(target_os = "linux")]
 mod root_supervisor;
+
+#[cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
+#[allow(
+    unused_imports,
+    reason = "used by the binary's private kernel-entry fixture"
+)]
+pub(crate) use root_supervisor::private_native_lineage;
 
 #[cfg(test)]
 pub(crate) mod test_support;
 
 pub(crate) const ENDPOINT_ENV: &str = "OULIPOLY_COMPLETION_ENDPOINT";
+pub(crate) const ROOT_AUTHORITY_ENV: &str = "OULIPOLY_ROOT_AUTHORITY_V1";
+pub(crate) const ORIGINAL_WORK_REQUIRED_ENV: &str = "OULIPOLY_ORIGINAL_WORK_REQUIRED_V1";
+pub(crate) const EXPECTED_KERNEL_ROOT_ENV: &str = "OULIPOLY_KERNEL_EXPECTED_ROOT_V1";
+pub(crate) const V30_OWNER_ENDPOINT_ENV: &str = "OULIPOLY_KERNEL_OWNER_ENDPOINT_V1";
+#[cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
+pub(crate) const V30_DISPOSITION_FD_ENV: &str = "OULIPOLY_KERNEL_V30_DISPOSITION_FD_V1";
+
+/// A declaration by the released J child, relayed on the original J/guardian
+/// connection. It carries custody intent only; it cannot select a source or W.
+#[cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum V30PreEffectDisposition {
+    Closed {
+        root_id: String,
+        owner_generation: String,
+        release_id: String,
+    },
+    AwaitingH {
+        root_id: String,
+        owner_generation: String,
+        release_id: String,
+        handoff_id: String,
+        d_key: String,
+        invocation_uuid: String,
+        session_id: String,
+    },
+}
+
+#[cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
+impl V30PreEffectDisposition {
+    pub(crate) fn identity(&self) -> (&str, &str, &str) {
+        match self {
+            Self::Closed {
+                root_id,
+                owner_generation,
+                release_id,
+            }
+            | Self::AwaitingH {
+                root_id,
+                owner_generation,
+                release_id,
+                ..
+            } => (root_id, owner_generation, release_id),
+        }
+    }
+
+    pub(crate) fn valid_h_identity(&self) -> bool {
+        let Self::AwaitingH {
+            handoff_id,
+            d_key,
+            invocation_uuid,
+            session_id,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        let canonical = |id: &str| {
+            uuid::Uuid::parse_str(id)
+                .is_ok_and(|parsed| !parsed.is_nil() && parsed.to_string() == id)
+        };
+        let session = session_id
+            .strip_prefix("v30:")
+            .and_then(|rest| rest.split_once(':'))
+            .is_some_and(|(lane, allocation)| canonical(lane) && canonical(allocation));
+        [handoff_id, d_key, invocation_uuid]
+            .iter()
+            .all(|id| canonical(id))
+            && session
+    }
+}
+
+/// A comparison target sent only after the original guardian's independent
+/// postcommit challenge.  It has no grant authority: the driver must repair
+/// State and select the projected source again before reserving W.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct V30WakeTarget {
+    pub root_id: String,
+    pub owner_generation: String,
+    pub source_generation: String,
+    pub request_id: String,
+    pub decision_id: String,
+    pub registration_id: String,
+    pub registration_digest: String,
+    pub authority_ordinal: i64,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct PinnedGuardian {
+    pub(crate) root_id: String,
+    pub(crate) domain_id: String,
+    pub(crate) supervisor_authority_id: String,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn run_pinned_guardian(
+    pin: &PinnedGuardian,
+    announce: std::os::unix::net::UnixStream,
+) -> Result<(), String> {
+    linux::run_pinned_guardian(pin, announce)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn run_pinned_guardian_v30(
+    pin: &PinnedGuardian,
+    announce: std::os::unix::net::UnixStream,
+) -> Result<(), String> {
+    linux::run_pinned_guardian_v30(pin, announce)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn verify_pinned_owner_ready(
+    announce: &mut std::os::unix::net::UnixStream,
+    pin: &PinnedGuardian,
+    guardian_pid: i32,
+) -> Result<String, String> {
+    linux::verify_pinned_owner_ready(announce, pin, guardian_pid)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn verify_kernel_owner_socket(
+    root_id: &str,
+    owner: &oulipoly_state::mailbox::CompletionDomainOwner,
+    socket: &std::os::unix::net::UnixStream,
+) -> Result<(), String> {
+    linux::verify_kernel_owner_socket(root_id, owner, socket)
+}
+
+#[cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
+pub(crate) fn join_private_accepted_work_fixture() -> Result<(), String> {
+    linux::bootstrap().map_err(|error| error.to_string())
+}
 
 /// Preserve the State open source at entry; unrelated owner/path text is operational.
 #[derive(Debug)]
@@ -75,8 +229,10 @@ fn requires_service(cli: &crate::usage::cli::Cli) -> bool {
             None | Some(Subcommands::Repl { .. })
                 | Some(Subcommands::Resume { .. })
                 | Some(Subcommands::Notify {
-                    command: NotifySubcommands::Register { .. }
-                        | NotifySubcommands::Listen { .. }
+                    command: NotifySubcommands::Register {
+                        accepted_intent_file: None,
+                        ..
+                    } | NotifySubcommands::Listen { .. }
                         | NotifySubcommands::Activate { .. }
                         | NotifySubcommands::Complete { .. }
                 })
@@ -114,7 +270,10 @@ pub fn bootstrap_service() -> Result<(), String> {
 fn bootstrap_entry_service() -> Result<(), BootstrapError> {
     #[cfg(target_os = "linux")]
     {
-        linux::bootstrap()
+        linux::bootstrap()?;
+        // The initial provider is launched by this process, not by the
+        // completion root worker. Establish lineage before dispatch can fork.
+        custody::establish_entry_lineage().map_err(BootstrapError::Operational)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -134,6 +293,33 @@ pub(crate) fn require_owner(
         let _ = domain_id;
         Err("completion-continuation-v2 requires supported Linux independent entry".into())
     }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn discover_v30_owner(
+    query_pid: Option<i32>,
+) -> Result<oulipoly_kernel_broker::protocol::OwnerDiscoveryReadback, String> {
+    linux::discover_v30_owner(query_pid)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn v30_broker_socket() -> std::path::PathBuf {
+    linux::owner_broker_socket()
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn read_v30_owner_if_present(
+    query_pid: Option<i32>,
+) -> Result<Option<oulipoly_kernel_broker::protocol::OwnerDiscoveryReadback>, String> {
+    linux::read_v30_owner_if_present(query_pid)
+}
+
+#[cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
+pub(crate) fn private_discovery_probe(
+    release: &oulipoly_state::mailbox::BrokerReleaseEvidence,
+    gate: &std::path::Path,
+) -> Result<(), String> {
+    linux::private_discovery_probe(release, gate)
 }
 
 #[cfg(target_os = "linux")]
@@ -158,7 +344,7 @@ pub fn defer_wake_to_owner() -> Result<bool, String> {
         .ok_or("native completion owner unavailable")?;
     #[cfg(target_os = "linux")]
     {
-        if owner.driver_identity == linux::identity(i64::from(std::process::id()))? {
+        if owner.driver_identity == linux::current_identity()? {
             return Ok(false);
         }
         // A stored owner row is discovery, not proof of a usable successor.
@@ -170,6 +356,55 @@ pub fn defer_wake_to_owner() -> Result<bool, String> {
     {
         let _ = owner;
         Ok(true)
+    }
+}
+
+/// Legacy mailbox mutations may use the user sidecar only while the live
+/// broker still reports a legacy entry route. The v30 copy is retained by the
+/// broker; a user-side copy (including an intact one) is never write authority.
+/// Local installs without a broker keep their existing mailbox behavior.
+#[doc(hidden)]
+pub fn require_legacy_recipient_effect_route() -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        use oulipoly_kernel_broker::protocol::{self, EntryRoute};
+        let socket = linux::owner_broker_socket();
+        if !socket.exists() {
+            if std::env::var_os("OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1").is_some() {
+                return Err("recipient broker entry route unavailable".into());
+            }
+            return Ok(());
+        }
+        return match protocol::observe_entry_gate_at(&socket) {
+            Ok(EntryRoute::LegacyOpen) => Ok(()),
+            Ok(EntryRoute::BrokerV30Closed) => Err(
+                "v30 recipient write requires broker-authenticated recipient grant; retired sidecar refused"
+                    .into(),
+            ),
+            Ok(EntryRoute::Draining) => Err("recipient broker entry gate is draining".into()),
+            Err(error) => Err(format!("recipient broker entry route unavailable: {error}")),
+        };
+    }
+    #[cfg(not(target_os = "linux"))]
+    Ok(())
+}
+
+/// Fresh v30 IDs are broker minted. A legacy command given one of these IDs
+/// cannot disambiguate an old row with the same `(session, seq)` spelling.
+/// Existing pinned v29 helpers retain their original, separate endpoint.
+#[doc(hidden)]
+pub fn require_unqualified_legacy_session(session_id: &str) -> Result<(), String> {
+    let mut parts = session_id.split(':');
+    let fresh_shape = match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some("v30"), Some(lane), Some(session), None) => [lane, session]
+            .into_iter()
+            .all(|part| uuid::Uuid::parse_str(part).is_ok_and(|id| id.to_string() == part)),
+        _ => false,
+    };
+    if fresh_shape {
+        Err("session requires an explicit versioned lane; legacy ACK/resume/wake refused".into())
+    } else {
+        Ok(())
     }
 }
 
@@ -191,6 +426,14 @@ pub(crate) fn custodian_entry() -> Option<Result<(), String>> {
 mod entry_tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn unqualified_legacy_session_refuses_fresh_namespace_even_if_old_row_collides() {
+        let id = uuid::Uuid::new_v4();
+        assert!(require_unqualified_legacy_session(&format!("v30:{id}:{id}")).is_err());
+        assert!(require_unqualified_legacy_session("v30:old-custom-name").is_ok());
+        assert!(require_unqualified_legacy_session("legacy-session").is_ok());
+    }
 
     #[test]
     fn service_entry_tracks_wake_producers_not_database_access() {
@@ -262,6 +505,27 @@ mod entry_tests {
             ],
             vec!["runner", "mailbox", "pause", "--session-id", "fixture"],
             vec!["runner", "notify", "agent-bash-capability"],
+            vec![
+                "runner",
+                "notify",
+                "agent-bash-register",
+                "--handle",
+                "fixture",
+                "--delivery-mode",
+                "async",
+                "--state-dir",
+                "/fixture",
+                "--meta",
+                "/fixture/meta",
+                "--log",
+                "/fixture/log",
+                "--rc",
+                "/fixture/rc",
+                "--registration-file",
+                "/fixture/source.json",
+                "--accepted-intent-file",
+                "/fixture/intent.json",
+            ],
             vec![
                 "runner",
                 "notify",

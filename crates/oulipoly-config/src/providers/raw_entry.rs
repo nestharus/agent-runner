@@ -33,6 +33,8 @@ pub(crate) struct RawEntry {
     #[serde(default)]
     pub(crate) settings_id: Option<String>,
     #[serde(default)]
+    pub(crate) quota_account_id: Option<String>,
+    #[serde(default)]
     pub(crate) quota_script: Option<String>,
     #[serde(default)]
     pub(crate) auth_refresh_command: Option<String>,

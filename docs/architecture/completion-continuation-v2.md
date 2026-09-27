@@ -1,5 +1,12 @@
 # Native completion continuation v2
 
+The current guardian also hosts the separate
+[`original-work-v1`](root-original-work-v1.md) lane. Sharing the guardian,
+endpoint, and root lifecycle does not change this protocol's source schemas,
+attempt claims, listener ACKs, or terminal meaning. Original-work causal `T`
+means that agent-bash published its selected outcome; it is not a v2 delivery
+ACK.
+
 This candidate supports **fresh isolated domains only**. It is not production
 transition authority; AGE365 owns legacy domains, old pinned writers and migration.
 The State source registration remains the admission authority. No original Bash

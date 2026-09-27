@@ -420,6 +420,8 @@ fn run_case(mode: &str) {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        let first_settlement = prepared.env.state.completed_turn(&uuid).unwrap().unwrap();
+        assert!(first_settlement.committed);
         let replay =
             std::process::Command::new(std::env::var_os("AGE360_ADMISSION_BUILT_RUNNER").unwrap())
                 .args([
@@ -440,6 +442,7 @@ fn run_case(mode: &str) {
 
         let after = prepared.env.state.completed_turn(&uuid).unwrap().unwrap();
         assert!(after.committed);
+        assert_eq!(after.tails, first_settlement.tails);
         assert_eq!(after.effects, record.effects);
         assert_eq!(after.context, record.context);
         assert_eq!(

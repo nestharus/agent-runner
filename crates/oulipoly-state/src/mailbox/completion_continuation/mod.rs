@@ -5,6 +5,7 @@ use super::*;
 use crate::completion_continuation::{AdmittedSourceBinding, PROTOCOL, SourceProcessIdentity};
 use serde::{Deserialize, Serialize};
 mod attempts;
+mod native_settlement;
 pub(super) use attempts::native_original_drain_on;
 mod notification;
 mod source;
@@ -17,6 +18,10 @@ pub(super) use notification::{
     register_listener_on as register_notification_listener_on,
 };
 pub(super) use source::{accept_on, bound_event, reject_unbound_v2_trigger, retained_payload};
+
+pub const NATIVE_WORKER_ATTACH_PROTOCOL: &str = "native-worker-attach-v1";
+pub const NATIVE_KERNEL_Q_PROTOCOL: &str = "native-kernel-q-v1";
+pub const NATIVE_ROOT_WORKER_ENTRY: &str = "__completion-root-worker-v1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompletionDomainOwner {
@@ -42,6 +47,100 @@ pub struct ContinuationAttempt {
     pub session_id: Option<String>,
     pub claim_token: Option<String>,
     pub result_path: String,
+}
+
+/// A single committed acceptance of an exact native attempt by its running
+/// guardian. This is evidence for a later broker grant, not a launch grant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptedNativeGrantSnapshot {
+    pub attempt: ContinuationAttempt,
+    pub domain_id: String,
+    pub kernel_root_id: String,
+    pub supervisor_authority_id: String,
+    pub owner_generation: String,
+    pub guardian_identity: SourceProcessIdentity,
+    pub phase: String,
+    pub revision: i64,
+    pub integrated: bool,
+    pub custodian_identity: Option<SourceProcessIdentity>,
+    pub adopter_identity: Option<SourceProcessIdentity>,
+}
+
+/// Durable one-to-one association. A broker grant is still preparation debt;
+/// this record alone neither releases the worker gate nor proves execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeGrantBinding {
+    pub attempt_id: String,
+    pub grant_id: String,
+    pub protocol: String,
+    pub accepted_revision: i64,
+    pub domain_id: String,
+    pub kernel_root_id: String,
+    pub supervisor_authority_id: String,
+    pub owner_generation: String,
+    pub guardian_identity: SourceProcessIdentity,
+    pub accepted_snapshot_sha256: String,
+    pub custodian_request_sha256: String,
+}
+
+/// Broker K attachment evidence, observed with its pre-exec gate still held.
+/// State validates the fields and exact v28 binding, but cannot authenticate
+/// the broker source until the production transport provides that proof.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrokerNativeAttachEvidence {
+    pub protocol: String,
+    pub gate_held_before_release: bool,
+    pub attempt_id: String,
+    pub grant_id: String,
+    pub kernel_root_id: String,
+    pub work_id: String,
+    pub work_incarnation_id: String,
+    pub broker_incarnation_id: String,
+    pub worker_entrypoint: String,
+    pub runner_image_sha256: String,
+    /// Host-observed process incarnations; namespace-local PIDs are invalid.
+    pub worker_identity: SourceProcessIdentity,
+    pub pid1_identity: SourceProcessIdentity,
+    pub work_pid_namespace_inode: i64,
+    pub attach_receipt_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeWorkerAttach {
+    pub attempt_id: String,
+    pub grant_id: String,
+    pub evidence: BrokerNativeAttachEvidence,
+}
+
+/// Broker Q observation of the exact attached PID1. The receipt must attest
+/// actual terminal/reap and zero remaining work processes; State checks its
+/// shape and binding, not the kernel observation or transport provenance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrokerNativeKernelQEvidence {
+    pub protocol: String,
+    pub attempt_id: String,
+    pub grant_id: String,
+    pub kernel_root_id: String,
+    pub work_id: String,
+    pub work_incarnation_id: String,
+    /// A recovered broker may observe Q after the attaching broker exits.
+    pub observing_broker_incarnation_id: String,
+    pub worker_identity: SourceProcessIdentity,
+    pub pid1_identity: SourceProcessIdentity,
+    pub work_pid_namespace_inode: i64,
+    pub pid1_wait_status: i64,
+    pub pid1_reaped: bool,
+    pub remaining_work_processes: i64,
+    pub terminal_receipt_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeKernelQSettlement {
+    pub attempt_id: String,
+    pub grant_id: String,
+    pub work_id: String,
+    pub work_incarnation_id: String,
+    pub evidence: BrokerNativeKernelQEvidence,
 }
 
 impl MailboxDb {
@@ -148,11 +247,32 @@ impl MailboxDb {
             })).transpose()
     }
 
+    pub fn completion_owner_kernel_root_id(
+        &self,
+        generation: &str,
+    ) -> Result<Option<String>, String> {
+        self.conn
+            .query_row(
+                "SELECT kernel_root_id FROM completion_continuation_owner WHERE generation=?1 AND phase='running'",
+                [generation],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+            .map(|root| root.flatten())
+    }
+
     /// The sidecar continuity head is the exact durable cursor for State repair.
     /// Recovery reads only the append-only suffix after this ordinal; accepted
     /// historical bindings before it are not part of the hot working set.
     pub fn completion_continuity_repair_ordinal(&self) -> Result<i64, String> {
         Ok(completion_continuity_head_on(&self.conn)?.map_or(0, |head| head.authority_ordinal))
+    }
+
+    pub(crate) fn completion_continuity_head(
+        &self,
+    ) -> Result<Option<CompletionContinuityHead>, String> {
+        completion_continuity_head_on(&self.conn)
     }
 
     /// Return only source images that still lack an accepted completion.  The
@@ -254,11 +374,36 @@ WHERE supervisor_authority_id IN (SELECT authority_id FROM supervisor_scope) AND
         &mut self,
         owner: &CompletionDomainOwner,
     ) -> Result<(), String> {
+        self.publish_completion_owner_with_kernel_root(owner, None)
+    }
+
+    pub fn publish_completion_owner_with_kernel_root(
+        &mut self,
+        owner: &CompletionDomainOwner,
+        kernel_root_id: Option<&str>,
+    ) -> Result<(), String> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
-        if owner.protocol != PROTOCOL || domain_on(&tx)?.as_deref() != Some(&owner.domain_id) {
+        Self::publish_completion_owner_on(&tx, owner, kernel_root_id)?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    /// Shared by the v29 publisher and the v30 broker's atomic release. The
+    /// caller owns commit so no running owner can escape without its evidence.
+    pub(in crate::mailbox) fn publish_completion_owner_on(
+        tx: &Transaction<'_>,
+        owner: &CompletionDomainOwner,
+        kernel_root_id: Option<&str>,
+    ) -> Result<(), String> {
+        if let Some(root_id) = kernel_root_id {
+            let parsed = uuid::Uuid::parse_str(root_id).map_err(|_| "invalid kernel root ID")?;
+            if parsed.to_string() != root_id {
+                return Err("kernel root ID is not canonical".into());
+            }
+        }
+        if owner.protocol != PROTOCOL || domain_on(tx)?.as_deref() != Some(&owner.domain_id) {
             return Err("completion owner domain/protocol conflict".into());
         }
         let authority = uuid::Uuid::parse_str(&owner.supervisor_authority_id)
@@ -268,6 +413,25 @@ WHERE supervisor_authority_id IN (SELECT authority_id FROM supervisor_scope) AND
         }
         let encoded_guardian =
             serde_json::to_string(&owner.guardian_identity).map_err(|e| e.to_string())?;
+        if let Some(root_id) = kernel_root_id {
+            let moved: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM completion_continuation_owner
+                     WHERE kernel_root_id=?1 AND
+                     (domain_id!=?2 OR supervisor_authority_id!=?3 OR guardian_identity!=?4))",
+                    params![
+                        root_id,
+                        owner.domain_id,
+                        owner.supervisor_authority_id,
+                        encoded_guardian
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            if moved {
+                return Err("kernel root ID cannot move to another guardian or authority".into());
+            }
+        }
         let current_root: Option<(String, String)> = tx
             .query_row(
                 "SELECT supervisor_authority_id,guardian_identity
@@ -403,19 +567,20 @@ UPDATE completion_continuation_attempt SET phase='unknown_custody',revision=revi
         tx.execute(
             "INSERT INTO completion_continuation_owner(
                 generation,domain_id,phase,guardian_identity,driver_identity,
-                endpoint,supervisor_authority_id)
-             VALUES(?1,?2,'running',?3,?4,?5,?6)",
+                endpoint,supervisor_authority_id,kernel_root_id)
+             VALUES(?1,?2,'running',?3,?4,?5,?6,?7)",
             params![
                 owner.owner_generation,
                 owner.domain_id,
                 encoded_guardian,
                 serde_json::to_string(&owner.driver_identity).map_err(|e| e.to_string())?,
                 owner.endpoint,
-                owner.supervisor_authority_id
+                owner.supervisor_authority_id,
+                kernel_root_id,
             ],
         )
         .map_err(|e| e.to_string())?;
-        tx.commit().map_err(|e| e.to_string())
+        Ok(())
     }
 }
 
@@ -424,7 +589,14 @@ pub(in crate::mailbox) fn domain_on(conn: &Connection) -> Result<Option<String>,
     if !exists {
         return Ok(None);
     }
-    validate_schema_on(conn)?;
+    match super::schema::sidecar_version(conn)? {
+        33 => validate_broker_v33_schema_on(conn)?,
+        34 => validate_broker_v34_schema_on(conn)?,
+        version if version == super::schema::BROKER_OWNED_VERSION => {
+            validate_broker_schema_on(conn)?
+        }
+        _ => validate_schema_on(conn)?,
+    }
     conn.query_row("SELECT domain_id FROM completion_continuation_domain WHERE singleton=1 AND lineage='main-native-completion-v2'", [], |r| r.get(0)).optional().map_err(|e| e.to_string())
 }
 
@@ -455,23 +627,46 @@ pub(super) use attempts::{
 };
 
 pub(super) fn validate_schema_on(conn: &Connection) -> Result<(), String> {
+    validate_schema_version_on(conn, super::schema::CURRENT_VERSION, true)
+}
+
+pub(super) fn validate_broker_schema_on(conn: &Connection) -> Result<(), String> {
+    validate_schema_version_on(conn, super::schema::BROKER_OWNED_VERSION, true)
+}
+
+pub(super) fn validate_broker_v32_schema_on(conn: &Connection) -> Result<(), String> {
+    validate_schema_version_on(conn, 32, true)
+}
+
+pub(super) fn validate_broker_v33_schema_on(conn: &Connection) -> Result<(), String> {
+    validate_schema_version_on(conn, 33, true)
+}
+
+pub(super) fn validate_broker_v34_schema_on(conn: &Connection) -> Result<(), String> {
+    validate_schema_version_on(conn, 34, true)
+}
+
+// Historical v29 sources are still read for staged cutover. Their fingerprint
+// must not move when the ordinary current schema advances.
+pub(super) fn validate_v29_schema_on(conn: &Connection) -> Result<(), String> {
+    validate_schema_version_on(conn, 29, false)
+}
+
+fn validate_schema_version_on(
+    conn: &Connection,
+    required_version: i64,
+    include_uncertain: bool,
+) -> Result<(), String> {
     type Definition = (String, String, String);
-    static EXPECTED: std::sync::OnceLock<Result<Vec<Definition>, String>> =
+    static EXPECTED_V29: std::sync::OnceLock<Result<Vec<Definition>, String>> =
         std::sync::OnceLock::new();
-    fn definitions(conn: &Connection) -> Result<Vec<Definition>, String> {
+    static EXPECTED_CURRENT: std::sync::OnceLock<Result<Vec<Definition>, String>> =
+        std::sync::OnceLock::new();
+    fn definitions(conn: &Connection, include_uncertain: bool) -> Result<Vec<Definition>, String> {
         let mut statement = conn
             .prepare(
                 "SELECT type,name,sql FROM sqlite_master
-                 WHERE sql IS NOT NULL AND (
-                    name LIKE 'completion_continuation_%'
-                    OR name LIKE 'completion_supervisor_%'
-                    OR name LIKE 'completion_owner_supervisor_%'
-                    OR name LIKE 'completion_source_supervisor_%'
-                    OR name LIKE 'completion_attempt_supervisor_%'
-                    OR name='mailbox'
-                    OR name='mailbox_completion_provenance_immutable'
-                    OR name='mailbox_completion_provenance_insert_valid'
-                    OR name='mailbox_completion_provenance_update_valid')
+                 WHERE sql IS NOT NULL
                  ORDER BY type,name",
             )
             .map_err(|e| e.to_string())?;
@@ -480,6 +675,50 @@ pub(super) fn validate_schema_on(conn: &Connection) -> Result<(), String> {
                 let kind: String = r.get(0)?;
                 let name: String = r.get(1)?;
                 let mut sql: String = r.get(2)?;
+                // Filter the bounded schema catalog in memory. Evaluating a
+                // dozen LIKE arms in SQLite for every catalog row made an
+                // ordinary current-schema open exceed its VM-step ceiling.
+                // These are the fixed prefixes of the former SQLite LIKE
+                // patterns. SQLite treats '_' as one character and compares
+                // ASCII letters without case sensitivity by default.
+                let like_prefix = |pattern: &str| {
+                    let mut actual = name.chars();
+                    pattern.chars().all(|expected| {
+                        actual.next().is_some_and(|actual| {
+                            expected == '_' || expected.eq_ignore_ascii_case(&actual)
+                        })
+                    })
+                };
+                let selected = [
+                    "completion_continuation_",
+                    "completion_uncertain_input",
+                    "completion_native_grant_",
+                    "completion_native_worker_",
+                    "completion_native_kernel_",
+                    "completion_supervisor_",
+                    "completion_owner_supervisor_",
+                    "completion_source_supervisor_",
+                    "completion_attempt_supervisor_",
+                ]
+                .iter()
+                .any(|pattern| like_prefix(pattern))
+                    || matches!(
+                        name.as_str(),
+                        "mailbox"
+                            | "mailbox_completion_provenance_immutable"
+                            | "mailbox_completion_provenance_insert_valid"
+                            | "mailbox_completion_provenance_update_valid"
+                    )
+                    || (include_uncertain
+                        && matches!(
+                            name.as_str(),
+                            "idx_mailbox_deliverable_session_live"
+                                | "idx_mailbox_deliverable_target_live"
+                                | "idx_mailbox_deliverable_global"
+                        ));
+                if !selected {
+                    return Ok(None);
+                }
                 if name == "completion_continuation_attempt" {
                     // Synthetic older-version fixtures may retain v25's
                     // additive column while replaying v21's supervisor
@@ -524,57 +763,99 @@ pub(super) fn validate_schema_on(conn: &Connection) -> Result<(), String> {
                         }
                     }
                 }
-                Ok((kind, name, sql))
+                Ok(Some((kind, name, sql)))
             })
             .map_err(|e| e.to_string())?
             .map(|r| r.map_err(|e| e.to_string()))
-            .collect()
+            .collect::<Result<Vec<_>, _>>()
+            .map(|rows| rows.into_iter().flatten().collect())
     }
-    let expected = EXPECTED
-        .get_or_init(|| {
-            let expected = Connection::open_in_memory().map_err(|e| e.to_string())?;
-            expected
+    fn expected_definitions(include_uncertain: bool) -> Result<Vec<Definition>, String> {
+        let expected = Connection::open_in_memory().map_err(|e| e.to_string())?;
+        expected
                 .execute_batch("CREATE TABLE session_wake_claim(session_id TEXT,claim_token TEXT); CREATE TABLE completion_event_listener(event_id TEXT,listener_id TEXT,acknowledged_at TEXT,acknowledgement_reason TEXT,mailbox_seq INTEGER,PRIMARY KEY(event_id,listener_id));")
                 .map_err(|e| e.to_string())?;
-            expected
-                .execute_batch(include_str!(
-                    "../migrations/0018_completion_continuation.sql"
-                ))
-                .map_err(|e| e.to_string())?;
-            expected.execute_batch(include_str!("../migrations/0019_notification_settlement.sql"))
-                .map_err(|e| e.to_string())?;
-            expected
-                .execute_batch(include_str!(
-                    "../migrations/0021_completion_recovery_working_set.sql"
-                ))
-                .map_err(|e| e.to_string())?;
-            expected
-                .execute_batch(include_str!(
-                    "../migrations/0022_completion_native_runtime.sql"
-                ))
-                .map_err(|e| e.to_string())?;
-            expected.execute_batch(
-                "CREATE TABLE mailbox(completion_provenance TEXT NOT NULL DEFAULT 'unclassified');",
-            ).map_err(|e| e.to_string())?;
-            expected.execute_batch(super::schema::COMPLETION_PROVENANCE_TRIGGER_SQL)
-                .map_err(|e| e.to_string())?;
-            expected.execute_batch("ALTER TABLE completion_continuation_attempt
+        expected
+            .execute_batch(include_str!(
+                "../migrations/0018_completion_continuation.sql"
+            ))
+            .map_err(|e| e.to_string())?;
+        expected
+            .execute_batch(include_str!(
+                "../migrations/0019_notification_settlement.sql"
+            ))
+            .map_err(|e| e.to_string())?;
+        expected
+            .execute_batch(include_str!(
+                "../migrations/0021_completion_recovery_working_set.sql"
+            ))
+            .map_err(|e| e.to_string())?;
+        expected
+            .execute_batch(include_str!(
+                "../migrations/0022_completion_native_runtime.sql"
+            ))
+            .map_err(|e| e.to_string())?;
+        expected
+            .execute_batch(
+                "CREATE TABLE mailbox(seq INTEGER PRIMARY KEY,session_id TEXT,target_kind TEXT,
+                 target_id TEXT,delivered_at TEXT,delivery_error TEXT,
+                 completion_provenance TEXT NOT NULL DEFAULT 'unclassified');
+                 CREATE INDEX idx_mailbox_deliverable_session_live ON mailbox(seq);
+                 CREATE INDEX idx_mailbox_deliverable_target_live ON mailbox(seq);
+                 CREATE INDEX idx_mailbox_deliverable_global ON mailbox(seq);",
+            )
+            .map_err(|e| e.to_string())?;
+        expected
+            .execute_batch(super::schema::COMPLETION_PROVENANCE_TRIGGER_SQL)
+            .map_err(|e| e.to_string())?;
+        expected
+            .execute_batch(
+                "ALTER TABLE completion_continuation_attempt
             ADD COLUMN association_completeness TEXT NOT NULL DEFAULT 'unknown';
             ALTER TABLE completion_continuation_source
-            ADD COLUMN attempt_association_history TEXT NOT NULL DEFAULT 'unknown';")
+            ADD COLUMN attempt_association_history TEXT NOT NULL DEFAULT 'unknown';",
+            )
+            .map_err(|e| e.to_string())?;
+        expected
+            .execute_batch(include_str!(
+                "../migrations/0025_completion_attempt_sources.sql"
+            ))
+            .map_err(|e| e.to_string())?;
+        expected
+            .execute_batch(include_str!(
+                "../migrations/0026_completion_attempt_search_generation.sql"
+            ))
+            .map_err(|e| e.to_string())?;
+        expected
+            .execute_batch(include_str!("../migrations/0027_kernel_root_owner.sql"))
+            .map_err(|e| e.to_string())?;
+        expected
+            .execute_batch(include_str!("../migrations/0028_native_grant_binding.sql"))
+            .map_err(|e| e.to_string())?;
+        expected
+            .execute_batch(include_str!(
+                "../migrations/0029_native_worker_kernel_q.sql"
+            ))
+            .map_err(|e| e.to_string())?;
+        if include_uncertain {
+            expected
+                .execute_batch(include_str!("../migrations/0031_uncertain_activation.sql"))
                 .map_err(|e| e.to_string())?;
-            expected.execute_batch(include_str!("../migrations/0025_completion_attempt_sources.sql"))
-                .map_err(|e| e.to_string())?;
-            expected.execute_batch(include_str!("../migrations/0026_completion_attempt_search_generation.sql"))
-                .map_err(|e| e.to_string())?;
-            definitions(&expected)
-        })
-        .as_ref()
-        .map_err(Clone::clone)?;
+        }
+        definitions(&expected, include_uncertain)
+    }
+    let expected = if include_uncertain {
+        EXPECTED_CURRENT.get_or_init(|| expected_definitions(true))
+    } else {
+        EXPECTED_V29.get_or_init(|| expected_definitions(false))
+    }
+    .as_ref()
+    .map_err(Clone::clone)?;
     let version: i64 = conn
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .map_err(|e| e.to_string())?;
-    if version != super::schema::CURRENT_VERSION || definitions(conn)? != *expected {
+    let actual = definitions(conn, include_uncertain)?;
+    if version != required_version || actual != *expected {
         return Err(
             "unsupported_transition_required: completion domain schema lineage differs".into(),
         );
@@ -746,6 +1027,87 @@ mod tests {
         };
         db.publish_completion_continuation_owner(&owner).unwrap();
         (dir, db, owner)
+    }
+
+    #[test]
+    fn kernel_root_is_atomic_and_only_reused_for_same_guardian_succession() {
+        let (_dir, mut db, owner) = fixture();
+        assert_eq!(
+            db.completion_owner_kernel_root_id(&owner.owner_generation)
+                .unwrap(),
+            None
+        );
+        let root_id = uuid::Uuid::new_v4().to_string();
+        let mut pinned = owner.clone();
+        pinned.owner_generation = uuid::Uuid::new_v4().to_string();
+        pinned.supervisor_authority_id = uuid::Uuid::new_v4().to_string();
+        assert!(
+            db.publish_completion_owner_with_kernel_root(&pinned, Some("bad-root"))
+                .is_err()
+        );
+        assert_eq!(db.completion_continuation_owner().unwrap(), Some(owner));
+        db.publish_completion_owner_with_kernel_root(&pinned, Some(&root_id))
+            .unwrap();
+        assert_eq!(
+            db.completion_continuation_owner().unwrap(),
+            Some(pinned.clone())
+        );
+        assert_eq!(
+            db.completion_owner_kernel_root_id(&pinned.owner_generation)
+                .unwrap(),
+            Some(root_id.clone())
+        );
+        let mut replacement = pinned.clone();
+        replacement.owner_generation = uuid::Uuid::new_v4().to_string();
+        db.publish_completion_owner_with_kernel_root(&replacement, Some(&root_id))
+            .unwrap();
+        assert_eq!(
+            db.completion_owner_kernel_root_id(&replacement.owner_generation)
+                .unwrap(),
+            Some(root_id.clone())
+        );
+        let mut replay = replacement.clone();
+        replay.owner_generation = uuid::Uuid::new_v4().to_string();
+        replay.supervisor_authority_id = uuid::Uuid::new_v4().to_string();
+        assert!(
+            db.publish_completion_owner_with_kernel_root(&replay, Some(&root_id))
+                .is_err()
+        );
+        assert_eq!(
+            db.completion_continuation_owner().unwrap(),
+            Some(replacement)
+        );
+    }
+
+    #[test]
+    fn populated_v23_owner_upgrades_without_inventing_a_kernel_root() {
+        let (dir, db, owner) = fixture();
+        drop(db);
+        let path = dir.path().join("pid-identity.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE completion_native_kernel_q;
+                 DROP TABLE completion_native_worker_attach;
+                 DROP TRIGGER completion_native_grant_no_legacy_terminal;
+                 DROP TABLE completion_native_grant_binding;
+                 DROP INDEX completion_continuation_owner_kernel_root;
+                 ALTER TABLE completion_continuation_owner DROP COLUMN kernel_root_id;
+                 PRAGMA user_version=23;",
+            )
+            .unwrap();
+        drop(connection);
+        let upgraded = MailboxDb::open(&path).unwrap();
+        assert_eq!(
+            upgraded.completion_continuation_owner().unwrap(),
+            Some(owner.clone())
+        );
+        assert_eq!(
+            upgraded
+                .completion_owner_kernel_root_id(&owner.owner_generation)
+                .unwrap(),
+            None
+        );
     }
 
     fn explain(db: &MailboxDb, sql: &str, supervisor_authority_id: &str) -> Vec<String> {
@@ -1189,6 +1551,600 @@ mod tests {
         db.reserve_continuation_attempt(&attempt).unwrap();
         attempt
     }
+
+    #[test]
+    fn native_acceptance_reads_exact_running_owner_and_rolls_back_conflicts() {
+        let (_dir, mut db, old_owner) = fixture();
+        let root = uuid::Uuid::new_v4().to_string();
+        let mut owner = old_owner.clone();
+        owner.owner_generation = uuid::Uuid::new_v4().to_string();
+        owner.supervisor_authority_id = uuid::Uuid::new_v4().to_string();
+        db.publish_completion_owner_with_kernel_root(&owner, Some(&root))
+            .unwrap();
+        let attempt = reservation(&mut db, &owner);
+        let phase = |db: &MailboxDb| -> (String, i64) {
+            db.conn.query_row(
+                "SELECT phase,revision FROM completion_continuation_attempt WHERE attempt_id=?1",
+                [&attempt.attempt_id], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap()
+        };
+        let mut changed = attempt.clone();
+        changed.request_sha256 = "b".repeat(64);
+        assert!(
+            db.accept_exact_native_attempt(&changed, &owner, &root)
+                .is_err()
+        );
+        changed = attempt.clone();
+        changed.result_path = "/sibling/result.json".into();
+        assert!(
+            db.accept_exact_native_attempt(&changed, &owner, &root)
+                .is_err()
+        );
+        let mut wrong_owner = owner.clone();
+        wrong_owner.owner_generation = old_owner.owner_generation;
+        assert!(
+            db.accept_exact_native_attempt(&attempt, &wrong_owner, &root)
+                .is_err()
+        );
+        wrong_owner = owner.clone();
+        wrong_owner.guardian_identity.starttime_ticks += 1;
+        assert!(
+            db.accept_exact_native_attempt(&attempt, &wrong_owner, &root)
+                .is_err()
+        );
+        assert!(
+            db.accept_exact_native_attempt(&attempt, &owner, &uuid::Uuid::new_v4().to_string())
+                .is_err()
+        );
+        assert_eq!(phase(&db), ("reserved".into(), 1));
+        attempts::crash_after_native_update_once();
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = db.accept_exact_native_attempt(&attempt, &owner, &root);
+            }))
+            .is_err()
+        );
+        assert_eq!(phase(&db), ("reserved".into(), 1));
+        let accepted = db
+            .accept_exact_native_attempt(&attempt, &owner, &root)
+            .unwrap();
+        assert_eq!(accepted.attempt, attempt);
+        assert_eq!(accepted.kernel_root_id, root);
+        assert_eq!(accepted.guardian_identity, owner.guardian_identity);
+        assert_eq!(accepted.revision, 2);
+        assert_eq!(accepted.phase, "accepted");
+        assert!(!accepted.integrated);
+        assert!(accepted.custodian_identity.is_none());
+        assert_eq!(phase(&db), ("accepted".into(), 2));
+        assert!(
+            db.accept_exact_native_attempt(&attempt, &owner, &root)
+                .is_err()
+        );
+        assert_eq!(phase(&db), ("accepted".into(), 2));
+        assert!(db.conn.execute(
+            "UPDATE completion_continuation_attempt SET result_path='/replaced',revision=3 WHERE attempt_id=?1",
+            [&attempt.attempt_id],
+        ).is_err());
+        assert!(
+            db.conn
+                .execute(
+                    "DELETE FROM completion_continuation_attempt WHERE attempt_id=?1",
+                    [&attempt.attempt_id],
+                )
+                .is_err()
+        );
+        assert_eq!(phase(&db), ("accepted".into(), 2));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_acceptance_rejects_stale_sqlite_connection_after_copied_file_swap() {
+        use std::os::unix::fs::MetadataExt;
+
+        let (dir, mut db, old_owner) = fixture();
+        let path = dir.path().join("pid-identity.db");
+        let held = dir.path().join("held-pid-identity.db");
+        let copied = dir.path().join("copied-pid-identity.db");
+        let root = uuid::Uuid::new_v4().to_string();
+        let mut owner = old_owner;
+        owner.owner_generation = uuid::Uuid::new_v4().to_string();
+        owner.supervisor_authority_id = uuid::Uuid::new_v4().to_string();
+        db.publish_completion_owner_with_kernel_root(&owner, Some(&root))
+            .unwrap();
+        let attempt = reservation(&mut db, &owner);
+        db.conn
+            .execute("VACUUM INTO ?1", [copied.to_str().unwrap()])
+            .unwrap();
+
+        // The copied database contains the exact reservation and owner rows.
+        // Their equality cannot make it the file used by this live connection.
+        let copied_row: (String, i64) = rusqlite::Connection::open_with_flags(
+            &copied,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap()
+        .query_row(
+            "SELECT phase,revision FROM completion_continuation_attempt WHERE attempt_id=?1",
+            [&attempt.attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+        assert_eq!(copied_row, ("reserved".into(), 1));
+        let original_inode = std::fs::metadata(&path).unwrap().ino();
+        std::fs::rename(&path, &held).unwrap();
+        std::fs::rename(&copied, &path).unwrap();
+        assert_ne!(std::fs::metadata(&path).unwrap().ino(), original_inode);
+        let error = db
+            .accept_exact_native_attempt(&attempt, &owner, &root)
+            .unwrap_err();
+        assert!(error.contains("SQLite main file moved"), "{error}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_binding_rejects_name_replaced_after_acceptance_with_copied_row() {
+        use std::os::unix::fs::MetadataExt;
+
+        let (dir, mut db, old_owner) = fixture();
+        let path = dir.path().join("pid-identity.db");
+        let held = dir.path().join("held-pid-identity.db");
+        let copied = dir.path().join("copied-pid-identity.db");
+        let root = uuid::Uuid::new_v4().to_string();
+        let mut owner = old_owner;
+        owner.owner_generation = uuid::Uuid::new_v4().to_string();
+        owner.supervisor_authority_id = uuid::Uuid::new_v4().to_string();
+        db.publish_completion_owner_with_kernel_root(&owner, Some(&root))
+            .unwrap();
+        let attempt = reservation(&mut db, &owner);
+        let accepted = db
+            .accept_exact_native_attempt(&attempt, &owner, &root)
+            .unwrap();
+        db.conn
+            .execute("VACUUM INTO ?1", [copied.to_str().unwrap()])
+            .unwrap();
+        let copied_row: (String, i64) = rusqlite::Connection::open_with_flags(
+            &copied,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap()
+        .query_row(
+            "SELECT phase,revision FROM completion_continuation_attempt WHERE attempt_id=?1",
+            [&attempt.attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+        assert_eq!(copied_row, ("accepted".into(), 2));
+        let original_inode = std::fs::metadata(&path).unwrap().ino();
+        std::fs::rename(&path, &held).unwrap();
+        std::fs::rename(&copied, &path).unwrap();
+        assert_ne!(std::fs::metadata(&path).unwrap().ino(), original_inode);
+        let error = db
+            .bind_exact_native_grant(
+                &accepted,
+                &uuid::Uuid::new_v4().to_string(),
+                &"b".repeat(64),
+            )
+            .unwrap_err();
+        assert!(error.contains("SQLite main file moved"), "{error}");
+    }
+
+    #[test]
+    fn native_grant_binding_is_exact_one_to_one_and_survives_reply_loss() {
+        let (dir, mut db, old_owner) = fixture();
+        let root = uuid::Uuid::new_v4().to_string();
+        let mut owner = old_owner.clone();
+        owner.owner_generation = uuid::Uuid::new_v4().to_string();
+        owner.supervisor_authority_id = uuid::Uuid::new_v4().to_string();
+        db.publish_completion_owner_with_kernel_root(&owner, Some(&root))
+            .unwrap();
+        let attempt = reservation(&mut db, &owner);
+        let accepted = db
+            .accept_exact_native_attempt(&attempt, &owner, &root)
+            .unwrap();
+        let first_grant = uuid::Uuid::new_v4().to_string();
+        let request_digest = "b".repeat(64);
+        let mut wrong = accepted.clone();
+        wrong.kernel_root_id = uuid::Uuid::new_v4().to_string();
+        assert!(
+            db.bind_exact_native_grant(&wrong, &first_grant, &request_digest)
+                .is_err()
+        );
+        wrong = accepted.clone();
+        wrong.guardian_identity.starttime_ticks += 1;
+        assert!(
+            db.bind_exact_native_grant(&wrong, &first_grant, &request_digest)
+                .is_err()
+        );
+        wrong = accepted.clone();
+        wrong.attempt.result_path = "/sibling/result.json".into();
+        assert!(
+            db.bind_exact_native_grant(&wrong, &first_grant, &request_digest)
+                .is_err()
+        );
+        assert!(
+            db.bind_exact_native_grant(&accepted, "not-a-grant", &request_digest)
+                .is_err()
+        );
+        assert!(
+            db.bind_exact_native_grant(&accepted, &first_grant, "bad-digest")
+                .is_err()
+        );
+        assert!(
+            db.native_grant_binding(&attempt.attempt_id)
+                .unwrap()
+                .is_none()
+        );
+
+        let bound = db
+            .bind_exact_native_grant(&accepted, &first_grant, &request_digest)
+            .unwrap();
+        assert_eq!(bound.accepted_revision, 2);
+        assert_eq!(bound.kernel_root_id, root);
+        assert_eq!(bound.guardian_identity, owner.guardian_identity);
+        assert_eq!(bound.custodian_request_sha256, request_digest);
+        assert_eq!(
+            db.native_grant_binding(&attempt.attempt_id).unwrap(),
+            Some(bound.clone())
+        );
+        assert!(
+            db.bind_exact_native_grant(&accepted, &first_grant, &request_digest)
+                .is_err()
+        );
+        assert!(
+            db.bind_exact_native_grant(
+                &accepted,
+                &uuid::Uuid::new_v4().to_string(),
+                &request_digest
+            )
+            .is_err()
+        );
+
+        // Another accepted sibling cannot reuse this grant even with the same
+        // live guardian/root. The unique grant index rejects the insertion.
+        let mut sibling = attempt.clone();
+        sibling.attempt_id = uuid::Uuid::new_v4().to_string();
+        sibling.session_id = Some("sibling-session".into());
+        sibling.claim_token = Some("sibling-token".into());
+        db.conn.execute("INSERT INTO session_wake_claim(session_id,claim_token,claimed_at,reason,auto_wake_count) VALUES('sibling-session','sibling-token','2026-09-12T00:00:00Z','fixture',1)",[]).unwrap();
+        db.reserve_continuation_attempt(&sibling).unwrap();
+        let sibling_accepted = db
+            .accept_exact_native_attempt(&sibling, &owner, &root)
+            .unwrap();
+        assert!(
+            db.bind_exact_native_grant(&sibling_accepted, &first_grant, &request_digest)
+                .is_err()
+        );
+        assert!(
+            db.native_grant_binding(&sibling.attempt_id)
+                .unwrap()
+                .is_none()
+        );
+
+        let path = dir.path().join("pid-identity.db");
+        drop(db); // the caller lost the response but the one binding committed
+        let reopened = MailboxDb::open(&path).unwrap();
+        assert_eq!(
+            reopened.native_grant_binding(&attempt.attempt_id).unwrap(),
+            Some(bound)
+        );
+        let plan: String = reopened.conn.query_row(
+            "EXPLAIN QUERY PLAN SELECT grant_id FROM completion_native_grant_binding WHERE attempt_id=?1",
+            [&attempt.attempt_id], |row| row.get(3),
+        ).unwrap();
+        assert!(
+            plan.contains("sqlite_autoindex_completion_native_grant_binding_1"),
+            "{plan}"
+        );
+        assert!(reopened.conn.execute("UPDATE completion_native_grant_binding SET grant_id='replacement' WHERE attempt_id=?1", [&attempt.attempt_id]).is_err());
+        assert!(
+            reopened
+                .conn
+                .execute(
+                    "DELETE FROM completion_native_grant_binding WHERE attempt_id=?1",
+                    [&attempt.attempt_id]
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn native_grant_binding_is_part_of_current_schema_fingerprint() {
+        let (_dir, db, _) = fixture();
+        db.conn
+            .execute_batch("DROP TRIGGER completion_native_grant_binding_immutable")
+            .unwrap();
+        assert!(validate_schema_on(&db.conn).is_err());
+    }
+
+    #[test]
+    fn native_attach_and_q_are_exact_independent_debts() {
+        let (dir, mut db, old_owner) = fixture();
+        let root = uuid::Uuid::new_v4().to_string();
+        let mut owner = old_owner;
+        owner.owner_generation = uuid::Uuid::new_v4().to_string();
+        owner.supervisor_authority_id = uuid::Uuid::new_v4().to_string();
+        db.publish_completion_owner_with_kernel_root(&owner, Some(&root))
+            .unwrap();
+        let attempt = reservation(&mut db, &owner);
+        let accepted = db
+            .accept_exact_native_attempt(&attempt, &owner, &root)
+            .unwrap();
+        let bound = db
+            .bind_exact_native_grant(
+                &accepted,
+                &uuid::Uuid::new_v4().to_string(),
+                &"b".repeat(64),
+            )
+            .unwrap();
+        let worker = SourceProcessIdentity {
+            pid: owner.guardian_identity.pid + 1000,
+            boot_id: owner.guardian_identity.boot_id.clone(),
+            starttime_ticks: owner.guardian_identity.starttime_ticks + 1000,
+        };
+        let pid1 = SourceProcessIdentity {
+            pid: worker.pid + 1,
+            boot_id: worker.boot_id.clone(),
+            starttime_ticks: worker.starttime_ticks + 1,
+        };
+        let evidence = BrokerNativeAttachEvidence {
+            protocol: "native-worker-attach-v1".into(),
+            gate_held_before_release: true,
+            attempt_id: attempt.attempt_id.clone(),
+            grant_id: bound.grant_id.clone(),
+            kernel_root_id: root.clone(),
+            work_id: "native-work-a".into(),
+            work_incarnation_id: uuid::Uuid::new_v4().to_string(),
+            broker_incarnation_id: uuid::Uuid::new_v4().to_string(),
+            worker_entrypoint: NATIVE_ROOT_WORKER_ENTRY.into(),
+            runner_image_sha256: "a".repeat(64),
+            worker_identity: worker.clone(),
+            pid1_identity: pid1.clone(),
+            work_pid_namespace_inode: 12345,
+            attach_receipt_sha256: "c".repeat(64),
+        };
+        let unattached = NativeWorkerAttach {
+            attempt_id: attempt.attempt_id.clone(),
+            grant_id: bound.grant_id.clone(),
+            evidence: evidence.clone(),
+        };
+        let q = BrokerNativeKernelQEvidence {
+            protocol: "native-kernel-q-v1".into(),
+            attempt_id: attempt.attempt_id.clone(),
+            grant_id: bound.grant_id.clone(),
+            kernel_root_id: root.clone(),
+            work_id: evidence.work_id.clone(),
+            work_incarnation_id: evidence.work_incarnation_id.clone(),
+            observing_broker_incarnation_id: uuid::Uuid::new_v4().to_string(),
+            worker_identity: worker.clone(),
+            pid1_identity: pid1.clone(),
+            work_pid_namespace_inode: evidence.work_pid_namespace_inode,
+            pid1_wait_status: 0,
+            pid1_reaped: true,
+            remaining_work_processes: 0,
+            terminal_receipt_sha256: "d".repeat(64),
+        };
+        assert!(db.settle_broker_native_kernel_q(&unattached, &q).is_err());
+        assert!(db.native_kernel_q(&attempt.attempt_id).unwrap().is_none());
+        let mut bad_binding = bound.clone();
+        bad_binding.kernel_root_id = uuid::Uuid::new_v4().to_string();
+        assert!(
+            db.attach_broker_native_worker(&bad_binding, &evidence)
+                .is_err()
+        );
+        bad_binding = bound.clone();
+        bad_binding.owner_generation = uuid::Uuid::new_v4().to_string();
+        assert!(
+            db.attach_broker_native_worker(&bad_binding, &evidence)
+                .is_err()
+        );
+        for invalid in [
+            BrokerNativeAttachEvidence {
+                gate_held_before_release: false,
+                ..evidence.clone()
+            },
+            BrokerNativeAttachEvidence {
+                work_pid_namespace_inode: 0,
+                ..evidence.clone()
+            },
+            BrokerNativeAttachEvidence {
+                worker_identity: pid1.clone(),
+                ..evidence.clone()
+            },
+            BrokerNativeAttachEvidence {
+                attach_receipt_sha256: "invalid".into(),
+                ..evidence.clone()
+            },
+            BrokerNativeAttachEvidence {
+                worker_entrypoint: "arbitrary-worker".into(),
+                ..evidence.clone()
+            },
+            BrokerNativeAttachEvidence {
+                runner_image_sha256: "invalid".into(),
+                ..evidence.clone()
+            },
+            BrokerNativeAttachEvidence {
+                attempt_id: uuid::Uuid::new_v4().to_string(),
+                ..evidence.clone()
+            },
+            BrokerNativeAttachEvidence {
+                grant_id: uuid::Uuid::new_v4().to_string(),
+                ..evidence.clone()
+            },
+            BrokerNativeAttachEvidence {
+                kernel_root_id: uuid::Uuid::new_v4().to_string(),
+                ..evidence.clone()
+            },
+        ] {
+            assert!(db.attach_broker_native_worker(&bound, &invalid).is_err());
+        }
+        assert!(
+            db.native_worker_attach(&attempt.attempt_id)
+                .unwrap()
+                .is_none()
+        );
+        let attached = db.attach_broker_native_worker(&bound, &evidence).unwrap();
+        assert_eq!(attached, unattached);
+        assert!(db.attach_broker_native_worker(&bound, &evidence).is_err());
+        let mut wrong_attach = attached.clone();
+        wrong_attach.evidence.worker_identity.starttime_ticks += 1; // same PID, reused incarnation
+        assert!(db.settle_broker_native_kernel_q(&wrong_attach, &q).is_err());
+        wrong_attach = attached.clone();
+        wrong_attach.evidence.work_incarnation_id = uuid::Uuid::new_v4().to_string();
+        assert!(db.settle_broker_native_kernel_q(&wrong_attach, &q).is_err());
+        wrong_attach = attached.clone();
+        wrong_attach.grant_id = uuid::Uuid::new_v4().to_string();
+        assert!(db.settle_broker_native_kernel_q(&wrong_attach, &q).is_err());
+        for invalid in [
+            BrokerNativeKernelQEvidence {
+                pid1_reaped: false,
+                ..q.clone()
+            },
+            BrokerNativeKernelQEvidence {
+                remaining_work_processes: 1,
+                ..q.clone()
+            },
+            BrokerNativeKernelQEvidence {
+                pid1_identity: SourceProcessIdentity {
+                    starttime_ticks: pid1.starttime_ticks + 1,
+                    ..pid1.clone()
+                },
+                ..q.clone()
+            },
+            BrokerNativeKernelQEvidence {
+                worker_identity: SourceProcessIdentity {
+                    starttime_ticks: worker.starttime_ticks + 1,
+                    ..worker.clone()
+                },
+                ..q.clone()
+            },
+            BrokerNativeKernelQEvidence {
+                terminal_receipt_sha256: evidence.attach_receipt_sha256.clone(),
+                ..q.clone()
+            },
+            BrokerNativeKernelQEvidence {
+                attempt_id: uuid::Uuid::new_v4().to_string(),
+                ..q.clone()
+            },
+            BrokerNativeKernelQEvidence {
+                grant_id: uuid::Uuid::new_v4().to_string(),
+                ..q.clone()
+            },
+            BrokerNativeKernelQEvidence {
+                kernel_root_id: uuid::Uuid::new_v4().to_string(),
+                ..q.clone()
+            },
+            BrokerNativeKernelQEvidence {
+                work_id: "other-work".into(),
+                ..q.clone()
+            },
+            BrokerNativeKernelQEvidence {
+                work_incarnation_id: uuid::Uuid::new_v4().to_string(),
+                ..q.clone()
+            },
+        ] {
+            assert!(
+                db.settle_broker_native_kernel_q(&attached, &invalid)
+                    .is_err()
+            );
+        }
+        assert!(db.native_kernel_q(&attempt.attempt_id).unwrap().is_none());
+        let settled = db.settle_broker_native_kernel_q(&attached, &q).unwrap();
+        assert!(db.settle_broker_native_kernel_q(&attached, &q).is_err());
+        // Q is not worker result, gate release, source ACK, or claim integration.
+        let (phase, revision, integrated): (String, i64, i64) = db.conn.query_row(
+            "SELECT phase,revision,integrated FROM completion_continuation_attempt WHERE attempt_id=?1",
+            [&attempt.attempt_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).unwrap();
+        assert_eq!((phase, revision, integrated), ("accepted".into(), 2, 0));
+        let claim: i64 = db.conn.query_row("SELECT count(*) FROM session_wake_claim WHERE session_id='session' AND claim_token='token'", [], |r|r.get(0)).unwrap();
+        assert_eq!(claim, 1);
+        assert!(
+            db.record_continuation_never_forked(&attempt, "guessed gate failure")
+                .is_err()
+        );
+        assert!(db.conn.execute("UPDATE completion_continuation_attempt SET phase='drained',revision=3,integrated=1,drain_receipt='ECHILD' WHERE attempt_id=?1", [&attempt.attempt_id]).is_err());
+        assert!(db.conn.execute("DELETE FROM session_wake_claim WHERE session_id='session' AND claim_token='token'", []).is_err());
+        assert!(db.conn.execute("UPDATE completion_native_worker_attach SET work_id='reused' WHERE attempt_id=?1", [&attempt.attempt_id]).is_err());
+        assert!(
+            db.conn
+                .execute(
+                    "DELETE FROM completion_native_kernel_q WHERE attempt_id=?1",
+                    [&attempt.attempt_id]
+                )
+                .is_err()
+        );
+        let mut sibling = attempt.clone();
+        sibling.attempt_id = uuid::Uuid::new_v4().to_string();
+        sibling.session_id = Some("sibling-session".into());
+        sibling.claim_token = Some("sibling-token".into());
+        db.conn.execute("INSERT INTO session_wake_claim(session_id,claim_token,claimed_at,reason,auto_wake_count) VALUES('sibling-session','sibling-token','2026-09-12T00:00:00Z','fixture',1)",[]).unwrap();
+        db.reserve_continuation_attempt(&sibling).unwrap();
+        let sibling_accepted = db
+            .accept_exact_native_attempt(&sibling, &owner, &root)
+            .unwrap();
+        let sibling_bound = db
+            .bind_exact_native_grant(
+                &sibling_accepted,
+                &uuid::Uuid::new_v4().to_string(),
+                &"e".repeat(64),
+            )
+            .unwrap();
+        assert!(
+            db.attach_broker_native_worker(&sibling_bound, &evidence)
+                .is_err()
+        );
+        assert!(
+            db.native_worker_attach(&sibling.attempt_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(db.native_kernel_q(&sibling.attempt_id).unwrap().is_none());
+        let mut sibling_evidence = evidence.clone();
+        sibling_evidence.work_id = uuid::Uuid::new_v4().to_string();
+        sibling_evidence.work_incarnation_id = uuid::Uuid::new_v4().to_string();
+        sibling_evidence.attempt_id = sibling.attempt_id.clone();
+        sibling_evidence.grant_id = sibling_bound.grant_id.clone();
+        sibling_evidence.kernel_root_id = root.clone();
+        sibling_evidence.worker_identity.pid += 200;
+        sibling_evidence.worker_identity.starttime_ticks += 200;
+        sibling_evidence.pid1_identity.pid += 200;
+        sibling_evidence.pid1_identity.starttime_ticks += 200;
+        sibling_evidence.attach_receipt_sha256 = "f".repeat(64);
+        db.attach_broker_native_worker(&sibling_bound, &sibling_evidence)
+            .unwrap();
+        let sibling_attach = db
+            .native_worker_attach(&sibling.attempt_id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            db.settle_broker_native_kernel_q(&sibling_attach, &q)
+                .is_err()
+        );
+        assert!(db.native_kernel_q(&sibling.attempt_id).unwrap().is_none());
+        let path = dir.path().join("pid-identity.db");
+        drop(db); // lost attach/Q replies are recovered by exact indexed reads
+        let reopened = MailboxDb::open(&path).unwrap();
+        assert_eq!(
+            reopened.native_worker_attach(&attempt.attempt_id).unwrap(),
+            Some(attached)
+        );
+        assert_eq!(
+            reopened.native_kernel_q(&attempt.attempt_id).unwrap(),
+            Some(settled)
+        );
+        for table in [
+            "completion_native_worker_attach",
+            "completion_native_kernel_q",
+        ] {
+            let sql =
+                format!("EXPLAIN QUERY PLAN SELECT grant_id FROM {table} WHERE attempt_id=?1");
+            let plan: String = reopened
+                .conn
+                .query_row(&sql, [&attempt.attempt_id], |r| r.get(3))
+                .unwrap();
+            assert!(plan.contains("sqlite_autoindex"), "{plan}");
+        }
+    }
     #[test]
     fn original_birth_attachment_retry_closes_current_generation_start_authority() {
         let (_dir, mut db, owner) = fixture();
@@ -1604,6 +2560,132 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn never_forked_activation_keeps_submitted_input_retryable() {
+        let (_dir, mut db, owner) = fixture();
+        let result = db
+            .enqueue_submitted_input(&crate::mailbox::SubmittedInputEnqueue {
+                submission_token: "pre-effect",
+                target: crate::mailbox::InboxTarget {
+                    kind: crate::mailbox::InboxTargetKind::Session,
+                    id: "session",
+                },
+                input: b"safe-retry",
+            })
+            .unwrap();
+        let crate::mailbox::EnqueueResult::Inserted(row) = result else {
+            panic!("fixture input was not inserted");
+        };
+        let attempt = reservation(&mut db, &owner);
+        db.conn
+            .execute(
+                "UPDATE session_wake_claim
+                 SET min_pending_seq_at_claim=?1,max_pending_seq_at_claim=?1
+                 WHERE session_id='session'",
+                [row.seq],
+            )
+            .unwrap();
+        db.accept_continuation_attempt(&attempt).unwrap();
+        db.record_continuation_never_forked(&attempt, "worker_not_forked")
+            .unwrap();
+        assert_eq!(db.uncertain_activation_input_count("session").unwrap(), 0);
+        assert_eq!(db.pending_delivery_count("session", None).unwrap(), 1);
+        assert!(
+            db.wake_session_reader()
+                .wake_claim("session")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn drained_activation_fences_only_exact_claim_rows_across_restart_and_manual_ack() {
+        let (dir, mut db, owner) = fixture();
+        let enqueue = |db: &mut MailboxDb, token: &str| {
+            let crate::mailbox::EnqueueResult::Inserted(row) = db
+                .enqueue_submitted_input(&crate::mailbox::SubmittedInputEnqueue {
+                    submission_token: token,
+                    target: crate::mailbox::InboxTarget {
+                        kind: crate::mailbox::InboxTargetKind::Session,
+                        id: "session",
+                    },
+                    input: token.as_bytes(),
+                })
+                .unwrap()
+            else {
+                panic!("fixture input was not inserted");
+            };
+            row.seq
+        };
+        let first = enqueue(&mut db, "selected-first");
+        let second = enqueue(&mut db, "selected-second");
+        let attempt = reservation(&mut db, &owner);
+        db.conn
+            .execute(
+                "UPDATE session_wake_claim SET min_pending_seq_at_claim=?1,
+             max_pending_seq_at_claim=?2 WHERE session_id='session' AND claim_token='token'",
+                rusqlite::params![first, second],
+            )
+            .unwrap();
+        let later = enqueue(&mut db, "unrelated-later");
+        db.accept_continuation_attempt(&attempt).unwrap();
+        db.attach_continuation_custodian(&attempt, &owner.driver_identity)
+            .unwrap();
+        db.advance_continuation_attempt(
+            &attempt,
+            3,
+            "accepted",
+            "starting",
+            &owner.driver_identity,
+        )
+        .unwrap();
+        db.discharge_continuation_attempt(&attempt, &owner.driver_identity, "ECHILD")
+            .unwrap();
+        let fenced = db
+            .conn
+            .prepare("SELECT mailbox_seq FROM completion_uncertain_input ORDER BY mailbox_seq")
+            .unwrap()
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(fenced, vec![first, second]);
+        assert_eq!(db.uncertain_activation_input_count("session").unwrap(), 2);
+        assert_eq!(db.pending_delivery_count("session", None).unwrap(), 1);
+        let later_error: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT delivery_error FROM mailbox WHERE seq=?1",
+                [later],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(later_error, None);
+        assert!(
+            db.mark_delivery_failed("session", None, &[first], "transient")
+                .is_err()
+        );
+        drop(db);
+        let mut reopened = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        assert_eq!(
+            reopened
+                .uncertain_activation_input_count("session")
+                .unwrap(),
+            2
+        );
+        assert_eq!(reopened.pending_delivery_count("session", None).unwrap(), 1);
+        reopened
+            .acknowledge_range("session", first, first, "manual")
+            .unwrap();
+        assert_eq!(
+            reopened
+                .uncertain_activation_input_count("session")
+                .unwrap(),
+            1
+        );
+        assert_eq!(reopened.pending_delivery_count("session", None).unwrap(), 1);
     }
 
     #[test]

@@ -24,11 +24,12 @@ pub(crate) fn run_repl(
     working_dir: Option<&Path>,
     models_dir_override: Option<&Path>,
 ) -> Result<i32, String> {
-    crate::wake_coordinator::start_wake_reclaim_maintenance_driver();
-
     if let Some(session_id) = resume {
+        crate::completion_owner::require_unqualified_legacy_session(session_id)?;
         crate::run::resume::validate_resume_input(session_id)?;
     }
+
+    crate::wake_coordinator::start_wake_reclaim_maintenance_driver();
 
     let mut prepared = execution::prepare_repl_execution(
         agent_runtime_services,

@@ -16,6 +16,7 @@
 - `crates/oulipoly-state/src/db/invocation_timestamp_contract.rs`
 - `crates/oulipoly-state/src/db/opening_migrations.rs`
 - `crates/oulipoly-state/src/db/opening_write.rs`
+- `crates/oulipoly-state/src/db/ownership_authority.rs`
 - `crates/oulipoly-state/src/db/resume_lookup.rs`
 - `crates/oulipoly-state/src/db/resume_resolution.rs`
 - `crates/oulipoly-state/src/db/resume_types.rs`
@@ -27,15 +28,40 @@
 - `crates/oulipoly-state/src/live_history.rs`
 - `crates/oulipoly-state/src/lifecycle_log.rs`
 - `crates/oulipoly-state/src/mailbox.rs`
+- `crates/oulipoly-state/src/mailbox/broker_authority.rs`
+- `crates/oulipoly-state/src/mailbox/fresh_lane.rs`
+- `crates/oulipoly-state/src/mailbox/fresh_bash_child.rs`
+- `crates/oulipoly-state/src/mailbox/fresh_bash_source.rs`
+- `crates/oulipoly-state/src/mailbox/fresh_bash_notify.rs`
+- `crates/oulipoly-state/src/mailbox/fresh_bash_listener.rs`
+- `crates/oulipoly-state/src/mailbox/fresh_root_terminal.rs`
+- `crates/oulipoly-state/src/mailbox/migrations/0031_fresh_released_handoff.sql`
+- `crates/oulipoly-state/src/mailbox/migrations/0032_fresh_root_effect.sql`
+- `crates/oulipoly-state/src/mailbox/migrations/0033_fresh_bash_child.sql`
+- `crates/oulipoly-state/src/mailbox/migrations/0034_fresh_normal_work.sql`
+- `crates/oulipoly-state/src/mailbox/migrations/0035_fresh_bash_source.sql`
+- `crates/oulipoly-state/src/mailbox/migrations/0036_fresh_bash_notify.sql`
+- `crates/oulipoly-state/src/mailbox/migrations/0037_fresh_bash_listener.sql`
+- `crates/oulipoly-state/src/mailbox/migrations/0038_fresh_root_terminal.sql`
+- `crates/oulipoly-state/src/mailbox/migrations/0039_fresh_recipient_ack.sql`
+- `crates/oulipoly-state/src/mailbox/migrations/0030_fresh_state_identity.sql`
+- `crates/oulipoly-state/tests/age319_fresh_dual_lane.rs`
+- `crates/oulipoly-state/src/mailbox/fresh_recipient.rs`
+- `crates/oulipoly-state/src/mailbox/migrations/0030_fresh_recipient.sql`
+- `crates/oulipoly-state/src/mailbox/migrations/0030_fresh_recipient_state.sql`
 - `crates/oulipoly-state/src/mailbox/completion_continuation/attempts.rs`
 - `crates/oulipoly-state/src/mailbox/completion_continuation/mod.rs`
 - `crates/oulipoly-state/src/mailbox/completion_continuation/notification.rs`
 - `crates/oulipoly-state/src/mailbox/retention.rs`
 - `crates/oulipoly-state/src/mailbox/schema.rs`
+- `crates/oulipoly-state/src/mailbox/completion_continuation/mod.rs`
 - `crates/oulipoly-state/src/mailbox/migrations/0022_live_history_barrier.sql`
 - `crates/oulipoly-state/src/mailbox/migrations/0023_record_timestamp_contract.sql`
 - `crates/oulipoly-state/src/mailbox/migrations/0024_completion_mailbox_provenance.sql`
 - `crates/oulipoly-state/src/mailbox/migrations/0024_completion_mailbox_provenance_trigger.sql`
+- `crates/oulipoly-state/src/mailbox/migrations/0025_completion_attempt_sources.sql`
+- `crates/oulipoly-state/src/mailbox/migrations/0026_completion_attempt_search_generation.sql`
+- `crates/oulipoly-state/src/mailbox/migrations/0027_kernel_root_owner.sql`
 - `crates/oulipoly-state/migrations/0012_session_ingress_evidence.sql`
 - `crates/oulipoly-state/migrations/0026_live_history_barrier.sql`
 - `crates/oulipoly-state/migrations/0027_record_timestamp_contract.sql`
@@ -92,8 +118,17 @@
 |-----------------|-----------------|
 | Fresh deployment, no DB file. | `db.rs` opens (creating), `migrations.rs` applies the full schema in one transaction, `schema_probe.rs` reports the resulting version. |
 | Existing DB at current version. | Open succeeds without migration writes; `schema_probe.rs` confirms version match. |
+| Pinned kernel guardian publishes a completion owner. | Sidecar v24 stores its root UUID in the same transaction as domain, supervisor, guardian, and driver identity; a replacement driver may reuse the root only beneath that exact guardian and authority. |
 | Existing DB one or more versions behind. | `migrations.rs` runs forward migrations in order; row-version triggers apply per `row_version/triggers_sql/`. |
 | Existing DB at a FUTURE version. | Open fails with `SchemaTooNew` carrying actual and expected versions; do NOT downgrade. |
+| A quiesced complete v29 sidecar copy is placed under broker-controlled root-only storage. | Explicit activation stamps v30 and a broker-minted source generation in one transaction; a retained broker connection reopens the same WAL database after restart. Ordinary v29 sidecar writers refuse v30. This does not authorize native K or cut over the user-side callers. |
+| A broker-pinned Bash process in an already released root asks for a private v30 child reservation. | One immutable request row binds the exact actor and root, then a separate D/session, child invocation with the root as parent, `ab30_` handle and registration digest are committed and reread. A duplicate request returns the same identity; a changed actor or parent refuses. The private one-use effect/result rows grant no production work or physical drain. |
+| Original Bash C registers its listener policy. | State retains exact response-only or notify policy with C/D, source, attempt, original root recipient, and owner generation. Same-ID C/c readback refuses changed policy. |
+| The broker freezes a Bash child source event after consumed child K and physical Q. | State checks C/D, parent consumed K/work, child K/exit/drain/PID1 wait and original output bytes against the broker's captured receipt. Selected W and accepted-source fact commit together; interrupted acceptance is repaired from the same event without a new K. Bash O cannot substitute for physical output. |
+| An original notify listener settles an accepted W, or the pinned root explicitly requests notification. | State retains the exact request and original recipient attachment before sidecar F materialization from verified raw stdout/stderr. Restart repairs partial materialization from the same W. Response-only W alone produces no F; F submission and token ACK remain separate, and offline pending delivery is not settled by repair. |
+| A private released root reaches complete physical provider Q, with an optional accepted Bash W. | An immutable terminal row binds D/handoff, J/session, original actor/owner generation, independently checked parent K/Q/hashed output and exact child C/D/K/Q/W when present. Readback derives listener F/ACK and caller publication separately; unknown or submitted F is pending, manual ACK is labeled, and publication unknown cannot turn work into failure or replay. Missing physical evidence stays explicit unknown. |
+| A fresh recipient manually or delegated-manually acknowledges an exact F grant. | The same transaction records an immutable ACK evidence row joining the delivery row, grant, token digest, recipient, accepted source and retained payload with the manual or delegated basis. A zero-row update, legacy listener row, or ACKed grant without this evidence cannot make terminal readback report ACK. |
+| A released root with typed normal CLI intent reaches fresh preparation. | One immutable `held` row binds the exact U/D handoff, invocation, session, actor and intent. Retry reads that row; there is no provider fork, native K/Q, result or physical-drain transition. |
 | Existing DB at a known-incompatible past version (no migration path). | Open fails with `MigrationUnsupported`; advise the operator to reset or restore. |
 | Concurrent reader during writer migration. | SQLite WAL + retry handles short waits; long contention surfaces as `DbBusy`. |
 | Repository operation on a row whose `row_version` has advanced. | `repositories/mod.rs` returns a typed conflict error; caller decides retry/replace. |
@@ -196,6 +231,11 @@ table tests, repositories contract.
 - `crates/oulipoly-state/tests/age_62_readonly_schema_probe.rs`
 - `crates/oulipoly-state/tests/age_62_resolver_routing.rs`
 - `crates/oulipoly-state/tests/age371_record_timestamps.rs`
+- `crates/oulipoly-state/tests/sidecar_cutover_refusal.rs`
+- `crates/oulipoly-state/src/mailbox/broker_authority.rs`
+  (root-only path, WAL copy, v29 activation, restart, direct-writer refusal, and bound StateDb repair fixtures)
+- `crates/oulipoly-state/src/db/ownership_authority.rs`
+  (bounded v30 State admission suffix, exact continuity cursor, revision conflict, late listener page, and pending source readback)
 - `crates/oulipoly-state/src/retention.rs`
   (policy boundary, fail-closed record/generation facts, cursor and observation contracts)
 - `crates/oulipoly-state/src/db/retention.rs`

@@ -41,6 +41,7 @@ struct MailboxStatusResponse {
     observation_stop: Option<oulipoly_state::mailbox::MailboxObservationStop>,
     pending_count: usize,
     deliverable_count: usize,
+    uncertain_count: usize,
     min_pending_seq: Option<i64>,
     max_pending_seq: Option<i64>,
 }
@@ -130,6 +131,8 @@ pub(crate) fn run_status(session_id: &str, json: bool) -> Result<i32, String> {
 }
 
 pub(crate) fn run_pause(session_id: &str, paused: bool, json: bool) -> Result<i32, String> {
+    crate::completion_owner::require_unqualified_legacy_session(session_id)?;
+    crate::completion_owner::require_legacy_recipient_effect_route()?;
     let mut db = MailboxDb::open_default()?;
     let wake = set_pause_and_request_wake(&mut db, session_id, paused, || {
         crate::wake_coordinator::trigger_notify_wake(session_id)
@@ -166,6 +169,8 @@ pub(crate) fn run_ack(
     delivered_by: &str,
     json: bool,
 ) -> Result<i32, String> {
+    crate::completion_owner::require_unqualified_legacy_session(session_id)?;
+    crate::completion_owner::require_legacy_recipient_effect_route()?;
     let mut db = MailboxDb::open_default()?;
     let acknowledged_count = db.acknowledge_range(session_id, from_seq, to_seq, delivered_by)?;
     let remaining_pending = db.pending_delivery_count(session_id, None)?;
@@ -192,6 +197,7 @@ pub(crate) fn run_ack(
 }
 
 fn mailbox_status(session_id: &str) -> Result<MailboxStatusResponse, String> {
+    crate::completion_owner::require_unqualified_legacy_session(session_id)?;
     let Some(db) = MailboxDb::open_historical_default_if_exists()? else {
         return Ok(MailboxStatusResponse {
             session_id: session_id.to_string(),
@@ -200,6 +206,7 @@ fn mailbox_status(session_id: &str) -> Result<MailboxStatusResponse, String> {
             observation_stop: None,
             pending_count: 0,
             deliverable_count: 0,
+            uncertain_count: 0,
             min_pending_seq: None,
             max_pending_seq: None,
         });
@@ -216,6 +223,7 @@ fn mailbox_status(session_id: &str) -> Result<MailboxStatusResponse, String> {
         observation_stop: db.mailbox_observation_stop(session_id)?,
         pending_count: pending.len(),
         deliverable_count,
+        uncertain_count: db.uncertain_activation_input_count(session_id)?,
         min_pending_seq,
         max_pending_seq,
     })
@@ -233,11 +241,12 @@ fn render_status(response: &MailboxStatusResponse, json: bool) -> Result<(), Str
             );
         }
         println!(
-            "session={} paused={} pending={} deliverable={} min_seq={} max_seq={}",
+            "session={} paused={} pending={} deliverable={} uncertain={} min_seq={} max_seq={}",
             response.session_id,
             response.paused,
             response.pending_count,
             response.deliverable_count,
+            response.uncertain_count,
             optional_seq(response.min_pending_seq),
             optional_seq(response.max_pending_seq)
         );
@@ -319,6 +328,7 @@ fn render_mailbox_list(
 }
 
 fn list_rows(session_id: &str, all: bool) -> Result<Vec<MailboxRow>, String> {
+    crate::completion_owner::require_unqualified_legacy_session(session_id)?;
     let db = if all {
         MailboxDb::open_historical_default_if_exists()?
     } else {
@@ -534,6 +544,7 @@ pub(crate) fn run_rearm_observation(
     resolution: &str,
     json: bool,
 ) -> Result<i32, String> {
+    crate::completion_owner::require_unqualified_legacy_session(session_id)?;
     let db = MailboxDb::open_default()?;
     db.rearm_mailbox_observation(session_id, stop_id, resolution)?;
     if json {

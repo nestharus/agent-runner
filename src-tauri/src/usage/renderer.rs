@@ -38,6 +38,7 @@ fn append_account_rows(table: &mut Vec<[String; 5]>, row: &UsageRow) {
     match &row.row_state {
         RowState::HasWindows => table.extend(row.windows.iter().map(|w| window_row(row, w))),
         RowState::NoUsageApi => table.push(state_row(row, "(no usage api)")),
+        RowState::Unmetered => table.push(state_row(row, "(unmetered)")),
         RowState::Error(message) => table.push(state_row(row, &format!("(error: {message})"))),
         RowState::InFlight => table.push(state_row(row, "(in flight)")),
         RowState::NoWindows => table.push(state_row(row, "(no windows)")),

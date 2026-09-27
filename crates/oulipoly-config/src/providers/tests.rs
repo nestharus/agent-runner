@@ -168,6 +168,25 @@ settings_id = ""
 }
 
 #[test]
+fn quota_account_identity_is_explicit_and_trimmed() {
+    let cfg = load_inline_providers(
+        "[first]\ncommand = \"claude\"\nquota_account_id = \"anthropic:personal\"\n",
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.get("first").unwrap().quota_account_id.as_deref(),
+        Some("anthropic:personal")
+    );
+    for invalid in ["", " shared", "shared "] {
+        let error = load_inline_providers(&format!(
+            "[first]\ncommand = \"claude\"\nquota_account_id = \"{invalid}\"\n"
+        ))
+        .unwrap_err();
+        assert!(error.contains("quota_account_id"), "{error}");
+    }
+}
+
+#[test]
 fn rejects_invalid_account_provider_implementation() {
     let err = load_inline_providers(
         r#"
@@ -1273,6 +1292,7 @@ fn apply_defaults_to_raw_providers_sets_headless_for_absent_mode() {
         RawEntry {
             implementation: None,
             settings_id: None,
+            quota_account_id: None,
             quota_script: None,
             auth_refresh_command: None,
             command: Some("claude".to_string()),

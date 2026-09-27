@@ -1,9 +1,25 @@
-//! The driver schedules committed State obligations even when no sidecar source
-//! row exists.  It proposes immutable reservations to the root supervisor; it
-//! does not fork, reap, cancel, integrate terminal results, or succeed the root.
+//! The legacy driver schedules committed State obligations even when no sidecar
+//! source row exists. It proposes immutable reservations to the root supervisor;
+//! it does not fork, reap, cancel, integrate terminal results, or succeed the
+//! root. The selected v30 route repairs through the retained broker source,
+//! then refuses before source recovery or wake without their grants.
+
+#[cfg(feature = "age319-private-broker-fixture")]
+const PRIVATE_CHILD_ATTESTATION_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+#[cfg(feature = "age319-private-broker-fixture")]
+const PRIVATE_CHILD_ATTESTATION_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+#[cfg(feature = "age319-private-broker-fixture")]
+const PRIVATE_SOURCE_PRELAUNCH_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+#[cfg(feature = "age319-private-broker-fixture")]
+const PRIVATE_SOURCE_PRELAUNCH_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+use oulipoly_kernel_broker::protocol::{self, StateRoute};
 use oulipoly_state::StateDb;
 use oulipoly_state::mailbox::{CompletionDomainOwner, ContinuationAttempt, MailboxDb};
 use std::collections::{BTreeSet, HashMap};
+use std::io::Read;
+#[cfg(feature = "age319-private-broker-fixture")]
+use std::io::Write;
 use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -34,16 +50,144 @@ pub(super) fn entry() -> Result<(), String> {
     let mut channel = unsafe { UnixStream::from_raw_fd(fd) };
     let owner = super::linux::read_driver_owner(&mut channel)?;
     unsafe { std::env::set_var(super::ENDPOINT_ENV, &owner.endpoint) };
-    run(&path, &owner, channel)
+    // A held-J v30 guardian supplies the root selector. The broker still
+    // authenticates this process and derives the source from I; argv is never
+    // owner or storage authority. Legacy guardians omit this argument.
+    let root_id = std::env::args().nth(4);
+    run_with_root(&path, &owner, channel, root_id.as_deref())
 }
 
+#[cfg(test)]
 pub(super) fn run(
     path: &Path,
     owner: &CompletionDomainOwner,
     launch_channel: UnixStream,
 ) -> Result<(), String> {
-    super::root_supervisor::install_driver_channel(launch_channel);
-    let result = run_owned(path, owner);
+    run_with_root(path, owner, launch_channel, None)
+}
+
+fn run_with_root(
+    path: &Path,
+    owner: &CompletionDomainOwner,
+    launch_channel: UnixStream,
+    root_id: Option<&str>,
+) -> Result<(), String> {
+    let mut v30_channel = if root_id.is_some() {
+        Some(launch_channel)
+    } else {
+        super::root_supervisor::install_driver_channel(launch_channel);
+        None
+    };
+    let result = (|| match root_id {
+        Some(root_id) => match protocol::state_route_at(&super::linux::owner_broker_socket())
+            .map_err(|error| format!("completion driver broker route unavailable: {error}"))?
+        {
+            StateRoute::Legacy => Err("v30 driver root selector has no broker-owned source".into()),
+            StateRoute::BrokerOwned { .. } => {
+                let route = super::broker_route::V30OwnerRoute::driver(
+                    &super::linux::owner_broker_socket(),
+                    root_id,
+                    owner,
+                )?;
+                route.read_running(owner, None)?;
+                #[cfg(feature = "age319-private-broker-fixture")]
+                let mut h_awaiting = false;
+                #[cfg(feature = "age319-private-broker-fixture")]
+                if std::env::var_os("AGE319_PRIVATE_PRE_EFFECT_DISPOSITION_V1").is_some() {
+                    let channel = v30_channel
+                        .as_mut()
+                        .ok_or("v30 driver disposition gate absent")?;
+                    let mut disposition = [0];
+                    channel
+                        .read_exact(&mut disposition)
+                        .map_err(|e| e.to_string())?;
+                    match disposition {
+                        [b'C'] => {
+                            let refusal = run_v30_closed_boundary(&route, owner)?;
+                            channel.write_all(b"C").map_err(|e| e.to_string())?;
+                            return Err(refusal);
+                        }
+                        [b'H'] => {
+                            channel.write_all(b"H").map_err(|e| e.to_string())?;
+                            h_awaiting = true;
+                        }
+                        _ => return Err("v30 driver disposition changed".into()),
+                    }
+                }
+                #[cfg(feature = "age319-private-broker-fixture")]
+                if std::env::var_os("AGE319_PRIVATE_EXEC_DRIVER_ROUTE_V30").is_some() {
+                    let gate_dir = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                        .ok_or("private exec driver gate directory missing")?;
+                    let attested = Path::new(&gate_dir).join("child-attested");
+                    let deadline = Instant::now() + PRIVATE_CHILD_ATTESTATION_WAIT;
+                    while !attested.exists() {
+                        if Instant::now() >= deadline {
+                            return Err("private exec driver child attestation timed out".into());
+                        }
+                        std::thread::sleep(PRIVATE_CHILD_ATTESTATION_POLL);
+                    }
+                    return Err(
+                        "v30 driver bounded State repair and wake route is not available".into(),
+                    );
+                }
+                // Ordinary routes project while guardian/driver are pinned.
+                // The H-awaiting route holds this exact channel without
+                // source selection until the joined child completes.
+                #[cfg(feature = "age319-private-broker-fixture")]
+                let repair_result = if h_awaiting {
+                    let channel = v30_channel.as_mut().ok_or("v30 H driver gate absent")?;
+                    postcommit_driver_stage("waiting-wake");
+                    let mut marker = [0];
+                    channel.read_exact(&mut marker).map_err(|e| e.to_string())?;
+                    if marker != [b'W'] {
+                        return Err("v30 H driver received no postcommit W wake".into());
+                    }
+                    postcommit_driver_stage("reading-target");
+                    let target = read_v30_wake_target(channel)?;
+                    if target.root_id != root_id
+                        || target.owner_generation != owner.owner_generation
+                        || target.authority_ordinal <= 0
+                    {
+                        return Err("v30 W target changed root or owner".into());
+                    }
+                    postcommit_driver_stage("repairing-source");
+                    match run_v30_repair_boundary(&route, owner, Some(&target)) {
+                        Err(error)
+                            if error
+                                == "v30 source physically launched; v2 acceptance remains closed" =>
+                        {
+                            postcommit_driver_stage("source-launched");
+                            channel.write_all(b"A").map_err(|e| e.to_string())?;
+                            Err(error)
+                        }
+                        Err(error) => {
+                            postcommit_driver_stage(&format!("refused: {error}"));
+                            return Err(error);
+                        }
+                        Ok(()) => return Err("postcommit W returned without source effect".into()),
+                    }
+                } else {
+                    run_v30_repair_boundary(&route, owner, None)
+                };
+                #[cfg(not(feature = "age319-private-broker-fixture"))]
+                let repair_result = run_v30_repair_boundary(&route, owner, None);
+                // The broker's child attestation reopens this exact driver.
+                // Stay pinned until the original guardian reports the joined
+                // child's terminal receipt; EOF is a refusal, not succession.
+                let mut completed = [0];
+                v30_channel
+                    .as_mut()
+                    .ok_or("v30 driver gate absent")?
+                    .read_exact(&mut completed)
+                    .map_err(|e| e.to_string())?;
+                if completed != [b'D'] {
+                    return Err("v30 driver completion gate changed".into());
+                }
+                repair_result
+            }
+        },
+        None => run_owned(path, owner),
+    })();
     // Preserve the original failure, but not at the price of discarding its
     // uniquely capable witness. Only evidence integration continues on this cut.
     #[cfg(test)]
@@ -51,6 +195,134 @@ pub(super) fn run(
     #[cfg(test)]
     super::root_supervisor::clear_driver_channel();
     result
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn run_v30_closed_boundary(
+    route: &super::broker_route::V30OwnerRoute,
+    owner: &CompletionDomainOwner,
+) -> Result<String, String> {
+    loop {
+        let page = route.repair_page(owner)?;
+        if page.has_more {
+            continue;
+        }
+        if route.source_selection(owner, &page)?.candidate.is_some()
+            || route.recipient_selection(owner, &page)?.candidate.is_some()
+        {
+            return Err("v30 closed H disposition encountered a source or recipient".into());
+        }
+        return Ok("v30 no pending broker recipient; wake effect refused".into());
+    }
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn read_v30_wake_target(channel: &mut UnixStream) -> Result<super::V30WakeTarget, String> {
+    let mut bytes = Vec::new();
+    while bytes.len() < 2048 {
+        let mut byte = [0];
+        channel.read_exact(&mut byte).map_err(|e| e.to_string())?;
+        if byte == [b'\n'] {
+            return serde_json::from_slice(&bytes).map_err(|e| e.to_string());
+        }
+        bytes.push(byte[0]);
+    }
+    Err("v30 W target frame too large".into())
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn postcommit_driver_stage(stage: &str) {
+    if let Some(gate) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1") {
+        let _ = std::fs::write(
+            Path::new(&gate).join("source-driver-postcommit-stage"),
+            stage,
+        );
+    }
+}
+
+fn run_v30_repair_boundary(
+    route: &super::broker_route::V30OwnerRoute,
+    owner: &CompletionDomainOwner,
+    #[allow(unused_variables)] target: Option<&super::V30WakeTarget>,
+) -> Result<(), String> {
+    // Each broker call projects at most 64 admitted State rows. Continue to
+    // the actual bound head; a fixed turn limit could strand valid older work.
+    loop {
+        let page = route.repair_page(owner)?;
+        if page.has_more {
+            continue;
+        }
+        let selected = route.source_selection(owner, &page)?;
+        #[cfg(feature = "age319-private-broker-fixture")]
+        if let Some(target) = target {
+            let candidate = selected
+                .candidate
+                .as_ref()
+                .ok_or("postcommit W source not projected")?;
+            if selected.root_id != target.root_id
+                || selected.owner_generation != target.owner_generation
+                || selected.source_generation != target.source_generation
+                || selected.authority_ordinal != target.authority_ordinal
+                || candidate.registration_id != target.registration_id
+                || candidate.registration_digest != target.registration_digest
+            {
+                return Err("postcommit W projected receipt/source changed".into());
+            }
+        }
+        if selected.candidate.is_some() {
+            // Reserve a unique broker-owned debt for the exact State-selected
+            // registration/listener and running driver. W takes no source path
+            // or grant ID from us; the broker rereads this reservation before
+            // holding and releasing one recovery child.
+            let grant = match route.read_source_grant(owner)? {
+                Some(existing) => existing,
+                None => route.reserve_source_grant(owner, &selected)?,
+            };
+            if grant.candidate != *selected.candidate.as_ref().unwrap() {
+                return Err("v30 selected source/grant changed".into());
+            }
+            #[cfg(feature = "age319-private-broker-fixture")]
+            if let Some(gate) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1") {
+                std::fs::write(
+                    Path::new(&gate).join("source-grant-ready"),
+                    grant.grant_id.as_bytes(),
+                )
+                .map_err(|e| e.to_string())?;
+                if std::env::var_os("AGE319_PRIVATE_SOURCE_PRELAUNCH_BARRIER_V1").is_some() {
+                    let deadline = Instant::now() + PRIVATE_SOURCE_PRELAUNCH_WAIT;
+                    while !Path::new(&gate).join("source-allow-launch").exists() {
+                        if Instant::now() >= deadline {
+                            return Err("private source prelaunch barrier expired".into());
+                        }
+                        std::thread::sleep(PRIVATE_SOURCE_PRELAUNCH_POLL);
+                    }
+                }
+            }
+            if grant.phase != "reserved" || grant.revision != 1 {
+                return Err("v30 source grant already has effect or unknown debt".into());
+            }
+            let launched = route.launch_reserved_source(owner, &grant)?;
+            #[cfg(feature = "age319-private-broker-fixture")]
+            if let Some(gate) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1") {
+                std::fs::write(
+                    Path::new(&gate).join("source-launched"),
+                    launched.as_bytes(),
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            let _ = launched;
+            return Err("v30 source physically launched; v2 acceptance remains closed".into());
+        }
+        let selected = route.recipient_selection(owner, &page)?;
+        if selected.candidate.is_some() {
+            // The broker has selected and verified a retained pending row, but
+            // this preview is not an executable grant. The native recipient
+            // route must bind an actual session and the one-use provider K
+            // before any claim, transport submission, or delivery result.
+            return Err("v30 recipient effect closed: no broker-authenticated live recipient or exact wake successor, durable one-use work grant, or pinned provider K/physical child tree".into());
+        }
+        return Err("v30 no pending broker recipient; wake effect refused".into());
+    }
 }
 
 fn run_owned(path: &Path, owner: &CompletionDomainOwner) -> Result<(), String> {

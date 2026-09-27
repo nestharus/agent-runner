@@ -40,6 +40,9 @@ def launch(request):
         # and therefore cannot contaminate another session's resumed recipient.
         SESSION = "ses_age360_founder"
         os.environ.update(AGE360_CASE="owner_only", AGE360_HOLD_INITIAL="1", AGE360_FOUNDER="1")
+    if prompt == "j01 independent target two" and not known:
+        SESSION = "ses_age360_j01_second"
+        pathlib.Path(os.environ["AGE360_ROOT"]).joinpath("second-provider-ready").touch()
     case = os.environ.get("AGE360_CASE")
     if prompt == "synthetic independent listener":
         case = "listener_only"
@@ -76,6 +79,10 @@ def launch(request):
             runner = os.environ["AGENT_BASH_AGENT_RUNNER_BIN"]
             listed = subprocess.run([runner,"mailbox","list","--session-id",known,"--all","--json"],capture_output=True,check=True,timeout=10)
             rows = json.loads(listed.stdout)["rows"]
+            if case == "owner_only" and "unrelated-followup" in prompt:
+                # The negative control sees retained history but may ACK only
+                # the newly admitted, deliverable input.
+                rows = [row for row in rows if row["delivery_error"] != "completion_effect_uncertain"]
             if case == "two_source":
                 assert len(rows) == 2, rows
                 second = rows[1]
@@ -99,7 +106,7 @@ def launch(request):
                 assert rows[0]["handle"] in prompt
                 assert json.loads(rows[0]["payload_json"])["fixture"] == "legacy-materialized"
             elif os.environ.get("AGE360_CASE") == "owner_only":
-                assert "native-custody-input" in prompt
+                assert "native-custody-input" in prompt or "unrelated-followup" in prompt
             else:
                 assert rows[0]["handle"] in prompt
                 if case in ("native_missing", "missing_selection", "missing_pin", "missing_short"):
@@ -286,6 +293,16 @@ def launch(request):
                 extra = ["--ready-sentinel", "NEVER-SEEN"]
             elif os.environ["AGE360_CASE"] == "large_output":
                 workload = 'head -c 16777216 /dev/zero'
+            elif os.environ["AGE360_CASE"] == "stripped_nested":
+                workload = '''set +e
+env -u OULIPOLY_ROOT_WORK_ID -u OULIPOLY_ROOT_PARENT_CAPABILITY_V1 \
+  -u AGENT_BASH_OWNER_SESSION_ID -u AGENT_BASH_OWNER_INVOCATION_UUID \
+  AGENT_BASH_AGENT_RUNNER_BIN="$AGE360_RUNNER_BIN" \
+  "$AGE360_AGENT_BASH_BIN" run --delivery async -- /bin/true \
+  > "$AGE360_ROOT/stripped-nested.stdout" \
+  2> "$AGE360_ROOT/stripped-nested.stderr"
+printf '%s\n' "$?" > "$AGE360_ROOT/stripped-nested.rc"
+printf paired-source-output'''
             scope = "tree"
             if case == "publication_race":
                 scope = "root"
@@ -360,11 +377,26 @@ def launch(request):
         environment.pop("OULIPOLY_COMPLETION_ENDPOINT", None)
         nested = subprocess.run([os.environ["AGENT_BASH_AGENT_RUNNER_BIN"], "-m", "absent-nested-model", "must reject ancestry"], env=environment, capture_output=True, timeout=10)
         pathlib.Path(os.environ["AGE360_ROOT"]).joinpath("nested-rejection.json").write_text(json.dumps({"rc": nested.returncode,"stderr":nested.stderr.decode(errors="replace")}))
+    if pathlib.Path(os.environ["AGE360_ROOT"]).joinpath("j01-negative-enabled").exists():
+        # A real child of the live founding root, routed to its owner socket,
+        # with no inherited grant and no accepted native activation.
+        root = pathlib.Path(os.environ["AGE360_ROOT"])
+        (root / "j01-negative-start").touch()
+        endpoint_file = root / "j01-negative-endpoint"
+        deadline = time.monotonic() + 20
+        while not endpoint_file.exists():
+            assert time.monotonic() < deadline, "negative endpoint barrier expired"
+            time.sleep(0.02)
+        environment = dict(os.environ)
+        environment.pop("OULIPOLY_ROOT_AUTHORITY_V1", None)
+        environment["OULIPOLY_COMPLETION_ENDPOINT"] = endpoint_file.read_text()
+        nested = subprocess.run([os.environ["AGENT_BASH_AGENT_RUNNER_BIN"], "-m", "absent-nested-model", "must reject fresh child"], env=environment, capture_output=True, timeout=30)
+        (root / "j01-negative-result.json").write_text(json.dumps({"rc": nested.returncode, "stderr": nested.stderr.decode(errors="replace")}))
     if not params.get("session", {}).get("known_provider_session_id"):
         pathlib.Path(os.environ["AGE360_ROOT"]).joinpath("provider-initial-ready").touch()
     if not params.get("session", {}).get("known_provider_session_id") and os.environ.get("AGE360_HOLD_INITIAL") == "1":
         gate = pathlib.Path(os.environ["AGE360_ROOT"]) / ("release-founder" if os.environ.get("AGE360_FOUNDER") else "release-initial-provider")
-        deadline = time.monotonic() + (240 if os.environ.get("AGE360_FOUNDER") else 45)
+        deadline = time.monotonic() + (240 if os.environ.get("AGE360_FOUNDER") else 120 if prompt == "j01 independent target two" else 45)
         while not gate.exists():
             if time.monotonic() > deadline: raise RuntimeError("fixture initial hold expired")
             time.sleep(0.02)

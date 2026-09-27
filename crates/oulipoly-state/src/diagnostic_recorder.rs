@@ -140,19 +140,23 @@ pub struct RecorderProcessIdentity {
 
 impl RecorderProcessIdentity {
     fn current(producer_instance: ProducerInstanceId) -> Self {
-        let os_pid = i64::from(std::process::id());
-        let parent_pid = parent_pid();
-        match crate::pid_identity::read_live_process_identity(os_pid) {
-            Ok(Some(identity)) => Self {
-                os_pid,
-                parent_pid,
+        match crate::pid_identity::read_current_process_identity() {
+            Ok(identity) => Self {
+                os_pid: identity.os_pid,
+                #[cfg(target_os = "linux")]
+                parent_pid: crate::pid_identity::read_parent_process_identity()
+                    .ok()
+                    .flatten()
+                    .map(|parent| parent.os_pid),
+                #[cfg(not(target_os = "linux"))]
+                parent_pid: parent_pid(),
                 os_boot_id: Some(identity.os_boot_id),
                 os_pid_starttime_ticks: Some(identity.os_pid_starttime_ticks),
                 producer_instance,
             },
-            Ok(None) | Err(_) => Self {
-                os_pid,
-                parent_pid,
+            Err(_) => Self {
+                os_pid: i64::from(std::process::id()),
+                parent_pid: parent_pid(),
                 os_boot_id: None,
                 os_pid_starttime_ticks: None,
                 producer_instance,
@@ -1154,7 +1158,7 @@ impl FlightRecorder {
         })
     }
 
-    fn disabled() -> Self {
+    pub(crate) fn disabled() -> Self {
         let instance = ProducerInstanceId::new();
         Self {
             inner: Arc::new(RecorderInner {
@@ -1725,11 +1729,23 @@ fn cached_or_retry_process_recorder(
             *guard = Some(recorder.clone());
             recorder
         }
-        Err(_) => {
+        Err(error) => {
+            // Keep the failed initializer's reason separate from broker request
+            // errors. Recorder telemetry remains optional and retryable.
+            eprintln!("{}", recorder_init_failure_line(&error));
             emit_gap_once("process_recorder_init");
             FlightRecorder::disabled()
         }
     }
+}
+
+fn recorder_init_failure_line(error: &str) -> String {
+    let reason: String = error
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(240)
+        .collect();
+    format!("oulipoly recorder init failure: stage=process_recorder_init reason={reason}")
 }
 
 #[cfg(test)]
@@ -4833,6 +4849,10 @@ mod tests {
         });
         assert!(disabled.inner.writer.is_none());
         assert_eq!(reports.try_recv().unwrap(), "process_recorder_init");
+        assert_eq!(
+            recorder_init_failure_line("fixture OS error 11\npath"),
+            "oulipoly recorder init failure: stage=process_recorder_init reason=fixture OS error 11path"
+        );
 
         let initialized = cached_or_retry_process_recorder(&slot, || {
             FlightRecorder::open(directory.path(), RecorderConfig::default())

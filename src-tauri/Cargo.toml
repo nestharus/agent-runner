@@ -14,6 +14,9 @@ path = "src/main.rs"
 
 [features]
 age360-fault-fixtures = ["oulipoly-state/age360-fault-fixtures", "oulipoly-runtime/age360-fault-fixtures"]
+age319-private-broker-fixture = ["oulipoly-kernel-broker/age319-private-broker-fixture"]
+# Inert fresh image only; refuse even direct absolute-path/internal entry.
+age319-closed-fresh = []
 
 [dependencies]
 base64 = "0.22"
@@ -24,6 +27,7 @@ clap.workspace = true
 dirs.workspace = true
 fs4.workspace = true
 libc.workspace = true
+oulipoly-kernel-broker = { path = "../crates/oulipoly-kernel-broker" }
 oulipoly-config = { path = "../crates/oulipoly-config" }
 oulipoly-core = { path = "../crates/oulipoly-core" }
 oulipoly-provider = { path = "../crates/oulipoly-provider" }

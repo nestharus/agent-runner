@@ -44,4 +44,4 @@ pub use outcome::{QuotaScriptWindow, RefreshOutcome};
 pub use parse::parse_output;
 pub use process::{run_refresh_command, run_script};
 pub use refresh::{RuntimeQuotaService, refresh_provider, refresh_provider_for_routing};
-pub use source::has_refresh_source;
+pub use source::{fresh_refresh_source, has_refresh_source};

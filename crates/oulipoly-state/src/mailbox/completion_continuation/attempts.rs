@@ -1,4 +1,45 @@
 use super::*;
+
+#[cfg(test)]
+thread_local! {
+    static CRASH_AFTER_NATIVE_UPDATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(super) fn crash_after_native_update_once() {
+    CRASH_AFTER_NATIVE_UPDATE.with(|flag| flag.set(true));
+}
+
+/// Reject a connection whose opened main database is no longer at SQLite's
+/// canonical name. This does not expose that file's identity, attest the WAL,
+/// or prevent a later name replacement; native K still needs a VFS-backed
+/// descriptor proof before it can release a worker.
+#[cfg(target_os = "linux")]
+fn native_main_file_must_be_named(conn: &Connection) -> Result<(), String> {
+    let mut moved: std::ffi::c_int = -1;
+    // SAFETY: the Connection owns the SQLite handle for this call, `main` is
+    // NUL-terminated, and SQLite writes one C int to the live stack slot.
+    let status = unsafe {
+        rusqlite::ffi::sqlite3_file_control(
+            conn.handle(),
+            c"main".as_ptr(),
+            rusqlite::ffi::SQLITE_FCNTL_HAS_MOVED,
+            (&mut moved as *mut std::ffi::c_int).cast(),
+        )
+    };
+    if status != rusqlite::ffi::SQLITE_OK || moved != 0 {
+        return Err(format!(
+            "native acceptance SQLite main file moved or cannot be verified: status={status}, moved={moved}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn native_main_file_must_be_named(_conn: &Connection) -> Result<(), String> {
+    Err("native acceptance requires Linux SQLite file verification".into())
+}
+
 use crate::diagnostic_recorder::{
     OutcomeCertainty, SqliteAccessClass, SqliteMeasurementGap, SqlitePhaseEvidence,
     SqliteQueryPlanEvidence, SqliteTransactionPhase,
@@ -8,10 +49,129 @@ use crate::sqlite_observability::{
     process_query_plans_enabled,
 };
 
+/// Physical drain proves that this activation ended, not that its selected
+/// input caused no provider effect. Fence every still-pending row from the
+/// exact claim before deleting that claim. Rows enqueued after the claim are
+/// outside its immutable sequence bounds and remain independently startable.
+fn retain_uncertain_activation_input_on(
+    tx: &Transaction<'_>,
+    attempt: &ContinuationAttempt,
+) -> Result<(), String> {
+    let session = attempt
+        .session_id
+        .as_deref()
+        .ok_or("activation session absent")?;
+    let token = attempt
+        .claim_token
+        .as_deref()
+        .ok_or("activation claim absent")?;
+    let bounds: Option<(Option<i64>, Option<i64>)> = tx
+        .query_row(
+            "SELECT min_pending_seq_at_claim,max_pending_seq_at_claim
+             FROM session_wake_claim WHERE session_id=?1 AND claim_token=?2",
+            params![session, token],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let bounds = bounds.ok_or("exact activation claim absent at drain")?;
+    let (Some(min_seq), Some(max_seq)) = bounds else {
+        let pending: bool = tx
+            .query_row(
+                &format!(
+                    "SELECT EXISTS(SELECT 1 FROM mailbox WHERE delivered_at IS NULL
+                     AND ((target_kind IS NULL AND session_id=?1)
+                          OR (target_kind='session' AND target_id=?1)) AND {})",
+                    super::super::DELIVERABLE_MAILBOX_ERROR_PREDICATE
+                ),
+                [session],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        return if pending {
+            Err("activation claim lacks selected input bounds".into())
+        } else {
+            Ok(())
+        };
+    };
+    if min_seq <= 0 || max_seq < min_seq {
+        return Err("activation claim has invalid selected input bounds".into());
+    }
+    let select = format!(
+        "INSERT INTO completion_uncertain_input(mailbox_seq,attempt_id,recorded_at,disposition)
+         SELECT seq,?1,?5,'effect_uncertain' FROM mailbox
+         WHERE seq BETWEEN ?3 AND ?4 AND delivered_at IS NULL
+           AND ((target_kind IS NULL AND session_id=?2)
+                OR (target_kind='session' AND target_id=?2))
+           AND {}",
+        super::super::DELIVERABLE_MAILBOX_ERROR_PREDICATE
+    );
+    tx.execute(
+        &select,
+        params![attempt.attempt_id, session, min_seq, max_seq, now_rfc3339()],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.execute(
+        "UPDATE mailbox SET delivery_error=?2
+         WHERE seq IN (SELECT mailbox_seq FROM completion_uncertain_input WHERE attempt_id=?1)
+           AND delivered_at IS NULL",
+        params![
+            attempt.attempt_id,
+            super::super::COMPLETION_EFFECT_UNCERTAIN_ERROR
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 impl MailboxDb {
+    /// Read-only operator visibility. The delivery count intentionally omits
+    /// these rows, so status must report the separate retained obligation.
+    pub fn uncertain_activation_input_count(&self, session_id: &str) -> Result<usize, String> {
+        let version: i64 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        if version < 31 {
+            return Ok(0);
+        }
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM completion_uncertain_input uncertain
+                 JOIN mailbox message ON message.seq=uncertain.mailbox_seq
+                 WHERE message.delivered_at IS NULL
+                   AND message.delivery_error='completion_effect_uncertain'
+                   AND ((message.target_kind IS NULL AND message.session_id=?1)
+                        OR (message.target_kind='session' AND message.target_id=?1))",
+                [session_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        usize::try_from(count).map_err(|error| error.to_string())
+    }
+
     pub fn reserve_continuation_attempt(
         &mut self,
         request: &ContinuationAttempt,
+    ) -> Result<(), String> {
+        self.reserve_continuation_attempt_with_driver(request, None)
+    }
+
+    /// The broker supplies the driver incarnation it has just pinned. The
+    /// broker process itself is never the driver recorded in the owner row.
+    pub(in crate::mailbox) fn reserve_continuation_attempt_for_broker(
+        &mut self,
+        request: &ContinuationAttempt,
+        driver: &SourceProcessIdentity,
+    ) -> Result<(), String> {
+        self.reserve_continuation_attempt_with_driver(request, Some(driver))
+    }
+
+    fn reserve_continuation_attempt_with_driver(
+        &mut self,
+        request: &ContinuationAttempt,
+        driver: Option<&SourceProcessIdentity>,
     ) -> Result<(), String> {
         if request.operation == "activation" {
             if let Some(session) = request.session_id.as_deref() {
@@ -26,7 +186,7 @@ impl MailboxDb {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
-        reserve_on(&tx, request)?;
+        reserve_on_with_driver(&tx, request, driver)?;
         tx.commit().map_err(|e| e.to_string())
     }
 
@@ -52,15 +212,25 @@ impl MailboxDb {
         &mut self,
         attempt: &ContinuationAttempt,
     ) -> Result<bool, String> {
+        let live = crate::pid_identity::read_current_process_identity()?;
+        self.try_revoke_unaccepted_continuation_attempt_for_broker(
+            attempt,
+            &SourceProcessIdentity {
+                pid: live.os_pid,
+                boot_id: live.os_boot_id,
+                starttime_ticks: live.os_pid_starttime_ticks,
+            },
+        )
+    }
+
+    /// Only the broker's authenticated exact driver may supply this identity.
+    pub(in crate::mailbox) fn try_revoke_unaccepted_continuation_attempt_for_broker(
+        &mut self,
+        attempt: &ContinuationAttempt,
+        identity: &SourceProcessIdentity,
+    ) -> Result<bool, String> {
         require_exact_attempt(&self.conn, attempt)?;
-        let live = crate::pid_identity::read_live_process_identity(i64::from(std::process::id()))?
-            .ok_or("driver process disappeared")?;
-        let identity = SourceProcessIdentity {
-            pid: live.os_pid,
-            boot_id: live.os_boot_id,
-            starttime_ticks: live.os_pid_starttime_ticks,
-        };
-        let encoded = serde_json::to_string(&identity).map_err(|e| e.to_string())?;
+        let encoded = serde_json::to_string(identity).map_err(|e| e.to_string())?;
         // Reject a known accepted/root-owned attempt without requesting a
         // SQLite writer. The exact UPDATE below rechecks every predicate after
         // acquisition, so this read is only a contention-avoiding hint.
@@ -182,6 +352,9 @@ impl MailboxDb {
             }
         }
         if attempt.operation == "activation" {
+            if changed == 1 {
+                retain_uncertain_activation_input_on(&tx, attempt)?;
+            }
             tx.execute(
                 "DELETE FROM session_wake_claim WHERE session_id=?1 AND claim_token=?2",
                 params![attempt.session_id, attempt.claim_token],
@@ -472,6 +645,14 @@ fn continuation_write_span(
 }
 
 fn reserve_on(tx: &Transaction<'_>, request: &ContinuationAttempt) -> Result<(), String> {
+    reserve_on_with_driver(tx, request, None)
+}
+
+fn reserve_on_with_driver(
+    tx: &Transaction<'_>,
+    request: &ContinuationAttempt,
+    verified_driver: Option<&SourceProcessIdentity>,
+) -> Result<(), String> {
     let (domain, supervisor_authority_id): (String, String) = tx.query_row("SELECT domain_id,supervisor_authority_id FROM completion_continuation_owner WHERE generation=?1 AND phase='running'", [&request.owner_generation], |r| Ok((r.get(0)?,r.get(1)?))).map_err(|e| e.to_string())?;
     if !crate::completion_continuation::is_sha256(&request.request_sha256) {
         return Err("invalid continuation request digest".into());
@@ -514,14 +695,19 @@ fn reserve_on(tx: &Transaction<'_>, request: &ContinuationAttempt) -> Result<(),
                 |row| row.get(0),
             )
             .map_err(|error| error.to_string())?;
-        let live = crate::pid_identity::read_live_process_identity(i64::from(std::process::id()))?
-            .ok_or("driver identity unavailable")?;
-        let actual = serde_json::to_string(&SourceProcessIdentity {
-            pid: live.os_pid,
-            boot_id: live.os_boot_id,
-            starttime_ticks: live.os_pid_starttime_ticks,
-        })
-        .map_err(|error| error.to_string())?;
+        let actual_driver = if let Some(driver) = verified_driver {
+            driver.clone()
+        } else {
+            let live =
+                crate::pid_identity::read_live_process_identity(i64::from(std::process::id()))?
+                    .ok_or("driver identity unavailable")?;
+            SourceProcessIdentity {
+                pid: live.os_pid,
+                boot_id: live.os_boot_id,
+                starttime_ticks: live.os_pid_starttime_ticks,
+            }
+        };
+        let actual = serde_json::to_string(&actual_driver).map_err(|error| error.to_string())?;
         if driver != actual {
             return Err("completion activation must be admitted by independent driver".into());
         }
@@ -642,8 +828,7 @@ pub(in crate::mailbox) fn reserve_activation_on(
     let (generation,driver):(String,String)=tx.query_row("SELECT generation,driver_identity FROM completion_continuation_owner WHERE domain_id=?1 AND phase='running'",[&domain],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?
         .ok_or("completion_owner_unavailable: activation requires an independent owner; schema upgrade grants no actor custody")?;
     let driver: SourceProcessIdentity = serde_json::from_str(&driver).map_err(|e| e.to_string())?;
-    let live = crate::pid_identity::read_live_process_identity(i64::from(std::process::id()))?
-        .ok_or("driver identity unavailable")?;
+    let live = crate::pid_identity::read_current_process_identity()?;
     if driver.pid != live.os_pid
         || driver.boot_id != live.os_boot_id
         || driver.starttime_ticks != live.os_pid_starttime_ticks
@@ -978,6 +1163,290 @@ fn classify_one_pending_completion_with_hook(
 }
 
 impl MailboxDb {
+    /// Bind one broker-prepared grant to the exact revision-2 acceptance. This
+    /// is a one-use association CAS, not permission to open the worker gate.
+    /// The guardian supplies its committed snapshot and the digest of the
+    /// descriptor bytes it kept pinned while publishing the positive receipt.
+    pub fn bind_exact_native_grant(
+        &mut self,
+        accepted: &AcceptedNativeGrantSnapshot,
+        grant_id: &str,
+        custodian_request_sha256: &str,
+    ) -> Result<NativeGrantBinding, String> {
+        require_exact_live_guardian(&accepted.guardian_identity)?;
+        self.bind_exact_native_grant_on_retained_connection(
+            accepted,
+            grant_id,
+            custodian_request_sha256,
+        )
+    }
+
+    /// BrokerSidecar calls this only after its challenged N frame authenticates
+    /// the live guardian and its exact retained owner/attempt. The broker
+    /// process itself is not that guardian, so the local-caller check above
+    /// would reject a legitimate broker-owned bind.
+    pub(in crate::mailbox) fn bind_exact_native_grant_for_broker(
+        &mut self,
+        accepted: &AcceptedNativeGrantSnapshot,
+        grant_id: &str,
+        custodian_request_sha256: &str,
+    ) -> Result<NativeGrantBinding, String> {
+        self.bind_exact_native_grant_on_retained_connection(
+            accepted,
+            grant_id,
+            custodian_request_sha256,
+        )
+    }
+
+    fn bind_exact_native_grant_on_retained_connection(
+        &mut self,
+        accepted: &AcceptedNativeGrantSnapshot,
+        grant_id: &str,
+        custodian_request_sha256: &str,
+    ) -> Result<NativeGrantBinding, String> {
+        fn valid_sha256(value: &str) -> bool {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        }
+        if uuid::Uuid::parse_str(grant_id).is_err()
+            || !valid_sha256(custodian_request_sha256)
+            || accepted.phase != "accepted"
+            || accepted.revision != 2
+            || accepted.integrated
+            || accepted.custodian_identity.is_some()
+            || accepted.adopter_identity.is_some()
+            || accepted.attempt.owner_generation != accepted.owner_generation
+            || accepted.domain_id.is_empty()
+            || accepted.kernel_root_id.is_empty()
+            || accepted.supervisor_authority_id.is_empty()
+        {
+            return Err("invalid native grant binding proposal".into());
+        }
+        native_main_file_must_be_named(&self.conn)?;
+        let accepted_snapshot_sha256 = crate::completion_continuation::sha256(
+            &serde_json::to_vec(accepted).map_err(|error| error.to_string())?,
+        );
+        let guardian = serde_json::to_string(&accepted.guardian_identity)
+            .map_err(|error| error.to_string())?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        native_main_file_must_be_named(&tx)?;
+        require_exact_attempt(&tx, &accepted.attempt)?;
+        let changed = tx
+            .execute(
+                "INSERT INTO completion_native_grant_binding(
+                attempt_id,grant_id,protocol,accepted_revision,domain_id,kernel_root_id,
+                supervisor_authority_id,owner_generation,guardian_identity,
+                accepted_snapshot_sha256,custodian_request_sha256)
+             SELECT a.attempt_id,?2,'native-continuation-v1',2,a.domain_id,
+                    o.kernel_root_id,o.supervisor_authority_id,a.owner_generation,
+                    o.guardian_identity,?3,?4
+             FROM completion_continuation_attempt a
+             JOIN completion_continuation_owner o ON o.generation=a.owner_generation
+             WHERE a.attempt_id=?1 AND a.phase='accepted' AND a.revision=2
+               AND a.integrated=0 AND a.custodian_identity IS NULL
+               AND a.adopter_identity IS NULL AND o.phase='running'
+               AND a.domain_id=?5 AND o.domain_id=?5 AND o.kernel_root_id=?6
+               AND o.supervisor_authority_id=?7 AND a.owner_generation=?8
+               AND o.guardian_identity=?9
+               AND NOT EXISTS(SELECT 1 FROM completion_native_grant_binding b
+                              WHERE b.attempt_id=a.attempt_id)",
+                params![
+                    accepted.attempt.attempt_id,
+                    grant_id,
+                    accepted_snapshot_sha256,
+                    custodian_request_sha256,
+                    accepted.domain_id,
+                    accepted.kernel_root_id,
+                    accepted.supervisor_authority_id,
+                    accepted.owner_generation,
+                    guardian,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("native grant binding lost exact accepted row".into());
+        }
+        let readback = read_native_grant_binding_on(&tx, &accepted.attempt.attempt_id)?
+            .ok_or("native grant binding readback missing")?;
+        let expected = NativeGrantBinding {
+            attempt_id: accepted.attempt.attempt_id.clone(),
+            grant_id: grant_id.into(),
+            protocol: "native-continuation-v1".into(),
+            accepted_revision: 2,
+            domain_id: accepted.domain_id.clone(),
+            kernel_root_id: accepted.kernel_root_id.clone(),
+            supervisor_authority_id: accepted.supervisor_authority_id.clone(),
+            owner_generation: accepted.owner_generation.clone(),
+            guardian_identity: accepted.guardian_identity.clone(),
+            accepted_snapshot_sha256,
+            custodian_request_sha256: custodian_request_sha256.into(),
+        };
+        if readback != expected {
+            return Err("native grant binding readback conflict".into());
+        }
+        native_main_file_must_be_named(&tx)?;
+        tx.commit().map_err(|error| error.to_string())?;
+        native_main_file_must_be_named(&self.conn)?;
+        Ok(readback)
+    }
+
+    /// Indexed point readback for an uncertain prepare/bind response. This
+    /// does not infer a grant from a historical attempt scan.
+    pub fn native_grant_binding(
+        &self,
+        attempt_id: &str,
+    ) -> Result<Option<NativeGrantBinding>, String> {
+        read_native_grant_binding_on(&self.conn, attempt_id)
+    }
+
+    /// Accept and read back the exact PK while holding one immediate write
+    /// transaction. Failed readback rolls the UPDATE back; a committed result
+    /// cannot be inferred from a caller-supplied attempt or a sibling owner.
+    pub fn accept_exact_native_attempt(
+        &mut self,
+        attempt: &ContinuationAttempt,
+        owner: &CompletionDomainOwner,
+        root_id: &str,
+    ) -> Result<AcceptedNativeGrantSnapshot, String> {
+        if owner.protocol != PROTOCOL
+            || attempt.owner_generation != owner.owner_generation
+            || root_id.is_empty()
+        {
+            return Err("native acceptance owner/root conflict".into());
+        }
+        // This is a stale-connection rejection, not file provenance. SQLite's
+        // Unix VFS compares its own open main file with its canonical name;
+        // the caller must not substitute a pathname stat for that comparison.
+        native_main_file_must_be_named(&self.conn)?;
+        let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+        native_main_file_must_be_named(&tx)?;
+        let changed = tx
+            .execute(
+                "UPDATE completion_continuation_attempt SET phase='accepted',revision=revision+1
+             WHERE attempt_id=?1 AND owner_generation=?2 AND phase='reserved' AND revision=1
+               AND integrated=0 AND custodian_identity IS NULL AND adopter_identity IS NULL
+               AND EXISTS(SELECT 1 FROM completion_continuation_owner
+                 WHERE generation=?2 AND phase='running' AND domain_id=?3
+                   AND supervisor_authority_id=?4 AND kernel_root_id=?5
+                   AND guardian_identity=?6 AND driver_identity=?7 AND endpoint=?8)",
+                params![
+                    attempt.attempt_id,
+                    attempt.owner_generation,
+                    owner.domain_id,
+                    owner.supervisor_authority_id,
+                    root_id,
+                    serde_json::to_string(&owner.guardian_identity).map_err(|e| e.to_string())?,
+                    serde_json::to_string(&owner.driver_identity).map_err(|e| e.to_string())?,
+                    owner.endpoint
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        if changed != 1 {
+            return Err("native acceptance lost exact running reservation".into());
+        }
+        #[cfg(test)]
+        CRASH_AFTER_NATIVE_UPDATE.with(|flag| {
+            if flag.replace(false) {
+                panic!("injected crash between native UPDATE and readback");
+            }
+        });
+        let row = tx
+            .query_row(
+                "SELECT a.attempt_id,a.owner_generation,a.operation,a.request_sha256,
+                    a.source_registration_id,a.source_listener_revision,a.session_id,a.claim_token,
+                    a.result_path,a.domain_id,o.kernel_root_id,o.supervisor_authority_id,
+                    o.guardian_identity,a.phase,a.revision,a.integrated,a.custodian_identity,
+                    a.adopter_identity,o.phase,o.driver_identity,o.endpoint
+             FROM completion_continuation_attempt a
+             JOIN completion_continuation_owner o ON o.generation=a.owner_generation
+             WHERE a.attempt_id=?1",
+                [&attempt.attempt_id],
+                |r| {
+                    Ok((
+                        ContinuationAttempt {
+                            attempt_id: r.get(0)?,
+                            owner_generation: r.get(1)?,
+                            operation: r.get(2)?,
+                            request_sha256: r.get(3)?,
+                            source_registration_id: r.get(4)?,
+                            source_listener_revision: r.get(5)?,
+                            session_id: r.get(6)?,
+                            claim_token: r.get(7)?,
+                            result_path: r.get(8)?,
+                        },
+                        r.get::<_, String>(9)?,
+                        r.get::<_, Option<String>>(10)?,
+                        r.get::<_, String>(11)?,
+                        r.get::<_, String>(12)?,
+                        r.get::<_, String>(13)?,
+                        r.get::<_, i64>(14)?,
+                        r.get::<_, i64>(15)?,
+                        r.get::<_, Option<String>>(16)?,
+                        r.get::<_, Option<String>>(17)?,
+                        r.get::<_, String>(18)?,
+                        r.get::<_, String>(19)?,
+                        r.get::<_, String>(20)?,
+                    ))
+                },
+            )
+            .map_err(|e| e.to_string())?;
+        let (
+            stored,
+            domain,
+            root,
+            supervisor,
+            guardian,
+            phase,
+            revision,
+            integrated,
+            custodian,
+            adopter,
+            owner_phase,
+            driver,
+            endpoint,
+        ) = row;
+        let exact_guardian: SourceProcessIdentity =
+            serde_json::from_str(&guardian).map_err(|e| e.to_string())?;
+        if stored != *attempt
+            || domain != owner.domain_id
+            || root.as_deref() != Some(root_id)
+            || supervisor != owner.supervisor_authority_id
+            || stored.owner_generation != owner.owner_generation
+            || exact_guardian != owner.guardian_identity
+            || driver != serde_json::to_string(&owner.driver_identity).map_err(|e| e.to_string())?
+            || endpoint != owner.endpoint
+            || owner_phase != "running"
+            || phase != "accepted"
+            || revision != 2
+            || integrated != 0
+            || custodian.is_some()
+            || adopter.is_some()
+        {
+            return Err("native acceptance exact readback conflict".into());
+        }
+        native_main_file_must_be_named(&tx)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        native_main_file_must_be_named(&self.conn)?;
+        Ok(AcceptedNativeGrantSnapshot {
+            attempt: stored,
+            domain_id: domain,
+            kernel_root_id: root_id.into(),
+            supervisor_authority_id: supervisor,
+            owner_generation: owner.owner_generation.clone(),
+            guardian_identity: exact_guardian,
+            phase,
+            revision,
+            integrated: false,
+            custodian_identity: None,
+            adopter_identity: None,
+        })
+    }
+
     pub fn accept_continuation_attempt(
         &mut self,
         attempt: &ContinuationAttempt,
@@ -1090,8 +1559,7 @@ impl MailboxDb {
         adopter: &SourceProcessIdentity,
     ) -> Result<(), String> {
         require_exact_attempt(&self.conn, attempt)?;
-        let live = crate::pid_identity::read_live_process_identity(i64::from(std::process::id()))?
-            .ok_or("original driver absent")?;
+        let live = crate::pid_identity::read_current_process_identity()?;
         if driver.pid != live.os_pid
             || driver.boot_id != live.os_boot_id
             || driver.starttime_ticks != live.os_pid_starttime_ticks
@@ -1149,6 +1617,67 @@ impl MailboxDb {
     }
 }
 
+pub(super) fn read_native_grant_binding_on(
+    conn: &Connection,
+    attempt_id: &str,
+) -> Result<Option<NativeGrantBinding>, String> {
+    conn.query_row(
+        "SELECT attempt_id,grant_id,protocol,accepted_revision,domain_id,kernel_root_id,
+                supervisor_authority_id,owner_generation,guardian_identity,
+                accepted_snapshot_sha256,custodian_request_sha256
+         FROM completion_native_grant_binding WHERE attempt_id=?1",
+        [attempt_id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, String>(10)?,
+            ))
+        },
+    )
+    .optional()
+    .map_err(|error| error.to_string())?
+    .map(
+        |(
+            attempt_id,
+            grant_id,
+            protocol,
+            accepted_revision,
+            domain_id,
+            kernel_root_id,
+            supervisor_authority_id,
+            owner_generation,
+            guardian,
+            accepted_snapshot_sha256,
+            custodian_request_sha256,
+        )| {
+            Ok(NativeGrantBinding {
+                attempt_id,
+                grant_id,
+                protocol,
+                accepted_revision,
+                domain_id,
+                kernel_root_id,
+                supervisor_authority_id,
+                owner_generation,
+                guardian_identity: serde_json::from_str(&guardian)
+                    .map_err(|error| error.to_string())?,
+                accepted_snapshot_sha256,
+                custodian_request_sha256,
+            })
+        },
+    )
+    .transpose()
+}
+
 pub(in crate::mailbox) fn cancel_unaccepted_activation_on(
     tx: &Transaction<'_>,
     session: &str,
@@ -1157,8 +1686,7 @@ pub(in crate::mailbox) fn cancel_unaccepted_activation_on(
     if domain_on(tx)?.is_none() {
         return Ok(());
     }
-    let live = crate::pid_identity::read_live_process_identity(i64::from(std::process::id()))?
-        .ok_or("driver process disappeared")?;
+    let live = crate::pid_identity::read_current_process_identity()?;
     let driver = serde_json::to_string(&SourceProcessIdentity {
         pid: live.os_pid,
         boot_id: live.os_boot_id,
@@ -1186,13 +1714,13 @@ pub(in crate::mailbox) fn admit_launcher_on(
         .ok_or("unsupported_legacy_activation_recovery: retained wake claim has no admitted v2 attempt; migration cannot invent launcher custody")?;
     let custodian: SourceProcessIdentity =
         serde_json::from_str(&custodian).map_err(|e| e.to_string())?;
-    if child.os_pid != i64::from(std::process::id()) {
+    let caller = crate::pid_identity::read_current_process_identity()?;
+    if child != &caller {
         return Err("activation launcher must present its own exact process identity".into());
     }
     #[cfg(target_os = "linux")]
     {
-        let parent = unsafe { libc::getppid() };
-        let expected = crate::pid_identity::read_live_process_identity(i64::from(parent))?
+        let expected = crate::pid_identity::read_parent_process_identity()?
             .ok_or("activation custodian disappeared")?;
         if custodian.pid != expected.os_pid
             || custodian.boot_id != expected.os_boot_id
@@ -1351,8 +1879,7 @@ impl MailboxDb {
         gate: &str,
     ) -> Result<(), String> {
         require_exact_attempt(&self.conn, attempt)?;
-        let live = crate::pid_identity::read_live_process_identity(i64::from(std::process::id()))?
-            .ok_or("driver process disappeared")?;
+        let live = crate::pid_identity::read_current_process_identity()?;
         let identity = SourceProcessIdentity {
             pid: live.os_pid,
             boot_id: live.os_boot_id,
@@ -1393,8 +1920,7 @@ impl MailboxDb {
 }
 
 fn require_exact_live_guardian(guardian: &SourceProcessIdentity) -> Result<(), String> {
-    let live = crate::pid_identity::read_live_process_identity(i64::from(std::process::id()))?
-        .ok_or("root supervisor process disappeared")?;
+    let live = crate::pid_identity::read_current_process_identity()?;
     let caller = SourceProcessIdentity {
         pid: live.os_pid,
         boot_id: live.os_boot_id,
@@ -1471,8 +1997,7 @@ impl MailboxDb {
         custodian: &SourceProcessIdentity,
     ) -> Result<(), String> {
         require_exact_attempt(&self.conn, attempt)?;
-        let live = crate::pid_identity::read_live_process_identity(i64::from(std::process::id()))?
-            .ok_or("custodian disappeared")?;
+        let live = crate::pid_identity::read_current_process_identity()?;
         if custodian.pid != live.os_pid
             || custodian.boot_id != live.os_boot_id
             || custodian.starttime_ticks != live.os_pid_starttime_ticks
@@ -1566,6 +2091,9 @@ impl MailboxDb {
             }
         }
         if attempt.operation == "activation" {
+            if changed == 1 {
+                retain_uncertain_activation_input_on(&tx, attempt)?;
+            }
             tx.execute(
                 "DELETE FROM session_wake_claim WHERE session_id=?1 AND claim_token=?2",
                 params![attempt.session_id, attempt.claim_token],

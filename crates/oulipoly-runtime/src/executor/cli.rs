@@ -64,6 +64,8 @@
 //!   interactive signal-forwarding guard.
 
 mod capture_result;
+#[cfg(unix)]
+pub mod fresh_remote;
 mod headless;
 mod input_flags;
 mod interactive;

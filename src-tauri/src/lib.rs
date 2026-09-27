@@ -24,8 +24,13 @@ pub mod commands;
 pub mod completion_owner;
 #[allow(dead_code)]
 mod mailbox_delivery;
+#[cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
+#[allow(dead_code)]
+mod native_f_preparation;
 #[allow(dead_code)]
 mod native_receipt;
+#[cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
+mod private_provider_probe;
 #[allow(dead_code)]
 mod provider_artifact;
 #[path = "commands/provider_settings.rs"]

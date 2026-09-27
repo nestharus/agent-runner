@@ -20,6 +20,13 @@ fn run_from_env() -> Option<i32> {
     if args.next()?.as_os_str() != MODE_ARG {
         return None;
     }
+    // The Runner's opt-in host entry gate is in main(), while this constructor
+    // runs before main(). A directly invoked helper must not bypass that gate.
+    // Legitimate detached read-only probes clear the marker only for their
+    // private helper process when they spawn it.
+    if std::env::var_os("OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1").is_some() {
+        return Some(2);
+    }
     let Some(source) = args.next() else {
         return Some(2);
     };

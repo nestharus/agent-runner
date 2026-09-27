@@ -295,6 +295,556 @@ impl fmt::Display for OwnershipAuthorityError {
 impl std::error::Error for OwnershipAuthorityError {}
 
 impl StateDb {
+    pub(crate) fn exact_source_projection_for_registration(
+        &self,
+        registration_id: &str,
+    ) -> Result<Option<ExactSourceProjection>, String> {
+        let ordinal: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT c.authority_ordinal FROM invocation_completion_exact_source_decisions d
+             JOIN invocation_completion_continuity c ON c.admission_id=d.admission_id
+             WHERE d.registration_id=?1",
+                [registration_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        ordinal
+            .map(|ordinal| self.exact_source_projection_at(ordinal))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    /// One immutable State obligation, its decision and its append-only cursor.
+    /// This is read from the broker-bound original State file, never from a
+    /// caller-supplied registration or a copied sidecar row.
+    pub(crate) fn exact_source_projection_at(
+        &self,
+        ordinal: i64,
+    ) -> Result<Option<ExactSourceProjection>, String> {
+        let row: Option<(
+            String,
+            Vec<u8>,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            i64,
+            i64,
+            Vec<u8>,
+        )> = self
+            .conn
+            .query_row(
+                "SELECT o.admission_id,o.completion_v2_binding,d.request_id,d.decision_id,
+                    d.registration_id,d.registration_sha256,d.root_id,d.source_generation,
+                    d.owner_generation,d.supervisor_id,d.issuer_stamp_json,
+                    d.original_state_device,d.original_state_inode,d.broker_readback_json
+             FROM invocation_completion_continuity c
+             JOIN invocation_completion_obligations o ON o.admission_id=c.admission_id
+             JOIN invocation_completion_exact_source_decisions d ON d.admission_id=o.admission_id
+             WHERE c.authority_ordinal=?1 AND d.projection_state='unavailable'",
+                [ordinal],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                        r.get(9)?,
+                        r.get(10)?,
+                        r.get(11)?,
+                        r.get(12)?,
+                        r.get(13)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some((
+            admission_id,
+            bytes,
+            request_id,
+            decision_id,
+            registration_id,
+            registration_sha256,
+            root_id,
+            source_generation,
+            owner_generation,
+            supervisor_id,
+            issuer_stamp_json,
+            device,
+            inode,
+            readback_json,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        let opened = self
+            .completion_authority_state
+            .as_ref()
+            .ok_or("exact source projection requires opened original State")?;
+        if self.completion_authority_state_path().is_none()
+            || i64::try_from(opened.file.volume).ok() != Some(device)
+            || i64::try_from(opened.file.file).ok() != Some(inode)
+        {
+            return Err("exact source projection original State identity changed".into());
+        }
+        let binding = AdmittedSourceBinding::decode(&bytes)?;
+        let source = binding.registration()?;
+        let continuity = completion_continuity_by_admission_on(&self.conn, &admission_id)
+            .map_err(|e| e.to_string())?
+            .ok_or("exact source projection continuity absent")?;
+        let obligation: (String, String, String, String) = self
+            .conn
+            .query_row(
+                "SELECT event_id,owner_invocation_uuid,owner_session_id,expected_sidecar_generation
+             FROM invocation_completion_obligations WHERE admission_id=?1",
+                [&admission_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .map_err(|e| e.to_string())?;
+        let readback: super::exact_source_decision::BrokerReadback =
+            serde_json::from_slice(&readback_json).map_err(|e| e.to_string())?;
+        let capability_digest: Option<String> = self.conn.query_row(
+            "SELECT completion_registration_capability_digest FROM invocations WHERE invocation_uuid=?1",
+            [&source.owner_invocation_uuid], |r| r.get(0)
+        ).map_err(|e| e.to_string())?;
+        if binding.is_late_listener()
+            || source.registration_id != registration_id
+            || format!("{:x}", Sha256::digest(binding.registration_bytes())) != registration_sha256
+            || source.handle != obligation.0
+            || source.owner_invocation_uuid != obligation.1
+            || source.owner_session_id != obligation.2
+            || obligation.3 != readback.sidecar_generation()
+            || continuity.sidecar_generation != readback.sidecar_generation()
+            || continuity.admission_id != admission_id
+            || continuity.authority_ordinal != ordinal
+            || continuity.invocation_uuid != source.owner_invocation_uuid
+            || continuity.event_id != source.handle
+            || continuity.owner_invocation_uuid != source.owner_invocation_uuid
+            || continuity.owner_session_id != source.owner_session_id
+            || readback.request_id() != request_id
+            || readback.decision_id() != decision_id
+            || readback.registration_id() != registration_id
+            || readback.registration_sha256() != registration_sha256
+            || readback.root_id() != root_id
+            || readback.source_generation() != source_generation
+            || readback.owner_generation() != owner_generation
+            || readback.supervisor_id() != supervisor_id
+            || readback.domain_id() != source.domain_id
+            || readback.owner_invocation_uuid() != source.owner_invocation_uuid
+            || readback.owner_session_id() != source.owner_session_id
+            || readback.handle() != source.handle
+            || readback.caller_admission_id() != binding.caller_admission_id()
+            || readback.registration_path()
+                != std::path::Path::new(&source.handle_dir).join(&source.registration_relative)
+            || readback.registration_len() != binding.registration_bytes().len() as u64
+            || Some(readback.capability_digest()) != capability_digest.as_deref()
+            || !readback.registration_actors_match(&source.registering_caller)
+            || readback.issuer_json()? != issuer_stamp_json
+            || i64::try_from(readback.original_state_device()).ok() != Some(device)
+            || i64::try_from(readback.original_state_inode()).ok() != Some(inode)
+        {
+            return Err("exact source projection State attribution conflict".into());
+        }
+        Ok(Some(ExactSourceProjection {
+            admission_id,
+            binding,
+            continuity,
+            request_id,
+            decision_id,
+            registration_id,
+            registration_sha256,
+            root_id,
+            source_generation,
+            owner_generation,
+            supervisor_id,
+            issuer_stamp_json,
+            readback_json,
+        }))
+    }
+
+    pub(crate) fn exact_source_projection_unavailable(
+        &self,
+        registration_id: &str,
+    ) -> Result<bool, String> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM invocation_completion_exact_source_decisions
+             WHERE registration_id=?1 AND projection_state='unavailable')",
+                [registration_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())
+    }
+
+    /// Consume an issued original-child decision in the State writer transaction.
+    /// This slice retains the source as unavailable for sidecar projection and
+    /// Broker source selection; it does not return a projected event row.
+    pub fn register_completion_continuation_with_broker_decision(
+        &mut self,
+        mutation_authority: crate::InvocationMutationAuthority<'_>,
+        authority: &super::CompletionRegistrationAuthority,
+        binding: &AdmittedSourceBinding,
+        decision: super::ExactSourceDecisionReference<'_>,
+    ) -> Result<super::ExactSourceAdmissionResult, String> {
+        self.register_completion_continuation_with_broker_decision_on(
+            std::path::Path::new("/run/oulipoly-kernel-broker/control.sock"),
+            mutation_authority,
+            authority,
+            binding,
+            decision,
+        )
+    }
+
+    /// Private direct fixture endpoint. Production always uses the fixed socket.
+    #[cfg(feature = "age319-private-broker-fixture")]
+    pub fn register_completion_continuation_with_broker_decision_at(
+        &mut self,
+        socket: &std::path::Path,
+        mutation_authority: crate::InvocationMutationAuthority<'_>,
+        authority: &super::CompletionRegistrationAuthority,
+        binding: &AdmittedSourceBinding,
+        decision: super::ExactSourceDecisionReference<'_>,
+    ) -> Result<super::ExactSourceAdmissionResult, String> {
+        self.register_completion_continuation_with_broker_decision_on(
+            socket,
+            mutation_authority,
+            authority,
+            binding,
+            decision,
+        )
+    }
+
+    fn register_completion_continuation_with_broker_decision_on(
+        &mut self,
+        socket: &std::path::Path,
+        mutation_authority: crate::InvocationMutationAuthority<'_>,
+        authority: &super::CompletionRegistrationAuthority,
+        binding: &AdmittedSourceBinding,
+        decision: super::ExactSourceDecisionReference<'_>,
+    ) -> Result<super::ExactSourceAdmissionResult, String> {
+        let source = binding.registration()?;
+        if binding.is_late_listener() {
+            return Err("exact source admission requires the original listener".into());
+        }
+        let listener = binding.admission_listener()?;
+        let paths = source.paths();
+        let registration = CompletionEventRegistrationInput {
+            event_id: &source.handle,
+            delivery_mode: &source.delivery_mode,
+            owner_session_id: Some(&listener.session_id),
+            owner_invocation_uuid: Some(&listener.owner_invocation_uuid),
+            state_dir: &source.handle_dir,
+            meta_path: &paths[0],
+            log_path: &paths[1],
+            rc_path: &paths[2],
+        };
+        binding.validate_input(binding.caller_admission_id(), &registration)?;
+        validate_completion_event_registration(&registration)?;
+        let admission_id = completion_bound_admission_id(
+            binding.caller_admission_id(),
+            &registration,
+            Some(binding),
+        );
+        self.completion_authority_state_path()
+            .ok_or("exact source admission requires stable opened State identity")?;
+        let opened = self
+            .completion_authority_state
+            .as_ref()
+            .ok_or("exact source admission requires opened State file")?;
+        let opened_file = opened.file;
+        let source_path = opened.source_path.clone();
+        let canonical_path = opened.path.clone();
+        let tx = self
+            .conn
+            .transaction_with_behavior(sqlite::TransactionBehavior::Immediate)
+            .map_err(|e| format!("exact source admission writer reservation: {e}"))?;
+        require_completion_continuity_registration_ready(&tx)?;
+        validate_completion_registration_actor(
+            &tx,
+            authority,
+            &source.owner_invocation_uuid,
+            &source.owner_session_id,
+        )?;
+        // The private capability is independently compared with the challenged
+        // Broker response below. The request's capability field is not proof.
+        if authority.process_environment_value()
+            != super::exact_source_decision::witness_string(
+                &decision.verification.witness,
+                &["capability"],
+            )?
+        {
+            return Err("exact source decision capability/State actor conflict".into());
+        }
+        let existing: Option<(Vec<u8>, Vec<u8>)> = tx
+            .query_row(
+                "SELECT o.completion_v2_binding,d.broker_readback_json
+             FROM invocation_completion_obligations o
+             JOIN invocation_completion_exact_source_decisions d ON d.admission_id=o.admission_id
+             WHERE o.admission_id=?1",
+                [&admission_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if let Some((existing_binding, stored_readback)) = existing {
+            if existing_binding != binding.encoded()? {
+                return Err("exact source committed retry binding conflict".into());
+            }
+            let mut retry = decision.verification.clone();
+            retry.committed_retry = true;
+            let verified = super::exact_source_decision::verify_decision_in_transaction(
+                &tx,
+                socket,
+                &retry,
+                decision.guardian_fd,
+                decision.registration_fd,
+                binding,
+                opened_file.volume,
+                opened_file.file,
+                &source_path,
+                &canonical_path,
+            )?;
+            let current_readback = verified.readback.encoded()?;
+            if current_readback != stored_readback {
+                return Err("exact source committed retry decision attribution conflict".into());
+            }
+            return Ok(super::ExactSourceAdmissionResult {
+                inserted: false,
+                decision_id: verified.inspection.decision_id,
+                projection_available: false,
+            });
+        }
+        if completion_obligation_by_admission_id(&tx, &admission_id)
+            .map_err(|e| e.to_string())?
+            .is_some()
+        {
+            return Err(
+                "exact source admission conflicts with historical unattributed obligation".into(),
+            );
+        }
+        let mut first = decision.verification.clone();
+        first.committed_retry = false;
+        let verified = super::exact_source_decision::verify_decision_in_transaction(
+            &tx,
+            socket,
+            &first,
+            decision.guardian_fd,
+            decision.registration_fd,
+            binding,
+            opened_file.volume,
+            opened_file.file,
+            &source_path,
+            &canonical_path,
+        )?;
+        // The real generation is needed by the append-only continuity chain.
+        // The immutable decision row remains unavailable until the broker's
+        // retained sidecar commits and reads back its exact projection.
+        let generation = verified.readback.sidecar_generation().to_owned();
+        let state_head = completion_continuity_head_on(&tx).map_err(|e| e.to_string())?;
+        let owner_authorization = completion_owner_authorization(
+            &tx,
+            &source.owner_invocation_uuid,
+            &source.owner_session_id,
+            &source.handle,
+            &admission_id,
+        )?;
+        let obligation = CompletionObligationAdmission {
+            admission_id: &admission_id,
+            invocation_uuid: &source.owner_invocation_uuid,
+            event_id: &source.handle,
+            owner_invocation_uuid: &source.owner_invocation_uuid,
+            owner_session_id: &source.owner_session_id,
+            expected_sidecar_generation: &generation,
+        };
+        owner_authorization.validate_observed_generation(&obligation)?;
+        let invocation_row_id: i64 = tx
+            .query_row(
+                "SELECT id FROM invocations WHERE invocation_uuid=?1",
+                [&source.owner_invocation_uuid],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        let linked_fence = if matches!(
+            mutation_authority,
+            crate::InvocationMutationAuthority::Standalone
+        ) {
+            current_registration_effect_fence(&tx, invocation_row_id)?
+        } else {
+            None
+        };
+        let effect_authority = linked_fence
+            .as_ref()
+            .map(crate::InvocationMutationAuthority::ProviderLaunch)
+            .unwrap_or(mutation_authority);
+        super::provider_launch_lifecycle::validate_invocation_mutation_authority(
+            &tx,
+            invocation_row_id,
+            effect_authority,
+        )?;
+        let recorded = record_completion_obligation_on(&tx, obligation, Some(&binding.encoded()?))
+            .map_err(|e| e.to_string())?;
+        let CompletionObligationAdmissionResult::Recorded(expectation) = recorded else {
+            return Err("exact source admission unexpectedly replayed obligation".into());
+        };
+        let readback = &verified.readback;
+        tx.execute(
+            "INSERT INTO invocation_completion_exact_source_decisions (
+                admission_id,request_id,decision_id,registration_id,registration_sha256,
+                root_id,source_generation,owner_generation,supervisor_id,issuer_stamp_json,
+                original_state_device,original_state_inode,broker_readback_json
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            sqlite::params![
+                admission_id,
+                readback.request_id(),
+                readback.decision_id(),
+                readback.registration_id(),
+                readback.registration_sha256(),
+                readback.root_id(),
+                readback.source_generation(),
+                readback.owner_generation(),
+                readback.supervisor_id(),
+                readback.issuer_json()?,
+                i64::try_from(readback.original_state_device()).map_err(|e| e.to_string())?,
+                i64::try_from(readback.original_state_inode()).map_err(|e| e.to_string())?,
+                readback.encoded()?,
+            ],
+        )
+        .map_err(|e| format!("exact source decision consumption conflict: {e}"))?;
+        super::provider_launch_lifecycle::promote_invocation_effect(
+            &tx,
+            effect_authority,
+            crate::ProviderLaunchPromotion::MailboxSubmissionAccepted,
+            1,
+        )?;
+        let continuity = next_completion_continuity(state_head.as_ref(), &expectation);
+        append_completion_continuity_on(&tx, &continuity).map_err(|e| e.to_string())?;
+        tx.commit()
+            .map_err(|e| format!("exact source admission State commit: {e}"))?;
+        Ok(super::ExactSourceAdmissionResult {
+            inserted: true,
+            decision_id: verified.inspection.decision_id,
+            projection_available: false,
+        })
+    }
+
+    #[cfg(feature = "age319-private-broker-fixture")]
+    pub fn seed_private_pending_completion_source(
+        &mut self,
+        binding: &AdmittedSourceBinding,
+        sidecar_generation: &str,
+    ) -> Result<(), String> {
+        let source = binding.registration()?;
+        let listener = binding.admission_listener()?;
+        self.start_invocation(&crate::InvocationStart {
+            invocation_uuid: listener.owner_invocation_uuid.clone(),
+            model_name: "fixture".into(),
+            provider_name: "fixture".into(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        })?;
+        let paths = source.paths();
+        let registration = CompletionEventRegistrationInput {
+            event_id: &source.handle,
+            delivery_mode: &source.delivery_mode,
+            owner_session_id: Some(&listener.session_id),
+            owner_invocation_uuid: Some(&listener.owner_invocation_uuid),
+            state_dir: &source.handle_dir,
+            meta_path: &paths[0],
+            log_path: &paths[1],
+            rc_path: &paths[2],
+        };
+        binding.validate_input(binding.caller_admission_id(), &registration)?;
+        let admission_id = completion_bound_admission_id(
+            binding.caller_admission_id(),
+            &registration,
+            Some(binding),
+        );
+        let tx = self
+            .conn
+            .transaction_with_behavior(sqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        require_completion_continuity_registration_ready(&tx)?;
+        let head = completion_continuity_head_on(&tx).map_err(|e| e.to_string())?;
+        record_completion_obligation_with_continuity_on(
+            &tx,
+            CompletionObligationAdmission {
+                admission_id: &admission_id,
+                invocation_uuid: &source.owner_invocation_uuid,
+                event_id: &source.handle,
+                owner_invocation_uuid: &listener.owner_invocation_uuid,
+                owner_session_id: &listener.session_id,
+                expected_sidecar_generation: sidecar_generation,
+            },
+            head.as_ref(),
+            Some(&binding.encoded()?),
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+    /// Broker D/child custody fixes the exact route in the original State DB.
+    /// The marker is append-only and survives later session metadata changes.
+    pub fn mark_fresh_v30_exact_registration(
+        &self,
+        invocation_uuid: &str,
+        capture_method: &str,
+        authority: &super::CompletionRegistrationAuthority,
+    ) -> Result<(), String> {
+        let allowed = matches!(
+            capture_method,
+            "broker-released-root-v30" | "broker-bash-child-v30"
+        );
+        #[cfg(feature = "age319-private-broker-fixture")]
+        let allowed = allowed || capture_method == "private-released-j-d-original-state";
+        if !allowed {
+            return Err("fresh exact registration capture method invalid".into());
+        }
+        let row: Option<(Option<String>, Option<String>, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT provider_session_capture_method,provider_session_id,
+                    completion_registration_capability_digest
+             FROM invocations WHERE invocation_uuid=?1",
+                [invocation_uuid],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some((Some(method), Some(_session), Some(digest))) = row else {
+            return Err("fresh exact registration State actor absent".into());
+        };
+        if method != capture_method || digest != authority.digest() {
+            return Err("fresh exact registration State actor changed".into());
+        }
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO invocation_completion_exact_required
+             (invocation_uuid,route,capability_digest) VALUES (?1,'broker-v30',?2)",
+                sqlite::params![invocation_uuid, &digest],
+            )
+            .map_err(|e| e.to_string())?;
+        let stored: String = self.conn.query_row(
+            "SELECT capability_digest FROM invocation_completion_exact_required WHERE invocation_uuid=?1",
+            [invocation_uuid], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        if stored != digest {
+            return Err("fresh exact registration route attribution conflict".into());
+        }
+        Ok(())
+    }
+
     /// Admission still uses the original actor capability and continuity ledger.
     /// Source bytes are inserted atomically with that authority, before sidecar IO.
     pub fn register_completion_continuation_with_authority(
@@ -303,6 +853,46 @@ impl StateDb {
         authority: &super::CompletionRegistrationAuthority,
         binding: &AdmittedSourceBinding,
     ) -> Result<CompletionEventRegistrationResult, String> {
+        let source = binding.registration()?;
+        // The append-only marker is established by Broker D/child custody in
+        // the original State file. Copied capability/source bytes alone cannot
+        // authorize an unattributed first admission.
+        let exact_required: bool = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM invocation_completion_exact_required
+             WHERE invocation_uuid=?1)",
+                [&source.owner_invocation_uuid],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        // The Broker commits this capture method before inserting the
+        // immutable marker. Keep the short crash/retry gap closed too.
+        let capture_method: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT provider_session_capture_method FROM invocations WHERE invocation_uuid=?1",
+                [&source.owner_invocation_uuid],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let fresh_actor = matches!(
+            capture_method.as_ref().and_then(Option::as_deref),
+            Some("broker-released-root-v30" | "broker-bash-child-v30")
+        );
+        #[cfg(feature = "age319-private-broker-fixture")]
+        let fresh_actor = fresh_actor
+            || matches!(
+                capture_method.as_ref().and_then(Option::as_deref),
+                Some("private-released-j-d-original-state")
+            );
+        if !binding.is_late_listener()
+            && (exact_required || fresh_actor)
+            && self.admitted_completion_continuation(binding)?.is_none()
+        {
+            return Err("fresh v30 exact Broker decision required".into());
+        }
         self.register_bound_completion(mutation_authority, Some(authority), false, binding)
     }
 
@@ -380,6 +970,142 @@ impl StateDb {
         projection.unaccepted_completion_continuations(supervisor_authority_id, source_limit)
     }
 
+    /// Broker-owned v30 projection of one bounded State admission suffix.
+    /// The broker supplies its retained connection; this path never resolves or
+    /// opens the retired user sidecar. Each admission is read from this StateDb,
+    /// and the sidecar cursor is advanced atomically with its exact projection.
+    pub(crate) fn repair_pending_domain_completion_continuations_on(
+        &mut self,
+        projection: &mut MailboxDb,
+        domain: &str,
+        supervisor_authority_id: &str,
+        expected_ordinal: i64,
+        suffix_limit: usize,
+        source_limit: usize,
+    ) -> Result<(i64, bool, Vec<String>), String> {
+        if !(1..=64).contains(&suffix_limit) || !(1..=16).contains(&source_limit) {
+            return Err("broker completion repair bounds invalid".into());
+        }
+        let projection_head = projection.completion_continuity_head()?;
+        let ordinal = projection_head
+            .as_ref()
+            .map_or(0, |head| head.authority_ordinal);
+        if ordinal != expected_ordinal {
+            return Err("broker completion repair cursor revision conflict".into());
+        }
+        self.completion_repair_has_suffix(projection_head.as_ref())?;
+        let suffix = self.admitted_completion_continuations_after(ordinal, suffix_limit + 1)?;
+        let page = &suffix[..suffix.len().min(suffix_limit)];
+        let originals: std::collections::BTreeSet<Vec<u8>> = page
+            .iter()
+            .filter(|binding| !binding.is_late_listener())
+            .map(|binding| binding.registration_bytes().to_vec())
+            .collect();
+        for binding in page {
+            let source = binding.registration()?;
+            if self.exact_source_projection_unavailable(&source.registration_id)? {
+                return Err("exact source decision projection unavailable".into());
+            }
+            if source.domain_id != domain {
+                return Err("broker completion repair domain conflict".into());
+            }
+            if binding.is_late_listener()
+                && !originals.contains(binding.registration_bytes())
+                && !projection.has_original_completion_source(binding)?
+            {
+                return Err("late listener requires original committed v2 source admission".into());
+            }
+            let paths = source.paths();
+            let listener = binding.admission_listener()?;
+            let registration = CompletionEventRegistrationInput {
+                event_id: &source.handle,
+                delivery_mode: &source.delivery_mode,
+                owner_session_id: Some(&listener.session_id),
+                owner_invocation_uuid: Some(&listener.owner_invocation_uuid),
+                state_dir: &source.handle_dir,
+                meta_path: &paths[0],
+                log_path: &paths[1],
+                rc_path: &paths[2],
+            };
+            binding.validate_input(binding.caller_admission_id(), &registration)?;
+            let admission_id = completion_bound_admission_id(
+                binding.caller_admission_id(),
+                &registration,
+                Some(binding),
+            );
+            let continuity = completion_continuity_by_admission_on(&self.conn, &admission_id)
+                .map_err(|error| error.to_string())?
+                .ok_or("broker repair admission continuity absent")?;
+            let current = projection.completion_continuity_head()?;
+            if continuity.authority_ordinal
+                != current.as_ref().map_or(0, |h| h.authority_ordinal) + 1
+                || continuity.previous_continuity_digest
+                    != current
+                        .as_ref()
+                        .map_or(COMPLETION_CONTINUITY_GENESIS_DIGEST, |h| {
+                            h.continuity_digest.as_str()
+                        })
+            {
+                return Err("broker completion repair continuity order conflict".into());
+            }
+            let fence = projection.begin_completion_authority_fence()?;
+            if fence.sidecar_generation()? != continuity.sidecar_generation
+                || fence.completion_continuity_head()?.as_ref() != current.as_ref()
+            {
+                return Err("broker repair sidecar generation/cursor changed".into());
+            }
+            fence.preflight_continuation_binding(binding, true)?;
+            fence.require_continuation_binding(&source.handle, true)?;
+            fence.preflight_completion_event_registration(&registration)?;
+            fence.register_completion_event_for_broker_repair(
+                registration,
+                &continuity,
+                binding,
+            )?;
+        }
+        let final_ordinal = projection.completion_continuity_repair_ordinal()?;
+        let final_head = projection.completion_continuity_head()?;
+        let has_more = self.completion_repair_has_suffix(final_head.as_ref())?;
+        let pending = projection
+            .unaccepted_completion_continuations(supervisor_authority_id, source_limit)?
+            .into_iter()
+            .map(|binding| binding.registration().map(|source| source.registration_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((final_ordinal, has_more, pending))
+    }
+
+    pub(crate) fn completion_repair_has_suffix(
+        &self,
+        projection_head: Option<&CompletionContinuityHead>,
+    ) -> Result<bool, String> {
+        let ordinal = projection_head.map_or(0, |head| head.authority_ordinal);
+        if let Some(head) = projection_head {
+            let admitted = completion_continuity_by_ordinal_on(&self.conn, ordinal)
+                .map_err(|error| error.to_string())?;
+            if admitted.as_ref() != Some(head) {
+                return Err("broker completion repair State/sidecar cursor conflict".into());
+            }
+        }
+        let state_head = completion_continuity_head_on(&self.conn).map_err(|e| e.to_string())?;
+        if state_head
+            .as_ref()
+            .is_some_and(|head| head.authority_ordinal < ordinal)
+        {
+            return Err("broker completion repair sidecar cursor exceeds State".into());
+        }
+        let pending = !self
+            .admitted_completion_continuations_after(ordinal, 1)?
+            .is_empty();
+        if !pending
+            && state_head
+                .as_ref()
+                .is_some_and(|head| head.authority_ordinal > ordinal)
+        {
+            return Err("broker completion repair has unprojectable State suffix".into());
+        }
+        Ok(pending)
+    }
+
     fn repair_domain_binding(
         &mut self,
         domain: &str,
@@ -387,6 +1113,9 @@ impl StateDb {
         projection: Option<&MailboxDb>,
         binding: AdmittedSourceBinding,
     ) -> Result<Option<AdmittedSourceBinding>, String> {
+        if self.exact_source_projection_unavailable(&binding.registration()?.registration_id)? {
+            return Err("exact source decision projection unavailable".into());
+        }
         if binding.registration()?.domain_id != domain {
             return Ok(None);
         }
@@ -424,6 +1153,9 @@ impl StateDb {
         repair: bool,
         binding: &AdmittedSourceBinding,
     ) -> Result<CompletionEventRegistrationResult, String> {
+        if self.exact_source_projection_unavailable(&binding.registration()?.registration_id)? {
+            return Err("exact source decision projection unavailable".into());
+        }
         if binding.is_late_listener() && !self.has_original_admitted_completion_source(binding)? {
             return Err("late listener requires original committed v2 source admission".into());
         }
@@ -1284,6 +2016,22 @@ impl StateDb {
     }
 }
 
+pub(crate) struct ExactSourceProjection {
+    pub admission_id: String,
+    pub binding: AdmittedSourceBinding,
+    pub continuity: CompletionContinuityHead,
+    pub request_id: String,
+    pub decision_id: String,
+    pub registration_id: String,
+    pub registration_sha256: String,
+    pub root_id: String,
+    pub source_generation: String,
+    pub owner_generation: String,
+    pub supervisor_id: String,
+    pub issuer_stamp_json: String,
+    pub readback_json: Vec<u8>,
+}
+
 fn decode_admitted_completion_row(
     row: (Vec<u8>, String, String, String, String),
 ) -> Result<AdmittedSourceBinding, String> {
@@ -1592,6 +2340,22 @@ pub(super) fn completion_continuity_head_on(
     )
     .optional()
     .map_err(persistence("read completion continuity head"))
+}
+
+fn completion_continuity_by_ordinal_on(
+    conn: &sqlite::Connection,
+    ordinal: i64,
+) -> Result<Option<CompletionContinuityHead>, OwnershipAuthorityError> {
+    conn.query_row(
+        "SELECT authority_ordinal, admission_id, expected_sidecar_generation,
+                invocation_uuid, event_id, owner_invocation_uuid, owner_session_id,
+                previous_continuity_digest, continuity_digest
+         FROM invocation_completion_continuity WHERE authority_ordinal=?1",
+        [ordinal],
+        map_completion_continuity_head,
+    )
+    .optional()
+    .map_err(persistence("read completion continuity cursor"))
 }
 
 fn completion_continuity_by_admission_on(
@@ -4203,6 +4967,289 @@ mod completion_continuation_tests {
                 || assert!(!after, "after State commit fault"),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn fresh_v30_public_registration_refuses_copied_capability_and_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.db");
+        let binding = binding();
+        let mut state = StateDb::open(&path).unwrap();
+        seed_domain(&path);
+        let authority = crate::CompletionRegistrationAuthority::generate().unwrap();
+        let source = binding.registration().unwrap();
+        let started = state
+            .start_invocation_with_prepared_completion_registration_authority(
+                &InvocationStart {
+                    invocation_uuid: source.owner_invocation_uuid.clone(),
+                    model_name: "agent-runner-root".into(),
+                    provider_name: "agent-runner".into(),
+                    provider_index: 0,
+                    parent_invocation_id: None,
+                },
+                &authority,
+            )
+            .unwrap();
+        state
+            .bind_invocation_provider_session_start(
+                crate::InvocationMutationAuthority::Standalone,
+                started.invocation_row_id,
+                &crate::ProviderSessionBinding {
+                    provider_session_id: source.owner_session_id,
+                    capture_method: "broker-released-root-v30",
+                    resume_input_id: None,
+                    provider_session_resolved_account: None,
+                },
+            )
+            .unwrap();
+        state
+            .mark_fresh_v30_exact_registration(
+                &source.owner_invocation_uuid,
+                "broker-released-root-v30",
+                &authority,
+            )
+            .unwrap();
+        let error = state
+            .register_completion_continuation_with_authority(
+                crate::InvocationMutationAuthority::Standalone,
+                &authority,
+                &binding,
+            )
+            .unwrap_err();
+        assert!(
+            error.contains("fresh v30 exact Broker decision required"),
+            "{error}"
+        );
+        assert!(
+            state
+                .admitted_completion_continuation(&binding)
+                .unwrap()
+                .is_none()
+        );
+        state.conn.execute(
+            "UPDATE invocations SET provider_session_capture_method='broker-bash-child-v30' WHERE invocation_uuid=?1",
+            [&source.owner_invocation_uuid],
+        ).unwrap();
+        assert!(
+            state
+                .register_completion_continuation_with_authority(
+                    crate::InvocationMutationAuthority::Standalone,
+                    &authority,
+                    &binding,
+                )
+                .unwrap_err()
+                .contains("fresh v30 exact Broker decision required")
+        );
+        state.conn.execute(
+            "UPDATE invocations SET provider_session_capture_method='provider_live_report' WHERE invocation_uuid=?1",
+            [&source.owner_invocation_uuid],
+        ).unwrap();
+        assert!(
+            state
+                .register_completion_continuation_with_authority(
+                    crate::InvocationMutationAuthority::Standalone,
+                    &authority,
+                    &binding,
+                )
+                .unwrap_err()
+                .contains("fresh v30 exact Broker decision required")
+        );
+        assert!(
+            state
+                .admitted_completion_continuation(&binding)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn admitted_historical_binding_repairs_after_v30_capture_label() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.db");
+        let binding = binding();
+        let mut state = StateDb::open(&path).unwrap();
+        seed_domain(&path);
+        let authority = crate::CompletionRegistrationAuthority::generate().unwrap();
+        let source = binding.registration().unwrap();
+        let started = state
+            .start_invocation_with_prepared_completion_registration_authority(
+                &InvocationStart {
+                    invocation_uuid: source.owner_invocation_uuid.clone(),
+                    model_name: "fixture".into(),
+                    provider_name: "fixture".into(),
+                    provider_index: 0,
+                    parent_invocation_id: None,
+                },
+                &authority,
+            )
+            .unwrap();
+        state
+            .bind_invocation_provider_session_start(
+                crate::InvocationMutationAuthority::Standalone,
+                started.invocation_row_id,
+                &crate::ProviderSessionBinding {
+                    provider_session_id: source.owner_session_id,
+                    capture_method: "provider_live_report",
+                    resume_input_id: None,
+                    provider_session_resolved_account: None,
+                },
+            )
+            .unwrap();
+        assert!(
+            state
+                .register_completion_continuation_with_authority(
+                    crate::InvocationMutationAuthority::Standalone,
+                    &authority,
+                    &binding,
+                )
+                .unwrap()
+                .inserted
+        );
+        state.conn.execute(
+            "UPDATE invocations SET provider_session_capture_method='broker-released-root-v30' WHERE invocation_uuid=?1",
+            [&source.owner_invocation_uuid],
+        ).unwrap();
+        assert!(
+            !state
+                .register_completion_continuation_with_authority(
+                    crate::InvocationMutationAuthority::Standalone,
+                    &authority,
+                    &binding,
+                )
+                .unwrap()
+                .inserted
+        );
+    }
+
+    #[cfg(feature = "age319-private-broker-fixture")]
+    #[test]
+    fn broker_repair_uses_state_admission_and_bounded_cursor() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.db");
+        let original = binding();
+        let mut projection =
+            MailboxDb::open_completion_continuation_domain(&MailboxDb::path_for_state_db(&path))
+                .unwrap();
+        projection
+            .connection()
+            .execute(
+                "UPDATE completion_continuation_domain SET domain_id=?1",
+                [&original.registration().unwrap().domain_id],
+            )
+            .unwrap();
+        let generation = projection.sidecar_generation().unwrap();
+        let domain = original.registration().unwrap().domain_id;
+        let process =
+            crate::pid_identity::read_live_process_identity(i64::from(std::process::id()))
+                .unwrap()
+                .unwrap();
+        let identity = crate::completion_continuation::SourceProcessIdentity {
+            pid: process.os_pid,
+            boot_id: process.os_boot_id,
+            starttime_ticks: process.os_pid_starttime_ticks,
+        };
+        let supervisor = uuid::Uuid::new_v4().to_string();
+        projection
+            .publish_completion_continuation_owner(&crate::mailbox::CompletionDomainOwner {
+                protocol: crate::completion_continuation::PROTOCOL.into(),
+                domain_id: domain.clone(),
+                supervisor_authority_id: supervisor.clone(),
+                owner_generation: uuid::Uuid::new_v4().to_string(),
+                guardian_identity: identity.clone(),
+                driver_identity: identity,
+                endpoint: "/fixture/owner.sock".into(),
+            })
+            .unwrap();
+        let mut state = StateDb::open(&path).unwrap();
+        state
+            .seed_private_pending_completion_source(&original, &generation)
+            .unwrap();
+        let listener_id = uuid::Uuid::new_v4().to_string();
+        let late = original
+            .for_listener(
+                "fixture-late",
+                crate::completion_continuation::ListenerIdentity {
+                    listener_id: listener_id.clone(),
+                    owner_invocation_uuid: listener_id,
+                    session_id: "fixture-late-session".into(),
+                },
+            )
+            .unwrap();
+        state
+            .seed_private_pending_completion_source(&late, &generation)
+            .unwrap();
+        assert_eq!(
+            projection.completion_continuity_repair_ordinal().unwrap(),
+            0
+        );
+        assert!(
+            state
+                .repair_pending_domain_completion_continuations_on(
+                    &mut projection,
+                    &domain,
+                    &supervisor,
+                    1,
+                    1,
+                    1
+                )
+                .unwrap_err()
+                .contains("revision conflict")
+        );
+        let (ordinal, has_more, pending) = state
+            .repair_pending_domain_completion_continuations_on(
+                &mut projection,
+                &domain,
+                &supervisor,
+                0,
+                1,
+                1,
+            )
+            .unwrap();
+        assert_eq!((ordinal, has_more), (1, true));
+        assert_eq!(
+            pending,
+            vec![original.registration().unwrap().registration_id]
+        );
+        assert!(
+            state
+                .repair_pending_domain_completion_continuations_on(
+                    &mut projection,
+                    &domain,
+                    &supervisor,
+                    0,
+                    1,
+                    1
+                )
+                .unwrap_err()
+                .contains("revision conflict")
+        );
+        let (ordinal, has_more, pending) = state
+            .repair_pending_domain_completion_continuations_on(
+                &mut projection,
+                &domain,
+                &supervisor,
+                1,
+                1,
+                1,
+            )
+            .unwrap();
+        assert_eq!((ordinal, has_more), (2, false));
+        assert_eq!(
+            pending,
+            vec![original.registration().unwrap().registration_id]
+        );
+        assert!(
+            state
+                .repair_pending_domain_completion_continuations_on(
+                    &mut projection,
+                    &domain,
+                    &supervisor,
+                    2,
+                    0,
+                    1
+                )
+                .is_err()
+        );
     }
 
     #[test]

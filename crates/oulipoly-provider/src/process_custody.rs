@@ -487,6 +487,22 @@ pub(crate) fn containment_supported() -> bool {
     ))
 }
 
+/// Original-tree launches retain a separate wait owner instead of relying on
+/// inherited syscall restrictions. Restrictions inherited from an older lane
+/// cannot be undone by fork/exec; refuse before effects rather than claim sudo
+/// semantics that this process cannot provide. This also runs in the exec child.
+#[cfg(target_os = "linux")]
+pub(crate) fn require_unrestricted_context() -> std::io::Result<()> {
+    if unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) } != 0
+        || unsafe { libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0) } != 0
+    {
+        return Err(std::io::Error::other(
+            "original-tree provider inherited NNP or seccomp restriction",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn configure_containment(command: &mut std::process::Command, enabled: bool) {
     #[cfg(all(
         target_os = "linux",

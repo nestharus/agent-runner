@@ -59,6 +59,7 @@ struct Shared {
     invocation_uuid: String,
     trace_path: Option<PathBuf>,
     profile: Profile,
+    generation_identity: Option<broker::ResidentGenerationIdentity>,
 }
 
 impl Shared {
@@ -144,6 +145,7 @@ impl ControlWorker {
             invocation_uuid: control.invocation_uuid.clone(),
             trace_path,
             profile,
+            generation_identity: control.generation_identity.clone(),
         });
         let (events_tx, events) = mpsc::channel();
         let (commands, commands_rx) = mpsc::channel();
@@ -280,11 +282,18 @@ fn run_worker(
             }
             process_peer(&mut peer, &shared, &events, &commands)
         });
+        let identity_query = matches!(
+            &response,
+            Ok(broker::ControlPayloadOutcome::Identity(_)
+                | broker::ControlPayloadOutcome::IdentityRefused(_))
+        );
         let (ack, message) = broker::control_response_parts(response);
-        shared.trace_response(ack, &message);
+        if !identity_query {
+            shared.trace_response(ack, &message);
+        }
         let _ = broker::write_control_response(&mut peer, ack, &message);
         *lock_or_recover(&shared.peer) = None;
-        if events.send(Event::Finished).is_err() {
+        if !identity_query && events.send(Event::Finished).is_err() {
             return;
         }
     }
@@ -304,16 +313,28 @@ fn process_peer(
     commands: &mpsc::Receiver<Command>,
 ) -> Result<broker::ControlPayloadOutcome, String> {
     broker::validate_peer_uid(peer)?;
-    let session_id = lock_or_recover(&shared.session_id)
-        .clone()
-        .ok_or_else(|| "awaiting_session_identity".to_string())?;
-    let bytes = {
+    let request = {
         let _timing = shared.profile.measure("control.read");
-        broker::read_control_request(peer)?
+        broker::read_control_request_payload(peer)?
     };
+    let session_id = lock_or_recover(&shared.session_id).clone();
+    if request.operation == broker::CONTROL_OP_GENERATION_IDENTITY {
+        return Ok(broker::prepare_generation_identity_reply(
+            shared
+                .generation_identity
+                .as_ref()
+                .zip(session_id.as_deref()),
+            request.payload,
+        )
+        .unwrap_or_else(broker::ControlPayloadOutcome::IdentityRefused));
+    }
+    let session_id = session_id.ok_or_else(|| "awaiting_session_identity".to_string())?;
     let mut payload = {
         let _timing = shared.profile.measure("control.prepare");
-        broker::prepare_control_payload(bytes, Some((&session_id, &shared.invocation_uuid)))?
+        broker::prepare_control_payload(
+            broker::require_inject_operation(request)?,
+            Some((&session_id, &shared.invocation_uuid)),
+        )?
     };
     if payload.bytes.is_empty() {
         let _timing = shared.profile.measure("control.settle");
@@ -384,6 +405,7 @@ mod tests {
     use super::*;
     use oulipoly_state::mailbox::MailboxDb;
     use std::io::{Read, Write};
+    use std::os::unix::fs::MetadataExt;
     use std::time::Duration;
 
     struct Harness {
@@ -400,6 +422,10 @@ mod tests {
 
     impl Harness {
         fn new() -> Self {
+            Self::with_identity(None)
+        }
+
+        fn with_identity(identity: Option<broker::ResidentGenerationIdentity>) -> Self {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("control.sock");
             let control = ControlSocket {
@@ -409,6 +435,7 @@ mod tests {
                 session_id: Arc::new(Mutex::new(Some("session-a".to_string()))),
                 invocation_uuid: "invocation-a".to_string(),
                 child_started_at: Instant::now() - Duration::from_secs(20),
+                generation_identity: identity,
             };
             let worker = ControlWorker::start_with_trace_path(
                 &control,
@@ -505,6 +532,52 @@ mod tests {
             );
             routed.top_scroll_lines
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tui_worker_answers_generation_identity_without_entering_submission() {
+        let process = oulipoly_state::pid_identity::read_current_process_identity().unwrap();
+        let identity = broker::ResidentGenerationIdentity {
+            generation_id: uuid::Uuid::new_v4().to_string(),
+            spawn_invocation_uuid: "invocation-a".into(),
+            creator_process: process.clone(),
+            provider_process: process,
+            provider_account: "account-a".into(),
+            provider_instance_id: "instance-a".into(),
+            settings_id: "settings-a".into(),
+        };
+        let harness = Harness::with_identity(Some(identity.clone()));
+        let metadata = std::fs::symlink_metadata(&harness.control.path).unwrap();
+        let reply = broker::query_pty_generation_identity(
+            &harness.control.path,
+            metadata.dev(),
+            metadata.ino(),
+        )
+        .unwrap();
+        assert_eq!(reply.generation_id, identity.generation_id);
+        assert_eq!(reply.provider_session_id, "session-a");
+        assert_eq!(harness.worker.phase, Phase::Idle);
+        assert!(harness.pending.is_empty());
+        assert!(!harness._directory.path().join("trace.log").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tui_worker_refuses_unattested_identity_without_submission_or_trace() {
+        let harness = Harness::new();
+        let metadata = std::fs::symlink_metadata(&harness.control.path).unwrap();
+        assert!(
+            broker::query_pty_generation_identity(
+                &harness.control.path,
+                metadata.dev(),
+                metadata.ino(),
+            )
+            .is_err()
+        );
+        assert_eq!(harness.worker.phase, Phase::Idle);
+        assert!(harness.pending.is_empty());
+        assert!(!harness._directory.path().join("trace.log").exists());
     }
 
     #[test]

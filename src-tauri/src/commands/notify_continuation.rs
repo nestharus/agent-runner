@@ -3,18 +3,22 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use oulipoly_state::completion_continuation::{
     AdmittedSourceBinding, MAX_REGISTRATION_BYTES, PROTOCOL, SourceRegistration,
-    VerifiedCompletion, read_source_file,
+    VerifiedCompletion, copy_verified_raw, read_source_file, require_unchanged_output,
 };
 use oulipoly_state::mailbox::{CompletionEventTriggerInput, MailboxDb};
 use oulipoly_state::{InvocationMutationAuthority, StateDb};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::fs;
+use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 
 const COMPLETION_REGISTRATION_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
+#[cfg(target_os = "linux")]
+#[path = "notify_exact_v30.rs"]
+mod exact_v30;
 
 pub(crate) fn recovery_list(session_id: Option<&str>, cursor: Option<&str>) -> Result<i32, String> {
     let decoded = cursor
@@ -175,37 +179,13 @@ fn recovery_read_from(
         json!({"kind":"selected_missing_output", "evidence":selected,
             "exact_raw_bytes_available":false})
     } else if selected["representation"] == "retained-output-v1" {
-        let artifact = &payload["output_artifact"];
-        let digest = required_string(selected, "sha256")?;
-        let len = selected["byte_len"]
-            .as_u64()
-            .ok_or("selected output length missing")?;
-        let domain = required_string(&record, "domain_id")?;
-        if uuid::Uuid::parse_str(domain).is_err()
-            || digest.len() != 64
-            || !digest.bytes().all(|b| b.is_ascii_hexdigit())
-            || selected["relative"] != "completion-output-v2.bin"
-            || !matches!(selected["encoding"].as_str(), Some("raw" | "utf8-lossy"))
-            || len > oulipoly_state::completion_continuation::MAX_OUTPUT_BYTES as u64
-        {
-            return Err("unsupported selected raw output descriptor".into());
-        }
-        let path = data_root
-            .join("completion-continuation")
-            .join(domain)
-            .join("outputs")
-            .join(digest);
-        if artifact["path"] != path.to_string_lossy().as_ref()
-            || artifact["sha256"] != digest
-            || artifact["byte_len"] != len
-            || artifact["encoding"] != selected["encoding"]
-        {
-            return Err("retained raw artifact conflicts with selected output".into());
-        }
-        verify_and_copy_raw(&path, len, digest, output)?;
-        json!({"kind":"raw_bytes", "byte_len":len, "sha256":digest,
-            "verified":true, "output_file":output,
-            "exact_raw_bytes_available":true})
+        read_retained_raw_output(
+            selected,
+            &payload["output_artifact"],
+            required_string(&record, "domain_id")?,
+            data_root,
+            output,
+        )?
     } else {
         return Err("unknown selected output representation".into());
     };
@@ -221,6 +201,43 @@ fn recovery_read_from(
         "presentation_and_ack":presentation,
         "physical_drain":physical_drain,
     }))
+}
+
+fn read_retained_raw_output(
+    selected: &Value,
+    artifact: &Value,
+    domain: &str,
+    data_root: &Path,
+    output: Option<&Path>,
+) -> Result<Value, String> {
+    let digest = required_string(selected, "sha256")?;
+    let len = selected["byte_len"]
+        .as_u64()
+        .ok_or("selected output length missing")?;
+    if uuid::Uuid::parse_str(domain).is_err()
+        || digest.len() != 64
+        || !digest.bytes().all(|b| b.is_ascii_hexdigit())
+        || selected["relative"] != "completion-output-v2.bin"
+        || !matches!(selected["encoding"].as_str(), Some("raw" | "utf8-lossy"))
+    {
+        return Err("unsupported selected raw output descriptor".into());
+    }
+    let path = data_root
+        .join("completion-continuation")
+        .join(domain)
+        .join("outputs")
+        .join(digest);
+    if artifact["path"] != path.to_string_lossy().as_ref()
+        || artifact["sha256"] != digest
+        || artifact["byte_len"] != len
+        || artifact["encoding"] != selected["encoding"]
+    {
+        return Err("retained raw artifact conflicts with selected output".into());
+    }
+    verify_and_copy_raw(&path, len, digest, output)?;
+    Ok(json!({"kind":"raw_bytes", "byte_len":len, "sha256":digest,
+            "verified":true, "output_file":output,
+            "exact_raw_bytes_available":true}))
 }
 
 fn required_string<'a>(value: &'a Value, field: &str) -> Result<&'a str, String> {
@@ -239,7 +256,15 @@ fn verify_and_copy_raw(
     if !metadata.is_file() || metadata.len() != expected_len {
         return Err("retained selected output length/type conflict".into());
     }
-    let mut input = File::open(path).map_err(|e| e.to_string())?;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    }
+    let mut input = options.open(path).map_err(|e| e.to_string())?;
+    require_unchanged_output(&metadata, &input.metadata().map_err(|e| e.to_string())?)?;
     let mut staged = destination
         .map(|target| {
             tempfile::NamedTempFile::new_in(
@@ -251,27 +276,20 @@ fn verify_and_copy_raw(
             .map_err(|e| e.to_string())
         })
         .transpose()?;
-    let mut hasher = Sha256::new();
-    let mut total = 0u64;
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let count = input.read(&mut buffer).map_err(|e| e.to_string())?;
-        if count == 0 {
-            break;
-        }
-        total += count as u64;
-        if total > expected_len {
-            return Err("retained selected output grew during read".into());
-        }
-        hasher.update(&buffer[..count]);
-        if let Some(file) = staged.as_mut() {
-            file.write_all(&buffer[..count])
-                .map_err(|e| e.to_string())?;
-        }
+    if let Some(file) = staged.as_mut() {
+        copy_verified_raw(&mut input, expected_len, expected_digest, file)?;
+    } else {
+        copy_verified_raw(
+            &mut input,
+            expected_len,
+            expected_digest,
+            &mut std::io::sink(),
+        )?;
     }
-    if total != expected_len || format!("{:x}", hasher.finalize()) != expected_digest {
-        return Err("retained selected output digest/length conflict".into());
-    }
+    require_unchanged_output(
+        &metadata,
+        &fs::symlink_metadata(path).map_err(|e| e.to_string())?,
+    )?;
     if let (Some(file), Some(target)) = (staged, destination) {
         file.as_file().sync_all().map_err(|e| e.to_string())?;
         file.persist_noclobber(target).map_err(|e| e.to_string())?;
@@ -299,12 +317,28 @@ pub(super) fn register_with_backpressure<T>(
 }
 
 pub(crate) fn load_binding(path: &Path) -> Result<AdmittedSourceBinding, String> {
+    load_binding_with_fd(path).map(|(binding, _)| binding)
+}
+
+fn load_binding_with_fd(path: &Path) -> Result<(AdmittedSourceBinding, fs::File), String> {
     let directory = path.parent().ok_or("registration has no directory")?;
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or("invalid registration filename")?;
-    let bytes = read_source_file(directory, name, MAX_REGISTRATION_BYTES)?;
+    let mut file = oulipoly_state::completion_continuation::open_source_file(
+        directory,
+        name,
+        MAX_REGISTRATION_BYTES,
+    )?;
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(MAX_REGISTRATION_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() > MAX_REGISTRATION_BYTES {
+        return Err("source grew beyond bound".into());
+    }
     let source: SourceRegistration = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
     source.validate()?;
     if Path::new(&source.handle_dir).join(&source.registration_relative) != path {
@@ -314,7 +348,7 @@ pub(crate) fn load_binding(path: &Path) -> Result<AdmittedSourceBinding, String>
         &source.handle,
         &source.owner_invocation_uuid,
     );
-    AdmittedSourceBinding::new(&admission_id, &bytes)
+    Ok((AdmittedSourceBinding::new(&admission_id, &bytes)?, file))
 }
 
 pub(crate) fn response(binding: &AdmittedSourceBinding, status: &str) -> Result<Value, String> {
@@ -344,9 +378,17 @@ pub(crate) fn register(
     args: super::notify::AgentBashRegisterArgs<'_>,
     path: &Path,
 ) -> Result<i32, String> {
-    let binding = load_binding(path)?;
+    let (binding, registration_fd) = load_binding_with_fd(path)?;
     let source = binding.registration()?;
     let result = (|| {
+        #[cfg(target_os = "linux")]
+        let v30_owner = crate::completion_owner::read_v30_owner_if_present(None)?;
+        #[cfg(target_os = "linux")]
+        if v30_owner.is_none() {
+            super::notify::require_pinned_owner_work_id(&source.handle)?;
+        }
+        #[cfg(not(target_os = "linux"))]
+        super::notify::require_pinned_owner_work_id(&source.handle)?;
         if args.completion_protocol != Some(PROTOCOL) || args.repair_admitted {
             return Err(
                 "v2 requires explicit protocol; registration replay is not recovery authority"
@@ -357,6 +399,40 @@ pub(crate) fn register(
         crate::completion_owner::require_owner(&source.domain_id)?;
         let authority =
             oulipoly_state::CompletionRegistrationAuthority::from_process_environment()?;
+        #[cfg(target_os = "linux")]
+        if let Some(discovery) = v30_owner {
+            let intent = args
+                .accepted_intent_file
+                .ok_or("fresh v30 exact source requires accepted intent file")?;
+            let (exact, request_id) = exact_v30::register(
+                &binding,
+                &registration_fd,
+                path,
+                intent,
+                &discovery,
+                &authority,
+            )?;
+            let mut value = response(
+                &binding,
+                if exact.inserted {
+                    "registered"
+                } else {
+                    "already_registered"
+                },
+            )?;
+            value["registration_committed"] = true.into();
+            value["exact_source_decision_id"] = exact.decision_id.into();
+            value["exact_source_request_id"] = request_id.into();
+            value["exact_source_projection_available"] = exact.projection_available.into();
+            value["continuation_owner_domain"] = source.domain_id.clone().into();
+            value["listener_revision"] = json!(source.listeners.len());
+            value["listeners"] =
+                serde_json::to_value(&source.listeners).map_err(|e| e.to_string())?;
+            return Ok(value);
+        }
+        if args.accepted_intent_file.is_some() {
+            return Err("accepted v30 intent has no challenged Broker owner".into());
+        }
         let registration = register_with_backpressure(|| {
             let mut state = StateDb::open_default()?;
             state.register_completion_continuation_with_authority(
@@ -408,6 +484,12 @@ fn operation_result(
 pub(crate) fn readback(path: &Path, completion: bool) -> Result<i32, String> {
     let binding = load_binding(path)?;
     let result = (|| {
+        #[cfg(target_os = "linux")]
+        if crate::completion_owner::read_v30_owner_if_present(None)?.is_none() {
+            super::notify::require_pinned_owner_work_id(&binding.registration()?.handle)?;
+        }
+        #[cfg(not(target_os = "linux"))]
+        super::notify::require_pinned_owner_work_id(&binding.registration()?.handle)?;
         let state =
             StateDb::open_read_only(&StateDb::default_path()?).map_err(|e| format!("{e:?}"))?;
         if state.admitted_completion_continuation(&binding)?.is_none() {
@@ -470,6 +552,18 @@ fn add_completion_projection(
 }
 
 pub(crate) fn capability() -> Result<i32, String> {
+    #[cfg(target_os = "linux")]
+    if let Some(readback) = crate::completion_owner::read_v30_owner_if_present(None)? {
+        #[cfg(feature = "age319-private-broker-fixture")]
+        if std::env::var_os("AGE319_PRIVATE_PRE_K_H_SOURCE_V1").is_some() {
+            return emit(&json!({"protocol":PROTOCOL,"status":"available",
+                "domain_id":readback.owner.domain_id,"owner":readback.owner,
+                "root_id":readback.root_id,"source_generation":readback.source_generation,
+                "release_id":readback.release_id}));
+        }
+        return emit(&json!({"protocol":PROTOCOL,"status":"available",
+            "domain_id":readback.owner.domain_id,"owner":readback.owner}));
+    }
     let path = MailboxDb::default_path()?;
     if !path.exists() {
         return emit(&json!({"protocol":PROTOCOL,"status":"unavailable"}));
@@ -501,6 +595,8 @@ pub(crate) fn complete(
         || args.rc != Path::new(&paths[2])
     {
         Err("completion CLI fields conflict with immutable registration".into())
+    } else if let Err(error) = super::notify::require_pinned_owner_work_id(&source.handle) {
+        Err(error)
     } else if args.completion_protocol == Some(PROTOCOL) {
         accept(&binding, snapshot)
     } else {
@@ -675,6 +771,77 @@ mod tests {
             .is_err()
         );
         assert!(!destination.exists());
+    }
+
+    #[test]
+    #[ignore = "streams/copies 1 GiB + 1 byte; explicit manual descriptor/export control"]
+    fn artifact_above_old_cap_passes_manual_lookup_and_atomic_export() {
+        use serde_json::json;
+        use std::fs;
+        let root = tempfile::tempdir().unwrap();
+        let domain = uuid::Uuid::new_v4().to_string();
+        let directory = root
+            .path()
+            .join("completion-continuation")
+            .join(&domain)
+            .join("outputs");
+        fs::create_dir_all(&directory).unwrap();
+        let digest = "6d9bfe50425f2dfe4e2ac07efee1f0bc9d567348ad4aed62704ffe6f5884e9a8";
+        let length = 1024 * 1024 * 1024 + 1u64;
+        let path = directory.join(digest);
+        fs::File::create(&path).unwrap().set_len(length).unwrap();
+        let selected = json!({"representation":"retained-output-v1", "relative":"completion-output-v2.bin", "sha256":digest, "byte_len":length, "encoding":"raw"});
+        let artifact = json!({"path":path, "sha256":digest, "byte_len":length, "encoding":"raw"});
+        let output = root.path().join("export.bin");
+        let result = super::read_retained_raw_output(
+            &selected,
+            &artifact,
+            &domain,
+            root.path(),
+            Some(&output),
+        )
+        .unwrap();
+        assert_eq!(result["byte_len"], length);
+        assert_eq!(result["verified"], true);
+        assert!(serde_json::to_vec(&result).unwrap().len() < 512);
+        assert_eq!(fs::metadata(&output).unwrap().len(), length);
+        verify_and_copy_raw(&output, length, digest, None).unwrap();
+        fs::remove_file(&output).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(length - 1)
+            .unwrap();
+        assert!(
+            super::read_retained_raw_output(
+                &selected,
+                &artifact,
+                &domain,
+                root.path(),
+                Some(&output)
+            )
+            .is_err()
+        );
+        assert!(!output.exists());
+        println!("manual verified/exported bytes={length} sha256={digest}; no recipient ACK");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manual_raw_read_rejects_symlink_and_never_clobbers_existing_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let alias = root.path().join("alias");
+        let target = root.path().join("target");
+        std::fs::write(&source, b"body").unwrap();
+        std::fs::write(&target, b"keep").unwrap();
+        std::os::unix::fs::symlink(&source, &alias).unwrap();
+        let digest = format!("{:x}", Sha256::digest(b"body"));
+        assert!(verify_and_copy_raw(&alias, 4, &digest, None).is_err());
+        assert!(verify_and_copy_raw(&source, 4, &digest, Some(&target)).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 3);
     }
 
     #[test]

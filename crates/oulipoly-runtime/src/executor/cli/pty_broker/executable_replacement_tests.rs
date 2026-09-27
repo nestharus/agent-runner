@@ -155,7 +155,8 @@ fn replacement_child() {
         process_control_request_with_pending(
             &mut server,
             &mut io,
-            Some(("session-a", "invocation-a"))
+            Some(("session-a", "invocation-a")),
+            None,
         ),
         Ok(ControlPayloadOutcome::Accepted(Some(attempt.into())))
     );

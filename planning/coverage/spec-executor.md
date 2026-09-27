@@ -5,6 +5,7 @@
 - `crates/oulipoly-runtime/src/executor/mod.rs`
 - `crates/oulipoly-runtime/src/executor/cli.rs`
 - `crates/oulipoly-runtime/src/executor/cli/headless.rs`
+- `crates/oulipoly-runtime/src/executor/cli/fresh_remote.rs`
 - `crates/oulipoly-runtime/src/executor/cli/input_flags/mod.rs`
 - `crates/oulipoly-runtime/src/executor/cli/input_flags/validate.rs`
 - `crates/oulipoly-runtime/src/executor/cli/input_flags/parse.rs`

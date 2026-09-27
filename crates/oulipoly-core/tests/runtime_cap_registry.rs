@@ -491,7 +491,11 @@ fn registry_class_inventory_is_queryable_sorted_and_names_provisional_stopgaps()
             .filter(|cap| cap.class == RuntimeCapClass::ProvisionalStopgap)
             .map(|cap| cap.id.as_str())
             .collect::<Vec<_>>(),
-        vec!["runtime.executor.cli.live-session-binding.worker-join-timeout"]
+        vec![
+            "kernel-broker.linux-main.released-handoff-reply-timeout",
+            "runtime.executor.cli.live-session-binding.worker-join-timeout",
+            "tauri.completion-owner.control.pinned-eof-deadline",
+        ]
     );
     assert!(registry().windows(2).all(|pair| pair[0].id < pair[1].id));
     let raw: serde_json::Value =

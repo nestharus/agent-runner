@@ -326,7 +326,13 @@ pub(super) fn complete(
 
 /// No registry, execution service, resume loop or wake-launch function enters
 /// this selector, including when a DISTINCT next delivery remains pending.
-pub(crate) fn command(invocation: Option<&str>, settle: bool, output: bool) -> Result<i32, String> {
+pub(crate) fn command(
+    invocation: Option<&str>,
+    after_id: Option<i64>,
+    epoch: Option<i64>,
+    settle: bool,
+    output: bool,
+) -> Result<i32, String> {
     let state = StateDb::open_default()?;
     let Some(uuid) = invocation else {
         if settle || output {
@@ -334,7 +340,8 @@ pub(crate) fn command(invocation: Option<&str>, settle: bool, output: bool) -> R
         }
         println!(
             "{}",
-            serde_json::to_string(&state.completed_turn_identities()?).map_err(|e| e.to_string())?
+            serde_json::to_string(&state.completed_turn_identity_page(after_id, epoch)?)
+                .map_err(|e| e.to_string())?
         );
         return Ok(0);
     };
@@ -373,7 +380,9 @@ fn recovery_tails(
 ) -> Result<(), String> {
     let path = MailboxDb::path_for_state_db(state.path());
     let mut tails = serde_json::json!({"native":"pending","delivery":"pending","idle":"pending","wake":"pending_recheck","wake_owner":"root/operator","wake_action":"separate authorized session advance; recovery never launches"});
-    state.record_completed_turn_tails(&record.invocation_uuid, &record.settlement_id, &tails)?;
+    if !state.record_completed_turn_tails(&record.invocation_uuid, &record.settlement_id, &tails)? {
+        return Ok(());
+    }
     state.complete_completed_turn_native(&record.invocation_uuid, &record.settlement_id)?;
     tails["native"] = serde_json::json!("complete_or_standalone");
     if path.exists() {
@@ -413,7 +422,9 @@ fn recovery_tails(
     } else {
         return Err("completed_turn_history_missing".into());
     }
-    state.record_completed_turn_tails(&record.invocation_uuid, &record.settlement_id, &tails)
+    state
+        .record_completed_turn_tails(&record.invocation_uuid, &record.settlement_id, &tails)
+        .map(|_| ())
 }
 
 #[cfg(test)]

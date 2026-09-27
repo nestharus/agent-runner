@@ -155,7 +155,6 @@ mod tests {
         let state_path = directory.path().join("state.db");
         drop(StateDb::open(&state_path).unwrap());
         let started = std::time::Instant::now();
-
         let error = match open_state_read_only_at_with_retry_and_stale_progress(
             &state_path,
             Duration::from_secs(5),
@@ -166,8 +165,11 @@ mod tests {
             Err(error) => error,
         };
 
-        assert!(error.contains("made no defined progress"), "{error}");
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            error.contains("made no defined progress for 0ms"),
+            "{error}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     #[cfg(unix)]

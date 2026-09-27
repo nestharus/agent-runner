@@ -17,6 +17,16 @@ pub fn has_refresh_source(provider_name: &str, providers_cfg: &ProvidersConfig) 
     refresh_source(provider_name, providers_cfg).is_some()
 }
 
+/// The fresh broker route needs the same explicit or adapter-derived source
+/// that ordinary routing would use, without running the legacy State refresh.
+pub fn fresh_refresh_source(
+    provider_name: &str,
+    providers_cfg: &ProvidersConfig,
+) -> Option<(String, Option<String>)> {
+    refresh_source(provider_name, providers_cfg)
+        .map(|source| (source.script, source.auth_refresh_command))
+}
+
 fn provider_refresh_source(
     provider_name: &str,
     providers_cfg: &ProvidersConfig,

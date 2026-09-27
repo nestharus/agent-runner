@@ -97,6 +97,13 @@ mod chain_segments_import;
 mod chain_segments_open;
 mod cli_providers;
 mod discovered_models;
+#[cfg(target_os = "linux")]
+mod exact_source_decision;
+#[cfg(target_os = "linux")]
+pub use exact_source_decision::{
+    ExactSourceAdmissionResult, ExactSourceDecisionReference, SourceDecisionInspection,
+    SourceDecisionVerification,
+};
 mod discovery_types;
 mod fresh_continuation;
 mod imported_session_display_metadata;
@@ -125,6 +132,7 @@ mod opening_write;
 mod owned_turn_event_read;
 mod owned_turn_event_write;
 mod ownership_authority;
+pub(crate) use ownership_authority::ExactSourceProjection;
 mod provider_launch_lifecycle;
 mod provider_launch_publication;
 mod provider_quota_reads;

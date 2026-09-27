@@ -1,8 +1,32 @@
 use rusqlite::Connection;
 
-/// Test-only reverse of schema 27 for fixtures that deliberately reconstruct
-/// an older installed schema from a freshly opened current database.
+/// Test-only reverse of schema 28 and 27 for fixtures that deliberately
+/// reconstruct an older installed schema from a freshly opened current DB.
 pub fn remove_v27_timestamp_contract(conn: &Connection) {
+    let recovery_targets_present: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('completed_turns')
+             WHERE name='recovery_provider_name')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    if recovery_targets_present {
+        conn.execute_batch(
+            "DROP TRIGGER completed_turn_recovery_target_invocation_update;
+             DROP TRIGGER completed_turn_recovery_target_payload_update;
+             DROP TRIGGER completed_turn_recovery_target_insert;
+             DROP TRIGGER completed_turn_recovery_epoch_pending_update;
+             DROP TRIGGER completed_turn_recovery_epoch_insert;
+             DROP INDEX completed_turns_recovery_target;
+             DROP INDEX completed_turns_recovery_session;
+             ALTER TABLE completed_turns DROP COLUMN recovery_provider_session;
+             ALTER TABLE completed_turns DROP COLUMN recovery_provider_name;
+             ALTER TABLE completed_turns DROP COLUMN recovery_fallback_session;
+             DROP TABLE completed_turn_recovery_epoch;",
+        )
+        .unwrap();
+    }
     let present: bool = conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master

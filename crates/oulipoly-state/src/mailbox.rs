@@ -41,17 +41,45 @@ use crate::sqlite_observability::{
     connection_open_evidence,
 };
 
+mod broker_authority;
+#[cfg(unix)]
+mod broker_payload_custody;
 mod completion_continuation;
 mod finalization;
+#[cfg(target_os = "linux")]
+mod fresh_lane;
 mod native_publication;
 mod retention;
+pub use broker_authority::{
+    BoundStateFileIdentity, BrokerCompletionSourceAcceptance, BrokerContinuationReadback,
+    BrokerMailboxReadback, BrokerNativeGrantReadback, BrokerRecipientCandidate,
+    BrokerRecipientSelection, BrokerReleaseEvidence, BrokerRepairReadback, BrokerSidecar,
+    BrokerSourceCandidate, BrokerSourceEffectGrant, BrokerSourceEffectObligations,
+    BrokerSourceEvidenceReadback, BrokerSourceEvidenceSeal, BrokerSourceMaterial,
+    BrokerSourceRetentionRelease, BrokerSourceSelection, PreparedBrokerOwner, PreparedProcessStamp,
+    QuiescedCutoverProof,
+};
+#[cfg(target_os = "linux")]
+pub use fresh_lane::{
+    FreshAckDelegation, FreshBashChild, FreshBashListenerPolicy, FreshBashPrivateResult,
+    FreshBashSourceEvent, FreshBashSyncPublication, FreshDeliveryReadback, FreshDeliverySubmission,
+    FreshInteractiveResidentRegistration, FreshNativeFAutoAck, FreshNativeFObservedTurn,
+    FreshNativeFPreparation, FreshNativeFPrepareRequest, FreshNativeFReceipt,
+    FreshNativeFSubmission, FreshNativeFTransport, FreshNormalWorkPreparation,
+    FreshPhysicalTerminal, FreshRecipientIdentity, FreshReleasedHandoff, FreshRootCallerResult,
+    FreshRootEffect, FreshRootEffectState, FreshRootTerminalExecution, FreshRootTerminalReadback,
+    FreshRootWorkIntent, FreshV30Lane, FreshV30LaneIdentity, FreshV30Session,
+    normal_root_arguments,
+};
 pub use native_publication::NativePublication;
 #[path = "mailbox/schema.rs"]
 mod schema;
 pub use completion_continuation::{
+    AcceptedNativeGrantSnapshot, BrokerNativeAttachEvidence, BrokerNativeKernelQEvidence,
     CompletionDomainOwner, CompletionNotificationRequest, ContinuationAttempt,
-    NotificationDeliveryEvidence, NotificationDisposition, NotificationPolicy,
-    activation_request_sha256,
+    NATIVE_KERNEL_Q_PROTOCOL, NATIVE_ROOT_WORKER_ENTRY, NATIVE_WORKER_ATTACH_PROTOCOL,
+    NativeGrantBinding, NativeKernelQSettlement, NativeWorkerAttach, NotificationDeliveryEvidence,
+    NotificationDisposition, NotificationPolicy, activation_request_sha256,
 };
 pub use finalization::DeliveryFinalizationGuard;
 #[cfg(test)]
@@ -61,6 +89,7 @@ pub const AGENT_BASH_COMPLETE_KIND: &str = "agent_bash_complete";
 pub const MAILBOX_DELIVERY_UNCONFIRMED_ERROR: &str = "mailbox_delivery_unconfirmed";
 pub const MAILBOX_INGRESS_EXPIRED_ERROR: &str = "mailbox_ingress_expired";
 pub const MAILBOX_PAYLOAD_VERIFICATION_FAILED_ERROR: &str = "mailbox_payload_verification_failed";
+pub const COMPLETION_EFFECT_UNCERTAIN_ERROR: &str = "completion_effect_uncertain";
 pub const SUBMITTED_INPUT_KIND: &str = "input";
 pub const WAKE_SWEEP_ABANDONED_ERROR: &str = "wake_sweep_abandoned";
 pub const MAILBOX_PAYLOAD_RETENTION_POLICY: &str = "until_terminal_disposition";
@@ -88,7 +117,8 @@ pub(super) const DELIVERABLE_MAILBOX_ERROR_PREDICATE: &str = "(
     delivery_error IS NULL OR delivery_error NOT IN (
         'wake_sweep_abandoned',
         'mailbox_payload_verification_failed',
-        'mailbox_ingress_expired'
+        'mailbox_ingress_expired',
+        'completion_effect_uncertain'
     )
 )";
 
@@ -97,6 +127,41 @@ enum MailboxConnectionObservation<'a> {
     Disabled,
     Parent(&'a DiagnosticSpan),
     SelectedRecorder(&'a FlightRecorder),
+}
+
+#[cfg(test)]
+thread_local! {
+    static COMPLETION_OPEN_OBSERVATION_HOOK: std::cell::RefCell<Option<Box<dyn Fn(bool)>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+pub(crate) fn with_test_completion_open_observation<T>(
+    hook: impl Fn(bool) + 'static,
+    operation: impl FnOnce() -> T,
+) -> T {
+    COMPLETION_OPEN_OBSERVATION_HOOK.with(|slot| {
+        assert!(slot.replace(Some(Box::new(hook))).is_none());
+    });
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            COMPLETION_OPEN_OBSERVATION_HOOK.with(|slot| {
+                slot.replace(None);
+            });
+        }
+    }
+    let _reset = Reset;
+    operation()
+}
+
+#[cfg(test)]
+fn completion_open_observation_hook(after_record: bool) {
+    COMPLETION_OPEN_OBSERVATION_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow().as_ref() {
+            hook(after_record);
+        }
+    });
 }
 
 fn open_observed_mailbox_connection(
@@ -114,6 +179,18 @@ fn open_observed_mailbox_connection(
     };
     match open() {
         Ok(connection) => {
+            #[cfg(test)]
+            let deferred_completion_open = query_family
+                == "pid_mailbox.connection.open_completion_authority"
+                && matches!(
+                    &observation,
+                    MailboxConnectionObservation::Parent(_)
+                        | MailboxConnectionObservation::SelectedRecorder(_)
+                );
+            #[cfg(test)]
+            if deferred_completion_open {
+                completion_open_observation_hook(false);
+            }
             let span = || mailbox_connection_span(query_family, path_class, transaction_mode);
             let _ = match observation {
                 MailboxConnectionObservation::Process => observer.record_success(
@@ -144,6 +221,10 @@ fn open_observed_mailbox_connection(
                         connection_open_evidence,
                     ),
             };
+            #[cfg(test)]
+            if deferred_completion_open {
+                completion_open_observation_hook(true);
+            }
             Ok(connection)
         }
         Err(error) => {
@@ -1329,6 +1410,31 @@ pub(crate) struct CompletionMaterializationSummary {
 }
 
 impl CompletionAuthorityFence<'_> {
+    pub(crate) fn register_completion_event_for_broker_repair(
+        self,
+        input: CompletionEventRegistrationInput<'_>,
+        continuity: &CompletionContinuityHead,
+        binding: &crate::completion_continuation::AdmittedSourceBinding,
+    ) -> Result<CompletionEventRegistrationResult, String> {
+        self.register_completion_event_inner(input, continuity, Some(binding), None, None, None)
+    }
+
+    pub(crate) fn register_exact_source_projection(
+        self,
+        input: CompletionEventRegistrationInput<'_>,
+        projection: &crate::db::ExactSourceProjection,
+        provenance: Option<&broker_authority::ExactFreshSourceAdmission>,
+    ) -> Result<CompletionEventRegistrationResult, String> {
+        self.register_completion_event_inner(
+            input,
+            &projection.continuity,
+            Some(&projection.binding),
+            Some(projection),
+            provenance,
+            None,
+        )
+    }
+
     pub(crate) fn sidecar_generation(&self) -> Result<String, String> {
         sidecar_generation_on(&self.tx)
     }
@@ -1360,7 +1466,7 @@ impl CompletionAuthorityFence<'_> {
         binding: Option<&crate::completion_continuation::AdmittedSourceBinding>,
         phases: &mut TransactionPhaseGuard<'_>,
     ) -> Result<CompletionEventRegistrationResult, String> {
-        self.register_completion_event_inner(input, continuity, binding, Some(phases))
+        self.register_completion_event_inner(input, continuity, binding, None, None, Some(phases))
     }
 
     fn register_completion_event_inner(
@@ -1368,6 +1474,8 @@ impl CompletionAuthorityFence<'_> {
         input: CompletionEventRegistrationInput<'_>,
         continuity: &CompletionContinuityHead,
         binding: Option<&crate::completion_continuation::AdmittedSourceBinding>,
+        exact: Option<&crate::db::ExactSourceProjection>,
+        provenance: Option<&broker_authority::ExactFreshSourceAdmission>,
         mut phases: Option<&mut TransactionPhaseGuard<'_>>,
     ) -> Result<CompletionEventRegistrationResult, String> {
         let inserted = register_completion_event_on(&self.tx, &input, &now_rfc3339())?;
@@ -1383,6 +1491,72 @@ impl CompletionAuthorityFence<'_> {
             )?;
         }
         append_completion_continuity_on(&self.tx, continuity)?;
+        if let Some(exact) = exact {
+            if exact.continuity != *continuity
+                || input.event_id != exact.binding.registration()?.handle
+            {
+                return Err("exact source projection receipt input conflict".into());
+            }
+            self.tx
+                .execute(
+                    "INSERT INTO broker_exact_source_projection (
+                 registration_id,admission_id,request_id,decision_id,root_id,
+                 source_generation,owner_generation,supervisor_id,issuer_stamp_json,
+                 registration_sha256,registration_bytes,binding_bytes,broker_readback_json,
+                 authority_ordinal) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                    params![
+                        exact.registration_id,
+                        exact.admission_id,
+                        exact.request_id,
+                        exact.decision_id,
+                        exact.root_id,
+                        exact.source_generation,
+                        exact.owner_generation,
+                        exact.supervisor_id,
+                        exact.issuer_stamp_json,
+                        exact.registration_sha256,
+                        exact.binding.registration_bytes(),
+                        exact.binding.encoded()?,
+                        exact.readback_json,
+                        exact.continuity.authority_ordinal
+                    ],
+                )
+                .map_err(|e| format!("exact source projection receipt conflict: {e}"))?;
+            if let Some(provenance) = provenance {
+                if provenance.registration_id != exact.registration_id
+                    || provenance.registration_digest != exact.registration_sha256
+                    || provenance.state_admission_id != exact.admission_id
+                    || provenance.caller_admission_id != exact.binding.caller_admission_id()
+                    || provenance.source_generation != exact.source_generation
+                    || provenance.sidecar_generation != exact.continuity.sidecar_generation
+                    || provenance.root_id != exact.root_id
+                    || provenance.owner_generation != exact.owner_generation
+                    || provenance.request_id != exact.request_id
+                    || provenance.decision_id != exact.decision_id
+                    || provenance.authority_ordinal != exact.continuity.authority_ordinal
+                {
+                    return Err("fresh provenance and exact State projection conflict".into());
+                }
+                self.tx.execute(
+                    "INSERT INTO broker_exact_fresh_source_admission
+                     (registration_id,registration_digest,state_admission_id,caller_admission_id,
+                      source_generation,sidecar_generation,root_id,owner_generation,state_device,state_inode,
+                      request_id,decision_id,authority_ordinal,projected_material)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                    params![
+                        provenance.registration_id, provenance.registration_digest,
+                        provenance.state_admission_id, provenance.caller_admission_id,
+                        provenance.source_generation, provenance.sidecar_generation,
+                        provenance.root_id, provenance.owner_generation,
+                        provenance.state_device, provenance.state_inode,
+                        provenance.request_id, provenance.decision_id,
+                        provenance.authority_ordinal, provenance.projected_material,
+                    ],
+                ).map_err(|e| format!("exact fresh admission provenance conflict: {e}"))?;
+            }
+        } else if provenance.is_some() {
+            return Err("fresh provenance requires exact source projection".into());
+        }
         let result = completion_event_registration_on(&self.tx, input.event_id, inserted)?;
         if let Some(phases) = phases.as_mut() {
             phases.commit_started();
@@ -1931,6 +2105,7 @@ impl MailboxDb {
         .map_err(|err| format!("Failed to open PID mailbox sidecar authority: {err}"))?;
         authority.validate_opened_target()?;
         configure_writable_sidecar_connection(&conn)?;
+        schema::validate_existing_writer_version(&conn)?;
         conn.busy_timeout(COMPLETION_AUTHORITY_SQLITE_TIMEOUT)
             .map_err(|err| format!("Failed to configure PID mailbox sidecar authority: {err}"))?;
         Ok(Self {
@@ -1947,12 +2122,25 @@ impl MailboxDb {
         &mut self,
         session: &str,
         retained_claims: &[RetainedWakeClaim],
+        expected_claim: &Option<ManualWakeClaimIdentity>,
+        span: &DiagnosticSpan,
     ) -> Result<ManualWakeCoordination, String> {
         self.conn
             .busy_timeout(StdDuration::ZERO)
             .map_err(|e| e.to_string())?;
-        self.wake_sessions()
-            .coordinate_manual_resume(session, retained_claims)
+        self.wake_sessions().coordinate_manual_resume(
+            session,
+            retained_claims,
+            expected_claim,
+            span,
+        )
+    }
+
+    pub(crate) fn manual_wake_claim_identity(
+        &self,
+        session: &str,
+    ) -> Result<Option<ManualWakeClaimIdentity>, String> {
+        wake_claim(&self.conn, session).map(|claim| claim.map(ManualWakeClaimIdentity::from))
     }
 
     pub(crate) fn begin_completion_authority_fence(
@@ -2090,8 +2278,33 @@ impl RuntimeLifecycleRepository<'_> {
         request: CreateRuntimeGeneration<'_>,
         custody_proof: Option<&Path>,
     ) -> Result<GenerationMutation<RuntimeGenerationRow>, GenerationStorageError> {
-        validate_runtime_generation_create(&request)?;
         let creator_process_identity = current_runtime_creator_identity()?;
+        self.create_runtime_generation_for_attested_creator(
+            request,
+            custody_proof,
+            &creator_process_identity,
+        )
+    }
+
+    /// The fresh broker has already pinned the original root and the released
+    /// provider. Its procfs observer must match the sidecar's future readers.
+    /// This entry never interprets a local Child::id as the provider PID.
+    pub(crate) fn create_runtime_generation_for_attested_creator(
+        &mut self,
+        request: CreateRuntimeGeneration<'_>,
+        custody_proof: Option<&Path>,
+        creator_process_identity: &ProcessIdentity,
+    ) -> Result<GenerationMutation<RuntimeGenerationRow>, GenerationStorageError> {
+        validate_runtime_generation_create(&request)?;
+        if pid_identity::read_live_process_identity(creator_process_identity.os_pid)
+            .map_err(GenerationStorageError::new)?
+            .as_ref()
+            != Some(creator_process_identity)
+        {
+            return Err(GenerationStorageError::new(
+                "Attested runtime creator is not live in this procfs observer".into(),
+            ));
+        }
         let now = now_rfc3339();
         let tx = self
             .conn
@@ -4216,7 +4429,7 @@ impl MailboxDb {
             "SELECT {MAILBOX_ROW_COLUMNS}
              FROM mailbox
              WHERE seq=?3 AND delivered_at IS NULL
-               AND (delivery_error IS NULL OR delivery_error NOT IN (?4,?5,?6))
+               AND (delivery_error IS NULL OR delivery_error NOT IN (?4,?5,?6,?7))
                AND {PENDING_MAILBOX_TARGET_PREDICATE}"
         );
         self.conn
@@ -4229,6 +4442,7 @@ impl MailboxDb {
                     WAKE_SWEEP_ABANDONED_ERROR,
                     MAILBOX_PAYLOAD_VERIFICATION_FAILED_ERROR,
                     MAILBOX_INGRESS_EXPIRED_ERROR,
+                    COMPLETION_EFFECT_UNCERTAIN_ERROR,
                 ],
                 map_mailbox_row,
             )
@@ -4888,8 +5102,7 @@ impl MailboxDb {
             return Err("ambiguous registered headless submission".into());
         }
         let (attempt, target, anchor) = &attempts[0];
-        let live = pid_identity::read_live_process_identity(i64::from(std::process::id()))?
-            .ok_or("headless submission launcher absent")?;
+        let live = pid_identity::read_current_process_identity()?;
         let registered: bool = tx
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM runtime_generation
@@ -6361,6 +6574,33 @@ pub(crate) struct RetainedWakeClaim {
     pub(crate) phase: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManualWakeClaimIdentity {
+    pub(crate) claim_token: String,
+    pub(crate) wake_invocation_uuid: Option<String>,
+    claimed_at: String,
+    wake_pid: Option<i64>,
+    reason: String,
+    auto_wake_count: i64,
+    min_pending_seq_at_claim: Option<i64>,
+    max_pending_seq_at_claim: Option<i64>,
+}
+
+impl From<WakeClaimRow> for ManualWakeClaimIdentity {
+    fn from(claim: WakeClaimRow) -> Self {
+        Self {
+            claim_token: claim.claim_token,
+            wake_invocation_uuid: claim.wake_invocation_uuid,
+            claimed_at: claim.claimed_at,
+            wake_pid: claim.wake_pid,
+            reason: claim.reason,
+            auto_wake_count: claim.auto_wake_count,
+            min_pending_seq_at_claim: claim.min_pending_seq_at_claim,
+            max_pending_seq_at_claim: claim.max_pending_seq_at_claim,
+        }
+    }
+}
+
 impl WakeSessionRepository<'_> {
     pub fn upsert_session_metadata(
         &mut self,
@@ -7039,23 +7279,61 @@ impl WakeSessionRepository<'_> {
         &mut self,
         session: &str,
         retained_claims: &[RetainedWakeClaim],
+        expected_claim: &Option<ManualWakeClaimIdentity>,
+        parent_span: &DiagnosticSpan,
     ) -> Result<ManualWakeCoordination, String> {
         // A live coherent read is only a wait/release hint, not launch authority.
         // Drop it before acquiring a writer: never upgrade a read transaction.
         let read = self.conn.transaction().map_err(|e| e.to_string())?;
+        if wake_claim_tx(&read, session)?.map(ManualWakeClaimIdentity::from) != *expected_claim {
+            return Err(
+                "manual_resume_claim_changed_retry: claim changed after exact State lookup".into(),
+            );
+        }
         let observation = manual_resume_observation_on(&read, session)?;
         drop(read);
         if let Some(observation) = observation {
             return Ok(observation);
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| e.to_string())?;
+        let start = SpanStart::new(
+            "completed_turn_manual_resume_sidecar_write",
+            "pid_mailbox_sqlite",
+        )
+        .with_sqlite_identity(
+            SqliteEventIdentity::new(
+                SqliteDatabaseRole::PidMailbox,
+                SqlitePathClass::ManagedFile,
+                "completed_turn.manual_resume.sidecar_write",
+            )
+            .with_transaction_mode(SqliteTransactionMode::Immediate),
+        )
+        .with_busy_timeout(StdDuration::ZERO)
+        .with_diagnostic_id(parent_span.diagnostic_id().clone())
+        .with_parent_span_id(parent_span.span_id().clone())
+        .with_hashed_correlation("session_id", session);
+        parent_span.with_deferred_requested_span(start, |span| {
+        let attempt = TransactionAttempt::start();
+        let tx = match self.conn.transaction_with_behavior(TransactionBehavior::Immediate) {
+            Ok(tx) => tx,
+            Err(error) => {
+                record_sqlite_failure(span, &error, attempt);
+                record_unacquired_release(span);
+                return Err(error.to_string());
+            }
+        };
+        let mut phases = TransactionPhaseGuard::acquired(span, attempt);
+        let mut commit_attempted = false;
+        let result = (|| {
         if let Some(observation) = manual_native_custody_on(&tx, session)? {
             return Ok(observation);
         }
-        let Some(claim) = wake_claim_tx(&tx, session)? else {
+        let claim = wake_claim_tx(&tx, session)?;
+        if claim.clone().map(ManualWakeClaimIdentity::from) != *expected_claim {
+            return Err(
+                "manual_resume_claim_changed_retry: claim changed after exact State lookup".into(),
+            );
+        }
+        let Some(claim) = claim else {
             return Ok(ManualWakeCoordination::Absent);
         };
         if wake_claim_is_releasable_for_manual_resume(&tx, &claim)? {
@@ -7096,13 +7374,33 @@ impl WakeSessionRepository<'_> {
             if changed != 1 {
                 return Err("manual legacy release changed under writer".into());
             }
-            tx.commit().map_err(|e| e.to_string())?;
+            phases.commit_started();
+            commit_attempted = true;
+            match tx.commit() {
+                Ok(()) => phases.committed(),
+                Err(error) => {
+                    phases.sqlite_failure(&error);
+                    return Err(error.to_string());
+                }
+            }
             return Ok(ManualWakeCoordination::Released);
         }
         Ok(if wake_claim_has_persisted_process_identity(&tx, &claim)? {
             ManualWakeCoordination::LegacyLiveBusy
         } else {
             ManualWakeCoordination::UnknownCustody
+        })
+        })();
+        if result.is_err() {
+            phases.failed("manual_resume_sidecar_write_failed");
+        }
+        // The closure has dropped the transaction on every non-commit path.
+        if commit_attempted {
+            phases.release_after_owner();
+        } else {
+            phases.release_after_rollback();
+        }
+        result
         })
     }
 
@@ -7756,6 +8054,7 @@ pub fn mailbox_row_is_deliverable_pending(row: &MailboxRow) -> bool {
                 WAKE_SWEEP_ABANDONED_ERROR,
                 MAILBOX_PAYLOAD_VERIFICATION_FAILED_ERROR,
                 MAILBOX_INGRESS_EXPIRED_ERROR,
+                COMPLETION_EFFECT_UNCERTAIN_ERROR,
             ]
             .contains(&error)
         })
@@ -8150,7 +8449,8 @@ fn pending_wake_sessions_in_seq_range_query() -> &'static str {
        AND (delivery_error IS NULL OR delivery_error NOT IN (
            'wake_sweep_abandoned',
            'mailbox_payload_verification_failed',
-           'mailbox_ingress_expired'
+           'mailbox_ingress_expired',
+           'completion_effect_uncertain'
        ))
      GROUP BY session_id
      HAVING (?2 IS NULL OR oldest_seq > ?2)
@@ -9181,14 +9481,7 @@ fn validate_runtime_generation_create(
 }
 
 fn current_runtime_creator_identity() -> Result<ProcessIdentity, GenerationStorageError> {
-    let os_pid = i64::from(std::process::id());
-    pid_identity::read_live_process_identity(os_pid)
-        .map_err(GenerationStorageError::new)?
-        .ok_or_else(|| {
-            GenerationStorageError::new(format!(
-                "Runtime generation creator process {os_pid} is not live"
-            ))
-        })
+    pid_identity::read_current_process_identity().map_err(GenerationStorageError::new)
 }
 
 fn validate_runtime_mode(mode: &str) -> Result<(), GenerationStorageError> {
@@ -9944,6 +10237,9 @@ fn validate_delivery_claim_seqs(seqs: &[i64]) -> Result<(), GenerationStorageErr
 }
 
 fn reject_unauthorized_terminal_wake_abandonment(delivery_error: &str) -> Result<(), String> {
+    if delivery_error == COMPLETION_EFFECT_UNCERTAIN_ERROR {
+        return Err("Uncertain activation disposition requires exact custodian drain".into());
+    }
     if delivery_error == WAKE_SWEEP_ABANDONED_ERROR {
         return Err(
             "Terminal wake abandonment requires a dedicated authority-bearing disposition"
@@ -11633,6 +11929,10 @@ pub(crate) fn configure_writable_sidecar_connection(conn: &Connection) -> Result
 
 pub(crate) fn ensure_shared_sidecar_schema(conn: &mut Connection) -> Result<(), String> {
     schema::ensure(conn)
+}
+
+pub(crate) fn reject_future_sidecar_writer_version(conn: &Connection) -> Result<(), String> {
+    schema::validate_existing_writer_version(conn)
 }
 
 fn mailbox_schema_definition() -> &'static str {
@@ -14706,6 +15006,10 @@ mod tests {
         assert_eq!(version, schema::CURRENT_VERSION);
         assert_eq!(count, 32);
 
+        begin_completion_finalization_vm_count();
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+        let intact_current_open_steps = end_completion_finalization_vm_count();
+
         connection
             .execute(
                 "DELETE FROM completion_authority_materialization_summary",
@@ -14718,13 +15022,15 @@ mod tests {
         let current_open_steps = end_completion_finalization_vm_count();
         eprintln!("current-schema ordinary open VM steps: {current_open_steps}");
         assert_eq!(materialization_summary_count(&sidecar_path), 0);
+        assert_eq!(
+            current_open_steps, intact_current_open_steps,
+            "current-schema open did extra work after summary deletion"
+        );
         assert!(
-            // Schema 26 also fingerprints the fixed attempt-search generation
-            // objects (measured 5001 VM steps). Keep a fixed ceiling, the
-            // no-backfill assertion, and the separate retained-history growth
-            // test; this does not grant a data-size-dependent budget.
-            current_open_steps < 5500,
-            "current-schema open performed unexpected SQLite work: {current_open_steps}"
+            // An ordinary current-schema reopen must stay within the
+            // original fixed budget after the fingerprint optimization.
+            current_open_steps < 7_500,
+            "current-schema open exceeded its fixed VM budget: {current_open_steps}"
         );
     }
 

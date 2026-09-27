@@ -25,7 +25,24 @@ const SOURCE_COMMAND_BUFFER_BYTES: usize = 64 * 1024;
 mod birth_tests;
 #[cfg(test)]
 mod independent_waits;
+mod lineage_keyring;
 mod never_forked;
+
+// The first provider runs from the bootstrapped entry process, while later
+// continuation providers run from root_worker_entry. Mark both launch trees.
+pub(super) fn establish_entry_lineage() -> Result<(), String> {
+    lineage_keyring::establish().map(|_| ())
+}
+
+pub(super) fn original_worker_lineage_name() -> Result<std::ffi::CString, String> {
+    lineage_keyring::random_name()
+}
+
+pub(super) fn establish_original_worker_lineage_pre_exec(
+    name: &std::ffi::CStr,
+) -> std::io::Result<()> {
+    lineage_keyring::establish_pre_exec(name)
+}
 
 /// An outer driver failure must not destroy its unique live no-child witness.
 /// Keep this exact process until integration succeeds. No workload, reservation,
@@ -224,7 +241,7 @@ fn legacy_spawn(
     )?;
     let request_file = std::fs::File::open(&request_path).map_err(|e| e.to_string())?;
     let fork_gate = Path::new(&attempt.result_path).with_file_name("adopter-fork-gate.json");
-    let driver = super::linux::identity(i64::from(std::process::id()))?;
+    let driver = super::linux::current_identity()?;
     let mut gate_file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -333,14 +350,23 @@ pub(super) fn request_path(attempt: &ContinuationAttempt) -> Result<std::path::P
     Ok(directory.join("custodian-request.json"))
 }
 
-pub(super) fn read_request(path: &Path) -> Result<CustodianRequest, String> {
-    let directory = path.parent().ok_or("request directory absent")?;
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or("request filename is not UTF-8")?;
-    let bytes = read_source_file(directory, name, 4 * 1024 * 1024)?;
-    serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+/// Publish immutable launch bytes under their final name. A retry must keep
+/// the first request (and fail closed), never rename a new recipe over it.
+pub(super) fn write_request_once(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = path.parent().ok_or("request directory absent")?;
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|e| e.to_string())?;
+    std::fs::File::open(parent)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|e| e.to_string())
 }
 
 /// Birth and grant are small whole records. Packet boundaries prevent a child
@@ -572,14 +598,16 @@ impl UnreapedAdopter {
             oulipoly_state::completion_continuation::age360_fault_barrier(
                 "original-adopter-before-identity",
             );
-            self.identity = Some(super::linux::identity(i64::from(self.pid)).inspect_err(
-                |_| {
-                    #[cfg(feature = "age360-fault-fixtures")]
-                    oulipoly_state::completion_continuation::age360_fault_barrier(
-                        "original-adopter-identity-failed",
-                    );
-                },
-            )?);
+            self.identity = Some(
+                super::linux::retained_direct_child_identity(self.pid as u32).inspect_err(
+                    |_| {
+                        #[cfg(feature = "age360-fault-fixtures")]
+                        oulipoly_state::completion_continuation::age360_fault_barrier(
+                            "original-adopter-identity-failed",
+                        );
+                    },
+                )?,
+            );
         }
         Ok(self.identity.as_ref().unwrap())
     }
@@ -618,9 +646,9 @@ pub(super) fn pending_birth_fds() -> Vec<i32> {
     #[cfg(test)]
     {
         independent_waits::discard_fork_copies();
-        let current = i64::from(std::process::id());
+        let current = super::linux::current_identity().map(|identity| identity.pid);
         PENDING_UNRELEASED.with_borrow_mut(|pending| {
-            pending.retain(|p| p.driver.pid == current);
+            pending.retain(|p| current.as_ref().map_or(true, |pid| p.driver.pid == *pid));
             pending
                 .iter()
                 .filter_map(|p| p.socket.as_ref().map(AsRawFd::as_raw_fd))
@@ -728,23 +756,28 @@ fn retain_unfinished_birth(birth: &mut PendingUnreleased) -> bool {
 /// Shared by CD and its guardian succession: retry original evidence first,
 /// then reap unprotected exact child PIDs. Enumerating candidates is not drain
 /// evidence; only waitpid/waitid supply terminal/ECHILD observations.
-pub(super) fn reap_unprotected(status: &mut i32) -> i32 {
+pub(super) fn reap_unprotected(status: &mut i32, externally_protected: &[i64]) -> i32 {
     #[cfg(not(test))]
-    return unsafe { libc::waitpid(-1, status, libc::WNOHANG) };
+    {
+        if externally_protected.is_empty() {
+            return unsafe { libc::waitpid(-1, status, libc::WNOHANG) };
+        }
+        return reap_unprotected_children(status, externally_protected);
+    }
     #[cfg(test)]
     {
         let independent = independent_waits::reap(status);
         if independent > 0 {
             return independent;
         }
-        let waited = reap_generic_unprotected(status);
+        let waited = reap_generic_unprotected(status, externally_protected);
         independent_waits::observe_wait(waited);
         waited
     }
 }
 
 #[cfg(test)]
-fn reap_generic_unprotected(status: &mut i32) -> i32 {
+fn reap_generic_unprotected(status: &mut i32, externally_protected: &[i64]) -> i32 {
     #[cfg(feature = "age360-fault-fixtures")]
     if PENDING_UNRELEASED.with_borrow(|pending| pending.iter().any(|p| p.announced.is_none())) {
         oulipoly_state::completion_continuation::age360_fault_barrier("birth-unread-before-reap");
@@ -756,7 +789,7 @@ fn reap_generic_unprotected(status: &mut i32) -> i32 {
     if PENDING_UNRELEASED.with_borrow(|pending| pending.iter().any(|p| p.announced.is_none())) {
         return 0;
     }
-    let protected = PENDING_UNRELEASED.with_borrow(|pending| {
+    let mut protected = PENDING_UNRELEASED.with_borrow(|pending| {
         pending
             .iter()
             .flat_map(|p| {
@@ -768,9 +801,18 @@ fn reap_generic_unprotected(status: &mut i32) -> i32 {
             .flatten()
             .collect::<Vec<_>>()
     });
+    protected.extend_from_slice(externally_protected);
     // A consumed PID still names the original unreaped child. If its adopter
     // dies, this original subreaper inherits it; do not consume that incarnation
     // while identity lookup or attachment remains pending.
+    reap_unprotected_children(status, &protected)
+}
+
+/// Wait only children which have no operation-specific wait owner. Reading the
+/// kernel child list is candidate discovery, never terminal evidence; only the
+/// exact wait below consumes status. A protected child is left exclusively to
+/// its retained `Child` owner.
+fn reap_unprotected_children(status: &mut i32, protected: &[i64]) -> i32 {
     if protected.is_empty() {
         return unsafe { libc::waitpid(-1, status, libc::WNOHANG) };
     }
@@ -829,7 +871,7 @@ pub(super) fn entry() -> Result<(), String> {
     if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } < 0 {
         return Err(std::io::Error::last_os_error().to_string());
     }
-    let identity = super::linux::identity(i64::from(std::process::id()))?;
+    let identity = super::linux::current_identity()?;
     let mut byte = [0];
     if gate.read_exact(&mut byte).is_err() || byte != [1] {
         let receipt=serde_json::json!({"attempt_id":attempt.attempt_id,"custodian":identity,"gate":"unreleased_eof","owned_children":"ECHILD"}).to_string();
@@ -995,7 +1037,7 @@ pub(super) fn root_worker_entry() -> Result<(), String> {
     if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } < 0 {
         return Err(std::io::Error::last_os_error().to_string());
     }
-    let identity = super::linux::identity(i64::from(std::process::id()))?;
+    let identity = super::linux::current_identity()?;
     let mut byte = [0];
     if gate.read_exact(&mut byte).is_err() || byte != [1] {
         return Ok(());
@@ -1012,7 +1054,9 @@ pub(super) fn root_worker_entry() -> Result<(), String> {
     // an observation about the complete launched tree, not only the original
     // launcher. An intermediate executor would break the authenticated edge
     // and make a valid wake child look foreign.
-    let launch = launch_command(&request.recipe, attempt);
+    let launch = launch_after_lineage(lineage_keyring::establish, || {
+        launch_command(&request.recipe, attempt)
+    });
     let (mut child, spawn_error) = match launch {
         Ok(child) => (Some(child), None),
         Err(error) => (None, Some(error)),
@@ -1131,6 +1175,72 @@ pub(super) fn root_worker_entry() -> Result<(), String> {
         classification,
     )?;
     Ok(())
+}
+
+// A failed or ambiguous marker setup is a retained spawn_failed outcome. The
+// launch callback must not run when lineage has not been validated.
+fn launch_after_lineage<T>(
+    setup: impl FnOnce() -> Result<String, String>,
+    launch: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    setup().map_err(|error| {
+        format!("root worker lineage setup failed before provider spawn: {error}")
+    })?;
+    launch()
+}
+
+#[cfg(test)]
+#[test]
+fn lineage_setup_failure_prevents_root_worker_launch() {
+    let mut launched = false;
+    let failure: Result<(), String> = launch_after_lineage(
+        || Err("injected keyctl failure".into()),
+        || {
+            launched = true;
+            Ok(())
+        },
+    );
+    let error = failure.unwrap_err();
+    assert!(error.contains("injected keyctl failure"));
+    assert!(!launched);
+    let directory = tempfile::tempdir().unwrap();
+    let result_path = directory.path().join("result.json");
+    let attempt = ContinuationAttempt {
+        attempt_id: uuid::Uuid::new_v4().to_string(),
+        owner_generation: "test".into(),
+        operation: "activation".into(),
+        request_sha256: "a".repeat(64),
+        source_registration_id: None,
+        source_listener_revision: None,
+        session_id: None,
+        claim_token: None,
+        result_path: result_path.to_string_lossy().into_owned(),
+    };
+    let identity = super::linux::current_identity().unwrap();
+    persist_root_worker_result(
+        &attempt,
+        &identity,
+        RootLaunchResult {
+            spawn_failed: true,
+            spawn_error: Some(error),
+            root_exit_code: None,
+            root_wait_status: None,
+        },
+        None,
+        serde_json::json!({"classification":"native_wait_result"}),
+    )
+    .unwrap();
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(result_path).unwrap()).unwrap();
+    assert_eq!(receipt["spawn_failed"], true);
+    assert_eq!(receipt["owned_children"], "ECHILD");
+    assert_eq!(receipt["result_retained"], true);
+    assert!(
+        receipt["spawn_error"]
+            .as_str()
+            .unwrap()
+            .contains("injected keyctl failure")
+    );
 }
 
 struct RootLaunchResult {
@@ -1577,7 +1687,7 @@ fn adopt(
         // A returning identity-read error must not drop the only announcement
         // while this same AC stays alive waiting for its execution gate.
         let packet = loop {
-            if let Ok(identity) = super::linux::identity(i64::from(unsafe { libc::getpid() })) {
+            if let Ok(identity) = super::linux::current_identity() {
                 break encode_birth(&identity)?;
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -1603,8 +1713,8 @@ fn adopt(
     #[cfg(feature = "age360-fault-fixtures")]
     oulipoly_state::completion_continuation::age360_fault_barrier("adopter-after-ac-fork");
     drop(ac_gate);
-    let custodian = super::linux::identity(i64::from(pid))?;
-    let adopter = super::linux::identity(i64::from(std::process::id()))?;
+    let custodian = super::linux::retained_direct_child_identity(pid as u32)?;
+    let adopter = super::linux::current_identity()?;
     #[cfg(feature = "age360-fault-fixtures")]
     oulipoly_state::completion_continuation::age360_fault_barrier("adopter-before-ac-announce");
     // Relay only the actual original driver's grant after attachment. EOF or
@@ -1771,7 +1881,7 @@ fn exact_child_terminal(
     if unsafe { info.si_pid() } == 0 {
         return Ok(false);
     }
-    if super::linux::identity(i64::from(pid))? != *expected {
+    if super::linux::retained_direct_child_identity(pid as u32)? != *expected {
         return Err("original terminal child incarnation conflict".into());
     }
     Ok(true)
@@ -1826,7 +1936,7 @@ fn reap_adopted_child(
     }
     #[cfg(feature = "age360-fault-fixtures")]
     oulipoly_state::completion_continuation::age360_fault_barrier("adopted-before-identity");
-    let identity = match super::linux::identity(i64::from(pid)) {
+    let identity = match super::linux::retained_direct_child_identity(pid as u32) {
         Ok(identity) => identity,
         Err(_) => {
             // WNOWAIT left this exact incarnation owned and unreaped. A
@@ -1892,7 +2002,7 @@ pub(super) fn replay_result(path: &Path, attempt: &ContinuationAttempt) -> Resul
         MAX_REGISTRATION_BYTES,
     ) {
         let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-        let driver = super::linux::identity(i64::from(std::process::id()))?;
+        let driver = super::linux::current_identity()?;
         if value["attempt_id"] != attempt.attempt_id
             || value["driver"] != serde_json::to_value(driver).map_err(|e| e.to_string())?
             || value["observation"] != "waitid_wnowait"

@@ -1,5 +1,10 @@
 //! AGE-377's exact-generation destructive maintenance protocol.
 
+const RETIREMENT_HASH_BUFFER_BYTES: usize = 64 * 1024;
+const DEFAULT_VALIDATION_ROWS: u64 = 256;
+const DEFAULT_VALIDATION_BYTES: u64 = 8 * 1024 * 1024;
+const DEFAULT_UNLINK_ENTRIES: usize = 4;
+
 use super::generation::{
     MAX_GENERATION_CONTROL_RECORD_BYTES, checkpoint_closed_generation_under_lease,
     seal_closed_generation_under_lease,
@@ -50,9 +55,9 @@ pub struct EventRetirementWorkLimits {
 impl Default for EventRetirementWorkLimits {
     fn default() -> Self {
         Self {
-            max_validation_rows: 256,
-            max_validation_bytes: 8 * 1024 * 1024,
-            max_unlink_entries: 4,
+            max_validation_rows: DEFAULT_VALIDATION_ROWS,
+            max_validation_bytes: DEFAULT_VALIDATION_BYTES,
+            max_unlink_entries: DEFAULT_UNLINK_ENTRIES,
         }
     }
 }
@@ -870,7 +875,7 @@ fn hash_file(path: &Path, expected_bytes: u64) -> Result<Digest32, EventRetireme
         source,
     })?;
     let mut digest = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
+    let mut buffer = [0u8; RETIREMENT_HASH_BUFFER_BYTES];
     let mut total = 0u64;
     loop {
         let read = file

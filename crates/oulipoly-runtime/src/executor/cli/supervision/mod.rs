@@ -34,6 +34,8 @@ mod stdin_access;
 mod stdin_predicates;
 mod terminal_outcome;
 
+pub(super) use terminal_outcome::supervised_output_from_terminal;
+
 use super::provider_identity::ProviderRecognizer;
 use super::session_capture::{CapturePlan, parse_stdout_json_event_session_id};
 use super::spawn_identity::{

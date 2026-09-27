@@ -72,6 +72,164 @@ fn run(custody: Arc<LaunchCustody>, root: PathBuf, script: &'static str) -> Proc
     .unwrap()
 }
 
+#[test]
+fn original_tree_provider_preserves_host_privilege_transitions() {
+    // The original-tree owner, unlike the legacy group owner, can wait for a
+    // descendant that starts a new session without restricting its syscalls.
+    // Keep fixture files under this worktree's normal Cargo target directory.
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../src-tauri/target")
+        .join(format!("age319-provider-sudo-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let custody = Arc::new(LaunchCustody::start(root.join("proof")).unwrap());
+    let scope = LaunchScope::enter(Some(custody.clone()));
+    let actor = crate::custody::AttemptActorCustody::original_tree(uuid::Uuid::new_v4());
+    let guard = actor.begin("launch");
+    // A passwordless host sudo rule is optional. When present, exercise the
+    // actual setuid transition inside W; otherwise the NNP and setsid checks
+    // still run and the report must call out the untested sudo condition.
+    let sudo_ready = unsafe { libc::geteuid() } != 0
+        && std::process::Command::new("sudo")
+            .args(["-n", "id", "-u"])
+            .output()
+            .is_ok_and(|output| output.status.success() && output.stdout == b"0\n");
+    let script = r#"
+import ctypes, os, subprocess, sys
+status = open('/proc/self/status').read()
+assert 'NoNewPrivs:\t0' in status, status
+assert ctypes.CDLL(None).prctl(39, 0, 0, 0, 0) == 0
+assert ctypes.CDLL(None).prctl(21, 0, 0, 0, 0) == 0
+child = os.fork()
+if child == 0:
+    try:
+        os.setsid()
+    except OSError:
+        os._exit(1)
+    os._exit(0)
+assert os.waitpid(child, 0)[1] == 0
+if sys.argv[1] == 'sudo':
+    assert subprocess.check_output(['sudo', '-n', 'id', '-u'], timeout=5).strip() == b'0'
+print('nnp=0;setsid=ok;sudo=' + sys.argv[1])
+"#;
+    let result = ProcessRunner::new(ProcessLimits {
+        timeout: Duration::from_secs(10),
+        custody: Some(guard.0.clone()),
+        ..ProcessLimits::default()
+    })
+    .run(
+        ProcessCommand::new("/usr/bin/python3")
+            .arg("-c")
+            .arg(script)
+            .arg(if sudo_ready { "sudo" } else { "unavailable" }),
+        Vec::new(),
+        Vec::<(String, String)>::new(),
+    )
+    .unwrap();
+    drop(guard);
+    assert_eq!(result.status, ProcessStatus::Exited { code: 0 });
+    assert_eq!(
+        result.stdout.bytes,
+        format!(
+            "nnp=0;setsid=ok;sudo={}\n",
+            if sudo_ready { "sudo" } else { "unavailable" }
+        )
+        .as_bytes()
+    );
+    assert!(actor.receipts()[0].effect_incapable());
+    drop(scope);
+    custody.seal();
+    eventually(|| custody.quiescent());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn original_tree_refuses_inherited_restrictions_and_receipt_group() {
+    const CASE: &str = "OULIPOLY_TEST_UNRESTRICTED_CONTEXT";
+    if let Ok(case) = std::env::var(CASE) {
+        let expected = match case.as_str() {
+            "nnp" => {
+                assert_eq!(
+                    unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
+                    0
+                );
+                "inherited NNP or seccomp restriction"
+            }
+            "seccomp" => {
+                // Private userns CAP_SYS_ADMIN permits an allow-all filter
+                // without NNP. This distinguishes the two inherited states.
+                assert_eq!(
+                    unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) },
+                    0
+                );
+                let mut allow = libc::sock_filter {
+                    code: 0x06,
+                    jt: 0,
+                    jf: 0,
+                    k: 0x7fff0000,
+                };
+                let program = libc::sock_fprog {
+                    len: 1,
+                    filter: &mut allow,
+                };
+                assert_eq!(unsafe { libc::prctl(libc::PR_SET_SECCOMP, 2, &program) }, 0);
+                "inherited NNP or seccomp restriction"
+            }
+            "receipt-group" => {
+                assert_eq!(unsafe { libc::setpgid(0, 0) }, 0);
+                enter_receipt_inspection_group().unwrap();
+                "conflicts with receipt group custody"
+            }
+            "forged-context" => "original launch custody required",
+            _ => panic!("unknown private case"),
+        };
+        let actor = crate::custody::AttemptActorCustody::original_tree(uuid::Uuid::new_v4());
+        let guard = actor.begin("launch");
+        let result = ProcessRunner::new(ProcessLimits {
+            custody: Some(guard.0.clone()),
+            ..ProcessLimits::default()
+        })
+        .run(
+            ProcessCommand::new("/bin/true"),
+            Vec::new(),
+            Vec::<(String, String)>::new(),
+        );
+        assert!(format!("{result:?}").contains(expected), "{result:?}");
+        drop(guard);
+        assert!(!actor.receipts()[0].spawned);
+        return;
+    }
+    for case in ["nnp", "receipt-group", "forged-context"] {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "process::generation_wait_tests::original_tree_refuses_inherited_restrictions_and_receipt_group", "--nocapture"])
+            .env(CASE, case)
+            .env("OULIPOLY_BROKER_UNRESTRICTED", "1")
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{case}: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a private user namespace to install seccomp without NNP"]
+fn original_tree_refuses_seccomp_without_nnp() {
+    let output = Command::new("unshare")
+        .arg("-Ur")
+        .arg(std::env::current_exe().unwrap())
+        .args(["--exact", "process::generation_wait_tests::original_tree_refuses_inherited_restrictions_and_receipt_group", "--nocapture"])
+        .env("OULIPOLY_TEST_UNRESTRICTED_CONTEXT", "seccomp")
+        .output().unwrap();
+    assert!(
+        output.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 struct DelayedFinishProcessor {
     accumulator: ByteAccumulator,
     delay: Duration,

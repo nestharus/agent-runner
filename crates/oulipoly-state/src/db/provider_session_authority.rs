@@ -237,6 +237,16 @@ fn bind_segment_authority_on(
         .ok_or_else(|| {
             format!("Provider session segment not found for {provider_name}/{provider_session_id}")
         })?;
+    bind_segment_authority_by_id_on(conn, segment_id, provider_instance_id, settings_id)
+}
+
+pub(super) fn bind_segment_authority_by_id_on(
+    conn: &sqlite::Connection,
+    segment_id: i64,
+    provider_instance_id: &str,
+    settings_id: &str,
+) -> Result<(), DbError> {
+    validate_authority(provider_instance_id, settings_id)?;
     insert_or_validate_authority(
         conn,
         "session_chain_segment_provider_authority",

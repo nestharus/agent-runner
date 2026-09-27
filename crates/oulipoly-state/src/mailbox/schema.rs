@@ -315,7 +315,10 @@ fn classify_completion_summary(summary: CompletionProtocolSummary) -> Option<&'s
     }
 }
 
-pub(super) const CURRENT_VERSION: i64 = 26;
+// v30 was assigned to the broker-owned sidecar. Keep that ordinal reserved so
+// an ordinary opener can never mistake an old broker cutover for an upgrade.
+pub(super) const CURRENT_VERSION: i64 = 31;
+pub(super) const BROKER_OWNED_VERSION: i64 = 35;
 const MAX_SUPPORTED_VERSION: i64 = CURRENT_VERSION;
 const SCHEMA_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -487,7 +490,85 @@ const SCHEMA_STEPS: &[MigrationStep] = &[
         owner: SidecarEntity::CompletionAuthority,
         apply: migrate_completion_attempt_search_generation,
     },
+    MigrationStep {
+        target_version: 27,
+        owner: SidecarEntity::CompletionAuthority,
+        apply: migrate_kernel_root_owner,
+    },
+    MigrationStep {
+        target_version: 28,
+        owner: SidecarEntity::CompletionAuthority,
+        apply: migrate_native_grant_binding,
+    },
+    MigrationStep {
+        target_version: 29,
+        owner: SidecarEntity::CompletionAuthority,
+        apply: migrate_native_worker_kernel_q,
+    },
+    MigrationStep {
+        target_version: 30,
+        owner: SidecarEntity::CompletionAuthority,
+        apply: reserved_broker_version,
+    },
+    MigrationStep {
+        target_version: 31,
+        owner: SidecarEntity::CompletionAuthority,
+        apply: migrate_uncertain_activation,
+    },
 ];
+
+fn reserved_broker_version(_conn: &Connection) -> Result<(), String> {
+    Ok(())
+}
+
+fn migrate_uncertain_activation(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(include_str!("migrations/0031_uncertain_activation.sql"))
+        .map_err(|error| error.to_string())
+}
+
+fn migrate_native_worker_kernel_q(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(include_str!("migrations/0029_native_worker_kernel_q.sql"))
+        .map_err(|error| error.to_string())
+}
+
+fn migrate_native_grant_binding(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(include_str!("migrations/0028_native_grant_binding.sql"))
+        .map_err(|error| error.to_string())
+}
+
+fn migrate_kernel_root_owner(conn: &Connection) -> Result<(), String> {
+    let has_root_column: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('completion_continuation_owner') WHERE name='kernel_root_id')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !has_root_column {
+        return conn
+            .execute_batch(include_str!("migrations/0027_kernel_root_owner.sql"))
+            .map_err(|error| error.to_string());
+    }
+    // A synthetic downgrade or nonstandard recovery may retain the column
+    // while its version is old. Add only the missing index, with the canonical
+    // SQL text used by the current-schema fingerprint.
+    let has_root_index: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='completion_continuation_owner_kernel_root')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !has_root_index {
+        conn.execute_batch(
+            "CREATE INDEX completion_continuation_owner_kernel_root
+ON completion_continuation_owner(kernel_root_id)
+WHERE kernel_root_id IS NOT NULL;",
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
 
 fn migrate_notification_settlement(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(include_str!("migrations/0019_notification_settlement.sql"))
@@ -522,6 +603,7 @@ fn observe_valid_current(conn: &Connection) -> Result<bool, String> {
     validate_supported_version(version)?;
     if version == MAX_SUPPORTED_VERSION {
         super::completion_continuation::validate_schema_on(&tx)?;
+        validate_no_broker_shape(&tx)?;
     }
     tx.commit()
         .map_err(|e| format!("Failed to finish sidecar schema observation: {e}"))?;
@@ -587,6 +669,10 @@ fn ensure_with_deadline(conn: &mut Connection, deadline: Option<Instant>) -> Res
         }
         tx.pragma_update(None, "user_version", CURRENT_VERSION)
             .map_err(|err| format!("Failed to record PID mailbox sidecar schema version: {err}"))?;
+        // A migration must not commit a current version whose completed
+        // provenance, attempt, or kernel-owner schema fails ordinary readback.
+        super::completion_continuation::validate_schema_on(&tx)?;
+        validate_no_broker_shape(&tx)?;
         return tx.commit().map_err(|err| {
             format!("Failed to commit PID mailbox sidecar schema migration: {err}")
         });
@@ -607,6 +693,12 @@ fn after_stale_observation() {
 }
 
 fn validate_supported_version(version: i64) -> Result<(), String> {
+    if version == 30 {
+        return Err(
+            "Unsupported PID mailbox sidecar schema version 30; reserved broker-owned ordinal"
+                .into(),
+        );
+    }
     if (0..=MAX_SUPPORTED_VERSION).contains(&version) {
         return Ok(());
     }
@@ -615,11 +707,541 @@ fn validate_supported_version(version: i64) -> Result<(), String> {
     ))
 }
 
+/// Existing writable authority paths do not run the ordinary migration. They
+/// must still refuse a sidecar written by a newer broker-owned protocol.
+pub(super) fn validate_existing_writer_version(conn: &Connection) -> Result<(), String> {
+    validate_supported_version(sidecar_version(conn)?)
+}
+
+pub(super) fn validate_exact_v29(conn: &Connection) -> Result<(), String> {
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|error| format!("Failed to observe historical v29 sidecar: {error}"))?;
+    super::completion_continuation::validate_v29_schema_on(&tx)?;
+    validate_no_broker_shape(&tx)?;
+    tx.commit()
+        .map_err(|error| format!("Failed to finish historical v29 observation: {error}"))
+}
+
+pub(super) fn validate_exact_current(conn: &Connection) -> Result<(), String> {
+    if observe_valid_current(conn)? {
+        Ok(())
+    } else {
+        Err("broker activation requires a complete ordinary v31 sidecar".into())
+    }
+}
+
+fn validate_no_broker_shape(conn: &Connection) -> Result<(), String> {
+    let broker_shape: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name GLOB 'broker_*' \
+             AND type IN ('table','index','trigger'))",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if broker_shape {
+        return Err("ordinary sidecar contains broker-owned schema".into());
+    }
+    Ok(())
+}
+
+pub(super) fn validate_broker_owned(conn: &Connection) -> Result<String, String> {
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|error| format!("Failed to observe broker sidecar: {error}"))?;
+    let version = sidecar_version(&tx)?;
+    if version == 30 {
+        return Err("persisted broker-owned v30 sidecar requires separate disposition; in-place migration is unsupported".into());
+    }
+    if !matches!(version, 32 | 33 | 34 | BROKER_OWNED_VERSION) {
+        return Err(format!(
+            "broker sidecar requires schema version {BROKER_OWNED_VERSION}"
+        ));
+    }
+    if version == 32 {
+        super::completion_continuation::validate_broker_v32_schema_on(&tx)?;
+    } else if version == 33 {
+        super::completion_continuation::validate_broker_v33_schema_on(&tx)?;
+    } else if version == 34 {
+        super::completion_continuation::validate_broker_v34_schema_on(&tx)?;
+    } else {
+        super::completion_continuation::validate_broker_schema_on(&tx)?;
+    }
+    let definition: String = tx
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='broker_sidecar_authority'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("broker authority schema missing: {error}"))?;
+    if definition != BROKER_AUTHORITY_SCHEMA {
+        return Err("broker authority schema changed".into());
+    }
+    let owner_definition: String = tx
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='broker_completion_owner'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("broker owner schema missing: {error}"))?;
+    if owner_definition != BROKER_OWNER_SCHEMA {
+        return Err("broker owner schema changed".into());
+    }
+    let prepared_definition: String = tx
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='broker_prepared_owner'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("broker prepared owner schema missing: {error}"))?;
+    if prepared_definition != BROKER_PREPARED_OWNER_SCHEMA {
+        return Err("broker prepared owner schema changed".into());
+    }
+    let release_definition: String = tx
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='broker_owner_release'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("broker release schema missing: {error}"))?;
+    if release_definition != BROKER_OWNER_RELEASE_SCHEMA {
+        return Err("broker release schema changed".into());
+    }
+    let grant_definition: String = tx
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='broker_source_effect_grant'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("broker source grant schema missing: {error}"))?;
+    if grant_definition != BROKER_SOURCE_EFFECT_GRANT_SCHEMA {
+        return Err("broker source grant schema changed".into());
+    }
+    if version >= 33 {
+        for (name, expected) in [
+            (
+                "broker_exact_source_projection",
+                BROKER_EXACT_SOURCE_PROJECTION_SCHEMA,
+            ),
+            (
+                "broker_exact_source_projection_immutable",
+                BROKER_EXACT_SOURCE_PROJECTION_IMMUTABLE,
+            ),
+            (
+                "broker_exact_source_projection_retain",
+                BROKER_EXACT_SOURCE_PROJECTION_RETAIN,
+            ),
+        ] {
+            let actual: String = tx
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE name=?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("broker exact projection schema missing: {e}"))?;
+            if actual != expected {
+                return Err("broker exact projection schema changed".into());
+            }
+        }
+    }
+    for (name, expected) in [
+        ("broker_source_evidence", BROKER_SOURCE_EVIDENCE_SCHEMA),
+        (
+            "broker_fresh_source_admission",
+            BROKER_FRESH_SOURCE_ADMISSION_SCHEMA,
+        ),
+    ] {
+        let actual: String = tx
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                [name],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("broker source evidence schema missing: {error}"))?;
+        if actual != expected {
+            return Err("broker source evidence schema changed".into());
+        }
+    }
+    if version >= 34 {
+        for (name, expected) in [
+            (
+                "broker_exact_fresh_source_admission",
+                BROKER_EXACT_FRESH_SOURCE_ADMISSION_SCHEMA,
+            ),
+            (
+                "broker_exact_fresh_source_admission_immutable",
+                BROKER_EXACT_FRESH_SOURCE_ADMISSION_IMMUTABLE,
+            ),
+            (
+                "broker_exact_fresh_source_admission_retain",
+                BROKER_EXACT_FRESH_SOURCE_ADMISSION_RETAIN,
+            ),
+        ] {
+            let actual: String = tx
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE name=?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("broker exact fresh admission schema missing: {e}"))?;
+            if actual != expected {
+                return Err("broker exact fresh admission schema changed".into());
+            }
+        }
+    }
+    if version == BROKER_OWNED_VERSION {
+        for (name, expected) in [
+            (
+                "broker_completion_source_acceptance",
+                BROKER_COMPLETION_SOURCE_ACCEPTANCE_SCHEMA,
+            ),
+            (
+                "broker_completion_source_acceptance_immutable",
+                BROKER_COMPLETION_SOURCE_ACCEPTANCE_IMMUTABLE,
+            ),
+            (
+                "broker_completion_source_acceptance_retain",
+                BROKER_COMPLETION_SOURCE_ACCEPTANCE_RETAIN,
+            ),
+            (
+                "broker_source_retention_release",
+                BROKER_SOURCE_RETENTION_RELEASE_SCHEMA,
+            ),
+            (
+                "broker_source_retention_release_immutable",
+                BROKER_SOURCE_RETENTION_RELEASE_IMMUTABLE,
+            ),
+            (
+                "broker_source_retention_release_retain",
+                BROKER_SOURCE_RETENTION_RELEASE_RETAIN,
+            ),
+        ] {
+            let actual: String = tx
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE name=?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .map_err(|error| format!("broker source boundary schema missing: {error}"))?;
+            if actual != expected {
+                return Err("broker source boundary schema changed".into());
+            }
+        }
+    }
+    for (name, expected) in [
+        (
+            "broker_prepared_owner_immutable",
+            BROKER_PREPARED_OWNER_IMMUTABLE,
+        ),
+        (
+            "broker_source_evidence_update_guard",
+            BROKER_SOURCE_EVIDENCE_UPDATE_GUARD,
+        ),
+        (
+            "broker_source_evidence_retain",
+            BROKER_SOURCE_EVIDENCE_RETAIN,
+        ),
+        (
+            "broker_fresh_source_admission_immutable",
+            BROKER_FRESH_SOURCE_ADMISSION_IMMUTABLE,
+        ),
+        (
+            "broker_fresh_source_admission_retain",
+            BROKER_FRESH_SOURCE_ADMISSION_RETAIN,
+        ),
+        ("broker_prepared_owner_retain", BROKER_PREPARED_OWNER_RETAIN),
+        (
+            "broker_prepared_owner_no_running",
+            BROKER_PREPARED_OWNER_NO_RUNNING,
+        ),
+        (
+            "broker_owner_release_immutable",
+            BROKER_OWNER_RELEASE_IMMUTABLE,
+        ),
+        ("broker_owner_release_retain", BROKER_OWNER_RELEASE_RETAIN),
+        ("broker_owner_release_exact", BROKER_OWNER_RELEASE_EXACT),
+    ] {
+        let definition: String = tx
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+                [name],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("broker prepared owner trigger missing: {error}"))?;
+        if definition != expected {
+            return Err("broker prepared owner trigger changed".into());
+        }
+    }
+    let generation: String = tx
+        .query_row(
+            "SELECT source_generation FROM broker_sidecar_authority WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("broker source generation missing: {error}"))?;
+    uuid::Uuid::parse_str(&generation)
+        .map_err(|_| "broker source generation is invalid".to_string())?;
+    tx.commit()
+        .map_err(|error| format!("Failed to finish broker sidecar observation: {error}"))?;
+    Ok(generation)
+}
+
+pub(super) const BROKER_AUTHORITY_SCHEMA: &str = "CREATE TABLE broker_sidecar_authority (
+    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+    source_generation TEXT NOT NULL,
+    activated_at TEXT NOT NULL
+)";
+
+pub(super) const BROKER_OWNER_SCHEMA: &str = "CREATE TABLE broker_completion_owner (
+    owner_generation TEXT PRIMARY KEY REFERENCES completion_continuation_owner(generation) DEFERRABLE INITIALLY DEFERRED,
+    source_generation TEXT NOT NULL,
+    root_id TEXT NOT NULL,
+    guardian_identity TEXT NOT NULL,
+    driver_identity TEXT NOT NULL
+)";
+
+// v30 is not released. Prepared rows deliberately have no FK into the v18
+// running-owner table: an owner waiting at J must never enter its election,
+// reservation, acceptance, or source predicates.
+pub(super) const BROKER_PREPARED_OWNER_SCHEMA: &str = "CREATE TABLE broker_prepared_owner (
+    owner_generation TEXT PRIMARY KEY,
+    source_generation TEXT NOT NULL,
+    root_id TEXT NOT NULL UNIQUE,
+    owner_uid INTEGER NOT NULL CHECK(owner_uid>=0 AND owner_uid<=4294967295),
+    domain_id TEXT NOT NULL,
+    supervisor_authority_id TEXT NOT NULL,
+    endpoint TEXT NOT NULL,
+    entry_identity TEXT NOT NULL UNIQUE,
+    guardian_identity TEXT NOT NULL UNIQUE,
+    driver_identity TEXT NOT NULL UNIQUE,
+    root_init_identity TEXT NOT NULL UNIQUE,
+    joined_child_identity TEXT NOT NULL UNIQUE
+)";
+
+pub(super) const BROKER_PREPARED_OWNER_IMMUTABLE: &str =
+    "CREATE TRIGGER broker_prepared_owner_immutable
+BEFORE UPDATE ON broker_prepared_owner
+BEGIN SELECT RAISE(ABORT,'prepared owner is immutable'); END";
+
+pub(super) const BROKER_PREPARED_OWNER_RETAIN: &str = "CREATE TRIGGER broker_prepared_owner_retain
+BEFORE DELETE ON broker_prepared_owner
+BEGIN SELECT RAISE(ABORT,'prepared owner must be retained'); END";
+
+// A prepared generation may become running only inside the broker's exact
+// release transaction. The release row alone does not authorize child work;
+// live broker post-gate attestation is still required.
+pub(super) const BROKER_PREPARED_OWNER_NO_RUNNING: &str =
+    "CREATE TRIGGER broker_prepared_owner_no_running
+BEFORE INSERT ON completion_continuation_owner
+WHEN EXISTS (SELECT 1 FROM broker_prepared_owner WHERE owner_generation=NEW.generation)
+AND NOT EXISTS (
+ SELECT 1 FROM broker_owner_release r JOIN broker_prepared_owner p
+ ON p.owner_generation=r.owner_generation
+ JOIN broker_completion_owner b ON b.owner_generation=r.owner_generation
+ WHERE r.owner_generation=NEW.generation AND r.source_generation=p.source_generation
+ AND r.root_id=p.root_id AND NEW.kernel_root_id=p.root_id
+ AND NEW.domain_id=p.domain_id AND NEW.supervisor_authority_id=p.supervisor_authority_id
+ AND NEW.endpoint=p.endpoint AND NEW.guardian_identity=r.guardian_identity
+ AND NEW.driver_identity=r.driver_identity AND b.source_generation=r.source_generation
+ AND b.root_id=r.root_id AND b.guardian_identity=r.guardian_identity
+ AND b.driver_identity=r.driver_identity)
+BEGIN SELECT RAISE(ABORT,'prepared owner requires exact release'); END";
+
+pub(super) const BROKER_OWNER_RELEASE_SCHEMA: &str = "CREATE TABLE broker_owner_release (
+    owner_generation TEXT PRIMARY KEY REFERENCES broker_prepared_owner(owner_generation),
+    source_generation TEXT NOT NULL,
+    root_id TEXT NOT NULL UNIQUE,
+    release_id TEXT NOT NULL UNIQUE,
+    guardian_identity TEXT NOT NULL,
+    driver_identity TEXT NOT NULL,
+    committed_at TEXT NOT NULL
+)";
+
+// This is broker-owned debt, never a grant inferred from a copied State row or
+// an original source pathname. There is at most one grant per registration.
+// An unresolved launch is retained as unknown across broker incarnation loss.
+pub(super) const BROKER_SOURCE_EFFECT_GRANT_SCHEMA: &str =
+    "CREATE TABLE broker_source_effect_grant (
+    grant_id TEXT PRIMARY KEY,
+    source_generation TEXT NOT NULL,
+    root_id TEXT NOT NULL,
+    owner_generation TEXT NOT NULL,
+    driver_identity TEXT NOT NULL,
+    authority_ordinal INTEGER NOT NULL CHECK(authority_ordinal>=0),
+    registration_id TEXT NOT NULL UNIQUE,
+    registration_digest TEXT NOT NULL,
+    registration_bytes BLOB NOT NULL,
+    listener_revision INTEGER NOT NULL CHECK(listener_revision>=0),
+    listener_json TEXT NOT NULL,
+    phase TEXT NOT NULL CHECK(phase IN ('reserved','consumed','unknown')),
+    revision INTEGER NOT NULL CHECK(revision>=1)
+)";
+
+/// This row is a projection receipt, never independent source authority. The
+/// selector compares every field with the original State decision and current
+/// prepared/released owner before W can reserve.
+pub(super) const BROKER_EXACT_SOURCE_PROJECTION_SCHEMA: &str =
+    "CREATE TABLE broker_exact_source_projection (
+    registration_id TEXT PRIMARY KEY,
+    admission_id TEXT NOT NULL UNIQUE,
+    request_id TEXT NOT NULL UNIQUE,
+    decision_id TEXT NOT NULL UNIQUE,
+    root_id TEXT NOT NULL,
+    source_generation TEXT NOT NULL,
+    owner_generation TEXT NOT NULL,
+    supervisor_id TEXT NOT NULL,
+    issuer_stamp_json TEXT NOT NULL,
+    registration_sha256 TEXT NOT NULL,
+    registration_bytes BLOB NOT NULL,
+    binding_bytes BLOB NOT NULL,
+    broker_readback_json BLOB NOT NULL,
+    authority_ordinal INTEGER NOT NULL UNIQUE
+)";
+pub(super) const BROKER_EXACT_SOURCE_PROJECTION_IMMUTABLE: &str =
+    "CREATE TRIGGER broker_exact_source_projection_immutable
+BEFORE UPDATE ON broker_exact_source_projection
+BEGIN SELECT RAISE(ABORT,'exact source projection immutable'); END";
+pub(super) const BROKER_EXACT_SOURCE_PROJECTION_RETAIN: &str =
+    "CREATE TRIGGER broker_exact_source_projection_retain
+BEFORE DELETE ON broker_exact_source_projection
+BEGIN SELECT RAISE(ABORT,'exact source projection retained'); END";
+
+// An evidence row remains debt until an exact fresh-lane source admission is
+// present. The original four-column table is retained as untrusted historical
+// material; v34 never consults or silently reinterprets its rows.
+pub(super) const BROKER_SOURCE_EVIDENCE_SCHEMA: &str = "CREATE TABLE broker_source_evidence (
+    grant_id TEXT PRIMARY KEY REFERENCES broker_source_effect_grant(grant_id),
+    source_generation TEXT NOT NULL,
+    registration_id TEXT NOT NULL UNIQUE,
+    seal_json TEXT,
+    phase TEXT NOT NULL CHECK(phase IN ('unknown','captured','accepted')),
+    revision INTEGER NOT NULL CHECK(revision>=1)
+)";
+
+pub(super) const BROKER_FRESH_SOURCE_ADMISSION_SCHEMA: &str =
+    "CREATE TABLE broker_fresh_source_admission (
+    registration_id TEXT PRIMARY KEY,
+    source_generation TEXT NOT NULL,
+    state_admission_id TEXT NOT NULL,
+    registration_digest TEXT NOT NULL
+)";
+
+pub(super) const BROKER_EXACT_FRESH_SOURCE_ADMISSION_SCHEMA: &str =
+    "CREATE TABLE broker_exact_fresh_source_admission (
+    registration_id TEXT PRIMARY KEY,
+    registration_digest TEXT NOT NULL,
+    state_admission_id TEXT NOT NULL UNIQUE,
+    caller_admission_id TEXT NOT NULL UNIQUE,
+    source_generation TEXT NOT NULL,
+    sidecar_generation TEXT NOT NULL,
+    root_id TEXT NOT NULL,
+    owner_generation TEXT NOT NULL,
+    state_device INTEGER NOT NULL,
+    state_inode INTEGER NOT NULL,
+    request_id TEXT NOT NULL,
+    decision_id TEXT NOT NULL,
+    authority_ordinal INTEGER NOT NULL,
+    projected_material BLOB NOT NULL
+)";
+pub(super) const BROKER_EXACT_FRESH_SOURCE_ADMISSION_IMMUTABLE: &str =
+    "CREATE TRIGGER broker_exact_fresh_source_admission_immutable
+BEFORE UPDATE ON broker_exact_fresh_source_admission
+BEGIN SELECT RAISE(ABORT,'exact fresh source admission is immutable'); END";
+pub(super) const BROKER_EXACT_FRESH_SOURCE_ADMISSION_RETAIN: &str =
+    "CREATE TRIGGER broker_exact_fresh_source_admission_retain
+BEFORE DELETE ON broker_exact_fresh_source_admission
+BEGIN SELECT RAISE(ABORT,'exact fresh source admission must be retained'); END";
+
+// These are separate from notification publication and the legacy source row.
+// The acceptance holds a digest-bound description of the original selected
+// bytes in Broker custody; release is a later, separately committed decision.
+pub(super) const BROKER_COMPLETION_SOURCE_ACCEPTANCE_SCHEMA: &str =
+    "CREATE TABLE broker_completion_source_acceptance (
+    registration_id TEXT PRIMARY KEY REFERENCES broker_exact_fresh_source_admission(registration_id),
+    grant_id TEXT NOT NULL UNIQUE REFERENCES broker_source_effect_grant(grant_id),
+    source_generation TEXT NOT NULL,
+    receipt_json TEXT NOT NULL,
+    receipt_sha256 TEXT NOT NULL
+)";
+pub(super) const BROKER_COMPLETION_SOURCE_ACCEPTANCE_IMMUTABLE: &str =
+    "CREATE TRIGGER broker_completion_source_acceptance_immutable
+BEFORE UPDATE ON broker_completion_source_acceptance
+BEGIN SELECT RAISE(ABORT,'broker completion source acceptance immutable'); END";
+pub(super) const BROKER_COMPLETION_SOURCE_ACCEPTANCE_RETAIN: &str =
+    "CREATE TRIGGER broker_completion_source_acceptance_retain
+BEFORE DELETE ON broker_completion_source_acceptance
+BEGIN SELECT RAISE(ABORT,'broker completion source acceptance retained'); END";
+pub(super) const BROKER_SOURCE_RETENTION_RELEASE_SCHEMA: &str =
+    "CREATE TABLE broker_source_retention_release (
+    registration_id TEXT PRIMARY KEY REFERENCES broker_completion_source_acceptance(registration_id),
+    grant_id TEXT NOT NULL UNIQUE,
+    source_generation TEXT NOT NULL,
+    acceptance_sha256 TEXT NOT NULL,
+    receipt_json TEXT NOT NULL,
+    receipt_sha256 TEXT NOT NULL
+)";
+pub(super) const BROKER_SOURCE_RETENTION_RELEASE_IMMUTABLE: &str =
+    "CREATE TRIGGER broker_source_retention_release_immutable
+BEFORE UPDATE ON broker_source_retention_release
+BEGIN SELECT RAISE(ABORT,'broker source retention release immutable'); END";
+pub(super) const BROKER_SOURCE_RETENTION_RELEASE_RETAIN: &str =
+    "CREATE TRIGGER broker_source_retention_release_retain
+BEFORE DELETE ON broker_source_retention_release
+BEGIN SELECT RAISE(ABORT,'broker source retention release retained'); END";
+
+pub(super) const BROKER_SOURCE_EVIDENCE_UPDATE_GUARD: &str =
+    "CREATE TRIGGER broker_source_evidence_update_guard
+BEFORE UPDATE ON broker_source_evidence
+WHEN OLD.phase!='captured' OR NEW.phase!='accepted' OR OLD.revision!=1 OR NEW.revision!=2
+ OR NEW.grant_id!=OLD.grant_id OR NEW.source_generation!=OLD.source_generation
+ OR NEW.registration_id!=OLD.registration_id OR NEW.seal_json!=OLD.seal_json
+BEGIN SELECT RAISE(ABORT,'source evidence is immutable'); END";
+pub(super) const BROKER_SOURCE_EVIDENCE_RETAIN: &str =
+    "CREATE TRIGGER broker_source_evidence_retain
+BEFORE DELETE ON broker_source_evidence
+BEGIN SELECT RAISE(ABORT,'source evidence debt must be retained'); END";
+pub(super) const BROKER_FRESH_SOURCE_ADMISSION_IMMUTABLE: &str =
+    "CREATE TRIGGER broker_fresh_source_admission_immutable
+BEFORE UPDATE ON broker_fresh_source_admission
+BEGIN SELECT RAISE(ABORT,'fresh source admission is immutable'); END";
+pub(super) const BROKER_FRESH_SOURCE_ADMISSION_RETAIN: &str =
+    "CREATE TRIGGER broker_fresh_source_admission_retain
+BEFORE DELETE ON broker_fresh_source_admission
+BEGIN SELECT RAISE(ABORT,'fresh source admission must be retained'); END";
+
+pub(super) const BROKER_OWNER_RELEASE_IMMUTABLE: &str =
+    "CREATE TRIGGER broker_owner_release_immutable
+BEFORE UPDATE ON broker_owner_release
+BEGIN SELECT RAISE(ABORT,'broker release is immutable'); END";
+
+pub(super) const BROKER_OWNER_RELEASE_RETAIN: &str = "CREATE TRIGGER broker_owner_release_retain
+BEFORE DELETE ON broker_owner_release
+BEGIN SELECT RAISE(ABORT,'broker release must be retained'); END";
+
+pub(super) const BROKER_OWNER_RELEASE_EXACT: &str = "CREATE TRIGGER broker_owner_release_exact
+BEFORE INSERT ON broker_owner_release
+WHEN NOT EXISTS (
+ SELECT 1 FROM broker_prepared_owner p WHERE p.owner_generation=NEW.owner_generation
+ AND p.source_generation=NEW.source_generation AND p.root_id=NEW.root_id
+ AND json_valid(NEW.guardian_identity) AND json_valid(NEW.driver_identity)
+ AND CAST(json_extract(NEW.guardian_identity,'$.pid') AS INTEGER)=json_extract(p.guardian_identity,'$.host_pid')
+ AND json_extract(NEW.guardian_identity,'$.boot_id')=json_extract(p.guardian_identity,'$.boot_id')
+ AND CAST(json_extract(NEW.guardian_identity,'$.starttime_ticks') AS INTEGER)=json_extract(p.guardian_identity,'$.starttime_ticks')
+ AND CAST(json_extract(NEW.driver_identity,'$.pid') AS INTEGER)=json_extract(p.driver_identity,'$.host_pid')
+ AND json_extract(NEW.driver_identity,'$.boot_id')=json_extract(p.driver_identity,'$.boot_id')
+ AND CAST(json_extract(NEW.driver_identity,'$.starttime_ticks') AS INTEGER)=json_extract(p.driver_identity,'$.starttime_ticks')
+ AND NOT EXISTS (SELECT 1 FROM completion_continuation_owner WHERE generation=NEW.owner_generation))
+BEGIN SELECT RAISE(ABORT,'broker release actor mismatch'); END";
+
 fn create_fresh_schema(conn: &Connection) -> Result<(), String> {
     apply_steps(conn, SCHEMA_STEPS)
 }
 
 fn upgrade_installed_schema(conn: &Connection, stored_version: i64) -> Result<(), String> {
+    if stored_version == 24 {
+        reconcile_alternate_v24(conn)?;
+    }
     for target_version in (stored_version + 1)..=CURRENT_VERSION {
         let steps = SCHEMA_STEPS
             .iter()
@@ -640,6 +1262,56 @@ fn upgrade_installed_schema(conn: &Connection, stored_version: i64) -> Result<()
         }
     }
     Ok(())
+}
+
+// AGE-319's unpublished v24 used this ordinal for the kernel owner column;
+// merged main uses v24 for mailbox provenance. The exact alternate shape can
+// acquire provenance in this transaction before the published v25/v26 steps.
+// An unrecognized v24 must not be advanced under the wrong history.
+fn reconcile_alternate_v24(conn: &Connection) -> Result<(), String> {
+    let has_provenance: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('mailbox') WHERE name='completion_provenance')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if has_provenance {
+        return Ok(());
+    }
+    let kernel_index: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name='completion_continuation_owner_kernel_root'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let has_kernel_column: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('completion_continuation_owner') WHERE name='kernel_root_id' AND type='TEXT')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let has_later_columns: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('completion_continuation_attempt') WHERE name='association_completeness')
+               OR EXISTS(SELECT 1 FROM pragma_table_info('completion_continuation_source') WHERE name='attempt_association_history')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !has_kernel_column
+        || kernel_index.as_deref()
+            != Some(
+                "CREATE INDEX completion_continuation_owner_kernel_root\nON completion_continuation_owner(kernel_root_id)\nWHERE kernel_root_id IS NOT NULL",
+            )
+        || has_later_columns
+    {
+        return Err("unsupported_transition_required: unrecognized PID mailbox v24 lineage".into());
+    }
+    migrate_completion_mailbox_provenance(conn)
 }
 
 fn apply_steps(conn: &Connection, steps: &[MigrationStep]) -> Result<(), String> {
@@ -973,7 +1645,7 @@ fn session_has_nonterminal_generation(conn: &Connection, session_id: &str) -> Re
     .map_err(|err| format!("Failed to inspect promoted runtime session: {err}"))
 }
 
-fn sidecar_version(conn: &Connection) -> Result<i64, String> {
+pub(super) fn sidecar_version(conn: &Connection) -> Result<i64, String> {
     conn.query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(|err| format!("Failed to read PID mailbox sidecar schema version: {err}"))
 }
@@ -1011,6 +1683,10 @@ pub(super) fn remove_continuation_schema_for_legacy_fixture(conn: &Connection) {
         DROP TABLE mailbox_completed_turn_tails;
         DROP TRIGGER completion_continuation_notification_ack;
         DROP TABLE completion_continuation_notification;
+        DROP TABLE completion_native_kernel_q;
+        DROP TABLE completion_native_worker_attach;
+        DROP TRIGGER completion_native_grant_no_legacy_terminal;
+        DROP TABLE completion_native_grant_binding;
         DROP TABLE completion_continuation_attempt_source;
         DROP TABLE completion_continuation_attempt;
         DROP TABLE completion_continuation_source;
@@ -1032,12 +1708,20 @@ pub(crate) fn remove_completion_recovery_working_set_for_legacy_fixture(conn: &C
     remove_record_timestamp_contract_for_legacy_fixture(conn);
     remove_attempt_search_generation_for_legacy_fixture(conn);
     conn.execute_batch(
-        "DROP INDEX IF EXISTS idx_mailbox_pending_session_live;
+        "DROP TABLE completion_native_kernel_q;
+         DROP TABLE completion_native_worker_attach;
+         DROP TRIGGER completion_native_grant_no_legacy_terminal;
+         DROP TABLE completion_native_grant_binding;
+         DROP INDEX IF EXISTS completion_continuation_owner_kernel_root;
+         ALTER TABLE completion_continuation_owner DROP COLUMN kernel_root_id;
+         DROP INDEX IF EXISTS idx_mailbox_pending_session_live;
          DROP INDEX IF EXISTS idx_mailbox_pending_target_live;
          DROP INDEX IF EXISTS idx_mailbox_deliverable_session_live;
          DROP INDEX IF EXISTS idx_mailbox_deliverable_target_live;
          DROP INDEX IF EXISTS idx_mailbox_deliverable_global;
          DROP INDEX IF EXISTS idx_mailbox_delivery_attempt_unresolved;
+         DROP TRIGGER IF EXISTS completion_uncertain_input_preserve;
+         DROP TABLE IF EXISTS completion_uncertain_input;
          DROP INDEX IF EXISTS idx_completion_event_listener_session_live;
          DROP INDEX IF EXISTS idx_completion_event_listener_unacknowledged;
          DROP INDEX IF EXISTS idx_completion_event_listener_retirement_pending;
@@ -1145,6 +1829,366 @@ mod contention_tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
+
+    #[test]
+    fn v29_upgrade_retains_submitted_input_and_reserves_old_broker_ordinal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        let mut db = super::super::MailboxDb::open(&path).unwrap();
+        let result = db
+            .enqueue_submitted_input(&super::super::SubmittedInputEnqueue {
+                submission_token: "upgrade-pending",
+                target: super::super::InboxTarget {
+                    kind: super::super::InboxTargetKind::Session,
+                    id: "session",
+                },
+                input: b"exact-pending-input",
+            })
+            .unwrap();
+        let super::super::EnqueueResult::Inserted(row) = result else {
+            panic!("fixture input was not inserted");
+        };
+        drop(db);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP TRIGGER completion_uncertain_input_preserve;
+             DROP TABLE completion_uncertain_input;
+             DROP INDEX idx_mailbox_deliverable_session_live;
+             DROP INDEX idx_mailbox_deliverable_target_live;
+             DROP INDEX idx_mailbox_deliverable_global;
+             PRAGMA user_version=29;",
+        )
+        .unwrap();
+        conn.execute_batch(include_str!("migrations/0022_live_history_barrier.sql"))
+            .unwrap();
+        assert_eq!(sidecar_version(&conn).unwrap(), 29);
+        validate_exact_v29(&conn).unwrap();
+        assert_eq!(sidecar_version(&conn).unwrap(), 29);
+        drop(conn);
+        db = super::super::MailboxDb::open(&path).unwrap();
+        assert_eq!(sidecar_version(db.connection()).unwrap(), CURRENT_VERSION);
+        assert_eq!(db.pending_delivery_count("session", None).unwrap(), 1);
+        assert_eq!(db.uncertain_activation_input_count("session").unwrap(), 0);
+        assert_eq!(
+            super::super::MailboxDb::open_historical_read_only(&path)
+                .unwrap()
+                .list_mailbox("session", true)
+                .unwrap()[0]
+                .seq,
+            row.seq
+        );
+        drop(db);
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "user_version", 30).unwrap();
+        drop(conn);
+        assert!(
+            super::super::MailboxDb::open(&path)
+                .err()
+                .unwrap()
+                .contains("Unsupported PID mailbox sidecar schema version 30")
+        );
+    }
+
+    #[test]
+    fn current_sidecar_rejects_partial_uncertain_indexes_and_cross_role_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        drop(super::super::MailboxDb::open(&path).unwrap());
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("DROP INDEX idx_mailbox_deliverable_global")
+            .unwrap();
+        drop(conn);
+        assert!(super::super::MailboxDb::open(&path).is_err());
+
+        let other_dir = dir.path().join("wrong-role");
+        std::fs::create_dir(&other_dir).unwrap();
+        let other = other_dir.join("pid-identity.db");
+        drop(super::super::MailboxDb::open(&other).unwrap());
+        let conn = Connection::open(&other).unwrap();
+        conn.execute_batch("CREATE TABLE broker_sidecar_authority(singleton INTEGER PRIMARY KEY)")
+            .unwrap();
+        drop(conn);
+        assert!(
+            super::super::MailboxDb::open(&other)
+                .err()
+                .unwrap()
+                .contains("broker-owned schema")
+        );
+    }
+
+    #[test]
+    fn published_v24_to_v28_upgrade_to_native_worker_ledger_preserves_attempts() {
+        for version in 24..=28 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("pid-identity.db");
+            let conn = Connection::open(&path).unwrap();
+            let steps: Vec<_> = SCHEMA_STEPS
+                .iter()
+                .filter(|step| step.target_version <= version)
+                .map(|step| MigrationStep {
+                    target_version: step.target_version,
+                    owner: step.owner,
+                    apply: step.apply,
+                })
+                .collect();
+            apply_steps(&conn, &steps).unwrap();
+            let domain: String = conn
+                .query_row(
+                    "SELECT domain_id FROM completion_continuation_domain",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                "INSERT INTO completion_supervisor_authority
+                 (authority_id,domain_id,phase,created_by_generation,guardian_identity)
+                 VALUES('older-authority',?1,'active','older-owner','{}')",
+                [&domain],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO completion_continuation_owner
+                 (generation,domain_id,phase,guardian_identity,driver_identity,
+                  endpoint,supervisor_authority_id)
+                 VALUES('older-owner',?1,'lost','{}','{}','/older/owner','older-authority')",
+                [&domain],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO completion_continuation_attempt
+                 (attempt_id,domain_id,owner_generation,operation,request_sha256,
+                  phase,revision,result_path)
+                 VALUES('older-attempt',?1,'older-owner','transport','digest',
+                        'accepted',2,'/older/result')",
+                [&domain],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            drop(conn);
+
+            let db = super::super::MailboxDb::open(&path).unwrap();
+            assert_eq!(sidecar_version(db.connection()).unwrap(), CURRENT_VERSION);
+            let retained: String = db
+                .connection()
+                .query_row(
+                    "SELECT domain_id FROM completion_continuation_domain",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(retained, domain);
+            let retained_attempt: (String, i64) = db
+                .connection()
+                .query_row(
+                    "SELECT phase,revision FROM completion_continuation_attempt
+                 WHERE attempt_id='older-attempt'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(retained_attempt, ("accepted".into(), 2));
+            let grants: i64 = db
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM completion_native_grant_binding",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(grants, 0);
+            assert!(db.connection().query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('completion_continuation_owner') WHERE name='kernel_root_id')",
+                [], |row| row.get::<_, bool>(0),
+            ).unwrap());
+            drop(db);
+            super::super::MailboxDb::open(&path).unwrap();
+        }
+    }
+
+    #[test]
+    fn v28_binding_cannot_be_reopened_as_a_synthetic_v27() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        drop(super::super::MailboxDb::open(&path).unwrap());
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "user_version", 27).unwrap();
+        drop(conn);
+        let refused = super::super::MailboxDb::open(&path).err().unwrap();
+        assert!(
+            refused.contains("migration to version 28 failed"),
+            "{refused}"
+        );
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(sidecar_version(&conn).unwrap(), 27);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM completion_native_grant_binding",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn v28_binding_upgrades_to_current_without_rewriting_accepted_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        let conn = Connection::open(&path).unwrap();
+        let steps: Vec<_> = SCHEMA_STEPS
+            .iter()
+            .filter(|step| step.target_version <= 28)
+            .map(|step| MigrationStep {
+                target_version: step.target_version,
+                owner: step.owner,
+                apply: step.apply,
+            })
+            .collect();
+        apply_steps(&conn, &steps).unwrap();
+        let domain: String = conn
+            .query_row(
+                "SELECT domain_id FROM completion_continuation_domain",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute("INSERT INTO completion_supervisor_authority(authority_id,domain_id,phase,created_by_generation,guardian_identity) VALUES('v28-supervisor',?1,'active','v28-owner','{}')", [&domain]).unwrap();
+        conn.execute("INSERT INTO completion_continuation_owner(generation,domain_id,phase,guardian_identity,driver_identity,endpoint,supervisor_authority_id,kernel_root_id) VALUES('v28-owner',?1,'running','{}','{}','/v28','v28-supervisor','v28-root')", [&domain]).unwrap();
+        conn.execute("INSERT INTO completion_continuation_attempt(attempt_id,domain_id,owner_generation,operation,request_sha256,phase,revision,result_path) VALUES('v28-attempt',?1,'v28-owner','transport','digest','accepted',2,'/v28/result')", [&domain]).unwrap();
+        conn.execute("INSERT INTO completion_native_grant_binding(attempt_id,grant_id,protocol,accepted_revision,domain_id,kernel_root_id,supervisor_authority_id,owner_generation,guardian_identity,accepted_snapshot_sha256,custodian_request_sha256) VALUES('v28-attempt','v28-grant','native-continuation-v1',2,?1,'v28-root','v28-supervisor','v28-owner','{}',?2,?3)", params![domain,"a".repeat(64),"b".repeat(64)]).unwrap();
+        conn.pragma_update(None, "user_version", 28).unwrap();
+        drop(conn);
+        let db = super::super::MailboxDb::open(&path).unwrap();
+        assert_eq!(sidecar_version(db.connection()).unwrap(), CURRENT_VERSION);
+        let retained: (String, i64, i64) = db.connection().query_row("SELECT a.phase,a.revision,a.integrated FROM completion_continuation_attempt a JOIN completion_native_grant_binding b ON b.attempt_id=a.attempt_id WHERE b.grant_id='v28-grant'", [], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!(retained, ("accepted".into(), 2, 0));
+        assert!(db.native_worker_attach("v28-attempt").unwrap().is_none());
+        assert!(db.native_kernel_q("v28-attempt").unwrap().is_none());
+    }
+
+    #[test]
+    fn v29_fingerprint_and_downgrade_refuse_missing_or_older_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        drop(super::super::MailboxDb::open(&path).unwrap());
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("DROP TRIGGER completion_native_kernel_q_exact;")
+            .unwrap();
+        drop(conn);
+        let refused = super::super::MailboxDb::open(&path).err().unwrap();
+        assert!(refused.contains("schema lineage differs"), "{refused}");
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "user_version", 28).unwrap();
+        drop(conn);
+        let refused = super::super::MailboxDb::open(&path).err().unwrap();
+        assert!(
+            refused.contains("migration to version 29 failed"),
+            "{refused}"
+        );
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(sidecar_version(&conn).unwrap(), 28);
+    }
+
+    #[test]
+    fn alternate_kernel_v24_gets_provenance_and_attempt_history_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        let conn = Connection::open(&path).unwrap();
+        let steps: Vec<_> = SCHEMA_STEPS
+            .iter()
+            .filter(|step| step.target_version <= 23)
+            .map(|step| MigrationStep {
+                target_version: step.target_version,
+                owner: step.owner,
+                apply: step.apply,
+            })
+            .collect();
+        apply_steps(&conn, &steps).unwrap();
+        let domain: String = conn
+            .query_row(
+                "SELECT domain_id FROM completion_continuation_domain",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute_batch(include_str!("migrations/0027_kernel_root_owner.sql"))
+            .unwrap();
+        let root = Uuid::new_v4().to_string();
+        let authority = Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO completion_supervisor_authority(
+                authority_id,domain_id,phase,created_by_generation,guardian_identity)
+             VALUES(?1,?2,'active','old-generation','old-guardian')",
+            params![authority, domain],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO completion_continuation_owner(
+                generation,domain_id,phase,guardian_identity,driver_identity,
+                endpoint,supervisor_authority_id,kernel_root_id)
+             VALUES('old-generation',?1,'lost','old-guardian','old-driver',
+                '/private/old-endpoint',?2,?3)",
+            params![domain, authority, root],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 24).unwrap();
+        drop(conn);
+
+        let db = super::super::MailboxDb::open(&path).unwrap();
+        assert_eq!(sidecar_version(db.connection()).unwrap(), CURRENT_VERSION);
+        let retained: String = db
+            .connection()
+            .query_row(
+                "SELECT domain_id FROM completion_continuation_domain",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained, domain);
+        let retained_root: String = db
+            .connection()
+            .query_row(
+                "SELECT kernel_root_id FROM completion_continuation_owner WHERE generation='old-generation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained_root, root);
+        assert!(db.connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('mailbox') WHERE name='completion_provenance')",
+            [], |row| row.get::<_, bool>(0),
+        ).unwrap());
+        assert!(db.connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('completion_continuation_attempt') WHERE name='association_completeness')",
+            [], |row| row.get::<_, bool>(0),
+        ).unwrap());
+        drop(db);
+        super::super::MailboxDb::open(&path).unwrap();
+    }
+
+    #[test]
+    fn unrecognized_v24_does_not_advance_or_mutate() {
+        let conn = Connection::open_in_memory().unwrap();
+        let steps: Vec<_> = SCHEMA_STEPS
+            .iter()
+            .filter(|step| step.target_version <= 23)
+            .map(|step| MigrationStep {
+                target_version: step.target_version,
+                owner: step.owner,
+                apply: step.apply,
+            })
+            .collect();
+        apply_steps(&conn, &steps).unwrap();
+        conn.pragma_update(None, "user_version", 24).unwrap();
+        let mut conn = conn;
+        assert!(
+            ensure(&mut conn)
+                .unwrap_err()
+                .contains("unrecognized PID mailbox v24 lineage")
+        );
+        assert_eq!(sidecar_version(&conn).unwrap(), 24);
+    }
 
     #[test]
     fn v25_source_history_guard_is_part_of_schema_invariant() {
@@ -1504,7 +2548,9 @@ mod contention_tests {
     #[test]
     fn v25_association_schema_step_does_not_scan_large_attempt_history() {
         const ROWS: i64 = 20_000;
-        const VM_BUDGET: usize = 5_000;
+        // The current v29 fingerprint includes two more bounded ledgers and
+        // their guards. This remains below a fixed ceiling independent of rows.
+        const VM_BUDGET: usize = 8_000;
         fn history() -> Connection {
             let conn = Connection::open_in_memory().unwrap();
             conn.execute_batch(&format!(
@@ -1768,6 +2814,14 @@ mod contention_tests {
         // A fixture may carry the v24 column and triggers while its recorded
         // version is 23. Reapplying the step must keep classified rows intact.
         let fixture = Connection::open(&path).unwrap();
+        fixture
+            .execute_batch(
+                "DROP TABLE completion_native_kernel_q;
+                DROP TABLE completion_native_worker_attach;
+                DROP TRIGGER completion_native_grant_no_legacy_terminal;
+                DROP TABLE completion_native_grant_binding;",
+            )
+            .unwrap();
         fixture.pragma_update(None, "user_version", 23).unwrap();
         drop(fixture);
         let reopened = super::super::MailboxDb::open(&path).unwrap();
@@ -1897,7 +2951,11 @@ mod contention_tests {
         mailbox
             .connection()
             .execute_batch(
-                "DROP TRIGGER mailbox_completion_provenance_insert_valid;
+                "DROP TABLE completion_native_kernel_q;
+             DROP TABLE completion_native_worker_attach;
+             DROP TRIGGER completion_native_grant_no_legacy_terminal;
+             DROP TABLE completion_native_grant_binding;
+             DROP TRIGGER mailbox_completion_provenance_insert_valid;
              DROP TRIGGER mailbox_completion_provenance_update_valid;
              DROP TRIGGER mailbox_completion_provenance_immutable;
              ALTER TABLE mailbox DROP COLUMN completion_provenance;

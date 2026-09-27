@@ -1,0 +1,41 @@
+[package]
+name = "oulipoly-kernel-broker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+age319-private-broker-fixture = ["oulipoly-state/age319-private-broker-fixture"]
+
+[[bin]]
+name = "oulipoly-kernel-broker"
+path = "src/main.rs"
+
+[[bin]]
+name = "oulipoly-installed-launcher"
+path = "src/installed_launcher.rs"
+
+[[bin]]
+name = "oulipoly-shared-front-door"
+path = "src/shared_front_door.rs"
+
+[[bin]]
+name = "age319-fresh-provider-fixture"
+path = "src/fresh_provider_fixture.rs"
+required-features = ["age319-private-broker-fixture"]
+
+[dependencies]
+base64 = "0.22"
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+oulipoly-state = { path = "../oulipoly-state" }
+oulipoly-runtime = { path = "../oulipoly-runtime" }
+rusqlite.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+rusqlite.workspace = true

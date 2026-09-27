@@ -28,13 +28,19 @@ mod dispatch;
 mod error_emit;
 mod invocation;
 mod json_error;
+#[cfg(target_os = "linux")]
+mod kernel_entry;
 mod mailbox_delivery;
 mod maintenance_worker;
 mod migration_providers;
+#[cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
+mod native_f_preparation;
 mod native_receipt;
 #[allow(dead_code)]
 #[path = "main/owned_turn_event_ingest.rs"]
 mod owned_turn_event_ingest;
+#[cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
+mod private_provider_probe;
 mod provider_artifact;
 mod provider_proof;
 mod quota_zero_turn;
@@ -56,6 +62,15 @@ mod zero_turn_orchestration;
 use crate::usage::cli::Cli;
 
 fn main() -> ExitCode {
+    if cfg!(feature = "age319-closed-fresh") {
+        eprintln!("OULIPOLY_AGE319_FRESH_CLOSED=no production fresh root route");
+        return ExitCode::FAILURE;
+    }
+    #[cfg(target_os = "linux")]
+    if let Err(error) = kernel_entry::verify_installed_entry_route() {
+        eprintln!("OULIPOLY_KERNEL_ENTRY_GAP={error}");
+        return ExitCode::FAILURE;
+    }
     ordinary_entrypoint(production_entrypoint)
 }
 
@@ -64,6 +79,22 @@ fn ordinary_entrypoint(run: impl FnOnce() -> ExitCode) -> ExitCode {
 }
 
 fn production_entrypoint() -> ExitCode {
+    #[cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
+    if let Some(result) = kernel_entry::private_consumed_h_source_decision_entry() {
+        return result;
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(result) = kernel_entry::child_entry() {
+        return result;
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(result) = kernel_entry::host_entry() {
+        return result;
+    }
+    #[cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
+    if let Some(result) = private_installed_probe() {
+        return result;
+    }
     if maintenance_worker::is_worker_invocation() {
         return match maintenance_worker::run_worker_invocation() {
             Ok(()) => ExitCode::SUCCESS,
@@ -92,6 +123,313 @@ fn production_entrypoint() -> ExitCode {
     process_entrypoint()
 }
 
+#[cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
+fn private_installed_probe() -> Option<ExitCode> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WINCH: AtomicBool = AtomicBool::new(false);
+    static INT: AtomicBool = AtomicBool::new(false);
+    extern "C" fn winch(_: libc::c_int) {
+        WINCH.store(true, Ordering::Relaxed);
+    }
+    extern "C" fn interrupt(_: libc::c_int) {
+        INT.store(true, Ordering::Relaxed);
+    }
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.first().and_then(|arg| arg.to_str()) != Some("__age319-private-installed-probe-v1") {
+        return None;
+    }
+    let private_namespace = std::fs::read_to_string("/proc/self/uid_map")
+        .ok()
+        .is_some_and(|map| map.split_ascii_whitespace().nth(2) == Some("1"));
+    let gui_mode = args.get(1).and_then(|arg| arg.to_str()) == Some("gui") && args.len() == 2;
+    if !private_namespace || !gui_mode && (unsafe { libc::geteuid() }) != 0 {
+        return Some(ExitCode::FAILURE);
+    }
+    match args.get(1).and_then(|arg| arg.to_str()) {
+        Some("gui") if args.len() == 2 => Some(match private_gui_probe() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("PRIVATE_GUI_PROBE_GAP={error}");
+                ExitCode::FAILURE
+            }
+        }),
+        Some("tty") if args.len() == 2 => {
+            unsafe {
+                libc::signal(libc::SIGWINCH, winch as libc::sighandler_t);
+                libc::signal(libc::SIGINT, interrupt as libc::sighandler_t);
+            }
+            let cwd = std::env::current_dir().unwrap();
+            let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+            let tty = unsafe { libc::isatty(0) } == 1;
+            let ctty =
+                unsafe { libc::open(c"/dev/tty".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+            if ctty >= 0 {
+                unsafe { libc::close(ctty) };
+            }
+            unsafe { libc::ioctl(0, libc::TIOCGWINSZ, &mut size) };
+            println!(
+                "PRIVATE_TTY_READY cwd={} tty={tty} ctty={} rows={} cols={} display={}",
+                cwd.display(),
+                ctty >= 0,
+                size.ws_row,
+                size.ws_col,
+                std::env::var("DISPLAY").unwrap_or_default()
+            );
+            std::io::stdout().flush().ok();
+            let mut input = Vec::new();
+            let mut byte = [0u8; 1];
+            while input.len() < 128 {
+                let read = unsafe { libc::read(0, byte.as_mut_ptr().cast(), 1) };
+                if read == 1 {
+                    if byte[0] == b'\n' {
+                        break;
+                    }
+                    input.push(byte[0]);
+                } else if read < 0
+                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                {
+                    continue;
+                } else {
+                    break;
+                }
+            }
+            println!(
+                "PRIVATE_TTY_RESULT input={} winch={} int={}",
+                String::from_utf8_lossy(&input),
+                WINCH.load(Ordering::Relaxed),
+                INT.load(Ordering::Relaxed)
+            );
+            Some(ExitCode::SUCCESS)
+        }
+        Some("ambient") if args.len() == 3 => {
+            let marker = std::path::PathBuf::from(&args[2]);
+            let child = unsafe { libc::fork() };
+            if child < 0 {
+                return Some(ExitCode::FAILURE);
+            }
+            if child == 0 {
+                unsafe {
+                    libc::setsid();
+                    libc::clearenv();
+                }
+                let observed_pid = std::fs::read_to_string("/proc/self/status")
+                    .ok()
+                    .and_then(|status| {
+                        status
+                            .lines()
+                            .find(|line| line.starts_with("NSpid:"))
+                            .and_then(|line| line.split_whitespace().nth(1))
+                            .and_then(|field| field.parse::<i32>().ok())
+                    })
+                    .unwrap_or(-1);
+                let _ = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&marker)
+                    .and_then(|mut file| {
+                        file.write_all(
+                            format!("ambient-descendant-alive host_pid={observed_pid}\n")
+                                .as_bytes(),
+                        )
+                    });
+                for fd in 0..1024 {
+                    unsafe { libc::close(fd) };
+                }
+                loop {
+                    unsafe { libc::pause() };
+                }
+            }
+            println!("PRIVATE_AMBIENT_PARENT_EXIT child={child}");
+            Some(ExitCode::SUCCESS)
+        }
+        Some("provider") if args.len() == 3 => Some(
+            match private_provider_probe::run(std::path::Path::new(&args[2])) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("PRIVATE_PROVIDER_PROBE_GAP={error}");
+                    ExitCode::FAILURE
+                }
+            },
+        ),
+        Some("setuid") if args.len() == 2 => {
+            use std::os::fd::AsRawFd;
+            let image = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
+            let child = unsafe { libc::fork() };
+            if child < 0 {
+                return Some(ExitCode::FAILURE);
+            }
+            if child == 0 {
+                let argv = [
+                    c"oulipoly-agent-runner".as_ptr(),
+                    c"__age319-private-installed-probe-v1".as_ptr(),
+                    c"setuid-child".as_ptr(),
+                    std::ptr::null(),
+                ];
+                let envp = [std::ptr::null::<libc::c_char>()];
+                unsafe {
+                    if libc::setresgid(1, 1, 1) != 0 || libc::setresuid(1, 1, 1) != 0 {
+                        libc::_exit(71);
+                    }
+                    libc::syscall(
+                        libc::SYS_execveat,
+                        image.as_raw_fd(),
+                        c"".as_ptr(),
+                        argv.as_ptr(),
+                        envp.as_ptr(),
+                        libc::AT_EMPTY_PATH,
+                    );
+                    libc::_exit(72);
+                }
+            }
+            let mut status = 0;
+            if unsafe { libc::waitpid(child, &mut status, 0) } != child
+                || !libc::WIFEXITED(status)
+                || libc::WEXITSTATUS(status) != 0
+            {
+                eprintln!("PRIVATE_SETUID_CHILD_FAILED status={status}");
+                return Some(ExitCode::FAILURE);
+            }
+            Some(ExitCode::SUCCESS)
+        }
+        Some("setuid-child") if args.len() == 2 => {
+            let ruid = unsafe { libc::getuid() };
+            let euid = unsafe { libc::geteuid() };
+            let nnp = unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) };
+            println!("PRIVATE_SETUID_CHILD ruid={ruid} euid={euid} nnp={nnp}");
+            Some(if ruid == 1 && euid == 0 && nnp == 0 {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
+        }
+        Some("sleep") if args.len() == 2 => {
+            println!("PRIVATE_SLEEP_READY");
+            std::io::stdout().flush().ok();
+            loop {
+                unsafe { libc::pause() };
+            }
+        }
+        _ => Some(ExitCode::FAILURE),
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
+fn private_gui_probe() -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::net::UnixStream;
+    use std::path::{Path, PathBuf};
+
+    if unsafe { libc::getuid() } != unsafe { libc::geteuid() }
+        || unsafe { libc::getgid() } != unsafe { libc::getegid() }
+    {
+        return Err(std::io::Error::other("GUI credentials changed at exec"));
+    }
+    let group_count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if group_count < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut groups = vec![0 as libc::gid_t; group_count as usize];
+    if unsafe { libc::getgroups(group_count, groups.as_mut_ptr()) } != group_count {
+        return Err(std::io::Error::other("GUI group observation changed"));
+    }
+    if let Some(path) = std::env::var_os("OULIPOLY_AGE319_PRIVATE_GUI_GROUP_FILE_V1") {
+        if std::fs::read(path)? != b"group-access" {
+            return Err(std::io::Error::other("GUI group file content mismatch"));
+        }
+    }
+
+    let stdio_entry = std::env::var("OULIPOLY_AGE319_PRIVATE_GUI_STDIO_V1")
+        .map_err(|_| std::io::Error::other("broker stdio witness missing"))?;
+    if !matches!(
+        stdio_entry.as_str(),
+        "000" | "001" | "010" | "011" | "100" | "101" | "110" | "111"
+    ) {
+        return Err(std::io::Error::other("broker stdio witness invalid"));
+    }
+
+    let runtime = PathBuf::from(
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .ok_or_else(|| std::io::Error::other("runtime directory missing"))?,
+    );
+    if let Some(name) = std::env::var_os("WAYLAND_DISPLAY") {
+        UnixStream::connect(runtime.join(name))?;
+    }
+    if let Some(display) = std::env::var_os("DISPLAY") {
+        let bytes = display.as_bytes();
+        let number = bytes
+            .strip_prefix(b":")
+            .and_then(|rest| rest.split(|b| *b == b'.').next())
+            .ok_or_else(|| std::io::Error::other("X11 display invalid"))?;
+        UnixStream::connect(
+            Path::new("/tmp/.X11-unix").join(std::ffi::OsStr::from_bytes(
+                &[b"X".as_slice(), number].concat(),
+            )),
+        )?;
+    }
+    if let Some(address) = std::env::var_os("DBUS_SESSION_BUS_ADDRESS") {
+        let path = address
+            .as_bytes()
+            .strip_prefix(b"unix:path=")
+            .ok_or_else(|| std::io::Error::other("DBus address invalid"))?;
+        UnixStream::connect(Path::new(std::ffi::OsStr::from_bytes(path)))?;
+    }
+    if let Some(authority) = std::env::var_os("XAUTHORITY") {
+        std::fs::File::open(authority)?;
+    }
+    let hold = std::env::var_os("OULIPOLY_AGE319_PRIVATE_GUI_HOLD_V1").as_deref()
+        == Some(std::ffi::OsStr::new("1"));
+    let grandchild = if hold {
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if pid == 0 {
+            unsafe {
+                libc::setsid();
+                libc::clearenv();
+                for fd in 0..1024 {
+                    libc::close(fd);
+                }
+            }
+            loop {
+                unsafe { libc::pause() };
+            }
+        }
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status"))?;
+        status
+            .lines()
+            .find(|line| line.starts_with("NSpid:"))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|value| value.parse::<i32>().ok())
+            .unwrap_or(-1)
+    } else {
+        -1
+    };
+    let report = format!(
+        "PRIVATE_GUI_CONNECTED uid={} euid={} gid={} egid={} groups={groups:?} cwd={} stdio_entry={} nnp={} grandchild_host_pid={}\n",
+        unsafe { libc::getuid() },
+        unsafe { libc::geteuid() },
+        unsafe { libc::getgid() },
+        unsafe { libc::getegid() },
+        std::env::current_dir()?.display(),
+        stdio_entry,
+        unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) },
+        grandchild
+    );
+    let path = runtime.join("age319-private-gui-report");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    use std::io::Write;
+    file.write_all(report.as_bytes())?;
+    file.sync_all()?;
+    // The report is the fixed private probe's observable witness; the broker
+    // still owns terminal settlement and waits for PID1 to reap descendants.
+    Ok(())
+}
+
 fn run_with_event_sink_shutdown(
     run: impl FnOnce() -> ExitCode,
     shutdown: impl FnOnce() -> Result<(), String>,
@@ -107,6 +445,27 @@ fn process_entrypoint() -> ExitCode {
     if std::env::args_os().nth(1).as_deref()
         == Some(std::ffi::OsStr::new(native_receipt::helper::ARG))
     {
+        #[cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
+        if std::env::args_os().nth(2).as_deref()
+            == Some(std::ffi::OsStr::new(
+                native_receipt::helper::PRIVATE_BROKER_PROBE_ARG,
+            ))
+        {
+            return match std::env::args_os().nth(3) {
+                Some(marker) if std::env::args_os().nth(4).is_none() => {
+                    match native_receipt::helper::private_broker_owned_probe(std::path::Path::new(
+                        &marker,
+                    )) {
+                        Ok(()) => ExitCode::SUCCESS,
+                        Err(error) => {
+                            eprintln!("PRIVATE_RECEIPT_HELPER_PROBE_GAP={error}");
+                            ExitCode::FAILURE
+                        }
+                    }
+                }
+                _ => ExitCode::FAILURE,
+            };
+        }
         let target = match std::env::args()
             .nth(3)
             .map(|value| serde_json::from_str(&value))
@@ -118,7 +477,7 @@ fn process_entrypoint() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        return match native_receipt::helper::entry_target(
+        return match native_receipt::helper::legacy_group_entry_target(
             std::env::args_os().nth(2).as_deref() == Some(std::ffi::OsStr::new("once")),
             target,
         ) {
@@ -153,7 +512,19 @@ fn run_gui_entrypoint() -> ExitCode {
 }
 
 fn run_cli_entrypoint() -> ExitCode {
-    let cli = parse_cli();
+    let cli = match parse_cli() {
+        Ok(cli) => cli,
+        Err(error) => {
+            // Clap's parse_from exits the process for help and parse errors.
+            // The v30 root must return through its broker result transition.
+            let code = u8::try_from(error.exit_code()).unwrap_or(1);
+            if let Err(print_error) = error.print() {
+                eprintln!("CLI output failed: {print_error}");
+                return ExitCode::FAILURE;
+            }
+            return ExitCode::from(code);
+        }
+    };
     schedule_entrypoint_opportunity(
         Some(&cli),
         maintenance_worker::schedule_daily_opportunity_fail_open,
@@ -209,8 +580,8 @@ fn should_run_gui() -> bool {
     arg_count(cli_args()) == 1
 }
 
-fn parse_cli() -> Cli {
-    Cli::parse_from(crate::commands::resume_list::normalize_resume_list_args(
+fn parse_cli() -> Result<Cli, clap::Error> {
+    Cli::try_parse_from(crate::commands::resume_list::normalize_resume_list_args(
         cli_args(),
     ))
 }

@@ -204,6 +204,7 @@ impl Fixture {
                 self.root.path().join("release-workload"),
             )
             .env("AGENT_BASH_AGENT_RUNNER_BIN", runner())
+            .env("AGE360_RUNNER_BIN", runner())
             .current_dir(self.root.path());
         if let Some(tmpdir) = std::env::var_os("TMPDIR") {
             cmd.env("TMPDIR", tmpdir);
@@ -694,6 +695,26 @@ fn paired_case(mode: &'static str) {
     if mode == "acceptance_reply_loss" {
         f.wait_initial(&mut initial);
     }
+    if mode != "sync" {
+        let dispatch: serde_json::Value = wait(|| {
+            serde_json::from_slice(&fs::read(f.root.path().join("bash-dispatch.stdout")).ok()?).ok()
+        });
+        let expected = if mode == "acceptance_reply_loss" {
+            "effects-possible-no-replay"
+        } else {
+            "root-accepted"
+        };
+        assert_eq!(dispatch["dispatch_state"], expected, "{dispatch}");
+        assert_eq!(dispatch["retry_safe"], false, "{dispatch}");
+        assert_eq!(dispatch["effects_possible"], true, "{dispatch}");
+        assert_eq!(dispatch["handle"], source.handle, "{dispatch}");
+        assert!(
+            PathBuf::from(&source.handle_dir)
+                .join("root-work-accepted-v1.json")
+                .exists(),
+            "paired test must prove root-owned acceptance, not merely source registration"
+        );
+    }
     if mode == "pause" {
         let listeners = f
             .mailbox()
@@ -845,6 +866,13 @@ fn paired_case(mode: &'static str) {
         assert_eq!(output["receipt"]["physical_drain"], "unconfirmed");
         f.gate("release-initial-provider");
         f.wait_initial(&mut initial);
+        let dispatch: serde_json::Value =
+            serde_json::from_slice(&fs::read(f.root.path().join("bash-dispatch.stdout")).unwrap())
+                .unwrap();
+        assert_eq!(dispatch["dispatch_state"], "root-accepted", "{dispatch}");
+        assert_eq!(dispatch["retry_safe"], false, "{dispatch}");
+        assert_eq!(dispatch["effects_possible"], true, "{dispatch}");
+        assert_eq!(dispatch["handle"], source.handle, "{dispatch}");
         wait(|| {
             f.mailbox()
                 .pending_continuation_attempt_ids(&source.registration_id)
@@ -993,6 +1021,11 @@ fn paired_case(mode: &'static str) {
         println!(
             "sync output returned; accepted source retained; no notification or ACK; original drain read from source evidence, not suppression"
         );
+        let result: serde_json::Value = wait(|| {
+            serde_json::from_slice(&fs::read(lost_source.join("root-work-result-v1.json")).ok()?)
+                .ok()
+        });
+        assert_eq!(result["physical_tree_drained"], true, "{result}");
         return;
     }
     wait(|| {
@@ -1161,6 +1194,31 @@ fn paired_case(mode: &'static str) {
         "paired live resource observations source_recovery_attempts={attempts} integrated={integrated} observed_files={} observed_bytes={} disappeared_entries={:?}; non-atomic traversal, unknown sizes for disappeared entries, not a complete snapshot; fixture teardown is not product release authority",
         census.observed_files, census.observed_bytes, census.disappeared
     );
+    let result: serde_json::Value = wait(|| {
+        serde_json::from_slice(
+            &fs::read(PathBuf::from(&source.handle_dir).join("root-work-result-v1.json")).ok()?,
+        )
+        .ok()
+    });
+    assert_eq!(result["physical_tree_drained"], true, "{result}");
+    assert!(
+        result["outcome"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+    if mode == "stripped_nested" {
+        assert_ne!(
+            fs::read_to_string(f.root.path().join("stripped-nested.rc"))
+                .unwrap()
+                .trim(),
+            "0"
+        );
+        let stderr = fs::read_to_string(f.root.path().join("stripped-nested.stderr")).unwrap();
+        assert!(
+            stderr.contains("exact nested authority is required"),
+            "stripped ambient context must be rejected by live process-tree state: {stderr}"
+        );
+    }
 }
 #[test]
 fn normal_sleeping_recipient() {
@@ -1379,6 +1437,14 @@ fn sync_response_without_notification_or_ack() {
         return;
     }
     paired_case("sync");
+}
+
+#[test]
+fn paired_stripped_nested_context_cannot_mint_a_fresh_root() {
+    if private_case(true) {
+        return;
+    }
+    paired_case("stripped_nested");
 }
 
 #[test]
@@ -1665,8 +1731,8 @@ fn native_activation_channel_custody(owner_loss: u8, channel: Option<&str>) {
         )
         .unwrap();
     for (role, encoded) in [
-        ("AC", custodian.as_str()),
-        ("original_adopter", adopter.as_str()),
+        ("root_worker", custodian.as_str()),
+        ("guardian", adopter.as_str()),
     ] {
         let identity: oulipoly_state::completion_continuation::SourceProcessIdentity =
             serde_json::from_str(encoded).unwrap();
@@ -1813,12 +1879,30 @@ fn native_activation_channel_custody(owner_loss: u8, channel: Option<&str>) {
             fs::read_to_string(f.root.path().join(format!("{window}.reached"))).unwrap();
         let exact: oulipoly_state::completion_continuation::SourceProcessIdentity =
             serde_json::from_str(&launcher).unwrap();
+        let worker: oulipoly_state::completion_continuation::SourceProcessIdentity =
+            serde_json::from_str(&custodian).unwrap();
         assert_eq!(producer_pid.trim().parse::<i64>().unwrap(), exact.pid);
         assert!(current_identity_matches(&exact));
+        assert_eq!(parent(worker.pid), owner.guardian_identity.pid);
+        assert_eq!(parent(exact.pid), worker.pid);
+        let state = oulipoly_state::StateDb::open(&f.data.join("state.db")).unwrap();
+        let retained: i64 = state.connection().query_row(
+            "SELECT COUNT(*) FROM provider_launch_transition_replays WHERE operation_key LIKE '%/native-custody-receipts'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(
+            retained,
+            if window == "native-after-custody-retention" {
+                1
+            } else {
+                0
+            }
+        );
         println!("actual original executor held at receipt boundary={window} pid={producer_pid}");
         request_linked_cancel(&f, &attempt);
-        // Keep the producer held. Actual AC cancellation, not test release,
-        // terminates it at this exact producer receipt boundary.
+        // Keep the producer held. Actual root-worker cancellation, not test
+        // release, terminates it at this producer receipt boundary.
     } else if matches!(owner_loss, 3 | 6 | 8 | 9 | 10) {
         wait(|| {
             f.root
@@ -1962,6 +2046,23 @@ fn native_activation_channel_custody(owner_loss: u8, channel: Option<&str>) {
     assert_eq!(receipt.0, "drained");
     assert_eq!(receipt.1, 1);
     assert!(receipt.2.contains("ECHILD"));
+    if receipt_window.is_some() {
+        let worker: oulipoly_state::completion_continuation::SourceProcessIdentity =
+            serde_json::from_str(&custodian).unwrap();
+        let retained: serde_json::Value = serde_json::from_str(&receipt.2).unwrap();
+        assert_eq!(retained["authority"], "root_supervisor");
+        assert_eq!(
+            retained["custodian"],
+            serde_json::to_value(&worker).unwrap()
+        );
+        assert_eq!(retained["owned_children"], "ECHILD");
+        assert_eq!(retained["result_retained"], true);
+        assert!(!current_identity_matches(&worker));
+        assert_eq!(
+            fs::read(&attempt.result_path).unwrap(),
+            receipt.2.as_bytes()
+        );
+    }
     if let Some(invocation) = binding_invocation {
         let state = rusqlite::Connection::open_with_flags(
             f.data.join("state.db"),
@@ -2261,6 +2362,30 @@ fn native_root_reconciles_retained_result_across_driver_replacement() {
     f.gate("release-initial-provider");
     f.wait_initial(&mut initial);
     wait(|| f.root.path().join("descendant.pid").exists().then_some(()));
+    let descendant: i64 = fs::read_to_string(f.root.path().join("descendant.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(read_live_process_identity(descendant).unwrap().is_some());
+    assert!(current_identity_matches(&owner.driver_identity));
+    assert_eq!(
+        unsafe { libc::kill(owner.driver_identity.pid as i32, libc::SIGKILL) },
+        0
+    );
+    let replacement = wait(|| {
+        let current = f
+            .mailbox_for_poll()?
+            .completion_continuation_owner()
+            .ok()??;
+        (current.owner_generation != owner.owner_generation).then_some(current)
+    });
+    assert_eq!(replacement.guardian_identity, owner.guardian_identity);
+    assert_eq!(
+        replacement.supervisor_authority_id,
+        owner.supervisor_authority_id
+    );
+    assert!(read_live_process_identity(descendant).unwrap().is_some());
     f.gate("release-descendant");
     wait(|| {
         f.root
@@ -2285,27 +2410,19 @@ fn native_root_reconciles_retained_result_across_driver_replacement() {
     assert_eq!(retained["authority"], "root_supervisor");
     assert_eq!(retained["result_retained"], true);
     assert_eq!(retained["owned_children"], "ECHILD");
+    let worker: oulipoly_state::completion_continuation::SourceProcessIdentity =
+        serde_json::from_value(retained["custodian"].clone()).unwrap();
+    assert!(
+        !current_identity_matches(&worker),
+        "root worker must be reaped before the retained-result barrier"
+    );
     assert!(
         f.mailbox()
             .continuation_activation(SESSION, &claim.claim_token)
             .unwrap()
             .is_some()
     );
-    assert!(current_identity_matches(&owner.driver_identity));
-    assert_eq!(
-        unsafe { libc::kill(owner.driver_identity.pid as i32, libc::SIGKILL) },
-        0
-    );
     fs::remove_file(f.root.path().join("root-result-retained.hold")).unwrap();
-    let replacement = wait(|| {
-        let current = f.mailbox().completion_continuation_owner().ok()??;
-        (current.owner_generation != owner.owner_generation).then_some(current)
-    });
-    assert_eq!(replacement.guardian_identity, owner.guardian_identity);
-    assert_eq!(
-        replacement.supervisor_authority_id,
-        owner.supervisor_authority_id
-    );
     wait(|| {
         f.mailbox()
             .continuation_activation(SESSION, &claim.claim_token)
@@ -2500,16 +2617,842 @@ fn request_linked_cancel(f: &Fixture, attempt: &oulipoly_state::mailbox::Continu
     );
 }
 
+// The production owner is one root worker beneath the guardian. Killing that
+// worker before requesting State cancellation removes the only result writer;
+// the former AC/adopter schedule cannot prove this contract. Instead, keep the
+// exact worker live through token delivery and resistant-tree drain, then hold
+// its retained result after the guardian has waited for it. The second mode
+// replaces the driver while the worker and descendant are live, then proves
+// that the same root drains and integrates the result after replacement.
+fn native_root_state_token_cancellation(replace_driver: bool) {
+    let f = Fixture::new("owner_only");
+    f.gate("test-descendant-enabled");
+    f.gate("cancel-probe-enabled");
+    f.gate("release-resume");
+    f.gate("root-result-retained.hold");
+    let mut initial = f.start_with_hold(true);
+    let owner = f.owner();
+    wait(|| {
+        f.root
+            .path()
+            .join("provider-initial-ready")
+            .exists()
+            .then_some(())
+    });
+    MailboxDb::open(&f.data.join("pid-identity.db"))
+        .unwrap()
+        .enqueue_submitted_input(&oulipoly_state::mailbox::SubmittedInputEnqueue {
+            submission_token: "native-root-state-cancel",
+            target: oulipoly_state::mailbox::InboxTarget {
+                kind: oulipoly_state::mailbox::InboxTargetKind::Session,
+                id: SESSION,
+            },
+            input: b"native-custody-input",
+        })
+        .unwrap();
+    f.gate("release-initial-provider");
+    f.wait_initial(&mut initial);
+    let descendant: i64 = wait(|| {
+        if let Ok(pid) = fs::read_to_string(f.root.path().join("descendant.pid")) {
+            return pid.trim().parse().ok();
+        }
+        // The retained result is the earliest durable evidence that this
+        // launcher has exited. A pre-provider refusal cannot publish a PID;
+        // report its causal stderr now instead of waiting 45 seconds.
+        if let Some(claim) = f
+            .mailbox_for_poll()?
+            .wake_session_reader()
+            .wake_claim(SESSION)
+            .ok()?
+            && let Some(attempt) = f
+                .mailbox_for_poll()?
+                .continuation_activation(SESSION, &claim.claim_token)
+                .ok()?
+            && let Ok(bytes) = fs::read(&attempt.result_path)
+        {
+            let result: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("retained root result JSON");
+            let stderr = fs::read_to_string(
+                std::path::Path::new(&attempt.result_path)
+                    .parent()
+                    .unwrap()
+                    .join("launcher.stderr"),
+            )
+            .unwrap_or_else(|error| format!("launcher stderr unavailable: {error}"));
+            panic!(
+                "resumed launcher exited before descendant publication: root_result={result} launcher.stderr={stderr}"
+            );
+        }
+        None
+    });
+    let descendant_identity = read_live_process_identity(descendant)
+        .unwrap()
+        .expect("published resistant descendant incarnation");
+    wait(|| {
+        let rows = f.mailbox_for_poll()?.list_mailbox(SESSION, true).ok()?;
+        (!rows.is_empty() && rows.iter().all(|row| row.delivered_at.is_some())).then_some(())
+    });
+    let claim = f
+        .mailbox()
+        .wake_session_reader()
+        .wake_claim(SESSION)
+        .unwrap()
+        .unwrap();
+    let attempt = f
+        .mailbox()
+        .continuation_activation(SESSION, &claim.claim_token)
+        .unwrap()
+        .unwrap();
+    let (worker_json, launcher_json): (String, String) = f.sidecar_connection()
+        .query_row(
+            "SELECT custodian_identity,launcher_identity FROM completion_continuation_attempt WHERE attempt_id=?1",
+            [&attempt.attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let worker: oulipoly_state::completion_continuation::SourceProcessIdentity =
+        serde_json::from_str(&worker_json).unwrap();
+    let launcher: oulipoly_state::completion_continuation::SourceProcessIdentity =
+        serde_json::from_str(&launcher_json).unwrap();
+    assert_eq!(parent(worker.pid), owner.guardian_identity.pid);
+    assert_eq!(parent(launcher.pid), worker.pid);
+    assert!(current_identity_matches(&worker));
+    assert!(current_identity_matches(&launcher));
+    assert_eq!(
+        read_live_process_identity(descendant).unwrap(),
+        Some(descendant_identity.clone())
+    );
+    assert!(
+        f.mailbox()
+            .continuation_activation(SESSION, &claim.claim_token)
+            .unwrap()
+            .is_some()
+    );
+    assert!(!f.root.path().join("release-descendant").exists());
+    wait(|| {
+        f.root
+            .path()
+            .join("cancel-descendant-ready")
+            .exists()
+            .then_some(())
+    });
+    if replace_driver {
+        assert!(current_identity_matches(&owner.driver_identity));
+        assert_eq!(
+            unsafe { libc::kill(owner.driver_identity.pid as i32, libc::SIGKILL) },
+            0
+        );
+        let replacement = wait(|| {
+            let current = f
+                .mailbox_for_poll()?
+                .completion_continuation_owner()
+                .ok()??;
+            (current.owner_generation != owner.owner_generation).then_some(current)
+        });
+        assert_eq!(replacement.guardian_identity, owner.guardian_identity);
+        assert_eq!(
+            replacement.supervisor_authority_id,
+            owner.supervisor_authority_id
+        );
+        assert!(current_identity_matches(&worker));
+        assert_eq!(
+            read_live_process_identity(descendant).unwrap(),
+            Some(descendant_identity.clone())
+        );
+    }
+    request_linked_cancel(&f, &attempt);
+    wait(|| {
+        f.root
+            .path()
+            .join("root-result-retained.reached")
+            .exists()
+            .then_some(())
+    });
+    let original = fs::read(&attempt.result_path).unwrap();
+    let retained: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    let token = fs::read_to_string(f.root.path().join("state-cancel-token")).unwrap();
+    assert_eq!(retained["attempt_id"], attempt.attempt_id);
+    assert_eq!(
+        retained["custodian"],
+        serde_json::to_value(&worker).unwrap()
+    );
+    assert_eq!(retained["accepted_cancellation"], token);
+    assert_eq!(retained["authority"], "root_supervisor");
+    assert_eq!(retained["owned_children"], "ECHILD");
+    assert_eq!(retained["result_retained"], true);
+    assert!(retained["root_wait_status"].is_i64());
+    assert!(
+        !current_identity_matches(&worker),
+        "guardian must wait for the original root worker before replay"
+    );
+    assert_ne!(
+        read_live_process_identity(descendant).unwrap(),
+        Some(descendant_identity),
+        "resistant descendant must be physically gone before ECHILD result"
+    );
+    assert!(
+        f.mailbox()
+            .continuation_activation(SESSION, &claim.claim_token)
+            .unwrap()
+            .is_some()
+    );
+    fs::remove_file(f.root.path().join("root-result-retained.hold")).unwrap();
+    wait(|| {
+        f.mailbox_for_poll()?
+            .continuation_activation(SESSION, &claim.claim_token)
+            .ok()?
+            .is_none()
+            .then_some(())
+    });
+    wait(|| {
+        f.mailbox_for_poll()?
+            .wake_session_reader()
+            .wake_claim(SESSION)
+            .ok()?
+            .is_none()
+            .then_some(())
+    });
+    let integrated: (String, i64, String) = f.sidecar_connection()
+        .query_row(
+            "SELECT phase,integrated,drain_receipt FROM completion_continuation_attempt WHERE attempt_id=?1",
+            [&attempt.attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(integrated.0, "drained");
+    assert_eq!(integrated.1, 1);
+    assert_eq!(integrated.2.as_bytes(), original);
+    assert_eq!(
+        fs::read_to_string(f.root.path().join("resume-prompts.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "root result replay must not replay the recipient"
+    );
+    let state = oulipoly_state::StateDb::open(&f.data.join("state.db")).unwrap();
+    let logical_launch = token.split(':').next().unwrap();
+    wait(|| {
+        let status: String = state
+            .connection()
+            .query_row(
+                "SELECT status FROM provider_logical_launches WHERE logical_launch_id=?1",
+                [logical_launch],
+                |row| row.get(0),
+            )
+            .ok()?;
+        (status == "cancelled").then_some(())
+    });
+}
+
 #[test]
 fn native_state_linked_token_cancellation_drains_resistant_activation() {
     if !private_case(false) {
-        native_activation_custody(9);
+        native_root_state_token_cancellation(false);
     }
 }
+
+#[cfg(feature = "age360-fault-fixtures")]
 #[test]
-fn native_state_linked_token_cancellation_after_ac_loss_drains_original_adopter() {
+fn native_join_identity_refusal_retains_failure_and_releases_claim() {
+    if private_case(false) {
+        return;
+    }
+    let f = Fixture::new("owner_only");
+    f.gate("test-descendant-enabled");
+    f.gate("release-resume");
+    f.gate("root-result-retained.hold");
+    let mut initial = f.start_with_hold(true);
+    wait(|| {
+        f.root
+            .path()
+            .join("provider-initial-ready")
+            .exists()
+            .then_some(())
+    });
+    // The feature-only owner hook applies only to an inherited join. The
+    // initial provider has already established the session at this point.
+    f.gate("force-join-identity-refusal");
+    MailboxDb::open(&f.data.join("pid-identity.db"))
+        .unwrap()
+        .enqueue_submitted_input(&oulipoly_state::mailbox::SubmittedInputEnqueue {
+            submission_token: "native-join-refusal",
+            target: oulipoly_state::mailbox::InboxTarget {
+                kind: oulipoly_state::mailbox::InboxTargetKind::Session,
+                id: SESSION,
+            },
+            input: b"native-custody-input",
+        })
+        .unwrap();
+    f.gate("release-initial-provider");
+    f.wait_initial(&mut initial);
+    wait(|| {
+        f.root
+            .path()
+            .join("root-result-retained.reached")
+            .exists()
+            .then_some(())
+    });
+    let claim = f
+        .mailbox()
+        .wake_session_reader()
+        .wake_claim(SESSION)
+        .unwrap()
+        .unwrap();
+    let attempt = f
+        .mailbox()
+        .continuation_activation(SESSION, &claim.claim_token)
+        .unwrap()
+        .unwrap();
+    let original = fs::read(&attempt.result_path).unwrap();
+    let retained: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    let stderr = fs::read_to_string(
+        std::path::Path::new(&attempt.result_path)
+            .parent()
+            .unwrap()
+            .join("launcher.stderr"),
+    )
+    .unwrap();
+    println!("controlled join refusal: {}", stderr.trim());
+    assert!(stderr.contains("J90_FIXTURE_REFUSAL"), "{stderr}");
+    assert!(
+        stderr.contains("mode=fresh"),
+        "current-root launcher join mode: {stderr}"
+    );
+    assert_eq!(retained["root_exit_code"], 1);
+    assert_eq!(retained["root_wait_status"], 256);
+    assert_eq!(retained["spawn_failed"], false);
+    assert_eq!(retained["result_retained"], true);
+    assert_eq!(retained["owned_children"], "ECHILD");
+    assert!(retained["accepted_cancellation"].is_null());
+    assert!(
+        !f.root.path().join("resume-prompts.jsonl").exists(),
+        "resumed provider must have no effect"
+    );
+    assert!(
+        !f.root.path().join("descendant.pid").exists(),
+        "provider must not create a descendant"
+    );
+    assert!(
+        !f.root.path().join("state-cancel-token").exists(),
+        "no State token was requested"
+    );
+    fs::remove_file(f.root.path().join("root-result-retained.hold")).unwrap();
+    wait(|| {
+        f.mailbox_for_poll()?
+            .continuation_activation(SESSION, &claim.claim_token)
+            .ok()?
+            .is_none()
+            .then_some(())
+    });
+    wait(|| {
+        f.mailbox_for_poll()?
+            .wake_session_reader()
+            .wake_claim(SESSION)
+            .ok()?
+            .is_none()
+            .then_some(())
+    });
+    let integrated: (String, i64, String) = f.sidecar_connection()
+        .query_row(
+            "SELECT phase,integrated,drain_receipt FROM completion_continuation_attempt WHERE attempt_id=?1",
+            [&attempt.attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+    assert_eq!(integrated.0, "drained");
+    assert_eq!(integrated.1, 1);
+    assert_eq!(integrated.2.as_bytes(), original);
+    assert!(
+        !f.root.path().join("resume-prompts.jsonl").exists(),
+        "settlement must not replay provider"
+    );
+    let rows = f.mailbox().list_mailbox(SESSION, true).unwrap();
+    let submitted = rows
+        .iter()
+        .find(|row| row.submission_token.as_deref() == Some("native-join-refusal"))
+        .expect("original submitted input remains visible");
+    assert!(submitted.delivered_at.is_none());
+    assert_eq!(submitted.payload_byte_len, Some(20));
+    assert_eq!(
+        submitted.delivery_error.as_deref(),
+        Some(oulipoly_state::mailbox::COMPLETION_EFFECT_UNCERTAIN_ERROR)
+    );
+    let fenced: (String, String) = f
+        .sidecar_connection()
+        .query_row(
+            "SELECT attempt_id,disposition FROM completion_uncertain_input WHERE mailbox_seq=?1",
+            [submitted.seq],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        fenced,
+        (attempt.attempt_id.clone(), "effect_uncertain".into())
+    );
+    assert_eq!(
+        f.mailbox().pending_delivery_count(SESSION, None).unwrap(),
+        0
+    );
+    let state = oulipoly_state::StateDb::open(&f.data.join("state.db")).unwrap();
+    let resumed_attempts: i64 = state
+        .connection()
+        .query_row("SELECT COUNT(*) FROM provider_launch_attempts", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let false_successes: i64 = state
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM provider_logical_launches WHERE start_mode='resume' AND status='succeeded'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        resumed_attempts, 0,
+        "refused launcher must not reach provider launch"
+    );
+    assert_eq!(
+        false_successes, 0,
+        "refused launcher must not settle as success"
+    );
+    let activation_count: i64 = f
+        .sidecar_connection()
+        .query_row(
+            "SELECT COUNT(*) FROM completion_continuation_attempt WHERE session_id=?1",
+            [SESSION],
+            |row| row.get(0),
+        )
+        .unwrap();
+    println!(
+        "refusal settlement: activation_attempts={activation_count} provider_attempts={resumed_attempts} false_successes={false_successes}"
+    );
+    assert_eq!(
+        activation_count, 1,
+        "failure settlement must not re-activate"
+    );
+    // A new process takes the ordinary wake path after the original claim is
+    // gone. The fenced row remains visible but cannot select another effect.
+    let wake = f
+        .command()
+        .args(["mailbox", "resume", "--session-id", SESSION, "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        wake.status.success(),
+        "{}",
+        String::from_utf8_lossy(&wake.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&wake.stdout).unwrap();
+    assert_eq!(status["uncertain_count"], 1);
+    assert_eq!(status["deliverable_count"], 0);
+    assert_eq!(
+        f.mailbox().pending_delivery_count(SESSION, None).unwrap(),
+        0
+    );
+    let after_restart: i64 = f
+        .sidecar_connection()
+        .query_row(
+            "SELECT COUNT(*) FROM completion_continuation_attempt WHERE session_id=?1",
+            [SESSION],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(after_restart, 1, "restart/wake reactivated uncertain input");
+    assert!(
+        MailboxDb::open(&f.data.join("pid-identity.db"))
+            .unwrap()
+            .mark_delivery_failed(SESSION, None, &[submitted.seq], "transient_failure")
+            .is_err(),
+        "generic failure recording must not clear the uncertain disposition"
+    );
+
+    fs::remove_file(f.root.path().join("force-join-identity-refusal")).unwrap();
+    MailboxDb::open(&f.data.join("pid-identity.db"))
+        .unwrap()
+        .enqueue_submitted_input(&oulipoly_state::mailbox::SubmittedInputEnqueue {
+            submission_token: "native-unrelated-followup",
+            target: oulipoly_state::mailbox::InboxTarget {
+                kind: oulipoly_state::mailbox::InboxTargetKind::Session,
+                id: SESSION,
+            },
+            input: b"unrelated-followup",
+        })
+        .unwrap();
+    let wake = f
+        .command()
+        .args(["mailbox", "resume", "--session-id", SESSION, "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        wake.status.success(),
+        "{}",
+        String::from_utf8_lossy(&wake.stderr)
+    );
+    let prompts = wait(|| fs::read_to_string(f.root.path().join("resume-prompts.jsonl")).ok());
+    assert!(prompts.contains("unrelated-followup"), "{prompts}");
+    assert!(!prompts.contains("native-custody-input"), "{prompts}");
+    let provider_effects = wait(|| {
+        let state =
+            oulipoly_state::StateDb::open_historical_read_only(&f.data.join("state.db")).ok()?;
+        let count: i64 = state
+            .connection()
+            .query_row("SELECT COUNT(*) FROM provider_launch_attempts", [], |row| {
+                row.get(0)
+            })
+            .ok()?;
+        (count == 1).then_some(count)
+    });
+    assert_eq!(provider_effects, 1);
+    let retained = f.mailbox().list_mailbox(SESSION, true).unwrap();
+    assert!(retained.iter().any(|row| row.seq == submitted.seq
+        && row.delivery_error.as_deref()
+            == Some(oulipoly_state::mailbox::COMPLETION_EFFECT_UNCERTAIN_ERROR)));
+    let seq = submitted.seq.to_string();
+    let disposition = f
+        .command()
+        .args([
+            "mailbox",
+            "ack",
+            "--session-id",
+            SESSION,
+            "--from-seq",
+            &seq,
+            "--to-seq",
+            &seq,
+            "--delivered-by",
+            "manual-uncertain-resolution",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        disposition.status.success(),
+        "{}",
+        String::from_utf8_lossy(&disposition.stderr)
+    );
+    let resolved = f.mailbox().list_mailbox(SESSION, true).unwrap();
+    let original = resolved
+        .iter()
+        .find(|row| row.seq == submitted.seq)
+        .unwrap();
+    assert!(original.delivered_at.is_some());
+    assert!(original.delivery_error.is_none());
+    assert_eq!(
+        f.mailbox()
+            .uncertain_activation_input_count(SESSION)
+            .unwrap(),
+        0
+    );
+}
+
+#[cfg(feature = "age360-fault-fixtures")]
+#[test]
+fn private_j01_discriminates_founder_overlap_from_native_activation() {
+    if private_case(false) {
+        return;
+    }
+    use std::collections::HashSet;
+    const SECOND_SESSION: &str = "ses_age360_j01_second";
+    let f = Fixture::new("owner_only");
+    f.gate("j01-trace-enabled");
+    f.gate("j01-negative-enabled");
+    f.gate("release-resume");
+    f.gate("root-result-retained.hold");
+    let mut founder = f
+        .command()
+        .env("AGE360_MCP_E2E", "1")
+        .args(["-m", MODEL, "--models-dir"])
+        .arg(&f.models)
+        .arg("synthetic independent owner founder")
+        .stdout(fs::File::create(f.root.path().join("founder.stdout")).unwrap())
+        .stderr(fs::File::create(f.root.path().join("founder.stderr")).unwrap())
+        .stdin(Stdio::null())
+        .spawn()
+        .unwrap();
+    let owner = f.owner();
+    fs::write(f.root.path().join("j01-negative-endpoint"), &owner.endpoint).unwrap();
+    let mut seen = HashSet::new();
+    let next = |seen: &mut HashSet<PathBuf>, native: bool| -> serde_json::Value {
+        wait(|| {
+            if !native && let Ok(bytes) = fs::read(f.root.path().join("j01-negative-result.json")) {
+                panic!(
+                    "negative child returned before J01 trace: {}",
+                    String::from_utf8_lossy(&bytes)
+                );
+            }
+            for item in fs::read_dir(f.root.path()).ok()?.flatten() {
+                let path = item.path();
+                if !path
+                    .file_name()?
+                    .to_string_lossy()
+                    .starts_with("j01-trace-")
+                    || seen.contains(&path)
+                {
+                    continue;
+                }
+                let Ok(trace) = fs::read(&path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                    .ok_or(())
+                else {
+                    continue;
+                };
+                let direct_native = trace["native"]
+                    .as_array()?
+                    .iter()
+                    .any(|entry| entry["granted"] == true && entry["direct_peer"] == true);
+                seen.insert(path);
+                // A concurrent ordinary helper join is released but cannot
+                // stand in for an exact accepted native actor.
+                let pid = trace["peer"]["pid"].as_i64()?;
+                if direct_native == native {
+                    if !direct_native {
+                        f.gate(&format!("j01-release-{pid}"));
+                    }
+                    return Some(trace);
+                }
+                f.gate(&format!("j01-release-{pid}"));
+            }
+            None
+        })
+    };
+    let negative = next(&mut seen, false);
+    assert_eq!(negative["snapshot"], "stable", "{negative}");
+    assert_eq!(negative["peer"]["pid"].as_i64().is_some(), true);
+    assert!(
+        negative["matched"].as_array().unwrap().iter().any(|scope| {
+            scope["context"]["pid"] == i64::from(founder.id())
+                && scope["lease"] == true
+                && scope["local_sockets"].as_u64().unwrap_or(0) > 0
+        }),
+        "{negative}"
+    );
+    assert!(
+        negative["native"].as_array().unwrap().is_empty(),
+        "{negative}"
+    );
+    let rejected: serde_json::Value = wait(|| {
+        serde_json::from_slice(&fs::read(f.root.path().join("j01-negative-result.json")).ok()?).ok()
+    });
+    assert_ne!(rejected["rc"], 0);
+    assert!(
+        rejected["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("J01_FRESH_INSIDE_ROOT"),
+        "{rejected}"
+    );
+    fs::remove_file(f.root.path().join("j01-negative-enabled")).unwrap();
+    wait(|| {
+        f.root
+            .path()
+            .join("provider-initial-ready")
+            .exists()
+            .then_some(())
+    });
+    assert!(founder.try_wait().unwrap().is_none());
+
+    // A separate Runner establishes the target session in this same domain
+    // while the founding context remains live.
+    fs::remove_file(f.root.path().join("j01-trace-enabled")).unwrap();
+    let mut session_creator = f.start();
+    f.wait_initial(&mut session_creator);
+    let ready: String = f
+        .sidecar_connection()
+        .query_row(
+            "SELECT run_state FROM session_runtime WHERE session_id=?1",
+            [SESSION],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(ready, "idle");
+    let mut second_creator = f
+        .command()
+        .env("AGE360_HOLD_INITIAL", "1")
+        .args(["-m", MODEL, "--models-dir"])
+        .arg(&f.models)
+        .arg("j01 independent target two")
+        .stdout(fs::File::create(f.root.path().join("second.stdout")).unwrap())
+        .stderr(fs::File::create(f.root.path().join("second.stderr")).unwrap())
+        .stdin(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait(|| {
+        f.root
+            .path()
+            .join("second-provider-ready")
+            .exists()
+            .then_some(())
+    });
+    assert!(second_creator.try_wait().unwrap().is_none());
+    assert!(founder.try_wait().unwrap().is_none());
+    f.gate("j01-trace-enabled");
+    MailboxDb::open(&f.data.join("pid-identity.db"))
+        .unwrap()
+        .enqueue_submitted_input(&oulipoly_state::mailbox::SubmittedInputEnqueue {
+            submission_token: "j01-founder-alive",
+            target: oulipoly_state::mailbox::InboxTarget {
+                kind: oulipoly_state::mailbox::InboxTargetKind::Session,
+                id: SESSION,
+            },
+            input: b"j01-founder-alive",
+        })
+        .unwrap();
+    let alive = next(&mut seen, true);
+    assert_eq!(alive["snapshot"], "stable", "{alive}");
+    assert!(
+        alive["matched"].as_array().unwrap().iter().any(|scope| {
+            scope["context"]["pid"] == i64::from(founder.id())
+                && scope["lease"] == true
+                && scope["local_sockets"].as_u64().unwrap_or(0) > 0
+        }),
+        "{alive}"
+    );
+    let accepted_id = alive["native"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["direct_peer"] == true && entry["granted"] == true)
+        .unwrap()["attempt_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let first_attempt = wait(|| {
+        let claim = f
+            .mailbox_for_poll()?
+            .wake_session_reader()
+            .wake_claim(SESSION)
+            .ok()??;
+        let attempt = f
+            .mailbox_for_poll()?
+            .continuation_activation(SESSION, &claim.claim_token)
+            .ok()??;
+        (attempt.attempt_id == accepted_id).then_some(attempt)
+    });
+    f.gate(&format!(
+        "j01-release-{}",
+        alive["peer"]["pid"].as_i64().unwrap()
+    ));
+    wait(|| {
+        f.root
+            .path()
+            .join("root-result-retained.reached")
+            .exists()
+            .then_some(())
+    });
+    let stderr = fs::read_to_string(
+        PathBuf::from(&first_attempt.result_path)
+            .parent()
+            .unwrap()
+            .join("launcher.stderr"),
+    )
+    .unwrap();
+    assert!(!stderr.contains("J01_FRESH_INSIDE_ROOT"), "{stderr}");
+    let first_result: serde_json::Value =
+        serde_json::from_slice(&fs::read(&first_attempt.result_path).unwrap()).unwrap();
+    assert_eq!(first_result["root_exit_code"], 0, "{first_result}");
+    assert_eq!(first_result["spawn_failed"], false);
+    let first_prompts = fs::read_to_string(f.root.path().join("resume-prompts.jsonl")).unwrap();
+    assert!(
+        first_prompts.contains("j01-founder-alive"),
+        "{first_prompts}"
+    );
+
+    f.gate("release-founder");
+    f.wait_initial(&mut founder);
+    f.gate("j01-hold-after-release");
+    // The retained-result fixture pauses the guardian inside tick(), before
+    // its context-release pass. Release that pause after founder exit.
+    fs::remove_file(f.root.path().join("root-result-retained.hold")).unwrap();
+    wait(|| {
+        f.root
+            .path()
+            .join("j01-after-release.reached")
+            .exists()
+            .then_some(())
+    });
+    wait(|| {
+        (!f.mailbox_for_poll()?
+            .completion_contexts()
+            .ok()?
+            .iter()
+            .any(|id| id.pid == i64::from(founder.id())))
+        .then_some(())
+    });
+    assert_eq!(f.owner().guardian_identity, owner.guardian_identity);
+    MailboxDb::open(&f.data.join("pid-identity.db"))
+        .unwrap()
+        .enqueue_submitted_input(&oulipoly_state::mailbox::SubmittedInputEnqueue {
+            submission_token: "j01-founder-gone",
+            target: oulipoly_state::mailbox::InboxTarget {
+                kind: oulipoly_state::mailbox::InboxTargetKind::Session,
+                id: SECOND_SESSION,
+            },
+            input: b"j01-founder-gone",
+        })
+        .unwrap();
+    // Completion of this separate real session supplies the coordinator's
+    // idle transition only after founder exit and context release.
+    f.gate("release-initial-provider");
+    let second_status = wait(|| second_creator.try_wait().unwrap());
+    assert!(
+        second_status.success(),
+        "{}",
+        fs::read_to_string(f.root.path().join("second.stderr")).unwrap()
+    );
+    let second_ready: String = f
+        .sidecar_connection()
+        .query_row(
+            "SELECT run_state FROM session_runtime WHERE session_id=?1",
+            [SECOND_SESSION],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(second_ready, "idle");
+    fs::remove_file(f.root.path().join("j01-hold-after-release")).unwrap();
+    let gone = next(&mut seen, true);
+    assert_eq!(gone["snapshot"], "stable", "{gone}");
+    assert!(gone["matched"].as_array().unwrap().is_empty(), "{gone}");
+    assert_ne!(
+        gone["native"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["direct_peer"] == true)
+            .unwrap()["attempt_id"],
+        accepted_id
+    );
+    let second_claim = f
+        .mailbox()
+        .wake_session_reader()
+        .wake_claim(SECOND_SESSION)
+        .unwrap()
+        .unwrap();
+    let second_attempt = f
+        .mailbox()
+        .continuation_activation(SECOND_SESSION, &second_claim.claim_token)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        gone["native"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["direct_peer"] == true && entry["granted"] == true)
+            .unwrap()["attempt_id"],
+        second_attempt.attempt_id,
+    );
+    f.gate(&format!(
+        "j01-release-{}",
+        gone["peer"]["pid"].as_i64().unwrap()
+    ));
+    println!("J01 private phases: negative={negative} founder_alive={alive} founder_gone={gone}");
+}
+#[test]
+fn native_root_state_token_cancellation_retains_result_across_driver_replacement() {
     if !private_case(false) {
-        native_activation_custody(10);
+        native_root_state_token_cancellation(true);
     }
 }
 

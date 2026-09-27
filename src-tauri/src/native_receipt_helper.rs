@@ -1,5 +1,7 @@
-//! Scoped inspection process: one namespace owner, retained registry, bounded
-//! heartbeat watchdog and explicit kill/reap. No model/launch capability.
+//! Legacy group-scoped inspection process: retained registry, bounded heartbeat
+//! watchdog and explicit kill/reap. Provider descendants remain restricted by
+//! the group filter until a broker-owned receipt grant and terminal protocol
+//! replace this path. No model/launch capability.
 //! Roles: orchestration, accessor, validator.
 use super::{CancellationToken, Duration, MailboxDb, ReceiptPollGuard};
 use std::fs::{File, OpenOptions};
@@ -13,6 +15,12 @@ use std::sync::{
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) const ARG: &str = "--internal-native-receipt-helper";
+// The broker-owned route has no production receipt grant or result protocol yet.
+// This entry is compiled only for the private broker fixture. In particular,
+// the legacy group helper must never interpret this as permission to omit its
+// workload filter: its parent can certify only the unreaped process group.
+#[cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
+pub(crate) const PRIVATE_BROKER_PROBE_ARG: &str = "broker-owned-private-probe";
 const INTERVAL: Duration = Duration::from_secs(2);
 const STALL_BOUND: Duration = Duration::from_secs(30);
 // Scope containment also bounds descendants that close provider pipes but keep
@@ -66,7 +74,7 @@ fn receipt_admission_cadence_recovers_from_clock_rollback() {
 /// The parent's gate byte means process containment is installed before IO.
 #[cfg(test)]
 pub(crate) fn entry(once: bool) -> Result<(), String> {
-    entry_target(once, None)
+    legacy_group_entry_target(once, None)
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -120,7 +128,7 @@ impl Drop for LocalTeardown {
     }
 }
 
-pub(crate) fn entry_target(once: bool, target: Option<Target>) -> Result<(), String> {
+pub(crate) fn legacy_group_entry_target(once: bool, target: Option<Target>) -> Result<(), String> {
     let mut gate = [0u8];
     std::io::stdin()
         .read_exact(&mut gate)
@@ -154,6 +162,29 @@ pub(crate) fn entry_target(once: bool, target: Option<Target>) -> Result<(), Str
         std::io::stdout().flush().map_err(|e| e.to_string())?;
     }
     result
+}
+
+/// Execute the real provider client from the receipt-helper image while the
+/// private native K fixture owns this child beneath its nested PID1. This is
+/// deliberately a separate feature-gated entry. Production receipt scans
+/// cannot select it; a future route needs its own broker-validated grant.
+#[cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
+pub(crate) fn private_broker_owned_probe(marker: &Path) -> Result<(), String> {
+    let uid_map = std::fs::read_to_string("/proc/self/uid_map").map_err(|e| e.to_string())?;
+    if uid_map.split_ascii_whitespace().nth(2) != Some("1") {
+        return Err("private receipt probe requires private user namespace".into());
+    }
+    if unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) } != 0
+        || unsafe { libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0) } != 0
+    {
+        return Err("private receipt helper inherited NNP or seccomp".into());
+    }
+    std::fs::write(
+        marker.with_extension("helper-entry"),
+        b"receipt-helper nnp=0 seccomp=0",
+    )
+    .map_err(|e| e.to_string())?;
+    crate::private_provider_probe::run(marker)
 }
 
 fn inspect(once: bool, target: Option<Target>) -> Result<(), String> {
@@ -313,7 +344,7 @@ fn inspect_target(target: Target) -> Result<(), String> {
 }
 
 pub(crate) fn observe_target(target: Target) -> Result<(), String> {
-    let mut command = command(true)?;
+    let mut command = legacy_group_command(true)?;
     command.arg(serde_json::to_string(&target).map_err(|e| e.to_string())?);
     #[cfg(test)]
     let bound = TEST_BOUND.get().unwrap_or(STALL_BOUND);
@@ -331,7 +362,7 @@ thread_local! {
     pub(crate) static TEST_BOUND: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
 }
 
-fn command(once: bool) -> Result<Command, String> {
+fn legacy_group_command(once: bool) -> Result<Command, String> {
     #[cfg(test)]
     if let Some(command) = TEST_COMMAND.with_borrow(|factory| factory.as_ref().map(|f| f(once))) {
         return Ok(command);
@@ -352,7 +383,7 @@ fn command(once: bool) -> Result<Command, String> {
 }
 
 pub(crate) fn start() -> Result<ReceiptPollGuard, String> {
-    start_command(command(false)?)
+    start_command(legacy_group_command(false)?)
 }
 
 pub(crate) fn start_command(command: Command) -> Result<ReceiptPollGuard, String> {
@@ -383,7 +414,11 @@ pub(crate) fn start_command(command: Command) -> Result<ReceiptPollGuard, String
 }
 
 pub(crate) fn run_once() -> Result<(), String> {
-    supervise(&mut command(true)?, &CancellationToken::new(), STALL_BOUND)
+    supervise(
+        &mut legacy_group_command(true)?,
+        &CancellationToken::new(),
+        STALL_BOUND,
+    )
 }
 
 struct OwnedHelper {

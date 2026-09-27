@@ -6,7 +6,7 @@
 //! mechanism.  Consequently an old heartbeat cannot evict a slow live worker,
 //! while kernel release of the lock after process death permits exact recovery.
 
-use crate::pid_identity::{ProcessIdentity, read_live_process_identity};
+use crate::pid_identity::{ProcessIdentity, read_current_process_identity};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -131,10 +131,7 @@ pub struct MaintenanceWorkerIdentity {
 
 impl MaintenanceWorkerIdentity {
     pub fn current() -> Result<Self, MaintenanceError> {
-        let os_pid = i64::from(std::process::id());
-        let identity = read_live_process_identity(os_pid)
-            .map_err(MaintenanceError::Identity)?
-            .ok_or_else(|| MaintenanceError::Identity("current process is not live".into()))?;
+        let identity = read_current_process_identity().map_err(MaintenanceError::Identity)?;
         Ok(Self::from_process_identity(identity))
     }
 

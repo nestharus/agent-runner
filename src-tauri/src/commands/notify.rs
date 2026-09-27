@@ -32,6 +32,7 @@ pub(crate) struct AgentBashRegisterArgs<'a> {
     pub repair_admitted: bool,
     pub completion_protocol: Option<&'a str>,
     pub registration_file: Option<&'a Path>,
+    pub accepted_intent_file: Option<&'a Path>,
     pub json: bool,
 }
 
@@ -139,6 +140,7 @@ pub(crate) fn run_agent_bash_register(args: AgentBashRegisterArgs<'_>) -> Result
     if let Some(path) = args.registration_file {
         return super::notify_continuation::register(args, path);
     }
+    require_pinned_owner_work_id(args.handle)?;
     if args.completion_protocol.is_some() {
         return Err("completion protocol requires registration file".into());
     }
@@ -173,6 +175,7 @@ fn registration_status(repair_admitted: bool, inserted: bool) -> &'static str {
 }
 
 pub(crate) fn run_agent_bash_activate(args: AgentBashActivateArgs<'_>) -> Result<i32, String> {
+    require_pinned_owner_work_id(args.handle)?;
     match activate_completion_event(&args) {
         Ok((result, pty_delivery)) => {
             render(
@@ -201,6 +204,7 @@ pub(crate) fn run_agent_bash_complete(args: AgentBashCompleteArgs<'_>) -> Result
     if args.completion_protocol.is_some() || args.snapshot.is_some() {
         return Err("completion protocol requires registration file".into());
     }
+    require_pinned_owner_work_id(args.handle)?;
     match trigger_completion_event(&args) {
         Ok((result, pty_deliveries, wake)) => {
             let owner = result.listeners.first();
@@ -239,6 +243,29 @@ pub(crate) fn run_agent_bash_complete(args: AgentBashCompleteArgs<'_>) -> Result
         }
         Err(message) => render_error(args.handle, args.json, message),
     }
+}
+
+/// The environment selects a handle only. Broker V still proves its live
+/// consumed work and State still proves the admitted immutable source.
+pub(crate) fn require_pinned_owner_work_id(handle: &str) -> Result<(), String> {
+    let pinned = std::env::var_os(crate::completion_owner::EXPECTED_KERNEL_ROOT_ENV).is_some();
+    let claimed = std::env::var_os("AGENT_BASH_OWNER_WORK_ID_V1");
+    pinned_owner_work_id_matches(
+        pinned || claimed.is_some(),
+        claimed.as_ref().and_then(|value| value.to_str()),
+        handle,
+    )
+}
+
+fn pinned_owner_work_id_matches(
+    required: bool,
+    claimed: Option<&str>,
+    handle: &str,
+) -> Result<(), String> {
+    if (required || claimed.is_some()) && (claimed != Some(handle) || handle.is_empty()) {
+        return Err("pinned owner work ID conflict".into());
+    }
+    Ok(())
 }
 
 fn register_completion_event(
@@ -316,10 +343,9 @@ pub(super) fn completion_obligation_admission_id(
     event_id: &str,
     owner_invocation_uuid: &str,
 ) -> String {
-    format!(
-        "completion:{}:{event_id}:owner:{}:{owner_invocation_uuid}",
-        event_id.len(),
-        owner_invocation_uuid.len()
+    oulipoly_state::completion_continuation::completion_obligation_admission_id(
+        event_id,
+        owner_invocation_uuid,
     )
 }
 
@@ -842,6 +868,18 @@ mod tests {
     use oulipoly_state::mailbox::{CompletionEventTriggerInput, MailboxDb};
     use serde_json::json;
     use std::path::Path;
+
+    #[test]
+    fn pinned_notify_work_id_requires_exact_immutable_handle() {
+        let check = super::pinned_owner_work_id_matches;
+        assert!(check(true, Some("accepted-work"), "accepted-work").is_ok());
+        for claim in [None, Some(""), Some("sibling-work"), Some("stale-work")] {
+            assert!(check(true, claim, "accepted-work").is_err());
+        }
+        assert!(check(true, Some("accepted-work"), "").is_err());
+        assert!(check(false, Some("sibling-work"), "accepted-work").is_err());
+        assert!(check(false, None, "legacy-handle").is_ok());
+    }
 
     #[test]
     fn live_owner_registration_does_not_invent_workspace_authority() {

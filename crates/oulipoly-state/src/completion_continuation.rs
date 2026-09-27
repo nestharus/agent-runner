@@ -8,6 +8,17 @@ use std::path::{Component, Path};
 pub const PROTOCOL: &str = "completion-continuation-v2";
 pub const MAX_REGISTRATION_BYTES: usize = 1024 * 1024;
 
+/// Stable length-delimited State admission key for one handle and invocation.
+/// The broker journal uses the same key to refuse a second registration ID
+/// for an already decided original source.
+pub fn completion_obligation_admission_id(handle: &str, owner_invocation_uuid: &str) -> String {
+    format!(
+        "completion:{}:{handle}:owner:{}:{owner_invocation_uuid}",
+        handle.len(),
+        owner_invocation_uuid.len()
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceProcessIdentity {
@@ -345,11 +356,11 @@ mod tests {
 mod evidence;
 mod source_files;
 pub use evidence::{
-    CompletionIdentity, CompletionOutput, CompletionSnapshot, MAX_OUTPUT_BYTES,
-    MissingOriginalOutput, OriginalOutputSelection, OutputArtifact, SourceOutcome,
-    VerifiedCompletion,
+    CompletionIdentity, CompletionOutput, CompletionSnapshot, MissingOriginalOutput,
+    OriginalOutputSelection, OutputArtifact, SourceOutcome, VerifiedCompletion, copy_verified_raw,
+    require_unchanged_output,
 };
-pub use source_files::{open_source_file, read_source_file};
+pub use source_files::{open_source_file, open_source_output, read_source_file};
 
 /// Validate the current admission extension without repairing or manufacturing it.
 /// Historical schema23 readers remain readable and are not migrated here.

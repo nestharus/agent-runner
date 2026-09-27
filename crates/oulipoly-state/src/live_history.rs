@@ -195,6 +195,11 @@ pub const ACCESS_INVENTORY: &[InventoryEntry] = &[
         class: SqliteAccessClass::BoundedCrossBoundary,
     },
     InventoryEntry {
+        id: "table.completed_turn_recovery_epoch",
+        kind: InventoryKind::Table,
+        class: SqliteAccessClass::LiveAuthority,
+    },
+    InventoryEntry {
         id: "table.invocation_completion_obligations",
         kind: InventoryKind::Table,
         class: SqliteAccessClass::BoundedCrossBoundary,
@@ -311,6 +316,16 @@ pub const ACCESS_INVENTORY: &[InventoryEntry] = &[
     },
     InventoryEntry {
         id: "index.completed_turns_recovery_pending",
+        kind: InventoryKind::Index,
+        class: SqliteAccessClass::LiveAuthority,
+    },
+    InventoryEntry {
+        id: "index.completed_turns_recovery_target",
+        kind: InventoryKind::Index,
+        class: SqliteAccessClass::LiveAuthority,
+    },
+    InventoryEntry {
+        id: "index.completed_turns_recovery_session",
         kind: InventoryKind::Index,
         class: SqliteAccessClass::LiveAuthority,
     },
@@ -471,6 +486,16 @@ pub const ACCESS_INVENTORY: &[InventoryEntry] = &[
     },
     InventoryEntry {
         id: "statement.completed_turns.recovery_pending",
+        kind: InventoryKind::Statement,
+        class: SqliteAccessClass::LiveAuthority,
+    },
+    InventoryEntry {
+        id: "statement.completed_turns.recovery_target",
+        kind: InventoryKind::Statement,
+        class: SqliteAccessClass::LiveAuthority,
+    },
+    InventoryEntry {
+        id: "statement.completed_turns.recovery_page",
         kind: InventoryKind::Statement,
         class: SqliteAccessClass::LiveAuthority,
     },

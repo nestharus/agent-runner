@@ -3049,6 +3049,7 @@ dependencies = [
  "oulipoly-agent-store",
  "oulipoly-config",
  "oulipoly-core",
+ "oulipoly-kernel-broker",
  "oulipoly-provider",
  "oulipoly-runtime",
  "oulipoly-setup",
@@ -3126,6 +3127,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "oulipoly-kernel-broker"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "libc",
+ "oulipoly-runtime",
+ "oulipoly-state",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
 name = "oulipoly-provider"
 version = "0.1.0"
 dependencies = [
@@ -3192,6 +3210,7 @@ dependencies = [
 name = "oulipoly-state"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "ctor",
  "dirs",

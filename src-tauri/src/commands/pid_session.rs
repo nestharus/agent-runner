@@ -63,6 +63,27 @@ struct PidAnnotation {
 }
 
 pub(crate) fn run_of_pid(pid: u32, json: bool) -> Result<i32, String> {
+    #[cfg(target_os = "linux")]
+    if let Some(readback) = crate::completion_owner::read_v30_owner_if_present(Some(
+        i32::try_from(pid).map_err(|_| "invalid owner PID")?,
+    ))? {
+        let Some(binding) = readback.pid_binding else {
+            return render_of_pid_not_found(pid, json);
+        };
+        let response = PidSessionResponse {
+            found: true,
+            pid,
+            invocation_uuid: Some(binding.invocation_uuid),
+            session_id: Some(binding.session_id),
+            provider_name: None,
+            model_name: None,
+            os_boot_id: None,
+            os_pid_starttime_ticks: None,
+            os_pgid: None,
+            recorded_at: None,
+        };
+        return render_of_pid_found(&response, json);
+    }
     let Some(row) = lookup_verified_live_row(pid)? else {
         return render_of_pid_not_found(pid, json);
     };

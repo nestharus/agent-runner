@@ -105,6 +105,7 @@ pub use db::{CompactSummaryEvidence, OwnedTurnEvent, OwnedTurnEventRow};
 pub use db::{
     CompletedTurnEffects, CompletedTurnMigrationFence, CompletedTurnMigrationScope,
     CompletedTurnMigrationStage, CompletedTurnRecord, CompletedTurnRecoveryIdentity,
+    CompletedTurnRecoveryPage,
 };
 pub use db::{
     CompletionContinuityRecoveryState, CompletionObligationAdmission,
@@ -113,6 +114,11 @@ pub use db::{
     OwnedCompletionEventState, OwnerLineageRelationship, OwnershipAuthorityError,
     OwnershipAuthoritySnapshot, RecoveryDisposition, SettlementVerifierIdentity,
     SidecarGenerationState,
+};
+#[cfg(target_os = "linux")]
+pub use db::{
+    ExactSourceAdmissionResult, ExactSourceDecisionReference, SourceDecisionInspection,
+    SourceDecisionVerification,
 };
 pub use db::{
     ImportedSessionDisplayMetadata, ImportedSessionDisplayMetadataUpsert, ImportedSessionListRow,

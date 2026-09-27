@@ -116,7 +116,7 @@ fn paired_hash_window_cancellation_delivers_full_ready_artifact() {
 pub(super) fn prepare(f: &Fixture) {
     match f.case {
         "registration_reply_loss" => f.gate("registration-committed.hold"),
-        "acceptance_reply_loss" => f.gate("acceptance-committed.hold"),
+        "acceptance_reply_loss" => f.gate("root-work-acceptance-reply-loss.hold"),
         _ => {}
     }
 }
@@ -153,7 +153,20 @@ pub(super) fn after_registration(f: &Fixture) {
 }
 pub(super) fn after_acceptance(f: &Fixture) {
     if f.case == "acceptance_reply_loss" {
-        lose_reply(f, "acceptance-committed");
+        let authority_pid: i64 = wait(|| {
+            fs::read_to_string(
+                f.root
+                    .path()
+                    .join("root-work-acceptance-reply-loss.reached"),
+            )
+            .ok()?
+            .parse()
+            .ok()
+        });
+        assert_eq!(authority_pid, f.owner().guardian_identity.pid);
+        println!(
+            "root original-work acceptance reply dropped after durable acceptance by guardian pid={authority_pid}"
+        );
     }
 }
 #[test]

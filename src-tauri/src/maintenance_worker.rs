@@ -12,8 +12,10 @@ use oulipoly_state::maintenance::{
 };
 use oulipoly_state::pid_identity::{
     ProcessIdentity, ProcessIdentityObservation, observe_live_process_identity,
-    read_live_process_identity,
+    read_direct_child_process_identity,
 };
+#[cfg(target_os = "linux")]
+use oulipoly_state::pid_identity::{procfs_observer_domain, read_current_process_identity};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::{OsStr, OsString};
@@ -64,6 +66,8 @@ struct LaunchProcessIdentity {
     os_pid: i64,
     os_boot_id: String,
     os_pid_starttime_ticks: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    procfs_observer_domain: Option<String>,
 }
 
 impl From<ProcessIdentity> for LaunchProcessIdentity {
@@ -72,6 +76,7 @@ impl From<ProcessIdentity> for LaunchProcessIdentity {
             os_pid: value.os_pid,
             os_boot_id: value.os_boot_id,
             os_pid_starttime_ticks: value.os_pid_starttime_ticks,
+            procfs_observer_domain: None,
         }
     }
 }
@@ -361,6 +366,7 @@ pub(crate) fn run_worker_invocation() -> Result<(), String> {
     if arguments.next().is_some() {
         return Err("detached maintenance worker received excess arguments".to_string());
     }
+    oulipoly_state::pid_identity::require_declared_procfs_observer_domain()?;
     let data_root = oulipoly_state::paths::data_dir()?;
     let owner = MaintenanceWorkerIdentity::current()
         .map_err(|error| error.to_string())?
@@ -569,19 +575,30 @@ fn schedule_at_with_post_spawn(
     if let Err(error) = after_spawn() {
         return Err(persist_parent_launch_failure(&path, &mut record, &error));
     }
-    let child_identity = match read_live_process_identity(i64::from(child.id())) {
-        Ok(Some(identity)) => identity,
-        Ok(None) => {
-            let message = "maintenance worker exited before launch admission".to_string();
-            return Err(persist_parent_launch_failure(&path, &mut record, &message));
-        }
-        Err(error) => {
-            let message = format!("could not identify maintenance worker: {error}");
-            return Err(persist_parent_launch_failure(&path, &mut record, &message));
-        }
-    };
+    let child_identity =
+        match oulipoly_state::pid_identity::require_declared_procfs_observer_domain()
+            .and_then(|()| read_direct_child_process_identity(child.id()))
+        {
+            Ok(identity) => identity,
+            Err(error) if error.contains("disappeared") => {
+                let message = "maintenance worker exited before launch admission".to_string();
+                return Err(persist_parent_launch_failure(&path, &mut record, &message));
+            }
+            Err(error) => {
+                let message = format!("could not identify maintenance worker: {error}");
+                return Err(persist_parent_launch_failure(&path, &mut record, &message));
+            }
+        };
     record.state = LaunchAdmissionState::Admitted;
-    record.child = Some(child_identity.into());
+    let mut observed: LaunchProcessIdentity = child_identity.into();
+    #[cfg(target_os = "linux")]
+    {
+        observed.procfs_observer_domain = Some(match procfs_observer_domain() {
+            Ok(namespace) => namespace,
+            Err(error) => return Err(persist_parent_launch_failure(&path, &mut record, &error)),
+        });
+    }
+    record.child = Some(observed);
     refresh_launch_checksum(&mut record)?;
     if let Err(error) = write_launch_record(&path, &record) {
         let message = format!("could not publish full maintenance launch admission: {error}");
@@ -625,6 +642,7 @@ fn launch_child_is_live(record: &LaunchRecord) -> Result<bool, String> {
     let Some(child) = record.child.as_ref() else {
         return Ok(false);
     };
+    validate_launch_observer(child)?;
     match observe_live_process_identity(child.os_pid) {
         ProcessIdentityObservation::ExactLive(live) => {
             Ok(child.matches(&live) && !process_has_exited(live.os_pid))
@@ -637,6 +655,25 @@ fn launch_child_is_live(record: &LaunchRecord) -> Result<bool, String> {
             Err(format!("cannot inspect prior maintenance launch: {error}"))
         }
     }
+}
+
+fn validate_launch_observer(child: &LaunchProcessIdentity) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        let current = procfs_observer_domain()?;
+        if let Some(recorded) = &child.procfs_observer_domain {
+            if *recorded != current {
+                return Err("maintenance launch PID observer changed".into());
+            }
+        } else if read_current_process_identity()?.os_pid != i64::from(std::process::id()) {
+            // Old records have no domain tag. They are safe in the ordinary
+            // namespace, but cannot be reinterpreted through an ancestor procfs.
+            return Err("legacy maintenance launch has no PID observer domain".into());
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = child;
+    Ok(())
 }
 
 fn reconcile_and_settle_launch(
@@ -677,6 +714,7 @@ fn await_launch_release(
     basis: &str,
     owner: &MaintenanceWorkerIdentity,
 ) -> Result<(), String> {
+    oulipoly_state::pid_identity::require_declared_procfs_observer_domain()?;
     let mut line = String::new();
     io::stdin()
         .lock()
@@ -691,6 +729,7 @@ fn await_launch_release(
         .child
         .as_ref()
         .ok_or_else(|| "maintenance launch child identity is absent".to_string())?;
+    validate_launch_observer(child)?;
     if record.launch_id != launch_id
         || record.schedule_basis != basis
         || record.state != LaunchAdmissionState::Admitted
@@ -1383,6 +1422,17 @@ mod tests {
         assert!(validate_worker_epoch(day + 1, day * day_seconds + 1).is_err());
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn maintenance_launch_refuses_foreign_procfs_observer() {
+        let identity = read_current_process_identity().unwrap();
+        let mut child: LaunchProcessIdentity = identity.into();
+        child.procfs_observer_domain = Some("foreign-procfs-observer".into());
+        assert!(validate_launch_observer(&child).is_err());
+        child.procfs_observer_domain = Some(procfs_observer_domain().unwrap());
+        assert!(validate_launch_observer(&child).is_ok());
+    }
+
     #[cfg(unix)]
     #[test]
     fn real_scheduler_argv_is_nonblocking_deduplicated_and_recovers_dead_child() {
@@ -1485,6 +1535,7 @@ mod tests {
                 os_pid: identity.os_pid,
                 os_boot_id: identity.os_boot_id,
                 os_pid_starttime_ticks: identity.os_pid_starttime_ticks,
+                procfs_observer_domain: Some(procfs_observer_domain().unwrap()),
             }),
             outcome: None,
             parent_error: None,

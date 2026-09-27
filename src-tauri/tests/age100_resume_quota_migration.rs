@@ -3,7 +3,7 @@
 mod provider_authority_fixture;
 
 use oulipoly_state::{InvocationStatus, StateDb};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -195,6 +195,51 @@ impl Fixture {
                 |row| row.get(0),
             )
             .unwrap()
+    }
+
+    fn segment_authority(&self, provider: &str) -> Option<(String, String, Option<String>)> {
+        self.conn()
+            .query_row(
+                "SELECT authority.provider_instance_id, authority.settings_id, segment.ended_at
+                 FROM session_chain_segments AS segment
+                 JOIN session_chain_segment_provider_authority AS authority
+                   ON authority.segment_id = segment.id
+                 WHERE segment.chain_id = ?1 AND segment.provider_name = ?2",
+                params![CHAIN_ID, provider],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    fn segment_count(&self) -> i64 {
+        self.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM session_chain_segments WHERE chain_id = ?1",
+                params![CHAIN_ID],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn assert_bound_provider(&self, provider: &str, active: bool) {
+        let (instance, settings, ended_at) = self.segment_authority(provider).unwrap();
+        assert_eq!(
+            instance,
+            provider_authority_fixture::FIXTURE_PROVIDER_INSTANCE_ID
+        );
+        assert_eq!(settings, provider);
+        assert_eq!(ended_at.is_none(), active);
+        let cwd: String = self
+            .conn()
+            .query_row(
+                "SELECT cwd FROM imported_session_display_metadata
+             WHERE provider_name = ?1 AND provider_session_id = ?2",
+                params![provider, SESSION_ID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cwd, self.dir.path().display().to_string());
     }
 
     fn exhausted_row_count(&self, provider: &str) -> i64 {
@@ -475,6 +520,9 @@ fn resume_quota_exhausted_marks_provider_and_migrates_to_next_pool_member() {
     assert_eq!(line_count(&sibling_marker), 1);
     assert_eq!(fixture.failed_quota_invocation_count("claude-a"), 1);
     assert_eq!(fixture.active_segment_provider(), "claude-b");
+    assert_eq!(fixture.segment_count(), 2);
+    fixture.assert_bound_provider("claude-a", false);
+    fixture.assert_bound_provider("claude-b", true);
 }
 
 #[test]
@@ -526,6 +574,10 @@ fn resume_retries_n_minus_one_quota_exhausted_providers_then_succeeds() {
     assert_eq!(fixture.failed_quota_invocation_count("claude-a"), 1);
     assert_eq!(fixture.failed_quota_invocation_count("claude-b"), 1);
     assert_eq!(fixture.active_segment_provider(), "claude-c");
+    assert_eq!(fixture.segment_count(), 3);
+    fixture.assert_bound_provider("claude-a", false);
+    fixture.assert_bound_provider("claude-b", false);
+    fixture.assert_bound_provider("claude-c", true);
 }
 
 #[test]
@@ -573,6 +625,69 @@ fn resume_all_pool_members_quota_exhausted_returns_all_providers_exhausted() {
     assert_eq!(fixture.exhausted_provider_count(), 2);
     assert_eq!(fixture.failed_quota_invocation_count("claude-a"), 1);
     assert_eq!(fixture.failed_quota_invocation_count("claude-b"), 2);
+    assert_eq!(fixture.segment_count(), 2);
+    fixture.assert_bound_provider("claude-a", false);
+    fixture.assert_bound_provider("claude-b", true);
+}
+
+#[test]
+fn resume_refuses_missing_target_authority_before_chain_or_transcript_change() {
+    let first_marker = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+    let target_marker = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+    let first_marker = first_marker.to_path_buf();
+    let target_marker = target_marker.to_path_buf();
+    let _ = fs::remove_file(&first_marker);
+    let _ = fs::remove_file(&target_marker);
+    let fixture = seed_base_resume_fixture(
+        &[
+            (
+                "claude-a",
+                &first_marker,
+                provider_body(
+                    &first_marker,
+                    "printf '%s\\n' 'quota exhausted' >&2\nexit 42",
+                ),
+            ),
+            (
+                "claude-b",
+                &target_marker,
+                provider_body(&target_marker, "printf '%s\\n' 'must not execute'\nexit 0"),
+            ),
+        ],
+        true,
+    );
+    let config_path = fixture.app_config_dir.join("providers.toml");
+    let providers: toml::Table =
+        toml::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    let target_endpoint = providers["claude-b"]["implementation"]["executable"]
+        .as_str()
+        .unwrap();
+    let source_command = fixture.dir.path().join("claude-a-resume.sh");
+    fs::write(
+        &source_command,
+        executable_script_body(&format!(
+            "{}\nrm -f {}\nprintf '%s\\n' 'quota exhausted' >&2\nexit 42",
+            provider_marker_line(&first_marker),
+            toml_string(target_endpoint),
+        )),
+    )
+    .unwrap();
+
+    let output = fixture.run_resume_with_env(
+        "age100-resume",
+        &[(FORCE_KIND, "QuotaExhaustedInband,None")],
+    );
+    assert_ne!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("TargetAuthorityUnavailable"),
+        "{output:?}"
+    );
+    assert_eq!(line_count(&first_marker), 1);
+    assert_eq!(line_count(&target_marker), 0);
+    assert_eq!(fixture.active_segment_provider(), "claude-a");
+    assert_eq!(fixture.segment_count(), 1);
+    fixture.assert_bound_provider("claude-a", true);
+    assert!(!fixture.provider_projects_dir("claude-b").exists());
 }
 
 #[test]

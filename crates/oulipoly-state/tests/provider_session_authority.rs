@@ -1,13 +1,96 @@
 use chrono::{DateTime, Utc};
+use oulipoly_core::TransitionReason;
 use oulipoly_state::{
-    FinalizedProviderSessionAuthority, ImportedSessionDisplayMetadataUpsert, InvocationStart,
-    SessionTurnIngestStreamKey, SessionTurnStreamProjection, StateDb,
-    StoredProviderSessionAuthority,
+    ChainSegmentRotationInput, FinalizedProviderSessionAuthority,
+    ImportedSessionDisplayMetadataUpsert, InvocationStart, SessionTurnIngestStreamKey,
+    SessionTurnStreamProjection, StateDb, StoredProviderSessionAuthority,
 };
 use rusqlite::Connection;
 
 fn ts(value: &str) -> DateTime<Utc> {
     value.parse().unwrap()
+}
+
+#[test]
+fn target_authority_conflict_rolls_back_rotation_and_preserves_source_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = StateDb::open(&dir.path().join("state.db")).unwrap();
+    let started = ts("2026-09-02T00:00:00Z");
+    db.import_session_and_enqueue_turn_ingest(
+        &ImportedSessionDisplayMetadataUpsert {
+            provider_name: "account-a".into(),
+            provider_session_id: "session-a".into(),
+            title: None,
+            cwd: Some("/workspace/original".into()),
+            turn_count: None,
+            provider_updated_at: None,
+            seen_at: started,
+        },
+        &SessionTurnIngestStreamKey {
+            provider_name: "account-a".into(),
+            provider_instance_id: "instance-a".into(),
+            settings_id: "settings-a".into(),
+            session_id: "session-a".into(),
+            projection: SessionTurnStreamProjection::CanonicalIngest,
+        },
+        &started,
+        "model-a",
+    )
+    .unwrap();
+    let chain = chain_id(&db, "account-a", "session-a");
+    let changed = ts("2026-09-02T01:00:00Z");
+    let rotate = |source, target| ChainSegmentRotationInput {
+        chain_id: &chain,
+        source_provider_name: source,
+        source_session_id: "session-a",
+        target_provider_name: target,
+        target_session_id: "session-a",
+        changed_at: &changed,
+        reason: TransitionReason::Manual,
+    };
+    db.rotate_chain_segment_with_provider_authority(
+        rotate("account-a", "account-b"),
+        &authority("instance-b", "settings-b"),
+        "/workspace/original",
+    )
+    .unwrap();
+    let error = db
+        .rotate_chain_segment_with_provider_authority(
+            rotate("account-b", "account-a"),
+            &authority("different-instance", "settings-a"),
+            "/workspace/changed",
+        )
+        .unwrap_err();
+    assert!(
+        error.contains("provider_session_authority_mismatch"),
+        "{error}"
+    );
+    assert_eq!(
+        db.active_provider_session_authority(&chain).unwrap(),
+        Some(authority("instance-b", "settings-b"))
+    );
+    assert_eq!(
+        db.imported_session_cwd_for_authority(
+            "account-a",
+            "session-a",
+            &authority("instance-a", "settings-a")
+        )
+        .unwrap()
+        .as_deref(),
+        Some("/workspace/original")
+    );
+    let conn = Connection::open(db.path()).unwrap();
+    let (source_ended, target_ended): (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT a.ended_at, b.ended_at FROM session_chain_segments a
+         JOIN session_chain_segments b ON a.chain_id = b.chain_id
+         WHERE a.chain_id = ?1 AND a.provider_name = 'account-a' AND b.provider_name = 'account-b'",
+            [&chain],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(source_ended.is_some());
+    assert!(target_ended.is_none());
 }
 
 fn chain_id(db: &StateDb, provider_name: &str, session_id: &str) -> String {

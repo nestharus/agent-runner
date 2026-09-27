@@ -40,6 +40,9 @@ pub struct ProviderEntry {
     pub implementation: Option<ProviderEndpointConfig>,
     /// Explicit provider-owned settings/profile identity for this account.
     pub settings_id: Option<String>,
+    /// Stable identity of the physical quota account. Private fresh routing
+    /// requires this even when two model pools use different account labels.
+    pub quota_account_id: Option<String>,
     /// Shell command that prints JSON on stdout describing rolling-quota
     /// windows. Empty if the provider has no quota check wired up.
     pub quota_script: Option<String>,
@@ -72,6 +75,7 @@ impl Default for ProviderEntry {
         Self {
             implementation: None,
             settings_id: None,
+            quota_account_id: None,
             quota_script: None,
             auth_refresh_command: None,
             command: None,
@@ -106,6 +110,16 @@ impl ProviderEntry {
             return Err(format_provider_context_error(
                 name,
                 "settings_id must not be empty",
+            ));
+        }
+        if self
+            .quota_account_id
+            .as_ref()
+            .is_some_and(|id| id.trim().is_empty() || id != id.trim())
+        {
+            return Err(format_provider_context_error(
+                name,
+                "quota_account_id must be a nonempty, trimmed stable identity",
             ));
         }
         if let Some(resume) = &self.resume {

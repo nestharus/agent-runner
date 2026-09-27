@@ -1,0 +1,24 @@
+# Paired source artifact only. Requires a root-owned manifest, exact Runner
+# and broker images, and an oulipoly group. The service owns only the broker;
+# do not enable before a complete CLI/GUI/helper custody cutover exists.
+[Unit]
+Description=Oulipoly host PID namespace broker
+After=local-fs.target
+
+[Service]
+Type=simple
+User=root
+Group=oulipoly
+ExecStart=/usr/local/libexec/oulipoly/oulipoly-kernel-broker
+RuntimeDirectory=oulipoly-kernel-broker
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=restart
+StateDirectory=oulipoly-kernel-broker
+StateDirectoryMode=0700
+Restart=on-failure
+KillMode=process
+Delegate=yes
+NoNewPrivileges=no
+
+[Install]
+WantedBy=multi-user.target

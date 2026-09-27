@@ -41,17 +41,6 @@ pub fn build_modern_invocations_missing_repair_column(path: &Path) {
 pub fn build_modern_invocations_shape(path: &Path) {
     let conn = open(path);
     create_full_state_schema(&conn, 5);
-    conn.execute_batch(
-        "
-        ALTER TABLE invocations ADD COLUMN provider_session_id TEXT;
-        ALTER TABLE invocations ADD COLUMN resume_input_id TEXT;
-        ALTER TABLE invocations ADD COLUMN provider_session_capture_method TEXT;
-        CREATE INDEX IF NOT EXISTS idx_invocations_provider_provider_session
-            ON invocations(provider_name, provider_index, provider_session_id)
-            WHERE provider_session_id IS NOT NULL;
-        ",
-    )
-    .unwrap();
     insert_modern_row(&conn, MODERN_SHAPE_UUID);
 }
 

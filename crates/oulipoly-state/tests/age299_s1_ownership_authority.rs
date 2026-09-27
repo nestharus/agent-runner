@@ -177,6 +177,9 @@ fn schema_13_migrates_through_current_and_preserves_invocation_data() {
             (25, "0025_completed_turns"),
             (26, "0026_live_history_barrier"),
             (27, "0027_record_timestamp_contract"),
+            (28, "0028_completed_turn_recovery_targets"),
+            (29, "0029_exact_source_decision_admission"),
+            (30, "0030_fresh_exact_registration_route"),
         ]
     );
 
