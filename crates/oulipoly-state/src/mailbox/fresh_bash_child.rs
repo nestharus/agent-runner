@@ -157,6 +157,45 @@ impl FreshV30Lane {
         }).transpose()
     }
 
+    /// Read the spent authority without replaying its one-use consumption.
+    /// Callers must separately prove the live actor and selected provider K.
+    pub fn require_consumed_root_h_delegation(
+        &self, root: &FreshReleasedHandoff, root_actor: &FreshRecipientIdentity,
+        child: &FreshBashChild, selected_k: &FreshRootHSelectedK,
+    ) -> Result<FreshRootHDelegation, String> {
+        let receipt = self.read_root_h_delegation(&root.handoff_id)?
+            .ok_or("root H delegation absent")?;
+        let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let consumed: Option<String> = state.query_row(
+            "SELECT child_request_id FROM fresh_root_h_consumption WHERE handoff_id=?1",
+            [&root.handoff_id], |r| r.get(0),
+        ).optional().map_err(|e| e.to_string())?;
+        let session = self.read_session(&root.d_key)?.ok_or("root H D absent")?;
+        self.require_released_invocation(root, root_actor, &session)?;
+        self.require_bash_child(child, root, root_actor, &child.actor)?;
+        let authority = crate::CompletionRegistrationAuthority::from_process_environment_value(
+            root.registration_authority.clone())?;
+        let work_authority = root.delegated_root_work_authority.as_deref()
+            .ok_or("root H original J work capability absent")?;
+        if consumed.as_deref() != Some(child.request_id.as_str())
+            || receipt.child_request_id != child.request_id
+            || receipt.child_actor != child.actor
+            || receipt.selected_k != *selected_k
+            || receipt.root_id != root.old_release.prepared.root_id
+            || receipt.owner_generation != root.old_release.prepared.owner_generation
+            || receipt.root_invocation_uuid != root.invocation_uuid
+            || receipt.root_session_id != session.session_id
+            || receipt.registration_authority_digest != authority.digest()
+            || receipt.root_work_authority_digest != format!("{:x}", Sha256::digest(work_authority.as_bytes()))
+            || receipt.root_endpoint != root.old_release.owner.endpoint
+            || root.delegated_h_listener_policy.as_deref() != Some(receipt.listener_policy.as_str())
+            || receipt.listener_policy != "response_only"
+        {
+            return Err("consumed root H delegation binding changed".into());
+        }
+        Ok(receipt)
+    }
+
     pub fn consume_root_h_delegation(
         &self, root: &FreshReleasedHandoff, root_actor: &FreshRecipientIdentity,
         child: &FreshBashChild, selected_k: &FreshRootHSelectedK,

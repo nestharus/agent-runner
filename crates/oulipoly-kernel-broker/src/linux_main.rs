@@ -1127,6 +1127,61 @@ fn state_actor_matches(
 
 /// Registry and kernel process identity select the State actor. A claimed
 /// root/owner UUID or matching UID cannot turn a sibling into that actor.
+#[cfg(feature = "age319-private-broker-fixture")]
+fn verify_delegated_root_h_source(
+    state_root: &Path,
+    peer: &PeerIdentity,
+    root_id: &str,
+    request_id: &str,
+) -> io::Result<String> {
+    if !private_fixture() {
+        return Err(io::Error::other("delegated root H is private only"));
+    }
+    let bash_path = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_BASH_V1")
+        .ok_or_else(|| io::Error::other("delegated root H Bash image absent"))?;
+    let bash_image = File::open(bash_path)?;
+    let lane = FreshV30Lane::open_at(state_root).map_err(io::Error::other)?;
+    let (root, root_actor, parent) = fresh_bash_parent(state_root, &lane, peer, Some(&bash_image))?;
+    if root.old_release.prepared.root_id != root_id {
+        return Err(io::Error::other("delegated root H work scope changed"));
+    }
+    let selected =
+        fresh_provider::selected_root_h_k(&state_root.join("v30/fresh-provider"), &root, &parent)?;
+    let mut child = lane
+        .read_bash_child(request_id)
+        .map_err(io::Error::other)?
+        .ok_or_else(|| io::Error::other("delegated root H child absent"))?;
+    child.session = lane
+        .read_session(&child.d_key)
+        .map_err(io::Error::other)?
+        .ok_or_else(|| io::Error::other("delegated root H child D absent"))?;
+    let actor = FreshRecipientIdentity {
+        host_pid: peer.process.host_pid,
+        boot_id: peer.process.boot_id.clone(),
+        starttime_ticks: peer.process.starttime_ticks,
+        pidns_dev: peer.process.pidns_dev,
+        pidns_ino: peer.process.pidns_ino,
+    };
+    if child.actor != actor
+        || child.parent_work_grant_id != parent.grant_id()
+        || child.parent_work_id != parent.work_id()
+    {
+        return Err(io::Error::other(
+            "delegated root H child actor or K changed",
+        ));
+    }
+    lane.require_consumed_root_h_delegation(&root, &root_actor, &child, &selected)
+        .map_err(io::Error::other)?;
+    peer.process.verify()?;
+    if let Some(gate) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1") {
+        let _ = fs::write(
+            Path::new(&gate).join("delegated-h-broker-stage"),
+            b"source-verified",
+        );
+    }
+    Ok(parent.work_id().to_owned())
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "independent broker and State authority inputs"
@@ -2817,10 +2872,22 @@ fn verify_source_socket(
     works: &WorkRegistry,
     entries: &EntryRegistry,
     grants: &GrantRegistry,
+    state_root: &Path,
 ) -> io::Result<String> {
     for id in [&witness.root_id, &witness.domain_id, &witness.supervisor_id] {
         uuid::Uuid::parse_str(id).map_err(|_| io::Error::other("invalid source witness ID"))?;
     }
+    // The selected K is created by the separate fresh broker after this
+    // original broker has opened its registry. Reopen only for a claimed
+    // delegated source; all other source scopes keep their existing snapshot.
+    #[cfg(feature = "age319-private-broker-fixture")]
+    let refreshed_works = if witness.delegated_root_h_request_id.is_some() && private_fixture() {
+        Some(WorkRegistry::open(state_root.join("works"), roots)?)
+    } else {
+        None
+    };
+    #[cfg(feature = "age319-private-broker-fixture")]
+    let works = refreshed_works.as_ref().unwrap_or(works);
     if roots.has_debt()
         || works.has_debt()
         || entries.has_uncertain_write()
@@ -2858,7 +2925,38 @@ fn verify_source_socket(
             "source witness guardian incarnation mismatch",
         ));
     }
-    let scope = classify_scope(peer, host_namespace, roots, works);
+    let classified = classify_scope(peer, host_namespace, roots, works);
+    // Fresh selected K has its own physical work ledger. The original
+    // registry can classify that nested PID namespace as Root because it has
+    // no WorkRegistry row for fresh K. Promote only after the fresh physical
+    // K, consumed delegation and exact Bash incarnation prove Work scope.
+    #[cfg(feature = "age319-private-broker-fixture")]
+    let mut delegated_proof_work_id = None;
+    #[cfg(feature = "age319-private-broker-fixture")]
+    let scope = match classified {
+        Scope::Root(root_id)
+            if private_fixture()
+                && matches!(&witness.scope, SourceScope::Root)
+                && witness.delegated_root_h_request_id.is_some()
+                && root_id == witness.root_id =>
+        {
+            let work_id = verify_delegated_root_h_source(
+                state_root,
+                peer,
+                &root_id,
+                witness.delegated_root_h_request_id.as_deref().unwrap(),
+            )?;
+            delegated_proof_work_id = Some(work_id.clone());
+            Scope::Work {
+                root_id,
+                work_id,
+                work_incarnation: String::new(),
+            }
+        }
+        other => other,
+    };
+    #[cfg(not(feature = "age319-private-broker-fixture"))]
+    let scope = classified;
     // A legitimate in-root sudo descendant may become host UID 0. Its exact
     // PID namespace and source incarnation still bind it to this root/work;
     // the outside cancel route retains the original owner UID.
@@ -2867,8 +2965,35 @@ fn verify_source_socket(
     {
         return Err(io::Error::other("source UID is outside root policy"));
     }
+    #[cfg(feature = "age319-private-broker-fixture")]
+    let scope_diagnostic = format!(
+        "scope={scope:?} claim={:?} delegated={}",
+        witness.scope,
+        witness.delegated_root_h_request_id.is_some(),
+    );
     match (&witness.scope, scope) {
-        (SourceScope::Root, Scope::Root(root_id)) if root_id == witness.root_id => {}
+        (SourceScope::Root, Scope::Root(root_id))
+            if root_id == witness.root_id && witness.delegated_root_h_request_id.is_none() => {}
+        #[cfg(feature = "age319-private-broker-fixture")]
+        (
+            SourceScope::Root,
+            Scope::Work {
+                root_id, work_id, ..
+            },
+        ) if root_id == witness.root_id && witness.delegated_root_h_request_id.is_some() => {
+            let proved_work_id = match delegated_proof_work_id {
+                Some(id) => id,
+                None => verify_delegated_root_h_source(
+                    state_root,
+                    peer,
+                    &root_id,
+                    witness.delegated_root_h_request_id.as_deref().unwrap(),
+                )?,
+            };
+            if proved_work_id != work_id {
+                return Err(io::Error::other("delegated root H work scope changed"));
+            }
+        }
         (
             SourceScope::Nested { parent_work_id },
             Scope::Work {
@@ -2918,7 +3043,15 @@ fn verify_source_socket(
                 return Err(io::Error::other("source cancellation grant changed"));
             }
         }
-        _ => return Err(io::Error::other("source root/work scope mismatch")),
+        _ => {
+            #[cfg(feature = "age319-private-broker-fixture")]
+            if private_fixture() {
+                return Err(io::Error::other(format!(
+                    "source root/work scope mismatch: {scope_diagnostic}"
+                )));
+            }
+            return Err(io::Error::other("source root/work scope mismatch"));
+        }
     }
     let mut kind: libc::c_int = 0;
     let mut kind_len = std::mem::size_of_val(&kind) as libc::socklen_t;
@@ -3039,6 +3172,19 @@ fn issue_source_ticket(
             created: Instant::now(),
         },
     );
+    #[cfg(feature = "age319-private-broker-fixture")]
+    if private_fixture()
+        && tickets
+            .values()
+            .any(|ticket| ticket.witness.delegated_root_h_request_id.is_some())
+    {
+        if let Some(gate) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1") {
+            let _ = fs::write(
+                Path::new(&gate).join("delegated-h-broker-stage"),
+                b"ticket-issued",
+            );
+        }
+    }
     Ok(format!("verified-source-v2 {root_id}\n"))
 }
 
@@ -3057,6 +3203,7 @@ fn consume_source_ticket(
     entries: &EntryRegistry,
     grants: &GrantRegistry,
     tickets: &mut BTreeMap<String, SourceTicket>,
+    state_root: &Path,
 ) -> io::Result<String> {
     let ticket = tickets
         .remove(&spec.ticket)
@@ -3151,6 +3298,8 @@ fn consume_source_ticket(
         gid: ticket.source_gid,
         process: PinnedProcess::open(connector.pid)?,
     };
+    #[cfg(feature = "age319-private-broker-fixture")]
+    let delegated = ticket.witness.delegated_root_h_request_id.is_some();
     verify_source_socket(
         ticket.witness,
         ticket.source_socket,
@@ -3161,7 +3310,17 @@ fn consume_source_ticket(
         works,
         entries,
         grants,
+        state_root,
     )?;
+    #[cfg(feature = "age319-private-broker-fixture")]
+    if private_fixture() && delegated {
+        if let Some(gate) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1") {
+            let _ = fs::write(
+                Path::new(&gate).join("delegated-h-broker-stage"),
+                b"ticket-consumed",
+            );
+        }
+    }
     guardian_peer.process.verify()?;
     Ok(format!("verified-control {root_id}\n"))
 }
@@ -4670,6 +4829,7 @@ fn serve() -> io::Result<()> {
                     &works,
                     &entries,
                     &grants,
+                    Path::new(&state),
                 )?;
                 if operation == b's' {
                     issue_source_ticket(witness, socket, &peer, &mut source_tickets)
@@ -4691,6 +4851,7 @@ fn serve() -> io::Result<()> {
                     &entries,
                     &grants,
                     &mut source_tickets,
+                    Path::new(&state),
                 )
             } else if operation == b'B' {
                 let RequestPayload::VerifyJoinedChild { witness } = payload else {

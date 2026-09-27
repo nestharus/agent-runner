@@ -2240,6 +2240,10 @@ pub struct SourceSocketWitness {
     pub guardian: ProcessWitness,
     pub source: ProcessWitness,
     pub scope: SourceScope,
+    /// Private selected-K original H: a selector for the Broker's immutable,
+    /// consumed delegation. The selector alone never authorizes a source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegated_root_h_request_id: Option<String>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
