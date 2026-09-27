@@ -62,9 +62,10 @@ use oulipoly_kernel_broker::protocol::{
     AcceptedWorkSpec, ExactSourceDecisionRequest, ExactSourceDecisionVerification,
     ExactSourceIssuerKind, FreshChildRequest, FreshRecipientRequest, FreshRootEffectRequest,
     JoinSpec, JoinedChildWitness, LaunchAcceptedWorkSpec, NativeKSpec, NativePrepareSpec,
-    OwnerDiscoveryReadback, OwnerDiscoveryRequest, OwnerPidBinding, OwnerWitness, ProcessWitness,
-    SourceControlUse, SourceScope, SourceSocketWitness, SourceTicketUse, SourceWitnessProbe,
-    StateGenerationSpec, StateReadSpec, StateWriteAction, StateWriteSpec,
+    OwnerDiscoveryReadback, OwnerDiscoveryRequest, OwnerPidBinding, OwnerWitness,
+    PostcommitHChallenge, PostcommitHReadback, ProcessWitness, SourceControlUse, SourceScope,
+    SourceSocketWitness, SourceTicketUse, SourceWitnessProbe, StateGenerationSpec, StateReadSpec,
+    StateWriteAction, StateWriteSpec,
 };
 use oulipoly_kernel_broker::registry::{RootRecord, RootRegistry};
 use oulipoly_kernel_broker::root_drain;
@@ -405,7 +406,7 @@ fn require_cutover_entry_route(
     if gate_closed {
         return Err(io::Error::other("broker entry gate is durably closed"));
     }
-    if matches!(operation, b':' | b';') && !broker_owned_sidecar {
+    if matches!(operation, b':' | b';' | b'+') && !broker_owned_sidecar {
         return Err(io::Error::other(
             "exact source decision requires v30 sidecar",
         ));
@@ -442,7 +443,7 @@ fn require_cutover_entry_route(
         if private_fixture()
             && matches!(
                 operation,
-                b'L' | b'l' | b'M' | b'&' | b's' | b'T' | b'H' | b'K' | b'B' | b'Q' | b'Z'
+                b'L' | b'l' | b'M' | b'&' | b'+' | b's' | b'T' | b'H' | b'K' | b'B' | b'Q' | b'Z'
             )
         {
             return Ok(());
@@ -552,6 +553,12 @@ enum RequestPayload {
         request: ExactSourceDecisionVerification,
         socket: File,
         registration: File,
+    },
+    PostcommitH {
+        request: PostcommitHChallenge,
+        socket: File,
+        registration: File,
+        retained_guardian: File,
     },
     #[cfg(feature = "age319-private-broker-fixture")]
     PrivateSourceWitness {
@@ -757,7 +764,7 @@ fn recv_request(
         b'A' | b'a' => read == 33,
         b'J' | b'j' => (18..=48 * 1024 + 17).contains(&read),
         b'L' => (18..=48 * 1024 + 17).contains(&read),
-        b':' | b';' => (18..=8192 + 17).contains(&read),
+        b':' | b';' | b'+' => (18..=8192 + 17).contains(&read),
         #[cfg(feature = "age319-private-broker-fixture")]
         b'&' => (18..=2048 + 17).contains(&read),
         b'=' | b'V' | b'S' | b's' | b'T' | b'H' | b'K' | b'B' | b'N' | b'k' | b't' | b'R'
@@ -799,6 +806,7 @@ fn recv_request(
             #[cfg(feature = "age319-private-broker-fixture")]
             b'#' => descriptors.len() != 2,
             b':' | b';' => descriptors.len() != 2,
+            b'+' => descriptors.len() != 3,
             #[cfg(feature = "age319-private-broker-fixture")]
             b'&' => descriptors.len() != 2,
             #[cfg(feature = "age319-private-broker-fixture")]
@@ -985,6 +993,12 @@ fn recv_request(
             request: serde_json::from_slice(&request[17..read as usize])?,
             socket: descriptors.remove(0),
             registration: descriptors.remove(0),
+        },
+        b'+' => RequestPayload::PostcommitH {
+            request: serde_json::from_slice(&request[17..read as usize])?,
+            socket: descriptors.remove(0),
+            registration: descriptors.remove(0),
+            retained_guardian: descriptors.remove(0),
         },
         #[cfg(feature = "age319-private-broker-fixture")]
         b'&' => RequestPayload::PrivateSourceWitness {
@@ -2690,6 +2704,95 @@ fn verify_exact_source_witness(
         original_state_device: original_state.device,
         original_state_inode: original_state.inode,
         registration_sha256: probe.registration_sha256,
+    })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "postcommit H joins live guardian, helper, H/K, journal and bound State"
+)]
+fn challenge_postcommit_h(
+    request: PostcommitHChallenge,
+    socket: File,
+    registration: File,
+    retained_guardian: File,
+    guardian: &PeerIdentity,
+    runner_image: &File,
+    host_namespace: &File,
+    roots: &RootRegistry,
+    works: &WorkRegistry,
+    entries: &EntryRegistry,
+    grants: &GrantRegistry,
+    sidecar: &BrokerSidecar,
+    journal: &source_decision_journal::Journal,
+) -> io::Result<PostcommitHReadback> {
+    let verification = request.verification;
+    let release = sidecar
+        .read_released_owner_for_root(&verification.witness.owner.root_id)
+        .map_err(io::Error::other)?;
+    if prepared_stamp(&ProcessStamp::from(&guardian.process)) != release.prepared.guardian
+        || !guardian.process.same_executable_as(runner_image)?
+        || release.owner.owner_generation != verification.witness.owner_generation
+    {
+        return Err(io::Error::other(
+            "postcommit H caller is not original guardian",
+        ));
+    }
+    let connector = socket_credentials(&retained_guardian)?;
+    let other_end = socket_credentials(&socket)?;
+    if connector.pid <= 0
+        || connector.uid != guardian.uid
+        || other_end.pid != guardian.process.host_pid
+        || other_end.uid != guardian.uid
+    {
+        return Err(io::Error::other(
+            "postcommit H retained connection changed peers",
+        ));
+    }
+    let helper = PeerIdentity {
+        uid: connector.uid,
+        gid: connector.gid,
+        process: PinnedProcess::open(connector.pid)?,
+    };
+    let claims = verify_exact_source_witness(
+        verification.witness,
+        socket,
+        registration,
+        &helper,
+        runner_image,
+        host_namespace,
+        roots,
+        works,
+        entries,
+        grants,
+        sidecar,
+        true,
+    )?;
+    if claims.issuer_kind != ExactSourceIssuerKind::ConsumedHSealedHelper {
+        return Err(io::Error::other(
+            "postcommit H challenge did not identify consumed H",
+        ));
+    }
+    let decision = journal.verify_committed_retry(
+        &verification.request_id,
+        &verification.decision_id,
+        &claims,
+    )?;
+    let authority_ordinal = sidecar
+        .read_postcommit_exact_source(
+            &claims.registration_id,
+            &verification.request_id,
+            &verification.decision_id,
+            &serde_json::to_vec(&decision)?,
+            &claims.root_id,
+            &release.owner,
+        )
+        .map_err(io::Error::other)?;
+    guardian.process.verify()?;
+    helper.process.verify()?;
+    Ok(PostcommitHReadback {
+        decision,
+        authority_ordinal,
     })
 }
 
@@ -4405,6 +4508,20 @@ fn serve() -> io::Result<()> {
                 } else {
                     journal.verify_decision(&request.request_id, &request.decision_id, &claims)?
                 };
+                Ok(format!("{}\n", serde_json::to_string(&readback)?))
+            } else if operation == b'+' {
+                let RequestPayload::PostcommitH { request, socket, registration, retained_guardian } = payload else {
+                    return Err(io::Error::other("invalid postcommit H challenge payload"));
+                };
+                let sidecar = broker_sidecar.as_ref()
+                    .ok_or_else(|| io::Error::other("postcommit H requires v30 sidecar"))?;
+                let journal = source_decision_journal.as_ref()
+                    .ok_or_else(|| io::Error::other("postcommit H decision journal absent"))?;
+                let readback = challenge_postcommit_h(
+                    request, socket, registration, retained_guardian, &peer,
+                    &runner_image, &host_namespace, &registry, &works, &entries, &grants,
+                    sidecar, journal,
+                )?;
                 Ok(format!("{}\n", serde_json::to_string(&readback)?))
             } else if cfg!(feature = "age319-private-broker-fixture") && operation == b'&' {
                 #[cfg(feature = "age319-private-broker-fixture")]

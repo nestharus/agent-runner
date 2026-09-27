@@ -12,6 +12,8 @@ use oulipoly_state::{
 };
 use sha2::{Digest, Sha256};
 use std::fs::File;
+#[cfg(feature = "age319-private-broker-fixture")]
+use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -39,7 +41,7 @@ pub(super) fn register(
         return Err("fresh v30 owner domain changed".into());
     }
     let capability = authority.process_environment_value().to_owned();
-    let guardian = UnixStream::connect(&discovery.owner.endpoint).map_err(|e| e.to_string())?;
+    let mut guardian = UnixStream::connect(&discovery.owner.endpoint).map_err(|e| e.to_string())?;
     let owner = OwnerWitness {
         root_id: discovery.root_id.clone(),
         domain_id: discovery.owner.domain_id.clone(),
@@ -69,11 +71,21 @@ pub(super) fn register(
         request_id: uuid::Uuid::new_v4().to_string(),
         witness,
     };
+    #[cfg(feature = "age319-private-broker-fixture")]
+    let postcommit = std::env::var_os("AGE319_PRIVATE_POSTCOMMIT_H_V1").is_some();
+    #[cfg(feature = "age319-private-broker-fixture")]
+    if postcommit {
+        prepare_postcommit_h(&mut guardian, registration_fd, &request)?;
+    }
     let broker = crate::completion_owner::v30_broker_socket();
     #[cfg(feature = "age319-private-broker-fixture")]
     let private_gate = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
         .map(std::path::PathBuf::from)
         .filter(|gate| gate.join("source-production-registration-cli").exists());
+    #[cfg(feature = "age319-private-broker-fixture")]
+    if postcommit && private_gate.is_none() {
+        return Err("postcommit H fixture has no retained gate directory".into());
+    }
     #[cfg(feature = "age319-private-broker-fixture")]
     if private_gate.is_some() {
         let mut direct = StateDb::open_existing(&StateDb::default_path()?)?;
@@ -180,8 +192,23 @@ pub(super) fn register(
         })
     })?;
     #[cfg(feature = "age319-private-broker-fixture")]
+    if postcommit {
+        std::fs::write(
+            private_gate
+                .as_ref()
+                .unwrap()
+                .join("source-postcommit-step"),
+            b"first-state",
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    #[cfg(feature = "age319-private-broker-fixture")]
     if let Some(gate) = private_gate {
         let retry = submit()?;
+        if postcommit {
+            std::fs::write(gate.join("source-postcommit-step"), b"retry-state")
+                .map_err(|e| e.to_string())?;
+        }
         if !first.inserted
             || retry.inserted
             || retry.decision_id != first.decision_id
@@ -197,7 +224,85 @@ pub(super) fn register(
             })).map_err(|e| e.to_string())?,
         ).map_err(|e| e.to_string())?;
     }
+    #[cfg(feature = "age319-private-broker-fixture")]
+    if postcommit {
+        if let Some(gate) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1") {
+            let gate = std::path::PathBuf::from(gate);
+            std::fs::write(
+                gate.join("source-postcommit-ready"),
+                first.decision_id.as_bytes(),
+            )
+            .map_err(|e| e.to_string())?;
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(180);
+            while !gate.join("source-postcommit-notify").exists() {
+                if std::time::Instant::now() >= until {
+                    return Err("private postcommit H scheduling gate expired".into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        guardian
+            .write_all(format!("hcommit\n{}\n", first.decision_id).as_bytes())
+            .map_err(|e| format!("postcommit H notification failed: {e}"))?;
+        let mut acknowledged = [0];
+        guardian
+            .read_exact(&mut acknowledged)
+            .map_err(|e| format!("postcommit H guardian acknowledgement absent: {e}"))?;
+        if acknowledged != [b'A'] {
+            return Err("postcommit H guardian acknowledgement changed".into());
+        }
+        // Private fixture: discard the first response and retry the same
+        // request on the retained connection while the worker is still live.
+        guardian
+            .write_all(format!("hcommit\n{}\n", first.decision_id).as_bytes())
+            .map_err(|e| format!("postcommit H exact retry failed: {e}"))?;
+        guardian
+            .read_exact(&mut acknowledged)
+            .map_err(|e| format!("postcommit H exact retry acknowledgement absent: {e}"))?;
+        if acknowledged != [b'A'] {
+            return Err("postcommit H exact retry acknowledgement changed".into());
+        }
+    }
     Ok((first, request.request_id))
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn prepare_postcommit_h(
+    guardian: &mut UnixStream,
+    registration: &File,
+    request: &ExactSourceDecisionRequest,
+) -> Result<(), String> {
+    let mut frame = b"pwait\n".to_vec();
+    frame.extend_from_slice(&serde_json::to_vec(request).map_err(|e| e.to_string())?);
+    frame.push(b'\n');
+    if frame.len() > 8192 {
+        return Err("postcommit H prepare frame too large".into());
+    }
+    let descriptors = [guardian.as_raw_fd(), registration.as_raw_fd()];
+    let mut iov = libc::iovec {
+        iov_base: frame.as_mut_ptr().cast(),
+        iov_len: frame.len(),
+    };
+    let mut control = [0u8; 64];
+    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+    message.msg_iov = &mut iov;
+    message.msg_iovlen = 1;
+    message.msg_control = control.as_mut_ptr().cast();
+    message.msg_controllen =
+        unsafe { libc::CMSG_SPACE(std::mem::size_of_val(&descriptors) as _) } as usize;
+    unsafe {
+        let header = libc::CMSG_FIRSTHDR(&message);
+        (*header).cmsg_level = libc::SOL_SOCKET;
+        (*header).cmsg_type = libc::SCM_RIGHTS;
+        (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(&descriptors) as _) as usize;
+        std::ptr::copy_nonoverlapping(descriptors.as_ptr(), libc::CMSG_DATA(header).cast(), 2);
+    }
+    if unsafe { libc::sendmsg(guardian.as_raw_fd(), &message, libc::MSG_NOSIGNAL) }
+        != frame.len() as isize
+    {
+        return Err("postcommit H prepare frame short or refused".into());
+    }
+    Ok(())
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]

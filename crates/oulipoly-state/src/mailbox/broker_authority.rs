@@ -623,6 +623,38 @@ pub struct BrokerNativeGrantReadback {
 }
 
 impl BrokerSidecar {
+    /// Read the original State decision before a driver is woken.  The
+    /// caller's notification supplies only comparison keys; the opened bound
+    /// State file supplies the decision and immutable continuation.
+    pub fn read_postcommit_exact_source(
+        &self,
+        registration_id: &str,
+        request_id: &str,
+        decision_id: &str,
+        broker_readback: &[u8],
+        root_id: &str,
+        owner: &CompletionDomainOwner,
+    ) -> Result<i64, String> {
+        self.check_mailbox_read(&self.source_generation)?;
+        let state = self.bound_state()?;
+        let exact = state
+            .exact_source_projection_for_registration(registration_id)?
+            .ok_or("postcommit exact source absent from original State")?;
+        self.verify_exact_source_owner(&exact, root_id, owner)?;
+        if exact.request_id != request_id
+            || exact.decision_id != decision_id
+            || exact.registration_id != registration_id
+            || serde_json::from_slice::<serde_json::Value>(&exact.readback_json)
+                .map_err(|e| e.to_string())?
+                != serde_json::from_slice::<serde_json::Value>(broker_readback)
+                    .map_err(|e| e.to_string())?
+        {
+            return Err("postcommit Broker/State exact decision changed".into());
+        }
+        self.check_mailbox_read(&self.source_generation)?;
+        Ok(exact.continuity.authority_ordinal)
+    }
+
     pub fn retained_mailbox_generation(&self) -> Result<String, String> {
         self.check_mailbox_read(&self.source_generation)?;
         self.mailbox.sidecar_generation()

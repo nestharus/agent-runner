@@ -135,13 +135,42 @@ fn run_with_root(
                 // source selection until the joined child completes.
                 #[cfg(feature = "age319-private-broker-fixture")]
                 let repair_result = if h_awaiting {
-                    // H retains custody, but cannot select, reserve, or launch W.
-                    Err("v30 H awaiting custody; postcommit wake unavailable".into())
+                    let channel = v30_channel.as_mut().ok_or("v30 H driver gate absent")?;
+                    postcommit_driver_stage("waiting-wake");
+                    let mut marker = [0];
+                    channel.read_exact(&mut marker).map_err(|e| e.to_string())?;
+                    if marker != [b'W'] {
+                        return Err("v30 H driver received no postcommit W wake".into());
+                    }
+                    postcommit_driver_stage("reading-target");
+                    let target = read_v30_wake_target(channel)?;
+                    if target.root_id != root_id
+                        || target.owner_generation != owner.owner_generation
+                        || target.authority_ordinal <= 0
+                    {
+                        return Err("v30 W target changed root or owner".into());
+                    }
+                    postcommit_driver_stage("repairing-source");
+                    match run_v30_repair_boundary(&route, owner, Some(&target)) {
+                        Err(error)
+                            if error
+                                == "v30 source physically launched; v2 acceptance remains closed" =>
+                        {
+                            postcommit_driver_stage("source-launched");
+                            channel.write_all(b"A").map_err(|e| e.to_string())?;
+                            Err(error)
+                        }
+                        Err(error) => {
+                            postcommit_driver_stage(&format!("refused: {error}"));
+                            return Err(error);
+                        }
+                        Ok(()) => return Err("postcommit W returned without source effect".into()),
+                    }
                 } else {
-                    run_v30_repair_boundary(&route, owner)
+                    run_v30_repair_boundary(&route, owner, None)
                 };
                 #[cfg(not(feature = "age319-private-broker-fixture"))]
-                let repair_result = run_v30_repair_boundary(&route, owner);
+                let repair_result = run_v30_repair_boundary(&route, owner, None);
                 // The broker's child attestation reopens this exact driver.
                 // Stay pinned until the original guardian reports the joined
                 // child's terminal receipt; EOF is a refusal, not succession.
@@ -187,9 +216,34 @@ fn run_v30_closed_boundary(
     }
 }
 
+#[cfg(feature = "age319-private-broker-fixture")]
+fn read_v30_wake_target(channel: &mut UnixStream) -> Result<super::V30WakeTarget, String> {
+    let mut bytes = Vec::new();
+    while bytes.len() < 2048 {
+        let mut byte = [0];
+        channel.read_exact(&mut byte).map_err(|e| e.to_string())?;
+        if byte == [b'\n'] {
+            return serde_json::from_slice(&bytes).map_err(|e| e.to_string());
+        }
+        bytes.push(byte[0]);
+    }
+    Err("v30 W target frame too large".into())
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn postcommit_driver_stage(stage: &str) {
+    if let Some(gate) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1") {
+        let _ = std::fs::write(
+            Path::new(&gate).join("source-driver-postcommit-stage"),
+            stage,
+        );
+    }
+}
+
 fn run_v30_repair_boundary(
     route: &super::broker_route::V30OwnerRoute,
     owner: &CompletionDomainOwner,
+    #[allow(unused_variables)] target: Option<&super::V30WakeTarget>,
 ) -> Result<(), String> {
     // Each broker call projects at most 64 admitted State rows. Continue to
     // the actual bound head; a fixed turn limit could strand valid older work.
@@ -199,6 +253,22 @@ fn run_v30_repair_boundary(
             continue;
         }
         let selected = route.source_selection(owner, &page)?;
+        #[cfg(feature = "age319-private-broker-fixture")]
+        if let Some(target) = target {
+            let candidate = selected
+                .candidate
+                .as_ref()
+                .ok_or("postcommit W source not projected")?;
+            if selected.root_id != target.root_id
+                || selected.owner_generation != target.owner_generation
+                || selected.source_generation != target.source_generation
+                || selected.authority_ordinal != target.authority_ordinal
+                || candidate.registration_id != target.registration_id
+                || candidate.registration_digest != target.registration_digest
+            {
+                return Err("postcommit W projected receipt/source changed".into());
+            }
+        }
         if selected.candidate.is_some() {
             // Reserve a unique broker-owned debt for the exact State-selected
             // registration/listener and running driver. W takes no source path

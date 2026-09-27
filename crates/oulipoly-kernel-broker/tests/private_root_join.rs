@@ -288,7 +288,9 @@ fn inner() {
         "native_cancel" | "native_drain" | "native_receipt_cancel" | "native_receipt_drain"
     );
     let release_mode = mode.starts_with("held_release") || native_mode;
-    let production_source = mode == "normal_handoff_pre_k_h_source_registration_cli";
+    let postcommit_source = mode == "normal_handoff_pre_k_h_source_postcommit_w";
+    let production_source =
+        mode == "normal_handoff_pre_k_h_source_registration_cli" || postcommit_source;
     let bad_disposition = mode == "normal_empty_bad_disposition";
     let source_witness = (mode == "held_release_source_witness").then(|| {
         (
@@ -306,6 +308,7 @@ fn inner() {
                 | "normal_handoff_bash_child"
                 | "normal_handoff_pre_k_h_source"
                 | "normal_handoff_pre_k_h_source_registration_cli"
+                | "normal_handoff_pre_k_h_source_postcommit_w"
                 | "normal_handoff_fsync"
                 | "normal_handoff_effect_reply_loss"
                 | "normal_help"
@@ -1460,6 +1463,7 @@ fn inner() {
                 (mode == "normal_empty" || bad_disposition || production_source)
                     .then_some(("AGE319_PRIVATE_PRE_EFFECT_DISPOSITION_V1", "1")),
             )
+            .envs(postcommit_source.then_some(("AGE319_PRIVATE_POSTCOMMIT_H_V1", "1")))
             .envs(bad_disposition.then_some(("AGE319_PRIVATE_BAD_DISPOSITION_ROOT_V1", "1")))
             .envs(
                 (mode == "normal_bash_source_lost_reply")
@@ -2115,8 +2119,12 @@ fn inner() {
                     if production_source {
                         fs::write(gate.join("source-production-registration-cli"), b"yes").unwrap();
                     }
+                    if postcommit_source {
+                        fs::write(gate.join("source-production-postcommit-h"), b"schedule")
+                            .unwrap();
+                    }
                     fs::write(gate.join("source-decision-request"), b"issue").unwrap();
-                    if production_source {
+                    if production_source && !postcommit_source {
                         let deadline = Instant::now() + Duration::from_secs(180);
                         while !gate.join("source-decision-readback.json").exists()
                             && entry.try_wait().unwrap().is_none()
@@ -2148,7 +2156,7 @@ fn inner() {
                         assert_eq!(probes["state_exact_retry"], true);
                         assert_eq!(probes["public_api_bypass_refused"], true);
                         assert_eq!(probes["refusals"].as_array().unwrap().len(), 6);
-                    } else {
+                    } else if !production_source {
                         let state_deadline = Instant::now() + Duration::from_secs(180);
                         while !gate.join("source-state-ready").exists()
                             && entry.try_wait().unwrap().is_none()
@@ -2223,6 +2231,33 @@ fn inner() {
                                 .unwrap_or_default()
                         );
                     }
+                    if postcommit_source {
+                        let until = Instant::now() + Duration::from_secs(90);
+                        while !gate.join("source-postcommit-ready").exists()
+                            && entry.try_wait().unwrap().is_none()
+                            && Instant::now() < until
+                        {
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        assert!(
+                            gate.join("source-postcommit-ready").exists(),
+                            "postcommit helper did not reach committed gate: entry={} source={} broker={} stage={} postcommit_step={} guardian_stage={} state_decisions={} helper_logs={:?} gate={:?}",
+                            fs::read_to_string(&err).unwrap_or_default(),
+                            fs::read_to_string(gate.join("private-source-stderr.log")).unwrap_or_default(),
+                            fs::read_to_string(&broker_log).unwrap_or_default(),
+                            fs::read_to_string(gate.join("source-broker-stage")).unwrap_or_default(),
+                            fs::read_to_string(gate.join("source-postcommit-step")).unwrap_or_default(),
+                            fs::read_to_string(gate.join("source-guardian-postcommit-stage")).unwrap_or_default(),
+                            original.query_row::<i64,_,_>("SELECT count(*) FROM invocation_completion_exact_source_decisions", [], |r| r.get(0)).unwrap_or(-1),
+                            fs::read_dir(worker_dir).unwrap().filter_map(Result::ok).filter(|e| e.file_name().to_string_lossy().contains("private-exact-source-decision") && e.path().extension().is_some_and(|x| x == "stderr")).map(|e| fs::read_to_string(e.path()).unwrap_or_default()).collect::<Vec<_>>(),
+                            fs::read_dir(&gate).unwrap().filter_map(Result::ok).map(|e| e.file_name()).collect::<Vec<_>>(),
+                        );
+                        assert!(
+                            entry.try_wait().unwrap().is_none(),
+                            "original J exited before postcommit H custody"
+                        );
+                        assert!(Path::new(&format!("/proc/{worker_pid}")).exists());
+                    }
                     assert!(
                         entry.try_wait().unwrap().is_none(),
                         "J exited before H projection"
@@ -2287,92 +2322,184 @@ fn inner() {
                         .unwrap();
                     assert_eq!(receipt_count, 0, "H receipt preceded projection");
                     drop(retained);
-                    stop(&mut broker);
-                    broker = restart_source_broker(
-                        &socket,
-                        &broker_state,
-                        &runner,
-                        &gate,
-                        &temp.path().join("consumed-h-before-projection.log"),
-                    );
-                    stop(&mut broker);
-                    let mut retained =
-                        BrokerSidecar::open_existing(&retained_path, &broker_state).unwrap();
-                    let projected = retained
-                        .repair_bounded_suffix(&generation, &prepared.root_id, &released.owner, 0)
-                        .unwrap();
-                    assert_eq!(projected.authority_ordinal, 1);
-                    drop(retained); // Simulate loss of the sidecar commit response.
-                    broker = restart_source_broker(
-                        &socket,
-                        &broker_state,
-                        &runner,
-                        &gate,
-                        &temp.path().join("consumed-h-after-projection.log"),
-                    );
-                    let mut retained =
-                        BrokerSidecar::open_existing(&retained_path, &broker_state).unwrap();
-                    let replay = retained
-                        .repair_bounded_suffix(&generation, &prepared.root_id, &released.owner, 0)
-                        .unwrap();
-                    assert_eq!(replay, projected, "H projection retry changed receipt");
-                    let selected = retained
-                        .read_bounded_source_selection(
-                            &generation,
-                            &prepared.root_id,
-                            &released.owner,
+                    if postcommit_source {
+                        fs::write(gate.join("source-postcommit-notify"), b"schedule").unwrap();
+                        let until = Instant::now() + Duration::from_secs(90);
+                        while !gate.join("source-launched").exists()
+                            && entry.try_wait().unwrap().is_none()
+                            && !fs::read_to_string(gate.join("source-driver-postcommit-stage"))
+                                .is_ok_and(|stage| stage.starts_with("refused:"))
+                            && Instant::now() < until
+                        {
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        assert!(
+                            gate.join("source-launched").exists(),
+                            "postcommit H did not wake W: entry={} broker={} helper={} guardian_stage={} driver_stage={} broker_stage={} helper_logs={:?} gate={:?}",
+                            fs::read_to_string(&err).unwrap_or_default(),
+                            fs::read_to_string(&broker_log).unwrap_or_default(),
+                            fs::read_to_string(gate.join("private-source-stderr.log"))
+                                .unwrap_or_default(),
+                            fs::read_to_string(gate.join("source-guardian-postcommit-stage"))
+                                .unwrap_or_default(),
+                            fs::read_to_string(gate.join("source-driver-postcommit-stage"))
+                                .unwrap_or_default(),
+                            fs::read_to_string(gate.join("source-broker-stage"))
+                                .unwrap_or_default(),
+                            fs::read_dir(worker_dir)
+                                .unwrap()
+                                .filter_map(Result::ok)
+                                .filter(|e| e
+                                    .file_name()
+                                    .to_string_lossy()
+                                    .contains("private-exact-source-decision")
+                                    && e.path().extension().is_some_and(|x| x == "stderr"))
+                                .map(|e| fs::read_to_string(e.path()).unwrap_or_default())
+                                .collect::<Vec<_>>(),
+                            fs::read_dir(&gate)
+                                .unwrap()
+                                .filter_map(Result::ok)
+                                .map(|e| e.file_name())
+                                .collect::<Vec<_>>(),
+                        );
+                        eventually(|| gate.join("source-postcommit-retry-acked").exists());
+                        assert_eq!(
+                            fs::read(gate.join("source-postcommit-refusals")).unwrap(),
+                            b"root owner sibling decision copied"
+                        );
+                        let projected = rusqlite::Connection::open_with_flags(
+                            &retained_path,
+                            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
                         )
                         .unwrap();
-                    assert_eq!(
-                        selected.candidate.as_ref().unwrap().registration_id,
-                        attribution.2
-                    );
-                    assert!(
-                        retained
-                            .read_bounded_source_selection(
-                                &uuid::Uuid::new_v4().to_string(),
-                                &prepared.root_id,
-                                &released.owner
+                        let receipt: (String, String, String, String, String) = projected.query_row(
+                            "SELECT request_id,decision_id,registration_id,registration_sha256,root_id FROM broker_exact_source_projection",
+                            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+                        ).unwrap();
+                        assert_eq!(
+                            receipt,
+                            (
+                                attribution.0.clone(),
+                                attribution.1.clone(),
+                                attribution.2.clone(),
+                                attribution.3.clone(),
+                                prepared.root_id.clone()
                             )
-                            .is_err()
-                    );
-                    assert!(
-                        retained
+                        );
+                        let grant: (String, i64) = projected
+                            .query_row(
+                                "SELECT phase,revision FROM broker_source_effect_grant",
+                                [],
+                                |row| Ok((row.get(0)?, row.get(1)?)),
+                            )
+                            .unwrap();
+                        assert_eq!(grant, ("consumed".into(), 2));
+                        assert_eq!(
+                            SourcePhysicalRegistry::open(broker_state.join("source-physical"))
+                                .unwrap()
+                                .records()
+                                .len(),
+                            1,
+                            "one W must create one physical custody tree"
+                        );
+                    } else {
+                        stop(&mut broker);
+                        broker = restart_source_broker(
+                            &socket,
+                            &broker_state,
+                            &runner,
+                            &gate,
+                            &temp.path().join("consumed-h-before-projection.log"),
+                        );
+                        stop(&mut broker);
+                        let mut retained =
+                            BrokerSidecar::open_existing(&retained_path, &broker_state).unwrap();
+                        let projected = retained
+                            .repair_bounded_suffix(
+                                &generation,
+                                &prepared.root_id,
+                                &released.owner,
+                                0,
+                            )
+                            .unwrap();
+                        assert_eq!(projected.authority_ordinal, 1);
+                        drop(retained); // Simulate loss of the sidecar commit response.
+                        broker = restart_source_broker(
+                            &socket,
+                            &broker_state,
+                            &runner,
+                            &gate,
+                            &temp.path().join("consumed-h-after-projection.log"),
+                        );
+                        let mut retained =
+                            BrokerSidecar::open_existing(&retained_path, &broker_state).unwrap();
+                        let replay = retained
+                            .repair_bounded_suffix(
+                                &generation,
+                                &prepared.root_id,
+                                &released.owner,
+                                0,
+                            )
+                            .unwrap();
+                        assert_eq!(replay, projected, "H projection retry changed receipt");
+                        let selected = retained
                             .read_bounded_source_selection(
                                 &generation,
-                                &uuid::Uuid::new_v4().to_string(),
-                                &released.owner
-                            )
-                            .is_err()
-                    );
-                    let mut stale_owner = released.owner.clone();
-                    stale_owner.owner_generation = uuid::Uuid::new_v4().to_string();
-                    assert!(
-                        retained
-                            .read_bounded_source_selection(
-                                &generation,
                                 &prepared.root_id,
-                                &stale_owner
+                                &released.owner,
                             )
-                            .is_err()
-                    );
-                    let receipt: (String, String, String, String, String, Vec<u8>) = sidecar.query_row(
+                            .unwrap();
+                        assert_eq!(
+                            selected.candidate.as_ref().unwrap().registration_id,
+                            attribution.2
+                        );
+                        assert!(
+                            retained
+                                .read_bounded_source_selection(
+                                    &uuid::Uuid::new_v4().to_string(),
+                                    &prepared.root_id,
+                                    &released.owner
+                                )
+                                .is_err()
+                        );
+                        assert!(
+                            retained
+                                .read_bounded_source_selection(
+                                    &generation,
+                                    &uuid::Uuid::new_v4().to_string(),
+                                    &released.owner
+                                )
+                                .is_err()
+                        );
+                        let mut stale_owner = released.owner.clone();
+                        stale_owner.owner_generation = uuid::Uuid::new_v4().to_string();
+                        assert!(
+                            retained
+                                .read_bounded_source_selection(
+                                    &generation,
+                                    &prepared.root_id,
+                                    &stale_owner
+                                )
+                                .is_err()
+                        );
+                        let receipt: (String, String, String, String, String, Vec<u8>) = sidecar.query_row(
                         "SELECT request_id,decision_id,registration_id,registration_sha256,root_id,broker_readback_json FROM broker_exact_source_projection",
                         [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
                     ).unwrap();
-                    assert_eq!(
-                        (&receipt.0, &receipt.1, &receipt.2, &receipt.3, &receipt.4),
-                        (
-                            &attribution.0,
-                            &attribution.1,
-                            &attribution.2,
-                            &attribution.3,
-                            &prepared.root_id
-                        )
-                    );
-                    assert_eq!(receipt.5, attribution.7);
-                    drop(retained);
-                    fs::write(gate.join("source-projection-done"), b"yes").unwrap();
+                        assert_eq!(
+                            (&receipt.0, &receipt.1, &receipt.2, &receipt.3, &receipt.4),
+                            (
+                                &attribution.0,
+                                &attribution.1,
+                                &attribution.2,
+                                &attribution.3,
+                                &prepared.root_id
+                            )
+                        );
+                        assert_eq!(receipt.5, attribution.7);
+                        drop(retained);
+                        fs::write(gate.join("source-projection-done"), b"yes").unwrap();
+                    }
                     let decision_deadline = Instant::now() + Duration::from_secs(180);
                     while !gate.join("source-decision-readback.json").exists()
                         && entry.try_wait().unwrap().is_none()
@@ -12093,6 +12220,7 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_handoff_bash_child",
         "normal_handoff_pre_k_h_source",
         "normal_handoff_pre_k_h_source_registration_cli",
+        "normal_handoff_pre_k_h_source_postcommit_w",
         "normal_handoff_fsync",
         "normal_handoff_effect_reply_loss",
         "normal_help",
@@ -12379,6 +12507,36 @@ fn consumed_h_bash_bytes_reach_production_registration_cli() {
         .env(
             "AGE319_PRIVATE_JOIN_MODE",
             "normal_handoff_pre_k_h_source_registration_cli",
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+}
+
+#[test]
+fn consumed_h_postcommit_wakes_exact_source_once() {
+    if std::env::var_os("AGE319_PRIVATE_JOIN_INNER").is_some() {
+        inner();
+        return;
+    }
+    let output = Command::new("unshare")
+        .args(["-Urpfm", "--mount-proc"])
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "consumed_h_postcommit_wakes_exact_source_once",
+            "--nocapture",
+        ])
+        .env("AGE319_PRIVATE_JOIN_INNER", "1")
+        .env(
+            "AGE319_PRIVATE_JOIN_MODE",
+            "normal_handoff_pre_k_h_source_postcommit_w",
         )
         .output()
         .unwrap();

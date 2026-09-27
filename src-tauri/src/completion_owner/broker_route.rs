@@ -436,10 +436,16 @@ impl V30OwnerRoute {
             return Err("broker bounded repair cursor/readback conflict".into());
         }
         #[cfg(feature = "age319-private-broker-fixture")]
-        if std::env::var_os("AGE319_PRIVATE_REPAIR_CHALLENGE_V1").is_some()
-            && protocol::write_bounded_repair_at(&self.socket, &spec).is_ok()
-        {
-            return Err("private duplicate repair write accepted".into());
+        if std::env::var_os("AGE319_PRIVATE_REPAIR_CHALLENGE_V1").is_some() {
+            if std::env::var_os("AGE319_PRIVATE_POSTCOMMIT_H_V1").is_some() {
+                let replay = protocol::write_bounded_repair_at(&self.socket, &spec)
+                    .map_err(|e| format!("private exact repair retry refused: {e}"))?;
+                if replay != after || read()? != after {
+                    return Err("private exact repair retry changed projected receipt".into());
+                }
+            } else if protocol::write_bounded_repair_at(&self.socket, &spec).is_ok() {
+                return Err("private duplicate repair write accepted".into());
+            }
         }
         Ok(after)
     }

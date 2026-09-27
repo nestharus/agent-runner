@@ -753,14 +753,17 @@ pub(crate) fn run_pinned_guardian_v30(
             return Err("v30 driver disposition acknowledgement changed".into());
         }
         entry.write_all(&[expected]).map_err(|e| e.to_string())?;
+        let h_claim = matches!(&disposition, Disposition::AwaitingH { .. }).then_some(disposition);
         return run_private_v30_original_work(
             &listener,
             &owner,
             pin,
+            &route,
             &mut entry,
             &mut driver_gate,
             &mut authorities,
             expected == b'C',
+            h_claim,
         );
     }
     #[cfg(feature = "age319-private-broker-fixture")]
@@ -769,10 +772,12 @@ pub(crate) fn run_pinned_guardian_v30(
             &listener,
             &owner,
             pin,
+            &route,
             &mut entry,
             &mut driver_gate,
             &mut authorities,
             false,
+            None,
         );
     }
     #[cfg(not(feature = "age319-private-broker-fixture"))]
@@ -796,16 +801,20 @@ fn run_private_v30_original_work(
     listener: &UnixListener,
     owner: &CompletionDomainOwner,
     pin: &super::PinnedGuardian,
+    route: &super::broker_route::V30OwnerRoute,
     entry: &mut UnixStream,
     driver_gate: &mut UnixStream,
     authorities: &mut super::original_work::RootAuthorities,
     driver_closed: bool,
+    h_claim: Option<super::V30PreEffectDisposition>,
 ) -> Result<(), String> {
     let control = ControlService::start_pinned(listener, owner, &pin.root_id)?;
     let mut original = super::original_work::OriginalWorkSupervisor::default();
     original.set_kernel_pinned(true);
     entry.set_nonblocking(true).map_err(|e| e.to_string())?;
     let mut child_done = false;
+    let mut woken: Option<(String, String, String)> = None;
+    let mut postcommit_retry: Option<control::PostcommitHRequest> = None;
     loop {
         for request in control.pending() {
             match request {
@@ -841,6 +850,113 @@ fn run_private_v30_original_work(
                 ControlRequest::Join(mut request) => {
                     JoinRefusal::new(owner, RefusalReason::Identity).send(&mut request.socket);
                 }
+                ControlRequest::PostcommitH(request) => {
+                    if let Some(gate) =
+                        std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                    {
+                        let _ = std::fs::write(
+                            Path::new(&gate).join("source-guardian-postcommit-stage"),
+                            b"challenging-broker",
+                        );
+                    }
+                    let claim = h_claim
+                        .as_ref()
+                        .ok_or("postcommit H has no pre-effect custody")?;
+                    if woken.is_none() {
+                        private_postcommit_refusal_probes(&request)?;
+                    }
+                    let observed =
+                        challenge_postcommit_h_request(route, owner, pin, claim, &request)?;
+                    if let Some(gate) =
+                        std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                    {
+                        let _ = std::fs::write(
+                            Path::new(&gate).join("source-guardian-postcommit-stage"),
+                            b"broker-challenged",
+                        );
+                    }
+                    let key = (
+                        observed.decision.request_id.clone(),
+                        observed.decision.decision_id.clone(),
+                        observed.decision.registration_id.clone(),
+                    );
+                    if let Some(previous) = &woken {
+                        if previous != &key {
+                            return Err("postcommit H sibling decision after W".into());
+                        }
+                    } else {
+                        let target = super::V30WakeTarget {
+                            root_id: observed.decision.root_id.clone(),
+                            owner_generation: observed.decision.owner_generation.clone(),
+                            source_generation: observed.decision.source_generation.clone(),
+                            request_id: observed.decision.request_id.clone(),
+                            decision_id: observed.decision.decision_id.clone(),
+                            registration_id: observed.decision.registration_id.clone(),
+                            registration_digest: observed.decision.registration_sha256.clone(),
+                            authority_ordinal: observed.authority_ordinal,
+                        };
+                        driver_gate.write_all(b"W").map_err(|e| e.to_string())?;
+                        serde_json::to_writer(&mut *driver_gate, &target)
+                            .map_err(|e| e.to_string())?;
+                        driver_gate.write_all(b"\n").map_err(|e| e.to_string())?;
+                        let mut ack = [0];
+                        driver_gate
+                            .read_exact(&mut ack)
+                            .map_err(|e| e.to_string())?;
+                        if ack != [b'A'] {
+                            return Err("postcommit H exact driver did not acknowledge W".into());
+                        }
+                        woken = Some(key);
+                    }
+                    let mut request = request;
+                    request.socket.write_all(b"A").map_err(|e| e.to_string())?;
+                    // Keep the same authenticated connection and its original
+                    // descriptors until the helper closes it. A lost A can be
+                    // retried without issuing another W.
+                    postcommit_retry = Some(request);
+                }
+            }
+        }
+        if let Some(request) = postcommit_retry.as_mut() {
+            let mut probe = [0u8; 1];
+            let ready = unsafe {
+                libc::recv(
+                    request.socket.as_raw_fd(),
+                    probe.as_mut_ptr().cast(),
+                    probe.len(),
+                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                )
+            };
+            if ready == 0 {
+                postcommit_retry = None;
+            } else if ready > 0 {
+                let decision_id = control::receive_postcommit_h(&request.socket, &request.peer)?;
+                if decision_id != request.decision_id {
+                    return Err("postcommit H retry changed decision".into());
+                }
+                let claim = h_claim.as_ref().ok_or("postcommit H retry lost custody")?;
+                let observed = challenge_postcommit_h_request(route, owner, pin, claim, request)?;
+                let key = (
+                    observed.decision.request_id,
+                    observed.decision.decision_id,
+                    observed.decision.registration_id,
+                );
+                if woken.as_ref() != Some(&key) {
+                    return Err("postcommit H retry changed exact source".into());
+                }
+                request.socket.write_all(b"A").map_err(|e| e.to_string())?;
+                if let Some(gate) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1") {
+                    std::fs::write(
+                        Path::new(&gate).join("source-postcommit-retry-acked"),
+                        b"exact",
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+            } else {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::WouldBlock {
+                    return Err(error.to_string());
+                }
             }
         }
         original.tick(owner);
@@ -862,6 +978,132 @@ fn run_private_v30_original_work(
         }
         std::thread::sleep(GUARDIAN_POLL_INTERVAL);
     }
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_postcommit_refusal_probes(request: &control::PostcommitHRequest) -> Result<(), String> {
+    let base = protocol::ExactSourceDecisionVerification {
+        request_id: request.request.request_id.clone(),
+        decision_id: request.decision_id.clone(),
+        witness: request.request.witness.clone(),
+        committed_retry: true,
+    };
+    let challenge = |verification: protocol::ExactSourceDecisionVerification, file_fd| {
+        protocol::challenge_postcommit_h_at(
+            &owner_broker_socket(),
+            &protocol::PostcommitHChallenge { verification },
+            request.client_socket.as_raw_fd(),
+            file_fd,
+            request.socket.as_raw_fd(),
+        )
+    };
+    let mut other_root = base.clone();
+    other_root.witness.owner.root_id = uuid::Uuid::new_v4().to_string();
+    if challenge(other_root, request.registration.as_raw_fd()).is_ok() {
+        return Err("other root passed postcommit H challenge".into());
+    }
+    let mut stale_owner = base.clone();
+    stale_owner.witness.owner_generation = uuid::Uuid::new_v4().to_string();
+    if challenge(stale_owner, request.registration.as_raw_fd()).is_ok() {
+        return Err("stale owner passed postcommit H challenge".into());
+    }
+    let mut sibling = base.clone();
+    sibling.witness.owner.work_id = Some(uuid::Uuid::new_v4().to_string());
+    if challenge(sibling, request.registration.as_raw_fd()).is_ok() {
+        return Err("sibling work passed postcommit H challenge".into());
+    }
+    let mut unknown = base.clone();
+    unknown.decision_id = uuid::Uuid::new_v4().to_string();
+    if challenge(unknown, request.registration.as_raw_fd()).is_ok() {
+        return Err("unknown decision passed postcommit H challenge".into());
+    }
+    let copied_path = base
+        .witness
+        .registration_path
+        .with_file_name("source-registration-v30-copied-probe.json");
+    let copied = std::fs::File::open(copied_path).map_err(|e| e.to_string())?;
+    if challenge(base, copied.as_raw_fd()).is_ok() {
+        return Err("copied file passed postcommit H challenge".into());
+    }
+    if let Some(gate) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1") {
+        std::fs::write(
+            Path::new(&gate).join("source-postcommit-refusals"),
+            b"root owner sibling decision copied",
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn challenge_postcommit_h_request(
+    route: &super::broker_route::V30OwnerRoute,
+    owner: &CompletionDomainOwner,
+    pin: &super::PinnedGuardian,
+    claim: &super::V30PreEffectDisposition,
+    request: &control::PostcommitHRequest,
+) -> Result<protocol::PostcommitHReadback, String> {
+    let super::V30PreEffectDisposition::AwaitingH {
+        root_id,
+        owner_generation,
+        release_id,
+        invocation_uuid,
+        session_id,
+        ..
+    } = claim
+    else {
+        return Err("postcommit H was not awaiting custody".into());
+    };
+    let witness = &request.request.witness;
+    if root_id != &pin.root_id
+        || owner_generation != &owner.owner_generation
+        || witness.owner.root_id != *root_id
+        || witness.owner_generation != *owner_generation
+        || witness.owner.owner_generation.as_deref() != Some(owner_generation)
+        || witness.owner.work_id.as_deref().is_none_or(str::is_empty)
+        || witness.owner_invocation_uuid != *invocation_uuid
+        || witness.owner_session_id != *session_id
+        || witness.owner.owner_invocation_uuid.as_deref() != Some(invocation_uuid)
+        || witness.owner.owner_session_id.as_deref() != Some(session_id)
+        || identity(request.peer.pid)? != request.peer
+        || identity(owner.guardian_identity.pid)? != owner.guardian_identity
+        || identity(owner.driver_identity.pid)? != owner.driver_identity
+    {
+        return Err("postcommit H claim/root/owner/helper changed".into());
+    }
+    let running = route.read_running(owner, None)?;
+    let verification = protocol::ExactSourceDecisionVerification {
+        request_id: request.request.request_id.clone(),
+        decision_id: request.decision_id.clone(),
+        witness: witness.clone(),
+        committed_retry: true,
+    };
+    let observed = protocol::challenge_postcommit_h_at(
+        &owner_broker_socket(),
+        &protocol::PostcommitHChallenge { verification },
+        request.client_socket.as_raw_fd(),
+        request.registration.as_raw_fd(),
+        request.socket.as_raw_fd(),
+    )
+    .map_err(|e| e.to_string())?;
+    let exact = &observed.decision;
+    if exact.issuer_kind != protocol::ExactSourceIssuerKind::ConsumedHSealedHelper
+        || exact.root_id != *root_id
+        || exact.owner_generation != *owner_generation
+        || exact.source_generation != running.source_generation
+        || exact.owner_invocation_uuid != *invocation_uuid
+        || exact.owner_session_id != *session_id
+        || exact.issuer.host_pid != request.peer.pid as i32
+        || exact.issuer.boot_id != request.peer.boot_id
+        || exact.issuer.starttime_ticks != request.peer.starttime_ticks as u64
+        || exact.guardian.host_pid != owner.guardian_identity.pid as i32
+        || exact.driver.host_pid != owner.driver_identity.pid as i32
+        || release_id.is_empty()
+    {
+        return Err("postcommit H Broker/State readback changed exact custody".into());
+    }
+    route.read_running(owner, None)?;
+    Ok(observed)
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]
@@ -1331,6 +1573,8 @@ fn refuse_control_request(owner: &CompletionDomainOwner, request: ControlRequest
             request,
             "root control queue is full before cancellation".into(),
         ),
+        #[cfg(feature = "age319-private-broker-fixture")]
+        ControlRequest::PostcommitH(_) => {}
     }
 }
 
@@ -1411,6 +1655,8 @@ fn retain_pending_requests(
                 // and persisting the actual peer principal.
                 root_supervisor.cancel_original(owner, request);
             }
+            #[cfg(feature = "age319-private-broker-fixture")]
+            ControlRequest::PostcommitH(_) => {}
         }
     }
 }

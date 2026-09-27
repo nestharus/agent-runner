@@ -106,6 +106,23 @@ impl V30PreEffectDisposition {
     }
 }
 
+/// A comparison target sent only after the original guardian's independent
+/// postcommit challenge.  It has no grant authority: the driver must repair
+/// State and select the projected source again before reserving W.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct V30WakeTarget {
+    pub root_id: String,
+    pub owner_generation: String,
+    pub source_generation: String,
+    pub request_id: String,
+    pub decision_id: String,
+    pub registration_id: String,
+    pub registration_digest: String,
+    pub authority_ordinal: i64,
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) struct PinnedGuardian {
     pub(crate) root_id: String,

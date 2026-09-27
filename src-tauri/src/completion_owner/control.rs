@@ -90,6 +90,18 @@ pub(super) enum ControlRequest {
     Join(JoinRequest),
     Work(InboundWork),
     Cancel(InboundCancel),
+    #[cfg(feature = "age319-private-broker-fixture")]
+    PostcommitH(PostcommitHRequest),
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+pub(super) struct PostcommitHRequest {
+    pub socket: UnixStream,
+    pub peer: SourceProcessIdentity,
+    pub request: protocol::ExactSourceDecisionRequest,
+    pub decision_id: String,
+    pub client_socket: OwnedFd,
+    pub registration: OwnedFd,
 }
 
 enum Command {
@@ -411,6 +423,40 @@ fn serve_request(
             return;
         }
     };
+    #[cfg(feature = "age319-private-broker-fixture")]
+    if pinned_root_id.is_some() && request.starts_with(b"pwait\n") {
+        postcommit_stage("prepared-frame");
+        if ticket.is_some() || descriptors.len() != 2 || !accepting.load(Ordering::Acquire) {
+            return;
+        }
+        let Ok(request) =
+            serde_json::from_slice::<protocol::ExactSourceDecisionRequest>(&request[6..])
+        else {
+            return;
+        };
+        let Ok([client_socket, registration]): Result<[OwnedFd; 2], _> = descriptors.try_into()
+        else {
+            return;
+        };
+        postcommit_stage("waiting-notification");
+        let Ok(decision_id) = receive_postcommit_h(&socket, &context) else {
+            return;
+        };
+        postcommit_stage("notification-received");
+        if socket.set_nonblocking(false).is_err() {
+            return;
+        }
+        let _ = requests.try_send(ControlRequest::PostcommitH(PostcommitHRequest {
+            socket,
+            peer: context,
+            request,
+            decision_id,
+            client_socket,
+            registration,
+        }));
+        postcommit_stage("queued-guardian");
+        return;
+    }
     if !answering.load(Ordering::Acquire) {
         return;
     }
@@ -526,6 +572,9 @@ fn serve_request(
                     "root control queue is full before cancellation".into(),
                 );
             }
+            #[cfg(feature = "age319-private-broker-fixture")]
+            mpsc::TrySendError::Full(ControlRequest::PostcommitH(_))
+            | mpsc::TrySendError::Disconnected(ControlRequest::PostcommitH(_)) => {}
         }
     }
 }
@@ -549,6 +598,8 @@ fn refuse_retiring(owner: &CompletionDomainOwner, request: ControlRequest) {
                 "root authority is retiring before cancellation".into(),
             );
         }
+        #[cfg(feature = "age319-private-broker-fixture")]
+        ControlRequest::PostcommitH(_) => {}
     }
 }
 
@@ -702,6 +753,48 @@ fn receive_pinned_request(
         ));
     }
     Ok((frame, descriptors, Some(ticket)))
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+pub(super) fn receive_postcommit_h(
+    socket: &UnixStream,
+    peer: &SourceProcessIdentity,
+) -> Result<String, String> {
+    let connector = peer_credentials(socket)?;
+    if i64::from(connector.pid) != peer.pid {
+        return Err("postcommit H connector changed".into());
+    }
+    let mut frame = Vec::new();
+    while frame.len() < 128 {
+        let (byte, fds, sender) = receive_credentialled_byte(socket, peer, None)?;
+        if !fds.is_empty() || credential_tuple(sender) != credential_tuple(connector) {
+            return Err("postcommit H sender or descriptors changed".into());
+        }
+        frame.push(byte);
+        if frame.iter().filter(|byte| **byte == b'\n').count() == 2 {
+            break;
+        }
+    }
+    let text = std::str::from_utf8(&frame).map_err(|e| e.to_string())?;
+    let decision = text
+        .strip_prefix("hcommit\n")
+        .and_then(|value| value.strip_suffix('\n'))
+        .ok_or("postcommit H frame changed")?;
+    let parsed = uuid::Uuid::parse_str(decision).map_err(|e| e.to_string())?;
+    if parsed.is_nil() || parsed.to_string() != decision {
+        return Err("postcommit H decision ID noncanonical".into());
+    }
+    Ok(decision.into())
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn postcommit_stage(stage: &str) {
+    if let Some(gate) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1") {
+        let _ = std::fs::write(
+            std::path::Path::new(&gate).join("source-guardian-postcommit-stage"),
+            stage,
+        );
+    }
 }
 
 fn peer_credentials(socket: &UnixStream) -> Result<libc::ucred, String> {

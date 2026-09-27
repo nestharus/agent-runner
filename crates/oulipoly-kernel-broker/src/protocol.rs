@@ -2151,6 +2151,21 @@ pub struct ExactSourceDecisionVerification {
     pub committed_retry: bool,
 }
 
+/// Guardian-only challenge after the sealed helper commits its exact decision
+/// in the broker-bound original State.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PostcommitHChallenge {
+    pub verification: ExactSourceDecisionVerification,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PostcommitHReadback {
+    pub decision: ExactSourceDecisionReadback,
+    pub authority_ordinal: i64,
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ExactSourceDecisionReadback {
@@ -2552,7 +2567,11 @@ fn send_native_descriptors_frame<T: serde::Serialize, const N: usize>(
     descriptors: [RawFd; N],
 ) -> io::Result<UnixStream> {
     let body = serde_json::to_vec(spec)?;
-    let body_limit = if operation == b':' { 8192 } else { 2048 };
+    let body_limit = if matches!(operation, b':' | b'+') {
+        8192
+    } else {
+        2048
+    };
     if body.len() > body_limit {
         return Err(io::Error::other("native prepare request too large"));
     }
@@ -3206,6 +3225,39 @@ pub fn verify_exact_source_decision_at(
         ));
     }
     Ok(response)
+}
+
+pub fn challenge_postcommit_h_at(
+    path: &Path,
+    request: &PostcommitHChallenge,
+    owner_fd: RawFd,
+    registration_fd: RawFd,
+    retained_guardian_fd: RawFd,
+) -> io::Result<PostcommitHReadback> {
+    let stream = send_native_descriptors_frame(
+        path,
+        b'+',
+        request,
+        [owner_fd, registration_fd, retained_guardian_fd],
+    )?;
+    let mut bytes = Vec::new();
+    stream.take(8193).read_to_end(&mut bytes)?;
+    if bytes.starts_with(b"error ") {
+        return Err(io::Error::other(
+            String::from_utf8_lossy(&bytes).trim().to_owned(),
+        ));
+    }
+    if bytes.len() > 8192 || !bytes.ends_with(b"\n") {
+        return Err(io::Error::other("invalid postcommit H challenge reply"));
+    }
+    let reply: PostcommitHReadback = serde_json::from_slice(&bytes)?;
+    if reply.decision.request_id != request.verification.request_id
+        || reply.decision.decision_id != request.verification.decision_id
+        || reply.authority_ordinal <= 0
+    {
+        return Err(io::Error::other("postcommit H challenge identity changed"));
+    }
+    Ok(reply)
 }
 
 /// Production callers use the installed Broker socket; only fixtures select
