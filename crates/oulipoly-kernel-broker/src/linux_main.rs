@@ -69,7 +69,9 @@ use oulipoly_kernel_broker::protocol::{
 };
 use oulipoly_kernel_broker::registry::{RootRecord, RootRegistry};
 use oulipoly_kernel_broker::root_drain;
-use oulipoly_kernel_broker::source_acceptance::capture_and_stage_v2_evidence;
+use oulipoly_kernel_broker::source_acceptance::{
+    capture_and_stage_v2_evidence, commit_v2_evidence,
+};
 use oulipoly_kernel_broker::source_physical::{SourceObservation, SourcePhysicalRegistry};
 use oulipoly_kernel_broker::work_registry::{Scope, WorkRegistry, classify_scope};
 use oulipoly_state::mailbox::{
@@ -3864,8 +3866,9 @@ fn encode_release_evidence(evidence: &BrokerReleaseEvidence) -> io::Result<Strin
 
 // Observe terminal receipts while this broker is serving as well as after a
 // restart. A source can finish after its W reply with no further socket
-// traffic, so capture cannot depend on a later caller request. This only
-// stages evidence; it never accepts, releases, or notifies a source.
+// traffic, so capture cannot depend on a later caller request. An exact
+// independently admitted capture may advance Broker evidence to accepted;
+// completion source release, notification and ACK remain separate.
 fn capture_terminal_sources(
     sidecar: &mut BrokerSidecar,
     physical: &SourcePhysicalRegistry,
@@ -3874,7 +3877,15 @@ fn capture_terminal_sources(
     let grants: Vec<_> = pending.values().cloned().collect();
     for grant in grants {
         match sidecar.read_source_evidence(&grant) {
-            Ok(Some(_)) => {
+            Ok(Some(row)) => {
+                if row.phase == "captured"
+                    && let Err(error) = commit_v2_evidence(sidecar, physical, &grant.grant_id)
+                {
+                    eprintln!(
+                        "source evidence acceptance debt {}: {error}",
+                        grant.grant_id
+                    );
+                }
                 pending.remove(&grant.grant_id);
             }
             Ok(None) => match physical.observe(&grant.grant_id) {
@@ -3883,6 +3894,16 @@ fn capture_terminal_sources(
                         capture_and_stage_v2_evidence(sidecar, physical, &grant.grant_id)
                     {
                         eprintln!("source evidence debt {}: {error}", grant.grant_id);
+                    }
+                    if sidecar
+                        .read_source_evidence(&grant)
+                        .is_ok_and(|row| row.as_ref().is_some_and(|r| r.phase == "captured"))
+                        && let Err(error) = commit_v2_evidence(sidecar, physical, &grant.grant_id)
+                    {
+                        eprintln!(
+                            "source evidence acceptance debt {}: {error}",
+                            grant.grant_id
+                        );
                     }
                     if sidecar
                         .read_source_evidence(&grant)

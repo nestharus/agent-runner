@@ -349,9 +349,9 @@ fn assert_postcommit_source_physical_after_owner(
             .unwrap()
             .read_source_evidence(&record.grant)
             .unwrap()
-            .is_some()
+            .is_some_and(|row| row.phase == if completed_v2 { "accepted" } else { "unknown" })
     });
-    let retained =
+    let mut retained =
         BrokerSidecar::open_existing(&broker_state.join("sidecar/pid-identity.db"), &broker_state)
             .unwrap();
     let evidence = retained
@@ -359,8 +359,8 @@ fn assert_postcommit_source_physical_after_owner(
         .unwrap()
         .unwrap();
     assert!(
-        matches!(evidence.phase.as_str(), "unknown" | "captured"),
-        "physical Q alone must not manufacture v2 acceptance: {evidence:?}"
+        matches!(evidence.phase.as_str(), "unknown" | "accepted"),
+        "physical Q and fresh State provenance must agree: {evidence:?}"
     );
     let reply_status = serde_json::from_slice::<serde_json::Value>(&output)
         .ok()
@@ -371,7 +371,93 @@ fn assert_postcommit_source_physical_after_owner(
     );
     if completed_v2 {
         assert_eq!(reply_status.as_deref(), Some("source_ready"));
-        assert_eq!(evidence.phase, "captured");
+        assert_eq!(evidence.phase, "accepted");
+        oulipoly_kernel_broker::source_acceptance::commit_v2_evidence(&mut retained, &physical, id)
+            .unwrap(); // exact retry after a lost acceptance response
+        let state_source: serde_json::Value = serde_json::from_slice(
+            &fs::read(broker_state.join("sidecar/state-source.json")).unwrap(),
+        )
+        .unwrap();
+        let original_state = rusqlite::Connection::open_with_flags(
+            state_source["path"].as_str().unwrap(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let original_count: i64 = original_state.query_row(
+            "SELECT count(*) FROM invocation_completion_exact_source_decisions WHERE registration_id=?1",
+            [&record.grant.candidate.registration_id], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(original_count, 1);
+        let original_row: (String, String, String, i64, i64) = original_state.query_row(
+            "SELECT registration_sha256,root_id,owner_generation,original_state_device,original_state_inode
+             FROM invocation_completion_exact_source_decisions WHERE registration_id=?1",
+            [&record.grant.candidate.registration_id],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
+        ).unwrap();
+        let provenance: (String, String, String, String, String, String, i64, i64) =
+            rusqlite::Connection::open_with_flags(
+                broker_state.join("sidecar/pid-identity.db"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap()
+            .query_row(
+                "SELECT registration_digest,caller_admission_id,source_generation,root_id,
+                 owner_generation,decision_id,state_device,state_inode
+                 FROM broker_exact_fresh_source_admission WHERE registration_id=?1",
+                [&record.grant.candidate.registration_id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(provenance.0, record.grant.candidate.registration_digest);
+        assert_eq!(
+            provenance.1,
+            retained
+                .read_consumed_source_candidate(&record.grant)
+                .unwrap()
+                .caller_admission_id()
+        );
+        assert_eq!(provenance.2, record.grant.source_generation);
+        assert_eq!(provenance.3, record.grant.root_id);
+        assert_eq!(provenance.4, record.grant.owner_generation);
+        assert!(!provenance.5.is_empty());
+        assert_eq!(provenance.6, state_source["device"].as_i64().unwrap());
+        assert_eq!(provenance.7, state_source["inode"].as_i64().unwrap());
+        assert_eq!(
+            original_row,
+            (
+                provenance.0.clone(),
+                provenance.3.clone(),
+                provenance.4.clone(),
+                provenance.6,
+                provenance.7,
+            )
+        );
+        let sidecar_counts: (i64, i64, i64, i64) = rusqlite::Connection::open_with_flags(
+            broker_state.join("sidecar/pid-identity.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap()
+        .query_row(
+            "SELECT (SELECT count(*) FROM broker_exact_source_projection),
+                    (SELECT count(*) FROM broker_exact_fresh_source_admission),
+                    (SELECT count(*) FROM broker_fresh_source_admission),
+                    (SELECT count(*) FROM broker_source_evidence WHERE phase='accepted')",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+        assert_eq!(sidecar_counts, (1, 1, 0, 1));
     } else {
         assert_eq!(reply_status.as_deref(), Some("pending"));
         assert_eq!(evidence.phase, "unknown");
@@ -416,6 +502,18 @@ fn assert_postcommit_source_physical_after_owner(
                 read_captured_v2_evidence(&retained, &physical, id).is_err(),
                 "{name} mutation kept captured custody"
             );
+            let mut retry = BrokerSidecar::open_existing(
+                &broker_state.join("sidecar/pid-identity.db"),
+                broker_state,
+            )
+            .unwrap();
+            assert!(
+                oulipoly_kernel_broker::source_acceptance::commit_v2_evidence(
+                    &mut retry, &physical, id,
+                )
+                .is_err(),
+                "{name} mutation passed accepted retry"
+            );
             fs::write(&path, original).unwrap();
             accepted();
         };
@@ -437,6 +535,19 @@ fn assert_postcommit_source_physical_after_owner(
         assert!(
             assess_v2_candidate(&retained, &physical, id).is_err(),
             "missing outcome was accepted"
+        );
+        assert!(
+            oulipoly_kernel_broker::source_acceptance::commit_v2_evidence(
+                &mut BrokerSidecar::open_existing(
+                    &broker_state.join("sidecar/pid-identity.db"),
+                    broker_state
+                )
+                .unwrap(),
+                &physical,
+                id,
+            )
+            .is_err(),
+            "missing outcome passed accepted retry"
         );
         fs::rename(&missing_path, &outcome_path).unwrap();
         let mut wrong_outcome: serde_json::Value =
@@ -467,10 +578,50 @@ fn assert_postcommit_source_physical_after_owner(
             read_captured_v2_evidence(&retained, &physical, id).is_err(),
             "copied registration inode kept captured custody"
         );
+        assert!(
+            oulipoly_kernel_broker::source_acceptance::commit_v2_evidence(
+                &mut BrokerSidecar::open_existing(
+                    &broker_state.join("sidecar/pid-identity.db"),
+                    broker_state
+                )
+                .unwrap(),
+                &physical,
+                id,
+            )
+            .is_err(),
+            "copied registration passed accepted retry"
+        );
         fs::remove_file(&original_registration).unwrap();
         fs::rename(&saved_registration, &original_registration).unwrap();
         assert_eq!(accepted(), candidate);
         read_captured_v2_evidence(&retained, &physical, id).unwrap();
+        let manifest_path = physical_dir.join(format!("{id}.evidence.json"));
+        let manifest = fs::read(&manifest_path).unwrap();
+        fs::write(&manifest_path, b"changed manifest").unwrap();
+        assert!(
+            oulipoly_kernel_broker::source_acceptance::commit_v2_evidence(
+                &mut BrokerSidecar::open_existing(
+                    &broker_state.join("sidecar/pid-identity.db"),
+                    broker_state
+                )
+                .unwrap(),
+                &physical,
+                id,
+            )
+            .is_err(),
+            "changed broker manifest passed accepted retry"
+        );
+        fs::write(&manifest_path, manifest).unwrap();
+        oulipoly_kernel_broker::source_acceptance::commit_v2_evidence(
+            &mut BrokerSidecar::open_existing(
+                &broker_state.join("sidecar/pid-identity.db"),
+                broker_state,
+            )
+            .unwrap(),
+            &physical,
+            id,
+        )
+        .unwrap();
     }
     // Missing, partial and contradictory retained witnesses cannot
     // authorize Q after the original actors are gone.
@@ -487,6 +638,21 @@ fn assert_postcommit_source_physical_after_owner(
             ..
         }
     ));
+    if completed_v2 {
+        assert!(
+            oulipoly_kernel_broker::source_acceptance::commit_v2_evidence(
+                &mut BrokerSidecar::open_existing(
+                    &broker_state.join("sidecar/pid-identity.db"),
+                    broker_state
+                )
+                .unwrap(),
+                &SourcePhysicalRegistry::open(&physical_dir).unwrap(),
+                id,
+            )
+            .is_err(),
+            "missing physical terminal passed accepted retry"
+        );
+    }
     fs::write(&terminal_path, &original).unwrap();
     let stderr_path = physical_dir.join(format!("{id}.stderr"));
     fs::write(&stderr_path, &errors[..errors.len() - 1]).unwrap();
@@ -1494,19 +1660,33 @@ fn inner() {
                     .unwrap();
             assert_eq!(intent["request"]["model"], "alias");
         }
-        assert_eq!(
-            fs::read_dir(&operations)
-                .unwrap()
+        let physical_k_count = || match fs::read_dir(&operations) {
+            Ok(entries) => entries
                 .filter_map(Result::ok)
                 .filter(|entry| entry.path().join("k.json").exists())
                 .count(),
-            if mode == "normal_model_provider_v3_quota_route_manual_refresh"
-                || mode == "normal_model_provider_v3_quota_route_manual_physical_refresh"
-            {
-                2
-            } else {
-                1
-            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => panic!("manual physical K directory read failed: {error}"),
+        };
+        let expected_k = if mode == "normal_model_provider_v3_quota_route_manual_refresh"
+            || mode == "normal_model_provider_v3_quota_route_manual_physical_refresh"
+        {
+            2
+        } else {
+            1
+        };
+        if matches!(
+            mode.as_str(),
+            "normal_model_provider_v3_quota_route_manual_pending"
+                | "normal_model_provider_v3_quota_route_manual_unknown"
+        ) {
+            // Pending quota work may persist physical K just after the CLI
+            // returns. A bounded wait still refuses a missing or extra K.
+            eventually(|| physical_k_count() == expected_k);
+        }
+        assert_eq!(
+            physical_k_count(),
+            expected_k,
             "manual call must spend one physical K per deliberate refresh"
         );
     }
@@ -5436,10 +5616,16 @@ fn inner() {
                     ))
                     .spawn()
                     .unwrap();
+                let fresh_socket = socket.with_file_name("v30.sock");
                 eventually(|| {
-                    socket.with_file_name("v30.sock").exists()
-                        && protocol::request_at(&socket, Operation::Classify).is_ok()
+                    broker.try_wait().unwrap().is_some()
+                        || protocol::request_at(&fresh_socket, Operation::ObserveEntryGate).is_ok()
                 });
+                assert!(
+                    broker.try_wait().unwrap().is_none(),
+                    "fresh broker restart: {}",
+                    fs::read_to_string(temp.path().join("handoff-restart.log")).unwrap()
+                );
                 fs::write(gate.join("child-retry"), b"yes").unwrap();
                 eventually(|| {
                     gate.join("child-retried").exists() || entry.try_wait().unwrap().is_some()
@@ -10174,7 +10360,7 @@ fn inner() {
                                     &grant_id
                                 )
                                 .is_err(),
-                                "re-admitted old v29 source has no fresh v30 authority"
+                                "re-admitted old v29 source has no exact H authority"
                             );
                             let reply: serde_json::Value = serde_json::from_slice(
                                 &fs::read(physical.join(format!("{grant_id}.stdout"))).unwrap(),

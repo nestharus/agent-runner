@@ -589,10 +589,12 @@ pub(in crate::mailbox) fn domain_on(conn: &Connection) -> Result<Option<String>,
     if !exists {
         return Ok(None);
     }
-    if super::schema::sidecar_version(conn)? == super::schema::BROKER_OWNED_VERSION {
-        validate_broker_schema_on(conn)?;
-    } else {
-        validate_schema_on(conn)?;
+    match super::schema::sidecar_version(conn)? {
+        33 => validate_broker_v33_schema_on(conn)?,
+        version if version == super::schema::BROKER_OWNED_VERSION => {
+            validate_broker_schema_on(conn)?
+        }
+        _ => validate_schema_on(conn)?,
     }
     conn.query_row("SELECT domain_id FROM completion_continuation_domain WHERE singleton=1 AND lineage='main-native-completion-v2'", [], |r| r.get(0)).optional().map_err(|e| e.to_string())
 }
@@ -633,6 +635,10 @@ pub(super) fn validate_broker_schema_on(conn: &Connection) -> Result<(), String>
 
 pub(super) fn validate_broker_v32_schema_on(conn: &Connection) -> Result<(), String> {
     validate_schema_version_on(conn, 32, true)
+}
+
+pub(super) fn validate_broker_v33_schema_on(conn: &Connection) -> Result<(), String> {
+    validate_schema_version_on(conn, 33, true)
 }
 
 // Historical v29 sources are still read for staged cutover. Their fingerprint

@@ -1415,19 +1415,21 @@ impl CompletionAuthorityFence<'_> {
         continuity: &CompletionContinuityHead,
         binding: &crate::completion_continuation::AdmittedSourceBinding,
     ) -> Result<CompletionEventRegistrationResult, String> {
-        self.register_completion_event_inner(input, continuity, Some(binding), None, None)
+        self.register_completion_event_inner(input, continuity, Some(binding), None, None, None)
     }
 
     pub(crate) fn register_exact_source_projection(
         self,
         input: CompletionEventRegistrationInput<'_>,
         projection: &crate::db::ExactSourceProjection,
+        provenance: Option<&broker_authority::ExactFreshSourceAdmission>,
     ) -> Result<CompletionEventRegistrationResult, String> {
         self.register_completion_event_inner(
             input,
             &projection.continuity,
             Some(&projection.binding),
             Some(projection),
+            provenance,
             None,
         )
     }
@@ -1463,7 +1465,7 @@ impl CompletionAuthorityFence<'_> {
         binding: Option<&crate::completion_continuation::AdmittedSourceBinding>,
         phases: &mut TransactionPhaseGuard<'_>,
     ) -> Result<CompletionEventRegistrationResult, String> {
-        self.register_completion_event_inner(input, continuity, binding, None, Some(phases))
+        self.register_completion_event_inner(input, continuity, binding, None, None, Some(phases))
     }
 
     fn register_completion_event_inner(
@@ -1472,6 +1474,7 @@ impl CompletionAuthorityFence<'_> {
         continuity: &CompletionContinuityHead,
         binding: Option<&crate::completion_continuation::AdmittedSourceBinding>,
         exact: Option<&crate::db::ExactSourceProjection>,
+        provenance: Option<&broker_authority::ExactFreshSourceAdmission>,
         mut phases: Option<&mut TransactionPhaseGuard<'_>>,
     ) -> Result<CompletionEventRegistrationResult, String> {
         let inserted = register_completion_event_on(&self.tx, &input, &now_rfc3339())?;
@@ -1518,6 +1521,40 @@ impl CompletionAuthorityFence<'_> {
                     ],
                 )
                 .map_err(|e| format!("exact source projection receipt conflict: {e}"))?;
+            if let Some(provenance) = provenance {
+                if provenance.registration_id != exact.registration_id
+                    || provenance.registration_digest != exact.registration_sha256
+                    || provenance.state_admission_id != exact.admission_id
+                    || provenance.caller_admission_id != exact.binding.caller_admission_id()
+                    || provenance.source_generation != exact.source_generation
+                    || provenance.sidecar_generation != exact.continuity.sidecar_generation
+                    || provenance.root_id != exact.root_id
+                    || provenance.owner_generation != exact.owner_generation
+                    || provenance.request_id != exact.request_id
+                    || provenance.decision_id != exact.decision_id
+                    || provenance.authority_ordinal != exact.continuity.authority_ordinal
+                {
+                    return Err("fresh provenance and exact State projection conflict".into());
+                }
+                self.tx.execute(
+                    "INSERT INTO broker_exact_fresh_source_admission
+                     (registration_id,registration_digest,state_admission_id,caller_admission_id,
+                      source_generation,sidecar_generation,root_id,owner_generation,state_device,state_inode,
+                      request_id,decision_id,authority_ordinal,projected_material)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                    params![
+                        provenance.registration_id, provenance.registration_digest,
+                        provenance.state_admission_id, provenance.caller_admission_id,
+                        provenance.source_generation, provenance.sidecar_generation,
+                        provenance.root_id, provenance.owner_generation,
+                        provenance.state_device, provenance.state_inode,
+                        provenance.request_id, provenance.decision_id,
+                        provenance.authority_ordinal, provenance.projected_material,
+                    ],
+                ).map_err(|e| format!("exact fresh admission provenance conflict: {e}"))?;
+            }
+        } else if provenance.is_some() {
+            return Err("fresh provenance requires exact source projection".into());
         }
         let result = completion_event_registration_on(&self.tx, input.event_id, inserted)?;
         if let Some(phases) = phases.as_mut() {

@@ -537,9 +537,8 @@ pub fn capture_and_stage_v2_evidence(
     result
 }
 
-/// The positive transition is closed on this lineage: there is no writer for
-/// fresh v30 admission provenance yet. Its CAS and exact readback exist so
-/// the fresh-lane integration can connect authority without importing v29.
+/// Accept only the exact captured bytes and independently projected fresh
+/// State admission. A lost response retries by verifying the accepted row.
 pub fn commit_v2_evidence(
     sidecar: &mut BrokerSidecar,
     physical: &SourcePhysicalRegistry,
@@ -551,7 +550,9 @@ pub fn commit_v2_evidence(
     let staged = sidecar
         .read_source_evidence(&grant)?
         .ok_or("source evidence stage absent")?;
-    if staged.phase != "captured" || staged.seal.as_ref() != Some(&expected) {
+    if !matches!(staged.phase.as_str(), "captured" | "accepted")
+        || staged.seal.as_ref() != Some(&expected)
+    {
         return Err("source evidence stage changed before commit".into());
     }
     let accepted = sidecar.commit_source_evidence_acceptance(&grant, &expected)?;
