@@ -5,6 +5,7 @@ use oulipoly_kernel_broker::RootRecord;
 use oulipoly_kernel_broker::protocol::{
     self, AcceptedWorkSpec, JoinSpec, Operation, ProcessWitness, SourceScope, SourceSocketWitness,
 };
+use oulipoly_kernel_broker::source_acceptance::{assess_v2_candidate, read_captured_v2_evidence};
 use oulipoly_kernel_broker::source_physical::{SourceObservation, SourcePhysicalRegistry};
 use oulipoly_state::completion_continuation::AdmittedSourceBinding;
 use oulipoly_state::mailbox::{
@@ -191,6 +192,7 @@ fn assert_postcommit_source_physical_after_owner(
     broker_state: &Path,
     gate: &Path,
     bash: &str,
+    completed_v2: bool,
 ) {
     // J, guardian and driver have exited. Reopen only the Broker's
     // retained one-use physical record after a Broker restart.
@@ -257,6 +259,43 @@ fn assert_postcommit_source_physical_after_owner(
     let registration_path = fs::read_to_string(gate.join("source-ready")).unwrap();
     let registration_bytes = fs::read(registration_path.trim()).unwrap();
     let registration: serde_json::Value = serde_json::from_slice(&registration_bytes).unwrap();
+    if completed_v2 {
+        let source_dir = Path::new(registration_path.trim()).parent().unwrap();
+        eventually(|| source_dir.join("completion-snapshot-v2.json").exists());
+        let outcome_bytes = fs::read(source_dir.join("source-outcome-v2.json")).unwrap();
+        let outcome: serde_json::Value = serde_json::from_slice(&outcome_bytes).unwrap();
+        let snapshot: serde_json::Value = serde_json::from_slice(
+            &fs::read(source_dir.join("completion-snapshot-v2.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(registration_path.trim()).unwrap(),
+            registration_bytes
+        );
+        assert_eq!(
+            outcome["registration_digest"],
+            record.grant.candidate.registration_digest
+        );
+        assert_eq!(outcome["registration_id"], registration["registration_id"]);
+        assert_eq!(outcome["observer"], registration["registering_caller"]);
+        assert_eq!(outcome["kind"], "exit_tree");
+        assert_eq!(outcome["original_tree_drained"], true);
+        assert_eq!(outcome["output_closed"], true);
+        assert_eq!(snapshot["status"], "completed");
+        assert_eq!(snapshot["rc"], 0);
+        assert_eq!(
+            snapshot["outcome_sha256"],
+            format!("{:x}", Sha256::digest(&outcome_bytes))
+        );
+        assert_eq!(snapshot["outcome_byte_len"], outcome_bytes.len());
+        let selected = fs::read(source_dir.join("completion-output-v2.bin")).unwrap();
+        assert_eq!(
+            snapshot["output"]["sha256"],
+            format!("{:x}", Sha256::digest(&selected))
+        );
+        assert_eq!(snapshot["output"]["byte_len"], selected.len());
+        assert_eq!(selected, fs::read(source_dir.join("log")).unwrap());
+    }
     assert_eq!(
         registration["recovery"]["sha256"],
         format!("{:x}", Sha256::digest(fs::read(bash).unwrap()))
@@ -330,6 +369,13 @@ fn assert_postcommit_source_physical_after_owner(
         "age319 real H-W-Q: grant={} worker_wait={} stdout={} stderr={} reply_status={:?} evidence_phase={}",
         id, worker_wait_status, stdout.byte_len, stderr.byte_len, reply_status, evidence.phase
     );
+    if completed_v2 {
+        assert_eq!(reply_status.as_deref(), Some("source_ready"));
+        assert_eq!(evidence.phase, "captured");
+    } else {
+        assert_eq!(reply_status.as_deref(), Some("pending"));
+        assert_eq!(evidence.phase, "unknown");
+    }
     let source_phase: String = rusqlite::Connection::open_with_flags(
         broker_state.join("sidecar/pid-identity.db"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -342,6 +388,90 @@ fn assert_postcommit_source_physical_after_owner(
     )
     .unwrap();
     assert_eq!(source_phase, "registered");
+    if completed_v2 {
+        let source_dir = Path::new(registration_path.trim()).parent().unwrap();
+        let accepted = || {
+            assess_v2_candidate(&retained, &physical, id)
+                .expect("exact completed Bash source must remain assessable")
+        };
+        let candidate = accepted();
+        assert_eq!(
+            candidate.snapshot_sha256,
+            evidence.seal.as_ref().unwrap().snapshot_sha256
+        );
+        assert_eq!(
+            candidate.outcome_sha256,
+            evidence.seal.as_ref().unwrap().outcome_sha256
+        );
+        read_captured_v2_evidence(&retained, &physical, id).unwrap();
+        let reject_change = |name: &str, changed: Vec<u8>| {
+            let path = source_dir.join(name);
+            let original = fs::read(&path).unwrap();
+            fs::write(&path, changed).unwrap();
+            assert!(
+                assess_v2_candidate(&retained, &physical, id).is_err(),
+                "{name} mutation was accepted"
+            );
+            assert!(
+                read_captured_v2_evidence(&retained, &physical, id).is_err(),
+                "{name} mutation kept captured custody"
+            );
+            fs::write(&path, original).unwrap();
+            accepted();
+        };
+        let mut wrong_registration = registration.clone();
+        wrong_registration["helper"]["sha256"] = serde_json::json!("0".repeat(64));
+        reject_change(
+            "source-registration-v2.json",
+            serde_json::to_vec(&wrong_registration).unwrap(),
+        );
+        let mut wrong_worker = registration.clone();
+        wrong_worker["registering_caller"]["pid"] = serde_json::json!(0);
+        reject_change(
+            "source-registration-v2.json",
+            serde_json::to_vec(&wrong_worker).unwrap(),
+        );
+        let outcome_path = source_dir.join("source-outcome-v2.json");
+        let missing_path = source_dir.join("source-outcome-v2.missing-test");
+        fs::rename(&outcome_path, &missing_path).unwrap();
+        assert!(
+            assess_v2_candidate(&retained, &physical, id).is_err(),
+            "missing outcome was accepted"
+        );
+        fs::rename(&missing_path, &outcome_path).unwrap();
+        let mut wrong_outcome: serde_json::Value =
+            serde_json::from_slice(&fs::read(&outcome_path).unwrap()).unwrap();
+        wrong_outcome["observer"]["pid"] = serde_json::json!(0);
+        reject_change(
+            "source-outcome-v2.json",
+            serde_json::to_vec(&wrong_outcome).unwrap(),
+        );
+        let mut wrong_snapshot: serde_json::Value = serde_json::from_slice(
+            &fs::read(source_dir.join("completion-snapshot-v2.json")).unwrap(),
+        )
+        .unwrap();
+        wrong_snapshot["status"] = serde_json::json!("ready");
+        reject_change(
+            "completion-snapshot-v2.json",
+            serde_json::to_vec(&wrong_snapshot).unwrap(),
+        );
+        reject_change(
+            "completion-output-v2.bin",
+            b"changed selected output".to_vec(),
+        );
+        let original_registration = source_dir.join("source-registration-v2.json");
+        let saved_registration = source_dir.join("source-registration-v2.copy-test-original");
+        fs::rename(&original_registration, &saved_registration).unwrap();
+        fs::copy(&saved_registration, &original_registration).unwrap();
+        assert!(
+            read_captured_v2_evidence(&retained, &physical, id).is_err(),
+            "copied registration inode kept captured custody"
+        );
+        fs::remove_file(&original_registration).unwrap();
+        fs::rename(&saved_registration, &original_registration).unwrap();
+        assert_eq!(accepted(), candidate);
+        read_captured_v2_evidence(&retained, &physical, id).unwrap();
+    }
     // Missing, partial and contradictory retained witnesses cannot
     // authorize Q after the original actors are gone.
     let terminal_path = physical_dir.join(format!("{id}.terminal.json"));
@@ -521,7 +651,9 @@ fn inner() {
         "native_cancel" | "native_drain" | "native_receipt_cancel" | "native_receipt_drain"
     );
     let release_mode = mode.starts_with("held_release") || native_mode;
-    let postcommit_source = mode == "normal_handoff_pre_k_h_source_postcommit_w";
+    let completed_v2_source = mode == "normal_handoff_pre_k_h_source_postcommit_w_v2";
+    let postcommit_source =
+        mode == "normal_handoff_pre_k_h_source_postcommit_w" || completed_v2_source;
     let production_source =
         mode == "normal_handoff_pre_k_h_source_registration_cli" || postcommit_source;
     let bad_disposition = mode == "normal_empty_bad_disposition";
@@ -542,6 +674,7 @@ fn inner() {
                 | "normal_handoff_pre_k_h_source"
                 | "normal_handoff_pre_k_h_source_registration_cli"
                 | "normal_handoff_pre_k_h_source_postcommit_w"
+                | "normal_handoff_pre_k_h_source_postcommit_w_v2"
                 | "normal_handoff_fsync"
                 | "normal_handoff_effect_reply_loss"
                 | "normal_help"
@@ -577,6 +710,9 @@ fn inner() {
     fs::set_permissions(&broker_state, fs::Permissions::from_mode(0o700)).unwrap();
     fs::create_dir(&gate).unwrap();
     fs::set_permissions(&gate, fs::Permissions::from_mode(0o700)).unwrap();
+    if completed_v2_source {
+        fs::write(gate.join("source-v2-workload"), b"selected").unwrap();
+    }
     if let Some((invocation, session, capability)) = &source_witness {
         fs::write(
             gate.join("source-witness-request"),
@@ -1701,6 +1837,7 @@ fn inner() {
                 "AGE319_PRIVATE_SOURCE_Q_MARKER_V1",
                 gate.join("source-adopted-started"),
             )))
+            .envs(completed_v2_source.then_some(("AGE319_PRIVATE_V2_WAIT_SOURCE_V1", "1")))
             .envs(bad_disposition.then_some(("AGE319_PRIVATE_BAD_DISPOSITION_ROOT_V1", "1")))
             .envs(
                 (mode == "normal_bash_source_lost_reply")
@@ -2202,6 +2339,27 @@ fn inner() {
                         grant["sealed_helper"]["sha256"]
                     );
                     let worker_dir = registration_path.parent().unwrap();
+                    if completed_v2_source {
+                        let k_meta: serde_json::Value = serde_json::from_slice(
+                            &fs::read(worker_dir.join("meta.json")).unwrap(),
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            intent["argv"],
+                            serde_json::json!(["/bin/true", "selected workload"])
+                        );
+                        assert_eq!(k_meta["argv"], intent["argv"]);
+                        for name in [
+                            "source-outcome-v2.json",
+                            "completion-snapshot-v2.json",
+                            "completion-output-v2.bin",
+                        ] {
+                            assert!(
+                                !worker_dir.join(name).exists(),
+                                "{name} preceded exact H registration"
+                            );
+                        }
+                    }
                     let h_env: std::collections::BTreeMap<String, String> = serde_json::from_slice(
                         &fs::read(h_dir.join("delivery-helper-environment.json")).unwrap(),
                     )
@@ -2921,6 +3079,7 @@ fn inner() {
                             &broker_state,
                             &gate,
                             bash.as_ref().unwrap(),
+                            completed_v2_source,
                         );
                     });
                     stop(&mut restarted);
@@ -12511,6 +12670,7 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_handoff_pre_k_h_source",
         "normal_handoff_pre_k_h_source_registration_cli",
         "normal_handoff_pre_k_h_source_postcommit_w",
+        "normal_handoff_pre_k_h_source_postcommit_w_v2",
         "normal_handoff_fsync",
         "normal_handoff_effect_reply_loss",
         "normal_help",
@@ -12735,7 +12895,7 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
-        if mode == "normal_handoff_pre_k_h_source_postcommit_w"
+        if mode.starts_with("normal_handoff_pre_k_h_source_postcommit_w")
             || mode == "normal_model_provider_pty_physical"
             || mode == "normal_model_provider_pty_physical_resident_tail"
             || mode == "normal_model_provider_pty_physical_resident_bash_notify"
