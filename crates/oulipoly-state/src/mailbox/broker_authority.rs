@@ -4,6 +4,7 @@
 use super::*;
 use crate::StateDb;
 use crate::db::ExactSourceProjection;
+use base64::Engine as _;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Component;
@@ -268,6 +269,83 @@ pub struct BrokerSourceEvidenceReadback {
     pub seal: Option<BrokerSourceEvidenceSeal>,
     pub phase: String,
     pub revision: i64,
+}
+
+/// Broker's exact source-custody acceptance. The seal names the root-only
+/// manifest containing the original snapshot/outcome bytes and selected raw
+/// artifact. This is not a notification payload or recipient publication.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BrokerCompletionSourceAcceptance {
+    pub protocol: String,
+    pub grant_id: String,
+    pub registration_id: String,
+    pub registration_digest: String,
+    pub source_generation: String,
+    pub root_id: String,
+    pub owner_generation: String,
+    pub state_admission_id: String,
+    pub evidence_seal: BrokerSourceEvidenceSeal,
+    pub selected_output: serde_json::Value,
+    pub owned_artifact: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BrokerSourceRetentionRelease {
+    pub protocol: String,
+    pub grant_id: String,
+    pub registration_id: String,
+    pub source_generation: String,
+    pub root_id: String,
+    pub owner_generation: String,
+    pub acceptance_sha256: String,
+}
+
+fn verify_acceptance_manifest_material(
+    grant: &BrokerSourceEffectGrant,
+    receipt: &BrokerCompletionSourceAcceptance,
+    manifest_bytes: &[u8],
+) -> Result<(), String> {
+    let seal = &receipt.evidence_seal;
+    if manifest_bytes.len() as u64 != seal.manifest_byte_len
+        || crate::completion_continuation::sha256(manifest_bytes) != seal.manifest_sha256
+    {
+        return Err("accepted Broker manifest bytes differ from evidence seal".into());
+    }
+    let manifest: serde_json::Value =
+        serde_json::from_slice(manifest_bytes).map_err(|e| e.to_string())?;
+    if manifest["version"] != 1
+        || manifest["grant"] != serde_json::to_value(grant).map_err(|e| e.to_string())?
+    {
+        return Err("accepted Broker manifest grant changed".into());
+    }
+    let decode = |name: &str| -> Result<Vec<u8>, String> {
+        let encoded = manifest[name]
+            .as_str()
+            .ok_or("Broker manifest bytes absent")?;
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|e| e.to_string())
+    };
+    let registration = decode("registration")?;
+    let snapshot = decode("snapshot")?;
+    let outcome = decode("outcome")?;
+    let selected: serde_json::Value =
+        serde_json::from_slice(&snapshot).map_err(|e| e.to_string())?;
+    if crate::completion_continuation::sha256(&registration) != receipt.registration_digest
+        || crate::completion_continuation::sha256(&snapshot) != seal.snapshot_sha256
+        || crate::completion_continuation::sha256(&outcome) != seal.outcome_sha256
+        || selected["output"] != receipt.selected_output
+        || manifest["artifact_owned"]
+            != receipt
+                .owned_artifact
+                .clone()
+                .unwrap_or(serde_json::Value::Null)
+    {
+        return Err("selected Broker source material differs from sealed manifest".into());
+    }
+    Ok(())
 }
 
 /// A positive-only inventory of the retained broker's source-effect ledger.
@@ -1721,6 +1799,16 @@ impl BrokerSidecar {
         Ok(retained)
     }
 
+    pub fn bound_exact_fresh_source_admission(
+        &self,
+        grant: &BrokerSourceEffectGrant,
+        binding: &crate::completion_continuation::AdmittedSourceBinding,
+    ) -> Result<String, String> {
+        Ok(self
+            .require_exact_fresh_source_admission(grant, binding)?
+            .state_admission_id)
+    }
+
     pub fn read_source_evidence(
         &self,
         grant: &BrokerSourceEffectGrant,
@@ -1935,6 +2023,235 @@ impl BrokerSidecar {
             return Err("accepted source evidence readback conflict".into());
         }
         Ok(after)
+    }
+
+    fn read_completion_source_acceptance(
+        &self,
+        grant: &BrokerSourceEffectGrant,
+    ) -> Result<Option<(BrokerCompletionSourceAcceptance, String)>, String> {
+        self.check_mailbox_read(&grant.source_generation)?;
+        let row: Option<(String, String, String, String, String)> = self
+            .mailbox
+            .conn
+            .query_row(
+                "SELECT registration_id,grant_id,source_generation,receipt_json,receipt_sha256
+                 FROM broker_completion_source_acceptance WHERE registration_id=?1",
+                [&grant.candidate.registration_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        row.map(|(registration, grant_id, generation, json, digest)| {
+            let receipt: BrokerCompletionSourceAcceptance =
+                serde_json::from_str(&json).map_err(|e| e.to_string())?;
+            if registration != grant.candidate.registration_id
+                || grant_id != grant.grant_id
+                || generation != grant.source_generation
+                || receipt.registration_id != registration
+                || receipt.grant_id != grant_id
+                || receipt.source_generation != generation
+                || digest != crate::completion_continuation::sha256(json.as_bytes())
+            {
+                return Err("broker completion source acceptance readback conflict".into());
+            }
+            Ok((receipt, digest))
+        })
+        .transpose()
+    }
+
+    /// Accept the exact captured source after the independently accepted
+    /// evidence and fresh consumed-H State decision. The caller must verify
+    /// the root-only manifest and original files before and after this write.
+    /// The ordinary completion source projection remains registered; no
+    /// notification payload or recipient row is materialized here.
+    pub fn accept_captured_completion_source(
+        &mut self,
+        grant: &BrokerSourceEffectGrant,
+        receipt: &BrokerCompletionSourceAcceptance,
+        manifest_bytes: &[u8],
+    ) -> Result<String, String> {
+        let binding = self.read_consumed_source_candidate(grant)?;
+        let provenance = self.require_exact_fresh_source_admission(grant, &binding)?;
+        let evidence = self
+            .read_source_evidence(grant)?
+            .ok_or("broker source evidence absent")?;
+        if receipt.protocol != "broker-completion-source-acceptance-v1"
+            || receipt.grant_id != grant.grant_id
+            || receipt.registration_id != grant.candidate.registration_id
+            || receipt.registration_digest != binding.registration_digest()
+            || receipt.source_generation != grant.source_generation
+            || receipt.root_id != grant.root_id
+            || receipt.owner_generation != grant.owner_generation
+            || receipt.state_admission_id != provenance.state_admission_id
+            || evidence.phase != "accepted"
+            || evidence.revision != 2
+            || evidence.seal.as_ref() != Some(&receipt.evidence_seal)
+            || receipt.selected_output.is_null()
+        {
+            return Err("broker completion source acceptance authority conflict".into());
+        }
+        verify_acceptance_manifest_material(grant, receipt, manifest_bytes)?;
+        let source = binding.registration()?;
+        let retained: Option<(Vec<u8>, String, Option<String>)> = self
+            .mailbox
+            .conn
+            .query_row(
+                "SELECT binding,phase,snapshot_sha256 FROM completion_continuation_source
+             WHERE registration_id=?1 AND domain_id=?2 AND source_id=?3 AND event_id=?4",
+                params![
+                    source.registration_id,
+                    source.domain_id,
+                    source.source_id,
+                    source.handle
+                ],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let encoded_binding = binding.encoded()?;
+        if !retained.is_some_and(|(bytes, phase, snapshot)| {
+            bytes == encoded_binding && phase == "registered" && snapshot.is_none()
+        }) {
+            return Err("original completion source projection changed".into());
+        }
+        let json = serde_json::to_string(receipt).map_err(|e| e.to_string())?;
+        let digest = crate::completion_continuation::sha256(json.as_bytes());
+        if let Some((prior, prior_digest)) = self.read_completion_source_acceptance(grant)? {
+            return if prior == *receipt && prior_digest == digest {
+                Ok(digest)
+            } else {
+                Err("immutable broker completion source acceptance conflict".into())
+            };
+        }
+        let changed = self
+            .mailbox
+            .conn
+            .execute(
+                "INSERT INTO broker_completion_source_acceptance
+             (registration_id,grant_id,source_generation,receipt_json,receipt_sha256)
+             SELECT ?1,?2,?3,?4,?5 WHERE
+               EXISTS(SELECT 1 FROM broker_source_evidence e WHERE e.grant_id=?2
+                 AND e.registration_id=?1 AND e.source_generation=?3 AND e.phase='accepted'
+                 AND e.revision=2 AND e.seal_json=?6)
+               AND EXISTS(SELECT 1 FROM broker_exact_fresh_source_admission a
+                 WHERE a.registration_id=?1 AND a.source_generation=?3
+                 AND a.state_admission_id=?7 AND a.registration_digest=?8
+                 AND a.root_id=?9 AND a.owner_generation=?10)
+               AND EXISTS(SELECT 1 FROM completion_continuation_source s
+                 WHERE s.registration_id=?1 AND s.binding=?11 AND s.phase='registered'
+                 AND s.snapshot_sha256 IS NULL)",
+                params![
+                    receipt.registration_id,
+                    receipt.grant_id,
+                    receipt.source_generation,
+                    json,
+                    digest,
+                    serde_json::to_string(&receipt.evidence_seal).map_err(|e| e.to_string())?,
+                    receipt.state_admission_id,
+                    receipt.registration_digest,
+                    receipt.root_id,
+                    receipt.owner_generation,
+                    binding.encoded()?
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        if changed != 1
+            || self.read_completion_source_acceptance(grant)?
+                != Some((receipt.clone(), digest.clone()))
+        {
+            return Err("broker completion source acceptance commit/readback failed".into());
+        }
+        Ok(digest)
+    }
+
+    pub fn read_source_retention_release(
+        &self,
+        grant: &BrokerSourceEffectGrant,
+    ) -> Result<Option<(BrokerSourceRetentionRelease, String)>, String> {
+        self.check_mailbox_read(&grant.source_generation)?;
+        let row: Option<(String,String,String,String,String,String)> = self.mailbox.conn.query_row(
+            "SELECT registration_id,grant_id,source_generation,acceptance_sha256,receipt_json,receipt_sha256
+             FROM broker_source_retention_release WHERE registration_id=?1",
+            [&grant.candidate.registration_id],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)),
+        ).optional().map_err(|e|e.to_string())?;
+        row.map(
+            |(registration, grant_id, generation, acceptance, json, digest)| {
+                let receipt: BrokerSourceRetentionRelease =
+                    serde_json::from_str(&json).map_err(|e| e.to_string())?;
+                if registration != grant.candidate.registration_id
+                    || grant_id != grant.grant_id
+                    || generation != grant.source_generation
+                    || receipt.registration_id != registration
+                    || receipt.grant_id != grant_id
+                    || receipt.source_generation != generation
+                    || receipt.acceptance_sha256 != acceptance
+                    || digest != crate::completion_continuation::sha256(json.as_bytes())
+                {
+                    return Err("broker source retention release readback conflict".into());
+                }
+                Ok((receipt, digest))
+            },
+        )
+        .transpose()
+    }
+
+    /// A distinct durable Broker release decision. Bash receives no receipt
+    /// from this call, so its source reaping gate remains closed.
+    pub fn decide_source_retention_release(
+        &mut self,
+        grant: &BrokerSourceEffectGrant,
+        acceptance: &BrokerCompletionSourceAcceptance,
+    ) -> Result<BrokerSourceRetentionRelease, String> {
+        let binding = self.read_consumed_source_candidate(grant)?;
+        let provenance = self.require_exact_fresh_source_admission(grant, &binding)?;
+        let (retained, acceptance_digest) = self
+            .read_completion_source_acceptance(grant)?
+            .ok_or("broker completion source acceptance absent")?;
+        let evidence = self
+            .read_source_evidence(grant)?
+            .ok_or("broker source evidence absent")?;
+        if retained != *acceptance
+            || retained.state_admission_id != provenance.state_admission_id
+            || evidence.phase != "accepted"
+            || evidence.seal.as_ref() != Some(&retained.evidence_seal)
+        {
+            return Err("broker source retention release authority conflict".into());
+        }
+        let receipt = BrokerSourceRetentionRelease {
+            protocol: "broker-source-retention-release-v1".into(),
+            grant_id: grant.grant_id.clone(),
+            registration_id: grant.candidate.registration_id.clone(),
+            source_generation: grant.source_generation.clone(),
+            root_id: grant.root_id.clone(),
+            owner_generation: grant.owner_generation.clone(),
+            acceptance_sha256: acceptance_digest.clone(),
+        };
+        let json = serde_json::to_string(&receipt).map_err(|e| e.to_string())?;
+        let digest = crate::completion_continuation::sha256(json.as_bytes());
+        if let Some((prior, prior_digest)) = self.read_source_retention_release(grant)? {
+            return if prior == receipt && prior_digest == digest {
+                Ok(receipt)
+            } else {
+                Err("immutable broker source release conflict".into())
+            };
+        }
+        let changed = self.mailbox.conn.execute(
+            "INSERT INTO broker_source_retention_release
+             (registration_id,grant_id,source_generation,acceptance_sha256,receipt_json,receipt_sha256)
+             SELECT ?1,?2,?3,?4,?5,?6 WHERE EXISTS(
+               SELECT 1 FROM broker_completion_source_acceptance a
+               WHERE a.registration_id=?1 AND a.grant_id=?2 AND a.source_generation=?3
+                 AND a.receipt_sha256=?4 AND a.receipt_json=?7)",
+            params![receipt.registration_id,receipt.grant_id,receipt.source_generation,
+                receipt.acceptance_sha256,json,digest,serde_json::to_string(acceptance).map_err(|e|e.to_string())?],
+        ).map_err(|e|e.to_string())?;
+        if changed != 1
+            || self.read_source_retention_release(grant)? != Some((receipt.clone(), digest))
+        {
+            return Err("broker source retention release commit/readback failed".into());
+        }
+        Ok(receipt)
     }
 
     /// One conditional irreversible transition. A lost reply cannot consume
@@ -3554,7 +3871,7 @@ fn open_with_owner(path: &Path, owner: u32, anchor: &Path) -> Result<BrokerSidec
         .map_err(|error| format!("Failed to open broker sidecar: {error}"))?;
     authority.validate_opened_target()?;
     configure_writable_sidecar_connection(&conn)?;
-    if matches!(schema::sidecar_version(&conn)?, 32 | 33) {
+    if matches!(schema::sidecar_version(&conn)?, 32 | 33 | 34) {
         schema::validate_broker_owned(&conn)?;
         // Serialize both additive upgrades on the retained connection. The
         // historical four-column provenance table remains inert at v34.
@@ -3577,6 +3894,20 @@ fn open_with_owner(path: &Path, owner: u32, anchor: &Path) -> Result<BrokerSidec
                 schema::BROKER_EXACT_FRESH_SOURCE_ADMISSION_SCHEMA,
                 schema::BROKER_EXACT_FRESH_SOURCE_ADMISSION_IMMUTABLE,
                 schema::BROKER_EXACT_FRESH_SOURCE_ADMISSION_RETAIN,
+            ] {
+                tx.execute_batch(definition).map_err(|e| e.to_string())?;
+            }
+            tx.pragma_update(None, "user_version", 34)
+                .map_err(|e| e.to_string())?;
+        }
+        if schema::sidecar_version(&tx)? == 34 {
+            for definition in [
+                schema::BROKER_COMPLETION_SOURCE_ACCEPTANCE_SCHEMA,
+                schema::BROKER_COMPLETION_SOURCE_ACCEPTANCE_IMMUTABLE,
+                schema::BROKER_COMPLETION_SOURCE_ACCEPTANCE_RETAIN,
+                schema::BROKER_SOURCE_RETENTION_RELEASE_SCHEMA,
+                schema::BROKER_SOURCE_RETENTION_RELEASE_IMMUTABLE,
+                schema::BROKER_SOURCE_RETENTION_RELEASE_RETAIN,
             ] {
                 tx.execute_batch(definition).map_err(|e| e.to_string())?;
             }
@@ -3662,6 +3993,12 @@ pub(super) fn activate_with_owner(
         schema::BROKER_EXACT_FRESH_SOURCE_ADMISSION_SCHEMA,
         schema::BROKER_EXACT_FRESH_SOURCE_ADMISSION_IMMUTABLE,
         schema::BROKER_EXACT_FRESH_SOURCE_ADMISSION_RETAIN,
+        schema::BROKER_COMPLETION_SOURCE_ACCEPTANCE_SCHEMA,
+        schema::BROKER_COMPLETION_SOURCE_ACCEPTANCE_IMMUTABLE,
+        schema::BROKER_COMPLETION_SOURCE_ACCEPTANCE_RETAIN,
+        schema::BROKER_SOURCE_RETENTION_RELEASE_SCHEMA,
+        schema::BROKER_SOURCE_RETENTION_RELEASE_IMMUTABLE,
+        schema::BROKER_SOURCE_RETENTION_RELEASE_RETAIN,
         schema::BROKER_OWNER_RELEASE_IMMUTABLE,
         schema::BROKER_OWNER_RELEASE_RETAIN,
         schema::BROKER_OWNER_RELEASE_EXACT,
@@ -3779,6 +4116,76 @@ fn check_storage(path: &Path, owner: u32, anchor: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sealed_manifest_controls_selected_source_material() {
+        use base64::Engine as _;
+        let registration = b"original registration";
+        let snapshot = br#"{"output":{"representation":"retained-output-v1","sha256":"original"}}"#;
+        let outcome = b"original outcome";
+        let grant = BrokerSourceEffectGrant {
+            grant_id: "grant".into(),
+            source_generation: "generation".into(),
+            root_id: "root".into(),
+            owner_generation: "owner".into(),
+            driver_identity: crate::completion_continuation::SourceProcessIdentity {
+                pid: 1,
+                boot_id: "boot".into(),
+                starttime_ticks: 1,
+            },
+            authority_ordinal: 1,
+            candidate: BrokerSourceCandidate {
+                registration_id: "registration".into(),
+                registration_digest: crate::completion_continuation::sha256(registration),
+                listener_revision: 1,
+                listener: crate::completion_continuation::ListenerIdentity {
+                    listener_id: "listener".into(),
+                    session_id: "session".into(),
+                    owner_invocation_uuid: "invocation".into(),
+                },
+            },
+            phase: "consumed".into(),
+            revision: 2,
+        };
+        let owned = serde_json::json!({"device":1,"inode":2,"byte_len":3,"sha256":"original"});
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "version":1,"grant":grant,
+            "registration":base64::engine::general_purpose::STANDARD.encode(registration),
+            "snapshot":base64::engine::general_purpose::STANDARD.encode(snapshot),
+            "outcome":base64::engine::general_purpose::STANDARD.encode(outcome),
+            "artifact_owned":owned,
+        }))
+        .unwrap();
+        let receipt = BrokerCompletionSourceAcceptance {
+            protocol: "broker-completion-source-acceptance-v1".into(),
+            grant_id: grant.grant_id.clone(),
+            registration_id: grant.candidate.registration_id.clone(),
+            registration_digest: grant.candidate.registration_digest.clone(),
+            source_generation: grant.source_generation.clone(),
+            root_id: grant.root_id.clone(),
+            owner_generation: grant.owner_generation.clone(),
+            state_admission_id: "state".into(),
+            evidence_seal: BrokerSourceEvidenceSeal {
+                manifest_sha256: crate::completion_continuation::sha256(&manifest),
+                manifest_device: 1,
+                manifest_inode: 2,
+                manifest_byte_len: manifest.len() as u64,
+                snapshot_sha256: crate::completion_continuation::sha256(snapshot),
+                outcome_sha256: crate::completion_continuation::sha256(outcome),
+                recovery_stdout_sha256: crate::completion_continuation::sha256(b"reply"),
+            },
+            selected_output: serde_json::json!({"representation":"retained-output-v1","sha256":"original"}),
+            owned_artifact: Some(owned),
+        };
+        verify_acceptance_manifest_material(&grant, &receipt, &manifest).unwrap();
+        let mut changed = receipt.clone();
+        changed.selected_output["sha256"] = "substituted".into();
+        assert!(verify_acceptance_manifest_material(&grant, &changed, &manifest).is_err());
+        changed = receipt.clone();
+        changed.owned_artifact = None;
+        assert!(verify_acceptance_manifest_material(&grant, &changed, &manifest).is_err());
+        assert!(verify_acceptance_manifest_material(&grant, &receipt, b"copied manifest").is_err());
+    }
     use crate::completion_continuation::{PROTOCOL, SourceProcessIdentity};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -5003,6 +5410,12 @@ mod tests {
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(
             "PRAGMA wal_autocheckpoint=0;
+             DROP TRIGGER broker_source_retention_release_immutable;
+             DROP TRIGGER broker_source_retention_release_retain;
+             DROP TABLE broker_source_retention_release;
+             DROP TRIGGER broker_completion_source_acceptance_immutable;
+             DROP TRIGGER broker_completion_source_acceptance_retain;
+             DROP TABLE broker_completion_source_acceptance;
              DROP TRIGGER broker_exact_fresh_source_admission_immutable;
              DROP TRIGGER broker_exact_fresh_source_admission_retain;
              DROP TABLE broker_exact_fresh_source_admission;
@@ -5017,7 +5430,7 @@ mod tests {
         assert_eq!(schema::sidecar_version(&conn).unwrap(), 32);
         let upgraded = open_with_owner(&path, uid, root.path()).unwrap();
         assert_eq!(upgraded.source_generation(), generation);
-        assert_eq!(schema::sidecar_version(&upgraded.mailbox.conn).unwrap(), 34);
+        assert_eq!(schema::sidecar_version(&upgraded.mailbox.conn).unwrap(), 35);
         let value: String = upgraded
             .mailbox
             .conn
@@ -5044,6 +5457,12 @@ mod tests {
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(
             "PRAGMA wal_autocheckpoint=0;
+             DROP TRIGGER broker_source_retention_release_immutable;
+             DROP TRIGGER broker_source_retention_release_retain;
+             DROP TABLE broker_source_retention_release;
+             DROP TRIGGER broker_completion_source_acceptance_immutable;
+             DROP TRIGGER broker_completion_source_acceptance_retain;
+             DROP TABLE broker_completion_source_acceptance;
              DROP TRIGGER broker_exact_fresh_source_admission_immutable;
              DROP TRIGGER broker_exact_fresh_source_admission_retain;
              DROP TABLE broker_exact_fresh_source_admission;
@@ -5055,7 +5474,7 @@ mod tests {
         assert_eq!(schema::sidecar_version(&conn).unwrap(), 33);
         let upgraded = open_with_owner(&path, uid, root.path()).unwrap();
         assert_eq!(upgraded.source_generation(), generation);
-        assert_eq!(schema::sidecar_version(&upgraded.mailbox.conn).unwrap(), 34);
+        assert_eq!(schema::sidecar_version(&upgraded.mailbox.conn).unwrap(), 35);
         let old: String = upgraded
             .mailbox
             .conn
@@ -5082,6 +5501,46 @@ mod tests {
             .query_row("SELECT value FROM retained_v33_wal", [], |r| r.get(0))
             .unwrap();
         assert_eq!(wal, "committed");
+        schema::validate_broker_owned(&upgraded.mailbox.conn).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_v34_upgrade_adds_separate_acceptance_and_release_without_losing_wal() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("sidecar");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join("pid-identity.db");
+        drop(MailboxDb::open(&path).unwrap());
+        for artifact in [path.clone(), mailbox_authority_path(&path)] {
+            fs::set_permissions(artifact, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let uid = unsafe { libc::geteuid() };
+        let generation = activate_with_owner(&path, uid, root.path()).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "PRAGMA wal_autocheckpoint=0;
+             DROP TRIGGER broker_source_retention_release_immutable;
+             DROP TRIGGER broker_source_retention_release_retain;
+             DROP TABLE broker_source_retention_release;
+             DROP TRIGGER broker_completion_source_acceptance_immutable;
+             DROP TRIGGER broker_completion_source_acceptance_retain;
+             DROP TABLE broker_completion_source_acceptance;
+             CREATE TABLE retained_v34_wal(value TEXT NOT NULL);
+             INSERT INTO retained_v34_wal VALUES('committed');
+             PRAGMA user_version=34;",
+        )
+        .unwrap();
+        let upgraded = open_with_owner(&path, uid, root.path()).unwrap();
+        assert_eq!(upgraded.source_generation(), generation);
+        assert_eq!(schema::sidecar_version(&upgraded.mailbox.conn).unwrap(), 35);
+        let value: String = upgraded
+            .mailbox
+            .conn
+            .query_row("SELECT value FROM retained_v34_wal", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(value, "committed");
         schema::validate_broker_owned(&upgraded.mailbox.conn).unwrap();
     }
 

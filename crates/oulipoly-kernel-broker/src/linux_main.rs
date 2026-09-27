@@ -70,7 +70,8 @@ use oulipoly_kernel_broker::protocol::{
 use oulipoly_kernel_broker::registry::{RootRecord, RootRegistry};
 use oulipoly_kernel_broker::root_drain;
 use oulipoly_kernel_broker::source_acceptance::{
-    capture_and_stage_v2_evidence, commit_v2_evidence,
+    accept_v2_completion_source, capture_and_stage_v2_evidence, commit_v2_evidence,
+    decide_v2_source_retention_release,
 };
 use oulipoly_kernel_broker::source_physical::{SourceObservation, SourcePhysicalRegistry};
 use oulipoly_kernel_broker::work_registry::{Scope, WorkRegistry, classify_scope};
@@ -3867,8 +3868,9 @@ fn encode_release_evidence(evidence: &BrokerReleaseEvidence) -> io::Result<Strin
 // Observe terminal receipts while this broker is serving as well as after a
 // restart. A source can finish after its W reply with no further socket
 // traffic, so capture cannot depend on a later caller request. An exact
-// independently admitted capture may advance Broker evidence to accepted;
-// completion source release, notification and ACK remain separate.
+// independently admitted capture may advance Broker evidence to accepted.
+// The source acceptance and Broker release decision are separate commits;
+// delivery of the release to Bash, notification and ACK remain closed.
 fn capture_terminal_sources(
     sidecar: &mut BrokerSidecar,
     physical: &SourcePhysicalRegistry,
@@ -3885,8 +3887,40 @@ fn capture_terminal_sources(
                         "source evidence acceptance debt {}: {error}",
                         grant.grant_id
                     );
+                    // A captured legacy row without fresh H provenance is
+                    // durable debt. A restart can reassess it; polling the
+                    // same immutable refusal every tick cannot promote it.
+                    pending.remove(&grant.grant_id);
+                    continue;
                 }
-                pending.remove(&grant.grant_id);
+                match sidecar.read_source_evidence(&grant) {
+                    Ok(Some(accepted)) if accepted.phase == "accepted" => {
+                        let result =
+                            accept_v2_completion_source(sidecar, physical, &grant.grant_id)
+                                .and_then(|_| {
+                                    decide_v2_source_retention_release(
+                                        sidecar,
+                                        physical,
+                                        &grant.grant_id,
+                                    )
+                                });
+                        match result {
+                            Ok(_) => {
+                                pending.remove(&grant.grant_id);
+                            }
+                            Err(error) => {
+                                eprintln!("source boundary debt {}: {error}", grant.grant_id)
+                            }
+                        }
+                    }
+                    Ok(Some(unknown)) if unknown.phase == "unknown" => {
+                        pending.remove(&grant.grant_id);
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        eprintln!("source boundary readback debt {}: {error}", grant.grant_id)
+                    }
+                }
             }
             Ok(None) => match physical.observe(&grant.grant_id) {
                 Ok(SourceObservation::Drained { .. }) => {
@@ -3905,12 +3939,8 @@ fn capture_terminal_sources(
                             grant.grant_id
                         );
                     }
-                    if sidecar
-                        .read_source_evidence(&grant)
-                        .is_ok_and(|row| row.is_some())
-                    {
-                        pending.remove(&grant.grant_id);
-                    }
+                    // Keep the grant in the bounded pending set until the
+                    // separate source and release decisions are durable.
                 }
                 Ok(SourceObservation::Unknown { .. }) | Err(_) => {
                     if let Err(error) = sidecar.retain_unknown_source_evidence(&grant) {

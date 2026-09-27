@@ -318,7 +318,7 @@ fn classify_completion_summary(summary: CompletionProtocolSummary) -> Option<&'s
 // v30 was assigned to the broker-owned sidecar. Keep that ordinal reserved so
 // an ordinary opener can never mistake an old broker cutover for an upgrade.
 pub(super) const CURRENT_VERSION: i64 = 31;
-pub(super) const BROKER_OWNED_VERSION: i64 = 34;
+pub(super) const BROKER_OWNED_VERSION: i64 = 35;
 const MAX_SUPPORTED_VERSION: i64 = CURRENT_VERSION;
 const SCHEMA_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -754,7 +754,7 @@ pub(super) fn validate_broker_owned(conn: &Connection) -> Result<String, String>
     if version == 30 {
         return Err("persisted broker-owned v30 sidecar requires separate disposition; in-place migration is unsupported".into());
     }
-    if version != 32 && version != 33 && version != BROKER_OWNED_VERSION {
+    if !matches!(version, 32 | 33 | 34 | BROKER_OWNED_VERSION) {
         return Err(format!(
             "broker sidecar requires schema version {BROKER_OWNED_VERSION}"
         ));
@@ -763,6 +763,8 @@ pub(super) fn validate_broker_owned(conn: &Connection) -> Result<String, String>
         super::completion_continuation::validate_broker_v32_schema_on(&tx)?;
     } else if version == 33 {
         super::completion_continuation::validate_broker_v33_schema_on(&tx)?;
+    } else if version == 34 {
+        super::completion_continuation::validate_broker_v34_schema_on(&tx)?;
     } else {
         super::completion_continuation::validate_broker_schema_on(&tx)?;
     }
@@ -861,7 +863,7 @@ pub(super) fn validate_broker_owned(conn: &Connection) -> Result<String, String>
             return Err("broker source evidence schema changed".into());
         }
     }
-    if version == BROKER_OWNED_VERSION {
+    if version >= 34 {
         for (name, expected) in [
             (
                 "broker_exact_fresh_source_admission",
@@ -885,6 +887,45 @@ pub(super) fn validate_broker_owned(conn: &Connection) -> Result<String, String>
                 .map_err(|e| format!("broker exact fresh admission schema missing: {e}"))?;
             if actual != expected {
                 return Err("broker exact fresh admission schema changed".into());
+            }
+        }
+    }
+    if version == BROKER_OWNED_VERSION {
+        for (name, expected) in [
+            (
+                "broker_completion_source_acceptance",
+                BROKER_COMPLETION_SOURCE_ACCEPTANCE_SCHEMA,
+            ),
+            (
+                "broker_completion_source_acceptance_immutable",
+                BROKER_COMPLETION_SOURCE_ACCEPTANCE_IMMUTABLE,
+            ),
+            (
+                "broker_completion_source_acceptance_retain",
+                BROKER_COMPLETION_SOURCE_ACCEPTANCE_RETAIN,
+            ),
+            (
+                "broker_source_retention_release",
+                BROKER_SOURCE_RETENTION_RELEASE_SCHEMA,
+            ),
+            (
+                "broker_source_retention_release_immutable",
+                BROKER_SOURCE_RETENTION_RELEASE_IMMUTABLE,
+            ),
+            (
+                "broker_source_retention_release_retain",
+                BROKER_SOURCE_RETENTION_RELEASE_RETAIN,
+            ),
+        ] {
+            let actual: String = tx
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE name=?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .map_err(|error| format!("broker source boundary schema missing: {error}"))?;
+            if actual != expected {
+                return Err("broker source boundary schema changed".into());
             }
         }
     }
@@ -1111,6 +1152,43 @@ pub(super) const BROKER_EXACT_FRESH_SOURCE_ADMISSION_RETAIN: &str =
     "CREATE TRIGGER broker_exact_fresh_source_admission_retain
 BEFORE DELETE ON broker_exact_fresh_source_admission
 BEGIN SELECT RAISE(ABORT,'exact fresh source admission must be retained'); END";
+
+// These are separate from notification publication and the legacy source row.
+// The acceptance holds a digest-bound description of the original selected
+// bytes in Broker custody; release is a later, separately committed decision.
+pub(super) const BROKER_COMPLETION_SOURCE_ACCEPTANCE_SCHEMA: &str =
+    "CREATE TABLE broker_completion_source_acceptance (
+    registration_id TEXT PRIMARY KEY REFERENCES broker_exact_fresh_source_admission(registration_id),
+    grant_id TEXT NOT NULL UNIQUE REFERENCES broker_source_effect_grant(grant_id),
+    source_generation TEXT NOT NULL,
+    receipt_json TEXT NOT NULL,
+    receipt_sha256 TEXT NOT NULL
+)";
+pub(super) const BROKER_COMPLETION_SOURCE_ACCEPTANCE_IMMUTABLE: &str =
+    "CREATE TRIGGER broker_completion_source_acceptance_immutable
+BEFORE UPDATE ON broker_completion_source_acceptance
+BEGIN SELECT RAISE(ABORT,'broker completion source acceptance immutable'); END";
+pub(super) const BROKER_COMPLETION_SOURCE_ACCEPTANCE_RETAIN: &str =
+    "CREATE TRIGGER broker_completion_source_acceptance_retain
+BEFORE DELETE ON broker_completion_source_acceptance
+BEGIN SELECT RAISE(ABORT,'broker completion source acceptance retained'); END";
+pub(super) const BROKER_SOURCE_RETENTION_RELEASE_SCHEMA: &str =
+    "CREATE TABLE broker_source_retention_release (
+    registration_id TEXT PRIMARY KEY REFERENCES broker_completion_source_acceptance(registration_id),
+    grant_id TEXT NOT NULL UNIQUE,
+    source_generation TEXT NOT NULL,
+    acceptance_sha256 TEXT NOT NULL,
+    receipt_json TEXT NOT NULL,
+    receipt_sha256 TEXT NOT NULL
+)";
+pub(super) const BROKER_SOURCE_RETENTION_RELEASE_IMMUTABLE: &str =
+    "CREATE TRIGGER broker_source_retention_release_immutable
+BEFORE UPDATE ON broker_source_retention_release
+BEGIN SELECT RAISE(ABORT,'broker source retention release immutable'); END";
+pub(super) const BROKER_SOURCE_RETENTION_RELEASE_RETAIN: &str =
+    "CREATE TRIGGER broker_source_retention_release_retain
+BEFORE DELETE ON broker_source_retention_release
+BEGIN SELECT RAISE(ABORT,'broker source retention release retained'); END";
 
 pub(super) const BROKER_SOURCE_EVIDENCE_UPDATE_GUARD: &str =
     "CREATE TRIGGER broker_source_evidence_update_guard

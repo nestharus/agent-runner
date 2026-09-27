@@ -5,7 +5,10 @@ use oulipoly_state::completion_continuation::{
     CompletionOutput, MAX_REGISTRATION_BYTES, OutputArtifact, VerifiedCompletion,
     copy_verified_raw, open_source_file, open_source_output, require_unchanged_output, sha256,
 };
-use oulipoly_state::mailbox::{BrokerSidecar, BrokerSourceEffectGrant, BrokerSourceEvidenceSeal};
+use oulipoly_state::mailbox::{
+    BrokerCompletionSourceAcceptance, BrokerSidecar, BrokerSourceEffectGrant,
+    BrokerSourceEvidenceSeal, BrokerSourceRetentionRelease,
+};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -191,6 +194,8 @@ struct Evidence {
 pub struct CapturedSourceEvidence {
     pub candidate: SourceV2Candidate,
     pub manifest: FileIdentity,
+    pub selected_output: serde_json::Value,
+    pub owned_artifact: Option<FileIdentity>,
 }
 
 fn record<'a>(
@@ -491,6 +496,9 @@ pub fn read_captured_v2_evidence(
             recovery_stdout_sha256: stdout.sha256,
         },
         manifest: stamp,
+        selected_output: serde_json::to_value(&verified.snapshot.output)
+            .map_err(|e| e.to_string())?,
+        owned_artifact: captured.artifact_owned.clone(),
     };
     if let Some(row) = sidecar.read_source_evidence(&held.grant)?
         && (!matches!(row.phase.as_str(), "captured" | "accepted")
@@ -563,6 +571,74 @@ pub fn commit_v2_evidence(
         return Err("source evidence changed across commit readback".into());
     }
     Ok(())
+}
+
+fn accepted_source_receipt(
+    sidecar: &BrokerSidecar,
+    physical: &SourcePhysicalRegistry,
+    id: &str,
+) -> Result<(BrokerSourceEffectGrant, BrokerCompletionSourceAcceptance), String> {
+    let captured = read_captured_v2_evidence(sidecar, physical, id)?;
+    let grant = record(physical, id)?.grant.clone();
+    let binding = sidecar.read_consumed_source_candidate(&grant)?;
+    let state = sidecar.bound_exact_fresh_source_admission(&grant, &binding)?;
+    let receipt = BrokerCompletionSourceAcceptance {
+        protocol: "broker-completion-source-acceptance-v1".into(),
+        grant_id: grant.grant_id.clone(),
+        registration_id: grant.candidate.registration_id.clone(),
+        registration_digest: binding.registration_digest().into(),
+        source_generation: grant.source_generation.clone(),
+        root_id: grant.root_id.clone(),
+        owner_generation: grant.owner_generation.clone(),
+        state_admission_id: state,
+        evidence_seal: seal(&captured),
+        selected_output: captured.selected_output,
+        owned_artifact: captured
+            .owned_artifact
+            .map(|stamp| serde_json::to_value(stamp).expect("file identity serializes")),
+    };
+    Ok((grant, receipt))
+}
+
+/// The first durable source boundary. Reassessment is required even on an
+/// exact retry; a copied row or changed original files are never authority.
+pub fn accept_v2_completion_source(
+    sidecar: &mut BrokerSidecar,
+    physical: &SourcePhysicalRegistry,
+    id: &str,
+) -> Result<BrokerCompletionSourceAcceptance, String> {
+    let (grant, receipt) = accepted_source_receipt(sidecar, physical, id)?;
+    let manifest = physical
+        .read_witness(id, "evidence.json", MAX_MANIFEST)
+        .map_err(|e| e.to_string())?;
+    sidecar.accept_captured_completion_source(&grant, &receipt, &manifest)?;
+    let (_, again) = accepted_source_receipt(sidecar, physical, id)?;
+    if again != receipt {
+        return Err("broker completion source changed across acceptance".into());
+    }
+    Ok(receipt)
+}
+
+/// A second commit records Broker's release decision. Delivery of an exact
+/// receipt to the original Bash handle is still a separate closed boundary.
+pub fn decide_v2_source_retention_release(
+    sidecar: &mut BrokerSidecar,
+    physical: &SourcePhysicalRegistry,
+    id: &str,
+) -> Result<BrokerSourceRetentionRelease, String> {
+    let (grant, receipt) = accepted_source_receipt(sidecar, physical, id)?;
+    let released = sidecar.decide_source_retention_release(&grant, &receipt)?;
+    let (_, again) = accepted_source_receipt(sidecar, physical, id)?;
+    if again != receipt
+        || sidecar
+            .read_source_retention_release(&grant)?
+            .as_ref()
+            .map(|(readback, _)| readback)
+            != Some(&released)
+    {
+        return Err("broker source release changed across readback".into());
+    }
+    Ok(released)
 }
 
 #[cfg(all(test, target_os = "linux"))]

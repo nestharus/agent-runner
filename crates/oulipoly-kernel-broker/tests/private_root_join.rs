@@ -345,11 +345,20 @@ fn assert_postcommit_source_physical_after_owner(
     // launched W and the original owner are gone.
     eventually(|| {
         let _ = protocol::request_at(&socket, Operation::Classify);
-        BrokerSidecar::open_existing(&broker_state.join("sidecar/pid-identity.db"), &broker_state)
-            .unwrap()
+        let sidecar = BrokerSidecar::open_existing(
+            &broker_state.join("sidecar/pid-identity.db"),
+            &broker_state,
+        )
+        .unwrap();
+        sidecar
             .read_source_evidence(&record.grant)
             .unwrap()
             .is_some_and(|row| row.phase == if completed_v2 { "accepted" } else { "unknown" })
+            && (!completed_v2
+                || sidecar
+                    .read_source_retention_release(&record.grant)
+                    .unwrap()
+                    .is_some())
     });
     let mut retained =
         BrokerSidecar::open_existing(&broker_state.join("sidecar/pid-identity.db"), &broker_state)
@@ -374,6 +383,128 @@ fn assert_postcommit_source_physical_after_owner(
         assert_eq!(evidence.phase, "accepted");
         oulipoly_kernel_broker::source_acceptance::commit_v2_evidence(&mut retained, &physical, id)
             .unwrap(); // exact retry after a lost acceptance response
+        let accepted = oulipoly_kernel_broker::source_acceptance::accept_v2_completion_source(
+            &mut retained,
+            &physical,
+            id,
+        )
+        .unwrap();
+        let release =
+            oulipoly_kernel_broker::source_acceptance::decide_v2_source_retention_release(
+                &mut retained,
+                &physical,
+                id,
+            )
+            .unwrap();
+        assert_eq!(release.protocol, "broker-source-retention-release-v1");
+        assert_eq!(release.registration_id, accepted.registration_id);
+        assert_eq!(accepted.evidence_seal, evidence.seal.clone().unwrap());
+        assert_eq!(
+            accepted.selected_output["sha256"],
+            format!(
+                "{:x}",
+                Sha256::digest(
+                    fs::read(
+                        Path::new(registration_path.trim())
+                            .parent()
+                            .unwrap()
+                            .join("completion-output-v2.bin")
+                    )
+                    .unwrap()
+                )
+            )
+        );
+        assert!(accepted.owned_artifact.is_some());
+        assert_eq!(
+            retained
+                .read_source_retention_release(&record.grant)
+                .unwrap()
+                .unwrap()
+                .0,
+            release
+        );
+        let (acceptance_json, acceptance_sha, release_link): (String, String, String) =
+            rusqlite::Connection::open_with_flags(
+                broker_state.join("sidecar/pid-identity.db"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap()
+            .query_row(
+                "SELECT a.receipt_json,a.receipt_sha256,r.acceptance_sha256
+                 FROM broker_completion_source_acceptance a
+                 JOIN broker_source_retention_release r USING(registration_id)
+                 WHERE a.registration_id=?1 AND a.grant_id=?2 AND a.source_generation=?3",
+                rusqlite::params![
+                    accepted.registration_id,
+                    accepted.grant_id,
+                    accepted.source_generation
+                ],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            acceptance_sha,
+            format!("{:x}", Sha256::digest(acceptance_json.as_bytes()))
+        );
+        assert_eq!(release.acceptance_sha256, acceptance_sha);
+        assert_eq!(release_link, acceptance_sha);
+        let exact_manifest = physical
+            .read_witness(id, "evidence.json", 32 * 1024 * 1024)
+            .unwrap();
+        let mut changed_seal = accepted.clone();
+        changed_seal.evidence_seal.manifest_sha256 = "0".repeat(64);
+        assert!(
+            retained
+                .accept_captured_completion_source(&record.grant, &changed_seal, &exact_manifest)
+                .is_err()
+        );
+        let mut changed_selection = accepted.clone();
+        changed_selection.selected_output["sha256"] = serde_json::json!("0".repeat(64));
+        assert!(
+            retained
+                .accept_captured_completion_source(
+                    &record.grant,
+                    &changed_selection,
+                    &exact_manifest
+                )
+                .is_err()
+        );
+        assert!(
+            retained
+                .decide_source_retention_release(&record.grant, &changed_selection)
+                .is_err()
+        );
+        assert!(
+            !Path::new(registration_path.trim())
+                .parent()
+                .unwrap()
+                .join("source-retention-release-v1.json")
+                .exists(),
+            "Broker release decision is not Bash receipt delivery"
+        );
+        for changed in [
+            {
+                let mut g = record.grant.clone();
+                g.owner_generation = "wrong-owner".into();
+                g
+            },
+            {
+                let mut g = record.grant.clone();
+                g.source_generation = "wrong-generation".into();
+                g
+            },
+            {
+                let mut g = record.grant.clone();
+                g.candidate.registration_id = "wrong-registration".into();
+                g
+            },
+        ] {
+            assert!(
+                retained
+                    .decide_source_retention_release(&changed, &accepted)
+                    .is_err()
+            );
+        }
         let state_source: serde_json::Value = serde_json::from_slice(
             &fs::read(broker_state.join("sidecar/state-source.json")).unwrap(),
         )
@@ -461,6 +592,20 @@ fn assert_postcommit_source_physical_after_owner(
     } else {
         assert_eq!(reply_status.as_deref(), Some("pending"));
         assert_eq!(evidence.phase, "unknown");
+        assert!(
+            retained
+                .read_source_retention_release(&record.grant)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            oulipoly_kernel_broker::source_acceptance::accept_v2_completion_source(
+                &mut retained,
+                &physical,
+                id,
+            )
+            .is_err()
+        );
     }
     let source_phase: String = rusqlite::Connection::open_with_flags(
         broker_state.join("sidecar/pid-identity.db"),
@@ -474,6 +619,21 @@ fn assert_postcommit_source_physical_after_owner(
     )
     .unwrap();
     assert_eq!(source_phase, "registered");
+    let no_publication: (i64, i64, i64) = rusqlite::Connection::open_with_flags(
+        broker_state.join("sidecar/pid-identity.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ).unwrap().query_row(
+        "SELECT (SELECT count(*) FROM mailbox WHERE handle=?1),
+                (SELECT count(*) FROM completion_event WHERE event_id=?1 AND state='triggered'),
+                (SELECT count(*) FROM completion_event_listener WHERE event_id=?1 AND acknowledged_at IS NOT NULL)",
+        [registration["handle"].as_str().unwrap()],
+        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+    ).unwrap();
+    assert_eq!(
+        no_publication,
+        (0, 0, 0),
+        "source custody did not notify or ACK"
+    );
     if completed_v2 {
         let source_dir = Path::new(registration_path.trim()).parent().unwrap();
         let accepted = || {
@@ -513,6 +673,20 @@ fn assert_postcommit_source_physical_after_owner(
                 )
                 .is_err(),
                 "{name} mutation passed accepted retry"
+            );
+            assert!(
+                oulipoly_kernel_broker::source_acceptance::accept_v2_completion_source(
+                    &mut retry, &physical, id,
+                )
+                .is_err(),
+                "{name} mutation passed source acceptance retry"
+            );
+            assert!(
+                oulipoly_kernel_broker::source_acceptance::decide_v2_source_retention_release(
+                    &mut retry, &physical, id,
+                )
+                .is_err(),
+                "{name} mutation passed release retry"
             );
             fs::write(&path, original).unwrap();
             accepted();
@@ -1571,19 +1745,9 @@ fn inner() {
         .stderr(Stdio::from(File::create(&broker_log).unwrap()))
         .spawn()
         .unwrap();
-    eventually(|| {
-        (if v3_mode {
-            UnixStream::connect(&socket).is_ok()
-        } else {
-            socket.exists()
-        }) || broker.try_wait().unwrap().is_some()
-    });
+    eventually(|| UnixStream::connect(&socket).is_ok() || broker.try_wait().unwrap().is_some());
     assert!(
-        if v3_mode {
-            broker.try_wait().unwrap().is_none() && UnixStream::connect(&socket).is_ok()
-        } else {
-            socket.exists()
-        },
+        broker.try_wait().unwrap().is_none() && UnixStream::connect(&socket).is_ok(),
         "broker startup: {}",
         fs::read_to_string(&broker_log).unwrap()
     );
@@ -10361,6 +10525,18 @@ fn inner() {
                                 )
                                 .is_err(),
                                 "re-admitted old v29 source has no exact H authority"
+                            );
+                            assert!(oulipoly_kernel_broker::source_acceptance::accept_v2_completion_source(
+                                &mut retained, &custody, &grant_id,
+                            ).is_err(), "old v29 row acquired Broker source acceptance");
+                            assert!(oulipoly_kernel_broker::source_acceptance::decide_v2_source_retention_release(
+                                &mut retained, &custody, &grant_id,
+                            ).is_err(), "old v29 row acquired Broker release");
+                            assert!(
+                                retained
+                                    .read_source_retention_release(&custody.records()[0].grant)
+                                    .unwrap()
+                                    .is_none()
                             );
                             let reply: serde_json::Value = serde_json::from_slice(
                                 &fs::read(physical.join(format!("{grant_id}.stdout"))).unwrap(),

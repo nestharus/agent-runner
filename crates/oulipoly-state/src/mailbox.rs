@@ -51,12 +51,13 @@ mod fresh_lane;
 mod native_publication;
 mod retention;
 pub use broker_authority::{
-    BoundStateFileIdentity, BrokerContinuationReadback, BrokerMailboxReadback,
-    BrokerNativeGrantReadback, BrokerRecipientCandidate, BrokerRecipientSelection,
-    BrokerReleaseEvidence, BrokerRepairReadback, BrokerSidecar, BrokerSourceCandidate,
-    BrokerSourceEffectGrant, BrokerSourceEffectObligations, BrokerSourceEvidenceReadback,
-    BrokerSourceEvidenceSeal, BrokerSourceMaterial, BrokerSourceSelection, PreparedBrokerOwner,
-    PreparedProcessStamp, QuiescedCutoverProof,
+    BoundStateFileIdentity, BrokerCompletionSourceAcceptance, BrokerContinuationReadback,
+    BrokerMailboxReadback, BrokerNativeGrantReadback, BrokerRecipientCandidate,
+    BrokerRecipientSelection, BrokerReleaseEvidence, BrokerRepairReadback, BrokerSidecar,
+    BrokerSourceCandidate, BrokerSourceEffectGrant, BrokerSourceEffectObligations,
+    BrokerSourceEvidenceReadback, BrokerSourceEvidenceSeal, BrokerSourceMaterial,
+    BrokerSourceRetentionRelease, BrokerSourceSelection, PreparedBrokerOwner, PreparedProcessStamp,
+    QuiescedCutoverProof,
 };
 #[cfg(target_os = "linux")]
 pub use fresh_lane::{

@@ -591,6 +591,7 @@ pub(in crate::mailbox) fn domain_on(conn: &Connection) -> Result<Option<String>,
     }
     match super::schema::sidecar_version(conn)? {
         33 => validate_broker_v33_schema_on(conn)?,
+        34 => validate_broker_v34_schema_on(conn)?,
         version if version == super::schema::BROKER_OWNED_VERSION => {
             validate_broker_schema_on(conn)?
         }
@@ -639,6 +640,10 @@ pub(super) fn validate_broker_v32_schema_on(conn: &Connection) -> Result<(), Str
 
 pub(super) fn validate_broker_v33_schema_on(conn: &Connection) -> Result<(), String> {
     validate_schema_version_on(conn, 33, true)
+}
+
+pub(super) fn validate_broker_v34_schema_on(conn: &Connection) -> Result<(), String> {
+    validate_schema_version_on(conn, 34, true)
 }
 
 // Historical v29 sources are still read for staged cutover. Their fingerprint
