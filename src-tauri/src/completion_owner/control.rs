@@ -481,7 +481,12 @@ fn serve_request(
         if socket.set_nonblocking(false).is_err() {
             return;
         }
-        let _ = socket.write_all(reply);
+        if socket.write_all(reply).is_ok() {
+            // The control thread retains a shutdown clone until its next
+            // accept. End this one-shot response now so read-to-EOF clients
+            // do not wait for another unrelated connection.
+            let _ = socket.shutdown(std::net::Shutdown::Write);
+        }
         return; // EOF remains part of the existing hello protocol.
     }
     let Some(separator) = request.iter().position(|byte| *byte == b'\n') else {
@@ -496,6 +501,7 @@ fn serve_request(
         super::record_control_gap(owner, peer, "original_work_control_peer_disappeared");
         return;
     }
+    let mut delegated_root_h = None;
     if let Some(root_id) = pinned_root_id
         && (command == b"work!" || command == b"cancel")
     {
@@ -503,14 +509,24 @@ fn serve_request(
             super::record_control_gap(owner, peer, "original_work_control_source_ticket_missing");
             return;
         };
-        if attest_source_frame(owner, root_id, &socket, ticket, command, json).is_err()
-            || receive_pinned_eof(&socket, &context).is_err()
-        {
+        let proof = match attest_source_frame(owner, root_id, &socket, ticket, command, json) {
+            Ok(proof) => proof,
+            Err(_) => {
+                super::record_control_gap(
+                    owner,
+                    peer,
+                    "original_work_control_source_ticket_refused",
+                );
+                return;
+            }
+        };
+        if receive_pinned_eof(&socket, &context).is_err() {
             super::record_control_gap(owner, peer, "original_work_control_source_ticket_refused");
             #[cfg(feature = "age319-private-broker-fixture")]
             delegated_h_guardian_stage("ticket-refused");
             return;
         }
+        delegated_root_h = proof;
         #[cfg(feature = "age319-private-broker-fixture")]
         delegated_h_guardian_stage("ticket-accepted");
     } else if ticket.is_some() {
@@ -543,6 +559,7 @@ fn serve_request(
                     peer: context,
                     submission,
                     descriptors,
+                    delegated_root_h,
                 })
             })
         }
@@ -929,7 +946,7 @@ fn attest_source_frame(
     ticket: [u8; 16],
     command: &[u8],
     json: &[u8],
-) -> Result<(), String> {
+) -> Result<Option<protocol::DelegatedRootHProof>, String> {
     let request = if command == b"work!" {
         let work: WorkSubmission = serde_json::from_slice(json).map_err(|e| e.to_string())?;
         if work.root_authority.root_id != root_id

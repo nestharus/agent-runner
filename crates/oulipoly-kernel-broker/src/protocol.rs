@@ -2231,7 +2231,7 @@ pub struct JoinedChildWitness {
 /// A source presents its live host incarnation and the exact connected
 /// guardian socket. The broker observes the caller and socket in the host PID
 /// domain; these fields are assertions to compare, not authority by themselves.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceSocketWitness {
     pub root_id: String,
@@ -2246,7 +2246,7 @@ pub struct SourceSocketWitness {
     pub delegated_root_h_request_id: Option<String>,
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SourceScope {
     Root,
@@ -2259,6 +2259,17 @@ pub enum SourceScope {
     CancelOutside {
         work_id: String,
     },
+}
+
+/// Broker-produced evidence of one consumed original H ticket. The guardian
+/// carries it in its immutable acceptance; the Broker matches its own spent
+/// ticket and reopens the selected K before preparing W.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegatedRootHProof {
+    pub ticket_id: String,
+    pub work_id: String,
+    pub witness: SourceSocketWitness,
 }
 
 /// Version 2 binds the broker's source decision to the exact connected
@@ -2372,7 +2383,7 @@ pub fn consume_source_ticket_at(
     ticket: [u8; 16],
     request: SourceControlUse,
     accepted_socket_fd: RawFd,
-) -> io::Result<()> {
+) -> io::Result<Option<DelegatedRootHProof>> {
     let root_id = match &request {
         SourceControlUse::WorkRoot { root_id, .. }
         | SourceControlUse::WorkNested { root_id, .. }
@@ -2417,14 +2428,35 @@ pub fn consume_source_ticket_at(
             "short source ticket use; outcome uncertain",
         ));
     }
-    let response = read_response(stream)?;
-    if response != format!("verified-control {root_id}\n") {
-        return Err(io::Error::other(format!(
-            "source ticket refused: {}",
-            response.trim()
-        )));
+    let response = read_source_ticket_response(stream)?;
+    if response == format!("verified-control {root_id}\n") {
+        return Ok(None);
     }
-    Ok(())
+    let prefix = format!("verified-control {root_id} ");
+    if let Some(json) = response.strip_prefix(&prefix) {
+        let proof: DelegatedRootHProof = serde_json::from_str(json.trim_end())?;
+        if proof.ticket_id == spec.ticket
+            && matches!(&spec.request, SourceControlUse::WorkRoot { root_id: id, work_id }
+                if id == &root_id && work_id == &proof.work_id)
+            && proof.witness.root_id == root_id
+            && proof.witness.delegated_root_h_request_id.is_some()
+        {
+            return Ok(Some(proof));
+        }
+    }
+    Err(io::Error::other(format!(
+        "source ticket refused: {}",
+        response.trim()
+    )))
+}
+
+fn read_source_ticket_response(stream: UnixStream) -> io::Result<String> {
+    let mut response = Vec::new();
+    stream.take(4097).read_to_end(&mut response)?;
+    if response.len() > 4096 || !response.ends_with(b"\n") {
+        return Err(io::Error::other("invalid source ticket response"));
+    }
+    String::from_utf8(response).map_err(|_| io::Error::other("non-UTF8 source ticket response"))
 }
 
 /// The outside guardian asks the broker to attest the exact one-use joined
