@@ -722,6 +722,17 @@ pub struct BrokerNativeGrantReadback {
 }
 
 impl BrokerSidecar {
+    /// Owner of the original State source selected at Broker cutover. The
+    /// mutable Bash handle cannot nominate a different publication owner.
+    #[cfg(unix)]
+    pub fn original_source_owner_uid(&self) -> Result<u32, String> {
+        let source = self
+            .state_source
+            .as_ref()
+            .ok_or("Broker original State owner absent")?;
+        verify_bound_state_source(source)?;
+        Ok(source.owner)
+    }
     /// Read the original State decision before a driver is woken.  The
     /// caller's notification supplies only comparison keys; the opened bound
     /// State file supplies the decision and immutable continuation.
@@ -2029,7 +2040,7 @@ impl BrokerSidecar {
         Ok(after)
     }
 
-    fn read_completion_source_acceptance(
+    pub fn read_completion_source_acceptance(
         &self,
         grant: &BrokerSourceEffectGrant,
     ) -> Result<Option<(BrokerCompletionSourceAcceptance, String)>, String> {
