@@ -534,6 +534,19 @@ fn assert_postcommit_source_physical_after_owner(
             "changed retained Broker bytes passed trigger retry"
         );
         fs::write(output_path, saved_output).unwrap();
+        let event_payload_path = Path::new(publication.event.payload_file_path.as_deref().unwrap());
+        let saved_payload = fs::read(event_payload_path).unwrap();
+        fs::write(event_payload_path, b"changed retained completion payload").unwrap();
+        assert!(
+            oulipoly_kernel_broker::source_acceptance::read_v2_recipient_custody(
+                &mut retained,
+                &physical,
+                id,
+            )
+            .is_err(),
+            "changed retained payload passed recipient readback"
+        );
+        fs::write(event_payload_path, saved_payload).unwrap();
         let evidence_artifact = physical_dir.join(format!("{id}.evidence-artifact"));
         let saved_evidence_artifact = fs::read(&evidence_artifact).unwrap();
         fs::write(&evidence_artifact, b"changed sealed Broker artifact").unwrap();
@@ -764,6 +777,99 @@ fn assert_postcommit_source_physical_after_owner(
         if completed_v2 { (1, 1, 0) } else { (0, 0, 0) },
         "source trigger and notification custody differ from accepted source"
     );
+    let recipient_custody = if completed_v2 {
+        let custody = oulipoly_kernel_broker::source_acceptance::read_v2_recipient_custody(
+            &mut retained,
+            &physical,
+            id,
+        )
+        .unwrap();
+        assert_eq!(custody.source_grant_id, *id);
+        assert_eq!(custody.source_id, registration["source_id"]);
+        assert_eq!(custody.registration_id, registration["registration_id"]);
+        assert_eq!(custody.source_generation, record.grant.source_generation);
+        assert_eq!(custody.root_id, record.grant.root_id);
+        assert_eq!(custody.owner_generation, record.grant.owner_generation);
+        assert_eq!(
+            custody.listener_id,
+            registration["listeners"][0]["listener_id"]
+        );
+        assert_eq!(custody.session_id, registration["owner_session_id"]);
+        assert_eq!(
+            custody.owner_invocation_uuid,
+            registration["owner_invocation_uuid"]
+        );
+        assert!(custody.row_seq > 0);
+        let bytes = retained
+            .mailbox()
+            .completion_recovery_payload(registration["handle"].as_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            custody.payload_sha256,
+            format!("{:x}", Sha256::digest(&bytes))
+        );
+        assert_eq!(custody.payload_byte_len, bytes.len() as i64);
+        let reopened = oulipoly_kernel_broker::source_acceptance::read_v2_recipient_custody(
+            &mut BrokerSidecar::open_existing(
+                &broker_state.join("sidecar/pid-identity.db"),
+                broker_state,
+            )
+            .unwrap(),
+            &physical,
+            id,
+        )
+        .unwrap();
+        assert_eq!(
+            reopened, custody,
+            "restart readback changed recipient provenance"
+        );
+        let counts: (i64, i64, i64) = rusqlite::Connection::open_with_flags(
+            broker_state.join("sidecar/pid-identity.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap()
+        .query_row(
+            "SELECT (SELECT count(*) FROM mailbox WHERE seq=?1 AND delivered_at IS NULL),
+                    (SELECT count(*) FROM completion_event_listener WHERE event_id=?2
+                     AND mailbox_seq=?1 AND acknowledged_at IS NULL),
+                    (SELECT count(*) FROM sqlite_master
+                     WHERE type='table' AND name='fresh_recipient_grant')",
+            rusqlite::params![custody.row_seq, registration["handle"].as_str().unwrap()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+        assert_eq!(counts, (1, 1, 0));
+        assert!(
+            retained
+                .read_exact_mailbox_row(
+                    &custody.source_generation,
+                    "wrong-recipient-session",
+                    custody.row_seq,
+                )
+                .unwrap()
+                .is_none(),
+            "a different session saw the original recipient row"
+        );
+        let copied_db = broker_state.join("recipient-copy.db");
+        fs::copy(broker_state.join("sidecar/pid-identity.db"), &copied_db).unwrap();
+        assert!(
+            BrokerSidecar::open_existing(&copied_db, broker_state).is_err(),
+            "copied Broker DB reopened as retained authority"
+        );
+        Some(custody)
+    } else {
+        assert!(
+            oulipoly_kernel_broker::source_acceptance::read_v2_recipient_custody(
+                &mut retained,
+                &physical,
+                id,
+            )
+            .is_err(),
+            "pending source acquired recipient provenance"
+        );
+        None
+    };
     let source_dir = Path::new(registration_path.trim()).parent().unwrap();
     let broker_receipt = source_dir.join("broker-source-retention-release-v1.json");
     let local_release = source_dir.join("source-retention-release-v1.json");
@@ -878,6 +984,17 @@ fn assert_postcommit_source_physical_after_owner(
         assert!(!local_release.exists());
     }
     if completed_v2 {
+        let custody = recipient_custody.unwrap();
+        assert_eq!(
+            oulipoly_kernel_broker::source_acceptance::read_v2_recipient_custody(
+                &mut retained,
+                &physical,
+                id,
+            )
+            .unwrap(),
+            custody,
+            "exact readback minted or changed a recipient row"
+        );
         let accepted = || {
             assess_v2_candidate(&retained, &physical, id)
                 .expect("exact completed Bash source must remain assessable")
@@ -941,6 +1058,13 @@ fn assert_postcommit_source_physical_after_owner(
                 )
                 .is_err(),
                 "{name} mutation passed trigger retry"
+            );
+            assert!(
+                oulipoly_kernel_broker::source_acceptance::read_v2_recipient_custody(
+                    &mut retry, &physical, id,
+                )
+                .is_err(),
+                "{name} mutation passed recipient custody retry"
             );
             fs::write(&path, original).unwrap();
             accepted();
