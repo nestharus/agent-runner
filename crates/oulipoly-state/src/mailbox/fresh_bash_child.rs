@@ -33,6 +33,46 @@ pub struct FreshBashChild {
     pub session: FreshV30Session,
 }
 
+/// Broker-observed selected root K. These fields are evidence for a grant,
+/// never selectors supplied by Bash.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreshRootHSelectedK {
+    pub grant_id: String,
+    pub work_id: String,
+    pub plan_sha256: String,
+    pub account: String,
+    pub model: String,
+    pub provider_pid: i32,
+    pub provider_starttime: u64,
+    pub provider_boot_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreshRootHDelegation {
+    pub handoff_id: String,
+    pub child_request_id: String,
+    pub root_id: String,
+    pub owner_generation: String,
+    pub root_invocation_uuid: String,
+    pub root_session_id: String,
+    pub registration_authority_digest: String,
+    pub root_work_authority_digest: String,
+    pub root_endpoint: String,
+    pub listener_policy: String,
+    pub child_actor: FreshRecipientIdentity,
+    pub selected_k: FreshRootHSelectedK,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreshRootHConsumption {
+    pub delegation: FreshRootHDelegation,
+    pub registration_authority: String,
+    pub root_work_authority: String,
+}
+
 fn default_bash_listener_policy() -> String { "response_only".into() }
 fn is_response_only_bash_listener(value: &String) -> bool { value == "response_only" }
 
@@ -49,6 +89,113 @@ pub struct FreshBashPrivateResult {
 }
 
 impl FreshV30Lane {
+    pub fn issue_root_h_delegation(
+        &self, root: &FreshReleasedHandoff, root_actor: &FreshRecipientIdentity,
+        child: &FreshBashChild, selected_k: FreshRootHSelectedK,
+    ) -> Result<FreshRootHDelegation, String> {
+        if root.delegated_h_listener_policy.as_deref() != Some("response_only")
+            || !matches!(root.root_work_intent, FreshRootWorkIntent::NormalCli(_))
+            || child.root_handoff_id != root.handoff_id
+            || child.parent_work_grant_id != selected_k.grant_id
+            || child.parent_work_id != selected_k.work_id
+            || selected_k.plan_sha256.len() != 64
+            || selected_k.account.is_empty() || selected_k.model.is_empty()
+            || selected_k.provider_pid <= 0 || selected_k.provider_starttime == 0
+        {
+            return Err("root H delegation source or selected K invalid".into());
+        }
+        let root_session = self.read_session(&root.d_key)?
+            .ok_or("root H delegation original D absent")?;
+        self.require_released_invocation(root, root_actor, &root_session)?;
+        self.require_bash_child(child, root, root_actor, &child.actor)?;
+        let authority = crate::CompletionRegistrationAuthority::from_process_environment_value(
+            root.registration_authority.clone())?;
+        let work_authority = root.delegated_root_work_authority.as_deref()
+            .ok_or("root H original J work capability absent")?;
+        let receipt = FreshRootHDelegation {
+            handoff_id: root.handoff_id.clone(),
+            child_request_id: child.request_id.clone(),
+            root_id: root.old_release.prepared.root_id.clone(),
+            owner_generation: root.old_release.prepared.owner_generation.clone(),
+            root_invocation_uuid: root.invocation_uuid.clone(),
+            root_session_id: root_session.session_id,
+            registration_authority_digest: authority.digest(),
+            root_work_authority_digest: format!("{:x}", Sha256::digest(work_authority.as_bytes())),
+            root_endpoint: root.old_release.owner.endpoint.clone(),
+            listener_policy: "response_only".into(),
+            child_actor: child.actor.clone(), selected_k,
+        };
+        let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        state.execute_batch("PRAGMA synchronous=FULL").map_err(|e| e.to_string())?;
+        state.execute(
+            "INSERT INTO fresh_root_h_delegation(handoff_id,child_request_id,receipt_json,issued_at)
+             VALUES(?1,?2,?3,?4)",
+            params![receipt.handoff_id, receipt.child_request_id,
+                serde_json::to_string(&receipt).map_err(|e| e.to_string())?, Utc::now().to_rfc3339()],
+        ).map_err(|_| "root H delegation already issued or uncertain".to_string())?;
+        drop(state);
+        if self.read_root_h_delegation(&root.handoff_id)?.as_ref() != Some(&receipt) {
+            return Err("root H delegation readback mismatch".into());
+        }
+        Ok(receipt)
+    }
+
+    pub fn read_root_h_delegation(&self, handoff_id: &str)
+        -> Result<Option<FreshRootHDelegation>, String> {
+        validate_request_id(handoff_id)?;
+        let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let row: Option<(String,String)> = state.query_row(
+            "SELECT child_request_id,receipt_json FROM fresh_root_h_delegation WHERE handoff_id=?1",
+            [handoff_id], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional().map_err(|e| e.to_string())?;
+        row.map(|(child_request_id,json)| {
+            let receipt: FreshRootHDelegation = read_bash_json(&json,"fresh_root_h_delegation.receipt_json")?;
+            if receipt.handoff_id != handoff_id || receipt.child_request_id != child_request_id {
+                return Err("root H delegation identity changed".into());
+            }
+            Ok(receipt)
+        }).transpose()
+    }
+
+    pub fn consume_root_h_delegation(
+        &self, root: &FreshReleasedHandoff, root_actor: &FreshRecipientIdentity,
+        child: &FreshBashChild, selected_k: &FreshRootHSelectedK,
+    ) -> Result<FreshRootHConsumption, String> {
+        let receipt = self.read_root_h_delegation(&root.handoff_id)?
+            .ok_or("root H delegation absent")?;
+        if receipt.child_request_id != child.request_id || receipt.child_actor != child.actor
+            || receipt.selected_k != *selected_k || receipt.root_id != child.root_id
+            || receipt.owner_generation != root.old_release.prepared.owner_generation
+            || receipt.root_invocation_uuid != root.invocation_uuid
+            || root.delegated_h_listener_policy.as_deref() != Some(receipt.listener_policy.as_str())
+        {
+            return Err("root H delegation actor, source or K changed".into());
+        }
+        let session = self.read_session(&root.d_key)?.ok_or("root H D absent")?;
+        self.require_released_invocation(root, root_actor, &session)?;
+        self.require_bash_child(child, root, root_actor, &child.actor)?;
+        let authority = crate::CompletionRegistrationAuthority::from_process_environment_value(
+            root.registration_authority.clone())?;
+        let work_authority = root.delegated_root_work_authority.as_deref()
+            .ok_or("root H original J work capability absent")?;
+        if receipt.root_session_id != session.session_id
+            || receipt.registration_authority_digest != authority.digest()
+            || receipt.root_work_authority_digest != format!("{:x}", Sha256::digest(work_authority.as_bytes()))
+            || receipt.root_endpoint != root.old_release.owner.endpoint {
+            return Err("root H authority changed".into());
+        }
+        let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        state.execute_batch("PRAGMA synchronous=FULL").map_err(|e| e.to_string())?;
+        state.execute(
+            "INSERT INTO fresh_root_h_consumption(handoff_id,child_request_id,consumed_at)
+             VALUES(?1,?2,?3)",
+            params![receipt.handoff_id, child.request_id, Utc::now().to_rfc3339()],
+        ).map_err(|_| "root H delegation already consumed or uncertain".to_string())?;
+        Ok(FreshRootHConsumption { delegation: receipt,
+            registration_authority: root.registration_authority.clone(),
+            root_work_authority: work_authority.to_owned() })
+    }
+
     /// Fixture-only caller. An accepted request may be executed once only
     /// after this committed grant is returned. A lost grant reply is unknown
     /// and must never be turned into a second launch.

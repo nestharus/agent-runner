@@ -758,7 +758,7 @@ fn recv_request(
         #[cfg(feature = "age319-private-broker-fixture")]
         b'X' => read == 34,
         #[cfg(feature = "age319-private-broker-fixture")]
-        b'%' | b'!' => read == 33,
+        b'%' | b'!' | b'<' => read == 33,
         #[cfg(feature = "age319-private-broker-fixture")]
         b'u' | b'v' => read == 33,
         #[cfg(feature = "age319-private-broker-fixture")]
@@ -933,7 +933,7 @@ fn recv_request(
             ordinary_k_digest: None,
         },
         #[cfg(feature = "age319-private-broker-fixture")]
-        b'%' | b'!' | b'8' | b'9' | b'v' | b'u' => RequestPayload::FreshBashChildRequest {
+        b'%' | b'!' | b'8' | b'9' | b'v' | b'u' | b'<' => RequestPayload::FreshBashChildRequest {
             request_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
             listener_policy: None,
             ordinary_command: None,
@@ -3838,11 +3838,27 @@ fn released_child_handoff(
             .get(&root_id)
             .ok_or_else(|| io::Error::other("released root has no held child"))?
             .root_work_intent()?;
-        // Only the old loop can mint root authority. A later Bash descendant
-        // must use a separate registration and grant; this root has no handle.
+        // Only the old loop can mint root authority. The private selected-K
+        // route keeps the exact J capability for a later one-use delegation.
         let authority = oulipoly_state::CompletionRegistrationAuthority::generate()
             .map_err(io::Error::other)?;
         let image = runner_image.metadata()?;
+        let delegate_h = private_fixture()
+            && std::env::var_os("AGE319_PRIVATE_SELECTED_K_ROOT_H_V1").is_some()
+            && matches!(
+                root_work_intent,
+                oulipoly_state::mailbox::FreshRootWorkIntent::NormalCli(_)
+            );
+        let root_work_authority = if delegate_h {
+            Some(
+                held.get(&root_id)
+                    .ok_or_else(|| io::Error::other("delegated root J absent"))?
+                    .root_work_authority()
+                    .to_owned(),
+            )
+        } else {
+            None
+        };
         let receipt = FreshReleasedHandoff {
             handoff_id: uuid::Uuid::new_v4().to_string(),
             d_key: uuid::Uuid::new_v4().to_string(),
@@ -3854,6 +3870,8 @@ fn released_child_handoff(
             old_release: evidence,
             fresh_lane: request.lane,
             registration_authority: authority.process_environment_value().into(),
+            delegated_h_listener_policy: delegate_h.then(|| "response_only".into()),
+            delegated_root_work_authority: root_work_authority,
         };
         registry.persist(receipt)
     })();
@@ -5716,6 +5734,8 @@ fn serve_fresh_v30_at(
         #[cfg(feature = "age319-private-broker-fixture")]
         let mut drop_account_effect_reply = false;
         #[cfg(feature = "age319-private-broker-fixture")]
+        let mut drop_root_h_reply = false;
+        #[cfg(feature = "age319-private-broker-fixture")]
         let mut provider_output_files: Option<Vec<File>> = None;
         let mut drop_route_reply = false;
         let mut diagnostic_opcode = b'?';
@@ -5912,12 +5932,14 @@ fn serve_fresh_v30_at(
                     ))
                 }
                 #[cfg(not(feature = "age319-private-broker-fixture"))]
-                b'C' | b'X' | b'c' | b'E' | b'O' | b'^' | b'v' | b'u' => Err(io::Error::other(
-                    "fresh Bash child/work/result closed until normal root grant and physical result custody",
-                )),
+                b'C' | b'X' | b'c' | b'E' | b'O' | b'^' | b'v' | b'u' | b'<' => {
+                    Err(io::Error::other(
+                        "fresh Bash child/work/result closed until normal root grant and physical result custody",
+                    ))
+                }
                 #[cfg(feature = "age319-private-broker-fixture")]
                 b'C' | b'X' | b'c' | b'E' | b'O' | b'%' | b'!' | b'8' | b'9' | b'^' | b'v'
-                | b'u'
+                | b'u' | b'<'
                     if !matches!(operation, b'8' | b'9')
                         || matches!(&payload, RequestPayload::FreshBashChildRequest { .. }) =>
                 {
@@ -6014,6 +6036,42 @@ fn serve_fresh_v30_at(
                         child
                     };
                     peer.process.verify()?;
+                    if operation == b'<' {
+                        diagnostic_stage = "root_h_delegation_consume";
+                        let selected =
+                            fresh_provider::selected_root_h_k(&directory, &root, &parent_work)?;
+                        match lane
+                            .read_root_h_delegation(&root.handoff_id)
+                            .map_err(io::Error::other)?
+                        {
+                            Some(existing)
+                                if existing.child_request_id == child.request_id
+                                    && existing.selected_k == selected => {}
+                            Some(_) => {
+                                return Err(io::Error::other("root H delegation already assigned"));
+                            }
+                            None => {
+                                lane.issue_root_h_delegation(
+                                    &root,
+                                    &root_actor,
+                                    &child,
+                                    selected.clone(),
+                                )
+                                .map_err(io::Error::other)?;
+                            }
+                        }
+                        let consumed = lane
+                            .consume_root_h_delegation(&root, &root_actor, &child, &selected)
+                            .map_err(io::Error::other)?;
+                        peer.process.verify()?;
+                        if std::env::var_os("AGE319_PRIVATE_DROP_ROOT_H_REPLY_V1").is_some() {
+                            drop_root_h_reply = true;
+                        }
+                        return Ok(format!(
+                            "root-h-consumed {}\n",
+                            serde_json::to_string(&consumed)?
+                        ));
+                    }
                     if matches!(operation, b'C' | b'X' | b'c') {
                         lane.register_private_bash_source(&child)
                             .map_err(io::Error::other)?;
@@ -7687,9 +7745,12 @@ fn serve_fresh_v30_at(
             || drop_account_effect_reply
             || drop_route_reply
             || drop_interactive_k_reply
+            || drop_root_h_reply
         {
             if let Some(gate) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1") {
-                let marker = if drop_route_reply {
+                let marker = if drop_root_h_reply {
+                    "root-h-reply-dropped"
+                } else if drop_route_reply {
                     "route-reply-dropped"
                 } else if drop_provider_k_reply {
                     "provider-k-reply-dropped"

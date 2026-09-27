@@ -67,7 +67,8 @@ pub use fresh_lane::{
     FreshNativeFPreparation, FreshNativeFPrepareRequest, FreshNativeFReceipt,
     FreshNativeFSubmission, FreshNativeFTransport, FreshNormalWorkPreparation,
     FreshPhysicalTerminal, FreshRecipientIdentity, FreshReleasedHandoff, FreshRootCallerResult,
-    FreshRootEffect, FreshRootEffectState, FreshRootTerminalExecution, FreshRootTerminalReadback,
+    FreshRootEffect, FreshRootEffectState, FreshRootHConsumption, FreshRootHDelegation,
+    FreshRootHSelectedK, FreshRootTerminalExecution, FreshRootTerminalReadback,
     FreshRootWorkIntent, FreshV30Lane, FreshV30LaneIdentity, FreshV30Session,
     normal_root_arguments,
 };

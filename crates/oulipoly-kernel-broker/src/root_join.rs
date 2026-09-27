@@ -34,9 +34,13 @@ pub(super) struct HeldRootJoin {
     release_attempted: bool,
     release_id: Option<String>,
     launch_args: Vec<String>,
+    root_work_authority: String,
 }
 
 impl HeldRootJoin {
+    pub(super) fn root_work_authority(&self) -> &str {
+        &self.root_work_authority
+    }
     pub(super) fn release_id(&self) -> Option<&str> {
         self.release_id.as_deref()
     }
@@ -485,6 +489,7 @@ pub(super) fn hold(
         return Err(io::Error::last_os_error());
     }
     let launch_args = spec.args.clone();
+    let root_work_authority = spec.root_authority.clone();
     let context = Box::new(InitContext {
         spec,
         descriptors,
@@ -586,6 +591,7 @@ pub(super) fn hold(
         release_attempted: false,
         release_id: None,
         launch_args,
+        root_work_authority,
     })
 }
 
