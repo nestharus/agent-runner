@@ -159,12 +159,88 @@ pub fn normal_root_arguments(args: &[String]) -> bool {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FreshNormalWorkPreparation {
+    pub root_id: String,
+    pub owner_generation: String,
     pub handoff_id: String,
     pub invocation_uuid: String,
     pub session_id: String,
     pub actor: FreshRecipientIdentity,
     pub intent: FreshRootWorkIntent,
     pub state: String,
+}
+
+/// A model invocation derived from the broker's held normal-work readback.
+/// This describes the selected CLI shape only; it grants no provider K or
+/// caller-result authority. The root, actor and State bindings remain explicit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FreshHeadlessModelInvocation {
+    pub root_id: String,
+    pub owner_generation: String,
+    pub handoff_id: String,
+    pub invocation_uuid: String,
+    pub session_id: String,
+    pub actor: FreshRecipientIdentity,
+    pub model: String,
+    pub provider_pin: Option<String>,
+    pub prompt: String,
+}
+
+impl FreshNormalWorkPreparation {
+    pub fn headless_model_invocation(
+        &self,
+        receipt: &FreshReleasedHandoff,
+        session: &FreshV30Session,
+    ) -> Result<FreshHeadlessModelInvocation, String> {
+        if self.state != "held"
+            || self.root_id != receipt.old_release.prepared.root_id
+            || self.owner_generation != receipt.old_release.prepared.owner_generation
+            || self.handoff_id != receipt.handoff_id
+            || self.invocation_uuid != receipt.invocation_uuid
+            || self.session_id != session.session_id
+            || self.intent != receipt.root_work_intent
+            || self.actor.host_pid != receipt.old_release.prepared.joined_child.host_pid
+            || self.actor.boot_id != receipt.old_release.prepared.joined_child.boot_id
+            || self.actor.starttime_ticks
+                != receipt.old_release.prepared.joined_child.starttime_ticks
+            || self.actor.pidns_dev != receipt.old_release.prepared.joined_child.pidns_dev
+            || self.actor.pidns_ino != receipt.old_release.prepared.joined_child.pidns_ino
+            || session.request_id != receipt.d_key
+            || session.lane_id != receipt.fresh_lane.lane_id
+            || session.source_generation != receipt.fresh_lane.source_generation
+        {
+            return Err("headless model invocation differs from held root work".into());
+        }
+        let FreshRootWorkIntent::NormalCli(args) = &self.intent else {
+            return Err("headless model invocation requires normal CLI work".into());
+        };
+        let (model, provider_pin, prompt) = match args.as_slice() {
+            [flag, model, prompt] if flag == "--model" => (model, None, prompt),
+            [flag, model, pin_flag, pin, prompt]
+                if flag == "--model" && pin_flag == "--pin-provider" =>
+            {
+                (model, Some(pin), prompt)
+            }
+            _ => return Err("headless model CLI shape unsupported before K".into()),
+        };
+        if model.is_empty()
+            || model.starts_with('-')
+            || provider_pin.is_some_and(|pin| pin.is_empty() || pin.starts_with('-'))
+            || prompt.is_empty()
+        {
+            return Err("headless model CLI argument invalid".into());
+        }
+        Ok(FreshHeadlessModelInvocation {
+            root_id: receipt.old_release.prepared.root_id.clone(),
+            owner_generation: receipt.old_release.prepared.owner_generation.clone(),
+            handoff_id: self.handoff_id.clone(),
+            invocation_uuid: self.invocation_uuid.clone(),
+            session_id: self.session_id.clone(),
+            actor: self.actor.clone(),
+            model: model.clone(),
+            provider_pin: provider_pin.cloned(),
+            prompt: prompt.clone(),
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1616,6 +1692,8 @@ impl FreshV30Lane {
             return Err("normal work preparation identity readback conflict".into());
         }
         Ok(Some(FreshNormalWorkPreparation {
+            root_id: receipt.old_release.prepared.root_id.clone(),
+            owner_generation: receipt.old_release.prepared.owner_generation.clone(),
             handoff_id,
             invocation_uuid,
             session_id,
