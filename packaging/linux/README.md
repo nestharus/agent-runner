@@ -1,5 +1,37 @@
 # AGE-319 paired Linux artifact (prerequisite only)
 
+## Fresh-only first-install image package
+
+`first_install_v30.py` builds an inert archive from **four explicit images**:
+featureless Runner, Broker, Bash, and installed launcher. Its schema-2
+`install-v1.json` uses the same image-derived generation as the paired bundle;
+the outer manifest also pins the service unit. The archive contains no aliases,
+selector, State database, or install command. All image members have mode
+`0400`. `verify` checks the exact member set, image digests, service digest,
+manifest, and generation. `stage` writes an exclusive, fsynced, non-executable
+directory and `check` rereads it. Production staging requires root ownership
+and safe ancestry; `--fixture` permits a disposable non-root check.
+
+```bash
+python3 packaging/linux/first_install_v30.py build \
+  --runner /path/to/oulipoly-agent-runner \
+  --broker /path/to/oulipoly-kernel-broker \
+  --bash /path/to/agent-bash \
+  --launcher /path/to/oulipoly-installed-launcher \
+  --output /path/to/first-install-v30-inert.tar.gz
+python3 packaging/linux/first_install_v30.py verify /path/to/first-install-v30-inert.tar.gz
+python3 packaging/linux/first_install_v30.py stage \
+  /path/to/first-install-v30-inert.tar.gz /root/first-install-v30-stage
+python3 packaging/linux/first_install_v30.py check /root/first-install-v30-stage
+```
+
+This is the narrow source prerequisite for a clean first install. The current
+installed launcher refuses production launches, the Runner's installed pair
+gate refuses a `broker-v30-closed` route, and Bash's production ordinary v30
+call is gated on a private user namespace. This tool therefore has **no
+activation command**. The exact blockers and host action are recorded in
+`planning/age353-queue/AGE319-FIRST-INSTALL-V30-REPORT.md`.
+
 ## Separate old/new staging fixture
 
 `stage_versioned_island.py` accepts ten explicit source paths: retained legacy
