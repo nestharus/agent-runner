@@ -114,7 +114,7 @@ fn causal_bash(args: &[String], hold_survivor: bool, hold_start: bool) -> std::i
             .get(6)
             .is_some_and(|option| option.starts_with("ordinary-"))
         {
-            if args[6] == "ordinary-refuse" {
+            if args[6] == "ordinary-refuse" || args[6] == "ordinary-unsupported" {
                 use std::os::unix::fs::PermissionsExt;
                 let refused_shebang = gate.join("ordinary-refused-shebang");
                 std::fs::write(&refused_shebang, "#!/bin/sh\nprintf effect > \"$1\"\n")?;
@@ -153,20 +153,25 @@ fn causal_bash(args: &[String], hold_survivor: bool, hold_start: bool) -> std::i
                 std::fs::write(&missing_interp, elf)?;
                 std::fs::set_permissions(&missing_interp, std::fs::Permissions::from_mode(0o755))?;
                 let mut statuses = Vec::new();
-                for case in [
-                    "root",
-                    "ready",
-                    "cancel",
-                    "env-drift",
-                    "cwd-drift",
-                    "argv-before-c",
-                    "argv-after-c",
-                    "shebang",
-                    "malformed-elf",
-                    "missing-interp",
-                    "non-executable",
-                    "plain-script",
-                ] {
+                let cases: &[&str] = if args[6] == "ordinary-unsupported" {
+                    &["root", "ready", "cancel"]
+                } else {
+                    &[
+                        "root",
+                        "ready",
+                        "cancel",
+                        "env-drift",
+                        "cwd-drift",
+                        "argv-before-c",
+                        "argv-after-c",
+                        "shebang",
+                        "malformed-elf",
+                        "missing-interp",
+                        "non-executable",
+                        "plain-script",
+                    ]
+                };
+                for &case in cases {
                     let mut command = Command::new(&args[1]);
                     command.args(["run", "--delivery", "sync"]);
                     match case {

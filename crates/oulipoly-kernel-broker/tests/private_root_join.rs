@@ -2563,6 +2563,11 @@ fn inner() {
         )
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
         .envs(
+            (mode == "normal_model_provider_bash_ordinary_parent_tamper"
+                && std::env::var_os("AGE319_TEST_FEATURELESS_BASH_V1").is_some())
+            .then_some(("AGE319_PRIVATE_BASH_PAUSE_AFTER_C_V1", "1")),
+        )
+        .envs(
             (featureless_normal
                 && std::env::var_os("AGE319_TEST_NORMAL_CALLER_PARTIAL_V1").is_some())
             .then_some(("AGE319_TEST_NORMAL_CALLER_PARTIAL_V1", "1")),
@@ -3034,6 +3039,12 @@ fn inner() {
             .envs(
                 (mode == "normal_model_provider_bash_ordinary_refuse")
                     .then_some(("AGE319_PRIVATE_BASH_ORDINARY_MODE_V1", "ordinary-refuse"))
+                    .or_else(|| {
+                        (mode == "normal_model_provider_bash_ordinary_unsupported").then_some((
+                            "AGE319_PRIVATE_BASH_ORDINARY_MODE_V1",
+                            "ordinary-unsupported",
+                        ))
+                    })
                     .or_else(|| {
                         (mode == "normal_model_provider_bash_ordinary_parent_tamper").then_some((
                             "AGE319_PRIVATE_BASH_ORDINARY_MODE_V1",
@@ -5035,7 +5046,7 @@ fn inner() {
                     stop(&mut broker);
                     return;
                 }
-                if mode.ends_with("_refuse") {
+                if mode.ends_with("_refuse") || mode.ends_with("_unsupported") {
                     fs::write(gate.join("child-effect"), b"yes").unwrap();
                     eventually(|| {
                         gate.join("ordinary-refuse-statuses").exists()
@@ -5045,6 +5056,26 @@ fn inner() {
                         &fs::read(gate.join("ordinary-refuse-statuses")).unwrap(),
                     )
                     .unwrap();
+                    if mode.ends_with("_unsupported") {
+                        assert_eq!(statuses.len(), 3);
+                        assert!(statuses.iter().all(|(_, status)| *status != 0));
+                        assert!(!gate.join("ordinary-refused-effect").exists());
+                        let child_grants = fs::read_dir(broker_state.join("v30/fresh-provider"))
+                            .unwrap()
+                            .filter_map(Result::ok)
+                            .filter(|entry| {
+                                entry
+                                    .file_name()
+                                    .to_string_lossy()
+                                    .ends_with(".fresh-grant.json")
+                            })
+                            .count();
+                        assert_eq!(child_grants, 1, "unsupported mode consumed child K");
+                        fs::write(gate.join("provider-cancel"), b"yes").unwrap();
+                        eventually(|| entry.try_wait().unwrap().is_some());
+                        stop(&mut broker);
+                        return;
+                    }
                     assert_eq!(statuses.len(), 12);
                     assert!(
                         statuses[..7].iter().all(|(_, status)| *status != 0),
@@ -5244,6 +5275,17 @@ fn inner() {
                         .as_str()
                         .unwrap()
                 };
+                if mode == "normal_model_provider_bash_ordinary_sync" {
+                    let wrong_image = raw_fresh_id_request(
+                        &socket.with_file_name("v30.sock"),
+                        b'c',
+                        uuid::Uuid::parse_str(request_id).unwrap(),
+                    );
+                    assert!(
+                        wrong_image.contains("Bash child image changed"),
+                        "wrong image readback acquired Bash authority: {wrong_image}"
+                    );
+                }
                 if asynchronous {
                     assert_eq!(report["delivery_mode"], "async");
                     assert_eq!(report["completion_policy"], "tree");
@@ -17782,6 +17824,7 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_model_provider_bash_ordinary_sync_parent_output",
         "normal_model_provider_bash_ordinary_async",
         "normal_model_provider_bash_ordinary_refuse",
+        "normal_model_provider_bash_ordinary_unsupported",
         "normal_model_provider_bash_ordinary_loss",
         "normal_model_provider_bash_ordinary_copy",
         "normal_model_provider_bash_ordinary_restart",
