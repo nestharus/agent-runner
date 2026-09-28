@@ -177,6 +177,22 @@ pub fn files_as_raw(descriptors: &[File]) -> Vec<RawFd> {
     descriptors.iter().map(AsRawFd::as_raw_fd).collect()
 }
 
+/// Only an exact terminal and physical-drain receipt can become the CLI exit
+/// code. An unrecognized or mismatched reply leaves the submitted request
+/// unknown; the launcher must not resubmit it under another ID.
+pub fn drained_exit_code(response: &str, request_id: &str) -> Option<u8> {
+    let body = response.strip_suffix('\n')?.strip_prefix("exit ")?;
+    let (code, drained_id) = body.split_once(" drained ")?;
+    if drained_id != request_id
+        || code.is_empty()
+        || !code.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let value = code.parse::<u8>().ok()?;
+    (value.to_string() == code).then_some(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,5 +348,29 @@ mod tests {
             [-1; 3],
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn only_exact_drain_for_submitted_request_becomes_exit_status() {
+        let id = generation();
+        assert_eq!(
+            drained_exit_code(&format!("exit 0 drained {id}\n"), &id),
+            Some(0)
+        );
+        assert_eq!(
+            drained_exit_code(&format!("exit 255 drained {id}\n"), &id),
+            Some(255)
+        );
+        for reply in [
+            format!("exit 0 drained {}\n", generation()),
+            format!("exit 256 drained {id}\n"),
+            format!("exit 00 drained {id}\n"),
+            format!("exit -1 drained {id}\n"),
+            format!("exit 0 drained {id}"),
+            format!("exit 0 drained {id}\nextra"),
+            format!("exit 0\n"),
+        ] {
+            assert_eq!(drained_exit_code(&reply, &id), None, "{reply:?}");
+        }
     }
 }

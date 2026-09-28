@@ -3409,7 +3409,8 @@ pub fn join_at(path: &Path, spec: &JoinSpec, descriptors: [RawFd; 5]) -> io::Res
 
 /// Submit an exact installed CLI/GUI entry. The response is a receipt or an
 /// explicit refusal; a lost reply is uncertain and must never be retried as a
-/// new request ID. The production broker currently refuses before execution.
+/// new request ID. The production broker currently refuses after preflight,
+/// before root creation.
 pub fn submit_installed_launch_at(
     path: &Path,
     spec: &InstalledLaunchSpec,

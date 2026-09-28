@@ -428,15 +428,15 @@ fn checked_root_path(path: &Path, directory: bool) -> io::Result<()> {
 
 // The current installed Runner still has direct user-sidecar writers. A v30
 // database must not admit that image into a new root or let it exercise the
-// old source/control/work endpoint. Y/R/W and v30 N/t are generation-bound
-// broker authority checks; I is a read-only live route observation. None can
-// create a root on their own. Remove this gate only with the complete
-// production caller routing and image-version
-// admission protocol, never as part of ordinary broker startup.
+// old source/control/work endpoint. The activated fresh-only L frame may
+// reach its CLI preflight, but the handler still refuses before root creation.
+// Y/R/W and v30 N/t are generation-bound broker authority checks; I is a
+// read-only live route observation. None can create a root on their own.
 fn require_cutover_entry_route(
     operation: u8,
     broker_owned_sidecar: bool,
     gate_closed: bool,
+    fresh_only_active: bool,
 ) -> io::Result<()> {
     if matches!(
         operation,
@@ -446,6 +446,13 @@ fn require_cutover_entry_route(
     }
     if gate_closed {
         return Err(io::Error::other("broker entry gate is durably closed"));
+    }
+    if operation == b'L' && fresh_only_active {
+        return if broker_owned_sidecar {
+            Ok(())
+        } else {
+            Err(io::Error::other("fresh-only activation has no v30 sidecar"))
+        };
     }
     if matches!(operation, b':' | b';' | b'+') && !broker_owned_sidecar {
         return Err(io::Error::other(
@@ -492,6 +499,34 @@ fn require_cutover_entry_route(
         return Err(io::Error::other(
             "broker-owned v30 sidecar requires installed v30 Runner entry routing",
         ));
+    }
+    Ok(())
+}
+
+fn require_fresh_cli_shape(spec: &InstalledLaunchSpec, descriptors: &[File]) -> io::Result<()> {
+    if spec.kind != installed_launch::EntryKind::Cli {
+        return Err(io::Error::other(
+            "fresh-only installed entry supports CLI only",
+        ));
+    }
+    let args = spec
+        .args
+        .iter()
+        .map(|arg| {
+            std::str::from_utf8(arg)
+                .map(str::to_owned)
+                .map_err(|_| io::Error::other("non-UTF8 installed CLI argument"))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    if !oulipoly_kernel_broker::protocol::supported_entry_args(&args) {
+        return Err(io::Error::other("unsupported fresh-only CLI mode"));
+    }
+    if descriptors
+        .iter()
+        .take(descriptors.len().saturating_sub(1))
+        .any(|fd| unsafe { libc::isatty(fd.as_raw_fd()) } != 0)
+    {
+        return Err(io::Error::other("fresh-only PTY entry is not implemented"));
     }
     Ok(())
 }
@@ -5523,6 +5558,7 @@ fn serve() -> io::Result<()> {
                 operation,
                 broker_sidecar.is_some(),
                 entry_gate.is_closed(),
+                fresh_activation.is_some(),
             )?;
             if matches!(operation, 0x80..=0x83) {
                 if peer.uid != 0 || !peer.process.in_namespace(&host_namespace)? {
@@ -5676,11 +5712,24 @@ fn serve() -> io::Result<()> {
                     return Err(io::Error::other("installed launcher generation mismatch"));
                 }
                 installed_launch::validate(&spec, &installed_launch::files_as_raw(&descriptors))?;
-                // The current guardian/State routes cannot keep a GUI, PTY,
-                // provider descendants and arbitrary sudo grandchildren under
-                // one root. Accept no production launch until that is true.
+                let activation = fresh_activation
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("fresh-only activation absent"))?;
+                let sidecar = broker_sidecar
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("fresh-only source absent"))?;
+                if pair.schema != 2
+                    || pair.generation != activation.pair_generation
+                    || activation.source.source_generation != sidecar.source_generation()
+                {
+                    return Err(io::Error::other("fresh-only pair/source binding changed"));
+                }
+                require_fresh_cli_shape(&spec, &descriptors)?;
+                // This preflight is deliberately before any reservation. A
+                // Broker-owned v30 root launch and result/drain ledger are
+                // still required before this request can be admitted.
                 Err(io::Error::other(
-                    "installed supervisor transport staged; workload admission closed",
+                    "fresh-only CLI root launch and drain admission closed",
                 ))
             } else if operation == b'l' || operation == b'M' {
                 #[cfg(feature = "age319-private-broker-fixture")]
@@ -10049,6 +10098,7 @@ mod tests {
     use super::*;
     use oulipoly_kernel_broker::installed_launch::capture_from;
     use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
 
     #[cfg(not(feature = "age319-private-broker-fixture"))]
     #[test]
@@ -10129,40 +10179,104 @@ mod tests {
             b'Z', b'C', b'L',
         ] {
             assert!(
-                require_cutover_entry_route(operation, true, false).is_err(),
+                require_cutover_entry_route(operation, true, false, false).is_err(),
                 "legacy opcode {} admitted",
                 operation as char
             );
-            assert!(require_cutover_entry_route(operation, false, false).is_ok());
+            assert!(require_cutover_entry_route(operation, false, false, false).is_ok());
         }
         for operation in [b'Y', b'R', b'W', b'I', b'N', b't'] {
-            assert!(require_cutover_entry_route(operation, true, false).is_ok());
-            assert!(require_cutover_entry_route(operation, false, true).is_err());
+            assert!(require_cutover_entry_route(operation, true, false, false).is_ok());
+            assert!(require_cutover_entry_route(operation, false, true, false).is_err());
         }
         for operation in [b'e', b'p', b'g', b'a', b'j'] {
-            assert!(require_cutover_entry_route(operation, true, false).is_ok());
-            assert!(require_cutover_entry_route(operation, false, false).is_err());
-            assert!(require_cutover_entry_route(operation, true, true).is_err());
+            assert!(require_cutover_entry_route(operation, true, false, false).is_ok());
+            assert!(require_cutover_entry_route(operation, false, false, false).is_err());
+            assert!(require_cutover_entry_route(operation, true, true, false).is_err());
         }
-        assert!(require_cutover_entry_route(b':', true, false).is_ok());
-        assert!(require_cutover_entry_route(b':', false, false).is_err());
-        assert!(require_cutover_entry_route(b':', true, true).is_err());
-        assert!(require_cutover_entry_route(b';', true, false).is_ok());
-        assert!(require_cutover_entry_route(b';', false, false).is_err());
-        assert!(require_cutover_entry_route(b';', true, true).is_err());
+        assert!(require_cutover_entry_route(b':', true, false, false).is_ok());
+        assert!(require_cutover_entry_route(b':', false, false, false).is_err());
+        assert!(require_cutover_entry_route(b':', true, true, false).is_err());
+        assert!(require_cutover_entry_route(b';', true, false, false).is_ok());
+        assert!(require_cutover_entry_route(b';', false, false, false).is_err());
+        assert!(require_cutover_entry_route(b';', true, true, false).is_err());
+        assert!(require_cutover_entry_route(b'L', true, false, true).is_ok());
+        assert!(require_cutover_entry_route(b'L', true, false, false).is_err());
+        assert!(require_cutover_entry_route(b'L', false, false, true).is_err());
+        assert!(require_cutover_entry_route(b'L', true, true, true).is_err());
         for operation in [b'i', b'X', b'x'] {
-            assert!(require_cutover_entry_route(operation, true, true).is_ok());
+            assert!(require_cutover_entry_route(operation, true, true, false).is_ok());
         }
         for operation in [
             b'E', b'P', b'G', b'A', b'J', b'B', b'V', b'S', b's', b'T', b'H', b'N', b'k', b't',
             b'K', b'Q', b'Z', b'C', b'L', b'Y', b'R', b'W', b'I',
         ] {
             assert!(
-                require_cutover_entry_route(operation, false, true).is_err(),
+                require_cutover_entry_route(operation, false, true, false).is_err(),
                 "closed gate admitted opcode {}",
                 operation as char
             );
         }
+    }
+
+    #[test]
+    fn fresh_installed_preflight_accepts_only_supported_headless_cli_shape() {
+        let captured = capture_from(
+            &uuid::Uuid::new_v4().to_string(),
+            vec![OsString::from("agents"), OsString::from("--help")],
+            vec![],
+            [-1; 3],
+        )
+        .unwrap();
+        let mut spec = captured.spec;
+        let descriptors: Vec<File> = captured.descriptors.into_iter().map(File::from).collect();
+        assert!(require_fresh_cli_shape(&spec, &descriptors).is_ok());
+        spec.args = vec![b"--model".to_vec(), b"codex".to_vec()];
+        assert!(require_fresh_cli_shape(&spec, &descriptors).is_ok());
+        spec.kind = installed_launch::EntryKind::Gui;
+        assert!(require_fresh_cli_shape(&spec, &descriptors).is_err());
+        spec.kind = installed_launch::EntryKind::Cli;
+        spec.args = vec![b"--model".to_vec(), vec![0xff]];
+        assert!(require_fresh_cli_shape(&spec, &descriptors).is_err());
+        spec.args = vec![b"--unsupported".to_vec()];
+        assert!(require_fresh_cli_shape(&spec, &descriptors).is_err());
+
+        let mut master = -1;
+        let mut slave = -1;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        let master = unsafe { std::os::fd::OwnedFd::from_raw_fd(master) };
+        let slave = unsafe { std::os::fd::OwnedFd::from_raw_fd(slave) };
+        let captured = capture_from(
+            &uuid::Uuid::new_v4().to_string(),
+            vec![OsString::from("agents"), OsString::from("--help")],
+            vec![],
+            [slave.as_raw_fd(); 3],
+        )
+        .unwrap();
+        let descriptors: Vec<File> = captured.descriptors.into_iter().map(File::from).collect();
+        assert!(require_fresh_cli_shape(&captured.spec, &descriptors).is_err());
+        drop(master);
+
+        let captured = capture_from(
+            &uuid::Uuid::new_v4().to_string(),
+            vec![OsString::from("agents"), OsString::from_vec(vec![0xff])],
+            vec![],
+            [-1; 3],
+        )
+        .unwrap();
+        let descriptors: Vec<File> = captured.descriptors.into_iter().map(File::from).collect();
+        assert!(require_fresh_cli_shape(&captured.spec, &descriptors).is_err());
     }
     use std::io::Read;
     use std::process::Command;
