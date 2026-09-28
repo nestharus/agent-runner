@@ -713,6 +713,38 @@ impl GrantRegistry {
         &self.records
     }
 
+    /// Hash the exact consumed H/K record after comparing it with the opened
+    /// registry. A stale in-memory grant cannot authorize work retirement.
+    pub fn exact_consumed_sha256(&self, grant: &GrantRecord) -> io::Result<String> {
+        if self.poisoned || !grant.consumed {
+            return Err(io::Error::other(
+                "accepted work grant uncertain or unconsumed",
+            ));
+        }
+        let id = uuid::Uuid::parse_str(&grant.grant_id)
+            .map_err(|_| io::Error::other("invalid accepted work grant ID"))?;
+        if id.to_string() != grant.grant_id {
+            return Err(io::Error::other("noncanonical accepted work grant ID"));
+        }
+        let expected = serde_json::to_value(grant)?;
+        if !self.records.iter().any(|record| {
+            record.grant_id == grant.grant_id
+                && serde_json::to_value(record).ok().as_ref() == Some(&expected)
+        }) {
+            return Err(io::Error::other("accepted work grant changed in registry"));
+        }
+        let bytes = crate::work_registry::root_only_bytes(
+            &self.directory,
+            &format!("{}.json", grant.grant_id),
+            MAX_ARTIFACT,
+        )?;
+        let stored: serde_json::Value = serde_json::from_slice(&bytes)?;
+        if stored != expected {
+            return Err(io::Error::other("consumed work grant witness changed"));
+        }
+        Ok(digest(&bytes))
+    }
+
     pub fn native_record(&self, attempt_id: &str) -> Option<&NativeGrantRecord> {
         self.native_records
             .iter()
