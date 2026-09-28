@@ -75,7 +75,7 @@ use oulipoly_kernel_broker::protocol::{
     SourceTicketUse, SourceWitnessProbe, StateGenerationSpec, StateReadSpec, StateWriteAction,
     StateWriteSpec,
 };
-use oulipoly_kernel_broker::registry::{RootRecord, RootRegistry};
+use oulipoly_kernel_broker::registry::{OwnerCloseIntent, RootRecord, RootRegistry};
 use oulipoly_kernel_broker::source_acceptance::{
     accept_v2_completion_source, capture_and_stage_v2_evidence, commit_v2_evidence,
     decide_v2_source_retention_release, deliver_v2_source_retention_release,
@@ -416,7 +416,10 @@ fn require_cutover_entry_route(
     broker_owned_sidecar: bool,
     gate_closed: bool,
 ) -> io::Result<()> {
-    if matches!(operation, b'i' | b'v' | b'X' | b'x' | b'@' | b'[' | 0x7f) {
+    if matches!(
+        operation,
+        b'i' | b'v' | b'X' | b'x' | b'@' | b'[' | 0x7f | 0x80 | 0x81
+    ) {
         return Ok(());
     }
     if gate_closed {
@@ -476,6 +479,9 @@ enum RequestPayload {
     None,
     RootDrain {
         expected: RootRecord,
+    },
+    OwnerCloseIntent {
+        request: oulipoly_kernel_broker::protocol::OwnerCloseIntentRequest,
     },
     FreshChildRequest {
         request: FreshChildRequest,
@@ -798,7 +804,7 @@ fn recv_request(
         }
         #[cfg(feature = "age319-private-broker-fixture")]
         b'#' | b'{' | b'}' | b']' | b'|' | b'~' | b'?' => (18..=2048 + 17).contains(&read),
-        b'@' | b'[' | 0x7f => (18..=2048 + 17).contains(&read),
+        b'@' | b'[' | 0x7f | 0x80 | 0x81 => (18..=2048 + 17).contains(&read),
         b'F' => (18..=8192 + 17).contains(&read),
         b'O' => (18..=1024 + 17).contains(&read),
         b'U' => (18..=512 + 17).contains(&read),
@@ -860,6 +866,9 @@ fn recv_request(
     let payload = match request[0] {
         b'@' | b'[' | 0x7f => RequestPayload::RootDrain {
             expected: serde_json::from_slice(&request[17..read as usize])?,
+        },
+        0x80 | 0x81 => RequestPayload::OwnerCloseIntent {
+            request: serde_json::from_slice(&request[17..read as usize])?,
         },
         b'U' => RequestPayload::FreshChildRequest {
             request: serde_json::from_slice(&request[17..read as usize])?,
@@ -4884,7 +4893,44 @@ fn serve() -> io::Result<()> {
                 broker_sidecar.is_some(),
                 entry_gate.is_closed(),
             )?;
-            if operation == b'@' || operation == b'[' || operation == 0x7f {
+            if operation == 0x80 || operation == 0x81 {
+                if peer.uid != 0 || !peer.process.in_namespace(&host_namespace)? {
+                    return Err(io::Error::other("host-root owner close intent required"));
+                }
+                let RequestPayload::OwnerCloseIntent { request } = payload else {
+                    return Err(io::Error::other("owner close intent request absent"));
+                };
+                registry.exact_record(&request.expected)?;
+                let intent = if operation == 0x80 {
+                    // Fresh admissions holding this mutex finish first. The
+                    // old Broker serves this request on its single writer loop.
+                    let _guard = admission_fences.lock()
+                        .map_err(|_| io::Error::other("root admission fence poisoned"))?;
+                    let inventory = root_drain::readback(
+                        &request.expected, &registry, &entries, &works, &grants,
+                        &source_physical, broker_sidecar.as_ref(),
+                    )?;
+                    root_drain::ready_for_owner_close_preflight(
+                        &inventory, &request.expected.root_id, &request.owner_generation,
+                    )?;
+                    let owner = inventory.owner_close_inventory.as_ref()
+                        .ok_or_else(|| io::Error::other("owner close inventory absent"))?;
+                    registry.issue_close_intent(&OwnerCloseIntent {
+                        root: request.expected.clone(),
+                        owner_generation: request.owner_generation.clone(),
+                        source_generation: owner.source_generation.clone(),
+                        state_cursor: owner.state_cursor.clone()
+                            .ok_or_else(|| io::Error::other("owner close cursor absent"))?,
+                    })?
+                } else {
+                    registry.read_close_intent(&request.expected)?
+                        .ok_or_else(|| io::Error::other("owner close intent absent"))?
+                };
+                if intent.owner_generation != request.owner_generation {
+                    return Err(io::Error::other("owner close intent generation changed"));
+                }
+                Ok(format!("owner-close-intent-v1 {}\n", serde_json::to_string(&intent)?))
+            } else if operation == b'@' || operation == b'[' || operation == 0x7f {
                 if peer.uid != 0 || !peer.process.in_namespace(&host_namespace)? {
                     return Err(io::Error::other("host-root drain readback required"));
                 }
@@ -5109,6 +5155,9 @@ fn serve() -> io::Result<()> {
                     request.witness, socket, registration, &peer, &runner_image, &host_namespace,
                     &registry, &works, &entries, &grants, sidecar, true,
                 )?;
+                if registry.admission_fenced(&claims.root_id) {
+                    return Err(io::Error::other("exact root admission fenced"));
+                }
                 if source_decision_journal.is_none() {
                     source_decision_journal = Some(source_decision_journal::Journal::open(Path::new(&state))?);
                 }
@@ -5179,6 +5228,9 @@ fn serve() -> io::Result<()> {
                     Path::new(&state),
                 )?;
                 if operation == b's' {
+                    if registry.admission_fenced(&witness.root_id) {
+                        return Err(io::Error::other("exact root admission fenced"));
+                    }
                     issue_source_ticket(witness, socket, &peer, &mut source_tickets)
                 } else {
                     Ok(format!("verified-source {}\n", witness.root_id))
@@ -5639,6 +5691,11 @@ fn serve() -> io::Result<()> {
                 let RequestPayload::StateWrite { spec } = payload else {
                     return Err(io::Error::other("invalid broker State write payload"));
                 };
+                if registry.admission_fenced(&spec.root_id)
+                    && !matches!(&spec.action, StateWriteAction::Revoke { .. } | StateWriteAction::Repair { .. })
+                {
+                    return Err(io::Error::other("exact root admission fenced"));
+                }
                 let sidecar = broker_sidecar
                     .as_mut()
                     .ok_or_else(|| io::Error::other("broker State cutover absent"))?;
@@ -6447,6 +6504,12 @@ fn serve_fresh_v30_at(
                             lane.require_released_handoff(&receipt.d_key, &receipt, &recipient)
                                 .map_err(io::Error::other)?;
                         } else {
+                            let _guard = admission_fences
+                                .lock()
+                                .map_err(|_| io::Error::other("root admission fence poisoned"))?;
+                            if _guard.contains(&receipt.old_release.prepared.root_id) {
+                                return Err(io::Error::other("exact root admission fenced"));
+                            }
                             lane.bind_released_handoff(&receipt, &recipient)
                                 .map_err(io::Error::other)?;
                         }
@@ -6529,7 +6592,7 @@ fn serve_fresh_v30_at(
                         fresh_bash_parent(state_root, &lane, &peer, bash_image.as_ref())?;
                     let directory = state_root.join("v30/fresh-provider");
                     let _admission_guard =
-                        if matches!(operation, b'C' | b'X') && !instance.is_closed() {
+                        if matches!(operation, b'C' | b'X' | b'E' | b'%' | b'8' | b'^') {
                             let guard = admission_fences
                                 .lock()
                                 .map_err(|_| io::Error::other("root admission fence poisoned"))?;
@@ -6987,6 +7050,21 @@ fn serve_fresh_v30_at(
                     };
                     // d never repairs a half-written pair; only a retry of
                     // the same D key may finish its State-first admission.
+                    let _admission_guard = if operation == b'D' && !instance.is_closed() {
+                        if let Some(receipt) = released.as_ref() {
+                            let guard = admission_fences
+                                .lock()
+                                .map_err(|_| io::Error::other("root admission fence poisoned"))?;
+                            if guard.contains(&receipt.old_release.prepared.root_id) {
+                                return Err(io::Error::other("exact root admission fenced"));
+                            }
+                            Some(guard)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
                     let session = if operation == b'd' {
                         match lane.read_session(&request_id).map_err(io::Error::other)? {
                             Some(session) => session,
@@ -7275,7 +7353,17 @@ fn serve_fresh_v30_at(
                     // bridge reply, before any provider admission mutation.
                     let _admission_guard = if matches!(
                         operation,
-                        b'5' | b'h' | b'(' | b'f' | b')' | b'm' | b'#' | b'{'
+                        b'5' | b'7'
+                            | b'h'
+                            | b'('
+                            | b'f'
+                            | b')'
+                            | b'm'
+                            | b'#'
+                            | b'{'
+                            | b'}'
+                            | b'~'
+                            | b'?'
                     ) {
                         let guard = admission_fences
                             .lock()
@@ -8193,6 +8281,18 @@ fn serve_fresh_v30_at(
                             if instance.is_closed() {
                                 return Err(io::Error::other("fresh recipient entry gate closed"));
                             }
+                            let child = lane
+                                .read_bash_child(&request_id)
+                                .map_err(io::Error::other)?
+                                .ok_or_else(|| {
+                                    io::Error::other("fresh Bash notification child absent")
+                                })?;
+                            let _guard = admission_fences
+                                .lock()
+                                .map_err(|_| io::Error::other("root admission fence poisoned"))?;
+                            if _guard.contains(&child.root_id) {
+                                return Err(io::Error::other("exact root admission fenced"));
+                            }
                             let seq = lane
                                 .request_private_bash_notification(&request_id, &recipient)
                                 .map_err(io::Error::other)?;
@@ -8212,6 +8312,15 @@ fn serve_fresh_v30_at(
                                 .ok_or_else(|| {
                                     io::Error::other("fresh session allocation absent")
                                 })?;
+                            let (root_id, _) = lane
+                                .recipient_binding(&session, &recipient)
+                                .map_err(io::Error::other)?;
+                            let _guard = admission_fences
+                                .lock()
+                                .map_err(|_| io::Error::other("root admission fence poisoned"))?;
+                            if _guard.contains(&root_id) {
+                                return Err(io::Error::other("exact root admission fenced"));
+                            }
                             let submitted = lane
                                 .submit_recipient_delivery(
                                     &delivery_request_id,
@@ -8247,6 +8356,19 @@ fn serve_fresh_v30_at(
                         FreshRecipientRequest::PrepareNativeF { preparation } => {
                             if instance.is_closed() {
                                 return Err(io::Error::other("fresh recipient entry gate closed"));
+                            }
+                            let delivery = lane
+                                .read_recipient_delivery_by_request(
+                                    &preparation.delivery_request_id,
+                                    &recipient,
+                                )
+                                .map_err(io::Error::other)?
+                                .ok_or_else(|| io::Error::other("native F delivery absent"))?;
+                            let _guard = admission_fences
+                                .lock()
+                                .map_err(|_| io::Error::other("root admission fence poisoned"))?;
+                            if _guard.contains(&delivery.root_id) {
+                                return Err(io::Error::other("exact root admission fenced"));
                             }
                             if let Some(existing) = lane
                                 .read_native_f_preparation(
@@ -8303,6 +8425,12 @@ fn serve_fresh_v30_at(
                                 .read_native_f_preparation(&preparation_request_id, &recipient)
                                 .map_err(io::Error::other)?
                                 .ok_or_else(|| io::Error::other("native F preparation absent"))?;
+                            let _guard = admission_fences
+                                .lock()
+                                .map_err(|_| io::Error::other("root admission fence poisoned"))?;
+                            if _guard.contains(&prepared.root_id) {
+                                return Err(io::Error::other("exact root admission fenced"));
+                            }
                             let fence = lane
                                 .begin_native_f_submission(
                                     &preparation_request_id,

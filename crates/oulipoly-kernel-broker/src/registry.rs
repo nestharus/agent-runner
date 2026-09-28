@@ -1,6 +1,7 @@
 use crate::identity::{ChildExit, PinnedProcess, boot_id};
 use crate::json_artifact;
 use crate::root_pid1;
+use oulipoly_state::mailbox::BrokerStateCloseCursor;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
@@ -19,6 +20,17 @@ pub struct RootRecord {
     pub init_starttime_ticks: u64,
     pub pidns_dev: u64,
     pub pidns_ino: u64,
+}
+
+/// Durable admission stop for the exact owner generation. This is a close
+/// intent, not a closed-owner phase or a mailbox acknowledgement.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerCloseIntent {
+    pub root: RootRecord,
+    pub owner_generation: String,
+    pub source_generation: String,
+    pub state_cursor: BrokerStateCloseCursor,
 }
 
 #[derive(Debug)]
@@ -178,9 +190,23 @@ impl RootRegistry {
         {
             return Err(io::Error::other("unsafe root drain fence directory"));
         }
+        let mut close_intents = Vec::new();
         for entry in fs::read_dir(&fences)? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".close-intent.json") {
+                let intent: OwnerCloseIntent =
+                    json_artifact::read(&entry.path(), "owner_close_intent_open")?;
+                if !entry.file_type()?.is_file()
+                    || name != format!("{}.close-intent.json", intent.root.root_id)
+                    || intent.owner_generation.is_empty()
+                    || intent.source_generation.is_empty()
+                {
+                    return Err(io::Error::other("owner close intent identity conflict"));
+                }
+                close_intents.push(intent);
+                continue;
+            }
             if !entry.file_type()?.is_file() || !name.ends_with(".json") {
                 return Err(io::Error::other("unrecognized root drain fence"));
             }
@@ -200,6 +226,16 @@ impl RootRegistry {
                 return Err(io::Error::other("root drain fence identity conflict"));
             }
             registry.admission_fences.push(record);
+        }
+        if close_intents.iter().any(|intent| {
+            !registry
+                .admission_fences
+                .iter()
+                .any(|fence| fence == &intent.root)
+        }) {
+            return Err(io::Error::other(
+                "owner close intent without exact root fence",
+            ));
         }
         let pid1 = registry.directory.join("root-pid1");
         if !pid1.exists() {
@@ -344,8 +380,8 @@ impl RootRegistry {
 
     /// Durable exact-incarnation admission stop. A consumed grant can still
     /// finish its one-use launch; this fence never settles physical or State
-    /// obligations. The serving broker serializes this write with the fresh
-    /// Bash-child admission lane.
+    /// obligations. The serving broker serializes this write with the guarded
+    /// fresh lane admissions.
     pub fn fence_admission(&mut self, expected: &RootRecord) -> io::Result<()> {
         if self.poisoned {
             return Err(io::Error::other("uncertain root registry"));
@@ -388,6 +424,61 @@ impl RootRegistry {
                 .admission_fences
                 .iter()
                 .any(|fence| fence.root_id == root_id)
+    }
+
+    pub fn read_close_intent(&self, expected: &RootRecord) -> io::Result<Option<OwnerCloseIntent>> {
+        self.exact_record(expected)?;
+        let path = self
+            .directory
+            .join("root-drains")
+            .join(format!("{}.close-intent.json", expected.root_id));
+        if !path.exists() {
+            return Ok(None);
+        }
+        let intent: OwnerCloseIntent = json_artifact::read(&path, "owner_close_intent_read")?;
+        if intent.root != *expected || !self.admission_fences.iter().any(|fence| fence == expected)
+        {
+            return Err(io::Error::other("owner close intent root changed"));
+        }
+        Ok(Some(intent))
+    }
+
+    /// Caller holds the shared fresh admission mutex and has just repeated
+    /// close preflight. The old Broker request loop is single threaded.
+    pub fn issue_close_intent(
+        &mut self,
+        intent: &OwnerCloseIntent,
+    ) -> io::Result<OwnerCloseIntent> {
+        self.exact_record(&intent.root)?;
+        if !self
+            .admission_fences
+            .iter()
+            .any(|fence| fence == &intent.root)
+        {
+            return Err(io::Error::other(
+                "owner close intent root drain fence absent",
+            ));
+        }
+        if let Some(existing) = self.read_close_intent(&intent.root)? {
+            return if existing == *intent {
+                Ok(existing)
+            } else {
+                Err(io::Error::other(
+                    "owner close intent generation or cursor changed",
+                ))
+            };
+        }
+        let result = json_artifact::create_new(
+            &self.directory.join("root-drains"),
+            &format!("{}.close-intent.json", intent.root.root_id),
+            intent,
+        );
+        if let Err(error) = result {
+            self.poisoned = true;
+            return Err(error);
+        }
+        self.read_close_intent(&intent.root)?
+            .ok_or_else(|| io::Error::other("owner close intent lost after publication"))
     }
 
     pub fn fenced_root_ids(&self) -> impl Iterator<Item = &str> {
@@ -577,6 +668,28 @@ mod tests {
         assert!(!roots.admission_fenced(&first.root_id));
         roots.fence_admission(&first).unwrap();
         roots.fence_admission(&first).unwrap();
+        let intent = OwnerCloseIntent {
+            root: first.clone(),
+            owner_generation: uuid::Uuid::new_v4().to_string(),
+            source_generation: uuid::Uuid::new_v4().to_string(),
+            state_cursor: BrokerStateCloseCursor {
+                file: oulipoly_state::mailbox::BoundStateFileIdentity {
+                    device: 9,
+                    inode: 11,
+                },
+                authority_ordinal: 3,
+                admission_id: uuid::Uuid::new_v4().to_string(),
+                sidecar_generation: uuid::Uuid::new_v4().to_string(),
+                continuity_digest: "a".repeat(64),
+            },
+        };
+        assert_eq!(roots.issue_close_intent(&intent).unwrap(), intent);
+        assert_eq!(roots.issue_close_intent(&intent).unwrap(), intent);
+        let mut stale_intent = intent.clone();
+        stale_intent.owner_generation = uuid::Uuid::new_v4().to_string();
+        assert!(roots.issue_close_intent(&stale_intent).is_err());
+        assert!(roots.read_close_intent(&second).unwrap().is_none());
+        assert!(roots.read_close_intent(&stale).is_err());
         assert!(roots.admission_fenced(&first.root_id));
         assert!(!roots.admission_fenced(&second.root_id));
         assert!(roots.exact_record(&first).is_ok());
@@ -586,6 +699,7 @@ mod tests {
         let restarted = RootRegistry::open(temp.path()).unwrap();
         assert!(restarted.has_debt());
         assert!(restarted.admission_fenced(&first.root_id));
+        assert_eq!(restarted.read_close_intent(&first).unwrap(), Some(intent));
         assert!(!restarted.admission_fenced(&second.root_id));
         assert!(restarted.exact_record(&first).is_ok());
         let pending = temp.path().join("root-drains/.json-pending-crashed-fence");

@@ -15,7 +15,7 @@ const BROKER_RESPONSE_READ_BYTES: u64 = 257;
 const FRESH_ROUTE_REPLY_READ_BYTES: u64 = 4097;
 
 use crate::installed_launch::InstalledLaunchSpec;
-use crate::registry::RootRecord;
+use crate::registry::{OwnerCloseIntent, RootRecord};
 use std::io::{self, Read, Write};
 #[cfg(feature = "age319-private-broker-fixture")]
 use std::os::fd::FromRawFd;
@@ -54,6 +54,53 @@ pub fn root_drain_readback_at(
         return Err(io::Error::other(response));
     }
     Ok(response)
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerCloseIntentRequest {
+    pub expected: RootRecord,
+    pub owner_generation: String,
+}
+
+/// Host-root exact intent issue/readback. Issue is allowed only after Broker
+/// revalidates close preflight while holding its fresh admission mutex.
+pub fn owner_close_intent_at(
+    path: &Path,
+    expected: &RootRecord,
+    owner_generation: &str,
+    issue: bool,
+) -> io::Result<OwnerCloseIntent> {
+    let mut stream = checked_connection(path)?;
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let request = OwnerCloseIntentRequest {
+        expected: expected.clone(),
+        owner_generation: owner_generation.into(),
+    };
+    let mut frame = vec![if issue { 0x80 } else { 0x81 }];
+    frame.extend_from_slice(&challenge);
+    frame.extend_from_slice(&serde_json::to_vec(&request)?);
+    if frame.len() > 2048 {
+        return Err(io::Error::other("owner close intent request too large"));
+    }
+    stream.write_all(&frame)?;
+    let mut response = Vec::new();
+    stream.take(4097).read_to_end(&mut response)?;
+    if response.len() > 4096 || !response.ends_with(b"\n") {
+        return Err(io::Error::other("owner close intent response uncertain"));
+    }
+    let response = String::from_utf8(response).map_err(io::Error::other)?;
+    let body = response
+        .strip_prefix("owner-close-intent-v1 ")
+        .ok_or_else(|| io::Error::other(response.clone()))?;
+    let intent: OwnerCloseIntent = serde_json::from_str(body.trim_end())?;
+    if intent.root != *expected || intent.owner_generation != owner_generation {
+        return Err(io::Error::other(
+            "owner close intent reply identity changed",
+        ));
+    }
+    Ok(intent)
 }
 
 /// Host-root request for the exact fenced PID1. The broker independently

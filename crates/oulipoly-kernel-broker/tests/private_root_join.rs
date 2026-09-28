@@ -10033,6 +10033,94 @@ fn inner() {
                                             proof["owner_close_inventory"]["deliverable_mailbox_rows"],
                                             if old_pending_debt { 1 } else { 0 }
                                         );
+                                        let close_intent = if old_pending_debt {
+                                            assert!(
+                                                protocol::owner_close_intent_at(
+                                                    &socket,
+                                                    &expected,
+                                                    &prepared.owner_generation,
+                                                    true,
+                                                )
+                                                .is_err()
+                                            );
+                                            assert!(
+                                                protocol::owner_close_intent_at(
+                                                    &socket,
+                                                    &expected,
+                                                    &prepared.owner_generation,
+                                                    false,
+                                                )
+                                                .is_err()
+                                            );
+                                            None
+                                        } else {
+                                            let intent = protocol::owner_close_intent_at(
+                                                &socket,
+                                                &expected,
+                                                &prepared.owner_generation,
+                                                true,
+                                            )
+                                            .unwrap();
+                                            assert_eq!(intent.root, expected);
+                                            assert_eq!(
+                                                intent.owner_generation,
+                                                prepared.owner_generation
+                                            );
+                                            assert_eq!(
+                                                serde_json::to_value(&intent.state_cursor).unwrap(),
+                                                proof["owner_close_inventory"]["state_cursor"]
+                                            );
+                                            assert_eq!(
+                                                protocol::owner_close_intent_at(
+                                                    &socket,
+                                                    &expected,
+                                                    &prepared.owner_generation,
+                                                    false,
+                                                )
+                                                .unwrap(),
+                                                intent
+                                            );
+                                            let mut stale = expected.clone();
+                                            stale.init_starttime_ticks += 1;
+                                            assert!(
+                                                protocol::owner_close_intent_at(
+                                                    &socket,
+                                                    &stale,
+                                                    &prepared.owner_generation,
+                                                    false,
+                                                )
+                                                .is_err()
+                                            );
+                                            assert!(
+                                                protocol::owner_close_intent_at(
+                                                    &socket,
+                                                    &expected,
+                                                    "wrong-owner",
+                                                    false,
+                                                )
+                                                .is_err()
+                                            );
+                                            let placeholder = File::open("/dev/null").unwrap();
+                                            let late = protocol::prepare_accepted_work_at(
+                                                &socket,
+                                                &AcceptedWorkSpec {
+                                                    root_id: expected.root_id.clone(),
+                                                    work_id: uuid::Uuid::new_v4().to_string(),
+                                                    request_sha256: "0".repeat(64),
+                                                    accepted_sha256: "0".repeat(64),
+                                                    owner_generation: prepared
+                                                        .owner_generation
+                                                        .clone(),
+                                                },
+                                                [placeholder.as_raw_fd(); 5],
+                                            )
+                                            .unwrap();
+                                            assert!(
+                                                late.contains("exact root admission fenced"),
+                                                "{late}"
+                                            );
+                                            Some(intent)
+                                        };
                                         assert_exact_native_mailbox_acks(
                                             &broker_state,
                                             &gate,
@@ -10164,6 +10252,46 @@ fn inner() {
                                             restored["owner_close_inventory"],
                                             proof["owner_close_inventory"]
                                         );
+                                        if let Some(intent) = close_intent {
+                                            assert_eq!(
+                                                protocol::owner_close_intent_at(
+                                                    &socket,
+                                                    &expected,
+                                                    &prepared.owner_generation,
+                                                    false,
+                                                )
+                                                .unwrap(),
+                                                intent
+                                            );
+                                            assert_eq!(
+                                                protocol::owner_close_intent_at(
+                                                    &socket,
+                                                    &expected,
+                                                    &prepared.owner_generation,
+                                                    true,
+                                                )
+                                                .unwrap(),
+                                                intent
+                                            );
+                                            assert_eq!(
+                                                restored["owner_close_intent"],
+                                                serde_json::to_value(&intent).unwrap()
+                                            );
+                                        } else {
+                                            assert_eq!(
+                                                restored["owner_close_intent"],
+                                                serde_json::Value::Null
+                                            );
+                                            assert!(
+                                                protocol::owner_close_intent_at(
+                                                    &socket,
+                                                    &expected,
+                                                    &prepared.owner_generation,
+                                                    true,
+                                                )
+                                                .is_err()
+                                            );
+                                        }
                                         assert_exact_native_mailbox_acks(
                                             &broker_state,
                                             &gate,
