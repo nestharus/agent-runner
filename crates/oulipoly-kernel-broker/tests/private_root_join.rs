@@ -158,6 +158,201 @@ fn assert_old_pending_v29(broker_state: &Path) {
         [], |r| r.get::<_, i64>(0)).unwrap(), 1);
 }
 
+/// The owner inventory counts every deliverable row in the retained sidecar.
+/// Identify the exact remaining row after both native ACKs instead of
+/// attributing a global count to either native recipient.
+fn read_owner_mailbox_diagnostic(
+    broker_state: &Path,
+    historical_sidecar: &Path,
+    state_path: &Path,
+    source_generation: &str,
+    original_row_seq: i64,
+) -> serde_json::Value {
+    let side = rusqlite::Connection::open_with_flags(
+        broker_state.join("sidecar/pid-identity.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let pending = side
+        .prepare(
+            "SELECT seq FROM mailbox WHERE delivered_at IS NULL AND
+             (delivery_error IS NULL OR delivery_error NOT IN
+              ('wake_sweep_abandoned','mailbox_payload_verification_failed',
+               'mailbox_ingress_expired','completion_effect_uncertain')) ORDER BY seq",
+        )
+        .unwrap()
+        .query_map([], |row| row.get::<_, i64>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(pending.len(), 1, "owner inventory row identity changed");
+    let seq = pending[0];
+    assert_ne!(
+        seq, original_row_seq,
+        "native ACK left original row pending"
+    );
+    let retained =
+        BrokerSidecar::open_existing(&broker_state.join("sidecar/pid-identity.db"), broker_state)
+            .unwrap();
+    let row = retained
+        .read_exact_mailbox_row(source_generation, "old-pending", seq)
+        .unwrap()
+        .unwrap()
+        .row;
+    assert_eq!(
+        (row.kind.as_str(), row.handle.as_str()),
+        ("fixture", "old-unacked")
+    );
+    assert_eq!(row.payload_json, "{}");
+    assert_eq!(row.delivery_attempts, 0);
+    assert!(row.delivered_at.is_none());
+    assert!(row.owner_invocation_uuid.is_none());
+    assert!(row.target_kind.is_none() && row.target_id.is_none());
+    assert!(row.payload_file_path.is_none());
+    assert!(row.payload_sha256.is_none() && row.payload_byte_len.is_none());
+    assert!(
+        retained
+            .read_exact_mailbox_row(source_generation, "wrong-recipient", seq)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        retained
+            .read_exact_mailbox_row("changed-generation", "old-pending", seq)
+            .is_err()
+    );
+    let (listeners, projected_sources, recipient_grants): (i64, i64, i64) = side
+        .query_row(
+            "SELECT
+             (SELECT COUNT(*) FROM completion_event_listener WHERE mailbox_seq=?1),
+             (SELECT COUNT(*) FROM completion_continuation_source WHERE event_id=?2),
+             (SELECT COUNT(*) FROM broker_native_recipient_grant WHERE row_seq=?1)
+             +(SELECT COUNT(*) FROM broker_v2_recipient_grant WHERE row_seq=?1)",
+            rusqlite::params![seq, row.handle],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!((listeners, projected_sources, recipient_grants), (0, 0, 0));
+    let (session_runtime, wake_claim): (i64, i64) = side
+        .query_row(
+            "SELECT
+             (SELECT COUNT(*) FROM session_runtime WHERE session_id=?1),
+             (SELECT COUNT(*) FROM session_wake_claim WHERE session_id=?1)",
+            [&row.session_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((session_runtime, wake_claim), (0, 0));
+    let state = rusqlite::Connection::open_with_flags(
+        state_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let state_sources: i64 = state
+        .query_row(
+            "SELECT COUNT(*) FROM invocation_completion_v2_identity WHERE handle=?1",
+            [&row.handle],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(state_sources, 0);
+    let historical = rusqlite::Connection::open_with_flags(
+        historical_sidecar,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let historical_rows: i64 = historical
+        .query_row(
+            "SELECT COUNT(*) FROM mailbox WHERE session_id=?1 AND handle=?2",
+            rusqlite::params![row.session_id, row.handle],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(historical_rows, 0, "row came from historical copy");
+    serde_json::json!({
+        "seq": seq,
+        "session_id": row.session_id,
+        "kind": row.kind,
+        "handle": row.handle,
+        "phase": "pending_no_delivery_attempt",
+        "delivery_attempts": row.delivery_attempts,
+        "inline_payload_sha256": format!("{:x}", Sha256::digest(row.payload_json.as_bytes())),
+        "retained_payload_sha256": row.payload_sha256,
+        "owner_invocation_uuid": row.owner_invocation_uuid,
+        "target_kind": row.target_kind,
+        "target_id": row.target_id,
+        "listener_count": listeners,
+        "sidecar_source_count": projected_sources,
+        "state_source_count": state_sources,
+        "recipient_grant_count": recipient_grants,
+        "session_runtime_count": session_runtime,
+        "wake_claim_count": wake_claim,
+        "historical_copy_row_count": historical_rows,
+        "source": "private fixture INSERT after v29 copy",
+    })
+}
+
+fn assert_exact_native_mailbox_acks(
+    broker_state: &Path,
+    gate: &Path,
+    original_session: &str,
+    original_seq: i64,
+    fresh_session: &str,
+    fresh_seq: i64,
+) {
+    let original_receipt: serde_json::Value =
+        serde_json::from_slice(&fs::read(gate.join("native-turn-receipt.json")).unwrap()).unwrap();
+    let f_receipt: serde_json::Value =
+        serde_json::from_slice(&fs::read(gate.join("native-f-turn-receipt.json")).unwrap())
+            .unwrap();
+    let retained = rusqlite::Connection::open_with_flags(
+        broker_state.join("sidecar/pid-identity.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let original: (i64, String, String, String) = retained
+        .query_row(
+            "SELECT m.delivery_attempts,g.phase,g.turn_id,g.ack_response_sha256
+             FROM mailbox m JOIN broker_native_recipient_grant g ON g.row_seq=m.seq
+             JOIN completion_event_listener l ON l.mailbox_seq=m.seq
+             WHERE m.session_id=?1 AND m.seq=?2 AND m.delivered_at IS NOT NULL
+               AND g.acknowledged_at=m.delivered_at
+               AND l.acknowledgement_reason='explicit_native_codex_assistant_ack'",
+            rusqlite::params![original_session, original_seq],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(original.0, 1);
+    assert_eq!(original.1, "acked");
+    assert_eq!(original.2, original_receipt["turn_id"]);
+    assert_eq!(original.3, original_receipt["ack_response_sha256"]);
+
+    let fresh = rusqlite::Connection::open_with_flags(
+        broker_state.join("v30/sidecar/pid-identity.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let f: (i64, String, String, String) = fresh
+        .query_row(
+            "SELECT m.delivery_attempts,g.phase,a.turn_id,a.assistant_response_sha256
+             FROM mailbox m JOIN fresh_recipient_grant g
+               ON g.session_id=m.session_id AND g.seq=m.seq
+             JOIN fresh_headless_native_f_ack a ON a.grant_id=g.grant_id
+             WHERE m.session_id=?1 AND m.seq=?2 AND m.delivered_at IS NOT NULL
+               AND g.acknowledged_at=m.delivered_at
+               AND a.acknowledged_at=m.delivered_at
+               AND a.basis='native_codex_f_assistant_ack'",
+            rusqlite::params![fresh_session, fresh_seq],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(f.0, 1);
+    assert_eq!(f.1, "acked");
+    assert_eq!(f.2, f_receipt["turn_id"]);
+    assert_eq!(f.3, f_receipt["assistant_response_sha256"]);
+    assert_ne!(original.2, f.2, "F must have its own native turn");
+}
+
 fn assert_pending_notify_without_delivery(broker_state: &Path) {
     let fresh = rusqlite::Connection::open_with_flags(
         broker_state.join("v30/sidecar/pid-identity.db"),
@@ -1465,7 +1660,8 @@ fn terminate_postcommit_original_owner(broker_state: &Path) {
 
 fn inner() {
     let mode = std::env::var("AGE319_PRIVATE_JOIN_MODE").unwrap_or_else(|_| "help".into());
-    let native_f_turn = mode == "normal_model_provider_native_codex_f_turn";
+    let old_pending_debt = mode == "normal_model_provider_native_codex_f_turn_old_pending_debt";
+    let native_f_turn = mode == "normal_model_provider_native_codex_f_turn" || old_pending_debt;
     let native_f_candidate =
         mode == "normal_model_provider_native_codex_f_candidate" || native_f_turn;
     let native_ack_mode =
@@ -1692,6 +1888,7 @@ fn inner() {
             | "normal_model_provider_native_codex_recipient_ack"
             | "normal_model_provider_native_codex_f_candidate"
             | "normal_model_provider_native_codex_f_turn"
+            | "normal_model_provider_native_codex_f_turn_old_pending_debt"
     );
     let root_h_lost = mode == "normal_model_provider_bash_causal_root_h_lost";
     let root_h_notify = root_h_delegate && (mode.contains("_notify_") || native_turn_mode);
@@ -2227,7 +2424,9 @@ fn inner() {
     } else {
         None
     };
-    if handoff_mode {
+    // The real F-turn starts with the historical copy as it is. The separate
+    // debt mode adds a synthetic, undeliverable old row for the negative case.
+    if handoff_mode && mode != "normal_model_provider_native_codex_f_turn" {
         let sidecar =
             rusqlite::Connection::open(broker_state.join("sidecar/pid-identity.db")).unwrap();
         sidecar
@@ -6972,6 +7171,7 @@ fn inner() {
                         | "normal_model_provider_native_codex_recipient_ack"
                         | "normal_model_provider_native_codex_f_candidate"
                         | "normal_model_provider_native_codex_f_turn"
+                        | "normal_model_provider_native_codex_f_turn_old_pending_debt"
                 )
             {
                 let marker: serde_json::Value =
@@ -7413,7 +7613,15 @@ fn inner() {
                         |row| row.get(0),
                     )
                     .unwrap();
-                assert_eq!(pending, 1, "old pending ACK debt must coexist with fresh D");
+                assert_eq!(
+                    pending,
+                    if native_f_turn && !old_pending_debt {
+                        0
+                    } else {
+                        1
+                    },
+                    "historical pending debt differs from fixture mode"
+                );
                 let old_state_path = data.join("state.db");
                 let old_state_before = fs::read(&old_state_path).unwrap();
                 let old_wal_path = data.join("state.db-wal");
@@ -9814,8 +10022,40 @@ fn inner() {
                                         );
                                         assert_eq!(
                                             proof["owner_close_inventory"]["deliverable_mailbox_rows"],
-                                            1
+                                            if old_pending_debt { 1 } else { 0 }
                                         );
+                                        assert_exact_native_mailbox_acks(
+                                            &broker_state,
+                                            &gate,
+                                            &original_session.session_id,
+                                            custody.row_seq,
+                                            &witness.fresh.session_id,
+                                            witness.fresh.seq,
+                                        );
+                                        let mailbox_diagnostic = old_pending_debt.then(|| {
+                                            read_owner_mailbox_diagnostic(
+                                                &broker_state,
+                                                &historical_sidecar,
+                                                &data.join("state.db"),
+                                                &custody.source_generation,
+                                                custody.row_seq,
+                                            )
+                                        });
+                                        if let Some(diagnostic) = &mailbox_diagnostic {
+                                            eprintln!(
+                                                "owner mailbox historical debt: {diagnostic}"
+                                            );
+                                        } else {
+                                            let retained = rusqlite::Connection::open_with_flags(
+                                                broker_state.join("sidecar/pid-identity.db"),
+                                                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                                            )
+                                            .unwrap();
+                                            assert_eq!(retained.query_row(
+                                                "SELECT count(*) FROM mailbox WHERE session_id='old-pending'",
+                                                [], |row| row.get::<_, i64>(0),
+                                            ).unwrap(), 0);
+                                        }
                                         assert_eq!(
                                             proof["owner_close_inventory"]["source_effect"]["accepted"],
                                             1
@@ -9899,9 +10139,38 @@ fn inner() {
                                         assert_eq!(restored["work_retired"], 1);
                                         assert_eq!(restored["close_eligible"], false);
                                         assert_eq!(
+                                            restored["state_sidecar_outstanding_unknown"],
+                                            true
+                                        );
+                                        assert_eq!(
+                                            restored["owner_close_inventory"]["deliverable_mailbox_rows"],
+                                            if old_pending_debt { 1 } else { 0 }
+                                        );
+                                        assert_eq!(
                                             restored["owner_close_inventory"],
                                             proof["owner_close_inventory"]
                                         );
+                                        assert_exact_native_mailbox_acks(
+                                            &broker_state,
+                                            &gate,
+                                            &original_session.session_id,
+                                            custody.row_seq,
+                                            &witness.fresh.session_id,
+                                            witness.fresh.seq,
+                                        );
+                                        if let Some(mailbox_diagnostic) = mailbox_diagnostic {
+                                            assert_eq!(
+                                                read_owner_mailbox_diagnostic(
+                                                    &broker_state,
+                                                    &historical_sidecar,
+                                                    &data.join("state.db"),
+                                                    &custody.source_generation,
+                                                    custody.row_seq,
+                                                ),
+                                                mailbox_diagnostic,
+                                                "Broker restart changed exact pending row"
+                                            );
+                                        }
                                         eprintln!("root PID1 drain restart readback: {}", restored);
                                     }
                                 }
@@ -16144,6 +16413,7 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_model_provider_native_codex_recipient_ack",
         "normal_model_provider_native_codex_f_candidate",
         "normal_model_provider_native_codex_f_turn",
+        "normal_model_provider_native_codex_f_turn_old_pending_debt",
         "normal_model_provider_bash_causal_root_h_notify_row_drain",
         "normal_model_provider_bash_causal_root_h_notify_wake",
         "normal_model_provider_bash_causal_root_h_notify_wake_drain",
