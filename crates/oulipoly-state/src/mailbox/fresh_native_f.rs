@@ -3,7 +3,7 @@ use std::os::unix::fs::FileTypeExt;
 
 /// Read-only cross-lane evidence for a separate F delivery. This does not
 /// reserve native input, transfer the root recipient's token, or ACK F.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FreshNativeKFCandidate {
     pub fresh: FreshDeliveryReadback,
     pub fresh_physical_grant_id: String,

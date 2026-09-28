@@ -9047,7 +9047,7 @@ impl NativeCodexControl {
             return Err(io::Error::other("original native source is ambiguous"));
         };
         let original_source = original.grant.grant_id.clone();
-        let lane =
+        let mut lane =
             oulipoly_state::mailbox::FreshV30Lane::open_at(state_root).map_err(io::Error::other)?;
         let selected_json = serde_json::to_string(&selected)?;
         let candidate = lane
@@ -9168,6 +9168,24 @@ impl NativeCodexControl {
         file.write_all(b"\n")?;
         file.sync_all()?;
         File::open(directory)?.sync_all()?;
+        let reserved = lane
+            .reserve_headless_native_f_attempt(
+                &oulipoly_state::mailbox::FreshHeadlessNativeFRequest {
+                    bash_request_id: bash_request.to_owned(),
+                    delivery_request_id: delivery_request.to_owned(),
+                    delivery_token: delivery_token.to_owned(),
+                    recipient: recipient.clone(),
+                    original_source_grant_id: original_source.clone(),
+                    selected_k_json: selected_json,
+                    nonce: nonce.clone(),
+                    envelope: envelope.clone(),
+                    anchor_sha256: anchor.prefix_sha256.clone(),
+                },
+            )
+            .map_err(io::Error::other)?;
+        if reserved.candidate != candidate {
+            return Err(io::Error::other("headless native F reservation changed"));
+        }
         let receipt_path = directory.join(format!(
             "{}.native-f-receipt.json",
             candidate.fresh.grant_id
@@ -9230,7 +9248,7 @@ impl NativeCodexControl {
         if self.readback(directory, binding)? != *selected {
             return Err(io::Error::other("fresh F selected K changed before send"));
         }
-        let lane =
+        let mut lane =
             oulipoly_state::mailbox::FreshV30Lane::open_at(state_root).map_err(io::Error::other)?;
         let candidate = lane
             .attest_native_k_f_candidate(
@@ -9351,11 +9369,53 @@ impl NativeCodexControl {
                     .create_new(true)
                     .mode(0o600)
                     .open(receipt_path)?;
-                serde_json::to_writer(&mut file, &receipt)?;
-                file.write_all(b"\n")?;
+                let receipt_json = format!("{}\n", serde_json::to_string(&receipt)?);
+                file.write_all(receipt_json.as_bytes())?;
                 file.sync_all()?;
                 File::open(directory)?.sync_all()?;
-                return Ok(receipt);
+                self.provider.verify()?;
+                self.verify_native_home()?;
+                if self.readback(directory, binding)? != *selected {
+                    return Err(io::Error::other("selected K changed before F ACK"));
+                }
+                let proof = oulipoly_state::mailbox::FreshHeadlessNativeFProof {
+                    bash_request_id: bash_request.to_owned(),
+                    delivery_request_id: delivery_request.to_owned(),
+                    delivery_token: delivery_token.to_owned(),
+                    recipient: recipient.clone(),
+                    original_source_grant_id: original_source.to_owned(),
+                    selected_k_json: serde_json::to_string(selected)?,
+                    fresh_grant_id: candidate.fresh.grant_id.clone(),
+                    native_session_id: selected.native_session_id.clone(),
+                    first_turn_id: candidate.original_turn_id.clone(),
+                    turn_id: turn_id.to_owned(),
+                    nonce: nonce.to_owned(),
+                    envelope_sha256: format!("{:x}", Sha256::digest(envelope.as_bytes())),
+                    user_item_id,
+                    assistant_response_sha256: response_sha256,
+                    receipt_sha256: format!("{:x}", Sha256::digest(receipt_json.as_bytes())),
+                    receipt_json,
+                };
+                let committed = lane
+                    .acknowledge_headless_native_f(&proof)
+                    .map_err(io::Error::other)?;
+                // The readback is authoritative even when the post-commit
+                // response is deliberately lost. No second ACK is attempted.
+                let drop_ack_reply =
+                    std::env::var_os("AGE319_PRIVATE_NATIVE_F_ACK_DROP_REPLY_V1").is_some();
+                let reply = (!drop_ack_reply).then_some(committed);
+                let settled = lane
+                    .read_headless_native_f_ack(delivery_request, recipient)
+                    .map_err(io::Error::other)?
+                    .ok_or_else(|| io::Error::other("headless F ACK readback absent"))?;
+                if reply.is_some_and(|reply| reply != settled) || settled.proof != proof {
+                    return Err(io::Error::other("headless F ACK readback differs"));
+                }
+                let mut answer = receipt;
+                answer["fresh_row_acknowledged"] = serde_json::Value::Bool(true);
+                answer["ack_reply_dropped"] = serde_json::Value::Bool(drop_ack_reply);
+                answer["fresh_ack"] = serde_json::to_value(settled)?;
+                return Ok(answer);
             }
             if Instant::now() >= deadline {
                 return Err(io::Error::other(
@@ -10332,6 +10392,35 @@ mod tests {
         let user = serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","id":"fresh-user","content":[{"type":"input_text","text":envelope}]}});
         let assistant = serde_json::json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":format!("AGE319_F_ACK {token}")}]}});
         let done = serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"second"}});
+        fs::write(&path, format!("{prefix}{start}\n{user}\n{done}\n")).unwrap();
+        assert!(
+            native_rollout_assistant_expected(
+                temp.path(),
+                &session,
+                &anchor,
+                "second",
+                &envelope,
+                &format!("AGE319_F_ACK {token}"),
+            )
+            .is_err()
+        );
+        let altered_user = serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","id":"fresh-user","content":[{"type":"input_text","text":"altered F input"}]}});
+        fs::write(
+            &path,
+            format!("{prefix}{start}\n{altered_user}\n{assistant}\n{done}\n"),
+        )
+        .unwrap();
+        assert!(
+            native_rollout_assistant_expected(
+                temp.path(),
+                &session,
+                &anchor,
+                "second",
+                &envelope,
+                &format!("AGE319_F_ACK {token}"),
+            )
+            .is_err()
+        );
         let complete = format!("{prefix}{start}\n{user}\n{assistant}\n{done}\n");
         fs::write(&path, &complete).unwrap();
         assert!(
