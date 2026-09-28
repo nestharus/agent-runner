@@ -8579,9 +8579,29 @@ fn inner() {
                         }
                         assert!(
                             gate.join("native-bash-result.json").exists(),
-                            "real K Bash result absent: entry={} broker={}",
+                            "real K Bash result absent: entry={} broker={} h_client={} h_broker={} h_guardian={} postcommit={} driver={} source_launch={} h_diagnostic={}",
                             fs::read_to_string(&err).unwrap_or_default(),
-                            fs::read_to_string(&broker_log).unwrap_or_default()
+                            fs::read_to_string(&broker_log).unwrap_or_default(),
+                            fs::read_to_string(gate.join("delegated-h-client-stage"))
+                                .unwrap_or_default(),
+                            fs::read_to_string(gate.join("delegated-h-broker-stage"))
+                                .unwrap_or_default(),
+                            fs::read_to_string(gate.join("delegated-h-guardian-stage"))
+                                .unwrap_or_default(),
+                            fs::read_to_string(gate.join("source-guardian-postcommit-stage"))
+                                .unwrap_or_default(),
+                            fs::read_to_string(gate.join("source-driver-postcommit-stage"))
+                                .unwrap_or_default(),
+                            fs::read_to_string(gate.join("source-launch-stage"))
+                                .unwrap_or_default(),
+                            fs::read_to_string(
+                                std::path::PathBuf::from(
+                                    fs::read_to_string(gate.join("h-source-intent-dir"))
+                                        .unwrap_or_default()
+                                )
+                                .join("root-work-diagnostic-v1.jsonl")
+                            )
+                            .unwrap_or_default()
                         );
                         let result: serde_json::Value = serde_json::from_slice(
                             &fs::read(gate.join("native-bash-result.json")).unwrap(),
@@ -9667,6 +9687,96 @@ fn inner() {
                                             expected.root_id
                                         ));
                                         eventually(|| terminal_path.exists());
+                                        if std::env::var_os("AGE319_DIAG_PIDNS_V1").is_some() {
+                                            for sample in 0..3 {
+                                                eprintln!(
+                                                    "PIDNS diagnostic sample {sample} root={expected:?}"
+                                                );
+                                                let mut pids = fs::read_dir("/proc")
+                                                    .unwrap()
+                                                    .flatten()
+                                                    .filter_map(|entry| {
+                                                        entry
+                                                            .file_name()
+                                                            .to_string_lossy()
+                                                            .parse::<i32>()
+                                                            .ok()
+                                                    })
+                                                    .collect::<Vec<_>>();
+                                                pids.sort_unstable();
+                                                for pid in pids {
+                                                    let path = format!("/proc/{pid}");
+                                                    let Ok(status) = fs::read_to_string(format!(
+                                                        "{path}/status"
+                                                    )) else {
+                                                        continue;
+                                                    };
+                                                    let nspid = status
+                                                        .lines()
+                                                        .find(|line| line.starts_with("NSpid:"))
+                                                        .unwrap_or("");
+                                                    if pid != expected.init_host_pid
+                                                        && nspid.split_whitespace().count() < 3
+                                                    {
+                                                        continue;
+                                                    }
+                                                    let stat =
+                                                        fs::read_to_string(format!("{path}/stat"))
+                                                            .unwrap_or_default();
+                                                    let start = stat
+                                                        .rsplit_once(") ")
+                                                        .and_then(|(_, rest)| {
+                                                            rest.split_whitespace().nth(19)
+                                                        })
+                                                        .unwrap_or("?");
+                                                    let state = status
+                                                        .lines()
+                                                        .find(|line| line.starts_with("State:"))
+                                                        .unwrap_or("");
+                                                    let ppid = status
+                                                        .lines()
+                                                        .find(|line| line.starts_with("PPid:"))
+                                                        .unwrap_or("");
+                                                    let ns =
+                                                        fs::read_link(format!("{path}/ns/pid"))
+                                                            .map(|p| p.display().to_string())
+                                                            .unwrap_or_default();
+                                                    let children = fs::read_to_string(format!(
+                                                        "{path}/task/{pid}/children"
+                                                    ))
+                                                    .unwrap_or_default();
+                                                    let wchan =
+                                                        fs::read_to_string(format!("{path}/wchan"))
+                                                            .unwrap_or_default();
+                                                    let cmd = fs::read(format!("{path}/cmdline"))
+                                                        .unwrap_or_default();
+                                                    eprintln!(
+                                                        "PIDNS pid={pid} start={start} {state} {ppid} {nspid} ns={ns} children={children:?} wchan={wchan:?} cmd={:?}",
+                                                        String::from_utf8_lossy(&cmd)
+                                                    );
+                                                }
+                                                std::thread::sleep(Duration::from_secs(1));
+                                            }
+                                        }
+                                        eventually(|| {
+                                            protocol::root_drain_readback_at(
+                                                &socket, &expected, false,
+                                            )
+                                            .ok()
+                                            .and_then(|reply| {
+                                                serde_json::from_str::<serde_json::Value>(
+                                                    reply
+                                                        .strip_prefix("root-drain-v1 ")?
+                                                        .trim_end(),
+                                                )
+                                                .ok()
+                                            })
+                                            .is_some_and(|inventory| {
+                                                inventory["pid1_terminal_proof"] == true
+                                                    && inventory["pid1_parent_wait_proof"] == true
+                                                    && inventory["pid1_exact_live"] == false
+                                            })
+                                        });
                                         let proof = protocol::root_drain_readback_at(
                                             &socket, &expected, false,
                                         )
@@ -9679,14 +9789,12 @@ fn inner() {
                                         )
                                         .unwrap();
                                         assert_eq!(proof["pid1_echild_receipt"], true);
-                                        assert!(
-                                            proof["pid1_terminal_proof"] == true
-                                                || proof["pid1_exact_live"] == true
-                                        );
+                                        assert_eq!(proof["pid1_terminal_proof"], true);
+                                        assert_eq!(proof["pid1_exact_live"], false);
                                         assert_eq!(proof["source_physical_retired"], 1);
                                         assert_eq!(proof["work_retired"], 1);
                                         assert_eq!(proof["entry_physical_settled"], true);
-                                        assert_eq!(proof["pid1_parent_wait_proof"], false);
+                                        assert_eq!(proof["pid1_parent_wait_proof"], true);
                                         assert_eq!(proof["close_eligible"], false);
                                         let terminal: serde_json::Value = serde_json::from_slice(
                                             &fs::read(&terminal_path).unwrap(),
@@ -9761,10 +9869,9 @@ fn inner() {
                                         )
                                         .unwrap();
                                         assert_eq!(restored["pid1_echild_receipt"], true);
-                                        assert!(
-                                            restored["pid1_terminal_proof"] == true
-                                                || restored["pid1_exact_live"] == true
-                                        );
+                                        assert_eq!(restored["pid1_terminal_proof"], true);
+                                        assert_eq!(restored["pid1_parent_wait_proof"], true);
+                                        assert_eq!(restored["pid1_exact_live"], false);
                                         assert_eq!(restored["work_retired"], 1);
                                         assert_eq!(restored["close_eligible"], false);
                                         eprintln!("root PID1 drain restart readback: {}", restored);
@@ -15832,7 +15939,7 @@ fn inner() {
         let after: serde_json::Value =
             serde_json::from_str(after.strip_prefix("root-drain-v1 ").unwrap().trim_end()).unwrap();
         assert_eq!(after["fenced"], true);
-        assert_eq!(after["pid1"], "unknown");
+        assert_eq!(after["pid1"], "live");
         assert_eq!(after["spent_without_work"], 1);
         assert_eq!(after["state"], "blocked");
         assert_eq!(after["source_effect_readback_uncertain"], true);

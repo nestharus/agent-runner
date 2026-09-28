@@ -403,7 +403,7 @@ fn create_init(
             unsafe { libc::_exit(70) };
         }
         if entered > 0 {
-            unsafe { libc::_exit(0) };
+            work_launch::wait_entered_child(entered);
         }
         let pointer = Box::into_raw(Box::new(context));
         let mut stack = vec![0u8; 1024 * 1024];
@@ -436,13 +436,7 @@ fn create_init(
         unsafe { libc::_exit(if recorded { 0 } else { 70 }) };
     }
     drop(context);
-    let mut status = 0;
-    if unsafe { libc::waitpid(pid, &mut status, 0) } != pid
-        || !libc::WIFEXITED(status)
-        || libc::WEXITSTATUS(status) != 0
-    {
-        return Err(io::Error::other("native namespace helper failed"));
-    }
+    work_launch::reap_namespace_helper(pid)?;
     let credential = work_launch::child_credential(&broker_control, b'I')?;
     if credential.uid != 0 || credential.pid <= 0 {
         return Err(io::Error::other("native PID1 identity refused"));
