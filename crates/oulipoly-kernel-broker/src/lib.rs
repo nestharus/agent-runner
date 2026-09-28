@@ -10,6 +10,7 @@ pub mod entry_registry;
 pub mod first_install_activation;
 pub mod identity;
 pub mod installed_launch;
+pub mod installed_launch_ledger;
 pub mod installed_pair;
 pub mod json_artifact;
 pub mod native_receipt;

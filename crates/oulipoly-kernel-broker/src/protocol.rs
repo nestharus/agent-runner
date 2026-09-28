@@ -3407,10 +3407,8 @@ pub fn join_at(path: &Path, spec: &JoinSpec, descriptors: [RawFd; 5]) -> io::Res
     join_versioned_at(path, spec, descriptors, b'J')
 }
 
-/// Submit an exact installed CLI/GUI entry. The response is a receipt or an
-/// explicit refusal; a lost reply is uncertain and must never be retried as a
-/// new request ID. The production broker currently refuses after preflight,
-/// before root creation.
+/// Submit an exact installed CLI/GUI entry. A lost reply is uncertain and
+/// must be read back with the same request ID; submission never gets a new ID.
 pub fn submit_installed_launch_at(
     path: &Path,
     spec: &InstalledLaunchSpec,
@@ -3418,6 +3416,41 @@ pub fn submit_installed_launch_at(
 ) -> io::Result<String> {
     let stream = checked_connection(path)?;
     submit_installed_launch_on(stream, spec, descriptors)
+}
+
+/// Read only the exact request admitted by this same pinned launcher process.
+/// This opcode has no launch or cancellation effect.
+pub fn installed_launch_status_at(
+    path: &Path,
+    request_id: &str,
+    generation: &str,
+) -> io::Result<String> {
+    installed_launch_status_on(checked_connection(path)?, request_id, generation)
+}
+
+fn installed_launch_status_on(
+    mut stream: UnixStream,
+    request_id: &str,
+    generation: &str,
+) -> io::Result<String> {
+    let id = uuid::Uuid::parse_str(request_id)
+        .map_err(|_| io::Error::other("invalid installed launch request ID"))?;
+    let pair = uuid::Uuid::parse_str(generation)
+        .map_err(|_| io::Error::other("invalid installed launch generation"))?;
+    if id.to_string() != request_id || pair.to_string() != generation {
+        return Err(io::Error::other("noncanonical installed launch identity"));
+    }
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let mut frame = [0u8; 49];
+    frame[0] = b'l';
+    frame[1..17].copy_from_slice(&challenge);
+    frame[17..33].copy_from_slice(id.as_bytes());
+    frame[33..49].copy_from_slice(pair.as_bytes());
+    if stream.write(&frame)? != frame.len() {
+        return Err(io::Error::other("installed launch status uncertain"));
+    }
+    read_response(stream)
 }
 
 /// Private feature-only readback/cancel. The request ID selects an existing
@@ -3507,6 +3540,38 @@ mod installed_launch_wire_tests {
     use std::fs::File;
     use std::os::fd::{FromRawFd, OwnedFd};
     use std::thread;
+
+    #[test]
+    fn status_uses_exact_read_only_request_and_pair_frame() {
+        let request = uuid::Uuid::new_v4().to_string();
+        let pair = uuid::Uuid::new_v4().to_string();
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let expected_request = request.clone();
+        let expected_pair = pair.clone();
+        let worker = thread::spawn(move || {
+            server.write_all(&[9u8; 16]).unwrap();
+            let mut frame = [0u8; 49];
+            server.read_exact(&mut frame).unwrap();
+            assert_eq!(frame[0], b'l');
+            assert_eq!(&frame[1..17], &[9u8; 16]);
+            assert_eq!(
+                &frame[17..33],
+                uuid::Uuid::parse_str(&expected_request).unwrap().as_bytes()
+            );
+            assert_eq!(
+                &frame[33..49],
+                uuid::Uuid::parse_str(&expected_pair).unwrap().as_bytes()
+            );
+            server
+                .write_all(format!("pending {expected_request} {expected_pair}\n").as_bytes())
+                .unwrap();
+        });
+        assert_eq!(
+            installed_launch_status_on(client, &request, &pair).unwrap(),
+            format!("pending {request} {pair}\n")
+        );
+        worker.join().unwrap();
+    }
 
     fn exchange(kind: EntryKind, reply: Option<&'static str>) -> (io::Result<String>, String) {
         let name = if kind == EntryKind::Gui {

@@ -4,6 +4,7 @@
 
 - `crates/oulipoly-kernel-broker/src/identity.rs`
 - `crates/oulipoly-kernel-broker/src/installed_launch.rs`
+- `crates/oulipoly-kernel-broker/src/installed_launch_ledger.rs`
 - `crates/oulipoly-kernel-broker/src/installed_launcher.rs`
 - `crates/oulipoly-kernel-broker/src/installed_pair.rs`
 - `crates/oulipoly-kernel-broker/src/accepted_grant.rs`
@@ -89,13 +90,14 @@
 | Exact joined child verifies a connected native-owner socket through challenged V. | Broker checks the fsynced child stamp and root PID1 ancestry, the host guardian and driver boot/starttime, and host-side socket peer credentials before returning a read-only verification receipt. |
 | A sealed Runner helper in a consumed K work verifies the connected owner socket. | A v3 H grant must pin the helper inode, Runner SHA-256, session, invocation and native registration-authority digest from the accepted intent. V must match the exact live work/grant, root, owner generation, authority digest, executable and guardian socket. The same bytes at another inode, altered witness, or missing/unconsumed grant refuse; an unchanged live work reattaches across broker restart. |
 | V carries a changed guardian incarnation or unrelated connected socket. | Refused without changing the one-use join or granting work. |
-| Production provider/recovery CLI, GUI or TTY entry. | Refused before broker reservation while host/local PID plumbing and descriptor handoff are incomplete. |
+| Production provider/recovery CLI, GUI or TTY entry. | Supported headless CLI can acquire only an inert request record; root reservation and execution remain closed. GUI and TTY refuse before that record. |
 | Private feature-gated installed CLI entry with fixed Runner image, supported offline args, cwd and stdio/PTY descriptors. | One fsynced request identity; broker forks a host guardian and gated root PID1, pins the Runner child before release, and the guardian persists exit plus physical drain. Replay, unsettled second entrant, wrong image/generation and GUI refuse. Exact PID1 cancel survives broker restart and targets only that namespace. Production L remains closed. |
 | Loader-controlled environment, forged completion socket, sibling J, or replay J. | Refused without an arbitrary command launch. |
 | Broker restarts after a spent join. | Exact PID1 reattaches if live; spent join remains debt and no second child is launched. |
 | A sibling child tries to bind a prepared guardian's root ID. | Refused on pinned guardian incarnation mismatch. |
 | Legacy `L` request. | Refused; no ungated Runner is released. |
-| Exact paired launcher sends a versioned L request with argv/environment bytes, present stdio/TTY descriptors and cwd. | Broker pins launcher executable and validates generation, request ID and descriptor shape; current production route refuses before Runner or State work. An absent broker or lost reply is an error, never an automatic new launch. |
+| Exact schema-2 paired launcher sends a supported headless CLI L request with argv/environment bytes, present stdio descriptors and cwd. | Broker validates the activated pair/source, pinned launcher, generation, request ID and descriptor shape, then fsyncs an inert request record containing the launch spec digest, owner UID and launcher process stamp. It returns pending; no Runner root or State work starts. Exact duplicate L returns the same pending record, while changed bytes or owner refuse. |
+| The original installed launcher loses L reply and queries `l` after Broker restart. | The read-only query compares request ID, pair/source generation, pinned launcher image, UID and exact process stamp. It returns only pending for a recorded request; a different process or generation refuses. No terminal or physical drain is inferred from process disappearance. |
 | CLI and GUI paired links are staged from one archive. | Both point to the thin launcher; direct fixed Runner remains gated. Legacy `.deb` and raw Runner are not converted. |
 | Host root closes broker ingress with X, then broker restarts. | Durable draining marker refuses ordinary broker opcodes; challenged i reports draining from broker-owned state. |
 | A prerequisite fails before fixed sidecar publication, or fixed sidecar exists. | Explicit host-root x can resume legacy admission only before publication; publication makes abort refuse. |
