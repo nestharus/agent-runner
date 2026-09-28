@@ -9571,6 +9571,7 @@ fn inner() {
                                         );
                                         assert_eq!(after_work["entry_unsettled"], true);
                                         assert_eq!(after_work["close_eligible"], false);
+                                        assert_eq!(after_work["owner_close_preflight"], false);
                                         assert_eq!(after_work["pid1"], "live");
                                         assert_eq!(
                                             after_work["owner_close_inventory"]["owner_generation"],
@@ -9856,6 +9857,7 @@ fn inner() {
                                             true
                                         );
                                         assert_eq!(changed["close_eligible"], false);
+                                        assert_eq!(changed["owner_close_preflight"], false);
                                         assert_eq!(
                                             changed["owner_close_inventory"]["owner_generation"],
                                             prepared.owner_generation
@@ -10014,8 +10016,15 @@ fn inner() {
                                         assert_eq!(proof["source_physical_retired"], 1);
                                         assert_eq!(proof["work_retired"], 1);
                                         assert_eq!(proof["entry_physical_settled"], true);
+                                        assert_eq!(proof["entry_unsettled"], true);
                                         assert_eq!(proof["pid1_parent_wait_proof"], true);
                                         assert_eq!(proof["close_eligible"], false);
+                                        assert_eq!(
+                                            proof["owner_close_preflight"], !old_pending_debt,
+                                            "post-Q inventory: {proof}"
+                                        );
+                                        assert!(proof["owner_close_inventory"]["state_cursor"]["authority_ordinal"]
+                                            .as_i64().is_some_and(|ordinal| ordinal > 0));
                                         assert_eq!(
                                             proof["owner_close_inventory"]["owner_generation"],
                                             prepared.owner_generation
@@ -10086,6 +10095,7 @@ fn inner() {
                                         assert_eq!(missing["pid1_terminal_proof"], false);
                                         assert_eq!(missing["pid1_echild_receipt"], false);
                                         assert_eq!(missing["close_eligible"], false);
+                                        assert_eq!(missing["owner_close_preflight"], false);
                                         fs::rename(&terminal_backup, &terminal_path).unwrap();
                                         stop(&mut broker);
                                         broker = Command::new(env!(
@@ -10138,6 +10148,10 @@ fn inner() {
                                         assert_eq!(restored["pid1_exact_live"], false);
                                         assert_eq!(restored["work_retired"], 1);
                                         assert_eq!(restored["close_eligible"], false);
+                                        assert_eq!(
+                                            restored["owner_close_preflight"],
+                                            !old_pending_debt
+                                        );
                                         assert_eq!(
                                             restored["state_sidecar_outstanding_unknown"],
                                             true

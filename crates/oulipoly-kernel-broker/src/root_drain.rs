@@ -14,14 +14,14 @@ use oulipoly_state::mailbox::{
 use serde::Serialize;
 use std::io;
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DrainState {
     Blocked,
     Unknown,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RootDrainInventory {
     pub root_id: String,
     pub fenced: bool,
@@ -72,6 +72,9 @@ pub struct RootDrainInventory {
     pub owner_close_inventory: Option<BrokerOwnerCloseInventory>,
     pub uncertain_registry_or_incarnation: bool,
     pub state_sidecar_outstanding_unknown: bool,
+    /// Read-only close preflight. It binds this root's physical Q and the
+    /// observed State/sidecar debt; it does not hold their writer fences.
+    pub owner_close_preflight: bool,
     /// No State/sidecar atomic close or source-admission proof is supplied by
     /// this inventory. An empty count is never a drain certificate.
     pub close_eligible: bool,
@@ -339,7 +342,7 @@ pub fn readback(
         .iter()
         .filter(|grant| grant.state == "consumed")
         .count();
-    Ok(RootDrainInventory {
+    let mut inventory = RootDrainInventory {
         root_id: expected.root_id.clone(),
         fenced: roots.admission_fenced(&expected.root_id),
         state: classify_counts(
@@ -381,8 +384,90 @@ pub fn readback(
         owner_close_inventory,
         uncertain_registry_or_incarnation,
         state_sidecar_outstanding_unknown: true,
+        owner_close_preflight: false,
         close_eligible: false,
-    })
+    };
+    if let Some(owner_generation) = inventory
+        .owner_close_inventory
+        .as_ref()
+        .map(|owner| owner.owner_generation.clone())
+    {
+        inventory.owner_close_preflight =
+            ready_for_owner_close_preflight(&inventory, &expected.root_id, &owner_generation)
+                .is_ok();
+    }
+    Ok(inventory)
+}
+
+/// A fail-closed, read-only prerequisite for the one expected root and owner.
+/// A close writer must repeat every check under joined State, sidecar, fresh
+/// lane and Broker admission fences; this result never authorizes release.
+pub fn ready_for_owner_close_preflight(
+    inventory: &RootDrainInventory,
+    expected_root_id: &str,
+    expected_owner_generation: &str,
+) -> io::Result<()> {
+    let owner = inventory
+        .owner_close_inventory
+        .as_ref()
+        .ok_or_else(|| io::Error::other("owner close sidecar inventory absent"))?;
+    let cursor = owner
+        .state_cursor
+        .as_ref()
+        .ok_or_else(|| io::Error::other("owner close State cursor absent"))?;
+    if inventory.root_id != expected_root_id
+        || owner.root_id != expected_root_id
+        || owner.owner_generation != expected_owner_generation
+        || owner.source_generation.is_empty()
+        || cursor.authority_ordinal <= 0
+        || cursor.admission_id.is_empty()
+        || cursor.continuity_digest.len() != 64
+        || !cursor
+            .continuity_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || cursor.sidecar_generation.is_empty()
+        || !inventory.fenced
+        || inventory.pid1 != "terminal_echild_absent"
+        || inventory.pid1_exact_live
+        || !inventory.pid1_echild_receipt
+        || !inventory.pid1_terminal_proof
+        || !inventory.pid1_parent_wait_proof
+        || !inventory.entry_physical_settled
+        || !inventory.entry_original_exited
+        // Entry terminal_settlement is the later caller-publication identity,
+        // not an owner-side physical or notification duty.
+        || inventory.prepared_grants != 0
+        || inventory.spent_without_work != 0
+        || inventory.live_works != 0
+        || inventory.work_debt != 0
+        || inventory.work_records == 0
+        || inventory.work_retired != inventory.work_records
+        || inventory.work_outstanding != 0
+        || inventory.native_prepared != 0
+        || inventory.native_spent != 0
+        || inventory.source_physical_records != 1
+        || inventory.source_physical_retired != 1
+        || inventory.source_physical_outstanding != 0
+        || inventory.source_effect_readback_uncertain
+        || inventory.uncertain_registry_or_incarnation
+        || inventory.source_effect.as_ref() != Some(&owner.source_effect)
+        || owner.source_effect.unsettled() != 0
+        || owner.source_effect.accepted != 1
+        || owner.state_projection_pending
+        || owner.state_native_channel_pending
+        || owner.state_cancelling_native_attempts != 0
+        || owner.registered_sources != 0
+        || owner.retiring_listeners != 0
+        || owner.deliverable_mailbox_rows != 0
+        || owner.unresolved_attempts != 0
+        || owner.native_grants_without_q != 0
+    {
+        return Err(io::Error::other(
+            "exact root/owner close preflight evidence absent or changed",
+        ));
+    }
+    Ok(())
 }
 
 /// An explicit host-root drain request is allowed only after an exact,
@@ -422,6 +507,116 @@ pub fn ready_for_pid1_request(inventory: &RootDrainInventory) -> io::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oulipoly_state::mailbox::{BoundStateFileIdentity, BrokerStateCloseCursor};
+
+    fn settled_owner_inventory() -> RootDrainInventory {
+        let effect = BrokerSourceEffectObligations {
+            accepted: 1,
+            ..Default::default()
+        };
+        RootDrainInventory {
+            root_id: "root".into(),
+            fenced: true,
+            state: DrainState::Blocked,
+            pid1: "terminal_echild_absent",
+            pid1_exact_live: false,
+            pid1_echild_receipt: true,
+            pid1_terminal_proof: true,
+            pid1_parent_wait_proof: true,
+            entry_physical_settled: true,
+            entry_original_exited: true,
+            entry_unsettled: true,
+            prepared_grants: 0,
+            spent_without_work: 0,
+            live_works: 0,
+            work_debt: 0,
+            work_records: 1,
+            work_retired: 1,
+            work_outstanding: 0,
+            native_prepared: 0,
+            native_spent: 0,
+            source_physical_records: 1,
+            source_physical_retired: 1,
+            source_physical_outstanding: 0,
+            source_effect: Some(effect.clone()),
+            source_effect_readback_uncertain: false,
+            owner_close_inventory: Some(BrokerOwnerCloseInventory {
+                source_generation: "source".into(),
+                root_id: "root".into(),
+                owner_generation: "owner".into(),
+                state_cursor: Some(BrokerStateCloseCursor {
+                    file: BoundStateFileIdentity {
+                        device: 1,
+                        inode: 2,
+                    },
+                    authority_ordinal: 2,
+                    admission_id: "admission".into(),
+                    sidecar_generation: "sidecar".into(),
+                    continuity_digest: "a".repeat(64),
+                }),
+                state_projection_pending: false,
+                state_native_channel_pending: false,
+                state_cancelling_native_attempts: 0,
+                registered_sources: 0,
+                retiring_listeners: 0,
+                deliverable_mailbox_rows: 0,
+                unresolved_attempts: 0,
+                native_grants_without_q: 0,
+                source_effect: effect,
+            }),
+            uncertain_registry_or_incarnation: false,
+            state_sidecar_outstanding_unknown: true,
+            owner_close_preflight: false,
+            close_eligible: false,
+        }
+    }
+
+    #[test]
+    fn close_preflight_binds_root_owner_cursor_and_physical_q_without_claiming_close() {
+        let settled = settled_owner_inventory();
+        assert!(ready_for_owner_close_preflight(&settled, "root", "owner").is_ok());
+        assert!(!settled.close_eligible);
+        assert!(ready_for_owner_close_preflight(&settled, "other", "owner").is_err());
+        assert!(ready_for_owner_close_preflight(&settled, "root", "stale").is_err());
+
+        let mut changed = settled.clone();
+        changed.pid1_parent_wait_proof = false;
+        assert!(ready_for_owner_close_preflight(&changed, "root", "owner").is_err());
+        changed = settled.clone();
+        changed.work_outstanding = 1;
+        assert!(ready_for_owner_close_preflight(&changed, "root", "owner").is_err());
+        changed = settled.clone();
+        changed.owner_close_inventory.as_mut().unwrap().state_cursor = None;
+        assert!(ready_for_owner_close_preflight(&changed, "root", "owner").is_err());
+        changed = settled.clone();
+        changed
+            .owner_close_inventory
+            .as_mut()
+            .unwrap()
+            .state_projection_pending = true;
+        assert!(ready_for_owner_close_preflight(&changed, "root", "owner").is_err());
+        changed = settled.clone();
+        changed
+            .owner_close_inventory
+            .as_mut()
+            .unwrap()
+            .deliverable_mailbox_rows = 1;
+        assert!(ready_for_owner_close_preflight(&changed, "root", "owner").is_err());
+        changed = settled.clone();
+        changed
+            .owner_close_inventory
+            .as_mut()
+            .unwrap()
+            .native_grants_without_q = 1;
+        assert!(ready_for_owner_close_preflight(&changed, "root", "owner").is_err());
+        changed = settled;
+        changed
+            .owner_close_inventory
+            .as_mut()
+            .unwrap()
+            .owner_generation = "other".into();
+        assert!(ready_for_owner_close_preflight(&changed, "root", "owner").is_err());
+    }
 
     #[test]
     fn accepted_pre_fork_and_adopted_work_never_look_empty() {

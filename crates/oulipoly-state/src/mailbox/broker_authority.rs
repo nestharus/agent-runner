@@ -28,7 +28,7 @@ pub struct BrokerSidecar {
 /// Identity of the original State file selected by the broker-owned source
 /// binding. A later State transaction must compare these values to its own
 /// opened database before consuming a source decision.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct BoundStateFileIdentity {
     pub device: u64,
     pub inode: u64,
@@ -380,6 +380,9 @@ pub struct BrokerOwnerCloseInventory {
     pub source_generation: String,
     pub root_id: String,
     pub owner_generation: String,
+    /// The inode-bound State continuity head observed on both sides of the
+    /// sidecar inventory transaction. A later writer must compare it again.
+    pub state_cursor: Option<BrokerStateCloseCursor>,
     pub state_projection_pending: bool,
     pub state_native_channel_pending: bool,
     pub state_cancelling_native_attempts: usize,
@@ -389,6 +392,39 @@ pub struct BrokerOwnerCloseInventory {
     pub unresolved_attempts: usize,
     pub native_grants_without_q: usize,
     pub source_effect: BrokerSourceEffectObligations,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct BrokerStateCloseCursor {
+    pub file: BoundStateFileIdentity,
+    pub authority_ordinal: i64,
+    pub admission_id: String,
+    pub sidecar_generation: String,
+    pub continuity_digest: String,
+}
+
+fn state_close_cursor(
+    state: &StateDb,
+    file: BoundStateFileIdentity,
+) -> Result<Option<BrokerStateCloseCursor>, String> {
+    state
+        .connection()
+        .query_row(
+            "SELECT authority_ordinal,admission_id,expected_sidecar_generation,continuity_digest
+             FROM invocation_completion_continuity ORDER BY authority_ordinal DESC LIMIT 1",
+            [],
+            |row| {
+                Ok(BrokerStateCloseCursor {
+                    file,
+                    authority_ordinal: row.get(0)?,
+                    admission_id: row.get(1)?,
+                    sidecar_generation: row.get(2)?,
+                    continuity_digest: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())
 }
 
 fn source_effect_obligations_on(
@@ -1057,6 +1093,8 @@ impl BrokerSidecar {
         }
         let owner = &release.owner;
         let state = self.bound_state()?;
+        let state_file = self.bound_state_file_identity()?;
+        let state_cursor = state_close_cursor(&state, state_file)?;
         let tx = self
             .mailbox
             .conn
@@ -1069,6 +1107,18 @@ impl BrokerSidecar {
             }
         }
         let state_projection_pending = state.completion_repair_has_suffix(head.as_ref())?;
+        if !state_projection_pending
+            && state_cursor.as_ref().is_none_or(|cursor| {
+                head.as_ref().is_none_or(|head| {
+                    cursor.authority_ordinal != head.authority_ordinal
+                        || cursor.admission_id != head.admission_id
+                        || cursor.sidecar_generation != head.sidecar_generation
+                        || cursor.continuity_digest != head.continuity_digest
+                })
+            })
+        {
+            return Err("broker owner close State/sidecar cursor absent or changed".into());
+        }
         let supervisor = &owner.supervisor_authority_id;
         let scope = "WITH RECURSIVE supervisor_scope(authority_id) AS (
             SELECT ?1 UNION SELECT predecessor_authority_id
@@ -1111,7 +1161,9 @@ impl BrokerSidecar {
             &owner.owner_generation,
         )?;
         tx.commit().map_err(|error| error.to_string())?;
-        if state.completion_repair_has_suffix(head.as_ref())? != state_projection_pending {
+        if state.completion_repair_has_suffix(head.as_ref())? != state_projection_pending
+            || state_close_cursor(&state, self.bound_state_file_identity()?)? != state_cursor
+        {
             return Err("broker owner close State projection changed during readback".into());
         }
         let state_native_channel_pending =
@@ -1122,6 +1174,7 @@ impl BrokerSidecar {
             source_generation: self.source_generation.clone(),
             root_id: root_id.into(),
             owner_generation: owner.owner_generation.clone(),
+            state_cursor,
             state_projection_pending,
             state_native_channel_pending,
             state_cancelling_native_attempts,
