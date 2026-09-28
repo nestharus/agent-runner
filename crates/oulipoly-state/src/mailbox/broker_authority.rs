@@ -28,7 +28,7 @@ pub struct BrokerSidecar {
 /// Identity of the original State file selected by the broker-owned source
 /// binding. A later State transaction must compare these values to its own
 /// opened database before consuming a source decision.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BoundStateFileIdentity {
     pub device: u64,
     pub inode: u64,
@@ -394,7 +394,7 @@ pub struct BrokerOwnerCloseInventory {
     pub source_effect: BrokerSourceEffectObligations,
 }
 
-#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct BrokerStateCloseCursor {
     pub file: BoundStateFileIdentity,
     pub authority_ordinal: i64,

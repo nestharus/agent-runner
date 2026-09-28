@@ -4,7 +4,7 @@
 use crate::accepted_grant::{GrantRecord, GrantRegistry};
 use crate::entry_registry::{EntryRegistry, ProcessStamp};
 use crate::identity::{ChildExit, observed_incarnation_gone};
-use crate::registry::{RootRecord, RootRegistry};
+use crate::registry::{OwnerCloseIntent, RootRecord, RootRegistry};
 use crate::source_physical::SourcePhysicalRegistry;
 use crate::work_registry::{LiveWork, WorkRecord, WorkRegistry};
 use oulipoly_state::mailbox::{
@@ -75,7 +75,9 @@ pub struct RootDrainInventory {
     /// Read-only close preflight. It binds this root's physical Q and the
     /// observed State/sidecar debt; it does not hold their writer fences.
     pub owner_close_preflight: bool,
-    /// No State/sidecar atomic close or source-admission proof is supplied by
+    /// Exact durable intent, if issued. It does not close or release the owner.
+    pub owner_close_intent: Option<OwnerCloseIntent>,
+    /// No joined State/sidecar writer fence or atomic close is supplied by
     /// this inventory. An empty count is never a drain certificate.
     pub close_eligible: bool,
 }
@@ -385,6 +387,7 @@ pub fn readback(
         uncertain_registry_or_incarnation,
         state_sidecar_outstanding_unknown: true,
         owner_close_preflight: false,
+        owner_close_intent: roots.read_close_intent(expected)?,
         close_eligible: false,
     };
     if let Some(owner_generation) = inventory
@@ -400,8 +403,9 @@ pub fn readback(
 }
 
 /// A fail-closed, read-only prerequisite for the one expected root and owner.
-/// A close writer must repeat every check under joined State, sidecar, fresh
-/// lane and Broker admission fences; this result never authorizes release.
+/// A close writer must hold/revalidate the durable admission intent and
+/// repeat every check under joined State/sidecar writer fences; this result
+/// never authorizes release.
 pub fn ready_for_owner_close_preflight(
     inventory: &RootDrainInventory,
     expected_root_id: &str,
@@ -567,6 +571,7 @@ mod tests {
             uncertain_registry_or_incarnation: false,
             state_sidecar_outstanding_unknown: true,
             owner_close_preflight: false,
+            owner_close_intent: None,
             close_eligible: false,
         }
     }

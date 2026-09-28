@@ -47,7 +47,8 @@ impl FreshV30Lane {
         serde_json::to_string(identity).map_err(|e| e.to_string())
     }
 
-    fn recipient_binding(
+    /// Read-only exact root/owner binding for a serving Broker admission fence.
+    pub fn recipient_binding(
         &self,
         session: &FreshV30Session,
         identity: &FreshRecipientIdentity,
