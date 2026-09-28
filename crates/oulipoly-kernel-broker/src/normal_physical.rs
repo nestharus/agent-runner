@@ -80,6 +80,31 @@ pub struct PhysicalReadback {
     pub unknown_reason: Option<String>,
 }
 
+/// An immutable caller write reservation. The Q and root identity are copied
+/// into this root-only receipt before either output descriptor is touched.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct PublicationIntent {
+    root_id: String,
+    owner_generation: String,
+    handoff_id: String,
+    invocation_uuid: String,
+    session_id: String,
+    actor: FreshRecipientIdentity,
+    k: FreshNormalProviderK,
+    q: PhysicalQ,
+    exit_code: u8,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PublicationReadback {
+    pub state: String,
+    pub admission_id: String,
+    pub plan_sha256: String,
+    pub exit_code: Option<u8>,
+}
+
 fn stamp(process: &PinnedProcess) -> FreshRecipientIdentity {
     FreshRecipientIdentity {
         host_pid: process.host_pid,
@@ -393,6 +418,144 @@ pub fn observe(
         q,
         unknown_reason,
     }))
+}
+
+fn publication_intent(
+    receipt: &FreshReleasedHandoff,
+    actor: &FreshRecipientIdentity,
+    session: &FreshV30Session,
+    read: &PhysicalReadback,
+) -> io::Result<PublicationIntent> {
+    if read.state != "drained" {
+        return Err(io::Error::other("normal caller physical Q unknown"));
+    }
+    let q = read
+        .q
+        .clone()
+        .ok_or_else(|| io::Error::other("normal caller Q absent"))?;
+    if !libc::WIFEXITED(q.provider_wait_status) {
+        return Err(io::Error::other(
+            "normal caller non-exit wait status cannot be represented",
+        ));
+    }
+    let exit_code =
+        u8::try_from(libc::WEXITSTATUS(q.provider_wait_status)).map_err(io::Error::other)?;
+    Ok(PublicationIntent {
+        root_id: receipt.old_release.prepared.root_id.clone(),
+        owner_generation: receipt.old_release.prepared.owner_generation.clone(),
+        handoff_id: receipt.handoff_id.clone(),
+        invocation_uuid: receipt.invocation_uuid.clone(),
+        session_id: session.session_id.clone(),
+        actor: actor.clone(),
+        k: read.k.clone(),
+        q,
+        exit_code,
+    })
+}
+
+fn publication_readback(
+    directory: &Path,
+    expected: &PublicationIntent,
+) -> io::Result<PublicationReadback> {
+    let intent: Option<PublicationIntent> = read_optional(directory, "caller-intent.json")?;
+    let settled: Option<PublicationIntent> = read_optional(directory, "caller-settled.json")?;
+    if intent.as_ref().is_some_and(|value| value != expected)
+        || settled.as_ref().is_some_and(|value| value != expected)
+        || (settled.is_some() && intent.is_none())
+    {
+        return Err(io::Error::other(
+            "normal caller publication binding changed",
+        ));
+    }
+    Ok(PublicationReadback {
+        state: if settled.is_some() {
+            "settled"
+        } else if intent.is_some() {
+            "unknown"
+        } else {
+            "not_started"
+        }
+        .into(),
+        admission_id: expected.k.admission_id.clone(),
+        plan_sha256: expected.k.plan_sha256.clone(),
+        exit_code: settled.map(|value| value.exit_code),
+    })
+}
+
+pub fn observe_publication(
+    lane: &FreshV30Lane,
+    receipt: &FreshReleasedHandoff,
+    actor: &FreshRecipientIdentity,
+    session: &FreshV30Session,
+    state_root: &Path,
+) -> io::Result<PublicationReadback> {
+    let read = observe(lane, receipt, actor, session, state_root)?
+        .ok_or_else(|| io::Error::other("normal caller K absent"))?;
+    let expected = publication_intent(receipt, actor, session, &read)?;
+    let directory = id_path(&store_root(state_root)?, &read.k.admission_id)?;
+    publication_readback(&directory, &expected)
+}
+
+pub fn publish(
+    lane: &FreshV30Lane,
+    receipt: &FreshReleasedHandoff,
+    actor: &FreshRecipientIdentity,
+    session: &FreshV30Session,
+    state_root: &Path,
+    stdout: &mut File,
+    stderr: &mut File,
+) -> io::Result<PublicationReadback> {
+    let read = observe(lane, receipt, actor, session, state_root)?
+        .ok_or_else(|| io::Error::other("normal caller K absent"))?;
+    let expected = publication_intent(receipt, actor, session, &read)?;
+    let directory = id_path(&store_root(state_root)?, &read.k.admission_id)?;
+    let before = publication_readback(&directory, &expected)?;
+    if before.state != "not_started" {
+        return Ok(before);
+    }
+    // O_EXCL and the directory fsync make an interrupted or concurrent write
+    // permanently unknown. No request can write the same Q a second time.
+    if let Err(error) = write_new(&directory, "caller-intent.json", &expected) {
+        if error.kind() == io::ErrorKind::AlreadyExists {
+            return publication_readback(&directory, &expected);
+        }
+        return Err(error);
+    }
+    #[cfg(feature = "age319-private-broker-fixture")]
+    if super::private_fixture() && std::env::var_os("AGE319_TEST_NORMAL_CALLER_LOST_V1").is_some() {
+        return Err(io::Error::other(
+            "private caller write lost after reservation",
+        ));
+    }
+    #[cfg(feature = "age319-private-broker-fixture")]
+    if super::private_fixture()
+        && std::env::var_os("AGE319_TEST_NORMAL_CALLER_PARTIAL_V1").is_some()
+    {
+        stdout.write_all(b"n")?;
+        return Err(io::Error::other(
+            "private caller write partial after reservation",
+        ));
+    }
+    let copy = |name: &str, evidence: &OutputEvidence, destination: &mut File| -> io::Result<()> {
+        let mut source = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(directory.join(name))?;
+        if output_evidence(&mut source)? != *evidence {
+            return Err(io::Error::other("normal caller output changed after Q"));
+        }
+        use std::io::Seek;
+        source.rewind()?;
+        if io::copy(&mut source, destination)? != evidence.bytes {
+            return Err(io::Error::other("normal caller copied byte count changed"));
+        }
+        destination.flush()?;
+        verify_output(&directory, name, evidence)
+    };
+    copy("stdout", &expected.q.stdout, stdout)?;
+    copy("stderr", &expected.q.stderr, stderr)?;
+    write_new(&directory, "caller-settled.json", &expected)?;
+    publication_readback(&directory, &expected)
 }
 
 fn retained_k_matches(state_root: &Path, recipe: &SupervisorRecipe) -> io::Result<()> {

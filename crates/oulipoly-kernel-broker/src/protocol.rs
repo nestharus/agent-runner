@@ -656,12 +656,109 @@ pub fn launch_fresh_normal_provider_at(
         .ok_or_else(|| io::Error::other("normal physical K absent"))
 }
 
+/// Private source-path fault injection: send K and close before its reply.
+/// The caller must use the read-only K/Q observation, never submit K again.
+pub fn launch_fresh_normal_provider_without_reply_at(
+    path: &Path,
+    d_key: &str,
+    descriptors: [RawFd; 3],
+) -> io::Result<()> {
+    normal_plan_wire_at_inner(path, 0x8a, d_key, descriptors, false).map(|_| ())
+}
+
 pub fn observe_fresh_normal_provider_at(
     path: &Path,
     d_key: &str,
     descriptors: [RawFd; 3],
 ) -> io::Result<Option<serde_json::Value>> {
     normal_physical_request_at(path, 0x8b, d_key, descriptors)
+}
+
+/// Submit the original actor's caller descriptors once after exact physical Q.
+/// A lost reply is read through `observe_fresh_normal_publication_at`.
+pub fn publish_fresh_normal_provider_at(
+    path: &Path,
+    d_key: &str,
+    stdout: RawFd,
+    stderr: RawFd,
+) -> io::Result<serde_json::Value> {
+    normal_publication_request_at(path, 0x8c, d_key, &[stdout, stderr])
+}
+
+pub fn observe_fresh_normal_publication_at(
+    path: &Path,
+    d_key: &str,
+) -> io::Result<serde_json::Value> {
+    normal_publication_request_at(path, 0x8d, d_key, &[])
+}
+
+fn normal_publication_request_at(
+    path: &Path,
+    operation: u8,
+    d_key: &str,
+    descriptors: &[RawFd],
+) -> io::Result<serde_json::Value> {
+    let id = uuid::Uuid::parse_str(d_key)
+        .map_err(|_| io::Error::other("invalid normal publication D key"))?;
+    if id.is_nil() || id.to_string() != d_key {
+        return Err(io::Error::other("noncanonical normal publication D key"));
+    }
+    let body = serde_json::to_vec(&FreshRootEffectRequest {
+        d_key: d_key.into(),
+        success: None,
+    })?;
+    let mut stream = checked_connection(path)?;
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let mut frame = Vec::with_capacity(17 + body.len());
+    frame.push(operation);
+    frame.extend_from_slice(&challenge);
+    frame.extend_from_slice(&body);
+    if descriptors.is_empty() {
+        stream.write_all(&frame)?;
+    } else {
+        let mut iov = libc::iovec {
+            iov_base: frame.as_mut_ptr().cast(),
+            iov_len: frame.len(),
+        };
+        let mut control = [0u8; 64];
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr().cast();
+        msg.msg_controllen =
+            unsafe { libc::CMSG_SPACE(std::mem::size_of_val(descriptors) as _) } as usize;
+        unsafe {
+            let header = libc::CMSG_FIRSTHDR(&msg);
+            (*header).cmsg_level = libc::SOL_SOCKET;
+            (*header).cmsg_type = libc::SCM_RIGHTS;
+            (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(descriptors) as _) as usize;
+            std::ptr::copy_nonoverlapping(
+                descriptors.as_ptr(),
+                libc::CMSG_DATA(header).cast::<RawFd>(),
+                descriptors.len(),
+            );
+        }
+        if unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) }
+            != frame.len() as isize
+        {
+            return Err(io::Error::other("normal publication request uncertain"));
+        }
+    }
+    let mut reply = Vec::new();
+    stream.take(16 * 1024 + 1).read_to_end(&mut reply)?;
+    if reply.len() > 16 * 1024 || !reply.ends_with(b"\n") {
+        return Err(io::Error::other("normal publication readback incomplete"));
+    }
+    let reply = String::from_utf8(reply).map_err(io::Error::other)?;
+    if let Some(error) = reply.strip_prefix("error ") {
+        return Err(io::Error::other(error.trim_end().to_owned()));
+    }
+    let body = reply
+        .strip_prefix("fresh-normal-publication ")
+        .and_then(|value| value.strip_suffix('\n'))
+        .ok_or_else(|| io::Error::other("normal publication reply invalid"))?;
+    serde_json::from_str(body).map_err(io::Error::other)
 }
 
 fn normal_physical_request_at(
@@ -727,6 +824,16 @@ fn normal_plan_wire_at(
     d_key: &str,
     descriptors: [RawFd; 3],
 ) -> io::Result<String> {
+    normal_plan_wire_at_inner(path, operation, d_key, descriptors, true)
+}
+
+fn normal_plan_wire_at_inner(
+    path: &Path,
+    operation: u8,
+    d_key: &str,
+    descriptors: [RawFd; 3],
+    read_reply: bool,
+) -> io::Result<String> {
     let id =
         uuid::Uuid::parse_str(d_key).map_err(|_| io::Error::other("invalid normal plan D key"))?;
     if id.is_nil() || id.to_string() != d_key {
@@ -769,6 +876,9 @@ fn normal_plan_wire_at(
         != frame.len() as isize
     {
         return Err(io::Error::other("normal plan request uncertain"));
+    }
+    if !read_reply {
+        return Ok(String::new());
     }
     let mut reply = Vec::new();
     stream.take(16 * 1024 + 1).read_to_end(&mut reply)?;

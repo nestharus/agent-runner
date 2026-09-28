@@ -1774,6 +1774,8 @@ fn inner() {
         );
     let physical_normal =
         mode == "normal_model_held" && std::env::var_os("AGE319_TEST_NORMAL_PHYSICAL_V1").is_some();
+    let featureless_normal =
+        physical_normal && std::env::var_os("AGE319_TEST_FEATURELESS_NORMAL_V1").is_some();
     let physical_normal_bad_source =
         physical_normal && std::env::var_os("AGE319_TEST_NORMAL_BAD_SOURCE_V1").is_some();
     let model_mode = mode == "normal_model_held" || provider_mode;
@@ -2241,7 +2243,13 @@ fn inner() {
         if physical_normal {
             fs::write(
                 &physical_script,
-                b"#!/bin/sh\nprintf 'one\\n' >> \"$AGE319_EFFECT_FILE\"\nprintf 'normal-provider-out:'\ncat\nprintf 'normal-provider-err\\n' >&2\n",
+                if std::env::var_os("AGE319_TEST_FEATURELESS_BINARY_V1").is_some() {
+                    b"#!/bin/sh\nprintf 'one\\n' >> \"$AGE319_EFFECT_FILE\"\nprintf '\\377\\000normal-provider-out:'\ncat\nprintf '\\000\\377normal-provider-err\\n' >&2\n".as_slice()
+                } else if std::env::var_os("AGE319_TEST_FEATURELESS_NONZERO_V1").is_some() {
+                    b"#!/bin/sh\nprintf 'one\\n' >> \"$AGE319_EFFECT_FILE\"\nprintf 'normal-provider-out:'\ncat\nprintf 'normal-provider-err\\n' >&2\nexit 17\n".as_slice()
+                } else {
+                    b"#!/bin/sh\nprintf 'one\\n' >> \"$AGE319_EFFECT_FILE\"\nprintf 'normal-provider-out:'\ncat\nprintf 'normal-provider-err\\n' >&2\n".as_slice()
+                },
             ).unwrap();
             fs::set_permissions(&physical_script, fs::Permissions::from_mode(0o755)).unwrap();
         }
@@ -2520,6 +2528,15 @@ fn inner() {
                 .map(|path| ("OULIPOLY_KERNEL_BROKER_FIXTURE_BASH_V1", path)),
         )
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+        .envs(
+            (featureless_normal
+                && std::env::var_os("AGE319_TEST_NORMAL_CALLER_PARTIAL_V1").is_some())
+            .then_some(("AGE319_TEST_NORMAL_CALLER_PARTIAL_V1", "1")),
+        )
+        .envs(
+            (featureless_normal && std::env::var_os("AGE319_TEST_NORMAL_CALLER_LOST_V1").is_some())
+                .then_some(("AGE319_TEST_NORMAL_CALLER_LOST_V1", "1")),
+        )
         .envs(native_codex_mode.then(|| {
             (
                 "OULIPOLY_KERNEL_BROKER_PRIVATE_NATIVE_CODEX_SHA256_V1",
@@ -2826,6 +2843,7 @@ fn inner() {
             .env("OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1", "1")
             .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
             .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+            .envs(featureless_normal.then_some(("AGE319_TEST_FEATURELESS_DUP_PUBLISH_V1", "1")))
             .envs(
                 (mode == "normal_model_held")
                     .then_some(("AGE319_PRIVATE_MODEL_SELECTION_PROBE_V1", "1")),
@@ -3159,6 +3177,150 @@ fn inner() {
             .stderr(Stdio::from(File::create(&err).unwrap()))
             .spawn()
             .unwrap();
+        if featureless_normal {
+            if std::env::var_os("AGE319_TEST_FEATURELESS_LOST_K_V1").is_some() {
+                let until = Instant::now() + Duration::from_secs(30);
+                while !gate.join("featureless-k-sent").exists()
+                    && entry.try_wait().unwrap().is_none()
+                {
+                    assert!(
+                        Instant::now() < until,
+                        "featureless K was not sent: runner: {}; broker: {}",
+                        fs::read_to_string(&err).unwrap_or_default(),
+                        fs::read_to_string(&broker_log).unwrap_or_default(),
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                assert!(gate.join("featureless-k-sent").exists());
+                let until = Instant::now() + Duration::from_secs(30);
+                loop {
+                    let state =
+                        rusqlite::Connection::open(broker_state.join("v30/state.db")).unwrap();
+                    let count: i64 = state
+                        .query_row("SELECT count(*) FROM fresh_normal_provider_k", [], |row| {
+                            row.get(0)
+                        })
+                        .unwrap();
+                    if count == 1 {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < until,
+                        "featureless K did not commit before restart"
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                while !normal_effect.exists() {
+                    assert!(
+                        Instant::now() < until,
+                        "featureless provider effect absent before restart"
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                stop(&mut broker);
+                let restart_log = temp.path().join("featureless-k-restart.log");
+                broker =
+                    restart_source_broker(&socket, &broker_state, &runner, &gate, &restart_log);
+                fs::write(gate.join("featureless-k-resume"), b"restarted").unwrap();
+            }
+            let until = Instant::now() + Duration::from_secs(90);
+            while entry.try_wait().unwrap().is_none() {
+                assert!(
+                    Instant::now() < until,
+                    "featureless normal root stalled: runner: {}; broker: {}",
+                    fs::read_to_string(&err).unwrap_or_default(),
+                    fs::read_to_string(&broker_log).unwrap_or_default(),
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let status = entry.wait().unwrap();
+            let partial = std::env::var_os("AGE319_TEST_NORMAL_CALLER_PARTIAL_V1").is_some();
+            let lost = std::env::var_os("AGE319_TEST_NORMAL_CALLER_LOST_V1").is_some();
+            let nonzero = std::env::var_os("AGE319_TEST_FEATURELESS_NONZERO_V1").is_some();
+            let binary = std::env::var_os("AGE319_TEST_FEATURELESS_BINARY_V1").is_some();
+            if partial || lost {
+                assert!(!status.success());
+                assert_eq!(
+                    fs::read(&out).unwrap(),
+                    if partial {
+                        b"n".as_slice()
+                    } else {
+                        b"".as_slice()
+                    }
+                );
+                assert!(
+                    fs::read_to_string(&err)
+                        .unwrap()
+                        .contains("publication unknown")
+                );
+            } else {
+                assert_eq!(
+                    status.code(),
+                    Some(if nonzero { 17 } else { 0 }),
+                    "runner: {}; broker: {}",
+                    fs::read_to_string(&err).unwrap(),
+                    fs::read_to_string(&broker_log).unwrap_or_default()
+                );
+                assert_eq!(
+                    fs::read(&out).unwrap(),
+                    if binary {
+                        b"\xff\0normal-provider-out:hello fixture".as_slice()
+                    } else {
+                        b"normal-provider-out:hello fixture".as_slice()
+                    }
+                );
+                assert_eq!(
+                    fs::read(&err).unwrap(),
+                    if binary {
+                        b"\0\xffnormal-provider-err\n".as_slice()
+                    } else {
+                        b"normal-provider-err\n".as_slice()
+                    }
+                );
+            }
+            assert_eq!(fs::read_to_string(&normal_effect).unwrap(), "one\n");
+            let state = rusqlite::Connection::open(broker_state.join("v30/state.db")).unwrap();
+            let admission_id: String = state
+                .query_row(
+                    "SELECT json_extract(k_json, '$.admission_id') FROM fresh_normal_provider_k",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let publication = broker_state.join("v30/normal-provider").join(&admission_id);
+            assert!(publication.join("q.json").exists());
+            assert!(publication.join("caller-intent.json").exists());
+            let q: serde_json::Value =
+                serde_json::from_slice(&fs::read(publication.join("q.json")).unwrap()).unwrap();
+            let intent: serde_json::Value =
+                serde_json::from_slice(&fs::read(publication.join("caller-intent.json")).unwrap())
+                    .unwrap();
+            assert_eq!(q["provider_wait_status"], if nonzero { 17 << 8 } else { 0 });
+            assert_eq!(intent["q"], q);
+            assert_eq!(intent["k"]["admission_id"], admission_id);
+            assert_eq!(
+                publication.join("caller-settled.json").exists(),
+                !(partial || lost)
+            );
+            let release_path = fs::read_dir(broker_state.join("released-handoffs"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            let released: oulipoly_state::mailbox::FreshReleasedHandoff =
+                serde_json::from_slice(&fs::read(release_path).unwrap()).unwrap();
+            assert!(
+                protocol::observe_fresh_normal_publication_at(
+                    &socket.with_file_name("v30.sock"),
+                    &released.d_key
+                )
+                .is_err(),
+                "a non-actor read the caller result"
+            );
+            stop(&mut broker);
+            return;
+        }
         eventually(|| gate.join("held").exists() || entry.try_wait().unwrap().is_some());
         assert!(
             gate.join("held").exists(),

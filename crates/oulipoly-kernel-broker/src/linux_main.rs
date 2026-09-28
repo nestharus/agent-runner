@@ -523,6 +523,10 @@ enum RequestPayload {
         cwd: File,
         environment: File,
     },
+    FreshNormalPublicationRequest {
+        request: FreshRootEffectRequest,
+        descriptors: Vec<File>,
+    },
     #[cfg(feature = "age319-private-broker-fixture")]
     FreshProviderRequest {
         request: FreshRootEffectRequest,
@@ -817,7 +821,7 @@ fn recv_request(
         #[cfg(feature = "age319-private-broker-fixture")]
         b'#' | b'{' | b'}' | b']' | b'|' | b'~' | b'?' => (18..=2048 + 17).contains(&read),
         b'@' | b'[' | 0x7f | 0x80 | 0x81 | 0x82 | 0x83 | 0x84 | 0x85 | 0x86 | 0x87 | 0x88
-        | 0x89 | 0x8a | 0x8b => (18..=2048 + 17).contains(&read),
+        | 0x89 | 0x8a | 0x8b | 0x8c | 0x8d => (18..=2048 + 17).contains(&read),
         b'F' => (18..=8192 + 17).contains(&read),
         b'O' => (18..=1024 + 17).contains(&read),
         b'U' => (18..=512 + 17).contains(&read),
@@ -837,6 +841,8 @@ fn recv_request(
             b'K' => descriptors.len() != 7,
             0x84 | 0x85 => descriptors.len() != 1,
             0x86 | 0x87 | 0x88 | 0x89 | 0x8a | 0x8b => descriptors.len() != 3,
+            0x8c => descriptors.len() != 2,
+            0x8d => !descriptors.is_empty(),
             #[cfg(feature = "age319-private-broker-fixture")]
             b'5' | b'b' => descriptors.len() != 4,
             #[cfg(feature = "age319-private-broker-fixture")]
@@ -907,6 +913,10 @@ fn recv_request(
                 environment: descriptors.next().unwrap(),
             }
         }
+        0x8c | 0x8d => RequestPayload::FreshNormalPublicationRequest {
+            request: serde_json::from_slice(&request[17..read as usize])?,
+            descriptors,
+        },
         #[cfg(feature = "age319-private-broker-fixture")]
         b'5' | b'6' | b'7' | b'b' | b'y' | b'x' | b'*' | b'/' | b'>' | b'_' => {
             RequestPayload::FreshProviderRequest {
@@ -7612,6 +7622,84 @@ fn serve_fresh_v30_at(
                     Ok(format!(
                         "fresh-normal-model {}\n",
                         serde_json::to_string(&selection)?
+                    ))
+                }
+                0x8c | 0x8d => {
+                    let RequestPayload::FreshNormalPublicationRequest {
+                        request,
+                        mut descriptors,
+                    } = payload
+                    else {
+                        return Err(io::Error::other("normal publication request absent"));
+                    };
+                    if request.success.is_some() {
+                        return Err(io::Error::other(
+                            "normal publication cannot return root effect",
+                        ));
+                    }
+                    let receipt = lane
+                        .released_handoff_for_child(&request.d_key, &recipient)
+                        .map_err(io::Error::other)?;
+                    let spec = StateReadSpec {
+                        protocol: "broker-release-attest-v30".into(),
+                        source_generation: receipt.old_release.prepared.source_generation.clone(),
+                        root_id: receipt.old_release.prepared.root_id.clone(),
+                        owner_generation: receipt.old_release.prepared.owner_generation.clone(),
+                        attempt_id: None,
+                    };
+                    let bridge = handoff_tx.as_ref().ok_or_else(|| {
+                        io::Error::other("in-process release authority unavailable")
+                    })?;
+                    if bridge_released_handoff(
+                        bridge,
+                        spec,
+                        peer,
+                        lane.identity(),
+                        true,
+                        &runner_image,
+                    )? != receipt
+                    {
+                        return Err(io::Error::other("normal publication release changed"));
+                    }
+                    let session = lane
+                        .read_session(&request.d_key)
+                        .map_err(io::Error::other)?
+                        .ok_or_else(|| io::Error::other("normal publication D absent"))?;
+                    lane.require_released_invocation(&receipt, &recipient, &session)
+                        .map_err(io::Error::other)?;
+                    let live = PinnedProcess::open(recipient.host_pid)?;
+                    if live.boot_id != recipient.boot_id
+                        || live.starttime_ticks != recipient.starttime_ticks
+                        || live.pidns_dev != recipient.pidns_dev
+                        || live.pidns_ino != recipient.pidns_ino
+                    {
+                        return Err(io::Error::other("normal publication actor changed"));
+                    }
+                    live.verify()?;
+                    let publication = if operation == 0x8c {
+                        let (stdout, stderr) = descriptors.split_at_mut(1);
+                        normal_physical::publish(
+                            &lane,
+                            &receipt,
+                            &recipient,
+                            &session,
+                            &state_root,
+                            &mut stdout[0],
+                            &mut stderr[0],
+                        )?
+                    } else {
+                        normal_physical::observe_publication(
+                            &lane,
+                            &receipt,
+                            &recipient,
+                            &session,
+                            &state_root,
+                        )?
+                    };
+                    live.verify()?;
+                    Ok(format!(
+                        "fresh-normal-publication {}\n",
+                        serde_json::to_string(&publication)?
                     ))
                 }
                 0x86 | 0x87 | 0x88 | 0x89 | 0x8a | 0x8b => {
