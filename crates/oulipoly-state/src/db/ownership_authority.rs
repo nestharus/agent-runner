@@ -295,6 +295,15 @@ impl fmt::Display for OwnershipAuthorityError {
 impl std::error::Error for OwnershipAuthorityError {}
 
 impl StateDb {
+    /// Read an immutable continuity row by its original ordinal. A later
+    /// admission advances the head without replacing this generation's row.
+    pub(crate) fn completion_continuity_at(
+        &self,
+        ordinal: i64,
+    ) -> Result<Option<CompletionContinuityHead>, String> {
+        completion_continuity_by_ordinal_on(&self.conn, ordinal).map_err(|error| error.to_string())
+    }
+
     pub(crate) fn exact_source_projection_for_registration(
         &self,
         registration_id: &str,

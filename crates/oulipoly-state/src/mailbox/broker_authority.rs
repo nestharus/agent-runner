@@ -521,6 +521,39 @@ fn state_close_cursor(
         .map_err(|error| error.to_string())
 }
 
+/// A close binds the then-current head. Later admissions may append to both
+/// stores, but the exact historical row must remain identical and the latest
+/// State/sidecar projection must still be synchronized.
+fn verify_historical_close_cursor(
+    state: &StateDb,
+    sidecar: &Connection,
+    cursor: &BrokerStateCloseCursor,
+) -> Result<(), String> {
+    let head = completion_continuity_head_on(sidecar)?
+        .ok_or("broker closed owner sidecar continuity absent")?;
+    let historical_sidecar = completion_continuity_by_admission_on(sidecar, &cursor.admission_id)?
+        .ok_or("broker closed owner historical sidecar cursor absent")?;
+    let historical_state = state
+        .completion_continuity_at(cursor.authority_ordinal)?
+        .ok_or("broker closed owner historical State cursor absent")?;
+    if historical_state != historical_sidecar
+        || historical_sidecar.authority_ordinal != cursor.authority_ordinal
+        || historical_sidecar.admission_id != cursor.admission_id
+        || historical_sidecar.sidecar_generation != cursor.sidecar_generation
+        || historical_sidecar.continuity_digest != cursor.continuity_digest
+        || head.authority_ordinal < cursor.authority_ordinal
+        || state.completion_repair_has_suffix(Some(&head))?
+    {
+        return Err("broker closed owner historical continuity changed".into());
+    }
+    if completion_continuity_head_on(sidecar)?.as_ref() != Some(&head)
+        || state.completion_repair_has_suffix(Some(&head))?
+    {
+        return Err("broker closed owner continuity changed during readback".into());
+    }
+    Ok(())
+}
+
 fn source_effect_obligations_on(
     conn: &Connection,
     source_generation: &str,
@@ -1381,8 +1414,10 @@ impl BrokerSidecar {
             .ok_or("broker owner close commit readback absent".into())
     }
 
-    /// Exact lost-reply/restart readback. A certificate alone is insufficient:
-    /// the sidecar phase, State inode/cursor and retained duties must agree.
+    /// Exact lost-reply/restart readback. The saved cursor is an immutable
+    /// historical row in both stores; later generations may advance the head.
+    /// A certificate alone is insufficient: the owner phase, both continuity
+    /// rows, current projection and retained duties must still agree.
     pub fn read_closed_root_owner(
         &self,
         root_id: &str,
@@ -1428,15 +1463,8 @@ impl BrokerSidecar {
             return Err("broker closed owner phase or State inode changed".into());
         }
         let state = self.bound_state()?;
-        let head = completion_continuity_head_on(&self.mailbox.conn)?
-            .ok_or("broker closed owner sidecar continuity absent")?;
-        if state_close_cursor(&state, state_cursor.file)?.as_ref() != Some(&state_cursor)
-            || head.authority_ordinal != state_cursor.authority_ordinal
-            || head.admission_id != state_cursor.admission_id
-            || head.sidecar_generation != state_cursor.sidecar_generation
-            || head.continuity_digest != state_cursor.continuity_digest
-            || self.mailbox.sidecar_generation()? != state_cursor.sidecar_generation
-            || state.completion_repair_has_suffix(Some(&head))?
+        verify_historical_close_cursor(&state, &self.mailbox.conn, &state_cursor)?;
+        if self.mailbox.sidecar_generation()? != state_cursor.sidecar_generation
             || state.has_pending_native_channel_duty_for_domain(&domain)?
             || !state.cancelling_native_attempts()?.is_empty()
             || !owner_close_duties_on(
@@ -1459,6 +1487,33 @@ impl BrokerSidecar {
             root_record_json,
             physical_proof_json,
         }))
+    }
+
+    /// Admission must account for every State continuity advance. Older
+    /// closed owners retain their original cursors, but the newest closed
+    /// entry must still be the current, fully projected head in both stores.
+    pub fn read_current_close_cursor(&self) -> Result<BrokerStateCloseCursor, String> {
+        self.check_mailbox_read(&self.source_generation)?;
+        let state = self.bound_state()?;
+        let file = self.bound_state_file_identity()?;
+        let cursor =
+            state_close_cursor(&state, file)?.ok_or("broker current State close cursor absent")?;
+        let head = completion_continuity_head_on(&self.mailbox.conn)?
+            .ok_or("broker current sidecar close cursor absent")?;
+        if head.authority_ordinal != cursor.authority_ordinal
+            || head.admission_id != cursor.admission_id
+            || head.sidecar_generation != cursor.sidecar_generation
+            || head.continuity_digest != cursor.continuity_digest
+            || self.mailbox.sidecar_generation()? != cursor.sidecar_generation
+            || state.completion_repair_has_suffix(Some(&head))?
+            || state_close_cursor(&state, self.bound_state_file_identity()?)?.as_ref()
+                != Some(&cursor)
+            || completion_continuity_head_on(&self.mailbox.conn)?.as_ref() != Some(&head)
+        {
+            return Err("broker current State/sidecar close cursor changed".into());
+        }
+        self.check_mailbox_read(&self.source_generation)?;
+        Ok(cursor)
     }
 
     pub(super) fn bound_state(&self) -> Result<StateDb, String> {
@@ -5005,6 +5060,90 @@ fn check_storage(path: &Path, owner: u32, anchor: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn historical_close_cursor_survives_three_real_continuity_admissions_and_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let sidecar_path = MailboxDb::path_for_state_db(&state_path);
+        let mut state = StateDb::open(&state_path).unwrap();
+        let mut cursors = Vec::new();
+        for generation in 0..3 {
+            let invocation = uuid::Uuid::new_v4().to_string();
+            let event = format!("historical-event-{generation}");
+            let session = format!("historical-session-{generation}");
+            state
+                .start_invocation(&crate::InvocationStart {
+                    invocation_uuid: invocation.clone(),
+                    model_name: "historical-cursor".into(),
+                    provider_name: "fixture".into(),
+                    provider_index: 0,
+                    parent_invocation_id: None,
+                })
+                .unwrap();
+            state
+                .register_completion_event_with_obligation(
+                    crate::InvocationMutationAuthority::Standalone,
+                    &format!("historical-admission-{generation}"),
+                    CompletionEventRegistrationInput {
+                        event_id: &event,
+                        delivery_mode: "async",
+                        owner_session_id: Some(&session),
+                        owner_invocation_uuid: Some(&invocation),
+                        state_dir: "/tmp/age319-historical-state",
+                        meta_path: "/tmp/age319-historical-meta",
+                        log_path: "/tmp/age319-historical-log",
+                        rc_path: "/tmp/age319-historical-rc",
+                    },
+                )
+                .unwrap();
+            let sidecar = MailboxDb::open(&sidecar_path).unwrap();
+            let cursor = state_close_cursor(
+                &state,
+                BoundStateFileIdentity {
+                    device: 1,
+                    inode: 2,
+                },
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(cursor.authority_ordinal, i64::from(generation + 1));
+            cursors.push(cursor);
+            for prior in &cursors {
+                verify_historical_close_cursor(&state, sidecar.connection(), prior).unwrap();
+            }
+        }
+        drop(state);
+        let reopened_state = StateDb::open(&state_path).unwrap();
+        let reopened_sidecar = MailboxDb::open(&sidecar_path).unwrap();
+        assert_ne!(
+            state_close_cursor(
+                &reopened_state,
+                BoundStateFileIdentity {
+                    device: 1,
+                    inode: 2,
+                },
+            )
+            .unwrap()
+            .as_ref(),
+            Some(&cursors[0]),
+            "the former global-head comparison would reject the first close",
+        );
+        for prior in &cursors {
+            verify_historical_close_cursor(&reopened_state, reopened_sidecar.connection(), prior)
+                .unwrap();
+        }
+        let mut altered = cursors[0].clone();
+        altered.continuity_digest = "0".repeat(64);
+        assert!(
+            verify_historical_close_cursor(
+                &reopened_state,
+                reopened_sidecar.connection(),
+                &altered,
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn sealed_manifest_controls_selected_source_material() {
