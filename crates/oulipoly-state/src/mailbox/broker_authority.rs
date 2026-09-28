@@ -426,14 +426,27 @@ struct OwnerCloseDuties {
 }
 
 impl OwnerCloseDuties {
-    fn settled(&self) -> bool {
+    fn settled(&self, expected_source_acceptances: usize) -> bool {
         self.registered_sources == 0
             && self.retiring_listeners == 0
             && self.deliverable_mailbox_rows == 0
             && self.unresolved_attempts == 0
             && self.native_grants_without_q == 0
             && self.source_effect.unsettled() == 0
-            && self.source_effect.accepted == 1
+            && self.source_effect.accepted == expected_source_acceptances
+    }
+}
+
+fn close_proof_source_acceptances(physical_proof_json: &str) -> Result<usize, String> {
+    let proof: serde_json::Value =
+        serde_json::from_str(physical_proof_json).map_err(|error| error.to_string())?;
+    let object = proof
+        .as_object()
+        .ok_or("broker owner physical proof invalid")?;
+    if object.get("normal").is_some_and(|value| !value.is_null()) {
+        Ok(0)
+    } else {
+        Ok(1)
     }
 }
 
@@ -521,6 +534,41 @@ fn state_close_cursor(
         .map_err(|error| error.to_string())
 }
 
+const EMPTY_CLOSE_ADMISSION: &str = "no-completion-continuity";
+const EMPTY_CLOSE_DIGEST: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+fn empty_close_cursor(file: BoundStateFileIdentity, generation: String) -> BrokerStateCloseCursor {
+    BrokerStateCloseCursor {
+        file,
+        authority_ordinal: 0,
+        admission_id: EMPTY_CLOSE_ADMISSION.into(),
+        sidecar_generation: generation,
+        continuity_digest: EMPTY_CLOSE_DIGEST.into(),
+    }
+}
+
+fn current_close_cursor_on(
+    state: &StateDb,
+    sidecar: &Connection,
+    file: BoundStateFileIdentity,
+) -> Result<BrokerStateCloseCursor, String> {
+    let state_cursor = state_close_cursor(state, file)?;
+    let head = completion_continuity_head_on(sidecar)?;
+    match (state_cursor, head) {
+        (None, None) => Ok(empty_close_cursor(file, sidecar_generation_on(sidecar)?)),
+        (Some(cursor), Some(head))
+            if cursor.authority_ordinal == head.authority_ordinal
+                && cursor.admission_id == head.admission_id
+                && cursor.sidecar_generation == head.sidecar_generation
+                && cursor.continuity_digest == head.continuity_digest
+                && sidecar_generation_on(sidecar)? == head.sidecar_generation =>
+        {
+            Ok(cursor)
+        }
+        _ => Err("broker owner close State/sidecar cursor absent or changed".into()),
+    }
+}
+
 /// A close binds the then-current head. Later admissions may append to both
 /// stores, but the exact historical row must remain identical and the latest
 /// State/sidecar projection must still be synchronized.
@@ -529,6 +577,36 @@ fn verify_historical_close_cursor(
     sidecar: &Connection,
     cursor: &BrokerStateCloseCursor,
 ) -> Result<(), String> {
+    if cursor.authority_ordinal == 0 {
+        if cursor.admission_id != EMPTY_CLOSE_ADMISSION
+            || cursor.continuity_digest != EMPTY_CLOSE_DIGEST
+            || sidecar_generation_on(sidecar)? != cursor.sidecar_generation
+        {
+            return Err("broker closed owner empty cursor changed".into());
+        }
+        let head = completion_continuity_head_on(sidecar)?;
+        if let Some(head) = &head {
+            let first_id: String = sidecar.query_row(
+                "SELECT admission_id FROM completion_authority_continuity WHERE authority_ordinal=1",
+                [], |row| row.get(0),
+            ).map_err(|error| error.to_string())?;
+            let first = completion_continuity_by_admission_on(sidecar, &first_id)?
+                .ok_or("broker closed owner first continuity absent")?;
+            if first.authority_ordinal != 1
+                || first.sidecar_generation != cursor.sidecar_generation
+                || first.previous_continuity_digest != EMPTY_CLOSE_DIGEST
+                || state.completion_continuity_at(1)? != Some(first)
+                || state.completion_repair_has_suffix(Some(head))?
+            {
+                return Err("broker closed owner empty history changed".into());
+            }
+        } else if state_close_cursor(state, cursor.file)?.is_some()
+            || state.completion_repair_has_suffix(None)?
+        {
+            return Err("broker closed owner empty history changed".into());
+        }
+        return Ok(());
+    }
     let head = completion_continuity_head_on(sidecar)?
         .ok_or("broker closed owner sidecar continuity absent")?;
     let historical_sidecar = completion_continuity_by_admission_on(sidecar, &cursor.admission_id)?
@@ -1234,18 +1312,11 @@ impl BrokerSidecar {
             }
         }
         let state_projection_pending = state.completion_repair_has_suffix(head.as_ref())?;
-        if !state_projection_pending
-            && state_cursor.as_ref().is_none_or(|cursor| {
-                head.as_ref().is_none_or(|head| {
-                    cursor.authority_ordinal != head.authority_ordinal
-                        || cursor.admission_id != head.admission_id
-                        || cursor.sidecar_generation != head.sidecar_generation
-                        || cursor.continuity_digest != head.continuity_digest
-                })
-            })
-        {
-            return Err("broker owner close State/sidecar cursor absent or changed".into());
-        }
+        let close_cursor = if state_projection_pending {
+            None
+        } else {
+            Some(current_close_cursor_on(&state, &tx, state_file)?)
+        };
         let duties = owner_close_duties_on(
             &tx,
             &owner.supervisor_authority_id,
@@ -1267,7 +1338,7 @@ impl BrokerSidecar {
             source_generation: self.source_generation.clone(),
             root_id: root_id.into(),
             owner_generation: owner.owner_generation.clone(),
-            state_cursor,
+            state_cursor: close_cursor,
             state_projection_pending,
             state_native_channel_pending,
             state_cancelling_native_attempts,
@@ -1313,8 +1384,13 @@ impl BrokerSidecar {
         let state_tx =
             Transaction::new_unchecked(state.raw_connection(), TransactionBehavior::Immediate)
                 .map_err(|error| format!("broker owner close State writer reservation: {error}"))?;
-        if state_close_cursor(&state, self.bound_state_file_identity()?)?.as_ref()
-            != Some(&proof.state_cursor)
+        let state_cursor = state_close_cursor(&state, self.bound_state_file_identity()?)?;
+        if (proof.state_cursor.authority_ordinal == 0
+            && (state_cursor.is_some()
+                || proof.state_cursor.admission_id != EMPTY_CLOSE_ADMISSION
+                || proof.state_cursor.continuity_digest != EMPTY_CLOSE_DIGEST))
+            || (proof.state_cursor.authority_ordinal != 0
+                && state_cursor.as_ref() != Some(&proof.state_cursor))
         {
             return Err("broker owner close State cursor changed".into());
         }
@@ -1338,15 +1414,9 @@ impl BrokerSidecar {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| format!("broker owner close sidecar writer reservation: {error}"))?;
-        let head = completion_continuity_head_on(&sidecar_tx)?
-            .ok_or("broker owner close sidecar continuity head absent")?;
-        if sidecar_generation_on(&sidecar_tx)? != proof.state_cursor.sidecar_generation
-            || head.authority_ordinal != proof.state_cursor.authority_ordinal
-            || head.admission_id != proof.state_cursor.admission_id
-            || head.sidecar_generation != proof.state_cursor.sidecar_generation
-            || head.continuity_digest != proof.state_cursor.continuity_digest
-            || state.completion_repair_has_suffix(Some(&head))?
-            || state_close_cursor(&state, state_file)?.as_ref() != Some(&proof.state_cursor)
+        let head = completion_continuity_head_on(&sidecar_tx)?;
+        if current_close_cursor_on(&state, &sidecar_tx, state_file)? != proof.state_cursor
+            || state.completion_repair_has_suffix(head.as_ref())?
         {
             return Err("broker owner close State/sidecar continuity changed".into());
         }
@@ -1357,7 +1427,7 @@ impl BrokerSidecar {
             &proof.root_id,
             &proof.owner_generation,
         )?;
-        if !duties.settled()
+        if !duties.settled(close_proof_source_acceptances(&proof.physical_proof_json)?)
             || state.has_pending_native_channel_duty_for_domain(&release.owner.domain_id)?
             || !state.cancelling_native_attempts()?.is_empty()
         {
@@ -1474,7 +1544,7 @@ impl BrokerSidecar {
                 root_id,
                 owner_generation,
             )?
-            .settled()
+            .settled(close_proof_source_acceptances(&physical_proof_json)?)
         {
             return Err("broker closed owner evidence changed".into());
         }
@@ -1496,19 +1566,14 @@ impl BrokerSidecar {
         self.check_mailbox_read(&self.source_generation)?;
         let state = self.bound_state()?;
         let file = self.bound_state_file_identity()?;
-        let cursor =
-            state_close_cursor(&state, file)?.ok_or("broker current State close cursor absent")?;
-        let head = completion_continuity_head_on(&self.mailbox.conn)?
-            .ok_or("broker current sidecar close cursor absent")?;
-        if head.authority_ordinal != cursor.authority_ordinal
-            || head.admission_id != cursor.admission_id
-            || head.sidecar_generation != cursor.sidecar_generation
-            || head.continuity_digest != cursor.continuity_digest
-            || self.mailbox.sidecar_generation()? != cursor.sidecar_generation
-            || state.completion_repair_has_suffix(Some(&head))?
-            || state_close_cursor(&state, self.bound_state_file_identity()?)?.as_ref()
-                != Some(&cursor)
-            || completion_continuity_head_on(&self.mailbox.conn)?.as_ref() != Some(&head)
+        let cursor = current_close_cursor_on(&state, &self.mailbox.conn, file)?;
+        let head = completion_continuity_head_on(&self.mailbox.conn)?;
+        if state.completion_repair_has_suffix(head.as_ref())?
+            || current_close_cursor_on(
+                &state,
+                &self.mailbox.conn,
+                self.bound_state_file_identity()?,
+            )? != cursor
         {
             return Err("broker current State/sidecar close cursor changed".into());
         }
@@ -5067,6 +5132,19 @@ mod tests {
         let state_path = directory.path().join("state.db");
         let sidecar_path = MailboxDb::path_for_state_db(&state_path);
         let mut state = StateDb::open(&state_path).unwrap();
+        let initial_sidecar = MailboxDb::open(&sidecar_path).unwrap();
+        let empty = current_close_cursor_on(
+            &state,
+            initial_sidecar.connection(),
+            BoundStateFileIdentity {
+                device: 1,
+                inode: 2,
+            },
+        )
+        .unwrap();
+        assert_eq!(empty.authority_ordinal, 0);
+        verify_historical_close_cursor(&state, initial_sidecar.connection(), &empty).unwrap();
+        drop(initial_sidecar);
         let mut cursors = Vec::new();
         for generation in 0..3 {
             let invocation = uuid::Uuid::new_v4().to_string();
@@ -5109,6 +5187,7 @@ mod tests {
             .unwrap();
             assert_eq!(cursor.authority_ordinal, i64::from(generation + 1));
             cursors.push(cursor);
+            verify_historical_close_cursor(&state, sidecar.connection(), &empty).unwrap();
             for prior in &cursors {
                 verify_historical_close_cursor(&state, sidecar.connection(), prior).unwrap();
             }
@@ -5116,6 +5195,8 @@ mod tests {
         drop(state);
         let reopened_state = StateDb::open(&state_path).unwrap();
         let reopened_sidecar = MailboxDb::open(&sidecar_path).unwrap();
+        verify_historical_close_cursor(&reopened_state, reopened_sidecar.connection(), &empty)
+            .unwrap();
         assert_ne!(
             state_close_cursor(
                 &reopened_state,

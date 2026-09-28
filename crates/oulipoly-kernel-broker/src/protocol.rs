@@ -46,8 +46,10 @@ pub fn root_drain_readback_at(
     }
     stream.write_all(&frame)?;
     let mut response = Vec::new();
-    stream.take(4097).read_to_end(&mut response)?;
-    if response.len() > 4096 || !response.ends_with(b"\n") {
+    // A closed normal root includes both the exact provider Q and caller
+    // publication in its retained physical proof.
+    stream.take(8193).read_to_end(&mut response)?;
+    if response.len() > 8192 || !response.ends_with(b"\n") {
         return Err(io::Error::other("root drain response uncertain"));
     }
     let response = String::from_utf8(response).map_err(io::Error::other)?;

@@ -33,8 +33,6 @@ mod manual_quota;
 mod namespace_helper_reaper;
 #[path = "native_work.rs"]
 mod native_work;
-#[path = "normal_physical.rs"]
-mod normal_physical;
 #[cfg(feature = "age319-private-broker-fixture")]
 #[path = "private_installed_exec.rs"]
 mod private_installed_exec;
@@ -67,6 +65,7 @@ use oulipoly_kernel_broker::installed_pair::{self, InstalledPair};
 use oulipoly_kernel_broker::native_receipt::{
     BoundNativeAuthority, verify as verify_native_receipt,
 };
+use oulipoly_kernel_broker::normal_physical;
 use oulipoly_kernel_broker::protocol::{
     AcceptedWorkSpec, DelegatedRootHProof, ExactSourceDecisionRequest,
     ExactSourceDecisionVerification, ExactSourceIssuerKind, FreshChildRequest,
@@ -4267,11 +4266,41 @@ fn require_prior_entries_closed(
             .read_session(&handoff.d_key)
             .map_err(io::Error::other)?
             .ok_or_else(|| io::Error::other("prior entry session absent"))?;
-        let terminal = lane
-            .read_private_root_terminal(&handoff, &actor, &session)
-            .map_err(io::Error::other)?;
-        if &exact_entry_terminal_settlement(&terminal)? != stored {
-            return Err(io::Error::other("prior entry publication identity changed"));
+        if lane
+            .normal_provider_k_present(&handoff, &actor, &session)
+            .map_err(io::Error::other)?
+        {
+            let publication = normal_physical::observe_publication(
+                &lane, &handoff, &actor, &session, state_root,
+            )?;
+            if publication.state != "settled"
+                || stored.d_key != handoff.d_key
+                || stored.handoff_id != handoff.handoff_id
+                || stored.invocation_uuid != handoff.invocation_uuid
+                || stored.session_id != session.session_id
+                || stored.actor
+                    != (ProcessStamp {
+                        host_pid: actor.host_pid,
+                        boot_id: actor.boot_id.clone(),
+                        starttime_ticks: actor.starttime_ticks,
+                        pidns_dev: actor.pidns_dev,
+                        pidns_ino: actor.pidns_ino,
+                    })
+                || stored.parent_grant_id != publication.admission_id
+                || Some(stored.publication_sha256.as_str())
+                    != publication.publication_sha256.as_deref()
+            {
+                return Err(io::Error::other(
+                    "prior normal publication identity changed",
+                ));
+            }
+        } else {
+            let terminal = lane
+                .read_private_root_terminal(&handoff, &actor, &session)
+                .map_err(io::Error::other)?;
+            if &exact_entry_terminal_settlement(&terminal)? != stored {
+                return Err(io::Error::other("prior entry publication identity changed"));
+            }
         }
         let inventory =
             root_drain::readback(root, roots, entries, works, grants, sources, sidecar)?;
@@ -4281,7 +4310,7 @@ fn require_prior_entries_closed(
         if inventory.entry_unsettled
             || inventory.state_sidecar_outstanding_unknown
             || proof.root_id != entry.root_id
-            || proof.owner_generation != terminal.owner_generation
+            || proof.owner_generation != handoff.old_release.prepared.owner_generation
         {
             return Err(io::Error::other(
                 "prior entry close or caller result changed",
@@ -4293,7 +4322,8 @@ fn require_prior_entries_closed(
     // the immutable ordinals themselves and reject aliasing or a source swap.
     closed_cursors.sort_by_key(|cursor| cursor.authority_ordinal);
     if closed_cursors.windows(2).any(|pair| {
-        pair[0].authority_ordinal >= pair[1].authority_ordinal
+        (pair[0].authority_ordinal >= pair[1].authority_ordinal
+            && !(pair[0].authority_ordinal == 0 && pair[0] == pair[1]))
             || pair[0].file != pair[1].file
             || pair[0].sidecar_generation != pair[1].sidecar_generation
     }) {
@@ -7686,6 +7716,7 @@ fn serve_fresh_v30_at(
                             &state_root,
                             &mut stdout[0],
                             &mut stderr[0],
+                            private_fixture(),
                         )?
                     } else {
                         normal_physical::observe_publication(
@@ -7697,6 +7728,40 @@ fn serve_fresh_v30_at(
                         )?
                     };
                     live.verify()?;
+                    if publication.state == "settled" {
+                        let settlement = EntryTerminalSettlement {
+                            d_key: receipt.d_key.clone(),
+                            handoff_id: receipt.handoff_id.clone(),
+                            invocation_uuid: receipt.invocation_uuid.clone(),
+                            session_id: session.session_id.clone(),
+                            actor: ProcessStamp {
+                                host_pid: recipient.host_pid,
+                                boot_id: recipient.boot_id.clone(),
+                                starttime_ticks: recipient.starttime_ticks,
+                                pidns_dev: recipient.pidns_dev,
+                                pidns_ino: recipient.pidns_ino,
+                            },
+                            parent_grant_id: publication.admission_id.clone(),
+                            publication_sha256: publication
+                                .publication_sha256
+                                .clone()
+                                .ok_or_else(|| io::Error::other("normal settled hash absent"))?,
+                        };
+                        let bridge = terminal_tx.as_ref().ok_or_else(|| {
+                            io::Error::other("normal entry settlement bridge absent")
+                        })?;
+                        let (reply, answer) = mpsc::sync_channel(1);
+                        bridge
+                            .send(FreshTerminalBridgeRequest {
+                                root_id: receipt.old_release.prepared.root_id.clone(),
+                                settlement,
+                                reply,
+                            })
+                            .map_err(|_| io::Error::other("normal entry settlement unavailable"))?;
+                        answer
+                            .recv_timeout(RELEASED_HANDOFF_REPLY_TIMEOUT)
+                            .map_err(|_| io::Error::other("normal entry settlement uncertain"))??;
+                    }
                     Ok(format!(
                         "fresh-normal-publication {}\n",
                         serde_json::to_string(&publication)?
@@ -7893,6 +7958,7 @@ fn serve_fresh_v30_at(
                                     &state_root,
                                     peer_uid,
                                     peer_gid,
+                                    private_fixture(),
                                 )?
                             } else {
                                 match normal_physical::observe(
