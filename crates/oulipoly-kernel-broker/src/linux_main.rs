@@ -58,6 +58,7 @@ use oulipoly_kernel_broker::identity::{
     PeerIdentity, PinnedProcess, host_proc_file, host_proc_uid, install_detached_host_proc,
 };
 use oulipoly_kernel_broker::installed_launch::{self, InstalledLaunchSpec};
+use oulipoly_kernel_broker::installed_launch_ledger::InstalledLaunchLedger;
 use oulipoly_kernel_broker::installed_pair::{self, InstalledPair};
 use oulipoly_kernel_broker::native_receipt::{
     BoundNativeAuthority, verify as verify_native_receipt,
@@ -444,8 +445,16 @@ fn require_cutover_entry_route(
     ) {
         return Ok(());
     }
+    if operation == b'l' && fresh_only_active && broker_owned_sidecar {
+        return Ok(());
+    }
     if gate_closed {
         return Err(io::Error::other("broker entry gate is durably closed"));
+    }
+    if operation == b'l' && !private_fixture() {
+        return Err(io::Error::other(
+            "installed launch status requires fresh activation",
+        ));
     }
     if operation == b'L' && fresh_only_active {
         return if broker_owned_sidecar {
@@ -707,10 +716,10 @@ enum RequestPayload {
         spec: InstalledLaunchSpec,
         descriptors: Vec<File>,
     },
-    #[cfg(feature = "age319-private-broker-fixture")]
     PrivateLaunchStatus {
         request_id: String,
         generation: String,
+        #[allow(dead_code, reason = "cancel is private-fixture only")]
         cancel: bool,
     },
 }
@@ -851,8 +860,9 @@ fn recv_request(
         // Legacy E has no body; fresh Bash E carries a request UUID on its
         // separate socket. Preserve both exact wire shapes for pinned images.
         b'E' => read == 17 || read == 33,
+        b'l' => read == 49,
         #[cfg(feature = "age319-private-broker-fixture")]
-        b'l' | b'M' => read == 49,
+        b'M' => read == 49,
         b'A' | b'a' => read == 33,
         b'J' | b'j' => (18..=48 * 1024 + 17).contains(&read),
         b'L' => (18..=48 * 1024 + 17).contains(&read),
@@ -1176,11 +1186,16 @@ fn recv_request(
             spec: serde_json::from_slice(&request[17..read as usize])?,
             descriptors,
         },
-        #[cfg(feature = "age319-private-broker-fixture")]
-        b'l' | b'M' => RequestPayload::PrivateLaunchStatus {
+        b'l' => RequestPayload::PrivateLaunchStatus {
             request_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
             generation: uuid::Uuid::from_bytes(request[33..49].try_into().unwrap()).to_string(),
-            cancel: request[0] == b'M',
+            cancel: false,
+        },
+        #[cfg(feature = "age319-private-broker-fixture")]
+        b'M' => RequestPayload::PrivateLaunchStatus {
+            request_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
+            generation: uuid::Uuid::from_bytes(request[33..49].try_into().unwrap()).to_string(),
+            cancel: true,
         },
         _ => RequestPayload::None,
     };
@@ -5292,6 +5307,16 @@ fn serve() -> io::Result<()> {
     if let Some(sidecar) = broker_sidecar.as_mut() {
         capture_terminal_sources(sidecar, &source_physical, &mut pending_source_evidence);
     }
+    let installed_launches = fresh_activation
+        .as_ref()
+        .map(|activation| {
+            InstalledLaunchLedger::open(
+                Path::new(&state),
+                &activation.pair_generation,
+                &activation.source.source_generation,
+            )
+        })
+        .transpose()?;
     let host_namespace = host_proc_file("self/ns/pid")?;
     let mut registry = RootRegistry::open(&state)?;
     let admission_fences = Arc::new(Mutex::new(
@@ -5725,12 +5750,14 @@ fn serve() -> io::Result<()> {
                     return Err(io::Error::other("fresh-only pair/source binding changed"));
                 }
                 require_fresh_cli_shape(&spec, &descriptors)?;
-                // This preflight is deliberately before any reservation. A
-                // Broker-owned v30 root launch and result/drain ledger are
-                // still required before this request can be admitted.
-                Err(io::Error::other(
-                    "fresh-only CLI root launch and drain admission closed",
-                ))
+                let ledger = installed_launches
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("installed launch ledger absent"))?;
+                // This durable request is inert. Both a fresh submission and
+                // an exact duplicate remain pending until a separate
+                // Broker-owned root custody transition exists.
+                let _admission = ledger.reserve_request(&spec, &peer)?;
+                Ok(ledger.status(&spec.request_id, &spec.generation, &peer)?)
             } else if operation == b'l' || operation == b'M' {
                 #[cfg(feature = "age319-private-broker-fixture")]
                 if fixture {
@@ -5758,7 +5785,40 @@ fn serve() -> io::Result<()> {
                         .ok_or_else(|| io::Error::other("private launch ledger missing"))?
                         .status(&request_id, &generation, peer.uid, cancel);
                 }
-                Err(io::Error::other("production launch status closed"))
+                if operation != b'l' {
+                    return Err(io::Error::other("production launch cancel closed"));
+                }
+                let RequestPayload::PrivateLaunchStatus {
+                    request_id,
+                    generation,
+                    ..
+                } = payload else {
+                    return Err(io::Error::other("invalid installed launch status request"));
+                };
+                let pair = installed_pair
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("installed pair unavailable"))?;
+                let image = launcher_image
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("installed launcher unavailable"))?;
+                if pair.schema != 2 || !peer.process.same_executable_as(image)? {
+                    return Err(io::Error::other("installed launch status launcher mismatch"));
+                }
+                let activation = fresh_activation
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("fresh-only activation absent"))?;
+                let sidecar = broker_sidecar
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("fresh-only source absent"))?;
+                if pair.generation != activation.pair_generation
+                    || activation.source.source_generation != sidecar.source_generation()
+                {
+                    return Err(io::Error::other("fresh-only pair/source binding changed"));
+                }
+                installed_launches
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("installed launch ledger absent"))?
+                    .status(&request_id, &generation, &peer)
             } else if operation == b'X' || operation == b'x' {
                 if peer.uid != 0 || !peer.process.in_namespace(&host_namespace)? {
                     return Err(io::Error::other("host-root gate transition required"));
@@ -10201,6 +10261,9 @@ mod tests {
         assert!(require_cutover_entry_route(b';', false, false, false).is_err());
         assert!(require_cutover_entry_route(b';', true, true, false).is_err());
         assert!(require_cutover_entry_route(b'L', true, false, true).is_ok());
+        assert!(require_cutover_entry_route(b'l', true, true, true).is_ok());
+        assert!(require_cutover_entry_route(b'l', false, false, true).is_err());
+        assert!(require_cutover_entry_route(b'l', true, false, false).is_err());
         assert!(require_cutover_entry_route(b'L', true, false, false).is_err());
         assert!(require_cutover_entry_route(b'L', false, false, true).is_err());
         assert!(require_cutover_entry_route(b'L', true, true, true).is_err());

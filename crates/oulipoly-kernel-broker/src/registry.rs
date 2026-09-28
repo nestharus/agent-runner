@@ -109,6 +109,17 @@ impl RootRegistry {
             if name == "entries" && entry.file_type()?.is_dir() {
                 continue;
             }
+            // Opened and validated by the serving Broker before this scan.
+            if name == "installed-launches"
+                && empty_bootstrap
+                && registry
+                    .directory
+                    .join("first-install-activation-v1.json")
+                    .exists()
+                && entry.file_type()?.is_dir()
+            {
+                continue;
+            }
             if name == "released-handoffs" {
                 let meta = fs::symlink_metadata(entry.path())?;
                 if !meta.is_dir()

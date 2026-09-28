@@ -56,10 +56,23 @@ fn main() {
             if let Some(code) = installed_launch::drained_exit_code(&response, &request_id) {
                 std::process::exit(code as i32);
             }
+            let readback = protocol::installed_launch_status_at(
+                Path::new(protocol::INSTALLED_SOCKET),
+                &request_id,
+                &generation,
+            );
+            if let Ok(status) = &readback {
+                if let Some(code) = installed_launch::drained_exit_code(status, &request_id) {
+                    std::process::exit(code as i32);
+                }
+            }
             if response
                 .strip_prefix("error ")
                 .and_then(|body| body.strip_suffix('\n'))
                 .is_some_and(|body| !body.contains('\n'))
+                && !readback
+                    .as_ref()
+                    .is_ok_and(|status| status == &format!("pending {request_id} {generation}\n"))
             {
                 eprintln!(
                     "OULIPOLY_INSTALLED_LAUNCH_GAP=request {request_id}: {}",
@@ -67,13 +80,23 @@ fn main() {
                 );
             } else {
                 eprintln!(
-                    "OULIPOLY_INSTALLED_LAUNCH_UNKNOWN=request {request_id} generation {generation}: unrecognized broker outcome"
+                    "OULIPOLY_INSTALLED_LAUNCH_UNKNOWN=request {request_id} generation {generation}: {response:?}; status {readback:?}"
                 );
             }
         }
         Ok((request_id, generation, Err(error))) => {
+            let readback = protocol::installed_launch_status_at(
+                Path::new(protocol::INSTALLED_SOCKET),
+                &request_id,
+                &generation,
+            );
+            if let Ok(status) = &readback {
+                if let Some(code) = installed_launch::drained_exit_code(status, &request_id) {
+                    std::process::exit(code as i32);
+                }
+            }
             eprintln!(
-                "OULIPOLY_INSTALLED_LAUNCH_UNKNOWN=request {request_id} generation {generation}: {error}"
+                "OULIPOLY_INSTALLED_LAUNCH_UNKNOWN=request {request_id} generation {generation}: {error}; status {readback:?}"
             );
         }
         Err(error) => {
