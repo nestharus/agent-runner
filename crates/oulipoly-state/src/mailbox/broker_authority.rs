@@ -1607,6 +1607,17 @@ impl BrokerSidecar {
         })
     }
 
+    pub(super) fn require_bound_state_path(&self, expected: &Path) -> Result<(), String> {
+        let source = self
+            .state_source
+            .as_ref()
+            .ok_or("broker StateDb source binding absent")?;
+        if source.path != expected {
+            return Err("broker StateDb source path differs from fixed root".into());
+        }
+        verify_bound_state_source(source)
+    }
+
     /// Read of the original, inode-bound State invocation before a broker
     /// source decision. This never registers a source or advances a lifecycle.
     pub fn verify_bound_invocation(

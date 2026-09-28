@@ -72,6 +72,7 @@ fn reattach(record: RootRecord) -> Result<LiveRoot, RootRecord> {
 impl RootRegistry {
     pub fn open(directory: impl AsRef<Path>) -> io::Result<Self> {
         let directory = directory.as_ref().to_path_buf();
+        let empty_bootstrap = directory.join("empty-v30-bootstrap-v1.json").exists();
         let mut registry = Self {
             directory,
             live: Vec::new(),
@@ -137,6 +138,41 @@ impl RootRegistry {
             // serve() has already opened and validated this fixed root-only
             // storage before it opens the root registry.
             if name == "sidecar" && entry.file_type()?.is_dir() {
+                continue;
+            }
+            // The offline empty-first-install bootstrap marker is validated
+            // before the serving broker opens this registry.
+            if name == "empty-v30-bootstrap-v1.json" {
+                let meta = fs::symlink_metadata(entry.path())?;
+                if !meta.is_file()
+                    || meta.file_type().is_symlink()
+                    || meta.uid() != 0
+                    || meta.nlink() != 1
+                    || meta.mode() & 0o777 != 0o600
+                {
+                    return Err(io::Error::other("unsafe empty v30 bootstrap marker"));
+                }
+                continue;
+            }
+            if empty_bootstrap
+                && matches!(
+                    name.as_ref(),
+                    "state.db"
+                        | "state.db-wal"
+                        | "state.db-shm"
+                        | "state.db-journal"
+                        | "state.db.namespace.lock"
+                )
+            {
+                let meta = fs::symlink_metadata(entry.path())?;
+                if !meta.is_file()
+                    || meta.file_type().is_symlink()
+                    || meta.uid() != 0
+                    || meta.nlink() != 1
+                    || meta.mode() & 0o077 != 0
+                {
+                    return Err(io::Error::other("unsafe empty v30 State artifact"));
+                }
                 continue;
             }
             // The serving broker validates the separate exact-source journal
