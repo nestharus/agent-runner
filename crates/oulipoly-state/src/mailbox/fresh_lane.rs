@@ -12,6 +12,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 include!("fresh_recipient.rs");
 include!("fresh_native_f.rs");
+include!("fresh_headless_native_f.rs");
 include!("fresh_bash_child.rs");
 include!("fresh_bash_source.rs");
 include!("fresh_bash_notify.rs");
@@ -45,6 +46,8 @@ const FRESH_NATIVE_F_SUBMISSION_SCHEMA: &str =
     include_str!("migrations/0042_fresh_native_f_submission.sql");
 const FRESH_NATIVE_F_RECEIPT_SCHEMA: &str =
     include_str!("migrations/0043_fresh_native_f_receipt.sql");
+const FRESH_HEADLESS_NATIVE_F_SCHEMA: &str =
+    include_str!("migrations/0045_fresh_headless_native_f.sql");
 const FRESH_RECIPIENT_STATE_SCHEMA: &str =
     include_str!("migrations/0030_fresh_recipient_state.sql");
 
@@ -714,6 +717,46 @@ impl FreshV30Lane {
             verify_fresh_sql_objects(
                 &sidecar.mailbox().conn,
                 FRESH_NATIVE_F_RECEIPT_SCHEMA,
+                table,
+                &[update, delete],
+            )?;
+        }
+        let headless_objects: i64 = sidecar
+            .mailbox()
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name IN
+             ('fresh_headless_native_f_attempt','fresh_headless_native_f_attempt_no_update',
+              'fresh_headless_native_f_attempt_no_delete','fresh_headless_native_f_ack',
+              'fresh_headless_native_f_ack_no_update','fresh_headless_native_f_ack_no_delete')",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        match headless_objects {
+            0 => sidecar
+                .mailbox()
+                .conn
+                .execute_batch(FRESH_HEADLESS_NATIVE_F_SCHEMA)
+                .map_err(|e| e.to_string())?,
+            6 => {}
+            _ => return Err("fresh headless native F schema is incomplete".into()),
+        }
+        for (table, update, delete) in [
+            (
+                "fresh_headless_native_f_attempt",
+                "fresh_headless_native_f_attempt_no_update",
+                "fresh_headless_native_f_attempt_no_delete",
+            ),
+            (
+                "fresh_headless_native_f_ack",
+                "fresh_headless_native_f_ack_no_update",
+                "fresh_headless_native_f_ack_no_delete",
+            ),
+        ] {
+            verify_fresh_sql_objects(
+                &sidecar.mailbox().conn,
+                FRESH_HEADLESS_NATIVE_F_SCHEMA,
                 table,
                 &[update, delete],
             )?;

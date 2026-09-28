@@ -2296,6 +2296,7 @@ fn inner() {
         .envs(native_ack_mode.then_some(("AGE319_PRIVATE_NATIVE_RECIPIENT_ACK_V1", "1")))
         .envs(native_ack_mode.then_some(("AGE319_PRIVATE_NATIVE_ACK_DROP_REPLY_V1", "1")))
         .envs(native_f_turn.then_some(("AGE319_PRIVATE_NATIVE_F_TURN_DROP_REPLY_V1", "1")))
+        .envs(native_f_turn.then_some(("AGE319_PRIVATE_NATIVE_F_ACK_DROP_REPLY_V1", "1")))
         .envs(native_lost_reply.map(|stage| ("AGE319_PRIVATE_NATIVE_F_DROP_REPLY_V1", stage)))
         .envs(
             (mode == "normal_model_provider_bash_causal_success" || root_h_delegate)
@@ -8520,7 +8521,7 @@ fn inner() {
                             &fs::read(gate.join("native-k-control-readback.json")).unwrap(),
                         )
                         .unwrap();
-                        let lane = FreshV30Lane::open_at(&broker_state).unwrap();
+                        let mut lane = FreshV30Lane::open_at(&broker_state).unwrap();
                         let child = lane.read_bash_child(&bash_request).unwrap().unwrap();
                         let (root, _) = lane.released_handoff_for_root(&child.root_id).unwrap();
                         let k_pid = native["provider_pid"].as_i64().unwrap() as i32;
@@ -8990,7 +8991,45 @@ fn inner() {
                                         assert_eq!(f_receipt["first_turn_id"], receipt["turn_id"]);
                                         assert_ne!(f_receipt["turn_id"], receipt["turn_id"]);
                                         assert_eq!(f_receipt["status"], "completed");
-                                        assert_eq!(f_receipt["fresh_row_acknowledged"], false);
+                                        assert_eq!(f_receipt["fresh_row_acknowledged"], true);
+                                        assert_eq!(f_receipt["ack_reply_dropped"], true);
+                                        assert_eq!(
+                                            f_receipt["fresh_ack"]["basis"],
+                                            "native_codex_f_assistant_ack"
+                                        );
+                                        let settled = lane
+                                            .read_headless_native_f_ack(
+                                                delivery_request,
+                                                &recipient,
+                                            )
+                                            .unwrap()
+                                            .unwrap();
+                                        assert_eq!(
+                                            serde_json::to_value(&settled).unwrap(),
+                                            f_receipt["fresh_ack"]
+                                        );
+                                        let reopened =
+                                            oulipoly_state::mailbox::FreshV30Lane::open_at(
+                                                &broker_state,
+                                            )
+                                            .unwrap();
+                                        assert_eq!(
+                                            reopened
+                                                .read_headless_native_f_ack(
+                                                    delivery_request,
+                                                    &recipient
+                                                )
+                                                .unwrap(),
+                                            Some(settled.clone())
+                                        );
+                                        let mut duplicate = settled.proof.clone();
+                                        assert!(
+                                            lane.acknowledge_headless_native_f(&duplicate).is_err()
+                                        );
+                                        duplicate.delivery_token = "wrong-token".into();
+                                        assert!(
+                                            lane.acknowledge_headless_native_f(&duplicate).is_err()
+                                        );
                                         assert_eq!(
                                             f_attempt["fresh_grant_id"],
                                             witness.fresh.grant_id
@@ -9054,7 +9093,22 @@ fn inner() {
                                             |row| Ok((row.get(0)?, row.get(1)?)),
                                         )
                                         .unwrap();
-                                    assert_eq!(fresh_row, (None, 0));
+                                    if native_f_turn {
+                                        assert!(fresh_row.0.is_some());
+                                        assert_eq!(fresh_row.1, 1);
+                                        assert_eq!(
+                                            lane.read_recipient_delivery(
+                                                &witness.fresh.grant_id,
+                                                &recipient
+                                            )
+                                            .unwrap()
+                                            .unwrap()
+                                            .phase,
+                                            "acked"
+                                        );
+                                    } else {
+                                        assert_eq!(fresh_row, (None, 0));
+                                    }
                                     let terminal = lane
                                         .read_private_root_terminal(
                                             &root,
@@ -9064,8 +9118,18 @@ fn inner() {
                                         .unwrap();
                                     assert_eq!(
                                         terminal.notification_state,
-                                        "f_submitted_native_pending"
+                                        if native_f_turn {
+                                            "acked"
+                                        } else {
+                                            "f_submitted_native_pending"
+                                        }
                                     );
+                                    if native_f_turn {
+                                        assert_eq!(
+                                            terminal.ack_basis.as_deref(),
+                                            Some("native_codex_f_assistant_ack")
+                                        );
+                                    }
                                 }
                             } else {
                                 assert_eq!(pending, 1, "native turn must not ACK original row");

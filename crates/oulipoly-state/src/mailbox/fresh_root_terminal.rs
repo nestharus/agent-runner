@@ -833,7 +833,7 @@ impl FreshV30Lane {
                 let (basis, token_sha, token) = if let Some(evidence) = evidence {
                     evidence
                 } else {
-                    self.sidecar.mailbox().conn.query_row(
+                    let legacy = self.sidecar.mailbox().conn.query_row(
                         "SELECT a.basis,a.delivery_token_sha256,g.delivery_token
                          FROM fresh_native_f_auto_ack a
                          JOIN fresh_native_f_receipt n ON n.preparation_request_id=a.preparation_request_id
@@ -865,8 +865,31 @@ impl FreshV30Lane {
                            AND r.payload_sha256=a.payload_sha256 AND r.payload_byte_len=a.payload_byte_len",
                         params![grant_id,session.session_id,seq,source,attempt,identity,sha,len,delivery_request],
                         |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
-                    ).optional().map_err(|e| e.to_string())?
-                        .ok_or("terminal fresh ACK evidence absent or changed")?
+                    ).optional().map_err(|e| e.to_string())?;
+                    if let Some(legacy) = legacy {
+                        legacy
+                    } else {
+                            let ack = self.read_headless_native_f_ack(&delivery_request, actor)?
+                                .ok_or("terminal fresh ACK evidence absent or changed")?;
+                            let reserved = self.read_headless_native_f_attempt(&delivery_request, actor)?
+                                .ok_or("terminal headless F reservation absent")?;
+                            let fresh = &reserved.candidate.fresh;
+                            if ack.proof.fresh_grant_id != grant_id
+                                || ack.proof.native_session_id != reserved.candidate.native_session_id
+                                || ack.proof.first_turn_id != reserved.candidate.original_turn_id
+                                || ack.proof.turn_id == ack.proof.first_turn_id
+                                || ack.proof.envelope_sha256 != reserved.envelope_sha256
+                                || ack.proof.assistant_response_sha256
+                                    != sha256_hex(format!("AGE319_F_ACK {}", ack.proof.delivery_token).as_bytes())
+                                || ack.basis != "native_codex_f_assistant_ack"
+                                || fresh.session_id != session.session_id || fresh.seq != seq
+                                || fresh.source_id != source || fresh.attempt_id != attempt
+                                || fresh.payload_sha256 != sha || fresh.payload_byte_len != len
+                            {
+                                return Err("terminal headless F ACK evidence changed".into());
+                            }
+                            (ack.basis, reserved.delivery_token_sha256, ack.proof.delivery_token)
+                    }
                 };
                 if sha256_hex(token.as_bytes()) != token_sha {
                     return Err("terminal fresh ACK token conflict".into());

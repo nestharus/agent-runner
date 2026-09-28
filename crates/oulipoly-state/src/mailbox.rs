@@ -64,9 +64,10 @@ pub use broker_authority::{
 pub use fresh_lane::{
     FreshAckDelegation, FreshBashChild, FreshBashListenerPolicy, FreshBashPrivateResult,
     FreshBashSourceEvent, FreshBashSyncPublication, FreshDeliveryReadback, FreshDeliverySubmission,
-    FreshInteractiveResidentRegistration, FreshNativeFAutoAck, FreshNativeFObservedTurn,
-    FreshNativeFPreparation, FreshNativeFPrepareRequest, FreshNativeFReceipt,
-    FreshNativeFSubmission, FreshNativeFTransport, FreshNormalWorkPreparation,
+    FreshHeadlessNativeFAck, FreshHeadlessNativeFAttempt, FreshHeadlessNativeFProof,
+    FreshHeadlessNativeFRequest, FreshInteractiveResidentRegistration, FreshNativeFAutoAck,
+    FreshNativeFObservedTurn, FreshNativeFPreparation, FreshNativeFPrepareRequest,
+    FreshNativeFReceipt, FreshNativeFSubmission, FreshNativeFTransport, FreshNormalWorkPreparation,
     FreshPhysicalTerminal, FreshRecipientIdentity, FreshReleasedHandoff, FreshRootCallerResult,
     FreshRootEffect, FreshRootEffectState, FreshRootHConsumption, FreshRootHDelegation,
     FreshRootHSelectedK, FreshRootTerminalExecution, FreshRootTerminalReadback,
