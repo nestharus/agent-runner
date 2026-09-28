@@ -1,4 +1,4 @@
-//! Durable first-install request admission. Publication precedes any future
+//! Durable first-install request/root binding. Publication precedes any future
 //! root effect. A published request is never launchable again by resubmission.
 use crate::entry_registry::ProcessStamp;
 use crate::identity::PeerIdentity;
@@ -11,7 +11,8 @@ use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-const PROTOCOL: &str = "installed-launch-request-v1";
+const REQUEST_ONLY_PROTOCOL: &str = "installed-launch-request-v1";
+const ROOT_BOUND_PROTOCOL: &str = "installed-launch-request-v2";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -23,10 +24,13 @@ pub struct RequestRecord {
     pub owner_uid: u32,
     pub launcher: ProcessStamp,
     pub spec_sha256: String,
+    /// Broker-chosen before any control process or root fork. V1 stays inert.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_id: Option<String>,
 }
 
 pub enum Admission {
-    New,
+    New { root_id: String },
     Existing,
 }
 
@@ -69,6 +73,7 @@ impl InstalledLaunchLedger {
             pair_generation: pair_generation.into(),
             source_generation: source_generation.into(),
         };
+        let mut roots = std::collections::HashSet::new();
         for entry in fs::read_dir(&ledger.directory)? {
             let entry = entry?;
             let record = ledger.read_path(&entry.path())?;
@@ -76,6 +81,13 @@ impl InstalledLaunchLedger {
                 return Err(io::Error::other(
                     "installed launch ledger filename mismatch",
                 ));
+            }
+            if record
+                .root_id
+                .as_ref()
+                .is_some_and(|id| !roots.insert(id.clone()))
+            {
+                return Err(io::Error::other("duplicate installed launch root ID"));
             }
         }
         Ok(ledger)
@@ -99,8 +111,14 @@ impl InstalledLaunchLedger {
             return Err(io::Error::other("unsafe installed launch ledger record"));
         }
         let record: RequestRecord = json_artifact::read_open(file, path, "installed_launch")?;
-        if record.protocol != PROTOCOL
-            || !canonical_uuid(&record.request_id)
+        if !matches!(
+            (&record.protocol[..], record.root_id.as_deref()),
+            (REQUEST_ONLY_PROTOCOL, None) | (ROOT_BOUND_PROTOCOL, Some(_))
+        ) || !canonical_uuid(&record.request_id)
+            || record
+                .root_id
+                .as_deref()
+                .is_some_and(|id| !canonical_uuid(id))
             || record.pair_generation != self.pair_generation
             || record.source_generation != self.source_generation
             || record.spec_sha256.len() != 64
@@ -123,6 +141,21 @@ impl InstalledLaunchLedger {
         self.read_path(&self.directory.join(format!("{request_id}.json")))
     }
 
+    fn unused_root_id(&self) -> io::Result<String> {
+        let mut used = std::collections::HashSet::new();
+        for entry in fs::read_dir(&self.directory)? {
+            if let Some(root_id) = self.read_path(&entry?.path())?.root_id {
+                used.insert(root_id);
+            }
+        }
+        loop {
+            let root_id = uuid::Uuid::new_v4().to_string();
+            if !used.contains(&root_id) {
+                return Ok(root_id);
+            }
+        }
+    }
+
     pub fn reserve_request(
         &self,
         spec: &InstalledLaunchSpec,
@@ -133,19 +166,30 @@ impl InstalledLaunchLedger {
         }
         peer.process.verify()?;
         let record = RequestRecord {
-            protocol: PROTOCOL.into(),
+            protocol: ROOT_BOUND_PROTOCOL.into(),
             request_id: spec.request_id.clone(),
             pair_generation: self.pair_generation.clone(),
             source_generation: self.source_generation.clone(),
             owner_uid: peer.uid,
             launcher: ProcessStamp::from(&peer.process),
             spec_sha256: format!("{:x}", Sha256::digest(serde_json::to_vec(spec)?)),
+            root_id: Some(self.unused_root_id()?),
         };
         let name = format!("{}.json", record.request_id);
         match json_artifact::create_new(&self.directory, &name, &record) {
-            Ok(()) => Ok(Admission::New),
+            Ok(()) => Ok(Admission::New {
+                root_id: record.root_id.expect("new request has a root binding"),
+            }),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                if self.read(&record.request_id)? != record {
+                let existing = self.read(&record.request_id)?;
+                // The only ignored field is the newly sampled candidate
+                // root. A V1 record cannot acquire authority through retry.
+                let mut expected = record.clone();
+                expected.root_id = existing.root_id.clone();
+                if existing.protocol != ROOT_BOUND_PROTOCOL
+                    || existing.root_id.is_none()
+                    || existing != expected
+                {
                     return Err(io::Error::other(
                         "installed launch duplicate identity mismatch",
                     ));
@@ -156,8 +200,8 @@ impl InstalledLaunchLedger {
         }
     }
 
-    /// An authenticated observation of the durable request only. No root or
-    /// terminal transition exists yet, so every present record is pending.
+    /// An authenticated observation of the durable request. A bound UUID is
+    /// only an identity; no root or terminal evidence exists yet.
     pub fn status(
         &self,
         request_id: &str,
@@ -224,12 +268,13 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-            assert!(matches!(
-                ledger
-                    .reserve_request(&spec(&pair, &request), &owner)
-                    .unwrap(),
-                Admission::New
-            ));
+            let Admission::New { root_id } = ledger
+                .reserve_request(&spec(&pair, &request), &owner)
+                .unwrap()
+            else {
+                panic!("first admission did not bind a root");
+            };
+            assert!(canonical_uuid(&root_id));
             // The reply is intentionally dropped when this process exits.
         } else {
             assert_eq!(action, "wrong_owner");
@@ -270,6 +315,10 @@ mod tests {
         // reply. This process then reopens the same durable Broker storage.
         run_child("reserve", state.path(), &pair, &source, &request);
         let restarted = InstalledLaunchLedger::open(state.path(), &pair, &source).unwrap();
+        let bound = restarted.read(&request).unwrap();
+        assert_eq!(bound.protocol, ROOT_BOUND_PROTOCOL);
+        let root_id = bound.root_id.unwrap();
+        assert!(canonical_uuid(&root_id));
         assert_eq!(
             restarted.status(&request, &pair, &peer()).unwrap(),
             format!("pending {request} {pair}\n")
@@ -280,6 +329,20 @@ mod tests {
                 .unwrap(),
             Admission::Existing
         ));
+        assert_eq!(
+            restarted.read(&request).unwrap().root_id.as_deref(),
+            Some(root_id.as_str())
+        );
+        let second_request = uuid::Uuid::new_v4().to_string();
+        let Admission::New {
+            root_id: second_root,
+        } = restarted
+            .reserve_request(&spec(&pair, &second_request), &peer())
+            .unwrap()
+        else {
+            panic!("second request did not bind a root");
+        };
+        assert_ne!(root_id, second_root);
         let mut changed = spec(&pair, &request);
         changed.args = vec![b"diagnostics".to_vec()];
         assert!(restarted.reserve_request(&changed, &peer()).is_err());
@@ -305,5 +368,75 @@ mod tests {
             InstalledLaunchLedger::open(state.path(), &pair, &uuid::Uuid::new_v4().to_string())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn request_only_record_stays_pending_and_cannot_be_upgraded_by_retry() {
+        let state = tempfile::tempdir().unwrap();
+        let pair = uuid::Uuid::new_v4().to_string();
+        let source = uuid::Uuid::new_v4().to_string();
+        let request = uuid::Uuid::new_v4().to_string();
+        let ledger = InstalledLaunchLedger::open(state.path(), &pair, &source).unwrap();
+        let mut old = RequestRecord {
+            protocol: REQUEST_ONLY_PROTOCOL.into(),
+            request_id: request.clone(),
+            pair_generation: pair.clone(),
+            source_generation: source.clone(),
+            owner_uid: peer().uid,
+            launcher: ProcessStamp::from(&peer().process),
+            spec_sha256: format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&spec(&pair, &request)).unwrap())
+            ),
+            root_id: None,
+        };
+        json_artifact::create_new(&ledger.directory, &format!("{request}.json"), &old).unwrap();
+        let restarted = InstalledLaunchLedger::open(state.path(), &pair, &source).unwrap();
+        assert_eq!(
+            restarted.status(&request, &pair, &peer()).unwrap(),
+            format!("pending {request} {pair}\n")
+        );
+        assert!(
+            restarted
+                .reserve_request(&spec(&pair, &request), &peer())
+                .is_err()
+        );
+        old.root_id = Some(uuid::Uuid::new_v4().to_string());
+        fs::write(
+            ledger.directory.join(format!("{request}.json")),
+            serde_json::to_vec(&old).unwrap(),
+        )
+        .unwrap();
+        assert!(InstalledLaunchLedger::open(state.path(), &pair, &source).is_err());
+    }
+
+    #[test]
+    fn restart_refuses_two_requests_claiming_one_root() {
+        let state = tempfile::tempdir().unwrap();
+        let pair = uuid::Uuid::new_v4().to_string();
+        let source = uuid::Uuid::new_v4().to_string();
+        let ledger = InstalledLaunchLedger::open(state.path(), &pair, &source).unwrap();
+        let first = uuid::Uuid::new_v4().to_string();
+        let second = uuid::Uuid::new_v4().to_string();
+        assert!(matches!(
+            ledger
+                .reserve_request(&spec(&pair, &first), &peer())
+                .unwrap(),
+            Admission::New { .. }
+        ));
+        assert!(matches!(
+            ledger
+                .reserve_request(&spec(&pair, &second), &peer())
+                .unwrap(),
+            Admission::New { .. }
+        ));
+        let mut altered = ledger.read(&second).unwrap();
+        altered.root_id = ledger.read(&first).unwrap().root_id;
+        fs::write(
+            ledger.directory.join(format!("{second}.json")),
+            serde_json::to_vec(&altered).unwrap(),
+        )
+        .unwrap();
+        assert!(InstalledLaunchLedger::open(state.path(), &pair, &source).is_err());
     }
 }
