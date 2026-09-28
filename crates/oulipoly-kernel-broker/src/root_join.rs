@@ -21,8 +21,6 @@ use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use super::work_launch;
-
 const GATE_ENV: &str = "OULIPOLY_KERNEL_CHILD_JOIN_FD_V1";
 
 /// The broker owns this gate after J has durably consumed the entry and bound
@@ -587,6 +585,7 @@ pub(super) fn hold(
     let domain = context.spec.domain_id.clone();
     let supervisor = context.spec.supervisor_id.clone();
     let guardian_pid = context.spec.guardian_pid;
+    let (reservation, parent_permit, child_permit) = super::namespace_helper_reaper::prepare()?;
     let pointer = Box::into_raw(context);
     let parent_pid = unsafe { libc::fork() };
     if parent_pid < 0 {
@@ -595,6 +594,10 @@ pub(super) fn hold(
         return Err(error);
     }
     if parent_pid == 0 {
+        drop(parent_permit);
+        if !super::namespace_helper_reaper::await_permit(child_permit, reservation.broker_pidfd()) {
+            unsafe { libc::_exit(70) };
+        }
         drop(parent_notice);
         drop(broker_control);
         drop(broker_gate);
@@ -656,7 +659,8 @@ pub(super) fn hold(
     unsafe {
         drop(Box::from_raw(pointer));
     }
-    work_launch::reap_namespace_helper(parent_pid)?;
+    drop(child_permit);
+    super::namespace_helper_reaper::activate(reservation, parent_pid, parent_permit)?;
     let mut record_length = [0u8; 2];
     parent_notice.read_exact(&mut record_length)?;
     let length = usize::from(u16::from_be_bytes(record_length));

@@ -221,24 +221,6 @@ pub(super) fn wait_entered_child(entered: i32) -> ! {
     }
 }
 
-/// Reap the outside helper while this Broker survives. Its own wait for the
-/// entered child is independent of Broker lifetime and remains in force after
-/// a restart.
-pub(super) fn reap_namespace_helper(pid: i32) -> io::Result<()> {
-    std::thread::Builder::new()
-        .name("namespace-parent-wait".into())
-        .spawn(move || {
-            let mut status = 0;
-            loop {
-                let result = unsafe { libc::waitpid(pid, &mut status, 0) };
-                if result >= 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
-                    break;
-                }
-            }
-        })?;
-    Ok(())
-}
-
 extern "C" fn init_start(pointer: *mut libc::c_void) -> libc::c_int {
     let context = unsafe { Box::from_raw(pointer.cast::<InitContext>()) };
     if run_init(*context).is_ok() { 0 } else { 70 }
@@ -596,11 +578,16 @@ fn create_init(
     let mut context = context;
     context.control = init_control;
     context.gate = init_gate;
+    let (reservation, parent_permit, child_permit) = super::namespace_helper_reaper::prepare()?;
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         return Err(io::Error::last_os_error());
     }
     if pid == 0 {
+        drop(parent_permit);
+        if !super::namespace_helper_reaper::await_permit(child_permit, reservation.broker_pidfd()) {
+            unsafe { libc::_exit(70) };
+        }
         drop(broker_control);
         drop(broker_gate);
         if unsafe { libc::setns(parent_namespace.as_raw_fd(), libc::CLONE_NEWPID) } != 0 {
@@ -657,7 +644,8 @@ fn create_init(
     // The parent must not retain PID1's socket ends. If either helper or
     // clone fails, recvmsg must see EOF and leave consumed grant debt.
     drop(context);
-    reap_namespace_helper(pid)?;
+    drop(child_permit);
+    super::namespace_helper_reaper::activate(reservation, pid, parent_permit)?;
     let credential = child_credential(&broker_control, b'I')?;
     if credential.uid != 0 || credential.pid <= 0 {
         return Err(io::Error::other("work PID1 identity refused"));

@@ -29,6 +29,8 @@ mod fresh_index;
 #[cfg(feature = "age319-private-broker-fixture")]
 #[path = "manual_quota.rs"]
 mod manual_quota;
+#[path = "namespace_helper_reaper.rs"]
+mod namespace_helper_reaper;
 #[path = "native_work.rs"]
 mod native_work;
 #[cfg(feature = "age319-private-broker-fixture")]
