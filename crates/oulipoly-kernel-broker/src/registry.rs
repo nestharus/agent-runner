@@ -313,7 +313,7 @@ impl RootRegistry {
     }
 
     /// Exact live identity is recoverable from the pinned process after a
-    /// Broker restart, even though its parent wait status is not.
+    /// Broker restart. The separate stable parent publishes its own wait.
     pub fn pid1_exact_live(&self, expected: &RootRecord) -> io::Result<bool> {
         self.exact_record(expected)?;
         Ok(self
@@ -331,32 +331,11 @@ impl RootRegistry {
         root_pid1::parent_wait_proof(&self.pid1_directory(), expected)
     }
 
-    /// Only the broker that forked PID1 can consume this exact child wait.
-    /// If it crashes after waitpid and before publication, the parent wait is
-    /// irrecoverable; PID1's own terminal ECHILD receipt remains independent.
+    /// The stable parent of PID1 publishes its exact wait independently of
+    /// the serving Broker. This call only reads its durable result.
     pub fn reap_terminal_pid1(&self, expected: &RootRecord) -> io::Result<bool> {
         self.exact_record(expected)?;
-        if self.pid1_parent_wait_proof(expected)? {
-            return Ok(true);
-        }
-        let root = self
-            .live
-            .iter()
-            .find(|root| root.record == *expected)
-            .ok_or_else(|| io::Error::other("root PID1 original parent unavailable"))?;
-        if root_pid1::read_terminal(&self.pid1_directory(), expected)?.is_none() {
-            return Ok(false);
-        }
-        if !matches!(root.init.peek_child_exit()?, ChildExit::ExitedZero) {
-            return Ok(false);
-        }
-        let mut status = 0;
-        let reaped = unsafe { libc::waitpid(expected.init_host_pid, &mut status, libc::WNOHANG) };
-        if reaped != expected.init_host_pid {
-            return Err(io::Error::other("root PID1 exact parent wait unavailable"));
-        }
-        root_pid1::publish_parent_wait(&self.pid1_directory(), expected, status)?;
-        Ok(true)
+        self.pid1_parent_wait_proof(expected)
     }
 
     pub fn live_roots(&self) -> impl Iterator<Item = &LiveRoot> {
@@ -434,10 +413,9 @@ impl RootRegistry {
         }
     }
 
-    /// Observe only the exact PID1 child pinned by this broker incarnation.
-    /// Zero exit is a physical process observation, not proof that ECHILD was
-    /// reached, that accepted work or effects settled, or that an owner closed.
-    /// A restart cannot reconstruct the parent/child wait status from a PID.
+    /// Observe the exact pinned PID1. A direct-child wait is available to
+    /// older callers; roots launched with a stable parent use its durable
+    /// wait after exit. A missing wait never becomes a successful exit.
     pub fn observe_init_exit(&self, expected: &RootRecord) -> io::Result<ChildExit> {
         if self.poisoned || !self.debt.is_empty() {
             return Err(io::Error::other("uncertain root registry"));
@@ -450,7 +428,19 @@ impl RootRegistry {
         if root.record != *expected {
             return Err(io::Error::other("root PID1 incarnation changed"));
         }
-        root.init.peek_child_exit()
+        match root.init.peek_child_exit() {
+            Ok(exit) => Ok(exit),
+            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
+                if root.init.verify().is_ok() {
+                    Ok(ChildExit::Running)
+                } else if self.pid1_parent_wait_proof(expected)? {
+                    Ok(ChildExit::ExitedZero)
+                } else {
+                    Err(io::Error::other("root PID1 stable parent wait pending"))
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub fn insert(&mut self, record: RootRecord) -> io::Result<()> {

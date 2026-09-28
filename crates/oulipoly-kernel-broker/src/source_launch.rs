@@ -19,6 +19,8 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use super::work_launch;
+
 struct InitContext {
     grant_id: String,
     directory: PathBuf,
@@ -34,6 +36,16 @@ struct InitContext {
     owner_gid: u32,
     groups: Vec<libc::gid_t>,
 }
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn source_stage(stage: &str) {
+    if let Some(gate) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1") {
+        let _ = fs::write(Path::new(&gate).join("source-launch-stage"), stage);
+    }
+}
+
+#[cfg(not(feature = "age319-private-broker-fixture"))]
+fn source_stage(_: &str) {}
 
 fn ensure_host_sudo_context() -> io::Result<()> {
     if unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) } != 0
@@ -207,7 +219,7 @@ fn child_credential(stream: &UnixStream, expected: u8) -> io::Result<libc::ucred
 fn create_init(
     parent_namespace: &File,
     context: InitContext,
-) -> io::Result<(i32, UnixStream, UnixStream)> {
+) -> io::Result<(i32, i32, UnixStream, UnixStream)> {
     let (broker_control, init_control) = UnixStream::pair()?;
     let (broker_gate, init_gate) = UnixStream::pair()?;
     let one: libc::c_int = 1;
@@ -233,6 +245,18 @@ fn create_init(
     if pid == 0 {
         drop(broker_control);
         drop(broker_gate);
+        if close_other_descriptors(&[
+            parent_namespace.as_raw_fd(),
+            context.image.as_raw_fd(),
+            context.stdout_file.as_raw_fd(),
+            context.stderr_file.as_raw_fd(),
+            context.control.as_raw_fd(),
+            context.gate.as_raw_fd(),
+        ])
+        .is_err()
+        {
+            unsafe { libc::_exit(70) };
+        }
         if unsafe { libc::setns(parent_namespace.as_raw_fd(), libc::CLONE_NEWPID) } != 0 {
             unsafe { libc::_exit(70) };
         }
@@ -241,7 +265,21 @@ fn create_init(
             unsafe { libc::_exit(70) };
         }
         if entered > 0 {
-            unsafe { libc::_exit(0) };
+            work_launch::wait_entered_child(entered);
+        }
+        // This credential binds the retained in-root parent to the private
+        // launch channel before it forks source PID1. The PID1 credential
+        // follows on that same channel.
+        if unsafe {
+            libc::send(
+                context.control.as_raw_fd(),
+                b"E".as_ptr().cast(),
+                1,
+                libc::MSG_NOSIGNAL,
+            )
+        } != 1
+        {
+            unsafe { libc::_exit(70) };
         }
         let pointer = Box::into_raw(Box::new(context));
         let mut stack = vec![0u8; 1024 * 1024];
@@ -260,19 +298,43 @@ fn create_init(
         if init_pid < 0 {
             unsafe { libc::_exit(70) };
         }
-        unsafe { libc::_exit(0) };
+        let mut status = 0;
+        let waited = loop {
+            let result = unsafe { libc::waitpid(init_pid, &mut status, 0) };
+            if result >= 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                break result;
+            }
+        };
+        unsafe {
+            libc::_exit(
+                if waited == init_pid && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+                    0
+                } else {
+                    70
+                },
+            )
+        };
     }
     drop(context);
-    let mut status = 0;
-    let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
-    if waited != pid || !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
-        return Err(io::Error::other("source namespace helper failed"));
-    }
+    work_launch::reap_namespace_helper(pid)?;
+    source_stage("waiting-entered-credential");
+    let entered_credential = child_credential(&broker_control, b'E')?;
+    source_stage("waiting-pid1-credential");
     let credential = child_credential(&broker_control, b'I')?;
-    if credential.uid != 0 || credential.pid <= 0 {
+    if entered_credential.uid != 0
+        || entered_credential.pid <= 0
+        || credential.uid != 0
+        || credential.pid <= 0
+    {
         return Err(io::Error::other("source PID1 identity refused"));
     }
-    Ok((credential.pid, broker_control, broker_gate))
+    source_stage("pid1-credential-read");
+    Ok((
+        credential.pid,
+        entered_credential.pid,
+        broker_control,
+        broker_gate,
+    ))
 }
 
 fn write_confirmation(
@@ -377,12 +439,19 @@ pub(super) fn launch(
         owner_gid: peer.gid,
         groups: peer.process.supplementary_groups()?,
     };
-    let (pid, mut control, mut gate) = create_init(root.init.namespace(), context)?;
+    let (pid, entered_pid, mut control, mut gate) = create_init(root.init.namespace(), context)?;
     let pid1 = PinnedProcess::open(pid)?;
-    if !pid1.is_namespace_init()? || !pid1.direct_child_of(&root.init)? {
+    let entered = PinnedProcess::open(entered_pid)?;
+    if !pid1.is_namespace_init()?
+        || entered.is_namespace_init()?
+        || !entered.in_namespace(root.init.namespace())?
+        || !pid1.direct_child_of(&entered)?
+    {
         return Err(io::Error::other("source PID1 lineage changed"));
     }
+    source_stage("lineage-verified");
     control.write_all(b"P")?;
+    source_stage("waiting-worker-credential");
     let credentials = child_credential(&control, b'C')?;
     let worker = PinnedProcess::open(credentials.pid)?;
     if credentials.uid != peer.uid
@@ -416,11 +485,13 @@ pub(super) fn launch(
     )?;
     candidate.verify_at_use().map_err(io::Error::other)?;
     gate.write_all(b"R")?;
+    source_stage("waiting-exec-ack");
     let mut executed = [0];
     control.read_exact(&mut executed)?;
     if executed != [b'E'] {
         return Err(io::Error::other("source exec acknowledgement absent"));
     }
+    source_stage("source-launched");
     Ok(format!(
         "source-held {} {} {}\n",
         record.grant.grant_id, pid1.host_pid, worker.host_pid

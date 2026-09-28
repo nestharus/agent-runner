@@ -196,6 +196,49 @@ pub(super) fn close_other_descriptors(keep: &[RawFd]) -> io::Result<()> {
     Ok(())
 }
 
+/// The process that called setns remains outside the root namespace. It must
+/// wait for its exact forked child inside that namespace: if it exits first,
+/// that child can become an unreapable-by-root zombie after Broker restart.
+pub(super) fn wait_entered_child(entered: i32) -> ! {
+    if close_other_descriptors(&[]).is_err() {
+        unsafe { libc::_exit(70) };
+    }
+    let mut status = 0;
+    let waited = loop {
+        let result = unsafe { libc::waitpid(entered, &mut status, 0) };
+        if result >= 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            break result;
+        }
+    };
+    unsafe {
+        libc::_exit(
+            if waited == entered && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+                0
+            } else {
+                70
+            },
+        )
+    }
+}
+
+/// Reap the outside helper while this Broker survives. Its own wait for the
+/// entered child is independent of Broker lifetime and remains in force after
+/// a restart.
+pub(super) fn reap_namespace_helper(pid: i32) -> io::Result<()> {
+    std::thread::Builder::new()
+        .name("namespace-parent-wait".into())
+        .spawn(move || {
+            let mut status = 0;
+            loop {
+                let result = unsafe { libc::waitpid(pid, &mut status, 0) };
+                if result >= 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                    break;
+                }
+            }
+        })?;
+    Ok(())
+}
+
 extern "C" fn init_start(pointer: *mut libc::c_void) -> libc::c_int {
     let context = unsafe { Box::from_raw(pointer.cast::<InitContext>()) };
     if run_init(*context).is_ok() { 0 } else { 70 }
@@ -570,7 +613,7 @@ fn create_init(
             unsafe { libc::_exit(70) };
         }
         if entered > 0 {
-            unsafe { libc::_exit(0) };
+            wait_entered_child(entered);
         }
         let pointer = Box::into_raw(Box::new(context));
         let mut stack = vec![0u8; 1024 * 1024];
@@ -614,11 +657,7 @@ fn create_init(
     // The parent must not retain PID1's socket ends. If either helper or
     // clone fails, recvmsg must see EOF and leave consumed grant debt.
     drop(context);
-    let mut status = 0;
-    let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
-    if waited != pid || !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
-        return Err(io::Error::other("work namespace helper failed"));
-    }
+    reap_namespace_helper(pid)?;
     let credential = child_credential(&broker_control, b'I')?;
     if credential.uid != 0 || credential.pid <= 0 {
         return Err(io::Error::other("work PID1 identity refused"));

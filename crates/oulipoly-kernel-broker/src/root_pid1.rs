@@ -1,5 +1,5 @@
 //! Exact, root-only request and PID1's own terminal ECHILD witness. This is
-//! narrower than a retained parent wait or State/sidecar root close.
+//! separate from the stable parent's wait and State/sidecar root close.
 
 use crate::identity::observed_incarnation_absent;
 use crate::json_artifact;
@@ -150,7 +150,10 @@ pub fn publish_parent_wait(
     }
     read_terminal(directory, root)?
         .ok_or_else(|| io::Error::other("root PID1 terminal receipt absent"))?;
-    json_artifact::create_new(
+    if parent_wait_proof(directory, root)? {
+        return sync_existing(directory, &parent_wait_name(root));
+    }
+    let result = json_artifact::create_new(
         directory,
         &parent_wait_name(root),
         &RootPid1ParentWait {
@@ -159,7 +162,11 @@ pub fn publish_parent_wait(
             wait_status,
             reaped: true,
         },
-    )
+    );
+    if result.is_err() && parent_wait_proof(directory, root)? {
+        return sync_existing(directory, &parent_wait_name(root));
+    }
+    result
 }
 
 pub fn parent_wait_proof(directory: &Path, root: &RootRecord) -> io::Result<bool> {

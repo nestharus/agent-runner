@@ -356,7 +356,7 @@ impl WorkRegistry {
             return Err(refuse("accepted H, Bash child W and selected K differ"));
         }
         if sources.has_debt()
-            || roots.has_debt()
+            || roots.has_unrelated_debt(expected)
             || !roots.admission_fenced(&expected.root_id)
             || obligations.unsettled() != 0
             || source.root != *expected

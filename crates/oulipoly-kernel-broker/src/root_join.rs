@@ -21,6 +21,8 @@ use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+use super::work_launch;
+
 const GATE_ENV: &str = "OULIPOLY_KERNEL_CHILD_JOIN_FD_V1";
 
 /// The broker owns this gate after J has durably consumed the entry and bound
@@ -147,6 +149,9 @@ struct InitContext {
     held_v30: bool,
     pid1_directory: PathBuf,
     fence_directory: PathBuf,
+    // The stable outside parent announces PID1 to the Broker. PID1 must not
+    // keep the writer open if that parent dies before sending its record.
+    parent_notice_fd: RawFd,
 }
 
 fn validate(spec: &JoinSpec, descriptors: &[File; 5]) -> io::Result<()> {
@@ -247,6 +252,7 @@ fn close_other_descriptors(keep: &[RawFd]) -> io::Result<()> {
 
 extern "C" fn init_start(pointer: *mut libc::c_void) -> libc::c_int {
     let context = unsafe { Box::from_raw(pointer.cast::<InitContext>()) };
+    unsafe { libc::close(context.parent_notice_fd) };
     if run_init(*context).is_ok() { 0 } else { 70 }
 }
 
@@ -263,6 +269,7 @@ fn run_init(context: InitContext) -> io::Result<()> {
         held_v30,
         pid1_directory,
         fence_directory,
+        parent_notice_fd: _,
     } = context;
     if unsafe { libc::getpid() } != 1 {
         return Err(io::Error::other("root init is not namespace PID1"));
@@ -561,6 +568,7 @@ pub(super) fn hold(
     }
     let launch_args = spec.args.clone();
     let root_work_authority = spec.root_authority.clone();
+    let (mut parent_notice, mut helper_notice) = UnixStream::pair()?;
     let context = Box::new(InitContext {
         spec,
         descriptors,
@@ -573,43 +581,103 @@ pub(super) fn hold(
         held_v30: _held_v30,
         pid1_directory: roots.pid1_directory(),
         fence_directory: roots.pid1_directory().with_file_name("root-drains"),
+        parent_notice_fd: helper_notice.as_raw_fd(),
     });
     let root_id = context.spec.root_id.clone();
     let domain = context.spec.domain_id.clone();
     let supervisor = context.spec.supervisor_id.clone();
     let guardian_pid = context.spec.guardian_pid;
     let pointer = Box::into_raw(context);
-    let mut stack = vec![0u8; 1024 * 1024];
-    let top = unsafe { stack.as_mut_ptr().add(stack.len()) };
-    let init_pid = unsafe {
-        libc::clone(
-            init_start,
-            top.cast(),
-            libc::CLONE_NEWPID | libc::SIGCHLD,
-            pointer.cast(),
-        )
-    };
-    // Parent and PID1 have independent address spaces after clone.
+    let parent_pid = unsafe { libc::fork() };
+    if parent_pid < 0 {
+        let error = io::Error::last_os_error();
+        unsafe { drop(Box::from_raw(pointer)) };
+        return Err(error);
+    }
+    if parent_pid == 0 {
+        drop(parent_notice);
+        drop(broker_control);
+        drop(broker_gate);
+        let context = unsafe { &*pointer };
+        let directory = context.pid1_directory.clone();
+        let mut stack = vec![0u8; 1024 * 1024];
+        let top = unsafe { stack.as_mut_ptr().add(stack.len()) };
+        let init_pid = unsafe {
+            libc::clone(
+                init_start,
+                top.cast(),
+                libc::CLONE_NEWPID | libc::SIGCHLD,
+                pointer.cast(),
+            )
+        };
+        if init_pid < 0 {
+            unsafe { libc::_exit(70) };
+        }
+        let published = (|| -> io::Result<RootRecord> {
+            let init = PinnedProcess::open(init_pid)?;
+            if !init.is_namespace_init()? {
+                return Err(io::Error::other("root PID namespace did not form"));
+            }
+            let record = RootRecord {
+                version: 1,
+                boot_id: init.boot_id.clone(),
+                root_id: context.spec.root_id.clone(),
+                owner_uid: context.uid,
+                init_host_pid: init_pid,
+                init_starttime_ticks: init.starttime_ticks,
+                pidns_dev: init.pidns_dev,
+                pidns_ino: init.pidns_ino,
+            };
+            let bytes = serde_json::to_vec(&record)?;
+            helper_notice.write_all(&(bytes.len() as u16).to_be_bytes())?;
+            helper_notice.write_all(&bytes)?;
+            Ok(record)
+        })();
+        drop(helper_notice);
+        unsafe { drop(Box::from_raw(pointer)) };
+        let Ok(record) = published else {
+            unsafe { libc::_exit(70) };
+        };
+        if close_other_descriptors(&[]).is_err() {
+            unsafe { libc::_exit(70) };
+        }
+        let mut status = 0;
+        let waited = loop {
+            let result = unsafe { libc::waitpid(init_pid, &mut status, 0) };
+            if result >= 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                break result;
+            }
+        };
+        let recorded = waited == init_pid
+            && root_pid1::publish_parent_wait(&directory, &record, status).is_ok();
+        unsafe { libc::_exit(if recorded { 0 } else { 70 }) };
+    }
+    drop(helper_notice);
     unsafe {
         drop(Box::from_raw(pointer));
     }
-    if init_pid < 0 {
-        return Err(io::Error::last_os_error());
+    work_launch::reap_namespace_helper(parent_pid)?;
+    let mut record_length = [0u8; 2];
+    parent_notice.read_exact(&mut record_length)?;
+    let length = usize::from(u16::from_be_bytes(record_length));
+    if length == 0 || length > 2048 {
+        return Err(io::Error::other("root PID1 parent record length invalid"));
     }
-    let init = PinnedProcess::open(init_pid)?;
-    if !init.is_namespace_init()? || init.in_namespace(peer.process.namespace())? {
+    let mut record_bytes = vec![0u8; length];
+    parent_notice.read_exact(&mut record_bytes)?;
+    let record: RootRecord = serde_json::from_slice(&record_bytes)?;
+    if record.root_id != root_id || record.owner_uid != peer.uid {
+        return Err(io::Error::other("root PID1 parent record changed"));
+    }
+    let init = PinnedProcess::open(record.init_host_pid)?;
+    if !init.is_namespace_init()?
+        || init.in_namespace(peer.process.namespace())?
+        || record.boot_id != init.boot_id
+        || record.init_starttime_ticks != init.starttime_ticks
+        || (record.pidns_dev, record.pidns_ino) != (init.pidns_dev, init.pidns_ino)
+    {
         return Err(io::Error::other("root PID namespace did not form"));
     }
-    let record = RootRecord {
-        version: 1,
-        boot_id: init.boot_id.clone(),
-        root_id: root_id.clone(),
-        owner_uid: peer.uid,
-        init_host_pid: init_pid,
-        init_starttime_ticks: init.starttime_ticks,
-        pidns_dev: init.pidns_dev,
-        pidns_ino: init.pidns_ino,
-    };
     roots.insert(record.clone())?;
     broker_control.write_all(b"P")?;
     let bytes = serde_json::to_vec(&record)?;

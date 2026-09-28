@@ -34,8 +34,8 @@ pub struct RootDrainInventory {
     /// PID1's exact ECHILD receipt plus absence of its recorded incarnation.
     /// This does not include an authoritative parent wait receipt.
     pub pid1_terminal_proof: bool,
-    /// Exact parent wait persisted by the original serving Broker when it
-    /// survived long enough to consume the child status.
+    /// Exact parent wait persisted by PID1's stable parent across Broker
+    /// restart.
     pub pid1_parent_wait_proof: bool,
     /// Consumed J with the exact original joined child, guardian and driver
     /// bound to the one retained physical source. Its seal is checked below.
