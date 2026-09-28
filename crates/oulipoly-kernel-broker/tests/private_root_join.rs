@@ -8724,6 +8724,7 @@ fn inner() {
                             assert_eq!(before["source_physical_outstanding"], 1);
                             assert_eq!(before["work_outstanding"], 1);
                             assert_eq!(before["close_eligible"], false);
+                            assert!(protocol::root_pid1_drain_at(&socket, &expected).is_err());
                         }
                         fs::write(gate.join("source-adopted-started.release"), b"drain").unwrap();
                         let original_session = lane.read_session(&root.d_key).unwrap().unwrap();
@@ -9336,11 +9337,27 @@ fn inner() {
                                         assert_eq!(after_work["work_outstanding"], 0);
                                         assert_eq!(after_work["live_works"], 0);
                                         assert_eq!(after_work["work_debt"], 0);
+                                        assert_eq!(
+                                            after_work["entry_physical_settled"], true,
+                                            "{after_work}"
+                                        );
+                                        assert_eq!(after_work["entry_unsettled"], true);
                                         assert_eq!(after_work["close_eligible"], false);
+                                        assert_eq!(after_work["pid1"], "live");
+                                        let mut stale_root = expected.clone();
+                                        stale_root.init_starttime_ticks += 1;
+                                        assert!(
+                                            protocol::root_pid1_drain_at(&socket, &stale_root)
+                                                .is_err()
+                                        );
                                         let work_receipt_path = terminal_dir
                                             .join(format!("{}.json", work_q.work_incarnation,));
                                         let work_receipt = fs::read(&work_receipt_path).unwrap();
                                         fs::write(&work_receipt_path, b"changed child Q").unwrap();
+                                        assert!(
+                                            protocol::root_pid1_drain_at(&socket, &expected)
+                                                .is_err()
+                                        );
                                         assert!(
                                             reopened_work
                                                 .physical_q(
@@ -9462,6 +9479,10 @@ fn inner() {
                                         let original_receipt = fs::read(&receipt_path).unwrap();
                                         fs::write(&receipt_path, b"changed Q").unwrap();
                                         assert!(
+                                            protocol::root_pid1_drain_at(&socket, &expected)
+                                                .is_err()
+                                        );
+                                        assert!(
                                             reopened.retirement(&custody.source_grant_id).is_err()
                                         );
                                         assert!(
@@ -9518,6 +9539,26 @@ fn inner() {
                                                 )
                                                 .unwrap(),
                                             Some(work_retirement)
+                                        );
+                                        // The seals can finish while the original Runner still
+                                        // owns PID1's direct-child slot. Wait for that exact
+                                        // process to exit before issuing a physical drain.
+                                        eventually(|| entry.try_wait().unwrap().is_some());
+                                        let settled_entry = protocol::root_drain_readback_at(
+                                            &socket, &expected, false,
+                                        )
+                                        .unwrap();
+                                        let settled_entry: serde_json::Value =
+                                            serde_json::from_str(
+                                                settled_entry
+                                                    .strip_prefix("root-drain-v1 ")
+                                                    .unwrap()
+                                                    .trim_end(),
+                                            )
+                                            .unwrap();
+                                        assert_eq!(
+                                            settled_entry["entry_original_exited"], true,
+                                            "{settled_entry}"
                                         );
                                         // A new serving incarnation must read the retained
                                         // evidence again, including a changed child Q.
@@ -9579,6 +9620,10 @@ fn inner() {
                                             true
                                         );
                                         assert_eq!(changed["close_eligible"], false);
+                                        assert!(
+                                            protocol::root_pid1_drain_at(&socket, &expected)
+                                                .is_err()
+                                        );
                                         fs::write(&work_receipt_path, work_receipt).unwrap();
                                         eventually(|| {
                                             protocol::root_drain_readback_at(
@@ -9598,6 +9643,131 @@ fn inner() {
                                                     && inventory["work_outstanding"] == 0
                                             })
                                         });
+                                        assert!(
+                                            !broker_state
+                                                .join(format!(
+                                                    "root-pid1/{}.terminal.json",
+                                                    expected.root_id
+                                                ))
+                                                .exists()
+                                        );
+                                        assert_eq!(
+                                            protocol::root_pid1_drain_at(&socket, &expected)
+                                                .unwrap_or_else(|error| panic!(
+                                                    "PID1 request: {error}; inventory: {}",
+                                                    protocol::root_drain_readback_at(
+                                                        &socket, &expected, false
+                                                    )
+                                                    .unwrap()
+                                                )),
+                                            "root-pid1-drain-v1 requested\n"
+                                        );
+                                        let terminal_path = broker_state.join(format!(
+                                            "root-pid1/{}.terminal.json",
+                                            expected.root_id
+                                        ));
+                                        eventually(|| terminal_path.exists());
+                                        let proof = protocol::root_drain_readback_at(
+                                            &socket, &expected, false,
+                                        )
+                                        .unwrap();
+                                        let proof: serde_json::Value = serde_json::from_str(
+                                            proof
+                                                .strip_prefix("root-drain-v1 ")
+                                                .unwrap()
+                                                .trim_end(),
+                                        )
+                                        .unwrap();
+                                        assert_eq!(proof["pid1_echild_receipt"], true);
+                                        assert!(
+                                            proof["pid1_terminal_proof"] == true
+                                                || proof["pid1_exact_live"] == true
+                                        );
+                                        assert_eq!(proof["source_physical_retired"], 1);
+                                        assert_eq!(proof["work_retired"], 1);
+                                        assert_eq!(proof["entry_physical_settled"], true);
+                                        assert_eq!(proof["pid1_parent_wait_proof"], false);
+                                        assert_eq!(proof["close_eligible"], false);
+                                        let terminal: serde_json::Value = serde_json::from_slice(
+                                            &fs::read(&terminal_path).unwrap(),
+                                        )
+                                        .unwrap();
+                                        assert_eq!(
+                                            terminal["root"],
+                                            serde_json::to_value(&expected).unwrap()
+                                        );
+                                        assert_eq!(terminal["owned_children"], "ECHILD");
+                                        let terminal_backup =
+                                            temp.path().join("root-pid1-terminal-held.json");
+                                        fs::rename(&terminal_path, &terminal_backup).unwrap();
+                                        let missing = protocol::root_drain_readback_at(
+                                            &socket, &expected, false,
+                                        )
+                                        .unwrap();
+                                        let missing: serde_json::Value = serde_json::from_str(
+                                            missing
+                                                .strip_prefix("root-drain-v1 ")
+                                                .unwrap()
+                                                .trim_end(),
+                                        )
+                                        .unwrap();
+                                        assert_eq!(missing["pid1_terminal_proof"], false);
+                                        assert_eq!(missing["pid1_echild_receipt"], false);
+                                        assert_eq!(missing["close_eligible"], false);
+                                        fs::rename(&terminal_backup, &terminal_path).unwrap();
+                                        stop(&mut broker);
+                                        broker = Command::new(env!(
+                                            "CARGO_BIN_EXE_oulipoly-kernel-broker"
+                                        ))
+                                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                                        .env(
+                                            "OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1",
+                                            &broker_state,
+                                        )
+                                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
+                                        .env(
+                                            "OULIPOLY_KERNEL_BROKER_FIXTURE_BASH_V1",
+                                            bash.as_ref().unwrap(),
+                                        )
+                                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+                                        .env(
+                                            "OULIPOLY_KERNEL_BROKER_PRIVATE_NATIVE_CODEX_SHA256_V1",
+                                            format!(
+                                                "{:x}",
+                                                Sha256::digest(fs::read(&provider_image).unwrap())
+                                            ),
+                                        )
+                                        .stderr(Stdio::from(
+                                            File::create(temp.path().join("pid1-restart.log"))
+                                                .unwrap(),
+                                        ))
+                                        .spawn()
+                                        .unwrap();
+                                        eventually(|| {
+                                            protocol::root_drain_readback_at(
+                                                &socket, &expected, false,
+                                            )
+                                            .is_ok()
+                                        });
+                                        let restored = protocol::root_drain_readback_at(
+                                            &socket, &expected, false,
+                                        )
+                                        .unwrap();
+                                        let restored: serde_json::Value = serde_json::from_str(
+                                            restored
+                                                .strip_prefix("root-drain-v1 ")
+                                                .unwrap()
+                                                .trim_end(),
+                                        )
+                                        .unwrap();
+                                        assert_eq!(restored["pid1_echild_receipt"], true);
+                                        assert!(
+                                            restored["pid1_terminal_proof"] == true
+                                                || restored["pid1_exact_live"] == true
+                                        );
+                                        assert_eq!(restored["work_retired"], 1);
+                                        assert_eq!(restored["close_eligible"], false);
+                                        eprintln!("root PID1 drain restart readback: {}", restored);
                                     }
                                 }
                             } else {
@@ -15505,6 +15675,12 @@ fn inner() {
         assert_eq!(fenced["fenced"], true);
         assert_eq!(fenced["state"], "blocked");
         assert_eq!(fenced["close_eligible"], false);
+        assert!(protocol::root_pid1_drain_at(&socket, &exact).is_err());
+        assert!(
+            !broker_state
+                .join(format!("root-pid1/{root}.request.json"))
+                .exists()
+        );
         assert!(
             broker_state
                 .join(format!("root-drains/{root}.json"))

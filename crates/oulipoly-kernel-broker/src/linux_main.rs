@@ -74,7 +74,6 @@ use oulipoly_kernel_broker::protocol::{
     StateWriteSpec,
 };
 use oulipoly_kernel_broker::registry::{RootRecord, RootRegistry};
-use oulipoly_kernel_broker::root_drain;
 use oulipoly_kernel_broker::source_acceptance::{
     accept_v2_completion_source, capture_and_stage_v2_evidence, commit_v2_evidence,
     decide_v2_source_retention_release, deliver_v2_source_retention_release,
@@ -84,6 +83,7 @@ use oulipoly_kernel_broker::source_physical::{SourceObservation, SourcePhysicalR
 use oulipoly_kernel_broker::work_registry::{
     Scope, WorkRegistry, classify_scope, classify_scope_readback,
 };
+use oulipoly_kernel_broker::{root_drain, root_pid1};
 use oulipoly_state::mailbox::{
     BrokerReleaseEvidence, BrokerSidecar, BrokerSourceEffectGrant, ExactProcessEvidence,
     FreshBashListenerPolicy, FreshDeliverySubmission, FreshNativeFPreparation,
@@ -414,7 +414,7 @@ fn require_cutover_entry_route(
     broker_owned_sidecar: bool,
     gate_closed: bool,
 ) -> io::Result<()> {
-    if matches!(operation, b'i' | b'v' | b'X' | b'x' | b'@' | b'[') {
+    if matches!(operation, b'i' | b'v' | b'X' | b'x' | b'@' | b'[' | 0x7f) {
         return Ok(());
     }
     if gate_closed {
@@ -796,7 +796,7 @@ fn recv_request(
         }
         #[cfg(feature = "age319-private-broker-fixture")]
         b'#' | b'{' | b'}' | b']' | b'|' | b'~' | b'?' => (18..=2048 + 17).contains(&read),
-        b'@' | b'[' => (18..=2048 + 17).contains(&read),
+        b'@' | b'[' | 0x7f => (18..=2048 + 17).contains(&read),
         b'F' => (18..=8192 + 17).contains(&read),
         b'O' => (18..=1024 + 17).contains(&read),
         b'U' => (18..=512 + 17).contains(&read),
@@ -856,7 +856,7 @@ fn recv_request(
     }
     process.verify()?;
     let payload = match request[0] {
-        b'@' | b'[' => RequestPayload::RootDrain {
+        b'@' | b'[' | 0x7f => RequestPayload::RootDrain {
             expected: serde_json::from_slice(&request[17..read as usize])?,
         },
         b'U' => RequestPayload::FreshChildRequest {
@@ -4854,6 +4854,16 @@ fn serve() -> io::Result<()> {
                         &terminal_path,
                     );
                 }
+                // The original serving Broker alone can retain a parent wait
+                // for its own PID1 children. A crash between wait and journal
+                // leaves only PID1's independent durable ECHILD receipt.
+                for root in registry.live_roots() {
+                    if root_pid1::read_terminal(&registry.pid1_directory(), &root.record)
+                        .is_ok_and(|receipt| receipt.is_some())
+                    {
+                        let _ = registry.reap_terminal_pid1(&root.record);
+                    }
+                }
                 std::thread::sleep(BROKER_ACCEPT_POLL_INTERVAL);
                 continue;
             }
@@ -4872,7 +4882,7 @@ fn serve() -> io::Result<()> {
                 broker_sidecar.is_some(),
                 entry_gate.is_closed(),
             )?;
-            if operation == b'@' || operation == b'[' {
+            if operation == b'@' || operation == b'[' || operation == 0x7f {
                 if peer.uid != 0 || !peer.process.in_namespace(&host_namespace)? {
                     return Err(io::Error::other("host-root drain readback required"));
                 }
@@ -4893,6 +4903,11 @@ fn serve() -> io::Result<()> {
                     &expected, &registry, &entries, &works, &grants, &source_physical,
                     broker_sidecar.as_ref(),
                 )?;
+                if operation == 0x7f {
+                    root_drain::ready_for_pid1_request(&inventory)?;
+                    root_pid1::publish_request(&registry.pid1_directory(), &expected)?;
+                    return Ok("root-pid1-drain-v1 requested\n".into());
+                }
                 Ok(format!("root-drain-v1 {}\n", serde_json::to_string(&inventory)?))
             } else if operation == b'i' {
                 let route = if entry_gate.is_closed() {

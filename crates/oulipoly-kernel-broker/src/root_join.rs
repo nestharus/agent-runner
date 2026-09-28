@@ -6,9 +6,11 @@ const PRIVATE_ROOT_GATE_POLL: std::time::Duration = std::time::Duration::from_mi
 
 use oulipoly_kernel_broker::entry_registry::EntryRegistry;
 use oulipoly_kernel_broker::entry_registry::ProcessStamp;
+use oulipoly_kernel_broker::identity::own_pid1_record_matches;
 use oulipoly_kernel_broker::identity::{PeerIdentity, PinnedProcess};
 use oulipoly_kernel_broker::protocol::JoinSpec;
 use oulipoly_kernel_broker::registry::{RootRecord, RootRegistry};
+use oulipoly_kernel_broker::{json_artifact, root_pid1};
 use oulipoly_state::mailbox::FreshRootWorkIntent;
 use std::collections::HashSet;
 use std::fs::{self, File};
@@ -16,6 +18,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 const GATE_ENV: &str = "OULIPOLY_KERNEL_CHILD_JOIN_FD_V1";
@@ -142,6 +145,8 @@ struct InitContext {
     gid: u32,
     groups: Vec<libc::gid_t>,
     held_v30: bool,
+    pid1_directory: PathBuf,
+    fence_directory: PathBuf,
 }
 
 fn validate(spec: &JoinSpec, descriptors: &[File; 5]) -> io::Result<()> {
@@ -256,7 +261,37 @@ fn run_init(context: InitContext) -> io::Result<()> {
         gid,
         groups,
         held_v30,
+        pid1_directory,
+        fence_directory,
     } = context;
+    if unsafe { libc::getpid() } != 1 {
+        return Err(io::Error::other("root init is not namespace PID1"));
+    }
+    let mut release = [0u8; 1];
+    control.read_exact(&mut release)?;
+    if release != [b'P'] {
+        return Err(io::Error::other("root persistence gate refused"));
+    }
+    let mut record_length = [0u8; 2];
+    control.read_exact(&mut record_length)?;
+    let length = usize::from(u16::from_be_bytes(record_length));
+    if length == 0 || length > 2048 {
+        return Err(io::Error::other("root PID1 identity length invalid"));
+    }
+    let mut record_bytes = vec![0u8; length];
+    control.read_exact(&mut record_bytes)?;
+    let root_record: RootRecord = serde_json::from_slice(&record_bytes)?;
+    if root_record.root_id != spec.root_id || root_record.owner_uid != uid {
+        return Err(io::Error::other("root PID1 identity changed"));
+    }
+    if !own_pid1_record_matches(
+        root_record.init_host_pid,
+        &root_record.boot_id,
+        root_record.init_starttime_ticks,
+        (root_record.pidns_dev, root_record.pidns_ino),
+    )? {
+        return Err(io::Error::other("root PID1 incarnation changed"));
+    }
     close_other_descriptors(&[
         stdin.as_raw_fd(),
         stdout.as_raw_fd(),
@@ -267,14 +302,6 @@ fn run_init(context: InitContext) -> io::Result<()> {
         control.as_raw_fd(),
         gate.as_raw_fd(),
     ])?;
-    if unsafe { libc::getpid() } != 1 {
-        return Err(io::Error::other("root init is not namespace PID1"));
-    }
-    let mut release = [0u8; 1];
-    control.read_exact(&mut release)?;
-    if release != [b'P'] {
-        return Err(io::Error::other("root persistence gate refused"));
-    }
     if unsafe { libc::fchdir(cwd.as_raw_fd()) } != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -356,6 +383,8 @@ fn run_init(context: InitContext) -> io::Result<()> {
     // Reap every child, including adopted descendants that finish while the
     // original Runner is still live. The original exit is reported once.
     let mut original_reported = false;
+    let mut drain_requested = false;
+    let mut terminal_error_reported = false;
     let mut status = Some(status);
     loop {
         let mut child_status = 0;
@@ -384,7 +413,49 @@ fn run_init(context: InitContext) -> io::Result<()> {
         {
             continue;
         }
-        unsafe { libc::pause() };
+        // The durable admission fence stops new accepted descendants. Once
+        // original work is reported, PID1 latches only its exact request and
+        // keeps reaping adopted children until ECHILD. Empty snapshots alone
+        // never initiate the transition.
+        if original_reported && !drain_requested {
+            drain_requested = root_pid1::read_request(&pid1_directory, &root_record)
+                .is_ok_and(|request| request.is_some())
+                && json_artifact::read::<RootRecord>(
+                    &fence_directory.join(format!("{}.json", root_record.root_id)),
+                    "root_pid1_fence",
+                )
+                .is_ok_and(|fence| fence == root_record);
+        }
+        // Recheck both exact artifacts immediately before the create-new
+        // terminal publication. A failed read or write leaves PID1 alive.
+        if drain_requested
+            && reaped < 0
+            && io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
+            && root_pid1::read_request(&pid1_directory, &root_record)
+                .is_ok_and(|request| request.is_some())
+            && json_artifact::read::<RootRecord>(
+                &fence_directory.join(format!("{}.json", root_record.root_id)),
+                "root_pid1_fence",
+            )
+            .is_ok_and(|fence| fence == root_record)
+        {
+            match root_pid1::publish_terminal(&pid1_directory, &root_record) {
+                Ok(()) => {
+                    eprintln!("root PID1 terminal published: {}", root_record.root_id);
+                    return Ok(());
+                }
+                Err(error) if !terminal_error_reported => {
+                    eprintln!("root PID1 terminal publication pending: {error}");
+                    terminal_error_reported = true;
+                }
+                Err(_) => {}
+            }
+        }
+        if original_reported {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        } else {
+            unsafe { libc::pause() };
+        }
     }
 }
 
@@ -500,6 +571,8 @@ pub(super) fn hold(
         gid: peer.gid,
         groups: peer.process.supplementary_groups()?,
         held_v30: _held_v30,
+        pid1_directory: roots.pid1_directory(),
+        fence_directory: roots.pid1_directory().with_file_name("root-drains"),
     });
     let root_id = context.spec.root_id.clone();
     let domain = context.spec.domain_id.clone();
@@ -527,7 +600,7 @@ pub(super) fn hold(
     if !init.is_namespace_init()? || init.in_namespace(peer.process.namespace())? {
         return Err(io::Error::other("root PID namespace did not form"));
     }
-    roots.insert(RootRecord {
+    let record = RootRecord {
         version: 1,
         boot_id: init.boot_id.clone(),
         root_id: root_id.clone(),
@@ -536,8 +609,12 @@ pub(super) fn hold(
         init_starttime_ticks: init.starttime_ticks,
         pidns_dev: init.pidns_dev,
         pidns_ino: init.pidns_ino,
-    })?;
+    };
+    roots.insert(record.clone())?;
     broker_control.write_all(b"P")?;
+    let bytes = serde_json::to_vec(&record)?;
+    broker_control.write_all(&(bytes.len() as u16).to_be_bytes())?;
+    broker_control.write_all(&bytes)?;
     let credentials = child_credential(&broker_control)?;
     let child = PinnedProcess::open(credentials.pid)?;
     if credentials.uid != peer.uid
