@@ -509,6 +509,10 @@ enum RequestPayload {
         descriptors: Vec<File>,
     },
     #[cfg(feature = "age319-private-broker-fixture")]
+    PrivateNativeBashExec {
+        request: oulipoly_kernel_broker::protocol::PrivateNativeBashExec,
+    },
+    #[cfg(feature = "age319-private-broker-fixture")]
     FreshInteractivePtyHandoff {
         request: oulipoly_kernel_broker::protocol::PrivateFreshPtyHandoff,
         descriptors: Vec<File>,
@@ -784,7 +788,9 @@ fn recv_request(
         b'=' | b'V' | b'S' | b's' | b'T' | b'H' | b'K' | b'B' | b'N' | b'k' | b't' | b'R'
         | b'W' | b'Y' | b'0' | b'1' | b'2' | b'3' | b'4' => (18..=2048 + 17).contains(&read),
         #[cfg(feature = "age319-private-broker-fixture")]
-        b'5' | b'6' | b'7' | b'8' | b'9' | b'b' | b'y' => (18..=2048 + 17).contains(&read),
+        b'5' | b'6' | b'7' | b'8' | b'9' | b'b' | b'y' | b'x' | b'$' => {
+            (18..=2048 + 17).contains(&read)
+        }
         #[cfg(feature = "age319-private-broker-fixture")]
         b'h' | b'f' | b'(' | b')' | b'm' | b'n' | b'o' | b'w' | b'r' => {
             (18..=48 * 1024 + 17).contains(&read)
@@ -864,9 +870,13 @@ fn recv_request(
             request: serde_json::from_slice(&request[17..read as usize])?,
         },
         #[cfg(feature = "age319-private-broker-fixture")]
-        b'5' | b'6' | b'7' | b'b' | b'y' => RequestPayload::FreshProviderRequest {
+        b'5' | b'6' | b'7' | b'b' | b'y' | b'x' => RequestPayload::FreshProviderRequest {
             request: serde_json::from_slice(&request[17..read as usize])?,
             descriptors,
+        },
+        #[cfg(feature = "age319-private-broker-fixture")]
+        b'$' => RequestPayload::PrivateNativeBashExec {
+            request: serde_json::from_slice(&request[17..read as usize])?,
         },
         #[cfg(feature = "age319-private-broker-fixture")]
         b'8' | b'9' if read != 33 || !descriptors.is_empty() => {
@@ -6136,6 +6146,8 @@ fn serve_fresh_v30_at(
     #[cfg(feature = "age319-private-broker-fixture")]
     let mut native_codex_controls: HashMap<String, fresh_provider::NativeCodexControl> =
         HashMap::new();
+    #[cfg(feature = "age319-private-broker-fixture")]
+    let mut native_bash_execs: HashMap<String, fresh_provider::NativeBashExec> = HashMap::new();
     for incoming in listener.incoming() {
         let Ok(mut stream) = incoming else { continue };
         stream.set_read_timeout(Some(FRESH_V30_READ_TIMEOUT))?;
@@ -6143,6 +6155,8 @@ fn serve_fresh_v30_at(
         let mut submitted_grant = None;
         #[cfg(feature = "age319-private-broker-fixture")]
         let mut drop_provider_k_reply = false;
+        #[cfg(feature = "age319-private-broker-fixture")]
+        let mut drop_native_bash_reply = false;
         #[cfg(feature = "age319-private-broker-fixture")]
         let mut drop_interactive_k_reply = false;
         #[cfg(feature = "age319-private-broker-fixture")]
@@ -7030,11 +7044,16 @@ fn serve_fresh_v30_at(
                     }
                 }
                 #[cfg(feature = "age319-private-broker-fixture")]
-                b'5' | b'6' | b'7' | b'8' | b'9' | b'b' | b'y' | b'h' | b'f' | b'(' | b')'
-                | b'm' | b'n' | b'o' | b'#' | b'{' | b'}' | b']' | b'|' | b'~' | b'?' => {
+                b'5' | b'6' | b'7' | b'8' | b'9' | b'b' | b'y' | b'x' | b'$' | b'h' | b'f'
+                | b'(' | b')' | b'm' | b'n' | b'o' | b'#' | b'{' | b'}' | b']' | b'|' | b'~'
+                | b'?' => {
                     if !private_fixture() {
                         return Err(io::Error::other("fresh provider fixture route closed"));
                     }
+                    let native_bash_request = match &payload {
+                        RequestPayload::PrivateNativeBashExec { request } => Some(request.clone()),
+                        _ => None,
+                    };
                     let (d_key, route_request, effect_request, pty_request, descriptors) =
                         match payload {
                             RequestPayload::FreshProviderRequest {
@@ -7042,6 +7061,9 @@ fn serve_fresh_v30_at(
                                 descriptors,
                             } if request.success.is_none() => {
                                 (request.d_key, None, None, None, descriptors)
+                            }
+                            RequestPayload::PrivateNativeBashExec { request } => {
+                                (request.d_key, None, None, None, Vec::new())
                             }
                             RequestPayload::FreshRouteRequest {
                                 request,
@@ -7757,6 +7779,46 @@ fn serve_fresh_v30_at(
                             serde_json::to_string(&readback)?
                         ));
                     }
+                    if operation == b'$' {
+                        let request = native_bash_request
+                            .ok_or_else(|| io::Error::other("native Bash request absent"))?;
+                        if native_bash_execs.contains_key(&grant) {
+                            return Err(io::Error::other("native Bash command already submitted"));
+                        }
+                        let control = native_codex_controls.remove(&grant).ok_or_else(|| {
+                            io::Error::other(
+                                "native Codex control absent; command unknown, no replay",
+                            )
+                        })?;
+                        let image = bash_image
+                            .as_ref()
+                            .ok_or_else(|| io::Error::other("native Bash pinned image absent"))?;
+                        let gate = PathBuf::from(
+                            std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                                .map_err(io::Error::other)?,
+                        );
+                        let execution = control.begin_bash(
+                            &directory,
+                            &binding,
+                            image,
+                            &gate,
+                            &request.request_id,
+                            request.notify,
+                        )?;
+                        native_bash_execs.insert(grant.clone(), execution);
+                        if std::env::var_os("AGE319_PRIVATE_NATIVE_BASH_DROP_REPLY_V1").is_some() {
+                            drop_native_bash_reply = true;
+                        }
+                        return Ok(format!("native-bash-submitted {}\n", request.request_id));
+                    }
+                    if operation == b'x' {
+                        let execution = native_bash_execs.get_mut(&grant).ok_or_else(|| {
+                            io::Error::other(
+                                "native Bash command control absent; unknown, no replay",
+                            )
+                        })?;
+                        return execution.observe(&binding);
+                    }
                     if let Some(v3) = provider_readback_v3.as_ref() {
                         if provider_writer_v3 {
                             fresh_provider::settle_v3_provider(v3, &directory, &binding, &grant)?;
@@ -8213,6 +8275,7 @@ fn serve_fresh_v30_at(
         })();
         #[cfg(feature = "age319-private-broker-fixture")]
         if drop_provider_k_reply
+            || drop_native_bash_reply
             || drop_provider_q_reply
             || drop_account_effect_reply
             || drop_route_reply
@@ -8220,7 +8283,9 @@ fn serve_fresh_v30_at(
             || drop_root_h_reply
         {
             if let Some(gate) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1") {
-                let marker = if drop_root_h_reply {
+                let marker = if drop_native_bash_reply {
+                    "native-bash-reply-dropped"
+                } else if drop_root_h_reply {
                     "root-h-reply-dropped"
                 } else if drop_route_reply {
                     "route-reply-dropped"

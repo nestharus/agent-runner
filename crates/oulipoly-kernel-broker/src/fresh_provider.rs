@@ -7676,6 +7676,44 @@ pub(super) struct NativeCodexControl {
     readback: NativeCodexReadback,
 }
 
+pub(super) struct NativeBashExec {
+    binding: Binding,
+    request_id: String,
+    result: std::sync::mpsc::Receiver<Result<serde_json::Value, String>>,
+    settled: Option<Result<serde_json::Value, String>>,
+}
+
+impl NativeBashExec {
+    pub(super) fn observe(&mut self, binding: &Binding) -> io::Result<String> {
+        if &self.binding != binding {
+            return Err(io::Error::other("native Bash D or selected K changed"));
+        }
+        if self.settled.is_none() {
+            match self.result.try_recv() {
+                Ok(result) => self.settled = Some(result),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    return Ok(format!("native-bash-pending {}\n", self.request_id));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.settled = Some(Err("native Bash worker lost; no replay".into()));
+                }
+            }
+        }
+        match self.settled.as_ref().unwrap() {
+            Ok(result) => Ok(format!(
+                "native-bash-result {} {}\n",
+                self.request_id,
+                serde_json::to_string(result)?
+            )),
+            Err(error) => Ok(format!(
+                "native-bash-unknown {} {}\n",
+                self.request_id,
+                serde_json::to_string(error)?
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) struct NativeCodexReadback {
     pub grant_id: String,
@@ -7949,6 +7987,110 @@ pub(super) fn launch_native_codex(
 impl NativeCodexControl {
     pub(super) fn grant_id(&self) -> &str {
         &self.grant_id
+    }
+
+    pub(super) fn begin_bash(
+        mut self,
+        directory: &Path,
+        binding: &Binding,
+        bash_image: &File,
+        gate: &Path,
+        request_id: &str,
+        notify: bool,
+    ) -> io::Result<NativeBashExec> {
+        let child = uuid::Uuid::parse_str(request_id)
+            .map_err(|_| io::Error::other("native Bash child request invalid"))?;
+        if child.is_nil() || child.to_string() != request_id || !gate.is_absolute() {
+            return Err(io::Error::other("native Bash request or gate invalid"));
+        }
+        let readback = self.readback(directory, binding)?;
+        let bash_path = fs::read_link(format!("/proc/self/fd/{}", bash_image.as_raw_fd()))?;
+        let reopened = File::open(&bash_path)?;
+        if ImageDescriptor::of(&reopened)? != ImageDescriptor::of(bash_image)?
+            || !bash_path.is_absolute()
+        {
+            return Err(io::Error::other("native Bash pinned image changed"));
+        }
+        let (bash_sha256, _) = sha_file(bash_image)?;
+        let marker = gate.join("bash-effect");
+        let socket = gate
+            .parent()
+            .ok_or_else(|| io::Error::other("native Bash gate parent absent"))?
+            .join("v30.sock");
+        let mut command = vec![
+            bash_path.display().to_string(),
+            "__age319-private-admit-child-v1".into(),
+            socket.display().to_string(),
+            request_id.into(),
+            marker.display().to_string(),
+            "native".into(),
+            "no-cancel".into(),
+        ];
+        if notify {
+            command.push("notify".into());
+        }
+        let attempt = serde_json::json!({
+            "format": "age319-native-bash-command-attempt/v1",
+            "binding": binding,
+            "grant_id": self.grant_id,
+            "work_id": readback.work_id,
+            "native_session_id": readback.native_session_id,
+            "provider_pid": readback.provider_pid,
+            "provider_starttime": readback.provider_starttime,
+            "endpoint_generation": readback.endpoint_generation,
+            "request_id": request_id,
+            "bash_image_sha256": bash_sha256,
+            "command": command,
+        });
+        let attempt_path = directory.join(format!("{}.native-bash-attempt.json", self.grant_id));
+        let mut record = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&attempt_path)?;
+        serde_json::to_writer(&mut record, &attempt)?;
+        record.write_all(b"\n")?;
+        record.sync_all()?;
+        File::open(directory)?.sync_all()?;
+        let (sender, result) = std::sync::mpsc::channel();
+        let request = request_id.to_owned();
+        let gate = gate.to_path_buf();
+        std::thread::Builder::new()
+            .name("selected-k-native-bash".into())
+            .spawn(move || {
+                let result = (|| -> io::Result<serde_json::Value> {
+                    self.endpoint.set_read_timeout(Some(Duration::from_secs(180)))?;
+                    self.provider.verify()?;
+                    let response = native_codex_message(
+                        &mut self.endpoint,
+                        &self.provider,
+                        4,
+                        "command/exec",
+                        serde_json::json!({
+                            "command": command,
+                            "cwd": gate,
+                            "sandboxPolicy": {"type": "externalSandbox", "networkAccess": "enabled"},
+                            "timeoutMs": 150000,
+                        }),
+                    )?;
+                    self.provider.verify()?;
+                    if response["exitCode"].as_i64().is_none()
+                        || response["stdout"].as_str().is_none()
+                        || response["stderr"].as_str().is_none()
+                    {
+                        return Err(io::Error::other("native Bash command result incomplete"));
+                    }
+                    Ok(response)
+                })()
+                .map_err(|error| error.to_string());
+                let _ = sender.send(result);
+            })?;
+        Ok(NativeBashExec {
+            binding: binding.clone(),
+            request_id: request,
+            result,
+            settled: None,
+        })
     }
 
     pub(super) fn readback(
