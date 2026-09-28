@@ -3057,10 +3057,12 @@ impl oulipoly_runtime::executor::cli::fresh_remote::FreshProviderBackend
             &plan,
             oulipoly_kernel_broker::protocol::FreshPlanRole::Headless,
         )?;
+        let native_codex = std::env::var_os("AGE319_PRIVATE_NATIVE_CODEX_V1").as_deref()
+            == Some(std::ffi::OsStr::new("1"));
         let submitted = protocol::private_fresh_provider_at(
             &socket,
             &self.authority.receipt.d_key,
-            b'5',
+            if native_codex { b'b' } else { b'5' },
             Some(pinned.descriptors()),
         );
         let grant = match submitted {
@@ -3108,6 +3110,64 @@ impl oulipoly_runtime::executor::cli::fresh_remote::FreshProviderBackend
         uuid::Uuid::parse_str(&grant)
             .map_err(|_| self.unknown(Some(&grant), "K reply", "invalid grant"))?;
         self.grant_id = Some(grant.clone());
+        if native_codex {
+            let response = protocol::private_fresh_provider_at(
+                &socket,
+                &self.authority.receipt.d_key,
+                b'y',
+                None,
+            )
+            .map_err(|e| self.unknown(Some(&grant), "native K control readback", &e.to_string()))?;
+            let body = response
+                .strip_prefix("fresh-native-codex ")
+                .and_then(|value| value.strip_suffix('\n'))
+                .ok_or_else(|| {
+                    self.unknown(Some(&grant), "native K control readback", "invalid reply")
+                })?;
+            let readback: serde_json::Value = serde_json::from_str(body).map_err(|e| {
+                self.unknown(Some(&grant), "native K control readback", &e.to_string())
+            })?;
+            if readback["grant_id"] != grant
+                || readback["native_session_id"]
+                    .as_str()
+                    .and_then(|id| uuid::Uuid::parse_str(id).ok())
+                    .is_none()
+                || readback["provider_pid"].as_i64().is_none()
+            {
+                return Err(self.unknown(
+                    Some(&grant),
+                    "native K control readback",
+                    "selected K/session changed",
+                ));
+            }
+            let gate = std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                .map_err(|e| self.unknown(Some(&grant), "native K control gate", &e.to_string()))?;
+            std::fs::write(
+                std::path::Path::new(&gate).join("native-k-control-readback.json"),
+                body,
+            )
+            .map_err(|e| self.unknown(Some(&grant), "native K control report", &e.to_string()))?;
+            protocol::private_fresh_provider_at(&socket, &self.authority.receipt.d_key, b'7', None)
+                .map_err(|e| self.unknown(Some(&grant), "native K cancellation", &e.to_string()))?;
+            let deadline = std::time::Instant::now() + PRIVATE_PROVIDER_RESULT_WAIT;
+            loop {
+                let state = protocol::private_fresh_provider_at(
+                    &socket,
+                    &self.authority.receipt.d_key,
+                    b'6',
+                    None,
+                )
+                .map_err(|e| self.unknown(Some(&grant), "native K physical Q", &e.to_string()))?;
+                if state.starts_with(&format!("fresh-provider-drained {grant} ")) {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(self.unknown(Some(&grant), "native K physical Q", &state));
+                }
+                std::thread::sleep(PRIVATE_PROVIDER_RESULT_POLL);
+            }
+            return Err("private native Codex K control established and drained; original H/W/native receipt/ACK not yet joined".into());
+        }
         let causal = std::env::var_os("AGE319_PRIVATE_PROVIDER_CAUSAL_BASH_V1").is_some();
         let direct_caller = std::env::var_os("AGE319_PRIVATE_CALLER_OUTPUT_V1").is_some();
         let deadline = std::time::Instant::now()
@@ -3301,8 +3361,39 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
     let total = pool.model.providers.len();
     let mut prepared = Vec::with_capacity(total);
     let causal = std::env::var_os("AGE319_PRIVATE_PROVIDER_CAUSAL_BASH_V1").is_some();
+    let native_codex = std::env::var_os("AGE319_PRIVATE_NATIVE_CODEX_V1").as_deref()
+        == Some(std::ffi::OsStr::new("1"));
+    let native_home = if native_codex {
+        Some(
+            std::path::PathBuf::from(
+                std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                    .map_err(|_| "private native Codex gate directory absent")?,
+            )
+            .join("native-codex-home"),
+        )
+    } else {
+        None
+    };
     for index in 0..total {
         let mut plan = prepare_fresh_headless(&pool.model, index, prompt, &cwd)?;
+        if native_codex {
+            let selected_home = plan
+                .plan
+                .environment
+                .iter()
+                .find(|(key, _)| key == "CODEX_HOME")
+                .map(|(_, value)| std::path::Path::new(value));
+            if causal || selected_home != native_home.as_deref() {
+                return Err("private native Codex requires fixture-local CODEX_HOME and no causal Bash mode".into());
+            }
+            if std::fs::symlink_metadata(native_home.as_ref().unwrap())
+                .is_ok_and(|meta| meta.file_type().is_symlink())
+            {
+                return Err("private native Codex home is a symlink".into());
+            }
+            plan.plan.argv = vec!["app-server".into(), "--listen".into(), "stdio://".into()];
+            plan.plan.stdin.clear();
+        }
         if causal {
             plan.plan.argv.extend([
                 std::env::var("AGE319_PRIVATE_BASH_IMAGE")

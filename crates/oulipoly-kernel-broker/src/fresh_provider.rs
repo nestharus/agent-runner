@@ -3420,6 +3420,7 @@ pub(super) fn launch_interactive(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -6945,7 +6946,7 @@ fn root_interactive_identity(
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Attach {
     version: u32,
@@ -7226,6 +7227,7 @@ struct Init {
     stdout: File,
     stderr: File,
     interactive_slave: Option<File>,
+    native_stdio: Option<UnixStream>,
     control: UnixStream,
     gate: UnixStream,
     uid: u32,
@@ -7234,7 +7236,13 @@ struct Init {
 }
 extern "C" fn init_start(ptr: *mut libc::c_void) -> libc::c_int {
     let init = unsafe { Box::from_raw(ptr.cast::<Init>()) };
-    if run_init(*init).is_ok() { 0 } else { 70 }
+    match run_init(*init) {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("fresh provider PID1 refused: {error}");
+            70
+        }
+    }
 }
 
 fn run_init(mut init: Init) -> io::Result<()> {
@@ -7249,9 +7257,11 @@ fn run_init(mut init: Init) -> io::Result<()> {
         init.interactive_slave
             .as_ref()
             .map_or(-1, AsRawFd::as_raw_fd),
+        init.native_stdio.as_ref().map_or(-1, AsRawFd::as_raw_fd),
         init.control.as_raw_fd(),
         init.gate.as_raw_fd(),
-    ])?;
+    ])
+    .map_err(|e| io::Error::other(format!("PID1 fd closure: {e}")))?;
     if unsafe { libc::getpid() } != 1
         || unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) } != 0
         || unsafe { libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0) } != 0
@@ -7265,7 +7275,9 @@ fn run_init(mut init: Init) -> io::Result<()> {
     {
         return Err(io::Error::last_os_error());
     }
-    init.control.write_all(b"I")?;
+    init.control
+        .write_all(b"I")
+        .map_err(|e| io::Error::other(format!("PID1 identity send: {e}")))?;
     let mut release = [0u8; 1];
     init.control.read_exact(&mut release)?;
     if release != [b'P'] {
@@ -7325,6 +7337,11 @@ fn run_init(mut init: Init) -> io::Result<()> {
             .stdin(Stdio::from(slave.try_clone()?))
             .stdout(Stdio::from(slave.try_clone()?))
             .stderr(Stdio::from(slave.try_clone()?));
+    } else if let Some(native) = &init.native_stdio {
+        command
+            .stdin(Stdio::from(std::os::fd::OwnedFd::from(native.try_clone()?)))
+            .stdout(Stdio::from(std::os::fd::OwnedFd::from(native.try_clone()?)))
+            .stderr(Stdio::from(init.stderr.try_clone()?));
     } else {
         let stdin = if init.plan.stdin_dev_null {
             File::open("/dev/null")?
@@ -7432,7 +7449,10 @@ fn run_init(mut init: Init) -> io::Result<()> {
             libc::_exit(if error == libc::ENOENT { 127 } else { 126 });
         });
     }
-    let provider = command.spawn()?;
+    let provider = command
+        .spawn()
+        .map_err(|e| io::Error::other(format!("provider spawn before exec: {e}")))?;
+    drop(init.native_stdio.take());
     drop(init.gate);
     let provider_local_pid = provider.id() as i32;
     let mut provider_wait = None;
@@ -7638,6 +7658,378 @@ pub(super) fn launch(
     launch_inner(prepared, root, actor, uid, gid, index, None, None)
 }
 
+/// Private app-server transport. The broker creates this socketpair before K;
+/// only the selected provider receives the other end as its stdio. Losing the
+/// broker endpoint on restart closes readback rather than transferring trust
+/// to a pathname or a newly launched process.
+pub(super) struct NativeCodexControl {
+    grant_id: String,
+    binding: Binding,
+    grant: Grant,
+    decision: RouteDecision,
+    attach: Attach,
+    provider: PinnedProcess,
+    image: File,
+    endpoint: UnixStream,
+    endpoint_device: u64,
+    endpoint_inode: u64,
+    readback: NativeCodexReadback,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(super) struct NativeCodexReadback {
+    pub grant_id: String,
+    pub work_id: String,
+    pub plan_sha256: String,
+    pub account: String,
+    pub account_identity: String,
+    pub model: String,
+    pub provider_pid: i32,
+    pub provider_starttime: u64,
+    pub provider_boot_id: String,
+    pub provider_pidns_dev: u64,
+    pub provider_pidns_ino: u64,
+    pub image_sha256: String,
+    pub endpoint_generation: String,
+    pub native_session_id: String,
+}
+
+fn native_codex_byte(endpoint: &UnixStream, provider: &PinnedProcess) -> io::Result<u8> {
+    let mut byte = 0u8;
+    let mut iov = libc::iovec {
+        iov_base: (&mut byte as *mut u8).cast(),
+        iov_len: 1,
+    };
+    let mut ancillary = [0usize; 8];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = ancillary.as_mut_ptr().cast();
+    msg.msg_controllen = std::mem::size_of_val(&ancillary);
+    let read = unsafe { libc::recvmsg(endpoint.as_raw_fd(), &mut msg, 0) };
+    if read != 1 || msg.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0 {
+        return Err(if read < 0 {
+            io::Error::last_os_error()
+        } else {
+            io::Error::other("native Codex control closed or truncated")
+        });
+    }
+    let header = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+    if header.is_null()
+        || unsafe {
+            (*header).cmsg_level != libc::SOL_SOCKET
+                || (*header).cmsg_type != libc::SCM_CREDENTIALS
+                || (*header).cmsg_len
+                    < libc::CMSG_LEN(std::mem::size_of::<libc::ucred>() as _) as usize
+        }
+    {
+        return Err(io::Error::other(
+            "native Codex control peer credential absent",
+        ));
+    }
+    let credential = unsafe { *(libc::CMSG_DATA(header) as *const libc::ucred) };
+    if credential.pid != provider.host_pid {
+        return Err(io::Error::other(
+            "native Codex control peer is not selected K",
+        ));
+    }
+    Ok(byte)
+}
+
+fn native_codex_message(
+    endpoint: &mut UnixStream,
+    provider: &PinnedProcess,
+    id: u64,
+    method: &str,
+    params: serde_json::Value,
+) -> io::Result<serde_json::Value> {
+    endpoint.write_all(&serde_json::to_vec(
+        &serde_json::json!({"id": id, "method": method, "params": params}),
+    )?)?;
+    endpoint.write_all(b"\n")?;
+    for _ in 0..128 {
+        let mut line = Vec::new();
+        loop {
+            let byte = native_codex_byte(endpoint, provider)?;
+            if byte == b'\n' {
+                break;
+            }
+            if line.len() >= 1024 * 1024 {
+                return Err(io::Error::other("native Codex frame too large"));
+            }
+            line.push(byte);
+        }
+        let reply: serde_json::Value = serde_json::from_slice(&line)?;
+        provider.verify()?;
+        if reply.get("id") == Some(&serde_json::json!(id)) {
+            if reply.get("error").is_some() {
+                return Err(io::Error::other(format!(
+                    "native Codex {method} refused: {}",
+                    reply["error"]
+                )));
+            }
+            return reply
+                .get("result")
+                .cloned()
+                .ok_or_else(|| io::Error::other("native Codex result absent"));
+        }
+        if reply.get("id").is_some() {
+            return Err(io::Error::other("native Codex response ID changed"));
+        }
+    }
+    Err(io::Error::other("native Codex response absent"))
+}
+
+pub(super) fn launch_native_codex(
+    prepared: Prepared,
+    root: &PinnedProcess,
+    actor: &PinnedProcess,
+    uid: u32,
+    gid: u32,
+    index: Option<&Index>,
+    expected_image_sha256: &str,
+) -> io::Result<NativeCodexControl> {
+    let recipe_len: usize = prepared
+        .plan
+        .recipe
+        .metadata()?
+        .len()
+        .try_into()
+        .map_err(|_| io::Error::other("native Codex recipe too large"))?;
+    if recipe_len > 1024 * 1024 {
+        return Err(io::Error::other("native Codex recipe too large"));
+    }
+    let mut recipe_bytes = vec![0u8; recipe_len];
+    prepared.plan.recipe.read_exact_at(&mut recipe_bytes, 0)?;
+    let parsed: Recipe = serde_json::from_slice(&recipe_bytes)?;
+    if parsed.argv != ["app-server", "--listen", "stdio://"]
+        || !parsed.env.iter().any(|(key, _)| key == "CODEX_HOME")
+        || prepared.plan.input.metadata()?.len() != 0
+        || prepared.plan.path_execution
+        || expected_image_sha256.len() != 64
+        || !expected_image_sha256.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err(io::Error::other(
+            "private native Codex recipe or pin invalid before K",
+        ));
+    }
+    let image = File::open(&prepared.plan.broker_resolved_path)?;
+    let mut magic = [0u8; 4];
+    image.read_at(&mut magic, 0)?;
+    let (digest, _) = sha_file(&image)?;
+    if magic != *b"\x7fELF"
+        || digest != expected_image_sha256
+        || ImageDescriptor::of(&image)? != prepared.plan.image_descriptor
+    {
+        return Err(io::Error::other(
+            "private native Codex ELF pin changed before K",
+        ));
+    }
+    let directory = prepared.directory.clone();
+    let binding = prepared.grant.binding.clone();
+    let grant_id = prepared.grant.id.clone();
+    let cwd = fs::read_link(format!("/proc/self/fd/{}", prepared.plan.cwd.as_raw_fd()))?;
+    let (mut endpoint, child_stdio) = UnixStream::pair()?;
+    let one: libc::c_int = 1;
+    if unsafe {
+        libc::setsockopt(
+            endpoint.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PASSCRED,
+            (&one as *const libc::c_int).cast(),
+            std::mem::size_of_val(&one) as _,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let endpoint_meta = fs::metadata(format!("/proc/self/fd/{}", endpoint.as_raw_fd()))?;
+    endpoint.set_read_timeout(Some(Duration::from_secs(10)))?;
+    endpoint.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let grant = launch_with_pty(
+        prepared,
+        root,
+        actor,
+        uid,
+        gid,
+        None,
+        index,
+        None,
+        None,
+        Some(child_stdio),
+    )?;
+    if grant != grant_id {
+        return Err(io::Error::other("native Codex K grant changed"));
+    }
+    let attach: Attach = exact_file(&directory, &format!("{grant}.attach.json"))?
+        .ok_or_else(|| io::Error::other("native Codex K attach absent"))?;
+    let provider = PinnedProcess::open(attach.provider_pid)?;
+    if provider.starttime_ticks != attach.provider_starttime
+        || provider.boot_id != binding.actor_boot_id
+        || (provider.pidns_dev, provider.pidns_ino) != (attach.pidns_dev, attach.pidns_ino)
+        || !provider.direct_child_of(&PinnedProcess::open(attach.pid1)?)?
+    {
+        return Err(io::Error::other(
+            "native Codex K process incarnation changed",
+        ));
+    }
+    let until = Instant::now() + Duration::from_secs(5);
+    while !provider.same_executable_as(&image)? {
+        if Instant::now() >= until {
+            return Err(io::Error::other("native Codex K did not exec pinned ELF"));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    provider.verify()?;
+    let executed = host_proc_file(&format!("{}/exe", provider.host_pid))?;
+    if sha_file(&executed)?.0 != digest {
+        return Err(io::Error::other(
+            "native Codex K executable bytes changed at exec",
+        ));
+    }
+    provider.verify()?;
+    native_codex_message(
+        &mut endpoint,
+        &provider,
+        1,
+        "initialize",
+        serde_json::json!({"clientInfo": {"name": "oulipoly-broker", "version": "0.1"}}),
+    )?;
+    provider.verify()?;
+    endpoint.write_all(b"{\"method\":\"initialized\",\"params\":{}}\n")?;
+    let started = native_codex_message(
+        &mut endpoint,
+        &provider,
+        2,
+        "thread/start",
+        serde_json::json!({"cwd": cwd}),
+    )?;
+    provider.verify()?;
+    let session = started
+        .pointer("/thread/id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| io::Error::other("native Codex thread ID absent"))?;
+    uuid::Uuid::parse_str(session)
+        .map_err(|_| io::Error::other("native Codex thread ID invalid"))?;
+    let decision: RouteDecision = exact_file(&directory, &decision_name(&binding.handoff_id))?
+        .ok_or_else(|| io::Error::other("native Codex selected route absent"))?;
+    let consumed: Grant = exact_file(&directory, &format!("{grant}.consumed.json"))?
+        .ok_or_else(|| io::Error::other("native Codex consumed K absent"))?;
+    let readback = NativeCodexReadback {
+        grant_id: grant,
+        work_id: attach.work_id.clone(),
+        plan_sha256: decision.selection.plan_sha256.clone(),
+        account: decision.selection.account.clone(),
+        account_identity: decision.selection.account_identity.clone(),
+        model: decision.selection.model.clone(),
+        provider_pid: provider.host_pid,
+        provider_starttime: provider.starttime_ticks,
+        provider_boot_id: provider.boot_id.clone(),
+        provider_pidns_dev: provider.pidns_dev,
+        provider_pidns_ino: provider.pidns_ino,
+        image_sha256: digest,
+        endpoint_generation: uuid::Uuid::new_v4().to_string(),
+        native_session_id: session.to_owned(),
+    };
+    Ok(NativeCodexControl {
+        grant_id,
+        binding,
+        grant: consumed,
+        decision,
+        attach,
+        provider,
+        image,
+        endpoint,
+        endpoint_device: endpoint_meta.dev(),
+        endpoint_inode: endpoint_meta.ino(),
+        readback,
+    })
+}
+
+impl NativeCodexControl {
+    pub(super) fn grant_id(&self) -> &str {
+        &self.grant_id
+    }
+
+    pub(super) fn readback(
+        &mut self,
+        directory: &Path,
+        binding: &Binding,
+    ) -> io::Result<NativeCodexReadback> {
+        if *binding != self.binding {
+            return Err(io::Error::other("native Codex D or selected K changed"));
+        }
+        let endpoint_meta = fs::metadata(format!("/proc/self/fd/{}", self.endpoint.as_raw_fd()))?;
+        if (endpoint_meta.dev(), endpoint_meta.ino()) != (self.endpoint_device, self.endpoint_inode)
+        {
+            return Err(io::Error::other("native Codex control endpoint changed"));
+        }
+        let decision: RouteDecision =
+            exact_file(directory, &decision_name(&binding.handoff_id))?
+                .ok_or_else(|| io::Error::other("native Codex route absent"))?;
+        let grant: Grant = exact_file(directory, &format!("{}.consumed.json", self.grant_id))?
+            .ok_or_else(|| io::Error::other("native Codex consumed K absent"))?;
+        let attach: Attach = exact_file(directory, &format!("{}.attach.json", self.grant_id))?
+            .ok_or_else(|| io::Error::other("native Codex attach absent"))?;
+        if decision != self.decision
+            || grant != self.grant
+            || attach != self.attach
+            || decision.binding != *binding
+            || grant.binding != *binding
+            || grant.id != self.grant_id
+            || decision.selection.plan_sha256 != grant.plan_sha256
+            || decision.selection.account != self.readback.account
+            || decision.selection.account_identity != self.readback.account_identity
+            || decision.selection.model != self.readback.model
+            || attach.grant_id != self.grant_id
+            || attach.work_id != self.readback.work_id
+            || attach.provider_pid != self.readback.provider_pid
+            || attach.provider_starttime != self.readback.provider_starttime
+            || (attach.pidns_dev, attach.pidns_ino)
+                != (
+                    self.readback.provider_pidns_dev,
+                    self.readback.provider_pidns_ino,
+                )
+            || self.provider.host_pid != self.readback.provider_pid
+            || self.provider.starttime_ticks != self.readback.provider_starttime
+            || self.provider.boot_id != self.readback.provider_boot_id
+            || !self.provider.same_executable_as(&self.image)?
+        {
+            return Err(io::Error::other(
+                "native Codex selected K or live image changed",
+            ));
+        }
+        let init = PinnedProcess::open(attach.pid1)?;
+        if init.starttime_ticks != attach.pid1_starttime
+            || init.boot_id != self.readback.provider_boot_id
+            || (init.pidns_dev, init.pidns_ino) != (attach.pidns_dev, attach.pidns_ino)
+            || !init.is_namespace_init()?
+            || !self.provider.direct_child_of(&init)?
+        {
+            return Err(io::Error::other(
+                "native Codex K parent incarnation changed",
+            ));
+        }
+        self.provider.verify()?;
+        let thread = native_codex_message(
+            &mut self.endpoint,
+            &self.provider,
+            3,
+            "thread/read",
+            serde_json::json!({"threadId": self.readback.native_session_id}),
+        )?;
+        self.provider.verify()?;
+        if thread
+            .pointer("/thread/id")
+            .and_then(serde_json::Value::as_str)
+            != Some(self.readback.native_session_id.as_str())
+        {
+            return Err(io::Error::other("native Codex session readback changed"));
+        }
+        Ok(self.readback.clone())
+    }
+}
+
 fn launch_v3_quota(
     prepared: Prepared,
     root: &PinnedProcess,
@@ -7686,6 +8078,7 @@ fn launch_inner(
         index,
         v3_quota,
         v3_provider,
+        None,
     )
 }
 
@@ -7704,6 +8097,7 @@ fn launch_with_pty(
         u64,
     )>,
     v3_provider: Option<(&KeyedGeneration, &str, u64)>,
+    native_stdio: Option<UnixStream>,
 ) -> io::Result<String> {
     root.verify()?;
     actor.verify()?;
@@ -7772,6 +8166,9 @@ fn launch_with_pty(
         || prepared.plan.path_execution != prepared.grant.path_execution
     {
         return Err(io::Error::other("fresh provider plan changed before K"));
+    }
+    if pty.is_some() && native_stdio.is_some() {
+        return Err(io::Error::other("provider PTY and native stdio conflict"));
     }
     if pty.is_some() {
         let k: InteractiveK = exact_file(&prepared.directory, &interactive_k_name(b))?
@@ -7881,6 +8278,7 @@ fn launch_with_pty(
         stdout,
         stderr,
         interactive_slave: slave,
+        native_stdio,
         control: placeholder.0,
         gate: placeholder.1,
         uid,
@@ -11632,6 +12030,171 @@ mod tests {
                 .exists()
         );
         assert_eq!(std::fs::read(old_wal).unwrap(), b"old WAL unchanged");
+        actor_child.kill().unwrap();
+        actor_child.wait().unwrap();
+    }
+
+    #[test]
+    fn selected_real_codex_k_owns_native_control_and_refuses_wrong_endpoint_or_death() {
+        let Some(image) = std::env::var_os("AGE319_TEST_CODEX_ELF") else {
+            return;
+        };
+        if std::env::var_os("AGE319_NATIVE_CODEX_INNER").is_none() {
+            let output = Command::new("unshare")
+                .args(["-Urpfm", "--mount-proc"])
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", "linux_main::fresh_provider::tests::selected_real_codex_k_owns_native_control_and_refuses_wrong_endpoint_or_death", "--nocapture"])
+                .env("AGE319_NATIVE_CODEX_INNER", "1")
+                .env("AGE319_TEST_CODEX_ELF", image)
+                .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", "/tmp/native-codex-test-socket")
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        assert_eq!(unsafe { libc::getpid() }, 1);
+        let temp = tempfile::tempdir().unwrap();
+        let image = PathBuf::from(image);
+        let input = temp.path().join("empty-input");
+        fs::write(&input, []).unwrap();
+        let home = temp.path().join("codex-home");
+        fs::create_dir(&home).unwrap();
+        let mut actor_child = Command::new("sleep").arg("60").spawn().unwrap();
+        let root = PinnedProcess::open(unsafe { libc::getpid() }).unwrap();
+        let actor = PinnedProcess::open(actor_child.id() as i32).unwrap();
+        let binding = fixture_binding(&root, &actor);
+        let make_plan = || {
+            plan(
+                &image,
+                temp.path(),
+                &File::open(&input).unwrap(),
+                vec!["app-server".into(), "--listen".into(), "stdio://".into()],
+                vec![
+                    ("CODEX_HOME".into(), home.display().to_string()),
+                    ("HOME".into(), temp.path().display().to_string()),
+                    ("PATH".into(), "/usr/bin:/bin".into()),
+                ],
+            )
+            .unwrap()
+        };
+        let request = FreshRouteRequest {
+            protocol_version: 4,
+            d_key: binding.handoff_id.clone(),
+            model: "native-codex".into(),
+            config_sha256: "a".repeat(64),
+            account: Some("codex-account".into()),
+            account_identity: Some("codex-account-identity".into()),
+            index: Some(0),
+            total: 1,
+            pin: Some("codex-account".into()),
+            quota_script: None,
+            auth_refresh_command: None,
+            environment_sha256: None,
+        };
+        register_route_candidate(
+            temp.path(),
+            &binding,
+            &request,
+            make_plan(),
+            FreshTerminalRecognizer::OpenAiCompat,
+        )
+        .unwrap();
+        let selected = select_route(
+            temp.path(),
+            &binding,
+            &FreshRouteRequest {
+                index: None,
+                account: None,
+                account_identity: None,
+                ..request.clone()
+            },
+        )
+        .unwrap();
+        assert_eq!(selected.account, "codex-account");
+        require_selected_plan(temp.path(), &binding, &make_plan()).unwrap();
+        let (digest, _) = sha_file(&File::open(&image).unwrap()).unwrap();
+        assert!(
+            launch_native_codex(
+                prepare(temp.path(), binding.clone(), make_plan()).unwrap(),
+                &root,
+                &actor,
+                0,
+                0,
+                None,
+                &"0".repeat(64),
+            )
+            .is_err()
+        );
+        let held_grant = grant_for_binding(temp.path(), &binding).unwrap().unwrap();
+        assert!(
+            !temp
+                .path()
+                .join(format!("{held_grant}.consumed.json"))
+                .exists()
+        );
+        let mut control = launch_native_codex(
+            prepare(temp.path(), binding.clone(), make_plan()).unwrap(),
+            &root,
+            &actor,
+            0,
+            0,
+            None,
+            &digest,
+        )
+        .unwrap();
+        let readback = control.readback(temp.path(), &binding).unwrap();
+        assert_eq!(readback.grant_id, control.grant_id);
+        assert_eq!(readback.plan_sha256, selected.plan_sha256);
+        assert_eq!(readback.account, "codex-account");
+        assert_eq!(readback.provider_pid, control.provider.host_pid);
+        assert!(uuid::Uuid::parse_str(&readback.native_session_id).is_ok());
+        let mut wrong = binding.clone();
+        wrong.handoff_id = uuid::Uuid::new_v4().to_string();
+        assert!(control.readback(temp.path(), &wrong).is_err());
+        let (credential_probe, mut wrong_peer) = UnixStream::pair().unwrap();
+        let one: libc::c_int = 1;
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    credential_probe.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_PASSCRED,
+                    (&one as *const libc::c_int).cast(),
+                    std::mem::size_of_val(&one) as _,
+                )
+            },
+            0
+        );
+        wrong_peer.write_all(b"x").unwrap();
+        assert!(
+            native_codex_byte(&credential_probe, &control.provider)
+                .unwrap_err()
+                .to_string()
+                .contains("peer is not selected K")
+        );
+        let (fake, fake_peer) = UnixStream::pair().unwrap();
+        let real = std::mem::replace(&mut control.endpoint, fake);
+        assert!(
+            control
+                .readback(temp.path(), &binding)
+                .unwrap_err()
+                .to_string()
+                .contains("endpoint changed")
+        );
+        control.endpoint = real;
+        drop(fake_peer);
+        assert_eq!(control.readback(temp.path(), &binding).unwrap(), readback);
+        control.provider.signal(libc::SIGKILL).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        while !control.provider.exited().unwrap() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(control.readback(temp.path(), &binding).is_err());
         actor_child.kill().unwrap();
         actor_child.wait().unwrap();
     }
