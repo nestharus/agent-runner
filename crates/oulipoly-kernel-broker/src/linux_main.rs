@@ -91,6 +91,8 @@ use oulipoly_state::mailbox::{
     FreshV30LaneIdentity, PreparedBrokerOwner, PreparedProcessStamp, RuntimeGenerationRow,
 };
 use sha2::{Digest, Sha256};
+#[cfg(feature = "age319-private-broker-fixture")]
+use std::collections::HashMap;
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -782,7 +784,7 @@ fn recv_request(
         b'=' | b'V' | b'S' | b's' | b'T' | b'H' | b'K' | b'B' | b'N' | b'k' | b't' | b'R'
         | b'W' | b'Y' | b'0' | b'1' | b'2' | b'3' | b'4' => (18..=2048 + 17).contains(&read),
         #[cfg(feature = "age319-private-broker-fixture")]
-        b'5' | b'6' | b'7' | b'8' | b'9' => (18..=2048 + 17).contains(&read),
+        b'5' | b'6' | b'7' | b'8' | b'9' | b'b' | b'y' => (18..=2048 + 17).contains(&read),
         #[cfg(feature = "age319-private-broker-fixture")]
         b'h' | b'f' | b'(' | b')' | b'm' | b'n' | b'o' | b'w' | b'r' => {
             (18..=48 * 1024 + 17).contains(&read)
@@ -808,7 +810,7 @@ fn recv_request(
             b'k' => descriptors.len() != 4,
             b'K' => descriptors.len() != 7,
             #[cfg(feature = "age319-private-broker-fixture")]
-            b'5' => descriptors.len() != 4,
+            b'5' | b'b' => descriptors.len() != 4,
             #[cfg(feature = "age319-private-broker-fixture")]
             b'9' => !(read == 33 && descriptors.is_empty()) && descriptors.len() != 4,
             #[cfg(feature = "age319-private-broker-fixture")]
@@ -862,7 +864,7 @@ fn recv_request(
             request: serde_json::from_slice(&request[17..read as usize])?,
         },
         #[cfg(feature = "age319-private-broker-fixture")]
-        b'5' | b'6' | b'7' => RequestPayload::FreshProviderRequest {
+        b'5' | b'6' | b'7' | b'b' | b'y' => RequestPayload::FreshProviderRequest {
             request: serde_json::from_slice(&request[17..read as usize])?,
             descriptors,
         },
@@ -6131,6 +6133,9 @@ fn serve_fresh_v30_at(
     } else {
         None
     };
+    #[cfg(feature = "age319-private-broker-fixture")]
+    let mut native_codex_controls: HashMap<String, fresh_provider::NativeCodexControl> =
+        HashMap::new();
     for incoming in listener.incoming() {
         let Ok(mut stream) = incoming else { continue };
         stream.set_read_timeout(Some(FRESH_V30_READ_TIMEOUT))?;
@@ -7025,8 +7030,8 @@ fn serve_fresh_v30_at(
                     }
                 }
                 #[cfg(feature = "age319-private-broker-fixture")]
-                b'5' | b'6' | b'7' | b'8' | b'9' | b'h' | b'f' | b'(' | b')' | b'm' | b'n'
-                | b'o' | b'#' | b'{' | b'}' | b']' | b'|' | b'~' | b'?' => {
+                b'5' | b'6' | b'7' | b'8' | b'9' | b'b' | b'y' | b'h' | b'f' | b'(' | b')'
+                | b'm' | b'n' | b'o' | b'#' | b'{' | b'}' | b']' | b'|' | b'~' | b'?' => {
                     if !private_fixture() {
                         return Err(io::Error::other("fresh provider fixture route closed"));
                     }
@@ -7615,7 +7620,7 @@ fn serve_fresh_v30_at(
                             serde_json::to_string(&effect)?
                         ));
                     }
-                    if operation == b'5' {
+                    if operation == b'5' || operation == b'b' {
                         if instance.is_closed() {
                             return Err(io::Error::other("fresh provider K entry gate closed"));
                         }
@@ -7658,7 +7663,8 @@ fn serve_fresh_v30_at(
                                 .require_live_route(&binding.handoff_id)
                                 .map_err(io::Error::other)?;
                         }
-                        let mut prepared = fresh_provider::prepare(&directory, binding, plan)?;
+                        let mut prepared =
+                            fresh_provider::prepare(&directory, binding.clone(), plan)?;
                         let v3_revision = if let Some((account, revision)) = v3_selected.as_ref() {
                             Some(fresh_provider::announce_provider_v3(
                                 &prepared,
@@ -7672,7 +7678,31 @@ fn serve_fresh_v30_at(
                         if let Some(index) = route_index.as_ref() {
                             prepared.announce_indexed_grant(index)?;
                         }
-                        let grant = if let Some((account, _)) = v3_selected {
+                        let grant = if operation == b'b' {
+                            if v3_selected.is_some() {
+                                return Err(io::Error::other(
+                                    "private native Codex v3 writer not joined",
+                                ));
+                            }
+                            let expected = std::env::var(
+                                "OULIPOLY_KERNEL_BROKER_PRIVATE_NATIVE_CODEX_SHA256_V1",
+                            )
+                            .map_err(|_| {
+                                io::Error::other("private native Codex image SHA pin absent")
+                            })?;
+                            let control = fresh_provider::launch_native_codex(
+                                prepared,
+                                &root,
+                                &actor,
+                                actor_uid,
+                                actor_gid,
+                                route_index.as_ref(),
+                                &expected,
+                            )?;
+                            let grant = control.grant_id().to_owned();
+                            native_codex_controls.insert(grant.clone(), control);
+                            grant
+                        } else if let Some((account, _)) = v3_selected {
                             fresh_provider::launch_v3_provider(
                                 prepared,
                                 &root,
@@ -7717,6 +7747,16 @@ fn serve_fresh_v30_at(
                         fresh_provider::grant_for_binding(&directory, &binding)?
                             .ok_or_else(|| io::Error::other("fresh provider grant absent"))?
                     };
+                    if operation == b'y' {
+                        let control = native_codex_controls.get_mut(&grant).ok_or_else(|| {
+                            io::Error::other("native Codex control absent for selected K")
+                        })?;
+                        let readback = control.readback(&directory, &binding)?;
+                        return Ok(format!(
+                            "fresh-native-codex {}\n",
+                            serde_json::to_string(&readback)?
+                        ));
+                    }
                     if let Some(v3) = provider_readback_v3.as_ref() {
                         if provider_writer_v3 {
                             fresh_provider::settle_v3_provider(v3, &directory, &binding, &grant)?;

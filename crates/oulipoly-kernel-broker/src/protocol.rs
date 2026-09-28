@@ -438,8 +438,8 @@ pub fn private_fresh_provider_at(
     operation: u8,
     descriptors: Option<[RawFd; 4]>,
 ) -> io::Result<String> {
-    if !matches!(operation, b'5' | b'6' | b'7' | b'9')
-        || matches!(operation, b'5' | b'9') != descriptors.is_some()
+    if !matches!(operation, b'5' | b'6' | b'7' | b'9' | b'b' | b'y')
+        || matches!(operation, b'5' | b'9' | b'b') != descriptors.is_some()
     {
         return Err(io::Error::other("invalid private fresh provider operation"));
     }
