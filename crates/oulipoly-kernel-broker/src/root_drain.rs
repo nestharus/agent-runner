@@ -31,7 +31,12 @@ pub struct RootDrainInventory {
     pub work_debt: usize,
     pub native_prepared: usize,
     pub native_spent: usize,
+    /// Total retained source records, including sealed retirements.
     pub source_physical_records: usize,
+    /// Seals whose exact physical Q still revalidates on this readback.
+    pub source_physical_retired: usize,
+    /// Unsealed or changed source Q records that still block drain.
+    pub source_physical_outstanding: usize,
     /// Positive debt from the retained broker sidecar only. `None` means its
     /// exact owner/incarnation could not be read, including an absent sidecar.
     pub source_effect: Option<BrokerSourceEffectObligations>,
@@ -146,12 +151,26 @@ pub fn readback(
         .iter()
         .filter(|source| source.grant.root_id == expected.root_id)
         .collect();
+    let mut source_physical_retired = 0;
+    let mut source_physical_outstanding = 0;
+    let mut source_retirement_uncertain = false;
+    for source in &source_records {
+        match sources.retirement(&source.grant.grant_id) {
+            Ok(Some(_)) => source_physical_retired += 1,
+            Ok(None) => source_physical_outstanding += 1,
+            Err(_) => {
+                source_physical_outstanding += 1;
+                source_retirement_uncertain = true;
+            }
+        }
+    }
     let entry = entries.record(&expected.root_id);
     let entry_unsettled = entry.is_none_or(|entry| entry.terminal_settlement.is_none());
     let uncertain_registry_or_incarnation = roots.has_debt()
         || works.has_debt()
         || grants.has_debt()
         || sources.has_debt()
+        || source_retirement_uncertain
         || entries.has_uncertain_write()
         || entry.is_none()
         || root_grants.iter().any(|grant| grant.root_init != stamp)
@@ -199,7 +218,7 @@ pub fn readback(
             root_debt.len(),
             native_prepared,
             native_spent,
-            source_records.len(),
+            source_physical_outstanding,
             source_effect
                 .as_ref()
                 .map_or(0, BrokerSourceEffectObligations::unsettled),
@@ -213,6 +232,8 @@ pub fn readback(
         native_prepared,
         native_spent,
         source_physical_records: source_records.len(),
+        source_physical_retired,
+        source_physical_outstanding,
         source_effect,
         source_effect_readback_uncertain,
         uncertain_registry_or_incarnation,

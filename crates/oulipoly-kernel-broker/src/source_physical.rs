@@ -7,7 +7,11 @@ const PID1_REAP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_m
 use crate::entry_registry::{EntryRecord, ProcessStamp};
 use crate::identity::{PinnedProcess, observed_incarnation_gone};
 use crate::registry::RootRecord;
-use oulipoly_state::mailbox::BrokerSourceEffectGrant;
+use crate::registry::RootRegistry;
+use crate::source_acceptance;
+use oulipoly_state::mailbox::{
+    BrokerSidecar, BrokerSourceEffectGrant, FreshV30Lane, PreparedProcessStamp,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -148,6 +152,29 @@ pub enum SourceObservation {
         stderr: CapturedOutput,
         cancel_requested: bool,
     },
+}
+
+/// Immutable proof that this exact original source Q was retired after both
+/// independent native assistant ACKs. The physical files remain in custody.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SourceRetirement {
+    pub version: u32,
+    pub root: RootRecord,
+    pub d_key: String,
+    pub handoff_id: String,
+    pub source_grant_id: String,
+    pub source_record_sha256: String,
+    pub terminal_receipt_sha256: String,
+    pub root_terminal_execution_sha256: String,
+    pub worker_wait_status: i32,
+    pub stdout: CapturedOutput,
+    pub stderr: CapturedOutput,
+    pub original_native_grant_id: String,
+    pub original_turn_id: String,
+    pub fresh_grant_id: String,
+    pub fresh_turn_id: String,
+    pub fresh_receipt_sha256: String,
 }
 
 pub struct SourcePhysicalRegistry {
@@ -355,6 +382,7 @@ impl SourcePhysicalRegistry {
                 ".stderr",
                 ".evidence.json",
                 ".evidence-artifact",
+                ".retired.json",
             ]
             .into_iter()
             .find_map(|suffix| filename.strip_suffix(suffix))
@@ -399,6 +427,249 @@ impl SourcePhysicalRegistry {
 
     pub fn records(&self) -> &[SourcePhysicalRecord] {
         &self.records
+    }
+
+    /// A retained seal is counted only while the exact record, terminal
+    /// receipt, and captured bytes still match the observed drained source.
+    pub fn retirement(&self, grant_id: &str) -> io::Result<Option<SourceRetirement>> {
+        let bytes = match exact_bytes(&self.directory, grant_id, "retired.json", 16 * 1024) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let seal: SourceRetirement = serde_json::from_slice(&bytes)?;
+        let record = self
+            .records
+            .iter()
+            .find(|r| r.grant.grant_id == grant_id)
+            .ok_or_else(|| io::Error::other("retired source record absent"))?;
+        let observed = self.observe(grant_id)?;
+        if seal.version != 1
+            || seal.source_grant_id != grant_id
+            || seal.root.root_id != record.grant.root_id
+            || seal.root.boot_id != record.root_init.boot_id
+            || seal.root.init_host_pid != record.root_init.host_pid
+            || seal.root.init_starttime_ticks != record.root_init.starttime_ticks
+            || seal.root.pidns_dev != record.root_init.pidns_dev
+            || seal.root.pidns_ino != record.root_init.pidns_ino
+            || seal.source_record_sha256
+                != format!(
+                    "{:x}",
+                    Sha256::digest(self.read_witness(grant_id, "json", 16 * 1024)?)
+                )
+            || seal.terminal_receipt_sha256
+                != format!(
+                    "{:x}",
+                    Sha256::digest(self.read_witness(grant_id, "terminal.json", 16 * 1024)?)
+                )
+            || !valid_digest(&seal.root_terminal_execution_sha256)
+            || observed
+                != (SourceObservation::Drained {
+                    worker_wait_status: seal.worker_wait_status,
+                    stdout: seal.stdout.clone(),
+                    stderr: seal.stderr.clone(),
+                    cancel_requested: false,
+                })
+        {
+            return Err(io::Error::other("retired source physical witness changed"));
+        }
+        Ok(Some(seal))
+    }
+
+    /// Retire only the original accepted source under an exact fenced D/J and
+    /// a fresh State terminal readback. This never retires work PID1 or owner.
+    pub fn retire_after_native_acks(
+        &mut self,
+        expected: &RootRecord,
+        roots: &RootRegistry,
+        sidecar: &mut BrokerSidecar,
+        lane: &FreshV30Lane,
+        grant_id: &str,
+    ) -> io::Result<SourceRetirement> {
+        let refuse = |message| io::Error::other(message);
+        roots.exact_record(expected)?;
+        if self.has_debt() {
+            return Err(refuse("physical source custody uncertain"));
+        }
+        let record = self
+            .records
+            .iter()
+            .find(|r| r.grant.grant_id == grant_id)
+            .ok_or_else(|| refuse("original source grant absent"))?;
+        if record.grant.root_id != expected.root_id
+            || record.root_init
+                != (ProcessStamp {
+                    host_pid: expected.init_host_pid,
+                    boot_id: expected.boot_id.clone(),
+                    starttime_ticks: expected.init_starttime_ticks,
+                    pidns_dev: expected.pidns_dev,
+                    pidns_ino: expected.pidns_ino,
+                })
+        {
+            return Err(refuse("source root incarnation changed"));
+        }
+        let SourceObservation::Drained {
+            worker_wait_status: 0,
+            stdout,
+            stderr,
+            cancel_requested: false,
+        } = self.observe(grant_id)?
+        else {
+            return Err(refuse("source Q is live, unknown, failed or cancelled"));
+        };
+        if !roots.admission_fenced(&expected.root_id) || roots.has_debt() {
+            return Err(refuse("root admission or incarnation uncertain"));
+        }
+        source_acceptance::read_captured_v2_evidence(sidecar, self, grant_id)
+            .map_err(io::Error::other)?;
+        let accepted = sidecar
+            .read_source_evidence(&record.grant)
+            .map_err(io::Error::other)?
+            .ok_or_else(|| refuse("original source acceptance absent"))?;
+        if accepted.phase != "accepted" {
+            return Err(refuse("original source acceptance unsettled"));
+        }
+        let original = sidecar
+            .read_native_recipient_grant(grant_id)
+            .map_err(io::Error::other)?
+            .ok_or_else(|| refuse("original native ACK absent"))?;
+        if original.phase != "acked"
+            || original.binding.root_id != expected.root_id
+            || original.binding.owner_generation != record.grant.owner_generation
+            || original.binding.source_grant_id != grant_id
+            || original.binding.source_generation != record.grant.source_generation
+            || original.binding.registration_id != record.grant.candidate.registration_id
+        {
+            return Err(refuse("original native ACK binding changed"));
+        }
+        let (released, actor) = lane
+            .released_handoff_for_root(&expected.root_id)
+            .map_err(io::Error::other)?;
+        let session = lane
+            .read_session(&released.d_key)
+            .map_err(io::Error::other)?
+            .ok_or_else(|| refuse("original D session absent"))?;
+        let terminal = lane
+            .read_private_root_terminal(&released, &actor, &session)
+            .map_err(io::Error::other)?;
+        let execution = terminal
+            .execution
+            .as_ref()
+            .ok_or_else(|| refuse("terminal execution absent"))?;
+        let child = execution
+            .child_event
+            .as_ref()
+            .ok_or_else(|| refuse("terminal child W absent"))?;
+        let fresh_request = terminal
+            .delivery_request_id
+            .as_deref()
+            .ok_or_else(|| refuse("fresh F request absent"))?;
+        let fresh_ack = lane
+            .read_headless_native_f_ack(fresh_request, &actor)
+            .map_err(io::Error::other)?
+            .ok_or_else(|| refuse("distinct fresh F ACK absent"))?;
+        let attempt = lane
+            .read_headless_native_f_attempt(fresh_request, &actor)
+            .map_err(io::Error::other)?
+            .ok_or_else(|| refuse("fresh F attempt absent"))?;
+        let obligations = sidecar
+            .read_root_source_effect_obligations(
+                &expected.root_id,
+                &PreparedProcessStamp {
+                    host_pid: expected.init_host_pid,
+                    boot_id: expected.boot_id.clone(),
+                    starttime_ticks: expected.init_starttime_ticks,
+                    pidns_dev: expected.pidns_dev,
+                    pidns_ino: expected.pidns_ino,
+                },
+            )
+            .map_err(io::Error::other)?;
+        if obligations.unsettled() != 0
+            || released.old_release.prepared.root_id != expected.root_id
+            || released.old_release.prepared.owner_generation != record.grant.owner_generation
+            || terminal.root_id != expected.root_id
+            || terminal.d_key != released.d_key
+            || terminal.handoff_id != released.handoff_id
+            || !matches!(terminal.execution_state.as_str(), "success" | "failure")
+            || terminal.notification_state != "acked"
+            || terminal.ack_basis.as_deref() != Some("native_codex_f_assistant_ack")
+            || !terminal.unknown_stages.is_empty()
+            || !terminal.unresolved_child_request_ids.is_empty()
+            || child.root_id != expected.root_id
+            || child.owner_generation != record.grant.owner_generation
+            || original.selected_k_json != fresh_ack.proof.selected_k_json
+            || original.native_session_id != fresh_ack.proof.native_session_id
+            || original.turn_id.as_deref() != Some(fresh_ack.proof.first_turn_id.as_str())
+            || fresh_ack.proof.original_source_grant_id != grant_id
+            || fresh_ack.proof.fresh_grant_id
+                != terminal.delivery_grant_id.as_deref().unwrap_or_default()
+            || attempt.candidate.original_source_grant_id != grant_id
+            || attempt.candidate.original_row_seq != original.binding.row_seq
+            || attempt.candidate.original_native_grant_id != original.grant_id
+            || attempt.candidate.original_turn_receipt_sha256
+                != original.turn_receipt_sha256.as_deref().unwrap_or_default()
+            || attempt.candidate.fresh.grant_id != fresh_ack.proof.fresh_grant_id
+            || fresh_ack.proof.bash_request_id != child.request_id
+            || attempt.candidate.fresh.source_id != child.source_id
+            || attempt.candidate.fresh.attempt_id != child.attempt_id
+        {
+            return Err(refuse(
+                "terminal, Q, original ACK or fresh F binding changed",
+            ));
+        }
+        let seal = SourceRetirement {
+            version: 1,
+            root: expected.clone(),
+            d_key: released.d_key,
+            handoff_id: released.handoff_id,
+            source_grant_id: grant_id.into(),
+            source_record_sha256: format!(
+                "{:x}",
+                Sha256::digest(self.read_witness(grant_id, "json", 16 * 1024)?)
+            ),
+            terminal_receipt_sha256: format!(
+                "{:x}",
+                Sha256::digest(self.read_witness(grant_id, "terminal.json", 16 * 1024)?)
+            ),
+            root_terminal_execution_sha256: format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(execution)?)
+            ),
+            worker_wait_status: 0,
+            stdout,
+            stderr,
+            original_native_grant_id: original.grant_id,
+            original_turn_id: fresh_ack.proof.first_turn_id,
+            fresh_grant_id: fresh_ack.proof.fresh_grant_id,
+            fresh_turn_id: fresh_ack.proof.turn_id,
+            fresh_receipt_sha256: fresh_ack.proof.receipt_sha256,
+        };
+        if let Some(previous) = self.retirement(grant_id)? {
+            return if previous == seal {
+                Ok(previous)
+            } else {
+                Err(refuse("source retirement changed"))
+            };
+        }
+        let path = self.directory.join(name(grant_id, "retired.json")?);
+        let result = (|| {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(path)?;
+            serde_json::to_writer(&mut file, &seal)?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            File::open(&self.directory)?.sync_all()
+        })();
+        if let Err(error) = result {
+            self.poisoned = true;
+            return Err(error);
+        }
+        self.retirement(grant_id)?
+            .ok_or_else(|| refuse("source retirement readback absent"))
     }
 
     /// Only fixed, broker-owned witness names are exposed to the source

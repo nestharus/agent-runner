@@ -8674,6 +8674,42 @@ fn inner() {
                                 .is_some_and(|pid| pid > 0)
                         );
                         eventually(|| gate.join("source-adopted-started").exists());
+                        if native_f_turn {
+                            let expected: RootRecord = serde_json::from_slice(
+                                &fs::read(broker_state.join(format!("{}.json", prepared.root_id)))
+                                    .unwrap(),
+                            )
+                            .unwrap();
+                            let roots =
+                                oulipoly_kernel_broker::registry::RootRegistry::open(&broker_state)
+                                    .unwrap();
+                            let mut source =
+                                SourcePhysicalRegistry::open(broker_state.join("source-physical"))
+                                    .unwrap();
+                            let grant_id = source.records()[0].grant.grant_id.clone();
+                            assert!(matches!(
+                                source.observe(&grant_id).unwrap(),
+                                SourceObservation::Live { .. }
+                            ));
+                            let mut retained = BrokerSidecar::open_existing(
+                                &broker_state.join("sidecar/pid-identity.db"),
+                                &broker_state,
+                            )
+                            .unwrap();
+                            let refusal = source
+                                .retire_after_native_acks(
+                                    &expected,
+                                    &roots,
+                                    &mut retained,
+                                    &lane,
+                                    &grant_id,
+                                )
+                                .unwrap_err();
+                            assert!(
+                                refusal.to_string().contains("source Q is live"),
+                                "{refusal}"
+                            );
+                        }
                         fs::write(gate.join("source-adopted-started.release"), b"drain").unwrap();
                         let original_session = lane.read_session(&root.d_key).unwrap().unwrap();
                         let side = rusqlite::Connection::open(
@@ -9109,6 +9145,23 @@ fn inner() {
                                     } else {
                                         assert_eq!(fresh_row, (None, 0));
                                     }
+                                    if native_f_turn {
+                                        eventually(|| {
+                                            lane.settle_private_root_terminal(
+                                                &root,
+                                                &recipient,
+                                                &original_session,
+                                            )
+                                            .is_ok_and(
+                                                |read| {
+                                                    matches!(
+                                                        read.execution_state.as_str(),
+                                                        "success" | "failure"
+                                                    ) && read.unknown_stages.is_empty()
+                                                },
+                                            )
+                                        });
+                                    }
                                     let terminal = lane
                                         .read_private_root_terminal(
                                             &root,
@@ -9128,6 +9181,116 @@ fn inner() {
                                         assert_eq!(
                                             terminal.ack_basis.as_deref(),
                                             Some("native_codex_f_assistant_ack")
+                                        );
+                                        let expected: RootRecord = serde_json::from_slice(
+                                            &fs::read(
+                                                broker_state
+                                                    .join(format!("{}.json", prepared.root_id)),
+                                            )
+                                            .unwrap(),
+                                        )
+                                        .unwrap();
+                                        let before = protocol::root_drain_readback_at(
+                                            &socket, &expected, true,
+                                        )
+                                        .unwrap();
+                                        let before: serde_json::Value = serde_json::from_str(
+                                            before
+                                                .strip_prefix("root-drain-v1 ")
+                                                .unwrap()
+                                                .trim_end(),
+                                        )
+                                        .unwrap();
+                                        assert_eq!(before["source_physical_outstanding"], 1);
+                                        assert_eq!(before["source_physical_retired"], 0);
+                                        let roots =
+                                            oulipoly_kernel_broker::registry::RootRegistry::open(
+                                                &broker_state,
+                                            )
+                                            .unwrap();
+                                        let source_dir = broker_state.join("source-physical");
+                                        let mut physical =
+                                            SourcePhysicalRegistry::open(&source_dir).unwrap();
+                                        let mut retained = BrokerSidecar::open_existing(
+                                            &broker_state.join("sidecar/pid-identity.db"),
+                                            &broker_state,
+                                        )
+                                        .unwrap();
+                                        let mut stale = expected.clone();
+                                        stale.init_starttime_ticks += 1;
+                                        assert!(
+                                            physical
+                                                .retire_after_native_acks(
+                                                    &stale,
+                                                    &roots,
+                                                    &mut retained,
+                                                    &lane,
+                                                    &custody.source_grant_id,
+                                                )
+                                                .is_err()
+                                        );
+                                        let retired = physical
+                                            .retire_after_native_acks(
+                                                &expected,
+                                                &roots,
+                                                &mut retained,
+                                                &lane,
+                                                &custody.source_grant_id,
+                                            )
+                                            .unwrap();
+                                        assert_eq!(
+                                            retired.source_grant_id,
+                                            custody.source_grant_id
+                                        );
+                                        assert_ne!(retired.original_turn_id, retired.fresh_turn_id);
+                                        assert_eq!(
+                                            physical
+                                                .retire_after_native_acks(
+                                                    &expected,
+                                                    &roots,
+                                                    &mut retained,
+                                                    &lane,
+                                                    &custody.source_grant_id,
+                                                )
+                                                .unwrap(),
+                                            retired
+                                        );
+                                        let reopened =
+                                            SourcePhysicalRegistry::open(&source_dir).unwrap();
+                                        assert_eq!(
+                                            reopened.retirement(&custody.source_grant_id).unwrap(),
+                                            Some(retired)
+                                        );
+                                        let after = protocol::root_drain_readback_at(
+                                            &socket, &expected, false,
+                                        )
+                                        .unwrap();
+                                        let after: serde_json::Value = serde_json::from_str(
+                                            after
+                                                .strip_prefix("root-drain-v1 ")
+                                                .unwrap()
+                                                .trim_end(),
+                                        )
+                                        .unwrap();
+                                        assert_eq!(after["source_physical_records"], 1);
+                                        assert_eq!(after["source_physical_outstanding"], 0);
+                                        assert_eq!(after["source_physical_retired"], 1);
+                                        assert_eq!(after["close_eligible"], false);
+                                        let receipt_path = source_dir.join(format!(
+                                            "{}.terminal.json",
+                                            custody.source_grant_id
+                                        ));
+                                        let original_receipt = fs::read(&receipt_path).unwrap();
+                                        fs::write(&receipt_path, b"changed Q").unwrap();
+                                        assert!(
+                                            reopened.retirement(&custody.source_grant_id).is_err()
+                                        );
+                                        fs::write(&receipt_path, original_receipt).unwrap();
+                                        assert!(
+                                            reopened
+                                                .retirement(&custody.source_grant_id)
+                                                .unwrap()
+                                                .is_some()
                                         );
                                     }
                                 }
