@@ -4213,6 +4213,7 @@ fn require_prior_entries_closed(
         return Err(io::Error::other("unaccounted prior root or work debt"));
     }
     let lane = FreshV30Lane::open_at(state_root).map_err(io::Error::other)?;
+    let mut closed_cursors: Vec<oulipoly_state::mailbox::BrokerStateCloseCursor> = Vec::new();
     for entry in entries.records() {
         let root = roots
             .record(&entry.root_id)
@@ -4248,6 +4249,24 @@ fn require_prior_entries_closed(
                 "prior entry close or caller result changed",
             ));
         }
+        closed_cursors.push(proof.state_cursor);
+    }
+    // Directory enumeration after restart has no generation order. Compare
+    // the immutable ordinals themselves and reject aliasing or a source swap.
+    closed_cursors.sort_by_key(|cursor| cursor.authority_ordinal);
+    if closed_cursors.windows(2).any(|pair| {
+        pair[0].authority_ordinal >= pair[1].authority_ordinal
+            || pair[0].file != pair[1].file
+            || pair[0].sidecar_generation != pair[1].sidecar_generation
+    }) {
+        return Err(io::Error::other("prior entry close cursor order changed"));
+    }
+    let current = sidecar
+        .ok_or_else(|| io::Error::other("prior entry sidecar absent"))?
+        .read_current_close_cursor()
+        .map_err(io::Error::other)?;
+    if closed_cursors.last() != Some(&current) {
+        return Err(io::Error::other("unclosed State continuity generation"));
     }
     for entry in entries.records() {
         roots.admit_closed_historical(&entry.root_id)?;

@@ -10653,6 +10653,49 @@ fn inner() {
                                                     second_owner.1.as_str(),
                                                     "running" | "closing" | "lost"
                                                 ));
+                                                assert_eq!(
+                                                    protocol::owner_close_at(
+                                                        &socket,
+                                                        &expected,
+                                                        &prepared.owner_generation,
+                                                        false,
+                                                    )
+                                                    .unwrap(),
+                                                    closed_owner.clone().unwrap(),
+                                                    "first owner close changed after second E",
+                                                );
+                                                let third = Command::new(&runner)
+                                                    .arg("--help")
+                                                    .env("OULIPOLY_DATA_DIR", &data)
+                                                    .env("OULIPOLY_CONFIG_HOME", &config_home)
+                                                    .env("OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1", "1")
+                                                    .env(
+                                                        "OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1",
+                                                        &socket,
+                                                    )
+                                                    .env(
+                                                        "OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1",
+                                                        &gate,
+                                                    )
+                                                    .env("AGE319_PRIVATE_OFFLINE_ROOT_V1", "1")
+                                                    .env_remove("LD_LIBRARY_PATH")
+                                                    .output()
+                                                    .unwrap();
+                                                assert!(
+                                                    !third.status.success(),
+                                                    "third E entered before the second owner closed",
+                                                );
+                                                assert_eq!(
+                                                    fs::read_dir(broker_state.join("entries"))
+                                                        .unwrap()
+                                                        .filter_map(Result::ok)
+                                                        .filter(|entry| entry
+                                                            .path()
+                                                            .extension()
+                                                            .is_some_and(|ext| ext == "json"))
+                                                        .count(),
+                                                    2,
+                                                );
                                             }
                                         }
                                         eprintln!("root PID1 drain restart readback: {}", restored);
