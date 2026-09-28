@@ -6909,7 +6909,9 @@ fn serve_fresh_v30_at(
                     request: FreshRecipientRequest::Lookup { .. }
                 } | RequestPayload::FreshBashChildRequest { .. }
                     | RequestPayload::FreshBashPrivateResult { .. }
-            );
+            ) || (operation == 0x90
+                && matches!(payload, RequestPayload::None)
+                && private_fixture());
             // The shared front door has its own pinned image. It may observe
             // the live lane identity, but it cannot acquire Runner authority.
             // Every effect-bearing operation still requires the fresh Runner
@@ -7085,6 +7087,29 @@ fn serve_fresh_v30_at(
                 b'C' | b'X' | b'c' | b'E' | b'O' | b'^' | b'v' | b'u' | b'<' => {
                     Err(io::Error::other(
                         "fresh Bash child/work/result closed until normal root grant and physical result custody",
+                    ))
+                }
+                #[cfg(feature = "age319-private-broker-fixture")]
+                0x90 => {
+                    if !private_fixture() {
+                        return Err(io::Error::other("fresh Bash parent probe unavailable"));
+                    }
+                    let (root, _, parent) =
+                        fresh_bash_parent(state_root, &lane, &peer, bash_image.as_ref())?;
+                    let session = lane
+                        .read_session(&root.d_key)
+                        .map_err(io::Error::other)?
+                        .ok_or_else(|| io::Error::other("fresh Bash root D absent"))?;
+                    peer.process.verify()?;
+                    Ok(format!(
+                        "fresh-bash-parent {}\n",
+                        serde_json::json!({
+                            "root_id": root.old_release.prepared.root_id,
+                            "root_invocation_uuid": root.invocation_uuid,
+                            "root_session_id": session.session_id,
+                            "parent_work_grant_id": parent.grant_id(),
+                            "parent_work_id": parent.work_id(),
+                        })
                     ))
                 }
                 #[cfg(feature = "age319-private-broker-fixture")]
@@ -9613,6 +9638,31 @@ fn serve_fresh_v30_at(
                 fs::write(Path::new(&gate).join(marker), b"yes")?;
             }
             continue;
+        }
+        #[cfg(feature = "age319-private-broker-fixture")]
+        if answer.is_ok() && private_fixture() {
+            let phase = match diagnostic_opcode {
+                b'X' => Some("c"),
+                b'^' => Some("k"),
+                b'%' => Some("w"),
+                b'v' => Some("sync-begin"),
+                _ => None,
+            };
+            if let (Some(phase), Some(gate)) = (
+                phase,
+                std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1"),
+            ) {
+                let gate = Path::new(&gate);
+                let armed = gate.join(format!("featureless-bash-drop-{phase}"));
+                if armed.exists() {
+                    fs::remove_file(&armed)?;
+                    fs::write(
+                        gate.join(format!("featureless-bash-dropped-{phase}")),
+                        b"yes",
+                    )?;
+                    continue;
+                }
+            }
         }
         let response = answer.unwrap_or_else(|error| {
             eprintln!(

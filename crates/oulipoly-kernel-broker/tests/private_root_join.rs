@@ -1879,6 +1879,16 @@ fn inner() {
     fs::set_permissions(&broker_state, fs::Permissions::from_mode(0o700)).unwrap();
     fs::create_dir(&gate).unwrap();
     fs::set_permissions(&gate, fs::Permissions::from_mode(0o700)).unwrap();
+    if std::env::var_os("AGE319_TEST_FEATURELESS_BASH_REPLY_LOSS_V1").is_some() {
+        assert_eq!(mode, "normal_model_provider_bash_ordinary_sync");
+        for phase in ["c", "k", "w"] {
+            fs::write(gate.join(format!("featureless-bash-drop-{phase}")), b"yes").unwrap();
+        }
+    }
+    if std::env::var_os("AGE319_TEST_FEATURELESS_BASH_SYNC_BEGIN_LOSS_V1").is_some() {
+        assert_eq!(mode, "normal_model_provider_bash_ordinary_sync_reply_loss");
+        fs::write(gate.join("featureless-bash-drop-sync-begin"), b"yes").unwrap();
+    }
     if native_codex_mode {
         fs::create_dir(gate.join("native-codex-home")).unwrap();
         if native_turn_mode {
@@ -5206,6 +5216,17 @@ fn inner() {
                     fs::read_to_string(&broker_log).unwrap_or_default(),
                     fs::read_to_string(&err).unwrap_or_default(),
                 );
+                if std::env::var_os("AGE319_TEST_FEATURELESS_BASH_REPLY_LOSS_V1").is_some() {
+                    for phase in ["c", "k", "w"] {
+                        assert!(
+                            gate.join(format!("featureless-bash-dropped-{phase}"))
+                                .exists()
+                        );
+                    }
+                }
+                if std::env::var_os("AGE319_TEST_FEATURELESS_BASH_SYNC_BEGIN_LOSS_V1").is_some() {
+                    assert!(gate.join("featureless-bash-dropped-sync-begin").exists());
+                }
                 let report: serde_json::Value =
                     serde_json::from_slice(&fs::read(gate.join("bash-causal-output")).unwrap())
                         .unwrap();
@@ -9403,7 +9424,14 @@ fn inner() {
                                     &broker_state.join("terminals"),
                                 )
                                 .unwrap_err();
-                            assert!(refusal.to_string().contains("still live"), "{refusal}");
+                            assert!(
+                                refusal.to_string().contains("still live")
+                                    || (refusal
+                                        .to_string()
+                                        .contains("work root admission fence absent")
+                                        && !roots.admission_fenced(&expected.root_id)),
+                                "{refusal}"
+                            );
                             let before =
                                 protocol::root_drain_readback_at(&socket, &expected, false)
                                     .unwrap();
@@ -9989,7 +10017,9 @@ fn inner() {
                                                 }
                                                 Err(error)
                                                     if error.to_string()
-                                                        == "unresolved broker JSON publication" =>
+                                                        == "unresolved broker JSON publication"
+                                                        || error.to_string()
+                                                            == "work physical witness is not exact root-only file" =>
                                                 {
                                                     false
                                                 }
