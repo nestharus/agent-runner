@@ -19,7 +19,6 @@ use std::os::fd::{AsRawFd, RawFd};
 #[cfg(feature = "age319-private-broker-fixture")]
 use std::os::unix::fs::FileExt;
 use std::os::unix::fs::FileTypeExt;
-#[cfg(feature = "age319-private-broker-fixture")]
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
@@ -156,6 +155,19 @@ struct TerminalReceipt {
     physical_tree_drained: bool,
 }
 
+/// Published by the original parent of the namespace PID1 after its exact
+/// wait. The PID1 terminal above separately proves its own ECHILD traversal.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct WorkPid1Wait {
+    version: u32,
+    grant_id: String,
+    work_id: String,
+    pid1_parent_namespace_pid: i32,
+    wait_status: i32,
+    reaped: bool,
+}
+
 struct InitContext {
     descriptors: [File; 7],
     control: UnixStream,
@@ -164,6 +176,8 @@ struct InitContext {
     owner_uid: u32,
     owner_gid: u32,
     groups: Vec<libc::gid_t>,
+    grant_id: String,
+    work_id: String,
     #[cfg(feature = "age319-private-broker-fixture")]
     private_bash_source: Option<PrivateBashSource>,
 }
@@ -208,6 +222,67 @@ fn write_terminal(directory: &File, receipt: &TerminalReceipt) -> io::Result<()>
     directory.sync_all()
 }
 
+fn write_pid1_wait(
+    directory: &File,
+    grant_id: &str,
+    work_id: &str,
+    pid: i32,
+    status: i32,
+) -> io::Result<()> {
+    let name = std::ffi::CString::new(format!("{grant_id}.work-pid1-wait.json"))
+        .map_err(|_| io::Error::other("invalid work grant ID"))?;
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    serde_json::to_writer(
+        &mut file,
+        &WorkPid1Wait {
+            version: 1,
+            grant_id: grant_id.into(),
+            work_id: work_id.into(),
+            pid1_parent_namespace_pid: pid,
+            wait_status: status,
+            reaped: true,
+        },
+    )?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    directory.sync_all()
+}
+
+fn read_pid1_wait(directory: &Path, grant_id: &str) -> io::Result<Option<WorkPid1Wait>> {
+    let path = directory.join(format!("{grant_id}.work-pid1-wait.json"));
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let before = file.metadata()?;
+    if !before.is_file() || before.len() > 4096 {
+        return Err(io::Error::other("invalid work PID1 wait file"));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let after = file.metadata()?;
+    if after.len() != before.len() || bytes.len() as u64 != before.len() {
+        return Err(io::Error::other("work PID1 wait changed during read"));
+    }
+    Ok(Some(serde_json::from_slice(&bytes)?))
+}
+
 use std::os::fd::FromRawFd;
 
 fn run_init(context: InitContext) -> io::Result<()> {
@@ -228,6 +303,8 @@ fn run_init(context: InitContext) -> io::Result<()> {
         owner_uid,
         owner_gid,
         groups,
+        grant_id: _,
+        work_id: _,
         #[cfg(feature = "age319-private-broker-fixture")]
         private_bash_source,
     } = context;
@@ -506,13 +583,33 @@ fn create_init(
                 pointer.cast(),
             )
         };
-        unsafe {
-            drop(Box::from_raw(pointer));
-        }
+        let reaper_context = unsafe { Box::from_raw(pointer) };
         if init_pid < 0 {
             unsafe { libc::_exit(70) };
         }
-        unsafe { libc::_exit(0) };
+        // The entered helper is the one process that can wait for this PID1.
+        // Retain it across broker restart, while closing every descriptor
+        // except the private receipt directory before the wait.
+        if close_other_descriptors(&[reaper_context.terminal_dir.as_raw_fd()]).is_err() {
+            unsafe { libc::_exit(70) };
+        }
+        let mut status = 0;
+        let waited = loop {
+            let waited = unsafe { libc::waitpid(init_pid, &mut status, 0) };
+            if waited >= 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                break waited;
+            }
+        };
+        let recorded = waited == init_pid
+            && write_pid1_wait(
+                &reaper_context.terminal_dir,
+                &reaper_context.grant_id,
+                &reaper_context.work_id,
+                init_pid,
+                status,
+            )
+            .is_ok();
+        unsafe { libc::_exit(if recorded { 0 } else { 70 }) };
     }
     // The parent must not retain PID1's socket ends. If either helper or
     // clone fails, recvmsg must see EOF and leave consumed grant debt.
@@ -624,6 +721,8 @@ pub(super) fn launch(
         owner_uid: peer.uid,
         owner_gid: peer.gid,
         groups: peer.process.supplementary_groups()?,
+        grant_id: consumed.grant_id.clone(),
+        work_id: consumed.work_id.clone(),
         #[cfg(feature = "age319-private-broker-fixture")]
         private_bash_source,
     };
@@ -783,6 +882,34 @@ pub(super) fn observe(
     }
     if !gone {
         return Ok(format!("work-drain-pending {}\n", record.work_incarnation));
+    }
+    let wait = match read_pid1_wait(terminal_dir, grant_id) {
+        Ok(Some(wait)) => wait,
+        Ok(None) => {
+            return Ok(format!(
+                "work-q-pending {} PID1-wait-absent\n",
+                record.work_incarnation
+            ));
+        }
+        Err(_) => {
+            return Ok(format!(
+                "work-uncertain {} PID1-wait-invalid\n",
+                record.work_incarnation
+            ));
+        }
+    };
+    if wait.version != 1
+        || wait.grant_id != grant.grant_id
+        || wait.work_id != grant.work_id
+        || wait.pid1_parent_namespace_pid <= 0
+        || !wait.reaped
+        || !libc::WIFEXITED(wait.wait_status)
+        || libc::WEXITSTATUS(wait.wait_status) != 0
+    {
+        return Ok(format!(
+            "work-uncertain {} PID1-wait-conflict\n",
+            record.work_incarnation
+        ));
     }
     Ok(format!(
         "work-drained {} {} {}\n",
