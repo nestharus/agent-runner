@@ -8,7 +8,8 @@ use crate::registry::{RootRecord, RootRegistry};
 use crate::source_physical::SourcePhysicalRegistry;
 use crate::work_registry::{LiveWork, WorkRecord, WorkRegistry};
 use oulipoly_state::mailbox::{
-    BrokerSidecar, BrokerSourceEffectObligations, FreshV30Lane, PreparedProcessStamp,
+    BrokerOwnerCloseInventory, BrokerSidecar, BrokerSourceEffectObligations, FreshV30Lane,
+    PreparedProcessStamp,
 };
 use serde::Serialize;
 use std::io;
@@ -66,6 +67,9 @@ pub struct RootDrainInventory {
     /// exact owner/incarnation could not be read, including an absent sidecar.
     pub source_effect: Option<BrokerSourceEffectObligations>,
     pub source_effect_readback_uncertain: bool,
+    /// Exact State/retained-sidecar debt preview for the released owner. The
+    /// fresh lane and a State writer fence are still required for close.
+    pub owner_close_inventory: Option<BrokerOwnerCloseInventory>,
     pub uncertain_registry_or_incarnation: bool,
     pub state_sidecar_outstanding_unknown: bool,
     /// No State/sidecar atomic close or source-admission proof is supplied by
@@ -152,6 +156,18 @@ pub fn readback(
             .ok()
     });
     let source_effect_readback_uncertain = source_effect.is_none();
+    let owner_close_inventory = sidecar.and_then(|sidecar| {
+        let root_init = PreparedProcessStamp {
+            host_pid: expected.init_host_pid,
+            boot_id: expected.boot_id.clone(),
+            starttime_ticks: expected.init_starttime_ticks,
+            pidns_dev: expected.pidns_dev,
+            pidns_ino: expected.pidns_ino,
+        };
+        sidecar
+            .read_root_owner_close_inventory(&expected.root_id, &root_init)
+            .ok()
+    });
     let root_grants: Vec<_> = grants
         .records()
         .iter()
@@ -362,6 +378,7 @@ pub fn readback(
         source_physical_outstanding,
         source_effect,
         source_effect_readback_uncertain,
+        owner_close_inventory,
         uncertain_registry_or_incarnation,
         state_sidecar_outstanding_unknown: true,
         close_eligible: false,
