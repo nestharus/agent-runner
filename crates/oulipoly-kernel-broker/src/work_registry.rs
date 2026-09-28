@@ -54,6 +54,7 @@ pub struct WorkRegistry {
     directory: PathBuf,
     live: Vec<LiveWork>,
     debt: Vec<WorkRecord>,
+    closed_historical: HashSet<String>,
     poisoned: bool,
 }
 
@@ -692,6 +693,7 @@ impl WorkRegistry {
             directory,
             live: Vec::new(),
             debt: Vec::new(),
+            closed_historical: HashSet::new(),
             poisoned: false,
         };
         // Parent records can be read in any filesystem order. Reattach in
@@ -761,8 +763,20 @@ impl WorkRegistry {
 
     pub fn has_debt(&self) -> bool {
         self.poisoned
-            || !self.debt.is_empty()
-            || self.live.iter().any(|work| work.init.verify().is_err())
+            || self
+                .debt
+                .iter()
+                .any(|work| !self.closed_historical.contains(&work.root_id))
+            || self.live.iter().any(|work| {
+                !self.closed_historical.contains(&work.record.root_id)
+                    && work.init.verify().is_err()
+            })
+    }
+
+    /// Called only after the old Broker validates the matching closed root,
+    /// every retired work seal, and the exact caller settlement.
+    pub fn admit_closed_historical(&mut self, root_id: &str) {
+        self.closed_historical.insert(root_id.to_owned());
     }
 
     pub(crate) fn broker_root(&self) -> io::Result<&Path> {
@@ -954,7 +968,10 @@ fn classify_scope_inner(
     if peer.process.verify().is_err()
         || roots.has_debt()
         || works.poisoned
-        || !works.debt.is_empty()
+        || works
+            .debt
+            .iter()
+            .any(|work| !works.closed_historical.contains(&work.root_id))
         || require_all_live && works.has_debt()
     {
         return Scope::Uncertain;
