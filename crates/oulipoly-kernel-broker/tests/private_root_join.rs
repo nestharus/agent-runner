@@ -10185,6 +10185,127 @@ fn inner() {
                                         assert_eq!(missing["close_eligible"], false);
                                         assert_eq!(missing["owner_close_preflight"], false);
                                         fs::rename(&terminal_backup, &terminal_path).unwrap();
+                                        let closed_owner = if old_pending_debt {
+                                            assert!(
+                                                protocol::owner_close_at(
+                                                    &socket,
+                                                    &expected,
+                                                    &prepared.owner_generation,
+                                                    true,
+                                                )
+                                                .is_err()
+                                            );
+                                            assert!(
+                                                protocol::owner_close_at(
+                                                    &socket,
+                                                    &expected,
+                                                    &prepared.owner_generation,
+                                                    false,
+                                                )
+                                                .is_err()
+                                            );
+                                            None
+                                        } else {
+                                            // Send the commit and drop its reply socket. The
+                                            // following readback must recover that exact commit.
+                                            let mut lost_reply =
+                                                UnixStream::connect(&socket).unwrap();
+                                            let mut challenge = [0u8; 16];
+                                            lost_reply.read_exact(&mut challenge).unwrap();
+                                            let mut frame = vec![0x82];
+                                            frame.extend_from_slice(&challenge);
+                                            frame.extend_from_slice(
+                                                &serde_json::to_vec(
+                                                    &protocol::OwnerCloseIntentRequest {
+                                                        expected: expected.clone(),
+                                                        owner_generation: prepared
+                                                            .owner_generation
+                                                            .clone(),
+                                                    },
+                                                )
+                                                .unwrap(),
+                                            );
+                                            lost_reply.write_all(&frame).unwrap();
+                                            drop(lost_reply);
+                                            eventually(|| {
+                                                protocol::owner_close_at(
+                                                    &socket,
+                                                    &expected,
+                                                    &prepared.owner_generation,
+                                                    false,
+                                                )
+                                                .is_ok()
+                                            });
+                                            let closed = protocol::owner_close_at(
+                                                &socket,
+                                                &expected,
+                                                &prepared.owner_generation,
+                                                false,
+                                            )
+                                            .unwrap();
+                                            assert_eq!(closed.root_id, expected.root_id);
+                                            assert_eq!(
+                                                closed.owner_generation,
+                                                prepared.owner_generation
+                                            );
+                                            assert_eq!(
+                                                closed.state_cursor,
+                                                close_intent.as_ref().unwrap().state_cursor
+                                            );
+                                            // Duplicate read and commit are exact and idempotent.
+                                            assert_eq!(
+                                                protocol::owner_close_at(
+                                                    &socket,
+                                                    &expected,
+                                                    &prepared.owner_generation,
+                                                    false,
+                                                )
+                                                .unwrap(),
+                                                closed
+                                            );
+                                            assert_eq!(
+                                                protocol::owner_close_at(
+                                                    &socket,
+                                                    &expected,
+                                                    &prepared.owner_generation,
+                                                    true,
+                                                )
+                                                .unwrap(),
+                                                closed
+                                            );
+                                            assert!(
+                                                protocol::owner_close_at(
+                                                    &socket,
+                                                    &expected,
+                                                    "stale-owner",
+                                                    false,
+                                                )
+                                                .is_err()
+                                            );
+                                            let mut stale = expected.clone();
+                                            stale.init_starttime_ticks += 1;
+                                            assert!(
+                                                protocol::owner_close_at(
+                                                    &socket,
+                                                    &stale,
+                                                    &prepared.owner_generation,
+                                                    false,
+                                                )
+                                                .is_err()
+                                            );
+                                            fs::rename(&terminal_path, &terminal_backup).unwrap();
+                                            assert!(
+                                                protocol::owner_close_at(
+                                                    &socket,
+                                                    &expected,
+                                                    &prepared.owner_generation,
+                                                    false,
+                                                )
+                                                .is_err()
+                                            );
+                                            fs::rename(&terminal_backup, &terminal_path).unwrap();
+                                            Some(closed)
+                                        };
                                         stop(&mut broker);
                                         broker = Command::new(env!(
                                             "CARGO_BIN_EXE_oulipoly-kernel-broker"
@@ -10236,22 +10357,57 @@ fn inner() {
                                         assert_eq!(restored["pid1_exact_live"], false);
                                         assert_eq!(restored["work_retired"], 1);
                                         assert_eq!(restored["close_eligible"], false);
-                                        assert_eq!(
-                                            restored["owner_close_preflight"],
-                                            !old_pending_debt
-                                        );
+                                        assert_eq!(restored["owner_close_preflight"], false);
                                         assert_eq!(
                                             restored["state_sidecar_outstanding_unknown"],
-                                            true
+                                            old_pending_debt
                                         );
-                                        assert_eq!(
-                                            restored["owner_close_inventory"]["deliverable_mailbox_rows"],
-                                            if old_pending_debt { 1 } else { 0 }
-                                        );
-                                        assert_eq!(
-                                            restored["owner_close_inventory"],
-                                            proof["owner_close_inventory"]
-                                        );
+                                        if old_pending_debt {
+                                            assert_eq!(
+                                                restored["owner_close_inventory"]["deliverable_mailbox_rows"],
+                                                1
+                                            );
+                                            assert_eq!(
+                                                restored["owner_close_inventory"],
+                                                proof["owner_close_inventory"]
+                                            );
+                                            assert_eq!(
+                                                restored["owner_close_proof"],
+                                                serde_json::Value::Null
+                                            );
+                                        } else {
+                                            assert_eq!(
+                                                restored["owner_close_inventory"],
+                                                serde_json::Value::Null
+                                            );
+                                            assert_eq!(
+                                                restored["owner_close_proof"],
+                                                serde_json::to_value(
+                                                    closed_owner.as_ref().unwrap()
+                                                )
+                                                .unwrap()
+                                            );
+                                            assert_eq!(
+                                                protocol::owner_close_at(
+                                                    &socket,
+                                                    &expected,
+                                                    &prepared.owner_generation,
+                                                    false,
+                                                )
+                                                .unwrap(),
+                                                closed_owner.clone().unwrap()
+                                            );
+                                            assert_eq!(
+                                                protocol::owner_close_at(
+                                                    &socket,
+                                                    &expected,
+                                                    &prepared.owner_generation,
+                                                    true,
+                                                )
+                                                .unwrap(),
+                                                closed_owner.clone().unwrap()
+                                            );
+                                        }
                                         if let Some(intent) = close_intent {
                                             assert_eq!(
                                                 protocol::owner_close_intent_at(
@@ -10263,15 +10419,14 @@ fn inner() {
                                                 .unwrap(),
                                                 intent
                                             );
-                                            assert_eq!(
+                                            assert!(
                                                 protocol::owner_close_intent_at(
                                                     &socket,
                                                     &expected,
                                                     &prepared.owner_generation,
                                                     true,
                                                 )
-                                                .unwrap(),
-                                                intent
+                                                .is_err()
                                             );
                                             assert_eq!(
                                                 restored["owner_close_intent"],

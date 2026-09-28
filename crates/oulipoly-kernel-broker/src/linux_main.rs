@@ -418,7 +418,7 @@ fn require_cutover_entry_route(
 ) -> io::Result<()> {
     if matches!(
         operation,
-        b'i' | b'v' | b'X' | b'x' | b'@' | b'[' | 0x7f | 0x80 | 0x81
+        b'i' | b'v' | b'X' | b'x' | b'@' | b'[' | 0x7f | 0x80 | 0x81 | 0x82 | 0x83
     ) {
         return Ok(());
     }
@@ -804,7 +804,7 @@ fn recv_request(
         }
         #[cfg(feature = "age319-private-broker-fixture")]
         b'#' | b'{' | b'}' | b']' | b'|' | b'~' | b'?' => (18..=2048 + 17).contains(&read),
-        b'@' | b'[' | 0x7f | 0x80 | 0x81 => (18..=2048 + 17).contains(&read),
+        b'@' | b'[' | 0x7f | 0x80 | 0x81 | 0x82 | 0x83 => (18..=2048 + 17).contains(&read),
         b'F' => (18..=8192 + 17).contains(&read),
         b'O' => (18..=1024 + 17).contains(&read),
         b'U' => (18..=512 + 17).contains(&read),
@@ -867,7 +867,7 @@ fn recv_request(
         b'@' | b'[' | 0x7f => RequestPayload::RootDrain {
             expected: serde_json::from_slice(&request[17..read as usize])?,
         },
-        0x80 | 0x81 => RequestPayload::OwnerCloseIntent {
+        0x80 | 0x81 | 0x82 | 0x83 => RequestPayload::OwnerCloseIntent {
             request: serde_json::from_slice(&request[17..read as usize])?,
         },
         b'U' => RequestPayload::FreshChildRequest {
@@ -4893,7 +4893,7 @@ fn serve() -> io::Result<()> {
                 broker_sidecar.is_some(),
                 entry_gate.is_closed(),
             )?;
-            if operation == 0x80 || operation == 0x81 {
+            if matches!(operation, 0x80..=0x83) {
                 if peer.uid != 0 || !peer.process.in_namespace(&host_namespace)? {
                     return Err(io::Error::other("host-root owner close intent required"));
                 }
@@ -4901,6 +4901,78 @@ fn serve() -> io::Result<()> {
                     return Err(io::Error::other("owner close intent request absent"));
                 };
                 registry.exact_record(&request.expected)?;
+                if operation == 0x82 || operation == 0x83 {
+                    let _guard = admission_fences.lock()
+                        .map_err(|_| io::Error::other("root admission fence poisoned"))?;
+                    let intent = registry.read_close_intent(&request.expected)?
+                        .ok_or_else(|| io::Error::other("owner close intent absent"))?;
+                    if intent.owner_generation != request.owner_generation {
+                        return Err(io::Error::other("owner close intent generation changed"));
+                    }
+                    let inventory = root_drain::readback(
+                        &request.expected, &registry, &entries, &works, &grants,
+                        &source_physical, broker_sidecar.as_ref(),
+                    )?;
+                    let proof = if let Some(proof) = inventory.owner_close_proof {
+                        proof
+                    } else if operation == 0x82 {
+                        root_drain::ready_for_owner_close_preflight(
+                            &inventory, &request.expected.root_id, &request.owner_generation,
+                        )?;
+                        let owner = inventory.owner_close_inventory.as_ref()
+                            .ok_or_else(|| io::Error::other("owner close inventory absent"))?;
+                        if owner.source_generation != intent.source_generation
+                            || owner.state_cursor.as_ref() != Some(&intent.state_cursor)
+                        {
+                            return Err(io::Error::other("owner close intent cursor changed"));
+                        }
+                        let physical = root_drain::physical_close_proof(&inventory)?;
+                        let candidate = oulipoly_state::mailbox::BrokerClosedOwner {
+                            source_generation: intent.source_generation.clone(),
+                            root_id: request.expected.root_id.clone(),
+                            owner_generation: intent.owner_generation.clone(),
+                            state_cursor: intent.state_cursor.clone(),
+                            root_record_json: serde_json::to_string(&request.expected)?,
+                            physical_proof_json: serde_json::to_string(&physical)?,
+                        };
+                        let sidecar_path = broker_sidecar.as_ref()
+                            .ok_or_else(|| io::Error::other("owner close retained sidecar absent"))?
+                            .mailbox().path().to_path_buf();
+                        broker_sidecar.as_mut()
+                            .ok_or_else(|| io::Error::other("owner close retained sidecar absent"))?
+                            .close_exact_root_owner(&candidate, || {
+                                let observer = BrokerSidecar::open_existing(
+                                    &sidecar_path, Path::new(&state),
+                                )?;
+                                let again = root_drain::readback(
+                                    &request.expected, &registry, &entries, &works, &grants,
+                                    &source_physical, Some(&observer),
+                                ).map_err(|error| error.to_string())?;
+                                root_drain::ready_for_owner_close_preflight(
+                                    &again, &request.expected.root_id, &request.owner_generation,
+                                ).map_err(|error| error.to_string())?;
+                                if root_drain::physical_close_proof(&again)
+                                    .map_err(|error| error.to_string())? != physical
+                                    || again.owner_close_inventory.as_ref()
+                                        != inventory.owner_close_inventory.as_ref()
+                                {
+                                    return Err("owner close physical/ACK evidence changed under writers".into());
+                                }
+                                Ok(())
+                            })
+                            .map_err(io::Error::other)?
+                    } else {
+                        return Err(io::Error::other("owner close committed proof absent"));
+                    };
+                    if proof.root_id != request.expected.root_id
+                        || proof.owner_generation != request.owner_generation
+                        || proof.source_generation != intent.source_generation
+                        || proof.state_cursor != intent.state_cursor
+                    {
+                        return Err(io::Error::other("owner close committed proof changed"));
+                    }
+                    return Ok(format!("owner-close-v1 {}\n", serde_json::to_string(&proof)?));
+                }
                 let intent = if operation == 0x80 {
                     // Fresh admissions holding this mutex finish first. The
                     // old Broker serves this request on its single writer loop.
