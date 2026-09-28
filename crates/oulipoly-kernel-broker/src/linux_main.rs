@@ -2,6 +2,7 @@
 
 const SOURCE_TICKET_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 const BROKER_ACCEPT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+const NORMAL_CLOSE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 #[cfg(feature = "age319-private-broker-fixture")]
 const ORDINARY_BASH_COMPLETION_POLL_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(100);
@@ -4343,6 +4344,284 @@ fn require_prior_entries_closed(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "exact close joins all retained authorities"
+)]
+fn issue_exact_owner_close_intent(
+    expected: &RootRecord,
+    owner_generation: &str,
+    registry: &mut RootRegistry,
+    entries: &EntryRegistry,
+    works: &WorkRegistry,
+    grants: &GrantRegistry,
+    sources: &SourcePhysicalRegistry,
+    sidecar: Option<&BrokerSidecar>,
+) -> io::Result<OwnerCloseIntent> {
+    let inventory =
+        root_drain::readback(expected, registry, entries, works, grants, sources, sidecar)?;
+    root_drain::ready_for_owner_close_preflight(&inventory, &expected.root_id, owner_generation)?;
+    let owner = inventory
+        .owner_close_inventory
+        .as_ref()
+        .ok_or_else(|| io::Error::other("owner close inventory absent"))?;
+    registry.issue_close_intent(&OwnerCloseIntent {
+        root: expected.clone(),
+        owner_generation: owner_generation.to_owned(),
+        source_generation: owner.source_generation.clone(),
+        state_cursor: owner
+            .state_cursor
+            .clone()
+            .ok_or_else(|| io::Error::other("owner close cursor absent"))?,
+    })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "exact close joins all retained authorities"
+)]
+fn commit_exact_owner_close(
+    state_root: &Path,
+    expected: &RootRecord,
+    owner_generation: &str,
+    registry: &RootRegistry,
+    entries: &EntryRegistry,
+    works: &WorkRegistry,
+    grants: &GrantRegistry,
+    sources: &SourcePhysicalRegistry,
+    sidecar: &mut Option<BrokerSidecar>,
+    write: bool,
+) -> io::Result<oulipoly_state::mailbox::BrokerClosedOwner> {
+    let intent = registry
+        .read_close_intent(expected)?
+        .ok_or_else(|| io::Error::other("owner close intent absent"))?;
+    if intent.owner_generation != owner_generation {
+        return Err(io::Error::other("owner close intent generation changed"));
+    }
+    let inventory = root_drain::readback(
+        expected,
+        registry,
+        entries,
+        works,
+        grants,
+        sources,
+        sidecar.as_ref(),
+    )?;
+    let proof = if let Some(proof) = inventory.owner_close_proof {
+        proof
+    } else if write {
+        root_drain::ready_for_owner_close_preflight(
+            &inventory,
+            &expected.root_id,
+            owner_generation,
+        )?;
+        let owner = inventory
+            .owner_close_inventory
+            .as_ref()
+            .ok_or_else(|| io::Error::other("owner close inventory absent"))?;
+        if owner.source_generation != intent.source_generation
+            || owner.state_cursor.as_ref() != Some(&intent.state_cursor)
+        {
+            return Err(io::Error::other("owner close intent cursor changed"));
+        }
+        let physical = root_drain::physical_close_proof(&inventory)?;
+        let candidate = oulipoly_state::mailbox::BrokerClosedOwner {
+            source_generation: intent.source_generation.clone(),
+            root_id: expected.root_id.clone(),
+            owner_generation: intent.owner_generation.clone(),
+            state_cursor: intent.state_cursor.clone(),
+            root_record_json: serde_json::to_string(expected)?,
+            physical_proof_json: serde_json::to_string(&physical)?,
+        };
+        let sidecar_path = sidecar
+            .as_ref()
+            .ok_or_else(|| io::Error::other("owner close retained sidecar absent"))?
+            .mailbox()
+            .path()
+            .to_path_buf();
+        sidecar
+            .as_mut()
+            .ok_or_else(|| io::Error::other("owner close retained sidecar absent"))?
+            .close_exact_root_owner(&candidate, || {
+                let observer = BrokerSidecar::open_existing(&sidecar_path, state_root)?;
+                let again = root_drain::readback(
+                    expected,
+                    registry,
+                    entries,
+                    works,
+                    grants,
+                    sources,
+                    Some(&observer),
+                )
+                .map_err(|error| error.to_string())?;
+                root_drain::ready_for_owner_close_preflight(
+                    &again,
+                    &expected.root_id,
+                    owner_generation,
+                )
+                .map_err(|error| error.to_string())?;
+                if root_drain::physical_close_proof(&again).map_err(|error| error.to_string())?
+                    != physical
+                    || again.owner_close_inventory.as_ref()
+                        != inventory.owner_close_inventory.as_ref()
+                {
+                    return Err("owner close physical/ACK evidence changed under writers".into());
+                }
+                Ok(())
+            })
+            .map_err(io::Error::other)?
+    } else {
+        return Err(io::Error::other("owner close committed proof absent"));
+    };
+    if proof.root_id != expected.root_id
+        || proof.owner_generation != owner_generation
+        || proof.source_generation != intent.source_generation
+        || proof.state_cursor != intent.state_cursor
+    {
+        return Err(io::Error::other("owner close committed proof changed"));
+    }
+    Ok(proof)
+}
+
+/// One durable transition per timed serving pass. The normal K/Q and caller receipt
+/// select the route; each later transition rereads the same exact root. No
+/// process is signaled: only the pinned PID1 reads its own request file.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "normal progression joins all retained authorities"
+)]
+fn advance_one_normal_owner(
+    state_root: &Path,
+    registry: &mut RootRegistry,
+    entries: &EntryRegistry,
+    works: &WorkRegistry,
+    grants: &GrantRegistry,
+    sources: &SourcePhysicalRegistry,
+    sidecar: &mut Option<BrokerSidecar>,
+    admission_fences: &Mutex<HashSet<String>>,
+    completed: &mut HashSet<String>,
+) -> io::Result<()> {
+    if entries.records().is_empty() || sidecar.is_none() || !state_root.join("v30").exists() {
+        return Ok(());
+    }
+    let lane = FreshV30Lane::open_at(state_root).map_err(io::Error::other)?;
+    for entry in entries.records() {
+        if completed.contains(&entry.root_id) {
+            continue;
+        }
+        // An entry may be prepared before its root record is published. It
+        // carries no normal K or close authority until that exact root exists.
+        let Some(root) = registry.record(&entry.root_id).cloned() else {
+            continue;
+        };
+        let Ok((released, actor)) = lane.released_handoff_for_root(&root.root_id) else {
+            continue;
+        };
+        let Some(session) = lane
+            .read_session(&released.d_key)
+            .map_err(io::Error::other)?
+        else {
+            continue;
+        };
+        if !lane
+            .normal_provider_k_present(&released, &actor, &session)
+            .map_err(io::Error::other)?
+        {
+            continue;
+        }
+        let inventory = root_drain::readback(
+            &root,
+            registry,
+            entries,
+            works,
+            grants,
+            sources,
+            sidecar.as_ref(),
+        )?;
+        // No-effect, unknown K, partial publication, and other root routes
+        // cannot select normal progression from an empty physical set.
+        if inventory.normal.is_none() || inventory.normal_uncertain {
+            continue;
+        }
+        let expected_owner = &released.old_release.prepared.owner_generation;
+        if let Some(proof) = &inventory.owner_close_proof {
+            if &proof.owner_generation != expected_owner {
+                return Err(io::Error::other("normal closed owner generation changed"));
+            }
+            completed.insert(entry.root_id.clone());
+            continue;
+        }
+        if inventory
+            .owner_close_inventory
+            .as_ref()
+            .is_none_or(|owner| &owner.owner_generation != expected_owner)
+        {
+            continue;
+        }
+        if !inventory.fenced {
+            if root_drain::ready_for_normal_admission_fence(&inventory).is_err() {
+                continue;
+            }
+            let mut fences = admission_fences
+                .lock()
+                .map_err(|_| io::Error::other("root admission fence poisoned"))?;
+            let persisted = registry.fence_admission(&root);
+            // Match the host-root fence operation: a partial write also stops
+            // fresh admission in this incarnation.
+            fences.insert(root.root_id.clone());
+            persisted?;
+            return Ok(());
+        }
+        if !inventory.pid1_echild_receipt {
+            if root_drain::ready_for_pid1_request(&inventory).is_ok() {
+                root_pid1::publish_request(&registry.pid1_directory(), &root)?;
+            }
+            continue;
+        }
+        if !inventory.owner_close_preflight {
+            continue;
+        }
+        let _guard = admission_fences
+            .lock()
+            .map_err(|_| io::Error::other("root admission fence poisoned"))?;
+        if inventory.owner_close_intent.is_none() {
+            issue_exact_owner_close_intent(
+                &root,
+                expected_owner,
+                registry,
+                entries,
+                works,
+                grants,
+                sources,
+                sidecar.as_ref(),
+            )?;
+            return Ok(());
+        }
+        #[cfg(feature = "age319-private-broker-fixture")]
+        if std::env::var("AGE319_TEST_AUTO_RESTART_PHASE_V1").as_deref() == Ok("intent")
+            && std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                .is_some_and(|dir| !Path::new(&dir).join("auto-intent-resume").exists())
+        {
+            return Ok(());
+        }
+        commit_exact_owner_close(
+            state_root,
+            &root,
+            expected_owner,
+            registry,
+            entries,
+            works,
+            grants,
+            sources,
+            sidecar,
+            true,
+        )?;
+        completed.insert(root.root_id);
+        return Ok(());
+    }
+    Ok(())
+}
+
 /// Revisit one retained original source per idle tick. Only the serving
 /// Broker owns these registries; neither workload ingress nor drain readback
 /// calls this transition. The seals themselves re-read terminal State, both
@@ -4965,6 +5244,8 @@ fn serve() -> io::Result<()> {
                 }
             })?;
     }
+    let mut completed_auto_normal = HashSet::<String>::new();
+    let mut last_auto_normal = Instant::now() - NORMAL_CLOSE_POLL_INTERVAL;
     loop {
         if let Ok(request) = drain_rx.try_recv() {
             let result = (|| {
@@ -5005,6 +5286,22 @@ fn serve() -> io::Result<()> {
                 &mut released_handoffs,
                 &broker_incarnation,
             );
+        }
+        if last_auto_normal.elapsed() >= NORMAL_CLOSE_POLL_INTERVAL {
+            last_auto_normal = Instant::now();
+            if let Err(error) = advance_one_normal_owner(
+                Path::new(&state),
+                &mut registry,
+                &entries,
+                &works,
+                &grants,
+                &source_physical,
+                &mut broker_sidecar,
+                &admission_fences,
+                &mut completed_auto_normal,
+            ) {
+                eprintln!("normal owner close progression blocked: {error}");
+            }
         }
         let mut stream = match listener.accept() {
             Ok((stream, _)) => stream,
@@ -5099,96 +5396,21 @@ fn serve() -> io::Result<()> {
                 if operation == 0x82 || operation == 0x83 {
                     let _guard = admission_fences.lock()
                         .map_err(|_| io::Error::other("root admission fence poisoned"))?;
-                    let intent = registry.read_close_intent(&request.expected)?
-                        .ok_or_else(|| io::Error::other("owner close intent absent"))?;
-                    if intent.owner_generation != request.owner_generation {
-                        return Err(io::Error::other("owner close intent generation changed"));
-                    }
-                    let inventory = root_drain::readback(
-                        &request.expected, &registry, &entries, &works, &grants,
-                        &source_physical, broker_sidecar.as_ref(),
+                    let proof = commit_exact_owner_close(
+                        Path::new(&state), &request.expected, &request.owner_generation,
+                        &registry, &entries, &works, &grants, &source_physical,
+                        &mut broker_sidecar, operation == 0x82,
                     )?;
-                    let proof = if let Some(proof) = inventory.owner_close_proof {
-                        proof
-                    } else if operation == 0x82 {
-                        root_drain::ready_for_owner_close_preflight(
-                            &inventory, &request.expected.root_id, &request.owner_generation,
-                        )?;
-                        let owner = inventory.owner_close_inventory.as_ref()
-                            .ok_or_else(|| io::Error::other("owner close inventory absent"))?;
-                        if owner.source_generation != intent.source_generation
-                            || owner.state_cursor.as_ref() != Some(&intent.state_cursor)
-                        {
-                            return Err(io::Error::other("owner close intent cursor changed"));
-                        }
-                        let physical = root_drain::physical_close_proof(&inventory)?;
-                        let candidate = oulipoly_state::mailbox::BrokerClosedOwner {
-                            source_generation: intent.source_generation.clone(),
-                            root_id: request.expected.root_id.clone(),
-                            owner_generation: intent.owner_generation.clone(),
-                            state_cursor: intent.state_cursor.clone(),
-                            root_record_json: serde_json::to_string(&request.expected)?,
-                            physical_proof_json: serde_json::to_string(&physical)?,
-                        };
-                        let sidecar_path = broker_sidecar.as_ref()
-                            .ok_or_else(|| io::Error::other("owner close retained sidecar absent"))?
-                            .mailbox().path().to_path_buf();
-                        broker_sidecar.as_mut()
-                            .ok_or_else(|| io::Error::other("owner close retained sidecar absent"))?
-                            .close_exact_root_owner(&candidate, || {
-                                let observer = BrokerSidecar::open_existing(
-                                    &sidecar_path, Path::new(&state),
-                                )?;
-                                let again = root_drain::readback(
-                                    &request.expected, &registry, &entries, &works, &grants,
-                                    &source_physical, Some(&observer),
-                                ).map_err(|error| error.to_string())?;
-                                root_drain::ready_for_owner_close_preflight(
-                                    &again, &request.expected.root_id, &request.owner_generation,
-                                ).map_err(|error| error.to_string())?;
-                                if root_drain::physical_close_proof(&again)
-                                    .map_err(|error| error.to_string())? != physical
-                                    || again.owner_close_inventory.as_ref()
-                                        != inventory.owner_close_inventory.as_ref()
-                                {
-                                    return Err("owner close physical/ACK evidence changed under writers".into());
-                                }
-                                Ok(())
-                            })
-                            .map_err(io::Error::other)?
-                    } else {
-                        return Err(io::Error::other("owner close committed proof absent"));
-                    };
-                    if proof.root_id != request.expected.root_id
-                        || proof.owner_generation != request.owner_generation
-                        || proof.source_generation != intent.source_generation
-                        || proof.state_cursor != intent.state_cursor
-                    {
-                        return Err(io::Error::other("owner close committed proof changed"));
-                    }
                     return Ok(format!("owner-close-v1 {}\n", serde_json::to_string(&proof)?));
                 }
                 let intent = if operation == 0x80 {
-                    // Fresh admissions holding this mutex finish first. The
-                    // old Broker serves this request on its single writer loop.
+                    // Fresh admissions holding this mutex finish first.
                     let _guard = admission_fences.lock()
                         .map_err(|_| io::Error::other("root admission fence poisoned"))?;
-                    let inventory = root_drain::readback(
-                        &request.expected, &registry, &entries, &works, &grants,
-                        &source_physical, broker_sidecar.as_ref(),
-                    )?;
-                    root_drain::ready_for_owner_close_preflight(
-                        &inventory, &request.expected.root_id, &request.owner_generation,
-                    )?;
-                    let owner = inventory.owner_close_inventory.as_ref()
-                        .ok_or_else(|| io::Error::other("owner close inventory absent"))?;
-                    registry.issue_close_intent(&OwnerCloseIntent {
-                        root: request.expected.clone(),
-                        owner_generation: request.owner_generation.clone(),
-                        source_generation: owner.source_generation.clone(),
-                        state_cursor: owner.state_cursor.clone()
-                            .ok_or_else(|| io::Error::other("owner close cursor absent"))?,
-                    })?
+                    issue_exact_owner_close_intent(
+                        &request.expected, &request.owner_generation, &mut registry, &entries,
+                        &works, &grants, &source_physical, broker_sidecar.as_ref(),
+                    )?
                 } else {
                     registry.read_close_intent(&request.expected)?
                         .ok_or_else(|| io::Error::other("owner close intent absent"))?
