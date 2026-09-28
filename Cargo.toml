@@ -59,3 +59,8 @@ toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+
+# Private H source checks hash the full Runner image several times. Keep the
+# checks in debug tests while avoiding unoptimized SHA-256 compression.
+[profile.dev.package.sha2]
+opt-level = 3
