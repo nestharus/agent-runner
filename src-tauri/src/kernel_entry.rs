@@ -2259,6 +2259,24 @@ fn prepare_normal_work(
         if selection.invocation != *invocation || selection.state != "selected_no_effect" {
             return Err("normal model selection readback differs from held invocation".into());
         }
+        let cwd = File::open(std::env::current_dir().map_err(|e| e.to_string())?)
+            .map_err(|e| format!("normal plan cwd unavailable: {e}"))?;
+        let environment = sealed_normal_plan_environment()?;
+        let descriptors = [source.as_raw_fd(), cwd.as_raw_fd(), environment.as_raw_fd()];
+        let plan = protocol::select_fresh_normal_plan_at(&socket, &receipt.d_key, descriptors)
+            .or_else(|selection_error| {
+                match protocol::observe_fresh_normal_plan_at(&socket, &receipt.d_key, descriptors) {
+                    Ok(Some(value)) => Ok(value),
+                    Ok(None) => Err(selection_error),
+                    Err(readback_error) => Err(std::io::Error::other(format!(
+                        "{selection_error}; exact plan readback refused: {readback_error}",
+                    ))),
+                }
+            })
+            .map_err(|e| format!("normal executable plan refused: {e}"))?;
+        if plan.selection != selection || plan.state != "planned_no_effect" {
+            return Err("normal executable plan differs from selected invocation".into());
+        }
     }
     #[cfg(feature = "age319-private-broker-fixture")]
     if std::env::var_os("AGE319_PRIVATE_NORMAL_ROOT_V1").is_some() {
@@ -2285,8 +2303,65 @@ fn prepare_normal_work(
         if selected != repeated || selected.invocation != *invocation {
             return Err("private model selection readback changed".into());
         }
+        let cwd = File::open(std::env::current_dir().map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        let environment = sealed_normal_plan_environment()?;
+        let descriptors = [source.as_raw_fd(), cwd.as_raw_fd(), environment.as_raw_fd()];
+        let plan = protocol::select_fresh_normal_plan_at(&socket, &receipt.d_key, descriptors)
+            .map_err(|e| e.to_string())?;
+        let retried_plan =
+            protocol::select_fresh_normal_plan_at(&socket, &receipt.d_key, descriptors)
+                .map_err(|e| e.to_string())?;
+        let repeated_plan =
+            protocol::observe_fresh_normal_plan_at(&socket, &receipt.d_key, descriptors)
+                .map_err(|e| e.to_string())?
+                .ok_or("private normal plan readback absent")?;
+        if plan != retried_plan || plan != repeated_plan || plan.selection != selected {
+            return Err("private normal plan readback changed".into());
+        }
     }
     Ok(model_invocation)
+}
+
+fn sealed_normal_plan_environment() -> Result<File, String> {
+    let inherited = std::env::vars_os()
+        .map(|(key, value)| {
+            Ok::<_, String>((
+                key.into_string()
+                    .map_err(|_| "normal plan environment key is not UTF-8")?,
+                value
+                    .into_string()
+                    .map_err(|_| "normal plan environment value is not UTF-8")?,
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let data_dir = oulipoly_state::paths::data_dir()?;
+    let data_dir = data_dir
+        .to_str()
+        .ok_or("normal plan data directory is not UTF-8")?;
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "inherited": inherited, "data_dir": data_dir,
+    }))
+    .map_err(|e| e.to_string())?;
+    if bytes.len() > 1024 * 1024 {
+        return Err("normal plan environment oversized".into());
+    }
+    let fd = unsafe {
+        libc::memfd_create(
+            c"normal-plan-environment".as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    file.write_all(&bytes).map_err(|e| e.to_string())?;
+    let seals = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+    if unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, seals) } < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(file)
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]

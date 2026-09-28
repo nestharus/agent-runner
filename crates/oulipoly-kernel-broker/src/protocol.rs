@@ -608,6 +608,97 @@ pub fn observe_fresh_normal_model_at(
     normal_model_request_at(path, 0x85, d_key, config_dir)
 }
 
+/// Three descriptor inputs: selected config root, exact cwd, and sealed
+/// inherited environment. The broker derives argv/stdin and source evidence.
+pub fn select_fresh_normal_plan_at(
+    path: &Path,
+    d_key: &str,
+    descriptors: [RawFd; 3],
+) -> io::Result<oulipoly_state::mailbox::FreshNormalExecutablePlan> {
+    normal_plan_request_at(path, 0x86, d_key, descriptors)?
+        .ok_or_else(|| io::Error::other("normal plan absent"))
+}
+
+pub fn observe_fresh_normal_plan_at(
+    path: &Path,
+    d_key: &str,
+    descriptors: [RawFd; 3],
+) -> io::Result<Option<oulipoly_state::mailbox::FreshNormalExecutablePlan>> {
+    normal_plan_request_at(path, 0x87, d_key, descriptors)
+}
+
+fn normal_plan_request_at(
+    path: &Path,
+    operation: u8,
+    d_key: &str,
+    descriptors: [RawFd; 3],
+) -> io::Result<Option<oulipoly_state::mailbox::FreshNormalExecutablePlan>> {
+    let id =
+        uuid::Uuid::parse_str(d_key).map_err(|_| io::Error::other("invalid normal plan D key"))?;
+    if id.is_nil() || id.to_string() != d_key {
+        return Err(io::Error::other("noncanonical normal plan D key"));
+    }
+    let body = serde_json::to_vec(&FreshRootEffectRequest {
+        d_key: d_key.into(),
+        success: None,
+    })?;
+    let mut stream = checked_connection(path)?;
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let mut frame = Vec::with_capacity(17 + body.len());
+    frame.push(operation);
+    frame.extend_from_slice(&challenge);
+    frame.extend_from_slice(&body);
+    let mut iov = libc::iovec {
+        iov_base: frame.as_mut_ptr().cast(),
+        iov_len: frame.len(),
+    };
+    let mut control = [0u8; 128];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen =
+        unsafe { libc::CMSG_SPACE((3 * std::mem::size_of::<RawFd>()) as _) } as usize;
+    unsafe {
+        let header = libc::CMSG_FIRSTHDR(&msg);
+        (*header).cmsg_level = libc::SOL_SOCKET;
+        (*header).cmsg_type = libc::SCM_RIGHTS;
+        (*header).cmsg_len = libc::CMSG_LEN((3 * std::mem::size_of::<RawFd>()) as _) as usize;
+        std::ptr::copy_nonoverlapping(
+            descriptors.as_ptr(),
+            libc::CMSG_DATA(header).cast::<RawFd>(),
+            3,
+        );
+    }
+    if unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) }
+        != frame.len() as isize
+    {
+        return Err(io::Error::other("normal plan request uncertain"));
+    }
+    let mut reply = Vec::new();
+    stream.take(16 * 1024 + 1).read_to_end(&mut reply)?;
+    if reply.len() > 16 * 1024 || !reply.ends_with(b"\n") {
+        return Err(io::Error::other(
+            "normal plan readback oversized or incomplete",
+        ));
+    }
+    let reply = String::from_utf8(reply).map_err(io::Error::other)?;
+    if let Some(error) = reply.strip_prefix("error ") {
+        return Err(io::Error::other(error.trim_end().to_owned()));
+    }
+    if reply == "fresh-normal-plan absent\n" {
+        return Ok(None);
+    }
+    let body = reply
+        .strip_prefix("fresh-normal-plan ")
+        .and_then(|value| value.strip_suffix('\n'))
+        .ok_or_else(|| io::Error::other("normal plan readback invalid"))?;
+    serde_json::from_str(body)
+        .map(Some)
+        .map_err(io::Error::other)
+}
+
 fn normal_model_request_at(
     path: &Path,
     operation: u8,

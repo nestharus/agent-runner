@@ -335,6 +335,7 @@ fn interactive_command(
         working_dir,
         parent_invocation_env,
         None,
+        None,
     )
 }
 

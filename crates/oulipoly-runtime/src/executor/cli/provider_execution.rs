@@ -85,6 +85,7 @@ pub(super) fn execute_provider_with_arg_parts_and_supervisor_config(
             input_args,
             parent_invocation_env,
             start_known_provider_session_id,
+            data_dir_override: None,
         },
         supervisor_config,
     )?;

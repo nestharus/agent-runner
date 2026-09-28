@@ -30,6 +30,7 @@ pub(in crate::executor::cli) fn build_command(
     working_dir: Option<&Path>,
     parent_invocation_env: Option<&str>,
     return_channel: Option<&Path>,
+    data_dir_override: Option<&Path>,
 ) -> Result<Command, String> {
     let parts = parse_command_parts(&provider.command);
     validate_command_parts(&parts)?;
@@ -41,5 +42,6 @@ pub(in crate::executor::cli) fn build_command(
         working_dir,
         parent_invocation_env,
         return_channel,
+        data_dir_override,
     )
 }

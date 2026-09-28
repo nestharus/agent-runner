@@ -40,6 +40,7 @@
 - `crates/oulipoly-state/src/mailbox/migrations/0033_fresh_bash_child.sql`
 - `crates/oulipoly-state/src/mailbox/migrations/0034_fresh_normal_work.sql`
 - `crates/oulipoly-state/src/mailbox/migrations/0047_fresh_normal_model_selection.sql`
+- `crates/oulipoly-state/src/mailbox/migrations/0048_fresh_normal_plan.sql`
 - `crates/oulipoly-state/src/mailbox/migrations/0035_fresh_bash_source.sql`
 - `crates/oulipoly-state/src/mailbox/migrations/0036_fresh_bash_notify.sql`
 - `crates/oulipoly-state/src/mailbox/migrations/0037_fresh_bash_listener.sql`
@@ -130,6 +131,7 @@
 | A private released root reaches complete physical provider Q, with an optional accepted Bash W. | An immutable terminal row binds D/handoff, J/session, original actor/owner generation, independently checked parent K/Q/hashed output and exact child C/D/K/Q/W when present. Readback derives listener F/ACK and caller publication separately; unknown or submitted F is pending, manual ACK is labeled, and publication unknown cannot turn work into failure or replay. Missing physical evidence stays explicit unknown. |
 | A fresh recipient manually or delegated-manually acknowledges an exact F grant. | The same transaction records an immutable ACK evidence row joining the delivery row, grant, token digest, recipient, accepted source and retained payload with the manual or delegated basis. A zero-row update, legacy listener row, or ACKed grant without this evidence cannot make terminal readback report ACK. |
 | A released root with typed normal CLI intent reaches fresh preparation. | One immutable `held` row binds the exact U/D handoff, invocation, session, actor and intent. Retry reads that row; there is no provider fork, native K/Q, result or physical-drain transition. |
+| The selected model/account has a broker-derived executable plan. | One immutable plan row per handoff binds the exact selection and plan digest. A retry cannot replace it; readback requires the same held invocation, actor, session and selection. It grants no K or effect. |
 | Existing DB at a known-incompatible past version (no migration path). | Open fails with `MigrationUnsupported`; advise the operator to reset or restore. |
 | Concurrent reader during writer migration. | SQLite WAL + retry handles short waits; long contention surfaces as `DbBusy`. |
 | Repository operation on a row whose `row_version` has advanced. | `repositories/mod.rs` returns a typed conflict error; caller decides retry/replace. |
