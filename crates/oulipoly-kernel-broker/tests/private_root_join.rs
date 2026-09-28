@@ -10206,11 +10206,41 @@ fn inner() {
                                             );
                                             None
                                         } else {
+                                            // Send the commit and drop its reply socket. The
+                                            // following readback must recover that exact commit.
+                                            let mut lost_reply =
+                                                UnixStream::connect(&socket).unwrap();
+                                            let mut challenge = [0u8; 16];
+                                            lost_reply.read_exact(&mut challenge).unwrap();
+                                            let mut frame = vec![0x82];
+                                            frame.extend_from_slice(&challenge);
+                                            frame.extend_from_slice(
+                                                &serde_json::to_vec(
+                                                    &protocol::OwnerCloseIntentRequest {
+                                                        expected: expected.clone(),
+                                                        owner_generation: prepared
+                                                            .owner_generation
+                                                            .clone(),
+                                                    },
+                                                )
+                                                .unwrap(),
+                                            );
+                                            lost_reply.write_all(&frame).unwrap();
+                                            drop(lost_reply);
+                                            eventually(|| {
+                                                protocol::owner_close_at(
+                                                    &socket,
+                                                    &expected,
+                                                    &prepared.owner_generation,
+                                                    false,
+                                                )
+                                                .is_ok()
+                                            });
                                             let closed = protocol::owner_close_at(
                                                 &socket,
                                                 &expected,
                                                 &prepared.owner_generation,
-                                                true,
+                                                false,
                                             )
                                             .unwrap();
                                             assert_eq!(closed.root_id, expected.root_id);
@@ -10222,7 +10252,7 @@ fn inner() {
                                                 closed.state_cursor,
                                                 close_intent.as_ref().unwrap().state_cursor
                                             );
-                                            // The read path is the lost-reply recovery operation.
+                                            // Duplicate read and commit are exact and idempotent.
                                             assert_eq!(
                                                 protocol::owner_close_at(
                                                     &socket,
