@@ -154,6 +154,21 @@ impl RootRegistry {
                 }
                 continue;
             }
+            // serve() validated the exact pair/source/image binding before
+            // this scan. It is a fixed first-install record, not a root ID.
+            if name == "first-install-activation-v1.json" {
+                let meta = fs::symlink_metadata(entry.path())?;
+                if !empty_bootstrap
+                    || !meta.is_file()
+                    || meta.file_type().is_symlink()
+                    || meta.uid() != 0
+                    || meta.nlink() != 1
+                    || meta.mode() & 0o777 != 0o600
+                {
+                    return Err(io::Error::other("unsafe first-install activation record"));
+                }
+                continue;
+            }
             if empty_bootstrap
                 && matches!(
                     name.as_ref(),

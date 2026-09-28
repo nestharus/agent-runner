@@ -53,6 +53,7 @@ use oulipoly_kernel_broker::cutover_gate::EntryGate;
 use oulipoly_kernel_broker::entry_registry::{
     EntryRegistry, EntryTerminalSettlement, ProcessStamp,
 };
+use oulipoly_kernel_broker::first_install_activation::{FirstInstallActivation, PairPaths};
 use oulipoly_kernel_broker::identity::{
     PeerIdentity, PinnedProcess, host_proc_file, host_proc_uid, install_detached_host_proc,
 };
@@ -375,9 +376,16 @@ fn pinned_bash_image(pair: Option<&InstalledPair>) -> io::Result<Option<File>> {
         let Some(digest) = pair.bash_sha256.as_deref() else {
             return Ok(None);
         };
-        let path = Path::new(installed_pair::BASH);
+        let private_path = if private_fixture() {
+            std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_BASH_V1").map(PathBuf::from)
+        } else {
+            None
+        };
+        let path = private_path
+            .as_deref()
+            .unwrap_or(Path::new(installed_pair::BASH));
         let image = File::open(path)?;
-        pair.verify_file(path, digest, true, &image)?;
+        pair.verify_file(path, digest, !private_fixture(), &image)?;
         return Ok(Some(image));
     }
     #[cfg(feature = "age319-private-broker-fixture")]
@@ -432,7 +440,7 @@ fn require_cutover_entry_route(
 ) -> io::Result<()> {
     if matches!(
         operation,
-        b'i' | b'v' | b'X' | b'x' | b'@' | b'[' | 0x7f | 0x80 | 0x81 | 0x82 | 0x83
+        b'i' | 0x91 | b'X' | b'x' | b'@' | b'[' | 0x7f | 0x80 | 0x81 | 0x82 | 0x83
     ) {
         return Ok(());
     }
@@ -804,7 +812,7 @@ fn recv_request(
         b'%' | b'!' | b'<' => read == 33,
         b'u' | b'v' => read == 33,
         b'^' => read == 65,
-        0x90 => read == 17,
+        0x90 | 0x91 => read == 17,
         // Legacy E has no body; fresh Bash E carries a request UUID on its
         // separate socket. Preserve both exact wire shapes for pinned images.
         b'E' => read == 17 || read == 33,
@@ -5003,7 +5011,27 @@ fn serve() -> io::Result<()> {
         Err(error) => return Err(error),
     }
     let installed_pair = if fixture {
-        None
+        #[cfg(feature = "age319-private-broker-fixture")]
+        {
+            std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_PAIR_V1")
+                .map(|manifest| -> io::Result<InstalledPair> {
+                    let pair = InstalledPair::load(Path::new(&manifest), false)?;
+                    let broker = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_BROKER_V1")
+                        .ok_or_else(|| io::Error::other("private Broker image absent"))?;
+                    pair.verify_image_against(
+                        Path::new(&broker),
+                        &pair.broker_sha256,
+                        false,
+                        &host_proc_file("self/exe")?,
+                    )?;
+                    Ok(pair)
+                })
+                .transpose()?
+        }
+        #[cfg(not(feature = "age319-private-broker-fixture"))]
+        {
+            None
+        }
     } else {
         let pair = InstalledPair::load(Path::new(installed_pair::MANIFEST), true)?;
         pair.verify_image_against(
@@ -5013,6 +5041,84 @@ fn serve() -> io::Result<()> {
             &host_proc_file("self/exe")?,
         )?;
         Some(pair)
+    };
+    let record = Path::new(&state).join("first-install-activation-v1.json");
+    let record_present = match fs::symlink_metadata(&record) {
+        Ok(_) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    for entry in fs::read_dir(&state)? {
+        if entry?
+            .file_name()
+            .to_string_lossy()
+            .starts_with(oulipoly_kernel_broker::first_install_activation::STAGE_PREFIX)
+        {
+            return Err(io::Error::other(
+                "incomplete first-install activation stage",
+            ));
+        }
+    }
+    let fresh_activation = if let Some(pair) = &installed_pair {
+        if record_present {
+            if pair.schema != 2 {
+                return Err(io::Error::other(
+                    "activation requires schema-2 installed pair",
+                ));
+            }
+            let manifest = if fixture {
+                PathBuf::from(
+                    std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_PAIR_V1")
+                        .ok_or_else(|| io::Error::other("private pair manifest absent"))?,
+                )
+            } else {
+                PathBuf::from(installed_pair::MANIFEST)
+            };
+            let broker = if fixture {
+                PathBuf::from(
+                    std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_BROKER_V1")
+                        .ok_or_else(|| io::Error::other("private Broker image absent"))?,
+                )
+            } else {
+                PathBuf::from(installed_pair::BROKER)
+            };
+            let launcher = if fixture {
+                PathBuf::from(
+                    std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_LAUNCHER_V1")
+                        .ok_or_else(|| io::Error::other("private launcher image absent"))?,
+                )
+            } else {
+                PathBuf::from(installed_pair::LAUNCHER)
+            };
+            let bash = if fixture {
+                PathBuf::from(
+                    std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_BASH_V1")
+                        .ok_or_else(|| io::Error::other("private Bash image absent"))?,
+                )
+            } else {
+                PathBuf::from(installed_pair::BASH)
+            };
+            let paths = PairPaths {
+                manifest: &manifest,
+                runner: Path::new(&runner),
+                broker: &broker,
+                launcher: &launcher,
+                bash: &bash,
+            };
+            let activation =
+                FirstInstallActivation::readback_at(Path::new(&state), paths, fixture)?;
+            if activation.pair_generation != pair.generation {
+                return Err(io::Error::other("activated pair generation changed"));
+            }
+            Some(activation)
+        } else {
+            None
+        }
+    } else {
+        if record_present {
+            return Err(io::Error::other("activation has no installed pair"));
+        }
+        None
     };
     // The singleton lock and durable latch are established before the socket
     // accepts any new request. Normal startup never closes or reopens it.
@@ -5042,17 +5148,31 @@ fn serve() -> io::Result<()> {
         };
     let runner_image = File::open(&runner)?;
     if let Some(pair) = &installed_pair {
-        pair.verify_file(Path::new(&runner), &pair.runner_sha256, true, &runner_image)?;
+        pair.verify_file(
+            Path::new(&runner),
+            &pair.runner_sha256,
+            !fixture,
+            &runner_image,
+        )?;
     }
     let launcher_image = if let Some(pair) = &installed_pair {
         let digest = pair
             .launcher_sha256
             .as_deref()
             .ok_or_else(|| io::Error::other("installed launcher missing from pair"))?;
-        let path = Path::new(installed_pair::LAUNCHER);
-        checked_root_path(path, false)?;
+        let private_path = if fixture {
+            std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_LAUNCHER_V1").map(PathBuf::from)
+        } else {
+            None
+        };
+        let path = private_path
+            .as_deref()
+            .unwrap_or(Path::new(installed_pair::LAUNCHER));
+        if !fixture {
+            checked_root_path(path, false)?;
+        }
         let image = File::open(path)?;
-        pair.verify_file(path, digest, true, &image)?;
+        pair.verify_file(path, digest, !fixture, &image)?;
         Some(image)
     } else {
         None
@@ -5468,13 +5588,16 @@ fn serve() -> io::Result<()> {
             } else if operation == b'i' {
                 let route = if entry_gate.is_closed() {
                     "draining"
-                } else if broker_sidecar.is_some() {
+                } else if fresh_activation.is_some() {
+                    "fresh-only-open"
+                } else if installed_pair.as_ref().is_some_and(|pair| pair.schema == 2)
+                    || broker_sidecar.is_some() {
                     "broker-v30-closed"
                 } else {
                     "legacy-open"
                 };
                 Ok(format!("entry-gate-v1 {route}\n"))
-            } else if operation == b'v' {
+            } else if operation == 0x91 {
                 let pair = installed_pair
                     .as_ref()
                     .ok_or_else(|| io::Error::other("installed pair unavailable"))?;
@@ -5483,15 +5606,25 @@ fn serve() -> io::Result<()> {
                 }
                 let route = if entry_gate.is_closed() {
                     "draining"
-                } else if broker_sidecar.is_some() {
+                } else if fresh_activation.is_some() {
+                    "fresh-only-open"
+                } else if pair.schema == 2 || broker_sidecar.is_some() {
                     "broker-v30-closed"
                 } else {
                     "legacy-open"
                 };
-                Ok(format!(
-                    "installed-pair-v1 {} {} {route}\n",
-                    pair.version, pair.generation
-                ))
+                if route == "fresh-only-open" {
+                    let activation = fresh_activation.as_ref().expect("fresh route has activation");
+                    Ok(format!(
+                        "installed-pair-v1 {} {} {route} {}\n",
+                        pair.version, pair.generation, activation.source.source_generation
+                    ))
+                } else {
+                    Ok(format!(
+                        "installed-pair-v1 {} {} {route}\n",
+                        pair.version, pair.generation
+                    ))
+                }
             } else if operation == b'L' {
                 #[cfg(feature = "age319-private-broker-fixture")]
                 if fixture {
