@@ -158,6 +158,140 @@ fn assert_old_pending_v29(broker_state: &Path) {
         [], |r| r.get::<_, i64>(0)).unwrap(), 1);
 }
 
+/// The owner inventory counts every deliverable row in the retained sidecar.
+/// Identify the exact remaining row after both native ACKs instead of
+/// attributing a global count to either native recipient.
+fn read_owner_mailbox_diagnostic(
+    broker_state: &Path,
+    historical_sidecar: &Path,
+    state_path: &Path,
+    source_generation: &str,
+    original_row_seq: i64,
+) -> serde_json::Value {
+    let side = rusqlite::Connection::open_with_flags(
+        broker_state.join("sidecar/pid-identity.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let pending = side
+        .prepare(
+            "SELECT seq FROM mailbox WHERE delivered_at IS NULL AND
+             (delivery_error IS NULL OR delivery_error NOT IN
+              ('wake_sweep_abandoned','mailbox_payload_verification_failed',
+               'mailbox_ingress_expired','completion_effect_uncertain')) ORDER BY seq",
+        )
+        .unwrap()
+        .query_map([], |row| row.get::<_, i64>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(pending.len(), 1, "owner inventory row identity changed");
+    let seq = pending[0];
+    assert_ne!(
+        seq, original_row_seq,
+        "native ACK left original row pending"
+    );
+    let retained =
+        BrokerSidecar::open_existing(&broker_state.join("sidecar/pid-identity.db"), broker_state)
+            .unwrap();
+    let row = retained
+        .read_exact_mailbox_row(source_generation, "old-pending", seq)
+        .unwrap()
+        .unwrap()
+        .row;
+    assert_eq!(
+        (row.kind.as_str(), row.handle.as_str()),
+        ("fixture", "old-unacked")
+    );
+    assert_eq!(row.payload_json, "{}");
+    assert_eq!(row.delivery_attempts, 0);
+    assert!(row.delivered_at.is_none());
+    assert!(row.owner_invocation_uuid.is_none());
+    assert!(row.target_kind.is_none() && row.target_id.is_none());
+    assert!(row.payload_file_path.is_none());
+    assert!(row.payload_sha256.is_none() && row.payload_byte_len.is_none());
+    assert!(
+        retained
+            .read_exact_mailbox_row(source_generation, "wrong-recipient", seq)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        retained
+            .read_exact_mailbox_row("changed-generation", "old-pending", seq)
+            .is_err()
+    );
+    let (listeners, projected_sources, recipient_grants): (i64, i64, i64) = side
+        .query_row(
+            "SELECT
+             (SELECT COUNT(*) FROM completion_event_listener WHERE mailbox_seq=?1),
+             (SELECT COUNT(*) FROM completion_continuation_source WHERE event_id=?2),
+             (SELECT COUNT(*) FROM broker_native_recipient_grant WHERE row_seq=?1)
+             +(SELECT COUNT(*) FROM broker_v2_recipient_grant WHERE row_seq=?1)",
+            rusqlite::params![seq, row.handle],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!((listeners, projected_sources, recipient_grants), (0, 0, 0));
+    let (session_runtime, wake_claim): (i64, i64) = side
+        .query_row(
+            "SELECT
+             (SELECT COUNT(*) FROM session_runtime WHERE session_id=?1),
+             (SELECT COUNT(*) FROM session_wake_claim WHERE session_id=?1)",
+            [&row.session_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((session_runtime, wake_claim), (0, 0));
+    let state = rusqlite::Connection::open_with_flags(
+        state_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let state_sources: i64 = state
+        .query_row(
+            "SELECT COUNT(*) FROM invocation_completion_v2_identity WHERE handle=?1",
+            [&row.handle],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(state_sources, 0);
+    let historical = rusqlite::Connection::open_with_flags(
+        historical_sidecar,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let historical_rows: i64 = historical
+        .query_row(
+            "SELECT COUNT(*) FROM mailbox WHERE session_id=?1 AND handle=?2",
+            rusqlite::params![row.session_id, row.handle],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(historical_rows, 0, "row came from historical copy");
+    serde_json::json!({
+        "seq": seq,
+        "session_id": row.session_id,
+        "kind": row.kind,
+        "handle": row.handle,
+        "phase": "pending_no_delivery_attempt",
+        "delivery_attempts": row.delivery_attempts,
+        "inline_payload_sha256": format!("{:x}", Sha256::digest(row.payload_json.as_bytes())),
+        "retained_payload_sha256": row.payload_sha256,
+        "owner_invocation_uuid": row.owner_invocation_uuid,
+        "target_kind": row.target_kind,
+        "target_id": row.target_id,
+        "listener_count": listeners,
+        "sidecar_source_count": projected_sources,
+        "state_source_count": state_sources,
+        "recipient_grant_count": recipient_grants,
+        "session_runtime_count": session_runtime,
+        "wake_claim_count": wake_claim,
+        "historical_copy_row_count": historical_rows,
+        "source": "private fixture INSERT after v29 copy",
+    })
+}
+
 fn assert_pending_notify_without_delivery(broker_state: &Path) {
     let fresh = rusqlite::Connection::open_with_flags(
         broker_state.join("v30/sidecar/pid-identity.db"),
@@ -9816,6 +9950,16 @@ fn inner() {
                                             proof["owner_close_inventory"]["deliverable_mailbox_rows"],
                                             1
                                         );
+                                        let mailbox_diagnostic = read_owner_mailbox_diagnostic(
+                                            &broker_state,
+                                            &historical_sidecar,
+                                            &data.join("state.db"),
+                                            &custody.source_generation,
+                                            custody.row_seq,
+                                        );
+                                        eprintln!(
+                                            "owner mailbox exact row diagnostic: {mailbox_diagnostic}"
+                                        );
                                         assert_eq!(
                                             proof["owner_close_inventory"]["source_effect"]["accepted"],
                                             1
@@ -9901,6 +10045,17 @@ fn inner() {
                                         assert_eq!(
                                             restored["owner_close_inventory"],
                                             proof["owner_close_inventory"]
+                                        );
+                                        assert_eq!(
+                                            read_owner_mailbox_diagnostic(
+                                                &broker_state,
+                                                &historical_sidecar,
+                                                &data.join("state.db"),
+                                                &custody.source_generation,
+                                                custody.row_seq,
+                                            ),
+                                            mailbox_diagnostic,
+                                            "Broker restart changed exact pending row"
                                         );
                                         eprintln!("root PID1 drain restart readback: {}", restored);
                                     }
