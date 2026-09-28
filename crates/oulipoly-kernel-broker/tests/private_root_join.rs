@@ -39,6 +39,40 @@ fn stop(child: &mut Child) {
     let _ = child.wait();
 }
 
+fn normal_root_record(state: &Path, root_id: &str) -> RootRecord {
+    serde_json::from_slice(&fs::read(state.join(format!("{root_id}.json"))).unwrap()).unwrap()
+}
+
+fn normal_drain(socket: &Path, root: &RootRecord, fence: bool) -> serde_json::Value {
+    let reply = protocol::root_drain_readback_at(socket, root, fence).unwrap();
+    serde_json::from_str(reply.strip_prefix("root-drain-v1 ").unwrap()).unwrap()
+}
+
+fn close_normal_root(socket: &Path, state: &Path, root_id: &str, owner: &str) {
+    let root = normal_root_record(state, root_id);
+    let fenced = normal_drain(socket, &root, true);
+    assert_eq!(fenced["fenced"], true);
+    assert_eq!(fenced["normal"]["physical"]["state"], "drained");
+    assert_eq!(fenced["normal"]["publication"]["state"], "settled");
+    protocol::root_pid1_drain_at(socket, &root).unwrap();
+    eventually(|| normal_drain(socket, &root, false)["pid1_parent_wait_proof"] == true);
+    let drained = normal_drain(socket, &root, false);
+    assert_eq!(drained["owner_close_preflight"], true, "{drained}");
+    let intent = protocol::owner_close_intent_at(socket, &root, owner, true).unwrap();
+    assert_eq!(intent.root, root);
+    let closed = protocol::owner_close_at(socket, &root, owner, true).unwrap();
+    assert_eq!(closed.root_id, root_id);
+    assert_eq!(closed.owner_generation, owner);
+    assert_eq!(
+        protocol::owner_close_at(socket, &root, owner, false).unwrap(),
+        closed
+    );
+    assert_eq!(
+        normal_drain(socket, &root, false)["owner_close_proof"]["root_id"],
+        root_id
+    );
+}
+
 fn bash_retention_check(bash: &str, registration: &str) -> String {
     let output = Command::new(bash)
         .args(["__age319-private-source-retention-check-v1", registration])
@@ -2470,7 +2504,10 @@ fn inner() {
     };
     // The real F-turn starts with the historical copy as it is. The separate
     // debt mode adds a synthetic, undeliverable old row for the negative case.
-    if handoff_mode && mode != "normal_model_provider_native_codex_f_turn" {
+    if (handoff_mode && mode != "normal_model_provider_native_codex_f_turn" && !featureless_normal)
+        || (featureless_normal
+            && std::env::var_os("AGE319_TEST_FEATURELESS_OLD_PENDING_V1").is_some())
+    {
         let sidecar =
             rusqlite::Connection::open(broker_state.join("sidecar/pid-identity.db")).unwrap();
         sidecar
@@ -3318,6 +3355,173 @@ fn inner() {
                 .is_err(),
                 "a non-actor read the caller result"
             );
+            if std::env::var_os("AGE319_TEST_FEATURELESS_SEQUENTIAL_V1").is_some() {
+                let first_root = released.old_release.prepared.root_id.clone();
+                let first_owner = released.old_release.prepared.owner_generation.clone();
+                let launch_second = |output: &Path, errors: &Path| {
+                    Command::new(&runner)
+                        .args(["--model", "fixture-model", "hello fixture"])
+                        .env("OULIPOLY_DATA_DIR", &data)
+                        .env("OULIPOLY_CONFIG_HOME", &config_home)
+                        .env("OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1", "1")
+                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+                        .env("AGE319_EFFECT_FILE", &normal_effect)
+                        .stdout(Stdio::from(File::create(output).unwrap()))
+                        .stderr(Stdio::from(File::create(errors).unwrap()))
+                        .spawn()
+                        .unwrap()
+                };
+                let denied_out = temp.path().join("second-before-close.out");
+                let denied_err = temp.path().join("second-before-close.err");
+                let denied = launch_second(&denied_out, &denied_err).wait().unwrap();
+                assert!(!denied.success(), "second E reserved before first close");
+                assert_eq!(
+                    fs::read_dir(broker_state.join("entries")).unwrap().count(),
+                    1
+                );
+                assert_eq!(fs::read_to_string(&normal_effect).unwrap(), "one\n");
+                if partial || lost {
+                    let root = normal_root_record(&broker_state, &first_root);
+                    let blocked = normal_drain(&socket, &root, true);
+                    assert_eq!(blocked["normal"]["physical"]["state"], "drained");
+                    assert_eq!(blocked["normal"]["publication"]["state"], "unknown");
+                    assert!(protocol::root_pid1_drain_at(&socket, &root).is_err());
+                    assert_ne!(blocked["owner_close_preflight"], true);
+                    assert!(
+                        protocol::owner_close_intent_at(&socket, &root, &first_owner, true)
+                            .is_err()
+                    );
+                } else {
+                    let root = normal_root_record(&broker_state, &first_root);
+                    if std::env::var_os("AGE319_TEST_FEATURELESS_OLD_PENDING_V1").is_some() {
+                        normal_drain(&socket, &root, true);
+                        protocol::root_pid1_drain_at(&socket, &root).unwrap();
+                        eventually(|| {
+                            normal_drain(&socket, &root, false)["pid1_parent_wait_proof"] == true
+                        });
+                        let blocked = normal_drain(&socket, &root, false);
+                        assert_eq!(
+                            blocked["owner_close_inventory"]["deliverable_mailbox_rows"],
+                            1
+                        );
+                        assert_ne!(blocked["owner_close_preflight"], true);
+                        assert!(
+                            protocol::owner_close_intent_at(&socket, &root, &first_owner, true)
+                                .is_err()
+                        );
+                        let denied = launch_second(&denied_out, &denied_err).wait().unwrap();
+                        assert!(!denied.success());
+                        assert_eq!(
+                            fs::read_dir(broker_state.join("entries")).unwrap().count(),
+                            1
+                        );
+                    } else {
+                        close_normal_root(&socket, &broker_state, &first_root, &first_owner);
+                        stop(&mut broker);
+                        let restart_log = temp.path().join("normal-closed-restart.log");
+                        broker = restart_source_broker(
+                            &socket,
+                            &broker_state,
+                            &runner,
+                            &gate,
+                            &restart_log,
+                        );
+                        assert_eq!(
+                            protocol::owner_close_at(&socket, &root, &first_owner, false)
+                                .unwrap()
+                                .root_id,
+                            first_root
+                        );
+                        let second_out = temp.path().join("second-normal.out");
+                        let second_err = temp.path().join("second-normal.err");
+                        let status = launch_second(&second_out, &second_err).wait().unwrap();
+                        assert_eq!(
+                            status.code(),
+                            Some(if nonzero { 17 } else { 0 }),
+                            "second: {} broker: {}",
+                            fs::read_to_string(&second_err).unwrap(),
+                            fs::read_to_string(&restart_log).unwrap_or_default()
+                        );
+                        assert_eq!(
+                            fs::read(&second_out).unwrap(),
+                            if binary {
+                                b"\xff\0normal-provider-out:hello fixture".as_slice()
+                            } else {
+                                b"normal-provider-out:hello fixture".as_slice()
+                            }
+                        );
+                        assert_eq!(
+                            fs::read(&second_err).unwrap(),
+                            if binary {
+                                b"\0\xffnormal-provider-err\n".as_slice()
+                            } else {
+                                b"normal-provider-err\n".as_slice()
+                            }
+                        );
+                        assert_eq!(fs::read_to_string(&normal_effect).unwrap(), "one\none\n");
+                        let roots: Vec<_> = fs::read_dir(broker_state.join("entries"))
+                            .unwrap()
+                            .map(|entry| {
+                                entry
+                                    .unwrap()
+                                    .file_name()
+                                    .to_string_lossy()
+                                    .trim_end_matches(".json")
+                                    .to_owned()
+                            })
+                            .collect();
+                        assert_eq!(roots.len(), 2);
+                        let second_root = roots.into_iter().find(|id| id != &first_root).unwrap();
+                        let lane = FreshV30Lane::open_at(&broker_state).unwrap();
+                        let (second_release, _) =
+                            lane.released_handoff_for_root(&second_root).unwrap();
+                        let second_owner = second_release.old_release.prepared.owner_generation;
+                        assert_ne!(second_root, first_root);
+                        assert_ne!(second_owner, first_owner);
+                        let state =
+                            rusqlite::Connection::open(broker_state.join("v30/state.db")).unwrap();
+                        let second_k: String = state.query_row(
+                            "SELECT json_extract(k_json, '$.admission_id') FROM fresh_normal_provider_k WHERE handoff_id=?1",
+                            [&second_release.handoff_id], |row| row.get(0),
+                        ).unwrap();
+                        assert_ne!(second_k, admission_id);
+                        let second_physical =
+                            broker_state.join("v30/normal-provider").join(&second_k);
+                        assert!(second_physical.join("q.json").exists());
+                        assert!(second_physical.join("caller-settled.json").exists());
+                        close_normal_root(&socket, &broker_state, &second_root, &second_owner);
+                        assert_eq!(
+                            protocol::owner_close_at(&socket, &root, &first_owner, false)
+                                .unwrap()
+                                .root_id,
+                            first_root
+                        );
+                        stop(&mut broker);
+                        let second_restart_log = temp.path().join("second-closed-restart.log");
+                        broker = restart_source_broker(
+                            &socket,
+                            &broker_state,
+                            &runner,
+                            &gate,
+                            &second_restart_log,
+                        );
+                        assert_eq!(
+                            protocol::owner_close_at(&socket, &root, &first_owner, false)
+                                .unwrap()
+                                .root_id,
+                            first_root
+                        );
+                        let second_record = normal_root_record(&broker_state, &second_root);
+                        assert_eq!(
+                            protocol::owner_close_at(&socket, &second_record, &second_owner, false)
+                                .unwrap()
+                                .root_id,
+                            second_root
+                        );
+                    }
+                }
+            }
             stop(&mut broker);
             return;
         }

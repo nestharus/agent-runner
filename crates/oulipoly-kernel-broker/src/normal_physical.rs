@@ -2,9 +2,9 @@
 //! State K precedes the detached supervisor. Only that supervisor can produce
 //! a Q; missing or damaged evidence is unknown and never permits a retry.
 
-use oulipoly_kernel_broker::identity::{PinnedProcess, install_detached_host_proc};
-use oulipoly_kernel_broker::normal_model_selection;
-use oulipoly_kernel_broker::normal_plan_custody;
+use crate::identity::{PinnedProcess, install_detached_host_proc};
+use crate::normal_model_selection;
+use crate::normal_plan_custody;
 use oulipoly_runtime::executor::cli::fresh_remote::FreshProviderPlan;
 use oulipoly_state::mailbox::{
     FreshNormalExecutablePlan, FreshNormalProviderAdmission, FreshNormalProviderK,
@@ -71,7 +71,7 @@ struct ParentWait {
     pid1_wait_status: i32,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PhysicalReadback {
     pub k: FreshNormalProviderK,
@@ -103,6 +103,7 @@ pub struct PublicationReadback {
     pub admission_id: String,
     pub plan_sha256: String,
     pub exit_code: Option<u8>,
+    pub publication_sha256: Option<String>,
 }
 
 fn stamp(process: &PinnedProcess) -> FreshRecipientIdentity {
@@ -267,6 +268,7 @@ pub fn launch(
     state_root: &Path,
     uid: u32,
     gid: u32,
+    private_fixture: bool,
 ) -> io::Result<PhysicalReadback> {
     let root = PinnedProcess::open(receipt.old_release.prepared.root_init.host_pid)?;
     let actor = exact_process(actor_identity)?;
@@ -319,7 +321,7 @@ pub fn launch(
         uid,
         gid,
         groups: actor.supplementary_groups()?,
-        private_fixture: super::private_fixture(),
+        private_fixture,
         config_directory: fs::read_link(format!("/proc/self/fd/{}", config_dir.as_raw_fd()))?,
         executable: materialized.executable,
         cwd: materialized.cwd,
@@ -478,7 +480,12 @@ fn publication_readback(
         .into(),
         admission_id: expected.k.admission_id.clone(),
         plan_sha256: expected.k.plan_sha256.clone(),
-        exit_code: settled.map(|value| value.exit_code),
+        exit_code: settled.as_ref().map(|value| value.exit_code),
+        publication_sha256: settled
+            .as_ref()
+            .map(|value| serde_json::to_vec(value))
+            .transpose()?
+            .map(|bytes| format!("{:x}", Sha256::digest(bytes))),
     })
 }
 
@@ -504,7 +511,10 @@ pub fn publish(
     state_root: &Path,
     stdout: &mut File,
     stderr: &mut File,
+    private_fixture: bool,
 ) -> io::Result<PublicationReadback> {
+    #[cfg(not(feature = "age319-private-broker-fixture"))]
+    let _ = private_fixture;
     let read = observe(lane, receipt, actor, session, state_root)?
         .ok_or_else(|| io::Error::other("normal caller K absent"))?;
     let expected = publication_intent(receipt, actor, session, &read)?;
@@ -522,15 +532,13 @@ pub fn publish(
         return Err(error);
     }
     #[cfg(feature = "age319-private-broker-fixture")]
-    if super::private_fixture() && std::env::var_os("AGE319_TEST_NORMAL_CALLER_LOST_V1").is_some() {
+    if private_fixture && std::env::var_os("AGE319_TEST_NORMAL_CALLER_LOST_V1").is_some() {
         return Err(io::Error::other(
             "private caller write lost after reservation",
         ));
     }
     #[cfg(feature = "age319-private-broker-fixture")]
-    if super::private_fixture()
-        && std::env::var_os("AGE319_TEST_NORMAL_CALLER_PARTIAL_V1").is_some()
-    {
+    if private_fixture && std::env::var_os("AGE319_TEST_NORMAL_CALLER_PARTIAL_V1").is_some() {
         stdout.write_all(b"n")?;
         return Err(io::Error::other(
             "private caller write partial after reservation",

@@ -4,6 +4,7 @@
 use crate::accepted_grant::{GrantRecord, GrantRegistry};
 use crate::entry_registry::{EntryRegistry, ProcessStamp};
 use crate::identity::{ChildExit, observed_incarnation_gone};
+use crate::normal_physical::{self, PhysicalReadback, PublicationReadback};
 use crate::registry::{OwnerCloseIntent, RootRecord, RootRegistry};
 use crate::source_physical::SourcePhysicalRegistry;
 use crate::work_registry::{LiveWork, WorkRecord, WorkRegistry};
@@ -36,6 +37,15 @@ pub struct RootPhysicalCloseProof {
     pub source_physical_records: usize,
     pub source_physical_retired: usize,
     pub source_effect: BrokerSourceEffectObligations,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normal: Option<NormalRootEvidence>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NormalRootEvidence {
+    pub physical: PhysicalReadback,
+    pub publication: PublicationReadback,
 }
 
 /// The registries recheck the exact Q and both native ACK seals on every
@@ -57,18 +67,29 @@ pub fn physical_close_proof(inventory: &RootDrainInventory) -> io::Result<RootPh
         || inventory.spent_without_work != 0
         || inventory.live_works != 0
         || inventory.work_debt != 0
-        || inventory.work_records == 0
+        || (inventory.normal.is_none() && inventory.work_records == 0)
         || inventory.work_retired != inventory.work_records
         || inventory.work_outstanding != 0
         || inventory.native_prepared != 0
         || inventory.native_spent != 0
-        || inventory.source_physical_records != 1
-        || inventory.source_physical_retired != 1
+        || (inventory.normal.is_none() && inventory.source_physical_records != 1)
+        || inventory.source_physical_retired != inventory.source_physical_records
         || inventory.source_physical_outstanding != 0
         || inventory.source_effect_readback_uncertain
         || inventory.uncertain_registry_or_incarnation
         || source_effect.unsettled() != 0
-        || source_effect.accepted != 1
+        || (inventory.normal.is_none() && source_effect.accepted != 1)
+        || (inventory.normal.is_some()
+            && (source_effect.accepted != 0
+                || inventory.work_records != 0
+                || inventory.source_physical_records != 0))
+        || inventory.normal_uncertain
+        || inventory.normal.as_ref().is_some_and(|normal| {
+            normal.physical.state != "drained"
+                || normal.physical.q.is_none()
+                || normal.publication.state != "settled"
+                || normal.publication.publication_sha256.is_none()
+        })
     {
         return Err(io::Error::other("owner close physical Q/ACK proof changed"));
     }
@@ -85,6 +106,7 @@ pub fn physical_close_proof(inventory: &RootDrainInventory) -> io::Result<RootPh
         source_physical_records: inventory.source_physical_records,
         source_physical_retired: inventory.source_physical_retired,
         source_effect: source_effect.clone(),
+        normal: inventory.normal.clone(),
     })
 }
 
@@ -134,6 +156,8 @@ pub struct RootDrainInventory {
     /// exact owner/incarnation could not be read, including an absent sidecar.
     pub source_effect: Option<BrokerSourceEffectObligations>,
     pub source_effect_readback_uncertain: bool,
+    pub normal: Option<NormalRootEvidence>,
+    pub normal_uncertain: bool,
     /// Exact State/retained-sidecar debt preview for the released owner. The
     /// fresh lane and a State writer fence are still required for close.
     pub owner_close_inventory: Option<BrokerOwnerCloseInventory>,
@@ -344,13 +368,93 @@ pub fn readback(
         }
     }
     let entry = entries.record(&expected.root_id);
+    // A normal --model root has one State K and a broker-owned Q instead of
+    // source/work grants. Read it only through the exact released D/actor.
+    let normal_read = (|| -> io::Result<Option<NormalRootEvidence>> {
+        let Some(lane) = lane.as_ref() else {
+            return Ok(None);
+        };
+        let Ok((handoff, actor)) = lane.released_handoff_for_root(&expected.root_id) else {
+            return Ok(None);
+        };
+        let session = lane
+            .read_session(&handoff.d_key)
+            .map_err(io::Error::other)?
+            .ok_or_else(|| io::Error::other("normal root session absent"))?;
+        if !lane
+            .normal_provider_k_present(&handoff, &actor, &session)
+            .map_err(io::Error::other)?
+        {
+            return Ok(None);
+        }
+        let prepared = &handoff.old_release.prepared;
+        let same = |entry: &ProcessStamp, prepared: &PreparedProcessStamp| {
+            entry.host_pid == prepared.host_pid
+                && entry.boot_id == prepared.boot_id
+                && entry.starttime_ticks == prepared.starttime_ticks
+                && entry.pidns_dev == prepared.pidns_dev
+                && entry.pidns_ino == prepared.pidns_ino
+        };
+        if handoff.old_release.prepared.root_id != expected.root_id
+            || prepared.owner_uid != expected.owner_uid
+            || handoff.old_release.prepared.root_init.host_pid != expected.init_host_pid
+            || handoff.old_release.prepared.root_init.boot_id != expected.boot_id
+            || handoff.old_release.prepared.root_init.starttime_ticks
+                != expected.init_starttime_ticks
+            || prepared.root_init.pidns_dev != expected.pidns_dev
+            || prepared.root_init.pidns_ino != expected.pidns_ino
+            || entry.is_none_or(|entry| {
+                !same(&entry.entry, &prepared.entry)
+                    || entry
+                        .guardian
+                        .as_ref()
+                        .is_none_or(|stamp| !same(stamp, &prepared.guardian))
+                    || entry
+                        .prepared_driver
+                        .as_ref()
+                        .is_none_or(|stamp| !same(stamp, &prepared.driver))
+            })
+            || entry
+                .and_then(|entry| entry.joined_child.as_ref())
+                .is_none_or(|joined| {
+                    joined.host_pid != actor.host_pid
+                        || joined.boot_id != actor.boot_id
+                        || joined.starttime_ticks != actor.starttime_ticks
+                        || joined.pidns_dev != actor.pidns_dev
+                        || joined.pidns_ino != actor.pidns_ino
+                })
+        {
+            return Err(io::Error::other("normal root/actor identity changed"));
+        }
+        let physical =
+            normal_physical::observe(lane, &handoff, &actor, &session, works.broker_root()?)?
+                .ok_or_else(|| io::Error::other("normal root K absent"))?;
+        let publication = normal_physical::observe_publication(
+            lane,
+            &handoff,
+            &actor,
+            &session,
+            works.broker_root()?,
+        )?;
+        Ok(Some(NormalRootEvidence {
+            physical,
+            publication,
+        }))
+    })();
+    let normal_uncertain = normal_read.is_err();
+    let normal = normal_read.ok().flatten();
     let entry_unsettled = entry.is_none_or(|entry| entry.terminal_settlement.is_none());
     let entry_physical_settled = entry.is_some_and(|entry| {
         entry.join_consumed
-            && source_records.len() == 1
-            && entry.joined_child.as_ref() == Some(&source_records[0].joined_child)
-            && entry.prepared_driver.as_ref() == Some(&source_records[0].driver)
-            && entry.guardian.as_ref() == Some(&source_records[0].guardian)
+            && ((source_records.len() == 1
+                && entry.joined_child.as_ref() == Some(&source_records[0].joined_child)
+                && entry.prepared_driver.as_ref() == Some(&source_records[0].driver)
+                && entry.guardian.as_ref() == Some(&source_records[0].guardian))
+                || (normal.is_some()
+                    && source_records.is_empty()
+                    && entry.joined_child.is_some()
+                    && entry.prepared_driver.is_some()
+                    && entry.guardian.is_some()))
     });
     let entry_original_exited = entry
         .and_then(|entry| entry.joined_child.as_ref())
@@ -364,8 +468,10 @@ pub fn readback(
             .unwrap_or(false)
         });
     let pid1_receipt = roots.pid1_echild_receipt(expected);
+    // Historical proof stays scoped to this root. Later roots are checked
+    // independently by the all-entry E gate; their debt cannot rewrite this
+    // root's immutable Q, PID1 receipt, or owner certificate.
     let uncertain_registry_or_incarnation = pid1_receipt.is_err()
-        || roots.has_unrelated_debt(expected)
         || works.has_uncertain_write()
         || work_retirement_uncertain
         || grants.has_debt()
@@ -453,6 +559,8 @@ pub fn readback(
         source_physical_outstanding,
         source_effect,
         source_effect_readback_uncertain,
+        normal,
+        normal_uncertain,
         owner_close_inventory,
         uncertain_registry_or_incarnation,
         state_sidecar_outstanding_unknown: true,
@@ -509,12 +617,25 @@ pub fn ready_for_owner_close_preflight(
         .state_cursor
         .as_ref()
         .ok_or_else(|| io::Error::other("owner close State cursor absent"))?;
+    let normal = inventory.normal.as_ref().is_some_and(|normal| {
+        normal.physical.state == "drained"
+            && normal.physical.q.is_some()
+            && normal.publication.state == "settled"
+            && normal.publication.publication_sha256.is_some()
+            && inventory.work_records == 0
+            && inventory.source_physical_records == 0
+            && owner.source_effect.accepted == 0
+    });
     if inventory.root_id != expected_root_id
         || owner.root_id != expected_root_id
         || owner.owner_generation != expected_owner_generation
         || owner.source_generation.is_empty()
-        || cursor.authority_ordinal <= 0
-        || cursor.admission_id.is_empty()
+        || cursor.authority_ordinal < 0
+        || (cursor.authority_ordinal == 0
+            && (cursor.admission_id != "no-completion-continuity"
+                || cursor.continuity_digest
+                    != "0000000000000000000000000000000000000000000000000000000000000000"))
+        || (cursor.authority_ordinal > 0 && cursor.admission_id.is_empty())
         || cursor.continuity_digest.len() != 64
         || !cursor
             .continuity_digest
@@ -535,19 +656,20 @@ pub fn ready_for_owner_close_preflight(
         || inventory.spent_without_work != 0
         || inventory.live_works != 0
         || inventory.work_debt != 0
-        || inventory.work_records == 0
+        || (!normal && inventory.work_records == 0)
         || inventory.work_retired != inventory.work_records
         || inventory.work_outstanding != 0
         || inventory.native_prepared != 0
         || inventory.native_spent != 0
-        || inventory.source_physical_records != 1
-        || inventory.source_physical_retired != 1
+        || (!normal && inventory.source_physical_records != 1)
+        || inventory.source_physical_retired != inventory.source_physical_records
         || inventory.source_physical_outstanding != 0
         || inventory.source_effect_readback_uncertain
+        || inventory.normal_uncertain
         || inventory.uncertain_registry_or_incarnation
         || inventory.source_effect.as_ref() != Some(&owner.source_effect)
         || owner.source_effect.unsettled() != 0
-        || owner.source_effect.accepted != 1
+        || (!normal && owner.source_effect.accepted != 1)
         || owner.state_projection_pending
         || owner.state_native_channel_pending
         || owner.state_cancelling_native_attempts != 0
@@ -568,6 +690,14 @@ pub fn ready_for_owner_close_preflight(
 /// fenced readback revalidates every retained source and child work seal.
 /// Zero records and an empty count alone cannot authorize PID1 exit.
 pub fn ready_for_pid1_request(inventory: &RootDrainInventory) -> io::Result<()> {
+    let normal = inventory.normal.as_ref().is_some_and(|normal| {
+        normal.physical.state == "drained"
+            && normal.physical.q.is_some()
+            && normal.publication.state == "settled"
+            && normal.publication.publication_sha256.is_some()
+            && inventory.work_records == 0
+            && inventory.source_physical_records == 0
+    });
     if !inventory.fenced
         || !inventory.entry_physical_settled
         || !inventory.entry_original_exited
@@ -575,19 +705,20 @@ pub fn ready_for_pid1_request(inventory: &RootDrainInventory) -> io::Result<()> 
         || inventory.spent_without_work != 0
         || inventory.live_works != 0
         || inventory.work_debt != 0
-        || inventory.work_records == 0
+        || (!normal && inventory.work_records == 0)
         || inventory.work_outstanding != 0
         || inventory.work_retired != inventory.work_records
         || inventory.native_prepared != 0
         || inventory.native_spent != 0
-        || inventory.source_physical_records == 0
+        || (!normal && inventory.source_physical_records == 0)
         || inventory.source_physical_outstanding != 0
         || inventory.source_physical_retired != inventory.source_physical_records
         || inventory.source_effect_readback_uncertain
+        || inventory.normal_uncertain
         || inventory
             .source_effect
             .as_ref()
-            .is_none_or(|effect| effect.unsettled() != 0)
+            .is_none_or(|effect| effect.unsettled() != 0 || (normal && effect.accepted != 0))
         || inventory.uncertain_registry_or_incarnation
         || !inventory.pid1_exact_live
     {
@@ -634,6 +765,8 @@ mod tests {
             source_physical_outstanding: 0,
             source_effect: Some(effect.clone()),
             source_effect_readback_uncertain: false,
+            normal: None,
+            normal_uncertain: false,
             owner_close_inventory: Some(BrokerOwnerCloseInventory {
                 source_generation: "source".into(),
                 root_id: "root".into(),

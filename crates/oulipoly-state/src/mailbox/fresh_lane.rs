@@ -2118,6 +2118,25 @@ impl FreshV30Lane {
         Ok((retained, inserted))
     }
 
+    /// Distinguish the normal physical route from a released root whose work
+    /// uses another K. Presence is not a Q or caller-result certificate.
+    pub fn normal_provider_k_present(
+        &self,
+        receipt: &FreshReleasedHandoff,
+        actor: &FreshRecipientIdentity,
+        session: &FreshV30Session,
+    ) -> Result<bool, String> {
+        self.require_released_invocation(receipt, actor, session)?;
+        let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        state
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM fresh_normal_provider_k WHERE handoff_id=?1)",
+                [&receipt.handoff_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| error.to_string())
+    }
+
     pub fn read_normal_provider_k(
         &self,
         receipt: &FreshReleasedHandoff,
