@@ -814,9 +814,8 @@ fn recv_request(
         }
         #[cfg(feature = "age319-private-broker-fixture")]
         b'#' | b'{' | b'}' | b']' | b'|' | b'~' | b'?' => (18..=2048 + 17).contains(&read),
-        b'@' | b'[' | 0x7f | 0x80 | 0x81 | 0x82 | 0x83 | 0x84 | 0x85 | 0x86 | 0x87 => {
-            (18..=2048 + 17).contains(&read)
-        }
+        b'@' | b'[' | 0x7f | 0x80 | 0x81 | 0x82 | 0x83 | 0x84 | 0x85 | 0x86 | 0x87 | 0x88
+        | 0x89 => (18..=2048 + 17).contains(&read),
         b'F' => (18..=8192 + 17).contains(&read),
         b'O' => (18..=1024 + 17).contains(&read),
         b'U' => (18..=512 + 17).contains(&read),
@@ -835,7 +834,7 @@ fn recv_request(
             b'k' => descriptors.len() != 4,
             b'K' => descriptors.len() != 7,
             0x84 | 0x85 => descriptors.len() != 1,
-            0x86 | 0x87 => descriptors.len() != 3,
+            0x86 | 0x87 | 0x88 | 0x89 => descriptors.len() != 3,
             #[cfg(feature = "age319-private-broker-fixture")]
             b'5' | b'b' => descriptors.len() != 4,
             #[cfg(feature = "age319-private-broker-fixture")]
@@ -897,7 +896,7 @@ fn recv_request(
             request: serde_json::from_slice(&request[17..read as usize])?,
             config_dir: descriptors.into_iter().next().unwrap(),
         },
-        0x86 | 0x87 => {
+        0x86 | 0x87 | 0x88 | 0x89 => {
             let mut descriptors = descriptors.into_iter();
             RequestPayload::FreshNormalPlanRequest {
                 request: serde_json::from_slice(&request[17..read as usize])?,
@@ -7613,7 +7612,7 @@ fn serve_fresh_v30_at(
                         serde_json::to_string(&selection)?
                     ))
                 }
-                0x86 | 0x87 => {
+                0x86 | 0x87 | 0x88 | 0x89 => {
                     let RequestPayload::FreshNormalPlanRequest {
                         request,
                         config_dir,
@@ -7628,7 +7627,7 @@ fn serve_fresh_v30_at(
                             "normal plan request cannot return an effect",
                         ));
                     }
-                    if operation == 0x86 && instance.is_closed() {
+                    if matches!(operation, 0x86 | 0x88) && instance.is_closed() {
                         return Err(io::Error::other("normal plan gate closed"));
                     }
                     let receipt = lane
@@ -7688,6 +7687,12 @@ fn serve_fresh_v30_at(
                             &environment,
                         )? {
                             Some(plan) => plan,
+                            None if operation == 0x89 => {
+                                return Ok("fresh-normal-admission absent\n".into());
+                            }
+                            None if operation == 0x88 => {
+                                return Err(io::Error::other("normal admission plan absent"));
+                            }
                             None => return Ok("fresh-normal-plan absent\n".into()),
                         }
                     };
@@ -7712,6 +7717,47 @@ fn serve_fresh_v30_at(
                         return Err(io::Error::other("normal plan actor changed"));
                     }
                     live.verify()?;
+                    if matches!(operation, 0x88 | 0x89) {
+                        let _admission_guard = if operation == 0x88 {
+                            let guard = admission_fences
+                                .lock()
+                                .map_err(|_| io::Error::other("root admission fence poisoned"))?;
+                            if guard.contains(&receipt.old_release.prepared.root_id) {
+                                return Err(io::Error::other("exact root admission fenced"));
+                            }
+                            Some(guard)
+                        } else {
+                            None
+                        };
+                        let admission = if operation == 0x88 {
+                            lane.admit_normal_provider_plan(&receipt, &recipient, &session, &plan)
+                                .map(Some)
+                                .map_err(io::Error::other)?
+                        } else {
+                            lane.read_normal_provider_admission(&receipt, &recipient, &session)
+                                .map_err(io::Error::other)?
+                        };
+                        if oulipoly_kernel_broker::normal_plan_custody::observe(
+                            &lane,
+                            &receipt,
+                            &recipient,
+                            &session,
+                            &config_dir,
+                            &cwd,
+                            &environment,
+                        )? != Some(plan.clone())
+                        {
+                            return Err(io::Error::other("normal admission plan changed"));
+                        }
+                        live.verify()?;
+                        return match admission {
+                            Some(admission) => Ok(format!(
+                                "fresh-normal-admission {}\n",
+                                serde_json::to_string(&admission)?
+                            )),
+                            None => Ok("fresh-normal-admission absent\n".into()),
+                        };
+                    }
                     Ok(format!(
                         "fresh-normal-plan {}\n",
                         serde_json::to_string(&plan)?

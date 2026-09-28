@@ -2277,6 +2277,28 @@ fn prepare_normal_work(
         if plan.selection != selection || plan.state != "planned_no_effect" {
             return Err("normal executable plan differs from selected invocation".into());
         }
+        let admission =
+            protocol::admit_fresh_normal_provider_at(&socket, &receipt.d_key, descriptors)
+                .or_else(|admission_error| {
+                    match protocol::observe_fresh_normal_provider_admission_at(
+                        &socket,
+                        &receipt.d_key,
+                        descriptors,
+                    ) {
+                        Ok(Some(value)) => Ok(value),
+                        Ok(None) => Err(admission_error),
+                        Err(readback_error) => Err(std::io::Error::other(format!(
+                            "{admission_error}; exact admission readback refused: {readback_error}",
+                        ))),
+                    }
+                })
+                .map_err(|e| format!("normal provider admission refused: {e}"))?;
+        if admission.handoff_id != receipt.handoff_id
+            || admission.plan_sha256 != plan.plan_sha256
+            || admission.state != "admitted_no_effect"
+        {
+            return Err("normal provider admission differs from retained plan".into());
+        }
     }
     #[cfg(feature = "age319-private-broker-fixture")]
     if std::env::var_os("AGE319_PRIVATE_NORMAL_ROOT_V1").is_some() {
@@ -2318,6 +2340,27 @@ fn prepare_normal_work(
                 .ok_or("private normal plan readback absent")?;
         if plan != retried_plan || plan != repeated_plan || plan.selection != selected {
             return Err("private normal plan readback changed".into());
+        }
+        let admitted =
+            protocol::admit_fresh_normal_provider_at(&socket, &receipt.d_key, descriptors)
+                .map_err(|e| e.to_string())?;
+        let retried =
+            protocol::admit_fresh_normal_provider_at(&socket, &receipt.d_key, descriptors)
+                .map_err(|e| e.to_string())?;
+        let observed = protocol::observe_fresh_normal_provider_admission_at(
+            &socket,
+            &receipt.d_key,
+            descriptors,
+        )
+        .map_err(|e| e.to_string())?
+        .ok_or("private normal admission readback absent")?;
+        if admitted != retried
+            || admitted != observed
+            || admitted.handoff_id != receipt.handoff_id
+            || admitted.plan_sha256 != plan.plan_sha256
+            || admitted.state != "admitted_no_effect"
+        {
+            return Err("private normal admission readback changed".into());
         }
     }
     Ok(model_invocation)

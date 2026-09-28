@@ -13898,10 +13898,40 @@ fn inner() {
                     assert_eq!(plan.plan_sha256.len(), 64);
                     assert_eq!(plan.stdin_len, "hello fixture".len() as u64);
                     assert_eq!(plan.argv.first().map(String::as_str), None);
+                    let admission = settled_lane
+                        .read_normal_provider_admission(&receipt, &actor, &session)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(admission.handoff_id, receipt.handoff_id);
+                    assert_eq!(admission.plan_sha256, plan.plan_sha256);
+                    assert_eq!(admission.state, "admitted_no_effect");
+                    assert_eq!(
+                        settled_lane
+                            .admit_normal_provider_plan(&receipt, &actor, &session, &plan)
+                            .unwrap(),
+                        admission
+                    );
+                    let mut changed_plan = plan.clone();
+                    changed_plan.argv.push("unexpected".into());
+                    assert!(
+                        settled_lane
+                            .admit_normal_provider_plan(&receipt, &actor, &session, &changed_plan,)
+                            .is_err()
+                    );
                     assert_eq!(
                         fresh_state
                             .query_row::<i64, _, _>(
                                 "SELECT count(*) FROM fresh_normal_executable_plan",
+                                [],
+                                |row| row.get(0)
+                            )
+                            .unwrap(),
+                        1
+                    );
+                    assert_eq!(
+                        fresh_state
+                            .query_row::<i64, _, _>(
+                                "SELECT count(*) FROM fresh_normal_provider_admission",
                                 [],
                                 |row| row.get(0)
                             )
@@ -13935,6 +13965,15 @@ fn inner() {
                             .read_normal_executable_plan(&receipt, &swapped_actor.actor, &session)
                             .is_err()
                     );
+                    assert!(
+                        settled_lane
+                            .read_normal_provider_admission(
+                                &receipt,
+                                &swapped_actor.actor,
+                                &session,
+                            )
+                            .is_err()
+                    );
                     let mut swapped_session = session.clone();
                     swapped_session.session_id = uuid::Uuid::new_v4().to_string();
                     assert!(
@@ -13952,6 +13991,11 @@ fn inner() {
                             .read_normal_executable_plan(&receipt, &actor, &swapped_session)
                             .is_err()
                     );
+                    assert!(
+                        settled_lane
+                            .read_normal_provider_admission(&receipt, &actor, &swapped_session)
+                            .is_err()
+                    );
                     let mut swapped_root = receipt.clone();
                     swapped_root.old_release.prepared.root_id = uuid::Uuid::new_v4().to_string();
                     assert!(
@@ -13967,6 +14011,11 @@ fn inner() {
                     assert!(
                         settled_lane
                             .read_normal_executable_plan(&swapped_root, &actor, &session)
+                            .is_err()
+                    );
+                    assert!(
+                        settled_lane
+                            .read_normal_provider_admission(&swapped_root, &actor, &session)
                             .is_err()
                     );
                     let mut malformed = preparation.clone();
@@ -14120,6 +14169,17 @@ fn inner() {
                     );
                 }
                 stop(&mut broker);
+                if mode == "normal_model_held" {
+                    let reopened = FreshV30Lane::open_at(&broker_state).unwrap();
+                    assert_eq!(
+                        reopened
+                            .read_normal_provider_admission(&receipt, &actor, &session)
+                            .unwrap()
+                            .unwrap()
+                            .state,
+                        "admitted_no_effect"
+                    );
+                }
                 return;
             }
             let repair_read = protocol::StateReadSpec {
