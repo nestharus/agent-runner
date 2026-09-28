@@ -509,7 +509,8 @@ pub(crate) fn verify_installed_entry_route() -> Result<(), String> {
         let observation = protocol::observe_installed_pair_at(&broker_socket())
             .map_err(|error| format!("installed pair broker unavailable: {error}"))?;
         require_pair_route(&pair, &observation)?;
-        return require_paired_launch_mode(
+        return require_pair_launch_mode(
+            pair.schema,
             std::env::var_os(REQUIRED_ENV).is_some(),
             std::env::var_os(CHILD_FD_ENV).is_some(),
         );
@@ -538,10 +539,28 @@ fn require_pair_route(
     if pair.version != observed.version || pair.generation != observed.generation {
         return Err("installed broker and Runner generation differ".into());
     }
-    if pair.schema != 1 {
-        return Err("fresh-only installed Runner entry is not yet implemented".into());
+    if pair.schema == 2 {
+        return if observed.route == EntryRoute::FreshOnlyOpen
+            && observed.source_generation.is_some()
+        {
+            Ok(())
+        } else {
+            Err("fresh-only installed Runner requires the activated pair route".into())
+        };
     }
     require_legacy_entry_route(observed.route)
+}
+
+fn require_pair_launch_mode(schema: u8, host_entry: bool, child_entry: bool) -> Result<(), String> {
+    if schema == 2 {
+        if !host_entry && child_entry {
+            Ok(())
+        } else {
+            Err("fresh-only installed Runner requires a broker-owned child gate".into())
+        }
+    } else {
+        require_paired_launch_mode(host_entry, child_entry)
+    }
 }
 
 fn require_paired_launch_mode(host_entry: bool, child_entry: bool) -> Result<(), String> {
@@ -612,6 +631,13 @@ pub(crate) fn child_entry() -> Option<ExitCode> {
             line.push(byte[0]);
         }
         let line = String::from_utf8(line).map_err(|_| "invalid child grant")?;
+        if is_fixed_installed_image(
+            &std::env::current_exe().map_err(|e| format!("cannot identify Runner image: {e}"))?,
+        ) {
+            let pair = InstalledPair::load(std::path::Path::new(installed_pair::MANIFEST), true)
+                .map_err(|e| format!("installed pair manifest unavailable: {e}"))?;
+            require_pair_grant_kind(pair.schema, line.starts_with("v30 "))?;
+        }
         if let Some(versioned) = line.strip_prefix("v30 ") {
             return child_v30_entry(versioned, gate);
         }
@@ -778,6 +804,29 @@ pub(crate) fn child_entry() -> Option<ExitCode> {
             ExitCode::FAILURE
         }
     })
+}
+
+fn require_pair_grant_kind(schema: u8, v30: bool) -> Result<(), String> {
+    if schema == 2 && !v30 {
+        Err("installed child grant does not match pair route".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn require_fresh_grant_source(
+    observation: &protocol::InstalledPairObservation,
+    pair_generation: &str,
+    grant_source: &str,
+) -> Result<(), String> {
+    if observation.route == EntryRoute::FreshOnlyOpen
+        && observation.generation == pair_generation
+        && observation.source_generation.as_deref() == Some(grant_source)
+    {
+        Ok(())
+    } else {
+        Err("installed child grant is not bound to the activated source".into())
+    }
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]
@@ -1692,6 +1741,16 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
         })
     {
         return Err("invalid v30 child grant".into());
+    }
+    if is_fixed_installed_image(
+        &std::env::current_exe().map_err(|e| format!("cannot identify Runner image: {e}"))?,
+    ) {
+        let pair = InstalledPair::load(std::path::Path::new(installed_pair::MANIFEST), true)
+            .map_err(|e| format!("installed pair manifest unavailable: {e}"))?;
+        let observation = protocol::observe_installed_pair_at(&broker_socket())
+            .map_err(|e| format!("installed pair broker unavailable: {e}"))?;
+        require_pair_route(&pair, &observation)?;
+        require_fresh_grant_source(&observation, &pair.generation, fields[0])?;
     }
     let guardian_pid: i32 = fields[5].parse().map_err(|_| "invalid v30 guardian PID")?;
     let spec = protocol::StateReadSpec {
@@ -7487,6 +7546,10 @@ mod tests {
         assert!(require_paired_launch_mode(true, false).is_ok());
         assert!(require_paired_launch_mode(false, true).is_ok());
         assert!(require_paired_launch_mode(true, true).is_err());
+        assert!(require_pair_launch_mode(1, true, false).is_ok());
+        assert!(require_pair_launch_mode(1, false, true).is_ok());
+        assert!(require_pair_grant_kind(1, false).is_ok());
+        assert!(require_pair_grant_kind(1, true).is_ok());
         // An ordinary Tauri .deb GUI path remains outside opt-in pairing.
         assert!(!needs_installed_entry_gate(
             std::path::Path::new("/usr/bin/oulipoly-agent-runner"),
@@ -7510,6 +7573,23 @@ mod tests {
         fresh_pair.schema = 2;
         old.route = EntryRoute::LegacyOpen;
         assert!(require_pair_route(&fresh_pair, &old).is_err());
+        old.route = EntryRoute::FreshOnlyOpen;
+        old.source_generation = None;
+        assert!(require_pair_route(&fresh_pair, &old).is_err());
+        let source = uuid::Uuid::new_v4().to_string();
+        old.source_generation = Some(source.clone());
+        assert!(require_pair_route(&fresh_pair, &old).is_ok());
+        assert!(require_pair_launch_mode(2, false, false).is_err());
+        assert!(require_pair_launch_mode(2, true, false).is_err());
+        assert!(require_pair_launch_mode(2, true, true).is_err());
+        assert!(require_pair_launch_mode(2, false, true).is_ok());
+        assert!(require_pair_grant_kind(2, false).is_err());
+        assert!(require_pair_grant_kind(2, true).is_ok());
+        assert!(require_fresh_grant_source(&old, &pair.generation, &source).is_ok());
+        assert!(require_fresh_grant_source(&old, &source, &source).is_err());
+        assert!(require_fresh_grant_source(&old, &pair.generation, &pair.generation).is_err());
+        old.route = EntryRoute::Draining;
+        assert!(require_fresh_grant_source(&old, &pair.generation, &source).is_err());
     }
 
     #[test]

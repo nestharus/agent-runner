@@ -26,7 +26,7 @@ fn main() {
         std::process::exit(code);
     }
 
-    let result = (|| -> std::io::Result<()> {
+    let result = (|| -> std::io::Result<(String, String, std::io::Result<String>)> {
         let pair = InstalledPair::load(Path::new(installed_pair::MANIFEST), true)?;
         let digest = pair
             .launcher_sha256
@@ -48,16 +48,39 @@ fn main() {
             Path::new(protocol::INSTALLED_SOCKET),
             &captured.spec,
             &descriptors,
-        )?;
-        Err(std::io::Error::other(format!(
-            "broker did not admit entry: {}",
-            response.trim()
-        )))
+        );
+        Ok((captured.spec.request_id, pair.generation, response))
     })();
-    if let Err(error) = result {
-        eprintln!("OULIPOLY_INSTALLED_LAUNCH_GAP={error}");
-        std::process::exit(70);
+    match result {
+        Ok((request_id, generation, Ok(response))) => {
+            if let Some(code) = installed_launch::drained_exit_code(&response, &request_id) {
+                std::process::exit(code as i32);
+            }
+            if response
+                .strip_prefix("error ")
+                .and_then(|body| body.strip_suffix('\n'))
+                .is_some_and(|body| !body.contains('\n'))
+            {
+                eprintln!(
+                    "OULIPOLY_INSTALLED_LAUNCH_GAP=request {request_id}: {}",
+                    response.trim_end()
+                );
+            } else {
+                eprintln!(
+                    "OULIPOLY_INSTALLED_LAUNCH_UNKNOWN=request {request_id} generation {generation}: unrecognized broker outcome"
+                );
+            }
+        }
+        Ok((request_id, generation, Err(error))) => {
+            eprintln!(
+                "OULIPOLY_INSTALLED_LAUNCH_UNKNOWN=request {request_id} generation {generation}: {error}"
+            );
+        }
+        Err(error) => {
+            eprintln!("OULIPOLY_INSTALLED_LAUNCH_GAP={error}");
+        }
     }
+    std::process::exit(70);
 }
 
 #[cfg(target_os = "linux")]
