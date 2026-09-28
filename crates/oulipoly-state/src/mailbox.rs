@@ -57,8 +57,8 @@ pub use broker_authority::{
     BrokerReleaseEvidence, BrokerRepairReadback, BrokerSidecar, BrokerSourceCandidate,
     BrokerSourceEffectGrant, BrokerSourceEffectObligations, BrokerSourceEvidenceReadback,
     BrokerSourceEvidenceSeal, BrokerSourceMaterial, BrokerSourceRetentionRelease,
-    BrokerSourceSelection, BrokerV2RecipientBinding, BrokerV2RecipientGrant, PreparedBrokerOwner,
-    PreparedProcessStamp, QuiescedCutoverProof,
+    BrokerSourceSelection, BrokerStateCloseCursor, BrokerV2RecipientBinding,
+    BrokerV2RecipientGrant, PreparedBrokerOwner, PreparedProcessStamp, QuiescedCutoverProof,
 };
 #[cfg(target_os = "linux")]
 pub use fresh_lane::{
