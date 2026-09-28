@@ -40,6 +40,8 @@ const FRESH_ROOT_H_DELEGATION_SCHEMA: &str =
 const FRESH_BASH_SYNC_PUBLICATION_SCHEMA: &str =
     include_str!("migrations/0040_fresh_bash_sync_publication.sql");
 const FRESH_NORMAL_WORK_SCHEMA: &str = include_str!("migrations/0034_fresh_normal_work.sql");
+const FRESH_NORMAL_MODEL_SELECTION_SCHEMA: &str =
+    include_str!("migrations/0047_fresh_normal_model_selection.sql");
 const FRESH_RECIPIENT_SCHEMA: &str = include_str!("migrations/0030_fresh_recipient.sql");
 const FRESH_RECIPIENT_ACK_SCHEMA: &str = include_str!("migrations/0039_fresh_recipient_ack.sql");
 const FRESH_NATIVE_F_PREPARATION_SCHEMA: &str =
@@ -172,7 +174,8 @@ pub struct FreshNormalWorkPreparation {
 /// A model invocation derived from the broker's held normal-work readback.
 /// This describes the selected CLI shape only; it grants no provider K or
 /// caller-result authority. The root, actor and State bindings remain explicit.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FreshHeadlessModelInvocation {
     pub root_id: String,
     pub owner_generation: String,
@@ -183,6 +186,33 @@ pub struct FreshHeadlessModelInvocation {
     pub model: String,
     pub provider_pin: Option<String>,
     pub prompt: String,
+}
+
+/// A single broker-selected account bound to the held root and the exact
+/// config file identities. This readback has no K, result or effect authority.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreshNormalModelSelection {
+    pub invocation: FreshHeadlessModelInvocation,
+    pub config_sha256: String,
+    pub source: FreshNormalModelSource,
+    pub account: String,
+    pub account_identity: String,
+    pub index: usize,
+    pub total: usize,
+    pub state: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreshNormalModelSource {
+    pub directory_device: u64,
+    pub directory_inode: u64,
+    pub providers_device: u64,
+    pub providers_inode: u64,
+    pub model_device: u64,
+    pub model_inode: u64,
+    pub config_sha256: String,
 }
 
 impl FreshNormalWorkPreparation {
@@ -545,7 +575,7 @@ impl FreshV30Lane {
         let state_conn = Connection::open(&state_path).map_err(|e| e.to_string())?;
         state_conn
             .execute_batch(&format!(
-                "{FRESH_STATE_SCHEMA}\n{FRESH_RECIPIENT_STATE_SCHEMA}\n{FRESH_CHILD_REQUEST_SCHEMA}\n{FRESH_HANDOFF_SCHEMA}\n{FRESH_ROOT_EFFECT_SCHEMA}\n{FRESH_BASH_CHILD_SCHEMA}\n{FRESH_BASH_SOURCE_SCHEMA}\n{FRESH_BASH_NOTIFY_SCHEMA}\n{FRESH_ROOT_TERMINAL_SCHEMA}\n{FRESH_ROOT_CALLER_SETTLEMENT_SCHEMA}\n{FRESH_ROOT_H_DELEGATION_SCHEMA}\n{FRESH_BASH_SYNC_PUBLICATION_SCHEMA}"
+                "{FRESH_STATE_SCHEMA}\n{FRESH_RECIPIENT_STATE_SCHEMA}\n{FRESH_CHILD_REQUEST_SCHEMA}\n{FRESH_HANDOFF_SCHEMA}\n{FRESH_ROOT_EFFECT_SCHEMA}\n{FRESH_BASH_CHILD_SCHEMA}\n{FRESH_BASH_SOURCE_SCHEMA}\n{FRESH_BASH_NOTIFY_SCHEMA}\n{FRESH_ROOT_TERMINAL_SCHEMA}\n{FRESH_ROOT_CALLER_SETTLEMENT_SCHEMA}\n{FRESH_ROOT_H_DELEGATION_SCHEMA}\n{FRESH_BASH_SYNC_PUBLICATION_SCHEMA}\n{FRESH_NORMAL_WORK_SCHEMA}\n{FRESH_NORMAL_MODEL_SELECTION_SCHEMA}"
             ))
             .map_err(|e| e.to_string())?;
         state_conn
@@ -1130,6 +1160,22 @@ impl FreshV30Lane {
                 "fresh_normal_work_preparation_no_delete",
             ],
         )?;
+        match fresh_normal_model_selection_schema_count(&state_conn)? {
+            0 => state_conn
+                .execute_batch(FRESH_NORMAL_MODEL_SELECTION_SCHEMA)
+                .map_err(|e| e.to_string())?,
+            3 => {}
+            _ => return Err("fresh normal model selection schema incomplete".into()),
+        }
+        verify_fresh_sql_objects(
+            &state_conn,
+            FRESH_NORMAL_MODEL_SELECTION_SCHEMA,
+            "fresh_normal_model_selection",
+            &[
+                "fresh_normal_model_selection_no_update",
+                "fresh_normal_model_selection_no_delete",
+            ],
+        )?;
         let normal_trigger_count: i64 = state_conn
             .query_row(
                 "SELECT count(*) FROM sqlite_master WHERE type='trigger' AND tbl_name='fresh_normal_work_preparation'",
@@ -1703,6 +1749,83 @@ impl FreshV30Lane {
         }))
     }
 
+    /// Commit exactly one no-effect choice. A retry can read the same choice,
+    /// but cannot replace it or select another account after an uncertain reply.
+    pub fn select_normal_model(
+        &self,
+        receipt: &FreshReleasedHandoff,
+        actor: &FreshRecipientIdentity,
+        session: &FreshV30Session,
+        selection: &FreshNormalModelSelection,
+    ) -> Result<FreshNormalModelSelection, String> {
+        let held = self
+            .read_normal_work(receipt, actor, session)?
+            .ok_or("normal model selection requires held work")?;
+        if selection.invocation != held.headless_model_invocation(receipt, session)?
+            || selection.state != "selected_no_effect"
+            || selection.config_sha256 != selection.source.config_sha256
+            || selection.account.is_empty()
+            || selection.account_identity.is_empty()
+            || selection.total == 0
+            || selection.index >= selection.total
+        {
+            return Err("normal model selection differs from held invocation".into());
+        }
+        let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        state
+            .execute_batch("PRAGMA synchronous=FULL; BEGIN IMMEDIATE")
+            .map_err(|e| e.to_string())?;
+        state
+            .execute(
+                "INSERT INTO fresh_normal_model_selection(handoff_id,selection_json,selected_at)
+             VALUES(?1,?2,?3) ON CONFLICT(handoff_id) DO NOTHING",
+                params![
+                    receipt.handoff_id,
+                    serde_json::to_string(selection).map_err(|e| e.to_string())?,
+                    Utc::now().to_rfc3339()
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        state.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+        let readback = self
+            .read_normal_model_selection(receipt, actor, session)?
+            .ok_or("normal model selection disappeared")?;
+        if readback != *selection {
+            return Err("normal model selection already spent on another source or account".into());
+        }
+        Ok(readback)
+    }
+
+    pub fn read_normal_model_selection(
+        &self,
+        receipt: &FreshReleasedHandoff,
+        actor: &FreshRecipientIdentity,
+        session: &FreshV30Session,
+    ) -> Result<Option<FreshNormalModelSelection>, String> {
+        let held = self
+            .read_normal_work(receipt, actor, session)?
+            .ok_or("normal model selection requires held work")?;
+        let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let row: Option<String> = state
+            .query_row(
+                "SELECT selection_json FROM fresh_normal_model_selection WHERE handoff_id=?1",
+                [&receipt.handoff_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some(row) = row else { return Ok(None) };
+        let selection: FreshNormalModelSelection =
+            serde_json::from_str(&row).map_err(|e| e.to_string())?;
+        if selection.invocation != held.headless_model_invocation(receipt, session)?
+            || selection.state != "selected_no_effect"
+            || selection.config_sha256 != selection.source.config_sha256
+        {
+            return Err("normal model selection readback changed".into());
+        }
+        Ok(Some(selection))
+    }
+
     /// The intended caller is a released Runner root retaining both UUIDs
     /// across U and D. The broker supplies the pinned peer identity; caller
     /// JSON cannot select an actor. Release and invocation linkage are still
@@ -2149,6 +2272,106 @@ fn fresh_normal_work_schema_count(state: &Connection) -> Result<i64, String> {
             |row| row.get(0),
         )
         .map_err(|e| e.to_string())
+}
+
+fn fresh_normal_model_selection_schema_count(state: &Connection) -> Result<i64, String> {
+    state
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE
+         (type='table' AND name='fresh_normal_model_selection') OR
+         (type='trigger' AND name IN
+          ('fresh_normal_model_selection_no_update','fresh_normal_model_selection_no_delete'))",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod normal_model_selection_tests {
+    use super::*;
+
+    #[test]
+    fn disposable_state_selection_record_is_one_use_and_schema_checked() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.db");
+        drop(StateDb::open(&path).unwrap());
+        let state = Connection::open(&path).unwrap();
+        state
+            .execute_batch(
+                "CREATE TABLE fresh_normal_work_preparation(handoff_id TEXT PRIMARY KEY);
+             INSERT INTO fresh_normal_work_preparation VALUES('held-handoff');",
+            )
+            .unwrap();
+        state
+            .execute_batch(FRESH_NORMAL_MODEL_SELECTION_SCHEMA)
+            .unwrap();
+        assert_eq!(
+            fresh_normal_model_selection_schema_count(&state).unwrap(),
+            3
+        );
+        verify_fresh_sql_objects(
+            &state,
+            FRESH_NORMAL_MODEL_SELECTION_SCHEMA,
+            "fresh_normal_model_selection",
+            &[
+                "fresh_normal_model_selection_no_update",
+                "fresh_normal_model_selection_no_delete",
+            ],
+        )
+        .unwrap();
+        state
+            .execute(
+                "INSERT INTO fresh_normal_model_selection VALUES(?1,?2,?3)",
+                params!["held-handoff", "first", "now"],
+            )
+            .unwrap();
+        state
+            .execute(
+                "INSERT INTO fresh_normal_model_selection VALUES(?1,?2,?3)
+             ON CONFLICT(handoff_id) DO NOTHING",
+                params!["held-handoff", "second", "later"],
+            )
+            .unwrap();
+        assert_eq!(
+            state
+                .query_row(
+                    "SELECT selection_json FROM fresh_normal_model_selection",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "first"
+        );
+        assert!(
+            state
+                .execute(
+                    "UPDATE fresh_normal_model_selection SET selection_json='second'",
+                    [],
+                )
+                .is_err()
+        );
+        assert!(
+            state
+                .execute("DELETE FROM fresh_normal_model_selection", [])
+                .is_err()
+        );
+        state
+            .execute_batch("DROP TRIGGER fresh_normal_model_selection_no_delete")
+            .unwrap();
+        assert!(
+            verify_fresh_sql_objects(
+                &state,
+                FRESH_NORMAL_MODEL_SELECTION_SCHEMA,
+                "fresh_normal_model_selection",
+                &[
+                    "fresh_normal_model_selection_no_update",
+                    "fresh_normal_model_selection_no_delete"
+                ],
+            )
+            .is_err()
+        );
+    }
 }
 
 fn verify_fresh_sql_objects(

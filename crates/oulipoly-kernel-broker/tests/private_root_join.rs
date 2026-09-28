@@ -2229,6 +2229,20 @@ fn inner() {
             .unwrap();
         }
     }
+    if mode == "normal_model_held" {
+        let config_dir = config_home.join("oulipoly-agent-runner");
+        fs::create_dir_all(config_dir.join("models")).unwrap();
+        fs::write(
+            config_dir.join("providers.toml"),
+            "[local]\ncommand = 'echo'\nquota_account_id = 'physical-local'\n",
+        )
+        .unwrap();
+        fs::write(
+            config_dir.join("models/fixture-model.toml"),
+            "[[providers]]\nname = 'local'\n",
+        )
+        .unwrap();
+    }
     let mailbox =
         MailboxDb::open_completion_continuation_domain(&data.join("pid-identity.db")).unwrap();
     let pending_binding = (normal_mode
@@ -2786,12 +2800,16 @@ fn inner() {
             })
             .env("OULIPOLY_DATA_DIR", &data)
             .envs(
-                (provider_mode || mode == "normal_owner_discovery")
+                (provider_mode || mode == "normal_owner_discovery" || mode == "normal_model_held")
                     .then_some(("OULIPOLY_CONFIG_HOME", &config_home)),
             )
             .env("OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1", "1")
             .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
             .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+            .envs(
+                (mode == "normal_model_held")
+                    .then_some(("AGE319_PRIVATE_MODEL_SELECTION_PROBE_V1", "1")),
+            )
             .envs(native_codex_mode.then_some(("AGE319_PRIVATE_NATIVE_CODEX_V1", "1")))
             .envs(native_codex_mode.then_some(("AGE319_PRIVATE_NATIVE_BASH_NOTIFY_V1", "1")))
             .envs(native_turn_mode.then_some(("AGE319_PRIVATE_NATIVE_TURN_RECEIPT_V1", "1")))
@@ -13549,7 +13567,17 @@ fn inner() {
                             .read_private_root_terminal(&receipt, &actor, &session)
                             .unwrap();
                         assert_eq!(replay.execution, terminal.execution);
-                        assert_eq!(replay.publication_state, terminal.publication_state);
+                        if replay.publication_state != terminal.publication_state {
+                            // The original Runner may begin its caller publication
+                            // while this fixture restarts the broker. That is a
+                            // forward State transition, not a changed Q/result.
+                            assert_eq!(terminal.publication_state, "not_started");
+                            assert!(matches!(
+                                replay.publication_state.as_str(),
+                                "unknown" | "settled"
+                            ));
+                            assert!(replay.publication_sha256.is_some());
+                        }
                         assert_eq!(
                             reopened
                                 .settle_private_root_terminal(&receipt, &actor, &session)
@@ -13851,11 +13879,36 @@ fn inner() {
                     assert_eq!(invocation.model, "fixture-model");
                     assert_eq!(invocation.provider_pin, None);
                     assert_eq!(invocation.prompt, "hello fixture");
+                    let selected = settled_lane
+                        .read_normal_model_selection(&receipt, &actor, &session)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(selected.invocation, invocation);
+                    assert_eq!(selected.account, "local");
+                    assert_eq!(selected.account_identity, "physical-local");
+                    assert_eq!(selected.index, 0);
+                    assert_eq!(selected.total, 1);
+                    assert_eq!(selected.state, "selected_no_effect");
+                    assert_eq!(
+                        fresh_state
+                            .query_row::<i64, _, _>(
+                                "SELECT count(*) FROM fresh_normal_model_selection",
+                                [],
+                                |row| row.get(0),
+                            )
+                            .unwrap(),
+                        1
+                    );
                     let mut swapped_actor = preparation.clone();
                     swapped_actor.actor.starttime_ticks += 1;
                     assert!(
                         swapped_actor
                             .headless_model_invocation(&receipt, &session)
+                            .is_err()
+                    );
+                    assert!(
+                        settled_lane
+                            .read_normal_model_selection(&receipt, &swapped_actor.actor, &session)
                             .is_err()
                     );
                     let mut swapped_session = session.clone();
@@ -13865,11 +13918,21 @@ fn inner() {
                             .headless_model_invocation(&receipt, &swapped_session)
                             .is_err()
                     );
+                    assert!(
+                        settled_lane
+                            .read_normal_model_selection(&receipt, &actor, &swapped_session)
+                            .is_err()
+                    );
                     let mut swapped_root = receipt.clone();
                     swapped_root.old_release.prepared.root_id = uuid::Uuid::new_v4().to_string();
                     assert!(
                         preparation
                             .headless_model_invocation(&swapped_root, &session)
+                            .is_err()
+                    );
+                    assert!(
+                        settled_lane
+                            .read_normal_model_selection(&swapped_root, &actor, &session)
                             .is_err()
                     );
                     let mut malformed = preparation.clone();
@@ -13921,6 +13984,33 @@ fn inner() {
                             )
                             .unwrap(),
                         1
+                    );
+                    let source = File::open(config_home.join("oulipoly-agent-runner")).unwrap();
+                    assert_eq!(
+                        oulipoly_kernel_broker::normal_model_selection::observe(
+                            &settled_lane,
+                            &receipt,
+                            &actor,
+                            &session,
+                            &source,
+                        )
+                        .unwrap(),
+                        Some(selected)
+                    );
+                    fs::write(
+                        config_home.join("oulipoly-agent-runner/providers.toml"),
+                        "[local]\ncommand = 'echo changed'\nquota_account_id = 'physical-local'\n",
+                    )
+                    .unwrap();
+                    assert!(
+                        oulipoly_kernel_broker::normal_model_selection::observe(
+                            &settled_lane,
+                            &receipt,
+                            &actor,
+                            &session,
+                            &source,
+                        )
+                        .is_err()
                     );
                     assert!(
                         protocol::prepare_fresh_normal_work_at(

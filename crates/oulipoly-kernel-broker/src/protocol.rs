@@ -589,6 +589,92 @@ pub fn observe_fresh_normal_work_at(
     normal_work_request_at(path, b'4', d_key)
 }
 
+/// The broker chooses from the exact held model and the pinned config
+/// directory. This is a one-use no-effect readback, never a provider grant.
+pub fn select_fresh_normal_model_at(
+    path: &Path,
+    d_key: &str,
+    config_dir: RawFd,
+) -> io::Result<oulipoly_state::mailbox::FreshNormalModelSelection> {
+    normal_model_request_at(path, 0x84, d_key, config_dir)?
+        .ok_or_else(|| io::Error::other("normal model selection absent"))
+}
+
+pub fn observe_fresh_normal_model_at(
+    path: &Path,
+    d_key: &str,
+    config_dir: RawFd,
+) -> io::Result<Option<oulipoly_state::mailbox::FreshNormalModelSelection>> {
+    normal_model_request_at(path, 0x85, d_key, config_dir)
+}
+
+fn normal_model_request_at(
+    path: &Path,
+    operation: u8,
+    d_key: &str,
+    config_dir: RawFd,
+) -> io::Result<Option<oulipoly_state::mailbox::FreshNormalModelSelection>> {
+    let id =
+        uuid::Uuid::parse_str(d_key).map_err(|_| io::Error::other("invalid normal model D key"))?;
+    if id.is_nil() || id.to_string() != d_key {
+        return Err(io::Error::other("noncanonical normal model D key"));
+    }
+    let body = serde_json::to_vec(&FreshRootEffectRequest {
+        d_key: d_key.into(),
+        success: None,
+    })?;
+    let mut stream = checked_connection(path)?;
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let mut frame = Vec::with_capacity(17 + body.len());
+    frame.push(operation);
+    frame.extend_from_slice(&challenge);
+    frame.extend_from_slice(&body);
+    let mut iov = libc::iovec {
+        iov_base: frame.as_mut_ptr().cast(),
+        iov_len: frame.len(),
+    };
+    let mut control = [0u8; 64];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as _) } as usize;
+    unsafe {
+        let header = libc::CMSG_FIRSTHDR(&msg);
+        (*header).cmsg_level = libc::SOL_SOCKET;
+        (*header).cmsg_type = libc::SCM_RIGHTS;
+        (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as _) as usize;
+        *libc::CMSG_DATA(header).cast::<RawFd>() = config_dir;
+    }
+    if unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) }
+        != frame.len() as isize
+    {
+        return Err(io::Error::other("normal model request uncertain"));
+    }
+    let mut reply = Vec::new();
+    stream.take(16 * 1024 + 1).read_to_end(&mut reply)?;
+    if reply.len() > 16 * 1024 || !reply.ends_with(b"\n") {
+        return Err(io::Error::other(
+            "normal model readback oversized or incomplete",
+        ));
+    }
+    let reply = String::from_utf8(reply).map_err(io::Error::other)?;
+    if let Some(error) = reply.strip_prefix("error ") {
+        return Err(io::Error::other(error.trim_end().to_owned()));
+    }
+    if reply == "fresh-normal-model absent\n" {
+        return Ok(None);
+    }
+    let body = reply
+        .strip_prefix("fresh-normal-model ")
+        .and_then(|value| value.strip_suffix('\n'))
+        .ok_or_else(|| io::Error::other("normal model readback invalid"))?;
+    serde_json::from_str(body)
+        .map(Some)
+        .map_err(io::Error::other)
+}
+
 /// Private first provider proof. Variable recipe and stdin bytes are carried
 /// by pinned descriptors; the challenged frame contains only the D key.
 #[cfg(feature = "age319-private-broker-fixture")]
