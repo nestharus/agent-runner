@@ -144,6 +144,54 @@ pub struct FreshRootEffectRequest {
 #[cfg(feature = "age319-private-broker-fixture")]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct PrivateNativeBashExec {
+    pub d_key: String,
+    pub request_id: String,
+    pub notify: bool,
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+pub fn private_native_bash_at(path: &Path, request: &PrivateNativeBashExec) -> io::Result<String> {
+    let id = uuid::Uuid::parse_str(&request.d_key)
+        .map_err(|_| io::Error::other("invalid native Bash D key"))?;
+    let child = uuid::Uuid::parse_str(&request.request_id)
+        .map_err(|_| io::Error::other("invalid native Bash child request"))?;
+    if id.is_nil()
+        || id.to_string() != request.d_key
+        || child.is_nil()
+        || child.to_string() != request.request_id
+    {
+        return Err(io::Error::other("noncanonical native Bash request"));
+    }
+    let mut stream = checked_connection(path)?;
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let body = serde_json::to_vec(request)?;
+    let mut frame = Vec::with_capacity(17 + body.len());
+    frame.push(b'$');
+    frame.extend_from_slice(&challenge);
+    frame.extend_from_slice(&body);
+    if unsafe {
+        libc::send(
+            stream.as_raw_fd(),
+            frame.as_ptr().cast(),
+            frame.len(),
+            libc::MSG_NOSIGNAL,
+        )
+    } != frame.len() as isize
+    {
+        return Err(io::Error::other("native Bash submission uncertain"));
+    }
+    let answer = read_private_native_response(stream)?;
+    if let Some(error) = answer.strip_prefix("error ") {
+        return Err(io::Error::other(error.trim_end().to_owned()));
+    }
+    Ok(answer)
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FreshRouteRequest {
     /// Required so pre-identity clients cannot silently register a candidate.
     pub protocol_version: u32,
@@ -438,7 +486,7 @@ pub fn private_fresh_provider_at(
     operation: u8,
     descriptors: Option<[RawFd; 4]>,
 ) -> io::Result<String> {
-    if !matches!(operation, b'5' | b'6' | b'7' | b'9' | b'b' | b'y')
+    if !matches!(operation, b'5' | b'6' | b'7' | b'9' | b'b' | b'y' | b'x')
         || matches!(operation, b'5' | b'9' | b'b') != descriptors.is_some()
     {
         return Err(io::Error::other("invalid private fresh provider operation"));
@@ -496,7 +544,11 @@ pub fn private_fresh_provider_at(
             "fresh provider observe/cancel request uncertain",
         ));
     }
-    let answer = read_response(stream)?;
+    let answer = if matches!(operation, b'y' | b'x') {
+        read_private_native_response(stream)?
+    } else {
+        read_response(stream)?
+    };
     if let Some(error) = answer.strip_prefix("error ") {
         return Err(io::Error::other(error.trim_end().to_owned()));
     }
@@ -3395,6 +3447,16 @@ fn read_response(stream: UnixStream) -> io::Result<String> {
         return Err(io::Error::other("invalid broker response"));
     }
     String::from_utf8(response).map_err(|_| io::Error::other("non-UTF8 broker response"))
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn read_private_native_response(stream: UnixStream) -> io::Result<String> {
+    let mut response = Vec::new();
+    stream.take(48 * 1024 + 1).read_to_end(&mut response)?;
+    if response.len() > 48 * 1024 || !response.ends_with(b"\n") {
+        return Err(io::Error::other("invalid private native broker response"));
+    }
+    String::from_utf8(response).map_err(|_| io::Error::other("non-UTF8 native broker response"))
 }
 
 pub fn request_at(path: &Path, operation: Operation) -> io::Result<String> {

@@ -3147,6 +3147,67 @@ impl oulipoly_runtime::executor::cli::fresh_remote::FreshProviderBackend
                 body,
             )
             .map_err(|e| self.unknown(Some(&grant), "native K control report", &e.to_string()))?;
+            let request_id = std::env::var("AGE319_PRIVATE_BASH_REQUEST_KEY")
+                .map_err(|e| self.unknown(Some(&grant), "native Bash request", &e.to_string()))?;
+            let bash = protocol::PrivateNativeBashExec {
+                d_key: self.authority.receipt.d_key.clone(),
+                request_id: request_id.clone(),
+                notify: std::env::var_os("AGE319_PRIVATE_NATIVE_BASH_NOTIFY_V1").is_some(),
+            };
+            // e is one-shot. A lost e reply is observed through x; never send e again.
+            let submitted = protocol::private_native_bash_at(&socket, &bash);
+            if let Ok(reply) = &submitted {
+                if reply != &format!("native-bash-submitted {request_id}\n") {
+                    return Err(self.unknown(
+                        Some(&grant),
+                        "native Bash submission",
+                        "invalid reply",
+                    ));
+                }
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+            let bash_result = loop {
+                let state = protocol::private_fresh_provider_at(
+                    &socket,
+                    &self.authority.receipt.d_key,
+                    b'x',
+                    None,
+                )
+                .map_err(|error| {
+                    self.unknown(
+                        Some(&grant),
+                        "native Bash result",
+                        &format!("submission={submitted:?}; observation={error}"),
+                    )
+                })?;
+                if let Some(body) = state.strip_prefix(&format!("native-bash-result {request_id} "))
+                {
+                    let result: serde_json::Value =
+                        serde_json::from_str(body.trim_end()).map_err(|error| {
+                            self.unknown(Some(&grant), "native Bash result", &error.to_string())
+                        })?;
+                    break result;
+                }
+                if state.starts_with("native-bash-unknown ")
+                    || !state.starts_with(&format!("native-bash-pending {request_id}\n"))
+                    || std::time::Instant::now() >= deadline
+                {
+                    return Err(self.unknown(Some(&grant), "native Bash result", &state));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            };
+            if bash_result["exitCode"] != 0 {
+                return Err(self.unknown(
+                    Some(&grant),
+                    "native Bash child",
+                    &bash_result.to_string(),
+                ));
+            }
+            std::fs::write(
+                std::path::Path::new(&gate).join("native-bash-result.json"),
+                serde_json::to_vec(&bash_result).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| self.unknown(Some(&grant), "native Bash result report", &e.to_string()))?;
             protocol::private_fresh_provider_at(&socket, &self.authority.receipt.d_key, b'7', None)
                 .map_err(|e| self.unknown(Some(&grant), "native K cancellation", &e.to_string()))?;
             let deadline = std::time::Instant::now() + PRIVATE_PROVIDER_RESULT_WAIT;
@@ -3166,7 +3227,7 @@ impl oulipoly_runtime::executor::cli::fresh_remote::FreshProviderBackend
                 }
                 std::thread::sleep(PRIVATE_PROVIDER_RESULT_POLL);
             }
-            return Err("private native Codex K control established and drained; original H/W/native receipt/ACK not yet joined".into());
+            return Err("private native Codex K launched and drained after same-K Bash; native F/receipt/ACK not yet joined".into());
         }
         let causal = std::env::var_os("AGE319_PRIVATE_PROVIDER_CAUSAL_BASH_V1").is_some();
         let direct_caller = std::env::var_os("AGE319_PRIVATE_CALLER_OUTPUT_V1").is_some();
