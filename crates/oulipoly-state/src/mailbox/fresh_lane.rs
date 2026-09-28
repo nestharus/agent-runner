@@ -9,6 +9,7 @@ use crate::StateDb;
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::Component;
 
 include!("fresh_recipient.rs");
 include!("fresh_native_f.rs");
@@ -65,6 +66,249 @@ pub struct FreshV30LaneIdentity {
     pub lane_id: String,
     pub domain_id: String,
     pub source_generation: String,
+}
+
+/// Readback of one atomically published, empty Broker State root. This is
+/// storage identity only; it does not admit a service, caller or effect.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmptyV30BootstrapIdentity {
+    pub source_generation: String,
+    pub domain_id: String,
+    pub state_device: u64,
+    pub state_inode: u64,
+    pub fresh_lane: FreshV30LaneIdentity,
+}
+
+const EMPTY_BOOTSTRAP_MARKER: &str = "empty-v30-bootstrap-v1.json";
+const EMPTY_BOOTSTRAP_STAGE_PREFIX: &str = ".empty-v30-bootstrap-";
+
+impl EmptyV30BootstrapIdentity {
+    /// Create a new root from absent storage or read back the exact published
+    /// identity. Any interrupted stage is retained as inert evidence and
+    /// refuses a new generation until explicitly investigated.
+    pub fn bootstrap_at(root: &Path) -> Result<Self, String> {
+        require_root()?;
+        unsafe { libc::umask(0o077) };
+        if !root.is_absolute()
+            || root.file_name().is_none()
+            || root
+                .components()
+                .any(|part| matches!(part, Component::CurDir | Component::ParentDir))
+        {
+            return Err("empty v30 Broker root must be an absolute normalized path".into());
+        }
+        let parent = root.parent().ok_or("empty v30 Broker parent absent")?;
+        require_bootstrap_parent(parent)?;
+        let name = root.file_name().unwrap().to_string_lossy();
+        let lock_path = parent.join(format!(".{name}-empty-v30-bootstrap.lock"));
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&lock_path)
+            .map_err(|e| e.to_string())?;
+        let lock_meta = lock.metadata().map_err(|e| e.to_string())?;
+        if !lock_meta.is_file()
+            || lock_meta.uid() != 0
+            || lock_meta.nlink() != 1
+            || lock_meta.mode() & 0o777 != 0o600
+        {
+            return Err("empty v30 Broker bootstrap lock is untrusted".into());
+        }
+        if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&lock), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        match fs::symlink_metadata(root) {
+            Ok(_) => return Self::readback_at(root),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        for entry in fs::read_dir(parent).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(EMPTY_BOOTSTRAP_STAGE_PREFIX)
+            {
+                return Err("incomplete empty v30 Broker bootstrap stage exists".into());
+            }
+        }
+        let stage = parent.join(format!("{EMPTY_BOOTSTRAP_STAGE_PREFIX}{}", Uuid::new_v4()));
+        fs::create_dir(&stage).map_err(|e| e.to_string())?;
+        fs::set_permissions(&stage, fs::Permissions::from_mode(0o700))
+            .map_err(|e| e.to_string())?;
+        File::open(parent)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| e.to_string())?;
+        let state_path = stage.join("state.db");
+        drop(StateDb::open_historical_without_observation(&state_path)?);
+        let sidecar_dir = stage.join("sidecar");
+        fs::create_dir(&sidecar_dir).map_err(|e| e.to_string())?;
+        fs::set_permissions(&sidecar_dir, fs::Permissions::from_mode(0o700))
+            .map_err(|e| e.to_string())?;
+        let sidecar_path = sidecar_dir.join("pid-identity.db");
+        let mailbox = MailboxDb::open_historical_without_observation(&sidecar_path)?;
+        let domain_id = mailbox
+            .completion_continuation_domain()?
+            .ok_or("empty Broker completion domain absent")?;
+        drop(mailbox);
+        let source_generation = activate_with_owner(&sidecar_path, 0, &stage)?;
+        let fresh_lane = FreshV30Lane::initialize_at(&stage)?;
+        let state_meta = fs::symlink_metadata(&state_path).map_err(|e| e.to_string())?;
+        if !state_meta.is_file()
+            || state_meta.file_type().is_symlink()
+            || state_meta.uid() != 0
+            || state_meta.nlink() != 1
+        {
+            return Err("empty Broker State file is untrusted".into());
+        }
+        // Both source bindings are written while this entire root is private.
+        // They name the future published path and the already created inode.
+        project_unpublished_binding(
+            &sidecar_dir.join("state-source.json"),
+            &root.join("state.db"),
+            &state_meta,
+        )?;
+        let lane_state = stage.join("v30/state.db");
+        let lane_meta = fs::symlink_metadata(&lane_state).map_err(|e| e.to_string())?;
+        project_unpublished_binding(
+            &stage.join("v30/sidecar/state-source.json"),
+            &root.join("v30/state.db"),
+            &lane_meta,
+        )?;
+        let identity = Self {
+            source_generation,
+            domain_id,
+            state_device: state_meta.dev(),
+            state_inode: state_meta.ino(),
+            fresh_lane,
+        };
+        let mut marker = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(stage.join(EMPTY_BOOTSTRAP_MARKER))
+            .map_err(|e| e.to_string())?;
+        serde_json::to_writer(&mut marker, &identity).map_err(|e| e.to_string())?;
+        marker.sync_all().map_err(|e| e.to_string())?;
+        harden_tree(&stage)?;
+        sync_bootstrap_tree(&stage)?;
+        rename_noreplace(&stage, root)?;
+        File::open(parent)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| e.to_string())?;
+        let reopened = Self::readback_at(root)?;
+        if reopened != identity {
+            return Err("published empty v30 Broker identity changed".into());
+        }
+        Ok(reopened)
+    }
+
+    pub fn readback_at(root: &Path) -> Result<Self, String> {
+        require_root()?;
+        require_broker_root(root)?;
+        let root_meta = fs::symlink_metadata(root).map_err(|e| e.to_string())?;
+        if root_meta.uid() != 0 || root_meta.mode() & 0o077 != 0 {
+            return Err("empty v30 Broker root is not owner-only".into());
+        }
+        let marker_path = root.join(EMPTY_BOOTSTRAP_MARKER);
+        let marker_meta = fs::symlink_metadata(&marker_path).map_err(|e| e.to_string())?;
+        if !marker_meta.is_file()
+            || marker_meta.file_type().is_symlink()
+            || marker_meta.uid() != 0
+            || marker_meta.nlink() != 1
+            || marker_meta.mode() & 0o777 != 0o600
+        {
+            return Err("empty v30 Broker bootstrap marker is untrusted".into());
+        }
+        let marker: Self =
+            serde_json::from_slice(&fs::read(&marker_path).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+        let sidecar = BrokerSidecar::open_existing(&root.join("sidecar/pid-identity.db"), root)?;
+        sidecar.require_bound_state_path(&root.join("state.db"))?;
+        let state_meta = fs::symlink_metadata(root.join("state.db")).map_err(|e| e.to_string())?;
+        if !state_meta.is_file()
+            || state_meta.file_type().is_symlink()
+            || state_meta.uid() != 0
+            || state_meta.nlink() != 1
+            || state_meta.mode() & 0o077 != 0
+        {
+            return Err("empty v30 Broker State storage is not root-only".into());
+        }
+        let bound = sidecar.bound_state_file_identity()?;
+        drop(sidecar.bound_state()?);
+        let lane = FreshV30Lane::open_at(root)?;
+        if marker.source_generation != sidecar.source_generation()
+            || marker.domain_id != sidecar.domain_id()?
+            || (marker.state_device, marker.state_inode) != (bound.device, bound.inode)
+            || marker.fresh_lane != *lane.identity()
+        {
+            return Err("empty v30 Broker bootstrap identity differs".into());
+        }
+        Ok(marker)
+    }
+}
+
+fn require_bootstrap_parent(parent: &Path) -> Result<(), String> {
+    #[cfg(feature = "age319-private-broker-fixture")]
+    if fs::read_to_string("/proc/self/uid_map")
+        .ok()
+        .is_some_and(|map| map.split_ascii_whitespace().nth(2) == Some("1"))
+    {
+        return require_broker_root(parent);
+    }
+    require_root_owned_ancestors(parent)
+}
+
+fn project_unpublished_binding(
+    path: &Path,
+    published_state: &Path,
+    meta: &fs::Metadata,
+) -> Result<(), String> {
+    if !meta.is_file() || meta.file_type().is_symlink() || meta.uid() != 0 || meta.nlink() != 1 {
+        return Err("unpublished State source is untrusted".into());
+    }
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    let source = BoundStateSource {
+        path: published_state.to_path_buf(),
+        owner: 0,
+        device: meta.dev(),
+        inode: meta.ino(),
+    };
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+    serde_json::to_writer(&mut file, &source).map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())
+}
+
+fn sync_bootstrap_tree(root: &Path) -> Result<(), String> {
+    for entry in fs::read_dir(root).map_err(|e| e.to_string())? {
+        let path = entry.map_err(|e| e.to_string())?.path();
+        let meta = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+        if meta.is_dir() {
+            sync_bootstrap_tree(&path)?;
+        } else if meta.is_file() && !meta.file_type().is_symlink() {
+            File::open(&path)
+                .and_then(|f| f.sync_all())
+                .map_err(|e| e.to_string())?;
+        } else {
+            return Err("empty v30 Broker bootstrap artifact is untrusted".into());
+        }
+    }
+    File::open(root)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| e.to_string())
 }
 
 /// The old release authority records the exact root entry it has already
@@ -689,6 +933,7 @@ impl FreshV30Lane {
         }
         let sidecar =
             BrokerSidecar::open_existing(&lane_root.join("sidecar/pid-identity.db"), &lane_root)?;
+        sidecar.require_bound_state_path(&lane_root.join("state.db"))?;
         let state = sidecar.bound_state()?;
         let state_meta =
             fs::symlink_metadata(lane_root.join("state.db")).map_err(|e| e.to_string())?;

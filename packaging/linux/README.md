@@ -32,6 +32,16 @@ call is gated on a private user namespace. This tool therefore has **no
 activation command**. The exact blockers and host action are recorded in
 `planning/age353-queue/AGE319-FIRST-INSTALL-V30-REPORT.md`.
 
+The featureless Broker also has an explicit offline storage command:
+`oulipoly-kernel-broker --bootstrap-empty-v30-state`. As root, it publishes
+`/var/lib/oulipoly-kernel-broker` only from an absent path. The publication
+contains a current empty State database, completion-domain sidecar, fresh v30
+lane, exact inode-bound State source bindings, and an identity marker. A retry
+reads back that same identity; an incompatible root or abandoned stage is a
+refusal. This command does not start the Broker service or activate the image
+package. The first-install activation and installed caller routes remain
+separate work.
+
 ## Separate old/new staging fixture
 
 `stage_versioned_island.py` accepts ten explicit source paths: retained legacy

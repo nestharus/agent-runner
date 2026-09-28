@@ -4984,6 +4984,24 @@ fn serve() -> io::Result<()> {
         checked_root_path(Path::new("/run/oulipoly-kernel-broker"), true)?;
         checked_root_path(Path::new(&runner), false)?;
     }
+    let bootstrap_marker = Path::new(&state).join("empty-v30-bootstrap-v1.json");
+    match fs::symlink_metadata(&bootstrap_marker) {
+        Ok(_) => {
+            oulipoly_state::mailbox::EmptyV30BootstrapIdentity::readback_at(Path::new(&state))
+                .map_err(io::Error::other)?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // Old cutover roots retain State outside this directory. A
+            // top-level State file is exclusive to the empty first-install
+            // publication and cannot outlive its identity marker.
+            match fs::symlink_metadata(Path::new(&state).join("state.db")) {
+                Ok(_) => return Err(io::Error::other("unmarked empty v30 Broker State")),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(error) => return Err(error),
+    }
     let installed_pair = if fixture {
         None
     } else {

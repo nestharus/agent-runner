@@ -63,13 +63,13 @@ pub use broker_authority::{
 };
 #[cfg(target_os = "linux")]
 pub use fresh_lane::{
-    FreshAckDelegation, FreshBashChild, FreshBashListenerPolicy, FreshBashPrivateResult,
-    FreshBashSourceEvent, FreshBashSyncPublication, FreshDeliveryReadback, FreshDeliverySubmission,
-    FreshHeadlessModelInvocation, FreshHeadlessNativeFAck, FreshHeadlessNativeFAttempt,
-    FreshHeadlessNativeFProof, FreshHeadlessNativeFRequest, FreshInteractiveResidentRegistration,
-    FreshNativeFAutoAck, FreshNativeFCallerResult, FreshNativeFObservedTurn,
-    FreshNativeFPreparation, FreshNativeFPrepareRequest, FreshNativeFReceipt,
-    FreshNativeFSubmission, FreshNativeFTransport, FreshNormalExecutablePlan,
+    EmptyV30BootstrapIdentity, FreshAckDelegation, FreshBashChild, FreshBashListenerPolicy,
+    FreshBashPrivateResult, FreshBashSourceEvent, FreshBashSyncPublication, FreshDeliveryReadback,
+    FreshDeliverySubmission, FreshHeadlessModelInvocation, FreshHeadlessNativeFAck,
+    FreshHeadlessNativeFAttempt, FreshHeadlessNativeFProof, FreshHeadlessNativeFRequest,
+    FreshInteractiveResidentRegistration, FreshNativeFAutoAck, FreshNativeFCallerResult,
+    FreshNativeFObservedTurn, FreshNativeFPreparation, FreshNativeFPrepareRequest,
+    FreshNativeFReceipt, FreshNativeFSubmission, FreshNativeFTransport, FreshNormalExecutablePlan,
     FreshNormalModelSelection, FreshNormalModelSource, FreshNormalProviderAdmission,
     FreshNormalProviderK, FreshNormalWorkPreparation, FreshPhysicalTerminal,
     FreshRecipientIdentity, FreshReleasedHandoff, FreshRootCallerResult, FreshRootEffect,
