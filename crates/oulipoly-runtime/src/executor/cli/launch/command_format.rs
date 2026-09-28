@@ -33,6 +33,7 @@ pub(super) fn command_from_parts(
     working_dir: Option<&Path>,
     parent_invocation_env: Option<&str>,
     return_channel: Option<&Path>,
+    data_dir_override: Option<&Path>,
 ) -> Result<Command, String> {
     let mut cmd = Command::new(&parts[0]);
     for part in &parts[1..] {
@@ -73,7 +74,14 @@ pub(super) fn command_from_parts(
     } else {
         cmd.env_remove("OULIPOLY_RETURN_CHANNEL");
     }
-    pin_agent_data_dir(&mut cmd)?;
+    if let Some(data_dir) = data_dir_override {
+        if !data_dir.is_absolute() {
+            return Err("provider data directory override is not absolute".into());
+        }
+        cmd.env(oulipoly_state::paths::DATA_DIR_ENV, data_dir);
+    } else {
+        pin_agent_data_dir(&mut cmd)?;
+    }
 
     Ok(cmd)
 }
@@ -140,6 +148,7 @@ mod tests {
             &[],
             &environment,
             &[],
+            None,
             None,
             None,
             None,

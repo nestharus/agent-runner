@@ -13889,6 +13889,25 @@ fn inner() {
                     assert_eq!(selected.index, 0);
                     assert_eq!(selected.total, 1);
                     assert_eq!(selected.state, "selected_no_effect");
+                    let plan = settled_lane
+                        .read_normal_executable_plan(&receipt, &actor, &session)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(plan.selection, selected);
+                    assert_eq!(plan.state, "planned_no_effect");
+                    assert_eq!(plan.plan_sha256.len(), 64);
+                    assert_eq!(plan.stdin_len, "hello fixture".len() as u64);
+                    assert_eq!(plan.argv.first().map(String::as_str), None);
+                    assert_eq!(
+                        fresh_state
+                            .query_row::<i64, _, _>(
+                                "SELECT count(*) FROM fresh_normal_executable_plan",
+                                [],
+                                |row| row.get(0)
+                            )
+                            .unwrap(),
+                        1
+                    );
                     assert_eq!(
                         fresh_state
                             .query_row::<i64, _, _>(
@@ -13911,6 +13930,11 @@ fn inner() {
                             .read_normal_model_selection(&receipt, &swapped_actor.actor, &session)
                             .is_err()
                     );
+                    assert!(
+                        settled_lane
+                            .read_normal_executable_plan(&receipt, &swapped_actor.actor, &session)
+                            .is_err()
+                    );
                     let mut swapped_session = session.clone();
                     swapped_session.session_id = uuid::Uuid::new_v4().to_string();
                     assert!(
@@ -13923,6 +13947,11 @@ fn inner() {
                             .read_normal_model_selection(&receipt, &actor, &swapped_session)
                             .is_err()
                     );
+                    assert!(
+                        settled_lane
+                            .read_normal_executable_plan(&receipt, &actor, &swapped_session)
+                            .is_err()
+                    );
                     let mut swapped_root = receipt.clone();
                     swapped_root.old_release.prepared.root_id = uuid::Uuid::new_v4().to_string();
                     assert!(
@@ -13933,6 +13962,11 @@ fn inner() {
                     assert!(
                         settled_lane
                             .read_normal_model_selection(&swapped_root, &actor, &session)
+                            .is_err()
+                    );
+                    assert!(
+                        settled_lane
+                            .read_normal_executable_plan(&swapped_root, &actor, &session)
                             .is_err()
                     );
                     let mut malformed = preparation.clone();

@@ -240,11 +240,46 @@ pub fn prepare_fresh_headless(
     prompt: &str,
     working_dir: &Path,
 ) -> Result<PreparedFreshHeadless, String> {
+    let inherited = std::env::vars_os()
+        .map(|(key, value)| {
+            Ok((
+                key.into_string()
+                    .map_err(|_| "fresh broker inherited environment key is not UTF-8")?,
+                value
+                    .into_string()
+                    .map_err(|_| "fresh broker inherited environment value is not UTF-8")?,
+            ))
+        })
+        .collect::<Result<Vec<_>, &str>>()?;
+    let data_dir = oulipoly_state::paths::data_dir()?;
+    prepare_fresh_headless_with_environment(
+        model,
+        provider_index,
+        prompt,
+        working_dir,
+        &inherited,
+        &data_dir,
+    )
+}
+
+/// Assemble the same launch using an explicitly supplied inherited environment.
+/// The broker uses this for a descriptor-backed, no-effect plan readback.
+pub fn prepare_fresh_headless_with_environment(
+    model: &ModelConfig,
+    provider_index: usize,
+    prompt: &str,
+    working_dir: &Path,
+    inherited: &[(String, String)],
+    data_dir: &Path,
+) -> Result<PreparedFreshHeadless, String> {
+    if !data_dir.is_absolute() {
+        return Err("fresh broker data directory is not absolute".into());
+    }
     validate_fresh_headless_shape(model, provider_index, working_dir)?;
     let provider = provider_for_index(model, provider_index)?;
     let parts = super::shell_split(&provider.command);
     let input_args = resolve_input_flags(model, &HashMap::new())?;
-    let mut launch = assemble_provider_launch(
+    let launch = assemble_provider_launch(
         ProviderLaunchRequest {
             provider,
             provider_args: &provider.args,
@@ -255,6 +290,7 @@ pub fn prepare_fresh_headless(
             input_args: &input_args,
             parent_invocation_env: None,
             start_known_provider_session_id: None,
+            data_dir_override: Some(data_dir),
         },
         None,
     )?;
@@ -264,27 +300,22 @@ pub fn prepare_fresh_headless(
     // The private broker recipe excludes loader and broker control variables.
     // Make those removals part of the assembled Command before freezing its
     // effective environment so the broker executes exactly this plan.
-    for key in std::env::vars_os().map(|(key, _)| key) {
-        if key.to_str().is_some_and(forbidden_fresh_environment) {
-            launch.cmd.env_remove(key);
-        }
-    }
     let cmd = &launch.cmd;
     if cmd.get_program() != parts[0].as_str() || cmd.get_current_dir() != Some(working_dir) {
         return Err("fresh broker launch command changed before K".into());
     }
     let mut environment = BTreeMap::<String, String>::new();
-    for (key, value) in std::env::vars_os() {
-        let key = key
-            .to_str()
-            .ok_or("fresh broker inherited environment key is not UTF-8")?;
+    for (key, value) in inherited {
         if forbidden_fresh_environment(key) {
             continue;
         }
-        let value = value
-            .to_str()
-            .ok_or("fresh broker inherited environment value is not UTF-8")?;
-        environment.insert(key.into(), value.into());
+        if key.is_empty()
+            || key.contains(['=', '\0'])
+            || value.contains('\0')
+            || environment.insert(key.clone(), value.clone()).is_some()
+        {
+            return Err("fresh broker inherited environment invalid".into());
+        }
     }
     for (key, value) in cmd.get_envs() {
         let key = key
@@ -393,7 +424,8 @@ pub fn prepare_fresh_interactive(
         .ok_or("fresh interactive_args absent before K")?;
     let mut no_prompt = None;
     super::policy::apply_provider_policy(provider, &mut args, &mut no_prompt)?;
-    let mut cmd = super::launch::build_command(provider, &args, Some(working_dir), None, None)?;
+    let mut cmd =
+        super::launch::build_command(provider, &args, Some(working_dir), None, None, None)?;
     for key in std::env::vars_os().map(|(key, _)| key) {
         if key.to_str().is_some_and(forbidden_fresh_environment) {
             cmd.env_remove(key);

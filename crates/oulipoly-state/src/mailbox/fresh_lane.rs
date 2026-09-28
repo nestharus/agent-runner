@@ -42,6 +42,7 @@ const FRESH_BASH_SYNC_PUBLICATION_SCHEMA: &str =
 const FRESH_NORMAL_WORK_SCHEMA: &str = include_str!("migrations/0034_fresh_normal_work.sql");
 const FRESH_NORMAL_MODEL_SELECTION_SCHEMA: &str =
     include_str!("migrations/0047_fresh_normal_model_selection.sql");
+const FRESH_NORMAL_PLAN_SCHEMA: &str = include_str!("migrations/0048_fresh_normal_plan.sql");
 const FRESH_RECIPIENT_SCHEMA: &str = include_str!("migrations/0030_fresh_recipient.sql");
 const FRESH_RECIPIENT_ACK_SCHEMA: &str = include_str!("migrations/0039_fresh_recipient_ack.sql");
 const FRESH_NATIVE_F_PREPARATION_SCHEMA: &str =
@@ -213,6 +214,32 @@ pub struct FreshNormalModelSource {
     pub model_device: u64,
     pub model_inode: u64,
     pub config_sha256: String,
+}
+
+/// Durable, no-effect evidence for the selected account's executable recipe.
+/// Digests keep inherited environment values out of State. A later K must
+/// establish its own execution custody; this record never grants one.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreshNormalExecutablePlan {
+    pub selection: FreshNormalModelSelection,
+    pub cwd: String,
+    pub cwd_device: u64,
+    pub cwd_inode: u64,
+    pub environment_sha256: String,
+    pub configured_program: String,
+    pub executable: String,
+    pub executable_device: u64,
+    pub executable_inode: u64,
+    pub executable_mount_id: u64,
+    pub executable_sha256: String,
+    pub executable_metadata_sha256: String,
+    pub path_execution: bool,
+    pub argv: Vec<String>,
+    pub stdin_sha256: String,
+    pub stdin_len: u64,
+    pub plan_sha256: String,
+    pub state: String,
 }
 
 impl FreshNormalWorkPreparation {
@@ -1176,6 +1203,22 @@ impl FreshV30Lane {
                 "fresh_normal_model_selection_no_delete",
             ],
         )?;
+        match fresh_normal_plan_schema_count(&state_conn)? {
+            0 => state_conn
+                .execute_batch(FRESH_NORMAL_PLAN_SCHEMA)
+                .map_err(|e| e.to_string())?,
+            3 => {}
+            _ => return Err("fresh normal plan schema incomplete".into()),
+        }
+        verify_fresh_sql_objects(
+            &state_conn,
+            FRESH_NORMAL_PLAN_SCHEMA,
+            "fresh_normal_executable_plan",
+            &[
+                "fresh_normal_executable_plan_no_update",
+                "fresh_normal_executable_plan_no_delete",
+            ],
+        )?;
         let normal_trigger_count: i64 = state_conn
             .query_row(
                 "SELECT count(*) FROM sqlite_master WHERE type='trigger' AND tbl_name='fresh_normal_work_preparation'",
@@ -1826,6 +1869,78 @@ impl FreshV30Lane {
         Ok(Some(selection))
     }
 
+    pub fn select_normal_executable_plan(
+        &self,
+        receipt: &FreshReleasedHandoff,
+        actor: &FreshRecipientIdentity,
+        session: &FreshV30Session,
+        plan: &FreshNormalExecutablePlan,
+    ) -> Result<FreshNormalExecutablePlan, String> {
+        let selection = self
+            .read_normal_model_selection(receipt, actor, session)?
+            .ok_or("normal executable plan requires selected account")?;
+        if plan.selection != selection
+            || plan.state != "planned_no_effect"
+            || plan.plan_sha256.len() != 64
+            || plan.environment_sha256.len() != 64
+            || plan.executable_sha256.len() != 64
+            || plan.executable_metadata_sha256.len() != 64
+            || plan.stdin_sha256.len() != 64
+        {
+            return Err("normal executable plan differs from selection".into());
+        }
+        let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        state
+            .execute_batch("PRAGMA synchronous=FULL; BEGIN IMMEDIATE")
+            .map_err(|e| e.to_string())?;
+        state
+            .execute(
+                "INSERT INTO fresh_normal_executable_plan(handoff_id,plan_json,planned_at)
+             VALUES(?1,?2,?3) ON CONFLICT(handoff_id) DO NOTHING",
+                params![
+                    receipt.handoff_id,
+                    serde_json::to_string(plan).map_err(|e| e.to_string())?,
+                    Utc::now().to_rfc3339()
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        state.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+        let readback = self
+            .read_normal_executable_plan(receipt, actor, session)?
+            .ok_or("normal executable plan disappeared")?;
+        if readback != *plan {
+            return Err("normal executable plan already spent on another source".into());
+        }
+        Ok(readback)
+    }
+
+    pub fn read_normal_executable_plan(
+        &self,
+        receipt: &FreshReleasedHandoff,
+        actor: &FreshRecipientIdentity,
+        session: &FreshV30Session,
+    ) -> Result<Option<FreshNormalExecutablePlan>, String> {
+        let selection = self
+            .read_normal_model_selection(receipt, actor, session)?
+            .ok_or("normal executable plan requires selected account")?;
+        let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let row: Option<String> = state
+            .query_row(
+                "SELECT plan_json FROM fresh_normal_executable_plan WHERE handoff_id=?1",
+                [&receipt.handoff_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some(row) = row else { return Ok(None) };
+        let plan: FreshNormalExecutablePlan =
+            serde_json::from_str(&row).map_err(|e| e.to_string())?;
+        if plan.selection != selection || plan.state != "planned_no_effect" {
+            return Err("normal executable plan readback changed".into());
+        }
+        Ok(Some(plan))
+    }
+
     /// The intended caller is a released Runner root retaining both UUIDs
     /// across U and D. The broker supplies the pinned peer identity; caller
     /// JSON cannot select an actor. Release and invocation linkage are still
@@ -2287,6 +2402,19 @@ fn fresh_normal_model_selection_schema_count(state: &Connection) -> Result<i64, 
         .map_err(|e| e.to_string())
 }
 
+fn fresh_normal_plan_schema_count(state: &Connection) -> Result<i64, String> {
+    state
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE
+         (type='table' AND name='fresh_normal_executable_plan') OR
+         (type='trigger' AND name IN
+          ('fresh_normal_executable_plan_no_update','fresh_normal_executable_plan_no_delete'))",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod normal_model_selection_tests {
     use super::*;
@@ -2368,6 +2496,92 @@ mod normal_model_selection_tests {
                     "fresh_normal_model_selection_no_update",
                     "fresh_normal_model_selection_no_delete"
                 ],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn disposable_executable_plan_record_is_one_use_and_schema_checked() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.db");
+        drop(StateDb::open(&path).unwrap());
+        let state = Connection::open(&path).unwrap();
+        state
+            .execute_batch(
+                "CREATE TABLE fresh_normal_work_preparation(handoff_id TEXT PRIMARY KEY);
+             INSERT INTO fresh_normal_work_preparation VALUES('held-handoff');",
+            )
+            .unwrap();
+        state
+            .execute_batch(FRESH_NORMAL_MODEL_SELECTION_SCHEMA)
+            .unwrap();
+        state
+            .execute(
+                "INSERT INTO fresh_normal_model_selection VALUES(?1,?2,?3)",
+                params!["held-handoff", "selected", "now"],
+            )
+            .unwrap();
+        state.execute_batch(FRESH_NORMAL_PLAN_SCHEMA).unwrap();
+        assert_eq!(fresh_normal_plan_schema_count(&state).unwrap(), 3);
+        verify_fresh_sql_objects(
+            &state,
+            FRESH_NORMAL_PLAN_SCHEMA,
+            "fresh_normal_executable_plan",
+            &[
+                "fresh_normal_executable_plan_no_update",
+                "fresh_normal_executable_plan_no_delete",
+            ],
+        )
+        .unwrap();
+        state
+            .execute(
+                "INSERT INTO fresh_normal_executable_plan VALUES(?1,?2,?3)",
+                params!["held-handoff", "first", "now"],
+            )
+            .unwrap();
+        state
+            .execute(
+                "INSERT INTO fresh_normal_executable_plan VALUES(?1,?2,?3)
+             ON CONFLICT(handoff_id) DO NOTHING",
+                params!["held-handoff", "second", "later"],
+            )
+            .unwrap();
+        assert_eq!(
+            state
+                .query_row(
+                    "SELECT plan_json FROM fresh_normal_executable_plan",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "first"
+        );
+        assert!(
+            state
+                .execute(
+                    "UPDATE fresh_normal_executable_plan SET plan_json='second'",
+                    []
+                )
+                .is_err()
+        );
+        assert!(
+            state
+                .execute("DELETE FROM fresh_normal_executable_plan", [])
+                .is_err()
+        );
+        state
+            .execute_batch("DROP TRIGGER fresh_normal_executable_plan_no_delete")
+            .unwrap();
+        assert!(
+            verify_fresh_sql_objects(
+                &state,
+                FRESH_NORMAL_PLAN_SCHEMA,
+                "fresh_normal_executable_plan",
+                &[
+                    "fresh_normal_executable_plan_no_update",
+                    "fresh_normal_executable_plan_no_delete"
+                ]
             )
             .is_err()
         );

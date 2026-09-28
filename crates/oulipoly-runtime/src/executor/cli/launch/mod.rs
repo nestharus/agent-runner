@@ -53,6 +53,7 @@ pub(super) struct ProviderLaunchRequest<'a> {
     pub(super) input_args: &'a [String],
     pub(super) parent_invocation_env: Option<&'a str>,
     pub(super) start_known_provider_session_id: Option<&'a str>,
+    pub(super) data_dir_override: Option<&'a Path>,
 }
 
 pub(super) struct ProviderLaunch {
@@ -76,6 +77,7 @@ pub(super) fn assemble_provider_launch(
         request.working_dir,
         request.parent_invocation_env,
         return_channel.as_ref().map(|channel| channel.path()),
+        request.data_dir_override,
     )?;
     append_command_args(&mut cmd, request.input_args);
     let (capture_plan, capture_args, mut temp_files) = capture::build_launch_capture_plan(

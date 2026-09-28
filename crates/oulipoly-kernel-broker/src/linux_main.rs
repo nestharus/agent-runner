@@ -515,6 +515,12 @@ enum RequestPayload {
         request: FreshRootEffectRequest,
         config_dir: File,
     },
+    FreshNormalPlanRequest {
+        request: FreshRootEffectRequest,
+        config_dir: File,
+        cwd: File,
+        environment: File,
+    },
     #[cfg(feature = "age319-private-broker-fixture")]
     FreshProviderRequest {
         request: FreshRootEffectRequest,
@@ -808,7 +814,7 @@ fn recv_request(
         }
         #[cfg(feature = "age319-private-broker-fixture")]
         b'#' | b'{' | b'}' | b']' | b'|' | b'~' | b'?' => (18..=2048 + 17).contains(&read),
-        b'@' | b'[' | 0x7f | 0x80 | 0x81 | 0x82 | 0x83 | 0x84 | 0x85 => {
+        b'@' | b'[' | 0x7f | 0x80 | 0x81 | 0x82 | 0x83 | 0x84 | 0x85 | 0x86 | 0x87 => {
             (18..=2048 + 17).contains(&read)
         }
         b'F' => (18..=8192 + 17).contains(&read),
@@ -829,6 +835,7 @@ fn recv_request(
             b'k' => descriptors.len() != 4,
             b'K' => descriptors.len() != 7,
             0x84 | 0x85 => descriptors.len() != 1,
+            0x86 | 0x87 => descriptors.len() != 3,
             #[cfg(feature = "age319-private-broker-fixture")]
             b'5' | b'b' => descriptors.len() != 4,
             #[cfg(feature = "age319-private-broker-fixture")]
@@ -890,6 +897,15 @@ fn recv_request(
             request: serde_json::from_slice(&request[17..read as usize])?,
             config_dir: descriptors.into_iter().next().unwrap(),
         },
+        0x86 | 0x87 => {
+            let mut descriptors = descriptors.into_iter();
+            RequestPayload::FreshNormalPlanRequest {
+                request: serde_json::from_slice(&request[17..read as usize])?,
+                config_dir: descriptors.next().unwrap(),
+                cwd: descriptors.next().unwrap(),
+                environment: descriptors.next().unwrap(),
+            }
+        }
         #[cfg(feature = "age319-private-broker-fixture")]
         b'5' | b'6' | b'7' | b'b' | b'y' | b'x' | b'*' | b'/' | b'>' | b'_' => {
             RequestPayload::FreshProviderRequest {
@@ -7595,6 +7611,110 @@ fn serve_fresh_v30_at(
                     Ok(format!(
                         "fresh-normal-model {}\n",
                         serde_json::to_string(&selection)?
+                    ))
+                }
+                0x86 | 0x87 => {
+                    let RequestPayload::FreshNormalPlanRequest {
+                        request,
+                        config_dir,
+                        cwd,
+                        environment,
+                    } = payload
+                    else {
+                        return Err(io::Error::other("normal plan request absent"));
+                    };
+                    if request.success.is_some() {
+                        return Err(io::Error::other(
+                            "normal plan request cannot return an effect",
+                        ));
+                    }
+                    if operation == 0x86 && instance.is_closed() {
+                        return Err(io::Error::other("normal plan gate closed"));
+                    }
+                    let receipt = lane
+                        .released_handoff_for_child(&request.d_key, &recipient)
+                        .map_err(io::Error::other)?;
+                    let spec = StateReadSpec {
+                        protocol: "broker-release-attest-v30".into(),
+                        source_generation: receipt.old_release.prepared.source_generation.clone(),
+                        root_id: receipt.old_release.prepared.root_id.clone(),
+                        owner_generation: receipt.old_release.prepared.owner_generation.clone(),
+                        attempt_id: None,
+                    };
+                    let bridge = handoff_tx.as_ref().ok_or_else(|| {
+                        io::Error::other("in-process release authority unavailable")
+                    })?;
+                    if bridge_released_handoff(
+                        bridge,
+                        spec,
+                        peer,
+                        lane.identity(),
+                        true,
+                        &runner_image,
+                    )? != receipt
+                    {
+                        return Err(io::Error::other("normal plan release readback changed"));
+                    }
+                    let session = lane
+                        .read_session(&request.d_key)
+                        .map_err(io::Error::other)?
+                        .ok_or_else(|| io::Error::other("normal plan D absent"))?;
+                    lane.require_released_invocation(&receipt, &recipient, &session)
+                        .map_err(io::Error::other)?;
+                    let plan = if operation == 0x86 {
+                        let guard = admission_fences
+                            .lock()
+                            .map_err(|_| io::Error::other("root admission fence poisoned"))?;
+                        if guard.contains(&receipt.old_release.prepared.root_id) {
+                            return Err(io::Error::other("exact root admission fenced"));
+                        }
+                        oulipoly_kernel_broker::normal_plan_custody::select(
+                            &lane,
+                            &receipt,
+                            &recipient,
+                            &session,
+                            &config_dir,
+                            &cwd,
+                            &environment,
+                        )?
+                    } else {
+                        match oulipoly_kernel_broker::normal_plan_custody::observe(
+                            &lane,
+                            &receipt,
+                            &recipient,
+                            &session,
+                            &config_dir,
+                            &cwd,
+                            &environment,
+                        )? {
+                            Some(plan) => plan,
+                            None => return Ok("fresh-normal-plan absent\n".into()),
+                        }
+                    };
+                    if oulipoly_kernel_broker::normal_plan_custody::observe(
+                        &lane,
+                        &receipt,
+                        &recipient,
+                        &session,
+                        &config_dir,
+                        &cwd,
+                        &environment,
+                    )? != Some(plan.clone())
+                    {
+                        return Err(io::Error::other("normal plan readback changed"));
+                    }
+                    let live = PinnedProcess::open(recipient.host_pid)?;
+                    if live.boot_id != recipient.boot_id
+                        || live.starttime_ticks != recipient.starttime_ticks
+                        || live.pidns_dev != recipient.pidns_dev
+                        || live.pidns_ino != recipient.pidns_ino
+                    {
+                        return Err(io::Error::other("normal plan actor changed"));
+                    }
+                    live.verify()?;
+                    Ok(format!(
+                        "fresh-normal-plan {}\n",
+                        serde_json::to_string(&plan)?
                     ))
                 }
                 #[cfg(feature = "age319-private-broker-fixture")]
