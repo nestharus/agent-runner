@@ -2362,6 +2362,95 @@ fn prepare_normal_work(
         {
             return Err("private normal admission readback changed".into());
         }
+        if std::env::var_os("AGE319_PRIVATE_NORMAL_PHYSICAL_V1").is_some() {
+            let gate = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                .ok_or("private normal K gate directory absent")?;
+            let gate = std::path::PathBuf::from(gate);
+            if std::env::var_os("AGE319_PRIVATE_NORMAL_BAD_SOURCE_V1").is_some() {
+                std::fs::write(gate.join("normal-pre-k-ready"), b"admitted")
+                    .map_err(|e| e.to_string())?;
+                let mutation_deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(20);
+                while !gate.join("normal-pre-k-mutated").exists() {
+                    if std::time::Instant::now() >= mutation_deadline {
+                        return Err("private normal pre-K mutation gate expired".into());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                if protocol::launch_fresh_normal_provider_at(&socket, &receipt.d_key, descriptors)
+                    .is_ok()
+                {
+                    return Err("private changed executable acquired K".into());
+                }
+                std::fs::write(gate.join("normal-pre-k-refused"), b"no K")
+                    .map_err(|e| e.to_string())?;
+                return Err("private changed executable refused before K".into());
+            }
+            private_drop_normal_physical_reply(&socket, &receipt.d_key, descriptors)?;
+            std::fs::write(gate.join("normal-k-sent"), b"committed-reply-lost")
+                .map_err(|e| e.to_string())?;
+            let restart_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !gate.join("normal-k-resume").exists() {
+                if std::time::Instant::now() >= restart_deadline {
+                    return Err("private normal K restart gate expired".into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let first =
+                protocol::observe_fresh_normal_provider_at(&socket, &receipt.d_key, descriptors)
+                    .and_then(|value| {
+                        value.ok_or_else(|| std::io::Error::other("normal K lost without readback"))
+                    })
+                    .map_err(|e| format!("private normal physical K refused: {e}"))?;
+            if first["k"]["admission_id"] != admitted.admission_id {
+                return Err("private normal K admission changed".into());
+            }
+            let duplicate =
+                protocol::launch_fresh_normal_provider_at(&socket, &receipt.d_key, descriptors)
+                    .map_err(|e| format!("private normal duplicate K refused: {e}"))?;
+            if duplicate["k"] != first["k"] {
+                return Err("private normal duplicate K changed".into());
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            let settled = loop {
+                let observed = protocol::observe_fresh_normal_provider_at(
+                    &socket,
+                    &receipt.d_key,
+                    descriptors,
+                )
+                .map_err(|e| format!("private normal Q readback refused: {e}"))?
+                .ok_or("private normal K disappeared")?;
+                if observed["k"] != first["k"] {
+                    return Err("private normal K changed while waiting for Q".into());
+                }
+                if observed["state"] == "drained" {
+                    if observed["q"]["admission_id"] != admitted.admission_id {
+                        return Err("private normal Q admission changed".into());
+                    }
+                    break observed;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "private normal physical Q remained unknown: {}",
+                        observed["unknown_reason"]
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            };
+            let original = gate.join("normal-source-after-q.original");
+            std::fs::rename(&plan.executable, &original).map_err(|e| e.to_string())?;
+            std::fs::write(&plan.executable, b"#!/bin/sh\nexit 87\n").map_err(|e| e.to_string())?;
+            let drifted =
+                protocol::observe_fresh_normal_provider_at(&socket, &receipt.d_key, descriptors);
+            std::fs::remove_file(&plan.executable).map_err(|e| e.to_string())?;
+            std::fs::rename(&original, &plan.executable).map_err(|e| e.to_string())?;
+            let drifted = drifted
+                .map_err(|e| format!("private normal Q after source drift refused: {e}"))?
+                .ok_or("private normal K after source drift disappeared")?;
+            if drifted["state"] != "drained" || drifted["q"] != settled["q"] {
+                return Err("private normal Q changed after source drift".into());
+            }
+        }
     }
     Ok(model_invocation)
 }
@@ -5496,6 +5585,66 @@ fn spec_for_handoff(spec: &protocol::StateReadSpec) -> protocol::StateReadSpec {
         root_id: spec.root_id.clone(),
         attempt_id: None,
     }
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_drop_normal_physical_reply(
+    socket: &std::path::Path,
+    d_key: &str,
+    descriptors: [std::os::fd::RawFd; 3],
+) -> Result<(), String> {
+    let mut stream = UnixStream::connect(socket).map_err(|e| e.to_string())?;
+    let mut challenge = [0u8; 16];
+    stream
+        .read_exact(&mut challenge)
+        .map_err(|e| e.to_string())?;
+    let body = serde_json::to_vec(&protocol::FreshRootEffectRequest {
+        d_key: d_key.into(),
+        success: None,
+    })
+    .map_err(|e| e.to_string())?;
+    let mut frame = Vec::with_capacity(17 + body.len());
+    frame.push(0x8a);
+    frame.extend_from_slice(&challenge);
+    frame.extend_from_slice(&body);
+    let mut iov = libc::iovec {
+        iov_base: frame.as_mut_ptr().cast(),
+        iov_len: frame.len(),
+    };
+    let mut control = [0u8; 128];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen =
+        unsafe { libc::CMSG_SPACE((3 * std::mem::size_of::<std::os::fd::RawFd>()) as _) } as usize;
+    unsafe {
+        let header = libc::CMSG_FIRSTHDR(&msg);
+        (*header).cmsg_level = libc::SOL_SOCKET;
+        (*header).cmsg_type = libc::SCM_RIGHTS;
+        (*header).cmsg_len =
+            libc::CMSG_LEN((3 * std::mem::size_of::<std::os::fd::RawFd>()) as _) as usize;
+        std::ptr::copy_nonoverlapping(
+            descriptors.as_ptr(),
+            libc::CMSG_DATA(header).cast::<std::os::fd::RawFd>(),
+            3,
+        );
+    }
+    if unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) }
+        != frame.len() as isize
+    {
+        return Err("private normal physical request uncertain".into());
+    }
+    stream
+        .set_read_timeout(Some(PRIVATE_LOST_REPLY_READ_TIMEOUT))
+        .map_err(|e| e.to_string())?;
+    let mut first = [0u8; 1];
+    stream.read_exact(&mut first).map_err(|e| e.to_string())?;
+    if first != [b'f'] {
+        return Err("private normal physical K refused before reply".into());
+    }
+    drop(stream);
+    Ok(())
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]

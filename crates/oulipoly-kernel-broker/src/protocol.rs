@@ -645,6 +645,44 @@ pub fn observe_fresh_normal_provider_admission_at(
     normal_admission_request_at(path, 0x89, d_key, descriptors)
 }
 
+/// Spend the exact admitted plan once. A lost reply is reconciled with the
+/// readback opcode; another launch request never creates a second process.
+pub fn launch_fresh_normal_provider_at(
+    path: &Path,
+    d_key: &str,
+    descriptors: [RawFd; 3],
+) -> io::Result<serde_json::Value> {
+    normal_physical_request_at(path, 0x8a, d_key, descriptors)?
+        .ok_or_else(|| io::Error::other("normal physical K absent"))
+}
+
+pub fn observe_fresh_normal_provider_at(
+    path: &Path,
+    d_key: &str,
+    descriptors: [RawFd; 3],
+) -> io::Result<Option<serde_json::Value>> {
+    normal_physical_request_at(path, 0x8b, d_key, descriptors)
+}
+
+fn normal_physical_request_at(
+    path: &Path,
+    operation: u8,
+    d_key: &str,
+    descriptors: [RawFd; 3],
+) -> io::Result<Option<serde_json::Value>> {
+    let reply = normal_plan_wire_at(path, operation, d_key, descriptors)?;
+    if reply == "fresh-normal-physical absent\n" {
+        return Ok(None);
+    }
+    let body = reply
+        .strip_prefix("fresh-normal-physical ")
+        .and_then(|value| value.strip_suffix('\n'))
+        .ok_or_else(|| io::Error::other("normal physical readback invalid"))?;
+    serde_json::from_str(body)
+        .map(Some)
+        .map_err(io::Error::other)
+}
+
 fn normal_admission_request_at(
     path: &Path,
     operation: u8,

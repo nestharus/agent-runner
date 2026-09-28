@@ -33,6 +33,8 @@ mod manual_quota;
 mod namespace_helper_reaper;
 #[path = "native_work.rs"]
 mod native_work;
+#[path = "normal_physical.rs"]
+mod normal_physical;
 #[cfg(feature = "age319-private-broker-fixture")]
 #[path = "private_installed_exec.rs"]
 mod private_installed_exec;
@@ -815,7 +817,7 @@ fn recv_request(
         #[cfg(feature = "age319-private-broker-fixture")]
         b'#' | b'{' | b'}' | b']' | b'|' | b'~' | b'?' => (18..=2048 + 17).contains(&read),
         b'@' | b'[' | 0x7f | 0x80 | 0x81 | 0x82 | 0x83 | 0x84 | 0x85 | 0x86 | 0x87 | 0x88
-        | 0x89 => (18..=2048 + 17).contains(&read),
+        | 0x89 | 0x8a | 0x8b => (18..=2048 + 17).contains(&read),
         b'F' => (18..=8192 + 17).contains(&read),
         b'O' => (18..=1024 + 17).contains(&read),
         b'U' => (18..=512 + 17).contains(&read),
@@ -834,7 +836,7 @@ fn recv_request(
             b'k' => descriptors.len() != 4,
             b'K' => descriptors.len() != 7,
             0x84 | 0x85 => descriptors.len() != 1,
-            0x86 | 0x87 | 0x88 | 0x89 => descriptors.len() != 3,
+            0x86 | 0x87 | 0x88 | 0x89 | 0x8a | 0x8b => descriptors.len() != 3,
             #[cfg(feature = "age319-private-broker-fixture")]
             b'5' | b'b' => descriptors.len() != 4,
             #[cfg(feature = "age319-private-broker-fixture")]
@@ -896,7 +898,7 @@ fn recv_request(
             request: serde_json::from_slice(&request[17..read as usize])?,
             config_dir: descriptors.into_iter().next().unwrap(),
         },
-        0x86 | 0x87 | 0x88 | 0x89 => {
+        0x86 | 0x87 | 0x88 | 0x89 | 0x8a | 0x8b => {
             let mut descriptors = descriptors.into_iter();
             RequestPayload::FreshNormalPlanRequest {
                 request: serde_json::from_slice(&request[17..read as usize])?,
@@ -7612,7 +7614,7 @@ fn serve_fresh_v30_at(
                         serde_json::to_string(&selection)?
                     ))
                 }
-                0x86 | 0x87 | 0x88 | 0x89 => {
+                0x86 | 0x87 | 0x88 | 0x89 | 0x8a | 0x8b => {
                     let RequestPayload::FreshNormalPlanRequest {
                         request,
                         config_dir,
@@ -7627,9 +7629,11 @@ fn serve_fresh_v30_at(
                             "normal plan request cannot return an effect",
                         ));
                     }
-                    if matches!(operation, 0x86 | 0x88) && instance.is_closed() {
+                    if matches!(operation, 0x86 | 0x88 | 0x8a) && instance.is_closed() {
                         return Err(io::Error::other("normal plan gate closed"));
                     }
+                    let peer_uid = peer.uid;
+                    let peer_gid = peer.gid;
                     let receipt = lane
                         .released_handoff_for_child(&request.d_key, &recipient)
                         .map_err(io::Error::other)?;
@@ -7660,6 +7664,33 @@ fn serve_fresh_v30_at(
                         .ok_or_else(|| io::Error::other("normal plan D absent"))?;
                     lane.require_released_invocation(&receipt, &recipient, &session)
                         .map_err(io::Error::other)?;
+                    // Once K is spent, readback must survive later source
+                    // changes. State still binds the exact actor, session,
+                    // admission and plan; observing Q cannot launch again.
+                    if operation == 0x8b {
+                        let live = PinnedProcess::open(recipient.host_pid)?;
+                        if live.boot_id != recipient.boot_id
+                            || live.starttime_ticks != recipient.starttime_ticks
+                            || live.pidns_dev != recipient.pidns_dev
+                            || live.pidns_ino != recipient.pidns_ino
+                        {
+                            return Err(io::Error::other("normal physical actor changed"));
+                        }
+                        live.verify()?;
+                        return match normal_physical::observe(
+                            &lane,
+                            &receipt,
+                            &recipient,
+                            &session,
+                            &state_root,
+                        )? {
+                            Some(readback) => Ok(format!(
+                                "fresh-normal-physical {}\n",
+                                serde_json::to_string(&readback)?
+                            )),
+                            None => Ok("fresh-normal-physical absent\n".into()),
+                        };
+                    }
                     let plan = if operation == 0x86 {
                         let guard = admission_fences
                             .lock()
@@ -7690,7 +7721,7 @@ fn serve_fresh_v30_at(
                             None if operation == 0x89 => {
                                 return Ok("fresh-normal-admission absent\n".into());
                             }
-                            None if operation == 0x88 => {
+                            None if matches!(operation, 0x88 | 0x8a | 0x8b) => {
                                 return Err(io::Error::other("normal admission plan absent"));
                             }
                             None => return Ok("fresh-normal-plan absent\n".into()),
@@ -7717,8 +7748,8 @@ fn serve_fresh_v30_at(
                         return Err(io::Error::other("normal plan actor changed"));
                     }
                     live.verify()?;
-                    if matches!(operation, 0x88 | 0x89) {
-                        let _admission_guard = if operation == 0x88 {
+                    if matches!(operation, 0x88 | 0x89 | 0x8a | 0x8b) {
+                        let _admission_guard = if matches!(operation, 0x88 | 0x8a) {
                             let guard = admission_fences
                                 .lock()
                                 .map_err(|_| io::Error::other("root admission fence poisoned"))?;
@@ -7750,6 +7781,48 @@ fn serve_fresh_v30_at(
                             return Err(io::Error::other("normal admission plan changed"));
                         }
                         live.verify()?;
+                        if matches!(operation, 0x8a | 0x8b) {
+                            let admission = admission.ok_or_else(|| {
+                                io::Error::other("normal physical admission absent")
+                            })?;
+                            let readback = if operation == 0x8a {
+                                let materialized =
+                                    oulipoly_kernel_broker::normal_plan_custody::reopen_recipe(
+                                        &plan,
+                                        &config_dir,
+                                        &cwd,
+                                        &environment,
+                                    )?;
+                                normal_physical::launch(
+                                    &lane,
+                                    &receipt,
+                                    &recipient,
+                                    &session,
+                                    &admission,
+                                    &plan,
+                                    materialized,
+                                    &config_dir,
+                                    &state_root,
+                                    peer_uid,
+                                    peer_gid,
+                                )?
+                            } else {
+                                match normal_physical::observe(
+                                    &lane,
+                                    &receipt,
+                                    &recipient,
+                                    &session,
+                                    &state_root,
+                                )? {
+                                    Some(value) => value,
+                                    None => return Ok("fresh-normal-physical absent\n".into()),
+                                }
+                            };
+                            return Ok(format!(
+                                "fresh-normal-physical {}\n",
+                                serde_json::to_string(&readback)?
+                            ));
+                        }
                         return match admission {
                             Some(admission) => Ok(format!(
                                 "fresh-normal-admission {}\n",
@@ -9268,6 +9341,9 @@ fn serve_fresh_v30_at(
 pub fn run() {
     let args: Vec<_> = std::env::args_os().collect();
     let result = match args.as_slice() {
+        [_, mode, state_root] if mode == "--normal-provider-supervisor" => {
+            normal_physical::supervisor(Path::new(state_root))
+        }
         #[cfg(feature = "age319-private-broker-fixture")]
         [_, mode, namespace_fd, socket_fd] if mode == "--age319-v2-wake-launcher" => {
             if !private_fixture() {

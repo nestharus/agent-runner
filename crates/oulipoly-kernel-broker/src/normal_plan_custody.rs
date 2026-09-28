@@ -48,7 +48,7 @@ pub fn inherited_environment(file: &File) -> io::Result<EnvironmentSnapshot> {
     serde_json::from_slice(&bytes).map_err(io::Error::other)
 }
 
-fn image_evidence(path: &Path) -> io::Result<(u64, u64, u64, String, String, bool)> {
+pub fn image_evidence(path: &Path) -> io::Result<(u64, u64, u64, String, String, bool)> {
     let mut source = File::open(path)?;
     let before = source.metadata()?;
     if !before.is_file() || before.len() > MAX_IMAGE_BYTES {
@@ -105,6 +105,12 @@ fn image_evidence(path: &Path) -> io::Result<(u64, u64, u64, String, String, boo
         || at_path.dev() != before.dev()
         || at_path.ino() != before.ino()
         || at_path_mount != mount_id
+        || at_path.len() != before.len()
+        || at_path.ctime() != before.ctime()
+        || at_path.ctime_nsec() != before.ctime_nsec()
+        || at_path.mtime() != before.mtime()
+        || at_path.mtime_nsec() != before.mtime_nsec()
+        || at_path.mode() != before.mode()
     {
         return Err(io::Error::other("normal plan image changed while reading"));
     }
@@ -140,6 +146,18 @@ pub fn candidate(
     cwd_fd: &File,
     environment_fd: &File,
 ) -> io::Result<FreshNormalExecutablePlan> {
+    candidate_and_recipe(selection, config_dir, cwd_fd, environment_fd).map(|(record, _)| record)
+}
+
+fn candidate_and_recipe(
+    selection: FreshNormalModelSelection,
+    config_dir: &File,
+    cwd_fd: &File,
+    environment_fd: &File,
+) -> io::Result<(
+    FreshNormalExecutablePlan,
+    oulipoly_runtime::executor::cli::fresh_remote::FreshProviderPlan,
+)> {
     if normal_model_selection::candidate(selection.invocation.clone(), config_dir)? != selection {
         return Err(io::Error::other("normal plan selection source changed"));
     }
@@ -196,6 +214,7 @@ pub fn candidate(
         )
         .map_err(io::Error::other)?;
     let plan = prepared.plan;
+    let recipe = plan.clone();
     let (image_device, image_inode, image_mount, image_sha, image_metadata_sha, path_execution) =
         image_evidence(&plan.executable)?;
     let environment_sha = format!(
@@ -254,7 +273,26 @@ pub fn candidate(
             "normal plan config changed during construction",
         ));
     }
-    Ok(result)
+    Ok((result, recipe))
+}
+
+/// Reconstruct the original runtime recipe from live descriptors immediately
+/// before K. The State record, including the complete source observation,
+/// must be byte-for-byte the same as the newly derived candidate.
+pub fn reopen_recipe(
+    retained: &FreshNormalExecutablePlan,
+    config_dir: &File,
+    cwd: &File,
+    environment: &File,
+) -> io::Result<oulipoly_runtime::executor::cli::fresh_remote::FreshProviderPlan> {
+    let (candidate, recipe) =
+        candidate_and_recipe(retained.selection.clone(), config_dir, cwd, environment)?;
+    if &candidate != retained {
+        return Err(io::Error::other(
+            "normal physical K source or recipe changed",
+        ));
+    }
+    Ok(recipe)
 }
 
 pub fn select(
