@@ -1,6 +1,6 @@
 # AGE-319 production provider K: no-effect admission prerequisite
 
-2026-09-28. Runner base `462f34f3ca1b8192bd6f63b2b96c1a78b347f4e1`, source commit `5b0fd8c0`; Bash base `1aadfe99a5bf4016f29b1ed1198ff74d9173c7f8`, paired pin commit `b786564`. The paired branches are `age319-production-provider-k-20260928`.
+2026-09-28. Runner base `462f34f3ca1b8192bd6f63b2b96c1a78b347f4e1`, source head `5b0fd8c0a0d94c461608b5cb0a86229efffada6b`; Bash base `1aadfe99a5bf4016f29b1ed1198ff74d9173c7f8`, paired head `b7865647f47352eba156b802a2af36b851e97279`. The paired branches are `age319-production-provider-k-20260928`; the Runner branch's report commit follows its source head.
 
 ## Result
 
