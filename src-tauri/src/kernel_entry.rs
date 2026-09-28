@@ -3277,6 +3277,10 @@ impl oulipoly_runtime::executor::cli::fresh_remote::FreshProviderBackend
                     serde_json::to_vec(&receipt).map_err(|e| e.to_string())?,
                 )
                 .map_err(|e| self.unknown(Some(&grant), "native turn report", &e.to_string()))?;
+                if std::env::var_os("AGE319_PRIVATE_BASH_RECIPIENT_MODE_V1").is_some() {
+                    private_bash_recipient_probe(&socket, &self.authority.receipt.d_key, &gate)
+                        .map_err(|e| self.unknown(Some(&grant), "fresh F source grant", &e))?;
+                }
             }
             protocol::private_fresh_provider_at(&socket, &self.authority.receipt.d_key, b'7', None)
                 .map_err(|e| self.unknown(Some(&grant), "native K cancellation", &e.to_string()))?;
@@ -4762,7 +4766,7 @@ fn private_bash_recipient_probe(
     let mode = std::env::var("AGE319_PRIVATE_BASH_RECIPIENT_MODE_V1").map_err(|e| e.to_string())?;
     if !matches!(
         mode.as_str(),
-        "ack" | "lost_pending" | "prepare_unavailable"
+        "ack" | "lost_pending" | "prepare_unavailable" | "native_k_pending"
     ) {
         return Err("invalid private Bash recipient mode".into());
     }
