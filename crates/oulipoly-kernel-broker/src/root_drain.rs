@@ -1,9 +1,9 @@
-//! Bounded broker inventory for an exact fenced root. This is deliberately a
-//! preparatory readback: no combination of these counts closes PID1 or State.
+//! Bounded broker inventory for an exact fenced root. PID1 terminal proof is
+//! narrower than State/sidecar close or caller publication.
 
 use crate::accepted_grant::{GrantRecord, GrantRegistry};
 use crate::entry_registry::{EntryRegistry, ProcessStamp};
-use crate::identity::ChildExit;
+use crate::identity::{ChildExit, observed_incarnation_gone};
 use crate::registry::{RootRecord, RootRegistry};
 use crate::source_physical::SourcePhysicalRegistry;
 use crate::work_registry::{LiveWork, WorkRecord, WorkRegistry};
@@ -26,6 +26,23 @@ pub struct RootDrainInventory {
     pub fenced: bool,
     pub state: DrainState,
     pub pid1: &'static str,
+    /// Pinned live incarnation, independent of a parent wait peek.
+    pub pid1_exact_live: bool,
+    /// Exact durable PID1 self-report that waitpid(-1) reached ECHILD.
+    /// It does not prove the PID1 incarnation has exited.
+    pub pid1_echild_receipt: bool,
+    /// PID1's exact ECHILD receipt plus absence of its recorded incarnation.
+    /// This does not include an authoritative parent wait receipt.
+    pub pid1_terminal_proof: bool,
+    /// Exact parent wait persisted by the original serving Broker when it
+    /// survived long enough to consume the child status.
+    pub pid1_parent_wait_proof: bool,
+    /// Consumed J with the exact original joined child, guardian and driver
+    /// bound to the one retained physical source. Its seal is checked below.
+    pub entry_physical_settled: bool,
+    /// The exact original Runner entry incarnation has ended. PID1 cannot
+    /// reach ECHILD while that direct child remains live.
+    pub entry_original_exited: bool,
     pub entry_unsettled: bool,
     pub prepared_grants: usize,
     pub spent_without_work: usize,
@@ -81,7 +98,7 @@ fn classify_counts(
     {
         DrainState::Blocked
     } else {
-        // State, source-admission, old WAL and PID1 ECHILD are not certified.
+        // State, source-admission and old WAL are not certified here.
         DrainState::Unknown
     }
 }
@@ -237,7 +254,27 @@ pub fn readback(
     }
     let entry = entries.record(&expected.root_id);
     let entry_unsettled = entry.is_none_or(|entry| entry.terminal_settlement.is_none());
-    let uncertain_registry_or_incarnation = roots.has_debt()
+    let entry_physical_settled = entry.is_some_and(|entry| {
+        entry.join_consumed
+            && source_records.len() == 1
+            && entry.joined_child.as_ref() == Some(&source_records[0].joined_child)
+            && entry.prepared_driver.as_ref() == Some(&source_records[0].driver)
+            && entry.guardian.as_ref() == Some(&source_records[0].guardian)
+    });
+    let entry_original_exited = entry
+        .and_then(|entry| entry.joined_child.as_ref())
+        .is_some_and(|actor| {
+            observed_incarnation_gone(
+                actor.host_pid,
+                &actor.boot_id,
+                actor.starttime_ticks,
+                (actor.pidns_dev, actor.pidns_ino),
+            )
+            .unwrap_or(false)
+        });
+    let pid1_receipt = roots.pid1_echild_receipt(expected);
+    let uncertain_registry_or_incarnation = pid1_receipt.is_err()
+        || roots.has_unrelated_debt(expected)
         || works.has_uncertain_write()
         || work_retirement_uncertain
         || grants.has_debt()
@@ -262,11 +299,19 @@ pub fn readback(
         || source_records
             .iter()
             .any(|source| source.root_init != stamp);
-    let pid1 = match roots.observe_init_exit(expected) {
-        Ok(ChildExit::Running) => "live",
-        Ok(ChildExit::ExitedZero) => "exited_zero_unreaped",
-        Ok(ChildExit::ExitedAbnormally) => "abnormal_exit",
-        Err(_) => "unknown",
+    let pid1_terminal_proof = roots.pid1_terminal_proof(expected).unwrap_or(false);
+    let pid1_echild_receipt = pid1_receipt.unwrap_or(false);
+    let pid1_exact_live = roots.pid1_exact_live(expected).unwrap_or(false);
+    let pid1_parent_wait_proof = roots.pid1_parent_wait_proof(expected).unwrap_or(false);
+    let pid1 = if pid1_terminal_proof {
+        "terminal_echild_absent"
+    } else {
+        match roots.observe_init_exit(expected) {
+            Ok(ChildExit::Running) => "live",
+            Ok(ChildExit::ExitedZero) => "exited_zero_unreaped",
+            Ok(ChildExit::ExitedAbnormally) => "abnormal_exit",
+            Err(_) => "unknown",
+        }
     };
     let prepared_grants = root_grants.iter().filter(|grant| !grant.consumed).count();
     let spent_without_work = spent_without_work(&root_grants, &root_live, &root_debt);
@@ -296,6 +341,12 @@ pub fn readback(
                 .map_or(0, BrokerSourceEffectObligations::unsettled),
         ),
         pid1,
+        pid1_exact_live,
+        pid1_echild_receipt,
+        pid1_terminal_proof,
+        pid1_parent_wait_proof,
+        entry_physical_settled,
+        entry_original_exited,
         entry_unsettled,
         prepared_grants,
         spent_without_work,
@@ -315,6 +366,40 @@ pub fn readback(
         state_sidecar_outstanding_unknown: true,
         close_eligible: false,
     })
+}
+
+/// An explicit host-root drain request is allowed only after an exact,
+/// fenced readback revalidates every retained source and child work seal.
+/// Zero records and an empty count alone cannot authorize PID1 exit.
+pub fn ready_for_pid1_request(inventory: &RootDrainInventory) -> io::Result<()> {
+    if !inventory.fenced
+        || !inventory.entry_physical_settled
+        || !inventory.entry_original_exited
+        || inventory.prepared_grants != 0
+        || inventory.spent_without_work != 0
+        || inventory.live_works != 0
+        || inventory.work_debt != 0
+        || inventory.work_records == 0
+        || inventory.work_outstanding != 0
+        || inventory.work_retired != inventory.work_records
+        || inventory.native_prepared != 0
+        || inventory.native_spent != 0
+        || inventory.source_physical_records == 0
+        || inventory.source_physical_outstanding != 0
+        || inventory.source_physical_retired != inventory.source_physical_records
+        || inventory.source_effect_readback_uncertain
+        || inventory
+            .source_effect
+            .as_ref()
+            .is_none_or(|effect| effect.unsettled() != 0)
+        || inventory.uncertain_registry_or_incarnation
+        || !inventory.pid1_exact_live
+    {
+        return Err(io::Error::other(
+            "exact root PID1 drain prerequisites absent or changed",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

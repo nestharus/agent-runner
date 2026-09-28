@@ -56,6 +56,29 @@ pub fn root_drain_readback_at(
     Ok(response)
 }
 
+/// Host-root request for the exact fenced PID1. The broker independently
+/// revalidates terminal State and both physical retirement seals before it
+/// writes a durable request; this call does not itself claim terminal proof.
+pub fn root_pid1_drain_at(path: &Path, expected: &RootRecord) -> io::Result<String> {
+    let mut stream = checked_connection(path)?;
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let mut frame = vec![0x7f];
+    frame.extend_from_slice(&challenge);
+    frame.extend_from_slice(&serde_json::to_vec(expected)?);
+    if frame.len() > 2048 {
+        return Err(io::Error::other("root PID1 request too large"));
+    }
+    stream.write_all(&frame)?;
+    let mut response = Vec::new();
+    stream.take(257).read_to_end(&mut response)?;
+    let response = String::from_utf8(response).map_err(io::Error::other)?;
+    if response != "root-pid1-drain-v1 requested\n" {
+        return Err(io::Error::other(response));
+    }
+    Ok(response)
+}
+
 /// The fresh lane has a fixed, versioned endpoint. Callers cannot provide a
 /// State path or select a ledger by an environment string.
 #[derive(Debug, Clone, PartialEq, Eq)]

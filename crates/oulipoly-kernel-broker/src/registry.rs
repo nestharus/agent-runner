@@ -1,5 +1,6 @@
 use crate::identity::{ChildExit, PinnedProcess, boot_id};
 use crate::json_artifact;
+use crate::root_pid1;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
@@ -83,6 +84,9 @@ impl RootRegistry {
                 continue;
             }
             if name == "root-drains" && entry.file_type()?.is_dir() {
+                continue;
+            }
+            if name == "root-pid1" && entry.file_type()?.is_dir() {
                 continue;
             }
             if name == "entries" && entry.file_type()?.is_dir() {
@@ -197,6 +201,56 @@ impl RootRegistry {
             }
             registry.admission_fences.push(record);
         }
+        let pid1 = registry.directory.join("root-pid1");
+        if !pid1.exists() {
+            fs::DirBuilder::new().mode(0o700).create(&pid1)?;
+            fs::File::open(&registry.directory)?.sync_all()?;
+        }
+        let meta = fs::symlink_metadata(&pid1)?;
+        if !meta.is_dir()
+            || meta.file_type().is_symlink()
+            || meta.uid() != unsafe { libc::geteuid() }
+            || meta.mode() & 0o077 != 0
+        {
+            return Err(io::Error::other("unsafe root PID1 directory"));
+        }
+        for entry in fs::read_dir(&pid1)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(".json-pending-") {
+                return Err(json_artifact::pending_error(
+                    &entry.path(),
+                    "root_pid1_open",
+                ));
+            }
+            let Some(root_id) = name
+                .strip_suffix(".request.json")
+                .or_else(|| name.strip_suffix(".terminal.json"))
+                .or_else(|| name.strip_suffix(".parent-wait.json"))
+            else {
+                return Err(io::Error::other("unrecognized root PID1 artifact"));
+            };
+            let root = registry
+                .live
+                .iter()
+                .map(|r| &r.record)
+                .chain(registry.debt.iter())
+                .find(|root| root.root_id == root_id)
+                .ok_or_else(|| io::Error::other("orphaned root PID1 artifact"))?;
+            if !registry.admission_fences.iter().any(|fence| fence == root)
+                || !entry.file_type()?.is_file()
+            {
+                return Err(io::Error::other("unfenced root PID1 artifact"));
+            }
+            if name.ends_with(".request.json") {
+                root_pid1::read_request(&pid1, root)?;
+            } else if name.ends_with(".terminal.json") {
+                root_pid1::read_terminal(&pid1, root)?
+                    .ok_or_else(|| io::Error::other("root PID1 terminal missing"))?;
+            } else if !root_pid1::parent_wait_proof(&pid1, root)? {
+                return Err(io::Error::other("root PID1 parent wait missing"));
+            }
+        }
         Ok(registry)
     }
 
@@ -220,6 +274,89 @@ impl RootRegistry {
 
     pub fn has_debt(&self) -> bool {
         self.poisoned || !self.debt.is_empty() || self.live.iter().any(|r| r.init.verify().is_err())
+    }
+
+    fn terminal_verified(&self, root: &RootRecord) -> bool {
+        self.admission_fences.iter().any(|fence| fence == root)
+            && root_pid1::terminal_proof(&self.directory.join("root-pid1"), root)
+                .is_ok_and(|proof| proof.is_some())
+    }
+
+    /// Read-only physical Q for one terminal root may use its exact PID1
+    /// receipt. Global admission debt remains until the separate root close.
+    pub fn has_unrelated_debt(&self, expected: &RootRecord) -> bool {
+        self.poisoned
+            || self
+                .debt
+                .iter()
+                .any(|root| root != expected || !self.terminal_verified(root))
+            || self.live.iter().any(|root| {
+                root.init.verify().is_err()
+                    && (root.record != *expected || !self.terminal_verified(&root.record))
+            })
+    }
+
+    pub fn pid1_terminal_proof(&self, expected: &RootRecord) -> io::Result<bool> {
+        self.exact_record(expected)?;
+        if !self.admission_fences.iter().any(|fence| fence == expected) {
+            return Ok(false);
+        }
+        Ok(root_pid1::terminal_proof(&self.directory.join("root-pid1"), expected)?.is_some())
+    }
+
+    pub fn pid1_echild_receipt(&self, expected: &RootRecord) -> io::Result<bool> {
+        self.exact_record(expected)?;
+        if !self.admission_fences.iter().any(|fence| fence == expected) {
+            return Ok(false);
+        }
+        Ok(root_pid1::read_terminal(&self.pid1_directory(), expected)?.is_some())
+    }
+
+    /// Exact live identity is recoverable from the pinned process after a
+    /// Broker restart, even though its parent wait status is not.
+    pub fn pid1_exact_live(&self, expected: &RootRecord) -> io::Result<bool> {
+        self.exact_record(expected)?;
+        Ok(self
+            .live
+            .iter()
+            .any(|root| root.record == *expected && root.init.verify().is_ok()))
+    }
+
+    pub fn pid1_directory(&self) -> PathBuf {
+        self.directory.join("root-pid1")
+    }
+
+    pub fn pid1_parent_wait_proof(&self, expected: &RootRecord) -> io::Result<bool> {
+        self.exact_record(expected)?;
+        root_pid1::parent_wait_proof(&self.pid1_directory(), expected)
+    }
+
+    /// Only the broker that forked PID1 can consume this exact child wait.
+    /// If it crashes after waitpid and before publication, the parent wait is
+    /// irrecoverable; PID1's own terminal ECHILD receipt remains independent.
+    pub fn reap_terminal_pid1(&self, expected: &RootRecord) -> io::Result<bool> {
+        self.exact_record(expected)?;
+        if self.pid1_parent_wait_proof(expected)? {
+            return Ok(true);
+        }
+        let root = self
+            .live
+            .iter()
+            .find(|root| root.record == *expected)
+            .ok_or_else(|| io::Error::other("root PID1 original parent unavailable"))?;
+        if root_pid1::read_terminal(&self.pid1_directory(), expected)?.is_none() {
+            return Ok(false);
+        }
+        if !matches!(root.init.peek_child_exit()?, ChildExit::ExitedZero) {
+            return Ok(false);
+        }
+        let mut status = 0;
+        let reaped = unsafe { libc::waitpid(expected.init_host_pid, &mut status, libc::WNOHANG) };
+        if reaped != expected.init_host_pid {
+            return Err(io::Error::other("root PID1 exact parent wait unavailable"));
+        }
+        root_pid1::publish_parent_wait(&self.pid1_directory(), expected, status)?;
+        Ok(true)
     }
 
     pub fn live_roots(&self) -> impl Iterator<Item = &LiveRoot> {

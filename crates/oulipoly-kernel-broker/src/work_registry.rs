@@ -552,7 +552,7 @@ impl WorkRegistry {
         terminal_dir: &Path,
     ) -> io::Result<WorkPhysicalQ> {
         roots.exact_record(expected)?;
-        if roots.has_debt() || self.poisoned {
+        if roots.has_unrelated_debt(expected) || self.poisoned {
             return Err(io::Error::other("work root or registry uncertain"));
         }
         let stamp = ProcessStamp {

@@ -171,6 +171,66 @@ pub fn observed_incarnation_gone(
     Ok(namespace_identity(&namespace)? != recorded_namespace)
 }
 
+/// Root PID1 terminal proof requires disappearance of its exact proc
+/// incarnation. A still-present zombie is exited but not yet absent.
+pub fn observed_incarnation_absent(
+    host_pid: i32,
+    recorded_boot: &str,
+    recorded_starttime: u64,
+    recorded_namespace: (u64, u64),
+) -> io::Result<bool> {
+    if boot_id()? != recorded_boot {
+        return Ok(true);
+    }
+    let (starttime, state) = match proc_starttime(host_pid) {
+        Ok(value) => value,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    if starttime != recorded_starttime {
+        return Ok(true);
+    }
+    if state == b'Z' || state == b'X' {
+        return Ok(false);
+    }
+    let namespace = match host_proc_file(&format!("{host_pid}/ns/pid")) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    Ok(namespace_identity(&namespace)? != recorded_namespace)
+}
+
+/// A new PID namespace cannot open a pidfd for its host PID. While the
+/// inherited host procfs observer is still open, PID1 can nevertheless
+/// compare the Broker's record to its own host proc identity before it
+/// closes inherited descriptors and starts the original Runner.
+pub fn own_pid1_record_matches(
+    host_pid: i32,
+    recorded_boot: &str,
+    recorded_starttime: u64,
+    recorded_namespace: (u64, u64),
+) -> io::Result<bool> {
+    if unsafe { libc::getpid() } != 1 || boot_id()? != recorded_boot {
+        return Ok(false);
+    }
+    let own_stat = host_proc_read("self/stat")?;
+    if own_stat
+        .split_ascii_whitespace()
+        .next()
+        .and_then(|value| value.parse::<i32>().ok())
+        != Some(host_pid)
+    {
+        return Ok(false);
+    }
+    let (starttime, state) = proc_starttime(host_pid)?;
+    if starttime != recorded_starttime || state == b'Z' || state == b'X' {
+        return Ok(false);
+    }
+    let namespace = host_proc_file(&format!("{host_pid}/ns/pid"))?;
+    Ok(namespace_identity(&namespace)? == recorded_namespace)
+}
+
 fn namespace_identity(file: &File) -> io::Result<(u64, u64)> {
     let stat = file.metadata()?;
     Ok((stat.dev(), stat.ino()))
