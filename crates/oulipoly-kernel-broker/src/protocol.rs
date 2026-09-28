@@ -1788,7 +1788,12 @@ pub fn state_route_at(path: &Path) -> io::Result<StateRoute> {
     let fields = response
         .strip_prefix("state-route broker-owned ")
         .and_then(|value| value.strip_suffix('\n'))
-        .ok_or_else(|| io::Error::other("invalid broker State route"))?;
+        .ok_or_else(|| {
+            io::Error::other(format!(
+                "invalid broker State route: {}",
+                response.trim_end()
+            ))
+        })?;
     let (generation, domain) = fields
         .split_once(' ')
         .ok_or_else(|| io::Error::other("missing broker domain"))?;

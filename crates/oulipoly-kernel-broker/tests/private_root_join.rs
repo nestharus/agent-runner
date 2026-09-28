@@ -5216,6 +5216,7 @@ fn inner() {
                         stdout_len: parent.stdout_len,
                         stderr_sha256: parent.stderr_sha256.clone(),
                         stderr_len: parent.stderr_len,
+                        native_f: None,
                     };
                     assert_ne!(offered.stdout_sha256, event.stdout_sha256);
                     if !caller_mode {
@@ -7055,6 +7056,7 @@ fn inner() {
                     stdout_len: parent.stdout_len,
                     stderr_sha256: parent.stderr_sha256.clone(),
                     stderr_len: parent.stderr_len,
+                    native_f: None,
                 };
                 assert_eq!(
                     lane.begin_private_root_caller_result(
@@ -9813,6 +9815,27 @@ fn inner() {
                                         // owns PID1's direct-child slot. Wait for that exact
                                         // process to exit before issuing a physical drain.
                                         eventually(|| entry.try_wait().unwrap().is_some());
+                                        if native_f_turn {
+                                            assert_eq!(
+                                                entry.wait().unwrap().code(),
+                                                Some(0),
+                                                "F-based original caller did not exit successfully: {}",
+                                                fs::read_to_string(&err).unwrap_or_default()
+                                            );
+                                            assert_eq!(
+                                                fs::read(&out).unwrap(),
+                                                format!("AGE319_F_ACK {token}\n").as_bytes(),
+                                                "original caller bytes differ from exact F ACK"
+                                            );
+                                            // The pinned source driver also writes its
+                                            // preexisting launch diagnostic to the entry's
+                                            // stderr. It is separate from the F caller bytes
+                                            // committed by the publication boundary.
+                                            assert_eq!(
+                                                fs::read(&err).unwrap(),
+                                                b"v30 source physically launched; v2 acceptance remains closed\n"
+                                            );
+                                        }
                                         let settled_entry = protocol::root_drain_readback_at(
                                             &socket, &expected, false,
                                         )
@@ -9837,7 +9860,15 @@ fn inner() {
                                                     &original_session,
                                                 )
                                                 .unwrap();
-                                            assert_eq!(published.publication_state, "not_started");
+                                            assert_eq!(published.publication_state, "settled");
+                                            let parent =
+                                                &published.execution.as_ref().unwrap().parent;
+                                            assert!(parent.cancelled);
+                                            assert_eq!(parent.outcome, "cancelled");
+                                            assert_eq!(
+                                                published.ack_basis.as_deref(),
+                                                Some("native_codex_f_assistant_ack")
+                                            );
                                             let entry_record: serde_json::Value =
                                                 serde_json::from_slice(
                                                     &fs::read(broker_state.join("entries").join(
@@ -9846,8 +9877,19 @@ fn inner() {
                                                     .unwrap(),
                                                 )
                                                 .unwrap();
-                                            assert!(entry_record["terminal_settlement"].is_null());
-                                            assert_eq!(settled_entry["entry_unsettled"], true);
+                                            assert_eq!(
+                                                entry_record["terminal_settlement"]["root_id"],
+                                                serde_json::Value::Null
+                                            );
+                                            assert_eq!(
+                                                entry_record["terminal_settlement"]["d_key"],
+                                                root.d_key
+                                            );
+                                            assert_eq!(
+                                                entry_record["terminal_settlement"]["publication_sha256"],
+                                                published.publication_sha256.unwrap()
+                                            );
+                                            assert_eq!(settled_entry["entry_unsettled"], false);
                                         }
                                         // A new serving incarnation must read the retained
                                         // evidence again, including a changed child Q.
@@ -10068,7 +10110,7 @@ fn inner() {
                                         assert_eq!(proof["source_physical_retired"], 1);
                                         assert_eq!(proof["work_retired"], 1);
                                         assert_eq!(proof["entry_physical_settled"], true);
-                                        assert_eq!(proof["entry_unsettled"], true);
+                                        assert_eq!(proof["entry_unsettled"], false);
                                         assert_eq!(proof["pid1_parent_wait_proof"], true);
                                         assert_eq!(proof["close_eligible"], false);
                                         assert_eq!(
@@ -10545,20 +10587,73 @@ fn inner() {
                                                 .spawn()
                                                 .unwrap();
                                             eventually(|| second.try_wait().unwrap().is_some());
-                                            assert!(!second.wait().unwrap().success());
-                                            assert_eq!(
+                                            let second_status = second.wait().unwrap();
+                                            let entries: Vec<_> =
                                                 fs::read_dir(broker_state.join("entries"))
                                                     .unwrap()
                                                     .filter_map(Result::ok)
-                                                    .filter(|entry| entry
-                                                        .path()
-                                                        .extension()
-                                                        .is_some_and(|ext| ext == "json"))
-                                                    .count(),
-                                                1,
-                                                "unsettled caller result or old debt allowed second E: {}",
-                                                fs::read_to_string(&second_err).unwrap()
-                                            );
+                                                    .filter(|entry| {
+                                                        entry
+                                                            .path()
+                                                            .extension()
+                                                            .is_some_and(|ext| ext == "json")
+                                                    })
+                                                    .collect();
+                                            if old_pending_debt {
+                                                assert!(!second_status.success());
+                                                assert_eq!(
+                                                    entries.len(),
+                                                    1,
+                                                    "old debt allowed second E: {}",
+                                                    fs::read_to_string(&second_err).unwrap()
+                                                );
+                                            } else {
+                                                assert_eq!(
+                                                    entries.len(),
+                                                    2,
+                                                    "second E did not reserve a new root: {}",
+                                                    fs::read_to_string(&second_err).unwrap()
+                                                );
+                                                assert!(entries.iter().any(|entry| {
+                                                    entry.file_name().to_string_lossy()
+                                                        != format!("{}.json", prepared.root_id)
+                                                }));
+                                                let second_entry = entries
+                                                    .iter()
+                                                    .find(|entry| {
+                                                        entry.file_name().to_string_lossy()
+                                                            != format!("{}.json", prepared.root_id)
+                                                    })
+                                                    .unwrap();
+                                                let second_record: serde_json::Value =
+                                                    serde_json::from_slice(
+                                                        &fs::read(second_entry.path()).unwrap(),
+                                                    )
+                                                    .unwrap();
+                                                let second_id =
+                                                    second_record["root_id"].as_str().unwrap();
+                                                assert_ne!(second_id, prepared.root_id);
+                                                let retained =
+                                                    rusqlite::Connection::open_with_flags(
+                                                        broker_state
+                                                            .join("sidecar/pid-identity.db"),
+                                                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                                                    )
+                                                    .unwrap();
+                                                let second_owner: (String, String) = retained.query_row(
+                                                    "SELECT generation,phase FROM completion_continuation_owner WHERE kernel_root_id=?1",
+                                                    [second_id],
+                                                    |row| Ok((row.get(0)?, row.get(1)?)),
+                                                ).unwrap();
+                                                assert_ne!(
+                                                    second_owner.0,
+                                                    prepared.owner_generation
+                                                );
+                                                assert!(matches!(
+                                                    second_owner.1.as_str(),
+                                                    "running" | "closing" | "lost"
+                                                ));
+                                            }
                                         }
                                         eprintln!("root PID1 drain restart readback: {}", restored);
                                     }
@@ -13263,6 +13358,7 @@ fn inner() {
                             stdout_len: parent.stdout_len,
                             stderr_sha256: parent.stderr_sha256.clone(),
                             stderr_len: parent.stderr_len,
+                            native_f: None,
                         };
                         assert_eq!(
                             terminal_lane

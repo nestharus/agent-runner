@@ -81,6 +81,23 @@ pub struct FreshRootCallerResult {
     pub stdout_len: u64,
     pub stderr_sha256: String,
     pub stderr_len: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_f: Option<FreshNativeFCallerResult>,
+}
+
+/// A caller presentation sourced from the exact acknowledged second Codex
+/// turn. The parent K still has its own, cancelled, physical Q above.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreshNativeFCallerResult {
+    pub delivery_request_id: String,
+    pub turn_id: String,
+    pub assistant_response_sha256: String,
+    pub stdout_sha256: String,
+    pub stdout_len: u64,
+    pub stderr_sha256: String,
+    pub stderr_len: u64,
+    pub exit_code: u8,
 }
 
 impl FreshRootTerminalReadback {
@@ -182,6 +199,52 @@ fn verify_fresh_root_caller_settlement_schema(state: &Connection) -> Result<(), 
 }
 
 impl FreshV30Lane {
+    fn native_f_caller_result(
+        &self,
+        read: &FreshRootTerminalReadback,
+    ) -> Result<FreshNativeFCallerResult, String> {
+        let execution = read.execution.as_ref().ok_or("native F parent Q absent")?;
+        if !execution.parent.cancelled
+            || execution.parent.outcome != "cancelled"
+            || read.ack_basis.as_deref() != Some("native_codex_f_assistant_ack")
+            || read.notification_state != "acked"
+            || !read.unresolved_child_request_ids.is_empty()
+        {
+            return Err("native F caller result lacks cancelled Q or exact F ACK".into());
+        }
+        let delivery = read.delivery_request_id.as_deref().ok_or("native F delivery absent")?;
+        let ack = self.read_headless_native_f_ack(delivery, &read.actor)?
+            .ok_or("native F ACK readback absent")?;
+        if ack.proof.native_session_id.is_empty()
+            || ack.proof.delivery_request_id != delivery
+            || ack.proof.recipient != read.actor
+            || ack.proof.turn_id == ack.proof.first_turn_id
+        {
+            return Err("native F ACK identity changed".into());
+        }
+        let stdout = format!("AGE319_F_ACK {}\n", ack.proof.delivery_token);
+        Ok(FreshNativeFCallerResult {
+            delivery_request_id: delivery.into(),
+            turn_id: ack.proof.turn_id,
+            assistant_response_sha256: ack.proof.assistant_response_sha256,
+            stdout_sha256: sha256_hex(stdout.as_bytes()),
+            stdout_len: stdout.len() as u64,
+            stderr_sha256: sha256_hex(b""),
+            stderr_len: 0,
+            exit_code: 0,
+        })
+    }
+
+    fn caller_artifact(&self, read: &FreshRootTerminalReadback) -> Result<Vec<u8>, String> {
+        let execution = read.execution.as_ref().ok_or("root execution absent")?;
+        if execution.parent.cancelled {
+            serde_json::to_vec(&(execution, self.native_f_caller_result(read)?))
+                .map_err(|error| error.to_string())
+        } else {
+            serde_json::to_vec(execution).map_err(|error| error.to_string())
+        }
+    }
+
     pub fn begin_private_root_caller_result(
         &self,
         root: &FreshReleasedHandoff,
@@ -196,11 +259,8 @@ impl FreshV30Lane {
         if read.execution_state == "unknown" {
             return Err("root terminal execution unknown".into());
         }
-        let execution = read.execution.ok_or("root terminal execution absent")?;
+        let execution = read.execution.as_ref().ok_or("root terminal execution absent")?;
         let parent = &execution.parent;
-        if parent.cancelled {
-            return Err("caller result terminal was cancelled".into());
-        }
         if offered.parent_grant_id != parent.grant_id
             || offered.wait_status != parent.wait_status
             || offered.stdout_sha256 != parent.stdout_sha256
@@ -210,9 +270,19 @@ impl FreshV30Lane {
         {
             return Err("caller result differs from verified parent Q".into());
         }
+        if parent.cancelled {
+            if offered.native_f.is_none() {
+                return Err("caller result terminal was cancelled".into());
+            }
+            if offered.native_f.as_ref() != Some(&self.native_f_caller_result(&read)?) {
+                return Err("caller result differs from verified native F ACK".into());
+            }
+        } else if offered.native_f.is_some() {
+            return Err("native F caller result has no cancelled parent Q".into());
+        }
         // Include the original D/J/actor and parent Q in the committed
         // artifact. The caller retains the raw stream bytes.
-        let artifact = serde_json::to_vec(&execution).map_err(|e| e.to_string())?;
+        let artifact = self.caller_artifact(&read)?;
         self.begin_private_root_publication(root, actor, session, &artifact)
     }
 
@@ -633,10 +703,7 @@ impl FreshV30Lane {
                 .artifacts
                 .push(format!("caller-artifact:{sha}:{len}"));
             if let Some((settled_sha, settled_len)) = settlement {
-                let execution = serde_json::to_vec(
-                    result.execution.as_ref().ok_or("root execution absent")?,
-                )
-                .map_err(|error| error.to_string())?;
+                let execution = self.caller_artifact(&result)?;
                 if settled_sha != sha
                     || settled_len != len
                     || sha != format!("{:x}", Sha256::digest(&execution))
@@ -1009,8 +1076,7 @@ impl FreshV30Lane {
             .publication_sha256
             .as_ref()
             .ok_or("root caller publication absent")?;
-        let artifact = serde_json::to_vec(read.execution.as_ref().ok_or("root execution absent")?)
-            .map_err(|error| error.to_string())?;
+        let artifact = self.caller_artifact(&read)?;
         let len = i64::try_from(artifact.len()).map_err(|_| "caller artifact too large")?;
         let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         state

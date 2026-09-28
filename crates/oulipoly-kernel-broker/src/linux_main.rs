@@ -4165,9 +4165,9 @@ fn settle_entry_from_terminal(
 )]
 fn require_prior_entries_closed(
     state_root: &Path,
-    roots: &RootRegistry,
+    roots: &mut RootRegistry,
     entries: &EntryRegistry,
-    works: &WorkRegistry,
+    works: &mut WorkRegistry,
     grants: &GrantRegistry,
     sources: &SourcePhysicalRegistry,
     sidecar: Option<&BrokerSidecar>,
@@ -4183,6 +4183,34 @@ fn require_prior_entries_closed(
         .any(|entry| entry.terminal_settlement.is_none())
     {
         return Err(io::Error::other("prior entry caller result unsettled"));
+    }
+    let known: HashSet<&str> = entries
+        .records()
+        .iter()
+        .map(|entry| entry.root_id.as_str())
+        .collect();
+    if roots.live_roots().count() + roots.debt_records().len() != known.len()
+        || works
+            .live_works()
+            .any(|work| !known.contains(work.record.root_id.as_str()))
+        || works
+            .debt_records()
+            .iter()
+            .any(|work| !known.contains(work.root_id.as_str()))
+        || grants
+            .records()
+            .iter()
+            .any(|grant| !known.contains(grant.root_id.as_str()))
+        || grants
+            .native_records()
+            .iter()
+            .any(|grant| !known.contains(grant.root_id.as_str()))
+        || sources
+            .records()
+            .iter()
+            .any(|source| !known.contains(source.grant.root_id.as_str()))
+    {
+        return Err(io::Error::other("unaccounted prior root or work debt"));
     }
     let lane = FreshV30Lane::open_at(state_root).map_err(io::Error::other)?;
     for entry in entries.records() {
@@ -4220,6 +4248,10 @@ fn require_prior_entries_closed(
                 "prior entry close or caller result changed",
             ));
         }
+    }
+    for entry in entries.records() {
+        roots.admit_closed_historical(&entry.root_id)?;
+        works.admit_closed_historical(&entry.root_id);
     }
     Ok(())
 }
@@ -5966,13 +5998,36 @@ fn serve() -> io::Result<()> {
                 // route before E/G/J. No pathname, copied row or environment
                 // value can select the broker generation.
                 if !matches!(payload, RequestPayload::None)
-                    || !root_launch_admitted(
-                        &peer,
-                        &classify_scope(&peer, &host_namespace, &registry, &works),
-                        &host_namespace,
-                    )
+                    || !peer.process.in_namespace(&host_namespace)?
                     || !peer.process.same_executable_as(&runner_image)?
                 {
+                    return Err(io::Error::other("broker State route admission refused"));
+                }
+                let _entry_guard = admission_fences.lock().map_err(|_| {
+                    io::Error::other("root admission fence poisoned")
+                })?;
+                // A guardian reads I after its own E. That active entry is
+                // intentionally unsettled. E itself gates every reservation.
+                if entries
+                    .records()
+                    .iter()
+                    .all(|entry| entry.terminal_settlement.is_some())
+                {
+                    require_prior_entries_closed(
+                        Path::new(&state),
+                        &mut registry,
+                        &entries,
+                        &mut works,
+                        &grants,
+                        &source_physical,
+                        broker_sidecar.as_ref(),
+                    )?;
+                }
+                if !root_launch_admitted(
+                    &peer,
+                    &classify_scope(&peer, &host_namespace, &registry, &works),
+                    &host_namespace,
+                ) {
                     return Err(io::Error::other("broker State route admission refused"));
                 }
                 peer.process.verify()?;
@@ -6000,9 +6055,9 @@ fn serve() -> io::Result<()> {
                 if _entry_guard.is_some() {
                     require_prior_entries_closed(
                         Path::new(&state),
-                        &registry,
+                        &mut registry,
                         &entries,
-                        &works,
+                        &mut works,
                         &grants,
                         &source_physical,
                         broker_sidecar.as_ref(),

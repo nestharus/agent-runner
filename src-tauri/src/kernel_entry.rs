@@ -2242,6 +2242,7 @@ struct PrivateFreshBroker<'a> {
     authority: FreshEntryAuthority<'a>,
     grant_id: Option<String>,
     raw_result: Option<oulipoly_runtime::executor::cli::fresh_remote::FreshProviderCompletion>,
+    native_f_receipt: Option<serde_json::Value>,
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]
@@ -3208,6 +3209,7 @@ impl oulipoly_runtime::executor::cli::fresh_remote::FreshProviderBackend
                 serde_json::to_vec(&bash_result).map_err(|e| e.to_string())?,
             )
             .map_err(|e| self.unknown(Some(&grant), "native Bash result report", &e.to_string()))?;
+            let mut native_f_receipt = None;
             if std::env::var_os("AGE319_PRIVATE_NATIVE_TURN_RECEIPT_V1").is_some() {
                 let ready = std::path::Path::new(&gate).join("native-turn-ready");
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
@@ -3337,6 +3339,7 @@ impl oulipoly_runtime::executor::cli::fresh_remote::FreshProviderBackend
                         serde_json::to_vec(&receipt).map_err(|e| e.to_string())?,
                     )
                     .map_err(|e| self.unknown(Some(&grant), "native F report", &e.to_string()))?;
+                    native_f_receipt = Some(receipt);
                     let duplicate = protocol::private_fresh_provider_at(
                         &socket,
                         &self.authority.receipt.d_key,
@@ -3377,6 +3380,26 @@ impl oulipoly_runtime::executor::cli::fresh_remote::FreshProviderBackend
                     return Err(self.unknown(Some(&grant), "native K physical Q", &state));
                 }
                 std::thread::sleep(PRIVATE_PROVIDER_RESULT_POLL);
+            }
+            if let Some(receipt) = native_f_receipt {
+                let output = protocol::private_fresh_provider_output_at(
+                    &socket,
+                    &self.authority.receipt.d_key,
+                )
+                .map_err(|e| self.unknown(Some(&grant), "native K Q output", &e.to_string()))?;
+                if output.grant_id != grant || !output.cancelled {
+                    return Err(self.unknown(
+                        Some(&grant),
+                        "native K Q output",
+                        "cancelled Q changed",
+                    ));
+                }
+                private_verified_output(output.stdout, output.stdout_len, &output.stdout_sha256)
+                    .map_err(|e| self.unknown(Some(&grant), "native K stdout", &e))?;
+                private_verified_output(output.stderr, output.stderr_len, &output.stderr_sha256)
+                    .map_err(|e| self.unknown(Some(&grant), "native K stderr", &e))?;
+                self.native_f_receipt = Some(receipt);
+                return Err("native F caller result follows cancelled physical parent Q".into());
             }
             return Err("private native Codex K drained after same-K Bash; fresh F settlement and root close are not joined".into());
         }
@@ -4421,8 +4444,18 @@ fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode
         authority,
         grant_id: None,
         raw_result: None,
+        native_f_receipt: None,
     };
-    let result = run_prepared_fresh_headless(selected_plan, &mut backend)?;
+    let result = match run_prepared_fresh_headless(selected_plan, &mut backend) {
+        Ok(result) => result,
+        Err(error)
+            if backend.native_f_receipt.is_some()
+                && error == "native F caller result follows cancelled physical parent Q" =>
+        {
+            return private_publish_native_f_after_q(&socket, &backend);
+        }
+        Err(error) => return Err(error),
+    };
     if let Some(control) = &root_pty {
         control.ensure_live()?;
     }
@@ -4605,7 +4638,6 @@ fn private_publish_caller_result(
     terminal: &oulipoly_state::mailbox::FreshRootTerminalReadback,
     raw: &oulipoly_runtime::executor::cli::fresh_remote::FreshProviderCompletion,
 ) -> Result<ExitCode, String> {
-    use oulipoly_kernel_broker::protocol::FreshRecipientRequest;
     use oulipoly_state::mailbox::FreshRootCallerResult;
     use sha2::{Digest as _, Sha256};
     let execution = terminal
@@ -4627,6 +4659,7 @@ fn private_publish_caller_result(
         stdout_len: raw.stdout.len() as u64,
         stderr_sha256: format!("{:x}", Sha256::digest(&raw.stderr)),
         stderr_len: raw.stderr.len() as u64,
+        native_f: None,
     };
     if offered.wait_status != execution.parent.wait_status
         || offered.stdout_sha256 != execution.parent.stdout_sha256
@@ -4643,6 +4676,117 @@ fn private_publish_caller_result(
     }
     let code = libc::WEXITSTATUS(raw.wait_status);
     let code = u8::try_from(code).map_err(|_| "caller result exit code out of range")?;
+    private_commit_caller_result(
+        socket,
+        d_key,
+        terminal,
+        offered,
+        &raw.stdout,
+        &raw.stderr,
+        code,
+    )
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_publish_native_f_after_q(
+    socket: &std::path::Path,
+    backend: &PrivateFreshBroker<'_>,
+) -> Result<ExitCode, String> {
+    use oulipoly_kernel_broker::protocol::{self, FreshRecipientRequest};
+    use oulipoly_state::mailbox::{
+        FreshHeadlessNativeFAck, FreshNativeFCallerResult, FreshRootCallerResult,
+    };
+    use sha2::{Digest as _, Sha256};
+    let receipt = backend
+        .native_f_receipt
+        .as_ref()
+        .ok_or("native F receipt absent")?;
+    let ack: FreshHeadlessNativeFAck = serde_json::from_value(receipt["fresh_ack"].clone())
+        .map_err(|e| format!("native F ACK receipt invalid: {e}"))?;
+    if receipt["format"] != "age319-native-f-turn-receipt/v1"
+        || receipt["status"] != "completed"
+        || receipt["fresh_row_acknowledged"] != true
+        || receipt["turn_id"] != ack.proof.turn_id
+        || receipt["assistant_response_sha256"] != ack.proof.assistant_response_sha256
+        || ack.basis != "native_codex_f_assistant_ack"
+    {
+        return Err("native F caller receipt and ACK differ".into());
+    }
+    let d_key = &backend.authority.receipt.d_key;
+    let terminal = protocol::fresh_root_terminal_request_at(
+        socket,
+        &FreshRecipientRequest::SettleRootTerminal {
+            d_key: d_key.clone(),
+        },
+    )
+    .map_err(|e| format!("native F terminal settlement failed: {e}"))?;
+    let read = protocol::fresh_root_terminal_request_at(
+        socket,
+        &FreshRecipientRequest::ReadRootTerminal {
+            d_key: d_key.clone(),
+        },
+    )
+    .map_err(|e| format!("native F terminal readback failed: {e}"))?;
+    if read != terminal {
+        return Err("native F terminal changed after Q".into());
+    }
+    let repaired = protocol::fresh_root_terminal_request_at(
+        socket,
+        &FreshRecipientRequest::RepairRootTerminal {
+            d_key: d_key.clone(),
+        },
+    )
+    .map_err(|e| format!("native F terminal repair failed: {e}"))?;
+    if repaired != read {
+        return Err("native F terminal repair changed Q".into());
+    }
+    let execution = read.execution.as_ref().ok_or("native F parent Q absent")?;
+    if !execution.parent.cancelled
+        || execution.parent.outcome != "cancelled"
+        || read.ack_basis.as_deref() != Some("native_codex_f_assistant_ack")
+        || read.delivery_request_id.as_deref() != Some(&ack.proof.delivery_request_id)
+    {
+        return Err("native F caller result lacks cancelled parent Q and exact F ACK".into());
+    }
+    let stdout = format!("AGE319_F_ACK {}\n", ack.proof.delivery_token).into_bytes();
+    let native_f = FreshNativeFCallerResult {
+        delivery_request_id: ack.proof.delivery_request_id,
+        turn_id: ack.proof.turn_id,
+        assistant_response_sha256: ack.proof.assistant_response_sha256,
+        stdout_sha256: format!("{:x}", Sha256::digest(&stdout)),
+        stdout_len: stdout.len() as u64,
+        stderr_sha256: format!("{:x}", Sha256::digest(b"")),
+        stderr_len: 0,
+        exit_code: 0,
+    };
+    let offered = FreshRootCallerResult {
+        parent_grant_id: execution.parent.grant_id.clone(),
+        wait_status: execution.parent.wait_status,
+        stdout_sha256: execution.parent.stdout_sha256.clone(),
+        stdout_len: execution.parent.stdout_len,
+        stderr_sha256: execution.parent.stderr_sha256.clone(),
+        stderr_len: execution.parent.stderr_len,
+        native_f: Some(native_f),
+    };
+    private_commit_caller_result(socket, d_key, &read, offered, &stdout, b"", 0)
+}
+
+#[cfg(feature = "age319-private-broker-fixture")]
+fn private_commit_caller_result(
+    socket: &std::path::Path,
+    d_key: &str,
+    terminal: &oulipoly_state::mailbox::FreshRootTerminalReadback,
+    offered: oulipoly_state::mailbox::FreshRootCallerResult,
+    stdout_bytes: &[u8],
+    stderr_bytes: &[u8],
+    code: u8,
+) -> Result<ExitCode, String> {
+    use oulipoly_kernel_broker::protocol::{self, FreshRecipientRequest};
+    if terminal.publication_state != "not_started" {
+        return Err(
+            "caller result publication already unknown; automatic output replay refused".into(),
+        );
+    }
     let reserved = protocol::fresh_root_terminal_request_at(
         socket,
         &FreshRecipientRequest::BeginRootCallerResult {
@@ -4671,13 +4815,13 @@ fn private_publish_caller_result(
             inner: &mut stdout,
             remaining: 1,
         };
-        return private_write_caller_bytes(&mut partial, &mut stderr, &raw.stdout, &raw.stderr)
+        return private_write_caller_bytes(&mut partial, &mut stderr, stdout_bytes, stderr_bytes)
             .map(|_| ExitCode::from(code))
             .map_err(|e| {
                 format!("caller result write uncertain; publication remains unknown: {e}")
             });
     }
-    private_write_caller_bytes(&mut stdout, &mut stderr, &raw.stdout, &raw.stderr)
+    private_write_caller_bytes(&mut stdout, &mut stderr, stdout_bytes, stderr_bytes)
         .map_err(|e| format!("caller result write uncertain; publication remains unknown: {e}"))?;
     let settled = protocol::fresh_root_terminal_request_at(
         socket,

@@ -44,6 +44,9 @@ pub struct RootRegistry {
     directory: PathBuf,
     live: Vec<LiveRoot>,
     debt: Vec<RootRecord>,
+    /// Process-local admission classification, granted only after the Broker
+    /// revalidates State caller settlement and the exact owner-close proof.
+    closed_historical: std::collections::HashSet<String>,
     admission_fences: Vec<RootRecord>,
     poisoned: bool,
 }
@@ -73,6 +76,7 @@ impl RootRegistry {
             directory,
             live: Vec::new(),
             debt: Vec::new(),
+            closed_historical: std::collections::HashSet::new(),
             admission_fences: Vec::new(),
             poisoned: false,
         };
@@ -309,7 +313,24 @@ impl RootRegistry {
     }
 
     pub fn has_debt(&self) -> bool {
-        self.poisoned || !self.debt.is_empty() || self.live.iter().any(|r| r.init.verify().is_err())
+        self.poisoned
+            || self
+                .debt
+                .iter()
+                .any(|r| !self.closed_historical.contains(&r.root_id))
+            || self.live.iter().any(|r| {
+                !self.closed_historical.contains(&r.record.root_id) && r.init.verify().is_err()
+            })
+    }
+
+    /// This changes only in-memory debt classification. Durable root records
+    /// and physical proofs remain available for every later E readback.
+    pub fn admit_closed_historical(&mut self, root_id: &str) -> io::Result<()> {
+        if self.record(root_id).is_none() {
+            return Err(io::Error::other("closed historical root absent"));
+        }
+        self.closed_historical.insert(root_id.to_owned());
+        Ok(())
     }
 
     fn terminal_verified(&self, root: &RootRecord) -> bool {
@@ -322,12 +343,13 @@ impl RootRegistry {
     /// receipt. Global admission debt remains until the separate root close.
     pub fn has_unrelated_debt(&self, expected: &RootRecord) -> bool {
         self.poisoned
-            || self
-                .debt
-                .iter()
-                .any(|root| root != expected || !self.terminal_verified(root))
+            || self.debt.iter().any(|root| {
+                !self.closed_historical.contains(&root.root_id)
+                    && (root != expected || !self.terminal_verified(root))
+            })
             || self.live.iter().any(|root| {
-                root.init.verify().is_err()
+                !self.closed_historical.contains(&root.record.root_id)
+                    && root.init.verify().is_err()
                     && (root.record != *expected || !self.terminal_verified(&root.record))
             })
     }
@@ -516,7 +538,12 @@ impl RootRegistry {
     /// older callers; roots launched with a stable parent use its durable
     /// wait after exit. A missing wait never becomes a successful exit.
     pub fn observe_init_exit(&self, expected: &RootRecord) -> io::Result<ChildExit> {
-        if self.poisoned || !self.debt.is_empty() {
+        if self.poisoned
+            || self
+                .debt
+                .iter()
+                .any(|root| !self.closed_historical.contains(&root.root_id))
+        {
             return Err(io::Error::other("uncertain root registry"));
         }
         let root = self
@@ -663,6 +690,7 @@ mod tests {
                 },
             ],
             debt: Vec::new(),
+            closed_historical: std::collections::HashSet::new(),
             admission_fences: Vec::new(),
             poisoned: false,
         };
@@ -737,6 +765,7 @@ mod tests {
                 },
             ],
             debt: Vec::new(),
+            closed_historical: std::collections::HashSet::new(),
             admission_fences: Vec::new(),
             poisoned: false,
         };
