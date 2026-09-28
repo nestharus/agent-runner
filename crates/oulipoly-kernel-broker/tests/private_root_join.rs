@@ -1772,6 +1772,10 @@ fn inner() {
                 | "normal_model_provider_quota"
                 | "normal_model_provider_auth"
         );
+    let physical_normal =
+        mode == "normal_model_held" && std::env::var_os("AGE319_TEST_NORMAL_PHYSICAL_V1").is_some();
+    let physical_normal_bad_source =
+        physical_normal && std::env::var_os("AGE319_TEST_NORMAL_BAD_SOURCE_V1").is_some();
     let model_mode = mode == "normal_model_held" || provider_mode;
     let native_mode = mode.starts_with("native_");
     let native_live = matches!(
@@ -1837,6 +1841,7 @@ fn inner() {
         std::env::var("OULIPOLY_AGE319_PROVIDER_IMAGE").unwrap_or_default()
     };
     let temp = tempfile::tempdir().unwrap();
+    let normal_effect = temp.path().join("normal-effect");
     let data = temp.path().join("data");
     // Keep the source for the historical broker copy outside the current
     // Runner's writable entry domain. v29 remains an independent island.
@@ -2232,9 +2237,24 @@ fn inner() {
     if mode == "normal_model_held" {
         let config_dir = config_home.join("oulipoly-agent-runner");
         fs::create_dir_all(config_dir.join("models")).unwrap();
+        let physical_script = temp.path().join("normal-provider.sh");
+        if physical_normal {
+            fs::write(
+                &physical_script,
+                b"#!/bin/sh\nprintf 'one\\n' >> \"$AGE319_EFFECT_FILE\"\nprintf 'normal-provider-out:'\ncat\nprintf 'normal-provider-err\\n' >&2\n",
+            ).unwrap();
+            fs::set_permissions(&physical_script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
         fs::write(
             config_dir.join("providers.toml"),
-            "[local]\ncommand = 'echo'\nquota_account_id = 'physical-local'\n",
+            if physical_normal {
+                format!(
+                    "[local]\ncommand = '{}'\nquota_account_id = 'physical-local'\n",
+                    physical_script.display()
+                )
+            } else {
+                "[local]\ncommand = 'echo'\nquota_account_id = 'physical-local'\n".into()
+            },
         )
         .unwrap();
         fs::write(
@@ -2810,6 +2830,11 @@ fn inner() {
                 (mode == "normal_model_held")
                     .then_some(("AGE319_PRIVATE_MODEL_SELECTION_PROBE_V1", "1")),
             )
+            .envs(physical_normal.then_some(("AGE319_PRIVATE_NORMAL_PHYSICAL_V1", "1")))
+            .envs(
+                physical_normal_bad_source.then_some(("AGE319_PRIVATE_NORMAL_BAD_SOURCE_V1", "1")),
+            )
+            .envs(physical_normal.then_some(("AGE319_EFFECT_FILE", normal_effect.as_os_str())))
             .envs(native_codex_mode.then_some(("AGE319_PRIVATE_NATIVE_CODEX_V1", "1")))
             .envs(native_codex_mode.then_some(("AGE319_PRIVATE_NATIVE_BASH_NOTIFY_V1", "1")))
             .envs(native_turn_mode.then_some(("AGE319_PRIVATE_NATIVE_TURN_RECEIPT_V1", "1")))
@@ -13853,14 +13878,111 @@ fn inner() {
                     stop(&mut broker);
                     return;
                 }
-                eventually(|| entry.try_wait().unwrap().is_some());
+                if physical_normal_bad_source {
+                    let until = Instant::now() + Duration::from_secs(20);
+                    while !gate.join("normal-pre-k-ready").exists()
+                        && entry.try_wait().unwrap().is_none()
+                    {
+                        assert!(Instant::now() < until, "normal pre-K gate timed out");
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    assert!(gate.join("normal-pre-k-ready").exists());
+                    let script = temp.path().join("normal-provider.sh");
+                    let original = temp.path().join("normal-provider.saved");
+                    fs::rename(&script, &original).unwrap();
+                    fs::write(&script, b"#!/bin/sh\nexit 87\n").unwrap();
+                    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+                    fs::write(gate.join("normal-pre-k-mutated"), b"changed source").unwrap();
+                    let until = Instant::now() + Duration::from_secs(20);
+                    while !gate.join("normal-pre-k-refused").exists()
+                        && entry.try_wait().unwrap().is_none()
+                    {
+                        assert!(Instant::now() < until, "changed source K refusal timed out");
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    assert!(gate.join("normal-pre-k-refused").exists());
+                    let count: i64 = rusqlite::Connection::open(broker_state.join("v30/state.db"))
+                        .unwrap()
+                        .query_row("SELECT count(*) FROM fresh_normal_provider_k", [], |row| {
+                            row.get(0)
+                        })
+                        .unwrap();
+                    assert_eq!(count, 0, "changed source consumed K");
+                    assert!(!normal_effect.exists(), "changed source launched provider");
+                    assert!(!entry.wait().unwrap().success());
+                    assert!(
+                        fs::read_to_string(&err)
+                            .unwrap()
+                            .contains("changed executable refused before K")
+                    );
+                    stop(&mut broker);
+                    return;
+                }
+                if physical_normal {
+                    let until = Instant::now() + Duration::from_secs(20);
+                    while !gate.join("normal-k-sent").exists()
+                        && entry.try_wait().unwrap().is_none()
+                    {
+                        assert!(
+                            Instant::now() < until,
+                            "normal K gate timed out: runner: {}; broker: {}",
+                            fs::read_to_string(&err).unwrap_or_default(),
+                            fs::read_to_string(&broker_log).unwrap_or_default()
+                        );
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    assert!(
+                        gate.join("normal-k-sent").exists(),
+                        "normal K refused before reply: {}; broker: {}",
+                        fs::read_to_string(&err).unwrap_or_default(),
+                        fs::read_to_string(&broker_log).unwrap_or_default(),
+                    );
+                    stop(&mut broker);
+                    let restart_log = temp.path().join("normal-k-restarted-broker.log");
+                    broker =
+                        restart_source_broker(&socket, &broker_state, &runner, &gate, &restart_log);
+                    fs::write(gate.join("normal-k-resume"), b"restart-observed").unwrap();
+                }
+                if physical_normal {
+                    let until = Instant::now() + Duration::from_secs(35);
+                    while entry.try_wait().unwrap().is_none() {
+                        assert!(
+                            Instant::now() < until,
+                            "normal physical root still live: runner: {}; broker: {}",
+                            fs::read_to_string(&err).unwrap_or_default(),
+                            fs::read_to_string(&broker_log).unwrap_or_default()
+                        );
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                } else {
+                    eventually(|| entry.try_wait().unwrap().is_some());
+                }
                 let completed = entry.wait().unwrap().success();
                 if mode == "normal_model_held" {
                     assert!(!completed, "normal provider route must refuse before spawn");
                     assert!(
                         fs::read_to_string(&err)
                             .unwrap()
-                            .contains("normal provider route held")
+                            .contains("normal provider route held"),
+                        "{}; physical store: {:?}",
+                        fs::read_to_string(&err).unwrap_or_default(),
+                        fs::read_dir(broker_state.join("v30/normal-provider")).map(|entries| {
+                            entries
+                                .filter_map(Result::ok)
+                                .map(|entry| {
+                                    let files = fs::read_dir(entry.path())
+                                        .ok()
+                                        .into_iter()
+                                        .flatten()
+                                        .filter_map(Result::ok)
+                                        .map(|file| {
+                                            (file.file_name(), fs::read_to_string(file.path()).ok())
+                                        })
+                                        .collect::<Vec<_>>();
+                                    (entry.file_name(), files)
+                                })
+                                .collect::<Vec<_>>()
+                        }),
                     );
                     let settled_lane = FreshV30Lane::open_at(&broker_state).unwrap();
                     let preparation = settled_lane
@@ -13905,6 +14027,43 @@ fn inner() {
                     assert_eq!(admission.handoff_id, receipt.handoff_id);
                     assert_eq!(admission.plan_sha256, plan.plan_sha256);
                     assert_eq!(admission.state, "admitted_no_effect");
+                    if physical_normal {
+                        let k = settled_lane
+                            .read_normal_provider_k(&receipt, &actor, &session)
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(k.admission_id, admission.admission_id);
+                        assert_eq!(k.plan_sha256, plan.plan_sha256);
+                        assert_eq!(k.state, "consumed");
+                        let physical_dir = broker_state
+                            .join("v30/normal-provider")
+                            .join(&k.admission_id);
+                        let q: serde_json::Value =
+                            serde_json::from_slice(&fs::read(physical_dir.join("q.json")).unwrap())
+                                .unwrap();
+                        let parent: serde_json::Value = serde_json::from_slice(
+                            &fs::read(physical_dir.join("parent-wait.json")).unwrap(),
+                        )
+                        .unwrap();
+                        assert_eq!(q["admission_id"], k.admission_id);
+                        assert_eq!(q["plan_sha256"], k.plan_sha256);
+                        assert_eq!(q["provider_wait_status"], 0);
+                        assert_eq!(q["tree_drained"], true);
+                        assert_eq!(parent["admission_id"], k.admission_id);
+                        assert_eq!(fs::read_to_string(&normal_effect).unwrap(), "one\n");
+                        let stdout = fs::read(physical_dir.join("stdout")).unwrap();
+                        let stderr = fs::read(physical_dir.join("stderr")).unwrap();
+                        assert_eq!(stdout, b"normal-provider-out:hello fixture");
+                        assert_eq!(stderr, b"normal-provider-err\n");
+                        assert_eq!(
+                            q["stdout"]["sha256"],
+                            format!("{:x}", Sha256::digest(&stdout))
+                        );
+                        assert_eq!(
+                            q["stderr"]["sha256"],
+                            format!("{:x}", Sha256::digest(&stderr))
+                        );
+                    }
                     assert_eq!(
                         settled_lane
                             .admit_normal_provider_plan(&receipt, &actor, &session, &plan)
@@ -13927,6 +14086,16 @@ fn inner() {
                             )
                             .unwrap(),
                         1
+                    );
+                    assert_eq!(
+                        fresh_state
+                            .query_row::<i64, _, _>(
+                                "SELECT count(*) FROM fresh_normal_provider_k",
+                                [],
+                                |row| row.get(0),
+                            )
+                            .unwrap(),
+                        if physical_normal { 1 } else { 0 },
                     );
                     assert_eq!(
                         fresh_state
@@ -14069,6 +14238,15 @@ fn inner() {
                         1
                     );
                     let source = File::open(config_home.join("oulipoly-agent-runner")).unwrap();
+                    assert!(
+                        protocol::launch_fresh_normal_provider_at(
+                            &socket.with_file_name("v30.sock"),
+                            &receipt.d_key,
+                            [source.as_raw_fd(), source.as_raw_fd(), source.as_raw_fd()],
+                        )
+                        .is_err(),
+                        "a later sibling launched K after the original actor exited",
+                    );
                     assert_eq!(
                         oulipoly_kernel_broker::normal_model_selection::observe(
                             &settled_lane,
@@ -14179,6 +14357,18 @@ fn inner() {
                             .state,
                         "admitted_no_effect"
                     );
+                    if physical_normal {
+                        let k = reopened
+                            .read_normal_provider_k(&receipt, &actor, &session)
+                            .unwrap()
+                            .unwrap();
+                        let admission = reopened
+                            .read_normal_provider_admission(&receipt, &actor, &session)
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(k.admission_id, admission.admission_id);
+                        assert_eq!(fs::read_to_string(&normal_effect).unwrap(), "one\n");
+                    }
                 }
                 return;
             }

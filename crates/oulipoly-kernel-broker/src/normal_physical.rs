@@ -1,0 +1,702 @@
+//! Featureless, one-use physical provider execution for a held normal plan.
+//! State K precedes the detached supervisor. Only that supervisor can produce
+//! a Q; missing or damaged evidence is unknown and never permits a retry.
+
+use oulipoly_kernel_broker::identity::{PinnedProcess, install_detached_host_proc};
+use oulipoly_kernel_broker::normal_model_selection;
+use oulipoly_kernel_broker::normal_plan_custody;
+use oulipoly_runtime::executor::cli::fresh_remote::FreshProviderPlan;
+use oulipoly_state::mailbox::{
+    FreshNormalExecutablePlan, FreshNormalProviderAdmission, FreshNormalProviderK,
+    FreshRecipientIdentity, FreshReleasedHandoff, FreshV30Lane, FreshV30Session,
+};
+use rusqlite::{Connection, OpenFlags};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+const MAX_RECIPE: u64 = 64 * 1024 * 1024;
+const HASH_BUFFER: usize = 64 * 1024;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SupervisorRecipe {
+    k: FreshNormalProviderK,
+    plan: FreshNormalExecutablePlan,
+    root: FreshRecipientIdentity,
+    actor: FreshRecipientIdentity,
+    uid: u32,
+    gid: u32,
+    groups: Vec<u32>,
+    private_fixture: bool,
+    config_directory: PathBuf,
+    executable: PathBuf,
+    cwd: PathBuf,
+    argv: Vec<String>,
+    environment: Vec<(String, String)>,
+    stdin: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OutputEvidence {
+    pub device: u64,
+    pub inode: u64,
+    pub bytes: u64,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PhysicalQ {
+    pub admission_id: String,
+    pub plan_sha256: String,
+    pub provider_wait_status: i32,
+    pub tree_drained: bool,
+    pub stdout: OutputEvidence,
+    pub stderr: OutputEvidence,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ParentWait {
+    admission_id: String,
+    pid1_parent_namespace_pid: i32,
+    pid1_wait_status: i32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhysicalReadback {
+    pub k: FreshNormalProviderK,
+    pub state: String,
+    pub q: Option<PhysicalQ>,
+    pub unknown_reason: Option<String>,
+}
+
+fn stamp(process: &PinnedProcess) -> FreshRecipientIdentity {
+    FreshRecipientIdentity {
+        host_pid: process.host_pid,
+        boot_id: process.boot_id.clone(),
+        starttime_ticks: process.starttime_ticks,
+        pidns_dev: process.pidns_dev,
+        pidns_ino: process.pidns_ino,
+    }
+}
+
+fn exact_process(expected: &FreshRecipientIdentity) -> io::Result<PinnedProcess> {
+    let live = PinnedProcess::open(expected.host_pid)?;
+    if stamp(&live) != *expected {
+        return Err(io::Error::other(
+            "normal physical process incarnation changed",
+        ));
+    }
+    live.verify()?;
+    Ok(live)
+}
+
+fn store_root(state_root: &Path) -> io::Result<PathBuf> {
+    let lane = state_root.join("v30");
+    let meta = fs::symlink_metadata(&lane)?;
+    if !meta.is_dir() || meta.uid() != 0 || meta.mode() & 0o077 != 0 {
+        return Err(io::Error::other("normal physical lane is not root-only"));
+    }
+    let path = lane.join("normal-provider");
+    if !path.exists() {
+        fs::DirBuilder::new().mode(0o700).create(&path)?;
+        File::open(&lane)?.sync_all()?;
+    }
+    let meta = fs::symlink_metadata(&path)?;
+    if !meta.is_dir() || meta.uid() != 0 || meta.mode() & 0o077 != 0 {
+        return Err(io::Error::other("normal physical store is not root-only"));
+    }
+    Ok(path)
+}
+
+fn id_path(store: &Path, id: &str) -> io::Result<PathBuf> {
+    let uuid = uuid::Uuid::parse_str(id).map_err(io::Error::other)?;
+    if uuid.is_nil() || uuid.to_string() != id {
+        return Err(io::Error::other("normal physical admission ID invalid"));
+    }
+    Ok(store.join(id))
+}
+
+fn write_new<T: Serialize>(directory: &Path, name: &str, value: &T) -> io::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(directory.join(name))?;
+    serde_json::to_writer(&mut file, value)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    File::open(directory)?.sync_all()
+}
+
+fn read_optional<T: for<'de> Deserialize<'de>>(
+    directory: &Path,
+    name: &str,
+) -> io::Result<Option<T>> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(directory.join(name))
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !file.metadata()?.is_file() || file.metadata()?.len() > 16 * 1024 {
+        return Err(io::Error::other("normal physical receipt invalid"));
+    }
+    serde_json::from_reader(file)
+        .map(Some)
+        .map_err(io::Error::other)
+}
+
+fn output_evidence(file: &mut File) -> io::Result<OutputEvidence> {
+    file.sync_all()?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.uid() != 0 || meta.mode() & 0o077 != 0 {
+        return Err(io::Error::other("normal physical output ownership changed"));
+    }
+    let mut hash = Sha256::new();
+    let mut bytes = 0u64;
+    let mut buffer = [0u8; HASH_BUFFER];
+    let mut input = file.try_clone()?;
+    use std::io::Seek;
+    input.rewind()?;
+    loop {
+        let n = input.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        bytes = bytes
+            .checked_add(n as u64)
+            .ok_or_else(|| io::Error::other("normal output length overflow"))?;
+        hash.update(&buffer[..n]);
+    }
+    if bytes != meta.len() || file.metadata()?.len() != bytes {
+        return Err(io::Error::other("normal physical output changed"));
+    }
+    Ok(OutputEvidence {
+        device: meta.dev(),
+        inode: meta.ino(),
+        bytes,
+        sha256: format!("{:x}", hash.finalize()),
+    })
+}
+
+fn verify_output(directory: &Path, name: &str, expected: &OutputEvidence) -> io::Result<()> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(directory.join(name))?;
+    if &output_evidence(&mut file)? != expected {
+        return Err(io::Error::other("normal physical output changed after Q"));
+    }
+    Ok(())
+}
+
+fn sealed_recipe(value: &SupervisorRecipe) -> io::Result<File> {
+    let bytes = serde_json::to_vec(value)?;
+    if bytes.len() as u64 > MAX_RECIPE {
+        return Err(io::Error::other("normal physical recipe oversized"));
+    }
+    let fd = unsafe {
+        libc::memfd_create(
+            c"normal-provider-recipe".as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    file.write_all(&bytes)?;
+    let seals = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+    if unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, seals) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    use std::io::Seek;
+    file.rewind()?;
+    Ok(file)
+}
+
+pub fn launch(
+    lane: &FreshV30Lane,
+    receipt: &FreshReleasedHandoff,
+    actor_identity: &FreshRecipientIdentity,
+    session: &FreshV30Session,
+    admission: &FreshNormalProviderAdmission,
+    plan: &FreshNormalExecutablePlan,
+    materialized: FreshProviderPlan,
+    config_dir: &File,
+    state_root: &Path,
+    uid: u32,
+    gid: u32,
+) -> io::Result<PhysicalReadback> {
+    let root = PinnedProcess::open(receipt.old_release.prepared.root_init.host_pid)?;
+    let actor = exact_process(actor_identity)?;
+    if stamp(&root).host_pid != receipt.old_release.prepared.root_init.host_pid
+        || stamp(&root).boot_id != receipt.old_release.prepared.root_init.boot_id
+        || stamp(&root).starttime_ticks != receipt.old_release.prepared.root_init.starttime_ticks
+        || stamp(&root).pidns_dev != receipt.old_release.prepared.root_init.pidns_dev
+        || stamp(&root).pidns_ino != receipt.old_release.prepared.root_init.pidns_ino
+        || !root.is_namespace_init()?
+        || !actor.direct_child_of(&root)?
+        || !actor.in_namespace(root.namespace())?
+    {
+        return Err(io::Error::other("normal physical root or actor changed"));
+    }
+    if unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) } != 0
+        || unsafe { libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0) } != 0
+    {
+        return Err(io::Error::other("normal physical inherited NNP/seccomp"));
+    }
+    if lane
+        .read_normal_provider_admission(receipt, actor_identity, session)
+        .map_err(io::Error::other)?
+        .as_ref()
+        != Some(admission)
+        || admission.plan_sha256 != plan.plan_sha256
+        || materialized.executable.to_str() != Some(plan.executable.as_str())
+        || materialized.argv != plan.argv
+        || format!("{:x}", Sha256::digest(&materialized.stdin)) != plan.stdin_sha256
+        || format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&materialized.environment)?)
+        ) != plan.environment_sha256
+    {
+        return Err(io::Error::other(
+            "normal physical recipe differs from admission",
+        ));
+    }
+    store_root(state_root)?;
+    let proposed_k = FreshNormalProviderK {
+        handoff_id: receipt.handoff_id.clone(),
+        admission_id: admission.admission_id.clone(),
+        plan_sha256: plan.plan_sha256.clone(),
+        state: "consumed".into(),
+    };
+    let recipe = SupervisorRecipe {
+        k: proposed_k,
+        plan: plan.clone(),
+        root: stamp(&root),
+        actor: actor_identity.clone(),
+        uid,
+        gid,
+        groups: actor.supplementary_groups()?,
+        private_fixture: super::private_fixture(),
+        config_directory: fs::read_link(format!("/proc/self/fd/{}", config_dir.as_raw_fd()))?,
+        executable: materialized.executable,
+        cwd: materialized.cwd,
+        argv: materialized.argv,
+        environment: materialized.environment,
+        stdin: materialized.stdin,
+    };
+    let recipe_fd = sealed_recipe(&recipe)?;
+    root.verify()?;
+    actor.verify()?;
+    let (k, inserted) = lane
+        .consume_normal_provider_k(receipt, actor_identity, session, admission)
+        .map_err(io::Error::other)?;
+    if !inserted {
+        return observe(lane, receipt, actor_identity, session, state_root)?
+            .ok_or_else(|| io::Error::other("normal physical K disappeared"));
+    }
+    // K is now durable. Every following error is spent unknown debt.
+    // /proc/self/exe names the serving broker's already opened inode even if
+    // its installation pathname changes between K and this handoff.
+    let mut child = Command::new("/proc/self/exe");
+    child
+        .arg("--normal-provider-supervisor")
+        .arg(state_root)
+        .stdin(Stdio::from(recipe_fd))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .env_clear();
+    match child.spawn() {
+        Ok(mut supervisor) => {
+            let id = k.admission_id.clone();
+            if let Err(error) = std::thread::Builder::new()
+                .name("normal-provider-reaper".into())
+                .spawn(move || {
+                    if let Err(error) = supervisor.wait() {
+                        eprintln!("normal physical supervisor wait failed {id}: {error}");
+                    }
+                })
+            {
+                eprintln!(
+                    "normal physical reaper unavailable after K {}: {error}",
+                    k.admission_id
+                );
+            }
+        }
+        Err(error) => eprintln!(
+            "normal physical supervisor failed after K {}: {error}",
+            k.admission_id
+        ),
+    }
+    observe(lane, receipt, actor_identity, session, state_root)?
+        .ok_or_else(|| io::Error::other("normal physical K disappeared"))
+}
+
+pub fn observe(
+    lane: &FreshV30Lane,
+    receipt: &FreshReleasedHandoff,
+    actor: &FreshRecipientIdentity,
+    session: &FreshV30Session,
+    state_root: &Path,
+) -> io::Result<Option<PhysicalReadback>> {
+    let Some(k) = lane
+        .read_normal_provider_k(receipt, actor, session)
+        .map_err(io::Error::other)?
+    else {
+        return Ok(None);
+    };
+    let physical = (|| {
+        let directory = id_path(&store_root(state_root)?, &k.admission_id)?;
+        let q: Option<PhysicalQ> = read_optional(&directory, "q.json")?;
+        let wait: Option<ParentWait> = read_optional(&directory, "parent-wait.json")?;
+        let (Some(q), Some(wait)) = (q, wait) else {
+            return Err(io::Error::other("physical Q or PID1 wait absent"));
+        };
+        if q.admission_id != k.admission_id
+            || q.plan_sha256 != k.plan_sha256
+            || !q.tree_drained
+            || wait.admission_id != k.admission_id
+            || wait.pid1_parent_namespace_pid <= 0
+            || !libc::WIFEXITED(wait.pid1_wait_status)
+            || libc::WEXITSTATUS(wait.pid1_wait_status) != 0
+        {
+            return Err(io::Error::other("physical Q or PID1 wait changed"));
+        }
+        verify_output(&directory, "stdout", &q.stdout)?;
+        verify_output(&directory, "stderr", &q.stderr)?;
+        Ok(q)
+    })();
+    let (q, unknown_reason) = match physical {
+        Ok(q) => (Some(q), None),
+        Err(error) => (None, Some(error.to_string())),
+    };
+    Ok(Some(PhysicalReadback {
+        k,
+        state: if q.is_some() { "drained" } else { "unknown" }.into(),
+        q,
+        unknown_reason,
+    }))
+}
+
+fn retained_k_matches(state_root: &Path, recipe: &SupervisorRecipe) -> io::Result<()> {
+    let state = state_root.join("v30/state.db");
+    let db = Connection::open_with_flags(state, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(io::Error::other)?;
+    let (k, admission, plan): (String, String, String) = db
+        .query_row(
+            "SELECT k.k_json,a.admission_json,p.plan_json FROM fresh_normal_provider_k k
+         JOIN fresh_normal_provider_admission a USING(handoff_id)
+         JOIN fresh_normal_executable_plan p USING(handoff_id) WHERE k.handoff_id=?1",
+            [&recipe.k.handoff_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(io::Error::other)?;
+    let k: FreshNormalProviderK = serde_json::from_str(&k)?;
+    let admission: FreshNormalProviderAdmission = serde_json::from_str(&admission)?;
+    let plan: FreshNormalExecutablePlan = serde_json::from_str(&plan)?;
+    if k != recipe.k
+        || plan != recipe.plan
+        || admission.admission_id != k.admission_id
+        || admission.plan_sha256 != k.plan_sha256
+        || plan.plan_sha256 != k.plan_sha256
+        || format!("{:x}", Sha256::digest(&recipe.stdin)) != plan.stdin_sha256
+        || format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&recipe.environment)?)
+        ) != plan.environment_sha256
+        || recipe.argv != plan.argv
+        || recipe.executable.to_str() != Some(plan.executable.as_str())
+        || recipe.cwd.to_str() != Some(plan.cwd.as_str())
+    {
+        return Err(io::Error::other(
+            "normal physical supervisor recipe changed",
+        ));
+    }
+    Ok(())
+}
+
+struct Pid1Context {
+    recipe: SupervisorRecipe,
+    directory: PathBuf,
+    root: PinnedProcess,
+    actor: PinnedProcess,
+}
+
+extern "C" fn pid1_entry(pointer: *mut libc::c_void) -> libc::c_int {
+    let context = unsafe { Box::from_raw(pointer.cast::<Pid1Context>()) };
+    match pid1_run(
+        &context.recipe,
+        &context.directory,
+        &context.root,
+        &context.actor,
+    ) {
+        Ok(()) => 0,
+        Err(error) => {
+            let _ = write_new(
+                &context.directory,
+                "incomplete.json",
+                &serde_json::json!({ "admission_id": context.recipe.k.admission_id, "reason": error.to_string() }),
+            );
+            eprintln!("normal provider PID1 failed after K: {error}");
+            70
+        }
+    }
+}
+
+fn pid1_run(
+    recipe: &SupervisorRecipe,
+    directory: &Path,
+    root: &PinnedProcess,
+    actor: &PinnedProcess,
+) -> io::Result<()> {
+    if unsafe { libc::getpid() } != 1 {
+        return Err(io::Error::other("normal provider worker is not PID1"));
+    }
+    let mut stdout = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(directory.join("stdout"))?;
+    let mut stderr = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(directory.join("stderr"))?;
+    File::open(directory)?.sync_all()?;
+    let cwd = File::open(&recipe.cwd)?;
+    let meta = cwd.metadata()?;
+    if !meta.is_dir() || meta.dev() != recipe.plan.cwd_device || meta.ino() != recipe.plan.cwd_inode
+    {
+        return Err(io::Error::other("normal physical cwd changed before exec"));
+    }
+    // Scripts are launched through their ordinary pathname. This source
+    // observation is explicitly pre-exec evidence, not an inode-exec claim.
+    let source = normal_plan_custody::image_evidence(&recipe.executable)?;
+    if source
+        != (
+            recipe.plan.executable_device,
+            recipe.plan.executable_inode,
+            recipe.plan.executable_mount_id,
+            recipe.plan.executable_sha256.clone(),
+            recipe.plan.executable_metadata_sha256.clone(),
+            recipe.plan.path_execution,
+        )
+    {
+        return Err(io::Error::other(
+            "normal physical executable path changed before exec",
+        ));
+    }
+    let input_fd = unsafe {
+        libc::memfd_create(
+            c"normal-provider-stdin".as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    if input_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut input = unsafe { File::from_raw_fd(input_fd) };
+    input.write_all(&recipe.stdin)?;
+    use std::io::Seek;
+    input.rewind()?;
+    let mut command = Command::new(&recipe.executable);
+    command
+        .arg0(&recipe.plan.configured_program)
+        .args(&recipe.argv)
+        .env_clear()
+        .envs(recipe.environment.iter().cloned())
+        .stdin(Stdio::from(input))
+        .stdout(Stdio::from(stdout.try_clone()?))
+        .stderr(Stdio::from(stderr.try_clone()?));
+    let cwd_fd = std::os::fd::AsRawFd::as_raw_fd(&cwd);
+    let uid = recipe.uid;
+    let gid = recipe.gid;
+    let groups = recipe.groups.clone();
+    let fixture = recipe.private_fixture;
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fchdir(cwd_fd) != 0
+                || (!fixture && libc::setgroups(groups.len(), groups.as_ptr()) != 0)
+                || libc::setresgid(gid, gid, gid) != 0
+                || libc::setresuid(uid, uid, uid) != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) != 0
+                || libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0) != 0
+            {
+                return Err(io::Error::other("normal provider inherited NNP/seccomp"));
+            }
+            Ok(())
+        });
+    }
+    if stamp(root) != recipe.root
+        || stamp(actor) != recipe.actor
+        || !root.is_namespace_init()?
+        || !actor.direct_child_of(root)?
+        || !actor.in_namespace(root.namespace())?
+    {
+        return Err(io::Error::other(
+            "normal provider root or actor closed before exec",
+        ));
+    }
+    root.verify()?;
+    actor.verify()?;
+    let provider = command.spawn()?;
+    let provider_pid = provider.id() as i32;
+    let mut provider_wait = None;
+    loop {
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(-1, &mut status, 0) };
+        if waited == provider_pid {
+            provider_wait = Some(status);
+        }
+        if waited > 0 {
+            continue;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if error.raw_os_error() == Some(libc::ECHILD) {
+            break;
+        }
+        return Err(error);
+    }
+    let provider_wait_status =
+        provider_wait.ok_or_else(|| io::Error::other("normal provider wait absent"))?;
+    let q = PhysicalQ {
+        admission_id: recipe.k.admission_id.clone(),
+        plan_sha256: recipe.k.plan_sha256.clone(),
+        provider_wait_status,
+        tree_drained: true,
+        stdout: output_evidence(&mut stdout)?,
+        stderr: output_evidence(&mut stderr)?,
+    };
+    write_new(directory, "q.json", &q)
+}
+
+/// Runs only as a fresh process spawned by the broker after State K commits.
+pub fn supervisor(state_root: &Path) -> io::Result<()> {
+    // Keep a host-PID observer across setns/clone so PID1 can recheck the
+    // original root and actor immediately before it forks the provider.
+    install_detached_host_proc()?;
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .take(MAX_RECIPE + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_RECIPE {
+        return Err(io::Error::other("normal supervisor recipe oversized"));
+    }
+    let recipe: SupervisorRecipe = serde_json::from_slice(&bytes)?;
+    retained_k_matches(state_root, &recipe)?;
+    let root = exact_process(&recipe.root)?;
+    let actor = exact_process(&recipe.actor)?;
+    if !root.is_namespace_init()?
+        || !actor.direct_child_of(&root)?
+        || !actor.in_namespace(root.namespace())?
+    {
+        return Err(io::Error::other(
+            "normal supervisor root or actor closed before launch",
+        ));
+    }
+    if unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) } != 0
+        || unsafe { libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0) } != 0
+    {
+        return Err(io::Error::other("normal supervisor inherited NNP/seccomp"));
+    }
+    let config = File::open(&recipe.config_directory)?;
+    let meta = config.metadata()?;
+    if !meta.is_dir()
+        || meta.dev() != recipe.plan.selection.source.directory_device
+        || meta.ino() != recipe.plan.selection.source.directory_inode
+        || normal_model_selection::candidate(recipe.plan.selection.invocation.clone(), &config)?
+            != recipe.plan.selection
+    {
+        return Err(io::Error::other(
+            "normal supervisor selected config or account changed",
+        ));
+    }
+    let store = store_root(state_root)?;
+    let directory = id_path(&store, &recipe.k.admission_id)?;
+    fs::DirBuilder::new().mode(0o700).create(&directory)?;
+    File::open(&store)?.sync_all()?;
+    if unsafe { libc::setns(root.namespace().as_raw_fd(), libc::CLONE_NEWPID) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // setns changes the PID namespace of future children. Fork once into
+    // that namespace before making the nested PID1 that owns provider Q.
+    let intermediate = unsafe { libc::fork() };
+    if intermediate < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if intermediate == 0 {
+        let result = (|| {
+            let context = Box::into_raw(Box::new(Pid1Context {
+                recipe: recipe.clone(),
+                directory: directory.clone(),
+                root,
+                actor,
+            }));
+            let mut stack = vec![0u8; 1024 * 1024];
+            let top = unsafe { stack.as_mut_ptr().add(stack.len()) };
+            let child = unsafe {
+                libc::clone(
+                    pid1_entry,
+                    top.cast(),
+                    libc::CLONE_NEWPID | libc::SIGCHLD,
+                    context.cast(),
+                )
+            };
+            unsafe {
+                drop(Box::from_raw(context));
+            }
+            if child < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mut status = 0;
+            if unsafe { libc::waitpid(child, &mut status, 0) } != child {
+                return Err(io::Error::last_os_error());
+            }
+            write_new(
+                &directory,
+                "parent-wait.json",
+                &ParentWait {
+                    admission_id: recipe.k.admission_id,
+                    pid1_parent_namespace_pid: child,
+                    pid1_wait_status: status,
+                },
+            )
+        })();
+        unsafe { libc::_exit(if result.is_ok() { 0 } else { 70 }) };
+    }
+    let mut status = 0;
+    if unsafe { libc::waitpid(intermediate, &mut status, 0) } != intermediate {
+        return Err(io::Error::last_os_error());
+    }
+    if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+        return Err(io::Error::other("normal provider namespace helper failed"));
+    }
+    Ok(())
+}
