@@ -9364,6 +9364,14 @@ fn inner() {
                                         assert_eq!(after_work["entry_unsettled"], true);
                                         assert_eq!(after_work["close_eligible"], false);
                                         assert_eq!(after_work["pid1"], "live");
+                                        assert_eq!(
+                                            after_work["owner_close_inventory"]["owner_generation"],
+                                            prepared.owner_generation
+                                        );
+                                        assert_eq!(
+                                            after_work["owner_close_inventory"]["state_projection_pending"],
+                                            false
+                                        );
                                         let mut stale_root = expected.clone();
                                         stale_root.init_starttime_ticks += 1;
                                         assert!(
@@ -9640,6 +9648,10 @@ fn inner() {
                                             true
                                         );
                                         assert_eq!(changed["close_eligible"], false);
+                                        assert_eq!(
+                                            changed["owner_close_inventory"]["owner_generation"],
+                                            prepared.owner_generation
+                                        );
                                         assert!(
                                             protocol::root_pid1_drain_at(&socket, &expected)
                                                 .is_err()
@@ -9796,6 +9808,18 @@ fn inner() {
                                         assert_eq!(proof["entry_physical_settled"], true);
                                         assert_eq!(proof["pid1_parent_wait_proof"], true);
                                         assert_eq!(proof["close_eligible"], false);
+                                        assert_eq!(
+                                            proof["owner_close_inventory"]["owner_generation"],
+                                            prepared.owner_generation
+                                        );
+                                        assert_eq!(
+                                            proof["owner_close_inventory"]["deliverable_mailbox_rows"],
+                                            1
+                                        );
+                                        assert_eq!(
+                                            proof["owner_close_inventory"]["source_effect"]["accepted"],
+                                            1
+                                        );
                                         let terminal: serde_json::Value = serde_json::from_slice(
                                             &fs::read(&terminal_path).unwrap(),
                                         )
@@ -9874,6 +9898,10 @@ fn inner() {
                                         assert_eq!(restored["pid1_exact_live"], false);
                                         assert_eq!(restored["work_retired"], 1);
                                         assert_eq!(restored["close_eligible"], false);
+                                        assert_eq!(
+                                            restored["owner_close_inventory"],
+                                            proof["owner_close_inventory"]
+                                        );
                                         eprintln!("root PID1 drain restart readback: {}", restored);
                                     }
                                 }

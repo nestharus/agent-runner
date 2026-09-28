@@ -372,6 +372,25 @@ impl BrokerSourceEffectObligations {
     }
 }
 
+/// Exact, read-only State/retained-sidecar inventory for one released v30
+/// owner. This is a close prerequisite, not a close certificate: State and the
+/// fresh lane still need a joined writer fence before any phase transition.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct BrokerOwnerCloseInventory {
+    pub source_generation: String,
+    pub root_id: String,
+    pub owner_generation: String,
+    pub state_projection_pending: bool,
+    pub state_native_channel_pending: bool,
+    pub state_cancelling_native_attempts: usize,
+    pub registered_sources: usize,
+    pub retiring_listeners: usize,
+    pub deliverable_mailbox_rows: usize,
+    pub unresolved_attempts: usize,
+    pub native_grants_without_q: usize,
+    pub source_effect: BrokerSourceEffectObligations,
+}
+
 fn source_effect_obligations_on(
     conn: &Connection,
     source_generation: &str,
@@ -1020,6 +1039,99 @@ impl BrokerSidecar {
         )?;
         self.check_mailbox_read(&self.source_generation)?;
         Ok(obligations)
+    }
+
+    /// Read the exact released owner and the State/sidecar duties which the
+    /// existing idle-owner close must settle. A changed cursor or root PID1
+    /// identity refuses the readback. These reads do not hold a State writer
+    /// reservation and therefore cannot authorize close by themselves.
+    pub fn read_root_owner_close_inventory(
+        &self,
+        root_id: &str,
+        root_init: &PreparedProcessStamp,
+    ) -> Result<BrokerOwnerCloseInventory, String> {
+        self.check_mailbox_read(&self.source_generation)?;
+        let release = self.read_released_owner_for_root(root_id)?;
+        if &release.prepared.root_init != root_init {
+            return Err("broker owner close root PID1 incarnation changed".into());
+        }
+        let owner = &release.owner;
+        let state = self.bound_state()?;
+        let tx = self
+            .mailbox
+            .conn
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        let head = completion_continuity_head_on(&tx)?;
+        if let Some(head) = &head {
+            if sidecar_generation_on(&tx)? != head.sidecar_generation {
+                return Err("broker owner close continuity generation changed".into());
+            }
+        }
+        let state_projection_pending = state.completion_repair_has_suffix(head.as_ref())?;
+        let supervisor = &owner.supervisor_authority_id;
+        let scope = "WITH RECURSIVE supervisor_scope(authority_id) AS (
+            SELECT ?1 UNION SELECT predecessor_authority_id
+            FROM completion_supervisor_inheritance i JOIN supervisor_scope s
+            ON i.authority_id=s.authority_id)";
+        let count = |sql: &str| -> Result<usize, String> {
+            let value: i64 = tx
+                .query_row(sql, [supervisor], |row| row.get(0))
+                .map_err(|error| error.to_string())?;
+            usize::try_from(value).map_err(|_| "broker owner close count overflow".into())
+        };
+        let registered_sources = count(&format!(
+            "{scope} SELECT COUNT(*) FROM completion_continuation_source
+             WHERE supervisor_authority_id IN (SELECT authority_id FROM supervisor_scope)
+             AND phase='registered'"
+        ))?;
+        let unresolved_attempts = count(&format!(
+            "{scope} SELECT COUNT(*) FROM completion_continuation_attempt
+             WHERE supervisor_authority_id IN (SELECT authority_id FROM supervisor_scope)
+             AND phase NOT IN ('drained','never_started')"
+        ))?;
+        let retiring_listeners = count(
+            "SELECT COUNT(*) FROM completion_event_listener
+             WHERE retirement_pending=1 AND ?1!=''",
+        )?;
+        let deliverable_mailbox_rows = count(&format!(
+            "SELECT COUNT(*) FROM mailbox WHERE delivered_at IS NULL
+             AND {} AND ?1!=''",
+            super::DELIVERABLE_MAILBOX_ERROR_PREDICATE
+        ))?;
+        let native_grants_without_q = count(
+            "SELECT COUNT(*) FROM completion_native_grant_binding g
+             LEFT JOIN completion_native_kernel_q q ON q.attempt_id=g.attempt_id
+             WHERE g.owner_generation=?1 AND q.attempt_id IS NULL",
+        )?;
+        let source_effect = source_effect_obligations_on(
+            &tx,
+            &self.source_generation,
+            root_id,
+            &owner.owner_generation,
+        )?;
+        tx.commit().map_err(|error| error.to_string())?;
+        if state.completion_repair_has_suffix(head.as_ref())? != state_projection_pending {
+            return Err("broker owner close State projection changed during readback".into());
+        }
+        let state_native_channel_pending =
+            state.has_pending_native_channel_duty_for_domain(&owner.domain_id)?;
+        let state_cancelling_native_attempts = state.cancelling_native_attempts()?.len();
+        self.check_mailbox_read(&self.source_generation)?;
+        Ok(BrokerOwnerCloseInventory {
+            source_generation: self.source_generation.clone(),
+            root_id: root_id.into(),
+            owner_generation: owner.owner_generation.clone(),
+            state_projection_pending,
+            state_native_channel_pending,
+            state_cancelling_native_attempts,
+            registered_sources,
+            retiring_listeners,
+            deliverable_mailbox_rows,
+            unresolved_attempts,
+            native_grants_without_q,
+            source_effect,
+        })
     }
 
     pub(super) fn bound_state(&self) -> Result<StateDb, String> {
