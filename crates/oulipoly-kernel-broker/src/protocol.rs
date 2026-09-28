@@ -488,7 +488,7 @@ pub fn private_fresh_provider_at(
 ) -> io::Result<String> {
     if !matches!(
         operation,
-        b'5' | b'6' | b'7' | b'9' | b'b' | b'y' | b'x' | b'*' | b'/'
+        b'5' | b'6' | b'7' | b'9' | b'b' | b'y' | b'x' | b'*' | b'/' | b'>' | b'_'
     ) || matches!(operation, b'5' | b'9' | b'b') != descriptors.is_some()
     {
         return Err(io::Error::other("invalid private fresh provider operation"));
@@ -546,7 +546,7 @@ pub fn private_fresh_provider_at(
             "fresh provider observe/cancel request uncertain",
         ));
     }
-    let answer = if matches!(operation, b'y' | b'x' | b'/') {
+    let answer = if matches!(operation, b'y' | b'x' | b'/' | b'>' | b'_') {
         read_private_native_response(stream)?
     } else {
         read_response(stream)?

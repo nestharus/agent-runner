@@ -3281,6 +3281,83 @@ impl oulipoly_runtime::executor::cli::fresh_remote::FreshProviderBackend
                     private_bash_recipient_probe(&socket, &self.authority.receipt.d_key, &gate)
                         .map_err(|e| self.unknown(Some(&grant), "fresh F source grant", &e))?;
                 }
+                if std::env::var_os("AGE319_PRIVATE_NATIVE_F_TURN_V1").is_some() {
+                    // > is a one-use second turn on the retained selected-K
+                    // control. A lost reply is read through _, never resent.
+                    let submitted = protocol::private_fresh_provider_at(
+                        &socket,
+                        &self.authority.receipt.d_key,
+                        b'>',
+                        None,
+                    );
+                    if let Ok(reply) = &submitted {
+                        if reply != &format!("native-f-submitted {grant}\n") {
+                            return Err(self.unknown(
+                                Some(&grant),
+                                "native F submission",
+                                "invalid reply",
+                            ));
+                        }
+                    }
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(150);
+                    let receipt = loop {
+                        let state = protocol::private_fresh_provider_at(
+                            &socket,
+                            &self.authority.receipt.d_key,
+                            b'_',
+                            None,
+                        )
+                        .map_err(|error| {
+                            self.unknown(
+                                Some(&grant),
+                                "native F readback",
+                                &format!("submission={submitted:?}; observation={error}"),
+                            )
+                        })?;
+                        if let Some(body) = state.strip_prefix("native-f-receipt ") {
+                            break serde_json::from_str::<serde_json::Value>(body.trim_end())
+                                .map_err(|error| {
+                                    self.unknown(
+                                        Some(&grant),
+                                        "native F receipt",
+                                        &error.to_string(),
+                                    )
+                                })?;
+                        }
+                        if state.starts_with("native-f-unknown ")
+                            || state != "native-f-pending\n"
+                            || std::time::Instant::now() >= deadline
+                        {
+                            return Err(self.unknown(Some(&grant), "native F receipt", &state));
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    };
+                    std::fs::write(
+                        std::path::Path::new(&gate).join("native-f-turn-receipt.json"),
+                        serde_json::to_vec(&receipt).map_err(|e| e.to_string())?,
+                    )
+                    .map_err(|e| self.unknown(Some(&grant), "native F report", &e.to_string()))?;
+                    let duplicate = protocol::private_fresh_provider_at(
+                        &socket,
+                        &self.authority.receipt.d_key,
+                        b'>',
+                        None,
+                    );
+                    if duplicate.is_ok() {
+                        return Err(self.unknown(
+                            Some(&grant),
+                            "native F duplicate",
+                            "second submission accepted",
+                        ));
+                    }
+                    std::fs::write(
+                        std::path::Path::new(&gate).join("native-f-duplicate-refused"),
+                        duplicate.unwrap_err().to_string(),
+                    )
+                    .map_err(|e| {
+                        self.unknown(Some(&grant), "native F duplicate report", &e.to_string())
+                    })?;
+                }
             }
             protocol::private_fresh_provider_at(&socket, &self.authority.receipt.d_key, b'7', None)
                 .map_err(|e| self.unknown(Some(&grant), "native K cancellation", &e.to_string()))?;
@@ -4999,7 +5076,8 @@ fn private_bash_recipient_probe(
         std::path::Path::new(gate).join("bash-recipient-output"),
         serde_json::to_vec(
             &serde_json::json!({"mode":mode,"listener_policy":"notify_at_admission",
-            "delivery_request_id":delivery_request_id,"grant":grant,"readback":read,
+            "bash_request_id":request_id,"delivery_request_id":delivery_request_id,
+            "grant":grant,"readback":read,
             "native_f_preparation_refusal":preparation_refusal,
             "observed_payload_sha256":format!("{:x}",sha2::Sha256::digest(&bytes))}),
         )

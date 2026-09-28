@@ -1465,7 +1465,9 @@ fn terminate_postcommit_original_owner(broker_state: &Path) {
 
 fn inner() {
     let mode = std::env::var("AGE319_PRIVATE_JOIN_MODE").unwrap_or_else(|_| "help".into());
-    let native_f_candidate = mode == "normal_model_provider_native_codex_f_candidate";
+    let native_f_turn = mode == "normal_model_provider_native_codex_f_turn";
+    let native_f_candidate =
+        mode == "normal_model_provider_native_codex_f_candidate" || native_f_turn;
     let native_ack_mode =
         mode == "normal_model_provider_native_codex_recipient_ack" || native_f_candidate;
     let native_turn_mode =
@@ -1689,6 +1691,7 @@ fn inner() {
             | "normal_model_provider_native_codex_turn_receipt"
             | "normal_model_provider_native_codex_recipient_ack"
             | "normal_model_provider_native_codex_f_candidate"
+            | "normal_model_provider_native_codex_f_turn"
     );
     let root_h_lost = mode == "normal_model_provider_bash_causal_root_h_lost";
     let root_h_notify = root_h_delegate && (mode.contains("_notify_") || native_turn_mode);
@@ -2292,6 +2295,7 @@ fn inner() {
         .envs(native_turn_mode.then_some(("AGE319_PRIVATE_NATIVE_TURN_DROP_REPLY_V1", "1")))
         .envs(native_ack_mode.then_some(("AGE319_PRIVATE_NATIVE_RECIPIENT_ACK_V1", "1")))
         .envs(native_ack_mode.then_some(("AGE319_PRIVATE_NATIVE_ACK_DROP_REPLY_V1", "1")))
+        .envs(native_f_turn.then_some(("AGE319_PRIVATE_NATIVE_F_TURN_DROP_REPLY_V1", "1")))
         .envs(native_lost_reply.map(|stage| ("AGE319_PRIVATE_NATIVE_F_DROP_REPLY_V1", stage)))
         .envs(
             (mode == "normal_model_provider_bash_causal_success" || root_h_delegate)
@@ -2589,6 +2593,7 @@ fn inner() {
             .envs(native_codex_mode.then_some(("AGE319_PRIVATE_NATIVE_CODEX_V1", "1")))
             .envs(native_codex_mode.then_some(("AGE319_PRIVATE_NATIVE_BASH_NOTIFY_V1", "1")))
             .envs(native_turn_mode.then_some(("AGE319_PRIVATE_NATIVE_TURN_RECEIPT_V1", "1")))
+            .envs(native_f_turn.then_some(("AGE319_PRIVATE_NATIVE_F_TURN_V1", "1")))
             .envs(
                 native_f_candidate
                     .then_some(("AGE319_PRIVATE_BASH_RECIPIENT_MODE_V1", "native_k_pending")),
@@ -6965,6 +6970,7 @@ fn inner() {
                         | "normal_model_provider_native_codex_turn_receipt"
                         | "normal_model_provider_native_codex_recipient_ack"
                         | "normal_model_provider_native_codex_f_candidate"
+                        | "normal_model_provider_native_codex_f_turn"
                 )
             {
                 let marker: serde_json::Value =
@@ -8938,6 +8944,101 @@ fn inner() {
                                         )
                                         .is_err()
                                     );
+                                    if native_f_turn {
+                                        eventually(|| {
+                                            gate.join("native-f-turn-receipt.json").exists()
+                                                || entry.try_wait().unwrap().is_some()
+                                        });
+                                        assert!(
+                                            gate.join("native-f-turn-receipt.json").exists(),
+                                            "native F receipt absent: entry={} broker={}",
+                                            fs::read_to_string(&err).unwrap_or_default(),
+                                            fs::read_to_string(&broker_log).unwrap_or_default()
+                                        );
+                                        let f_receipt: serde_json::Value = serde_json::from_slice(
+                                            &fs::read(gate.join("native-f-turn-receipt.json"))
+                                                .unwrap(),
+                                        )
+                                        .unwrap();
+                                        let f_attempt: serde_json::Value = serde_json::from_slice(
+                                            &fs::read(physical_dir.join(format!(
+                                                "{}.native-f-attempt.json",
+                                                witness.fresh.grant_id
+                                            )))
+                                            .unwrap(),
+                                        )
+                                        .unwrap();
+                                        assert_eq!(
+                                            f_receipt["format"],
+                                            "age319-native-f-turn-receipt/v1"
+                                        );
+                                        assert_eq!(f_receipt["selected_k"], native);
+                                        assert_eq!(
+                                            f_receipt["fresh_grant_id"],
+                                            witness.fresh.grant_id
+                                        );
+                                        assert_eq!(
+                                            f_receipt["session_id"],
+                                            witness.fresh.session_id
+                                        );
+                                        assert_eq!(f_receipt["row_seq"], witness.fresh.seq);
+                                        assert_eq!(f_receipt["source_id"], witness.fresh.source_id);
+                                        assert_eq!(
+                                            f_receipt["payload_sha256"],
+                                            witness.fresh.payload_sha256
+                                        );
+                                        assert_eq!(f_receipt["first_turn_id"], receipt["turn_id"]);
+                                        assert_ne!(f_receipt["turn_id"], receipt["turn_id"]);
+                                        assert_eq!(f_receipt["status"], "completed");
+                                        assert_eq!(f_receipt["fresh_row_acknowledged"], false);
+                                        assert_eq!(
+                                            f_attempt["fresh_grant_id"],
+                                            witness.fresh.grant_id
+                                        );
+                                        assert_eq!(f_attempt["delivery_token"], token);
+                                        assert_eq!(
+                                            f_attempt["delivery_request_id"],
+                                            delivery_request
+                                        );
+                                        assert_eq!(f_attempt["source_id"], witness.fresh.source_id);
+                                        assert_eq!(f_attempt["row_seq"], witness.fresh.seq);
+                                        assert_eq!(f_attempt["nonce"], f_receipt["nonce"]);
+                                        assert_eq!(
+                                            f_attempt["envelope_sha256"],
+                                            f_receipt["envelope_sha256"]
+                                        );
+                                        use base64::Engine as _;
+                                        let reserved_payload =
+                                            base64::engine::general_purpose::STANDARD
+                                                .decode(
+                                                    f_attempt["payload_base64"].as_str().unwrap(),
+                                                )
+                                                .unwrap();
+                                        assert_eq!(
+                                            format!("{:x}", Sha256::digest(&reserved_payload)),
+                                            witness.fresh.payload_sha256
+                                        );
+                                        assert_eq!(
+                                            reserved_payload.len() as i64,
+                                            witness.fresh.payload_byte_len
+                                        );
+                                        assert!(
+                                            f_receipt["assistant_response_sha256"]
+                                                .as_str()
+                                                .is_some_and(|v| v.len() == 64)
+                                        );
+                                        assert!(gate.join("native-f-turn-reply-dropped").exists());
+                                        eventually(|| {
+                                            gate.join("native-f-duplicate-refused").exists()
+                                        });
+                                        assert!(
+                                            fs::read_to_string(
+                                                gate.join("native-f-duplicate-refused")
+                                            )
+                                            .unwrap()
+                                            .contains("no replay")
+                                        );
+                                    }
                                     let fresh_side = rusqlite::Connection::open(
                                         broker_state.join("v30/sidecar/pid-identity.db"),
                                     )
@@ -15198,6 +15299,7 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_model_provider_native_codex_turn_receipt",
         "normal_model_provider_native_codex_recipient_ack",
         "normal_model_provider_native_codex_f_candidate",
+        "normal_model_provider_native_codex_f_turn",
         "normal_model_provider_bash_causal_root_h_notify_row_drain",
         "normal_model_provider_bash_causal_root_h_notify_wake",
         "normal_model_provider_bash_causal_root_h_notify_wake_drain",

@@ -788,9 +788,8 @@ fn recv_request(
         b'=' | b'V' | b'S' | b's' | b'T' | b'H' | b'K' | b'B' | b'N' | b'k' | b't' | b'R'
         | b'W' | b'Y' | b'0' | b'1' | b'2' | b'3' | b'4' => (18..=2048 + 17).contains(&read),
         #[cfg(feature = "age319-private-broker-fixture")]
-        b'5' | b'6' | b'7' | b'8' | b'9' | b'b' | b'y' | b'x' | b'$' | b'*' | b'/' => {
-            (18..=2048 + 17).contains(&read)
-        }
+        b'5' | b'6' | b'7' | b'8' | b'9' | b'b' | b'y' | b'x' | b'$' | b'*' | b'/' | b'>'
+        | b'_' => (18..=2048 + 17).contains(&read),
         #[cfg(feature = "age319-private-broker-fixture")]
         b'h' | b'f' | b'(' | b')' | b'm' | b'n' | b'o' | b'w' | b'r' => {
             (18..=48 * 1024 + 17).contains(&read)
@@ -870,7 +869,7 @@ fn recv_request(
             request: serde_json::from_slice(&request[17..read as usize])?,
         },
         #[cfg(feature = "age319-private-broker-fixture")]
-        b'5' | b'6' | b'7' | b'b' | b'y' | b'x' | b'*' | b'/' => {
+        b'5' | b'6' | b'7' | b'b' | b'y' | b'x' | b'*' | b'/' | b'>' | b'_' => {
             RequestPayload::FreshProviderRequest {
                 request: serde_json::from_slice(&request[17..read as usize])?,
                 descriptors,
@@ -6152,6 +6151,8 @@ fn serve_fresh_v30_at(
     let mut native_bash_execs: HashMap<String, fresh_provider::NativeBashExec> = HashMap::new();
     #[cfg(feature = "age319-private-broker-fixture")]
     let mut native_turn_execs: HashMap<String, fresh_provider::NativeTurnExec> = HashMap::new();
+    #[cfg(feature = "age319-private-broker-fixture")]
+    let mut native_f_execs: HashMap<String, fresh_provider::NativeFExec> = HashMap::new();
     for incoming in listener.incoming() {
         let Ok(mut stream) = incoming else { continue };
         stream.set_read_timeout(Some(FRESH_V30_READ_TIMEOUT))?;
@@ -6163,6 +6164,8 @@ fn serve_fresh_v30_at(
         let mut drop_native_bash_reply = false;
         #[cfg(feature = "age319-private-broker-fixture")]
         let mut drop_native_turn_reply = false;
+        #[cfg(feature = "age319-private-broker-fixture")]
+        let mut drop_native_f_turn_reply = false;
         #[cfg(feature = "age319-private-broker-fixture")]
         let mut drop_interactive_k_reply = false;
         #[cfg(feature = "age319-private-broker-fixture")]
@@ -7051,8 +7054,8 @@ fn serve_fresh_v30_at(
                 }
                 #[cfg(feature = "age319-private-broker-fixture")]
                 b'5' | b'6' | b'7' | b'8' | b'9' | b'b' | b'y' | b'x' | b'$' | b'*' | b'/'
-                | b'h' | b'f' | b'(' | b')' | b'm' | b'n' | b'o' | b'#' | b'{' | b'}' | b']'
-                | b'|' | b'~' | b'?' => {
+                | b'>' | b'_' | b'h' | b'f' | b'(' | b')' | b'm' | b'n' | b'o' | b'#' | b'{'
+                | b'}' | b']' | b'|' | b'~' | b'?' => {
                     if !private_fixture() {
                         return Err(io::Error::other("fresh provider fixture route closed"));
                     }
@@ -7853,6 +7856,59 @@ fn serve_fresh_v30_at(
                         })?;
                         return execution.observe(&binding);
                     }
+                    if operation == b'>' {
+                        if native_f_execs.contains_key(&grant) {
+                            return Err(io::Error::other(
+                                "native F turn already reserved; no replay",
+                            ));
+                        }
+                        let gate = PathBuf::from(
+                            std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                                .map_err(io::Error::other)?,
+                        );
+                        let report: serde_json::Value =
+                            serde_json::from_slice(&fs::read(gate.join("bash-recipient-output"))?)?;
+                        if report["mode"] != "native_k_pending" {
+                            return Err(io::Error::other("native F source report mode changed"));
+                        }
+                        let delivery_request = report["delivery_request_id"]
+                            .as_str()
+                            .ok_or_else(|| io::Error::other("native F request absent"))?;
+                        let token = report["grant"]["delivery_token"]
+                            .as_str()
+                            .ok_or_else(|| io::Error::other("native F token absent"))?;
+                        let bash_request = report["bash_request_id"]
+                            .as_str()
+                            .ok_or_else(|| io::Error::other("native F Bash W request absent"))?;
+                        let (_, recipient) = lane
+                            .released_handoff_for_root(&receipt.old_release.prepared.root_id)
+                            .map_err(io::Error::other)?;
+                        let execution = native_turn_execs.get_mut(&grant).ok_or_else(|| {
+                            io::Error::other("original native ACK control absent; F refused")
+                        })?;
+                        let control = execution.take_control(&binding)?;
+                        let turn = control.begin_f_turn(
+                            &directory,
+                            state_root,
+                            &binding,
+                            bash_request,
+                            delivery_request,
+                            token,
+                            &recipient,
+                        )?;
+                        native_f_execs.insert(grant.clone(), turn);
+                        if std::env::var_os("AGE319_PRIVATE_NATIVE_F_TURN_DROP_REPLY_V1").is_some()
+                        {
+                            drop_native_f_turn_reply = true;
+                        }
+                        return Ok(format!("native-f-submitted {grant}\n"));
+                    }
+                    if operation == b'_' {
+                        let execution = native_f_execs.get_mut(&grant).ok_or_else(|| {
+                            io::Error::other("native F control absent; unknown, no replay")
+                        })?;
+                        return execution.observe(&binding);
+                    }
                     if let Some(v3) = provider_readback_v3.as_ref() {
                         if provider_writer_v3 {
                             fresh_provider::settle_v3_provider(v3, &directory, &binding, &grant)?;
@@ -8311,6 +8367,7 @@ fn serve_fresh_v30_at(
         if drop_provider_k_reply
             || drop_native_bash_reply
             || drop_native_turn_reply
+            || drop_native_f_turn_reply
             || drop_provider_q_reply
             || drop_account_effect_reply
             || drop_route_reply
@@ -8318,7 +8375,9 @@ fn serve_fresh_v30_at(
             || drop_root_h_reply
         {
             if let Some(gate) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1") {
-                let marker = if drop_native_turn_reply {
+                let marker = if drop_native_f_turn_reply {
+                    "native-f-turn-reply-dropped"
+                } else if drop_native_turn_reply {
                     "native-turn-reply-dropped"
                 } else if drop_native_bash_reply {
                     "native-bash-reply-dropped"

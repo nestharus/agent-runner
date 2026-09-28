@@ -7735,8 +7735,42 @@ impl NativeBashExec {
 
 pub(super) struct NativeTurnExec {
     binding: Binding,
+    result: std::sync::mpsc::Receiver<(Result<serde_json::Value, String>, NativeCodexControl)>,
+    settled: Option<Result<serde_json::Value, String>>,
+    control: Option<NativeCodexControl>,
+}
+
+pub(super) struct NativeFExec {
+    binding: Binding,
     result: std::sync::mpsc::Receiver<Result<serde_json::Value, String>>,
     settled: Option<Result<serde_json::Value, String>>,
+}
+
+impl NativeFExec {
+    pub(super) fn observe(&mut self, binding: &Binding) -> io::Result<String> {
+        if &self.binding != binding {
+            return Err(io::Error::other("native F D or selected K changed"));
+        }
+        if self.settled.is_none() {
+            match self.result.try_recv() {
+                Ok(result) => self.settled = Some(result),
+                Err(std::sync::mpsc::TryRecvError::Empty) => return Ok("native-f-pending\n".into()),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.settled = Some(Err("native F worker lost; no replay".into()));
+                }
+            }
+        }
+        match self.settled.as_ref().unwrap() {
+            Ok(receipt) => Ok(format!(
+                "native-f-receipt {}\n",
+                serde_json::to_string(receipt)?
+            )),
+            Err(error) => Ok(format!(
+                "native-f-unknown {}\n",
+                serde_json::to_string(error)?
+            )),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -7807,6 +7841,22 @@ fn native_rollout_bytes(path: &Path, session: &str) -> io::Result<Option<(Vec<u8
 }
 
 fn native_rollout_anchor(home: &Path, session: &str) -> io::Result<NativeRolloutAnchor> {
+    native_rollout_anchor_internal(home, session, None)
+}
+
+fn native_rollout_anchor_after(
+    home: &Path,
+    session: &str,
+    completed_turn_id: &str,
+) -> io::Result<NativeRolloutAnchor> {
+    native_rollout_anchor_internal(home, session, Some(completed_turn_id))
+}
+
+fn native_rollout_anchor_internal(
+    home: &Path,
+    session: &str,
+    completed_turn_id: Option<&str>,
+) -> io::Result<NativeRolloutAnchor> {
     let Some(path) = native_rollout_path(home, session)? else {
         return Ok(NativeRolloutAnchor {
             path: None,
@@ -7818,16 +7868,52 @@ fn native_rollout_anchor(home: &Path, session: &str) -> io::Result<NativeRollout
     };
     let (bytes, meta) = native_rollout_bytes(&path, session)?
         .ok_or_else(|| io::Error::other("native Codex pre-send rollout incomplete"))?;
+    let mut started = 0;
+    let mut completed = 0;
+    let mut users = 0;
     for line in bytes
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
     {
         let record: serde_json::Value = serde_json::from_slice(line)?;
-        if record["type"] == "response_item" && record["payload"]["role"] == "user" {
+        if record["type"] == "event_msg" && record["payload"]["type"] == "task_started" {
+            if record["payload"]["turn_id"] != completed_turn_id.unwrap_or_default()
+                || started != 0
+                || completed != 0
+            {
+                return Err(io::Error::other(
+                    "native Codex pre-send turn lineage changed",
+                ));
+            }
+            started += 1;
+        } else if record["type"] == "event_msg" && record["payload"]["type"] == "task_complete" {
+            if record["payload"]["turn_id"] != completed_turn_id.unwrap_or_default()
+                || started != 1
+                || completed != 0
+            {
+                return Err(io::Error::other("native Codex pre-send completion changed"));
+            }
+            completed += 1;
+        } else if record["type"] == "response_item" && record["payload"]["role"] == "user" {
+            if completed_turn_id.is_none() || completed != 0 {
+                return Err(io::Error::other(
+                    "native Codex pre-send user turn already exists",
+                ));
+            }
+            users += 1;
+        } else if completed == 1
+            && record["type"] == "response_item"
+            && record["payload"]["role"] == "assistant"
+        {
             return Err(io::Error::other(
-                "native Codex pre-send user turn already exists",
+                "native Codex pre-send assistant after first turn",
             ));
         }
+    }
+    if completed_turn_id.is_some() && (started != 1 || completed != 1 || users == 0) {
+        return Err(io::Error::other(
+            "native Codex first turn absent before F anchor",
+        ));
     }
     Ok(NativeRolloutAnchor {
         path: Some(path),
@@ -7980,6 +8066,24 @@ fn native_rollout_assistant(
     envelope: &str,
     token: &str,
 ) -> io::Result<Option<(String, String)>> {
+    native_rollout_assistant_expected(
+        home,
+        session,
+        anchor,
+        turn_id,
+        envelope,
+        &format!("AGE319_ACK {token}"),
+    )
+}
+
+fn native_rollout_assistant_expected(
+    home: &Path,
+    session: &str,
+    anchor: &NativeRolloutAnchor,
+    turn_id: &str,
+    envelope: &str,
+    expected: &str,
+) -> io::Result<Option<(String, String)>> {
     let Some(bytes) = native_rollout_snapshot(home, session, anchor)? else {
         return Ok(None);
     };
@@ -8023,7 +8127,7 @@ fn native_rollout_assistant(
         }
     }
     match assistant.as_slice() {
-        [response] if response.trim() == format!("AGE319_ACK {token}") => Ok(Some((
+        [response] if response.trim() == expected => Ok(Some((
             response.clone(),
             format!("{:x}", Sha256::digest(response.as_bytes())),
         ))),
@@ -8075,7 +8179,10 @@ impl NativeTurnExec {
         }
         if self.settled.is_none() {
             match self.result.try_recv() {
-                Ok(result) => self.settled = Some(result),
+                Ok((result, control)) => {
+                    self.settled = Some(result);
+                    self.control = Some(control);
+                }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
                     return Ok("native-turn-pending\n".into());
                 }
@@ -8094,6 +8201,23 @@ impl NativeTurnExec {
                 serde_json::to_string(error)?
             )),
         }
+    }
+
+    pub(super) fn take_control(&mut self, binding: &Binding) -> io::Result<NativeCodexControl> {
+        if &self.binding != binding
+            || !self.settled.as_ref().is_some_and(|result| {
+                result
+                    .as_ref()
+                    .is_ok_and(|receipt| receipt["original_row_acknowledged"] == true)
+            })
+        {
+            return Err(io::Error::other(
+                "original native ACK not settled for selected K",
+            ));
+        }
+        self.control
+            .take()
+            .ok_or_else(|| io::Error::other("native K control already consumed; no replay"))
     }
 }
 
@@ -8410,10 +8534,14 @@ impl NativeCodexControl {
         if child.is_nil() || child.to_string() != request_id || !gate.is_absolute() {
             return Err(io::Error::other("native Bash request or gate invalid"));
         }
-        let readback = self.readback(directory, binding)?;
+        let readback = self.readback(directory, binding).map_err(|error| {
+            io::Error::other(format!("native Bash selected K readback: {error}"))
+        })?;
         self.verify_native_home()?;
-        let bash_path = fs::read_link(format!("/proc/self/fd/{}", bash_image.as_raw_fd()))?;
-        let reopened = File::open(&bash_path)?;
+        let bash_path = fs::read_link(format!("/proc/self/fd/{}", bash_image.as_raw_fd()))
+            .map_err(|error| io::Error::other(format!("native Bash image fd: {error}")))?;
+        let reopened = File::open(&bash_path)
+            .map_err(|error| io::Error::other(format!("native Bash image pathname: {error}")))?;
         if ImageDescriptor::of(&reopened)? != ImageDescriptor::of(bash_image)?
             || !bash_path.is_absolute()
         {
@@ -8455,7 +8583,8 @@ impl NativeCodexControl {
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(&attempt_path)?;
+            .open(&attempt_path)
+            .map_err(|error| io::Error::other(format!("native Bash attempt path: {error}")))?;
         serde_json::to_writer(&mut record, &attempt)?;
         record.write_all(b"\n")?;
         record.sync_all()?;
@@ -8681,12 +8810,13 @@ impl NativeCodexControl {
                         native_grant.as_ref(),
                     )
                     .map_err(|error| error.to_string());
-                let _ = sender.send(result);
+                let _ = sender.send((result, self));
             })?;
         Ok(NativeTurnExec {
             binding,
             result,
             settled: None,
+            control: None,
         })
     }
 
@@ -8890,6 +9020,347 @@ impl NativeCodexControl {
             }
             if Instant::now() >= deadline {
                 return Err(io::Error::other("native user turn incomplete; no replay"));
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+
+    /// A second, one-use native turn for the distinct fresh F row. The first
+    /// turn's control and ACK are prerequisites; this never uses the PTY lane.
+    pub(super) fn begin_f_turn(
+        mut self,
+        directory: &Path,
+        state_root: &Path,
+        binding: &Binding,
+        bash_request: &str,
+        delivery_request: &str,
+        delivery_token: &str,
+        recipient: &oulipoly_state::mailbox::FreshRecipientIdentity,
+    ) -> io::Result<NativeFExec> {
+        use base64::Engine as _;
+        let selected = self.readback(directory, binding)?;
+        let physical = oulipoly_kernel_broker::source_physical::SourcePhysicalRegistry::open(
+            state_root.join("source-physical"),
+        )
+        .map_err(io::Error::other)?;
+        let [original] = physical.records() else {
+            return Err(io::Error::other("original native source is ambiguous"));
+        };
+        let original_source = original.grant.grant_id.clone();
+        let lane =
+            oulipoly_state::mailbox::FreshV30Lane::open_at(state_root).map_err(io::Error::other)?;
+        let selected_json = serde_json::to_string(&selected)?;
+        let candidate = lane
+            .attest_native_k_f_candidate(
+                bash_request,
+                delivery_request,
+                delivery_token,
+                recipient,
+                &original_source,
+                &selected_json,
+            )
+            .map_err(io::Error::other)?;
+        if candidate.fresh_physical_grant_id.is_empty()
+            || candidate.fresh_parent_work_grant_id != selected.grant_id
+            || candidate.native_session_id != selected.native_session_id
+        {
+            return Err(io::Error::other("fresh F does not belong to selected K"));
+        }
+        let mut first_file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(directory.join(format!("{}.native-turn-receipt.json", self.grant_id)))?;
+        if !first_file.metadata()?.is_file() {
+            return Err(io::Error::other("first native turn receipt is not regular"));
+        }
+        let mut first_bytes = Vec::new();
+        first_file.read_to_end(&mut first_bytes)?;
+        let first: serde_json::Value = serde_json::from_slice(&first_bytes)?;
+        if format!("{:x}", Sha256::digest(&first_bytes)) != candidate.original_turn_receipt_sha256
+            || first["turn_id"] != candidate.original_turn_id
+            || first["original_row_acknowledged"] != false
+            || first["readback"] != serde_json::to_value(&selected)?
+        {
+            return Err(io::Error::other("first native turn receipt changed"));
+        }
+        let payload = lane
+            .lookup_payload(
+                &candidate.fresh.lane_id,
+                &candidate.fresh.session_id,
+                candidate.fresh.seq,
+            )
+            .map_err(io::Error::other)?;
+        if payload.len() as i64 != candidate.fresh.payload_byte_len
+            || format!("{:x}", Sha256::digest(&payload)) != candidate.fresh.payload_sha256
+        {
+            return Err(io::Error::other("fresh F retained payload changed"));
+        }
+        let summary = native_codex_message(
+            &mut self.endpoint,
+            &self.provider,
+            11,
+            "thread/read",
+            serde_json::json!({"threadId": selected.native_session_id}),
+        )?;
+        if summary
+            .pointer("/thread/id")
+            .and_then(serde_json::Value::as_str)
+            != Some(selected.native_session_id.as_str())
+            || summary
+                .pointer("/thread/status/type")
+                .and_then(serde_json::Value::as_str)
+                != Some("idle")
+        {
+            return Err(io::Error::other("fresh F pre-send thread is not idle"));
+        }
+        let anchor = native_rollout_anchor_after(
+            &self.native_home,
+            &selected.native_session_id,
+            &candidate.original_turn_id,
+        )?;
+        if anchor.path.is_none() || anchor.prefix_len == 0 {
+            return Err(io::Error::other("fresh F first-turn rollout anchor absent"));
+        }
+        let nonce = uuid::Uuid::new_v4().to_string();
+        let envelope = serde_json::json!({
+            "format": "age319-native-f-input/v1",
+            "instruction": format!("Read this fresh notification and respond with exactly AGE319_F_ACK {delivery_token}. Do not use tools or add any other text."),
+            "nonce": nonce,
+            "delivery_request_id": delivery_request,
+            "delivery_token": delivery_token,
+            "selected_k": selected,
+            "first_turn_id": candidate.original_turn_id,
+            "fresh": candidate.fresh,
+            "payload_base64": base64::engine::general_purpose::STANDARD.encode(&payload),
+        }).to_string();
+        let attempt = serde_json::json!({
+            "format": "age319-native-f-attempt/v1",
+            "binding": binding,
+            "selected_k": selected,
+            "first_turn_id": candidate.original_turn_id,
+            "first_turn_receipt_sha256": candidate.original_turn_receipt_sha256,
+            "fresh_grant_id": candidate.fresh.grant_id,
+            "delivery_request_id": delivery_request,
+            "delivery_token": delivery_token,
+            "source_id": candidate.fresh.source_id,
+            "attempt_id": candidate.fresh.attempt_id,
+            "session_id": candidate.fresh.session_id,
+            "row_seq": candidate.fresh.seq,
+            "payload_sha256": candidate.fresh.payload_sha256,
+            "payload_byte_len": candidate.fresh.payload_byte_len,
+            "payload_base64": base64::engine::general_purpose::STANDARD.encode(&payload),
+            "anchor": {"thread": summary["thread"], "rollout": anchor},
+            "nonce": nonce,
+            "envelope": envelope,
+            "envelope_sha256": format!("{:x}", Sha256::digest(envelope.as_bytes())),
+            "envelope_byte_len": envelope.len(),
+        });
+        let path = directory.join(format!(
+            "{}.native-f-attempt.json",
+            candidate.fresh.grant_id
+        ));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        serde_json::to_writer(&mut file, &attempt)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        File::open(directory)?.sync_all()?;
+        let receipt_path = directory.join(format!(
+            "{}.native-f-receipt.json",
+            candidate.fresh.grant_id
+        ));
+        let (sender, result) = std::sync::mpsc::channel();
+        let worker_binding = binding.clone();
+        let binding = binding.clone();
+        let directory = directory.to_path_buf();
+        let state_root = state_root.to_path_buf();
+        let bash_request = bash_request.to_owned();
+        let delivery_request = delivery_request.to_owned();
+        let delivery_token = delivery_token.to_owned();
+        let recipient = recipient.clone();
+        std::thread::Builder::new()
+            .name("selected-k-native-f-turn".into())
+            .spawn(move || {
+                let result = self
+                    .complete_f_turn(
+                        &directory,
+                        &state_root,
+                        &worker_binding,
+                        &selected,
+                        &anchor,
+                        &envelope,
+                        &nonce,
+                        &receipt_path,
+                        &bash_request,
+                        &delivery_request,
+                        &delivery_token,
+                        &recipient,
+                        &original_source,
+                    )
+                    .map_err(|error| error.to_string());
+                let _ = sender.send(result);
+            })?;
+        Ok(NativeFExec {
+            binding,
+            result,
+            settled: None,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn complete_f_turn(
+        &mut self,
+        directory: &Path,
+        state_root: &Path,
+        binding: &Binding,
+        selected: &NativeCodexReadback,
+        anchor: &NativeRolloutAnchor,
+        envelope: &str,
+        nonce: &str,
+        receipt_path: &Path,
+        bash_request: &str,
+        delivery_request: &str,
+        delivery_token: &str,
+        recipient: &oulipoly_state::mailbox::FreshRecipientIdentity,
+        original_source: &str,
+    ) -> io::Result<serde_json::Value> {
+        if self.readback(directory, binding)? != *selected {
+            return Err(io::Error::other("fresh F selected K changed before send"));
+        }
+        let lane =
+            oulipoly_state::mailbox::FreshV30Lane::open_at(state_root).map_err(io::Error::other)?;
+        let candidate = lane
+            .attest_native_k_f_candidate(
+                bash_request,
+                delivery_request,
+                delivery_token,
+                recipient,
+                original_source,
+                &serde_json::to_string(selected)?,
+            )
+            .map_err(io::Error::other)?;
+        let attempt: serde_json::Value = serde_json::from_slice(&fs::read(directory.join(
+            format!("{}.native-f-attempt.json", candidate.fresh.grant_id),
+        ))?)?;
+        if attempt["fresh_grant_id"] != candidate.fresh.grant_id
+            || attempt["delivery_token"] != delivery_token
+            || attempt["envelope"] != envelope
+            || attempt["envelope_sha256"] != format!("{:x}", Sha256::digest(envelope.as_bytes()))
+            || attempt["anchor"]["rollout"] != serde_json::to_value(anchor)?
+        {
+            return Err(io::Error::other("fresh F durable attempt changed"));
+        }
+        let submitted = native_codex_message(
+            &mut self.endpoint,
+            &self.provider,
+            12,
+            "turn/start",
+            serde_json::json!({
+                "threadId": selected.native_session_id,
+                "input": [{"type": "text", "text": envelope}],
+                "approvalPolicy": "never",
+                "sandboxPolicy": {"type": "readOnly"},
+            }),
+        )?;
+        let turn_id = submitted
+            .pointer("/turn/id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| io::Error::other("fresh F turn submission ID absent"))?;
+        if turn_id == candidate.original_turn_id {
+            return Err(io::Error::other("fresh F reused first native turn"));
+        }
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            self.provider.verify()?;
+            self.verify_native_home()?;
+            if let Some(user_item_id) = native_rollout_turn(
+                &self.native_home,
+                &selected.native_session_id,
+                anchor,
+                turn_id,
+                envelope,
+            )? {
+                let (_, response_sha256) = native_rollout_assistant_expected(
+                    &self.native_home,
+                    &selected.native_session_id,
+                    anchor,
+                    turn_id,
+                    envelope,
+                    &format!("AGE319_F_ACK {delivery_token}"),
+                )?
+                .ok_or_else(|| io::Error::other("fresh F assistant action absent"))?;
+                let page = native_codex_message(
+                    &mut self.endpoint,
+                    &self.provider,
+                    13,
+                    "thread/read",
+                    serde_json::json!({"threadId": selected.native_session_id}),
+                )?;
+                if page
+                    .pointer("/thread/id")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(selected.native_session_id.as_str())
+                    || page
+                        .pointer("/thread/status/type")
+                        .and_then(serde_json::Value::as_str)
+                        != Some("idle")
+                    || self.readback(directory, binding)? != *selected
+                {
+                    return Err(io::Error::other(
+                        "fresh F completed thread or selected K changed",
+                    ));
+                }
+                let exact = lane
+                    .attest_native_k_f_candidate(
+                        bash_request,
+                        delivery_request,
+                        delivery_token,
+                        recipient,
+                        original_source,
+                        &serde_json::to_string(selected)?,
+                    )
+                    .map_err(io::Error::other)?;
+                if exact != candidate {
+                    return Err(io::Error::other(
+                        "fresh F candidate changed after native turn",
+                    ));
+                }
+                let receipt = serde_json::json!({
+                    "format": "age319-native-f-turn-receipt/v1",
+                    "selected_k": selected,
+                    "fresh_grant_id": candidate.fresh.grant_id,
+                    "delivery_request_id": delivery_request,
+                    "session_id": candidate.fresh.session_id,
+                    "row_seq": candidate.fresh.seq,
+                    "source_id": candidate.fresh.source_id,
+                    "payload_sha256": candidate.fresh.payload_sha256,
+                    "turn_id": turn_id,
+                    "first_turn_id": candidate.original_turn_id,
+                    "nonce": nonce,
+                    "envelope_sha256": format!("{:x}", Sha256::digest(envelope.as_bytes())),
+                    "user_item_id": user_item_id,
+                    "assistant_response_sha256": response_sha256,
+                    "status": "completed",
+                    "fresh_row_acknowledged": false,
+                });
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(receipt_path)?;
+                serde_json::to_writer(&mut file, &receipt)?;
+                file.write_all(b"\n")?;
+                file.sync_all()?;
+                File::open(directory)?.sync_all()?;
+                return Ok(receipt);
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::other(
+                    "fresh F native turn incomplete; no replay",
+                ));
             }
             std::thread::sleep(Duration::from_millis(250));
         }
@@ -9835,6 +10306,96 @@ mod tests {
                 "turn-one",
                 &envelope,
                 &token
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn fresh_f_action_requires_new_anchor_second_turn_and_own_token() {
+        let temp = tempfile::tempdir().unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        let directory = temp.path().join("sessions/2026/09/27");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(format!("rollout-{session}.jsonl"));
+        let meta = serde_json::json!({"type":"session_meta","payload":{"id":session}});
+        let first_start = serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"first"}});
+        let first_user = serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","id":"first-user","content":[{"type":"input_text","text":"first input"}]}});
+        let first_done = serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"first"}});
+        let prefix = format!("{meta}\n{first_start}\n{first_user}\n{first_done}\n");
+        fs::write(&path, &prefix).unwrap();
+        assert!(native_rollout_anchor(temp.path(), &session).is_err());
+        let anchor = native_rollout_anchor_after(temp.path(), &session, "first").unwrap();
+        let token = uuid::Uuid::new_v4().to_string();
+        let envelope = format!("fresh F {token}");
+        let start = serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"second"}});
+        let user = serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","id":"fresh-user","content":[{"type":"input_text","text":envelope}]}});
+        let assistant = serde_json::json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":format!("AGE319_F_ACK {token}")}]}});
+        let done = serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"second"}});
+        let complete = format!("{prefix}{start}\n{user}\n{assistant}\n{done}\n");
+        fs::write(&path, &complete).unwrap();
+        assert!(
+            native_rollout_assistant_expected(
+                temp.path(),
+                &session,
+                &anchor,
+                "second",
+                &envelope,
+                &format!("AGE319_F_ACK {token}"),
+            )
+            .unwrap()
+            .is_some()
+        );
+        assert!(
+            native_rollout_assistant_expected(
+                temp.path(),
+                &session,
+                &anchor,
+                "second",
+                &envelope,
+                "AGE319_F_ACK wrong-token",
+            )
+            .is_err()
+        );
+        assert!(
+            native_rollout_assistant_expected(
+                temp.path(),
+                &session,
+                &anchor,
+                "first",
+                &envelope,
+                &format!("AGE319_F_ACK {token}"),
+            )
+            .is_err()
+        );
+        let stale = NativeRolloutAnchor {
+            prefix_len: format!("{meta}\n").len(),
+            ..anchor.clone()
+        };
+        assert!(
+            native_rollout_assistant_expected(
+                temp.path(),
+                &session,
+                &stale,
+                "second",
+                &envelope,
+                &format!("AGE319_F_ACK {token}"),
+            )
+            .is_err()
+        );
+        fs::write(
+            &path,
+            format!("{prefix}{start}\n{user}\n{assistant}\n{assistant}\n{done}\n"),
+        )
+        .unwrap();
+        assert!(
+            native_rollout_assistant_expected(
+                temp.path(),
+                &session,
+                &anchor,
+                "second",
+                &envelope,
+                &format!("AGE319_F_ACK {token}"),
             )
             .is_err()
         );
