@@ -5753,9 +5753,10 @@ fn serve() -> io::Result<()> {
                 let ledger = installed_launches
                     .as_ref()
                     .ok_or_else(|| io::Error::other("installed launch ledger absent"))?;
-                // This durable request is inert. Both a fresh submission and
-                // an exact duplicate remain pending until a separate
-                // Broker-owned root custody transition exists.
+                // A new request durably binds its future root ID here. It is
+                // still inert: no control process or root may be forked until
+                // Broker owns the connected host grant and exact E admission.
+                // A duplicate cannot take that future first-attempt path.
                 let _admission = ledger.reserve_request(&spec, &peer)?;
                 Ok(ledger.status(&spec.request_id, &spec.generation, &peer)?)
             } else if operation == b'l' || operation == b'M' {
