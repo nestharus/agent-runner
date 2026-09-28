@@ -4647,7 +4647,7 @@ fn private_publish_caller_result(
         socket,
         &FreshRecipientRequest::BeginRootCallerResult {
             d_key: d_key.to_owned(),
-            result: offered,
+            result: offered.clone(),
         },
     )
     .map_err(|e| format!("caller result publication reservation failed: {e}"))?;
@@ -4679,6 +4679,21 @@ fn private_publish_caller_result(
     }
     private_write_caller_bytes(&mut stdout, &mut stderr, &raw.stdout, &raw.stderr)
         .map_err(|e| format!("caller result write uncertain; publication remains unknown: {e}"))?;
+    let settled = protocol::fresh_root_terminal_request_at(
+        socket,
+        &FreshRecipientRequest::SettleRootCallerResult {
+            d_key: d_key.to_owned(),
+            result: offered,
+        },
+    )
+    .map_err(|e| format!("caller result written but settlement uncertain: {e}"))?;
+    if settled.publication_state != "settled"
+        || settled.publication_sha256 != reserved.publication_sha256
+        || settled.execution != reserved.execution
+        || settled.actor != reserved.actor
+    {
+        return Err("caller result settlement readback changed".into());
+    }
     Ok(ExitCode::from(code))
 }
 
