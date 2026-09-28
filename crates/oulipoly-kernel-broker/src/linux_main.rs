@@ -4098,54 +4098,130 @@ fn fence_root_from_terminal(
         .map_err(|_| io::Error::other("root drain fence response uncertain"))?
 }
 
-fn settle_entry_from_terminal(
-    bridge: &SyncSender<FreshTerminalBridgeRequest>,
+fn exact_entry_terminal_settlement(
     read: &FreshRootTerminalReadback,
-) -> io::Result<()> {
+) -> io::Result<EntryTerminalSettlement> {
     let execution = read
         .execution
         .as_ref()
         .ok_or_else(|| io::Error::other("root terminal execution absent"))?;
     if read.execution_state == "unknown"
         || !read.unresolved_child_request_ids.is_empty()
-        || read.publication_state != "unknown"
+        || read.publication_state != "settled"
         || read.publication_sha256.is_none()
         || execution.root_id != read.root_id
         || execution.handoff_id != read.handoff_id
         || execution.d_key != read.d_key
         || execution.invocation_uuid != read.invocation_uuid
         || execution.session_id != read.session_id
+        || execution.owner_generation != read.owner_generation
         || execution.actor != read.actor
     {
         return Err(io::Error::other(
             "root terminal or publication remains unresolved",
         ));
     }
+    Ok(EntryTerminalSettlement {
+        d_key: read.d_key.clone(),
+        handoff_id: read.handoff_id.clone(),
+        invocation_uuid: read.invocation_uuid.clone(),
+        session_id: read.session_id.clone(),
+        actor: ProcessStamp {
+            host_pid: read.actor.host_pid,
+            boot_id: read.actor.boot_id.clone(),
+            starttime_ticks: read.actor.starttime_ticks,
+            pidns_dev: read.actor.pidns_dev,
+            pidns_ino: read.actor.pidns_ino,
+        },
+        parent_grant_id: execution.parent.grant_id.clone(),
+        publication_sha256: read.publication_sha256.clone().unwrap(),
+    })
+}
+
+fn settle_entry_from_terminal(
+    bridge: &SyncSender<FreshTerminalBridgeRequest>,
+    read: &FreshRootTerminalReadback,
+) -> io::Result<()> {
+    let settlement = exact_entry_terminal_settlement(read)?;
     let (reply, answer) = mpsc::sync_channel(1);
     bridge
         .send(FreshTerminalBridgeRequest {
             root_id: read.root_id.clone(),
-            settlement: EntryTerminalSettlement {
-                d_key: read.d_key.clone(),
-                handoff_id: read.handoff_id.clone(),
-                invocation_uuid: read.invocation_uuid.clone(),
-                session_id: read.session_id.clone(),
-                actor: ProcessStamp {
-                    host_pid: read.actor.host_pid,
-                    boot_id: read.actor.boot_id.clone(),
-                    starttime_ticks: read.actor.starttime_ticks,
-                    pidns_dev: read.actor.pidns_dev,
-                    pidns_ino: read.actor.pidns_ino,
-                },
-                parent_grant_id: execution.parent.grant_id.clone(),
-                publication_sha256: read.publication_sha256.clone().unwrap(),
-            },
+            settlement,
             reply,
         })
         .map_err(|_| io::Error::other("terminal entry authority unavailable"))?;
     answer
         .recv_timeout(RELEASED_HANDOFF_REPLY_TIMEOUT)
         .map_err(|_| io::Error::other("terminal entry settlement response uncertain"))?
+}
+
+/// Every older entry must have both the original caller's immutable settled
+/// Q result and the broker's exact physical/State owner close certificate.
+/// This runs on the old writer loop under the shared fresh admission mutex.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "entry reuse joins all retained authorities"
+)]
+fn require_prior_entries_closed(
+    state_root: &Path,
+    roots: &RootRegistry,
+    entries: &EntryRegistry,
+    works: &WorkRegistry,
+    grants: &GrantRegistry,
+    sources: &SourcePhysicalRegistry,
+    sidecar: Option<&BrokerSidecar>,
+) -> io::Result<()> {
+    if entries.records().is_empty() {
+        return Ok(());
+    }
+    // A fresh lane call can itself wait on this old writer loop for terminal
+    // settlement. Refuse its known-absent prerequisite before opening State.
+    if entries
+        .records()
+        .iter()
+        .any(|entry| entry.terminal_settlement.is_none())
+    {
+        return Err(io::Error::other("prior entry caller result unsettled"));
+    }
+    let lane = FreshV30Lane::open_at(state_root).map_err(io::Error::other)?;
+    for entry in entries.records() {
+        let root = roots
+            .record(&entry.root_id)
+            .ok_or_else(|| io::Error::other("prior entry has no exact root"))?;
+        let stored = entry
+            .terminal_settlement
+            .as_ref()
+            .ok_or_else(|| io::Error::other("prior entry caller result unsettled"))?;
+        let (handoff, actor) = lane
+            .released_handoff_for_root(&entry.root_id)
+            .map_err(io::Error::other)?;
+        let session = lane
+            .read_session(&handoff.d_key)
+            .map_err(io::Error::other)?
+            .ok_or_else(|| io::Error::other("prior entry session absent"))?;
+        let terminal = lane
+            .read_private_root_terminal(&handoff, &actor, &session)
+            .map_err(io::Error::other)?;
+        if &exact_entry_terminal_settlement(&terminal)? != stored {
+            return Err(io::Error::other("prior entry publication identity changed"));
+        }
+        let inventory =
+            root_drain::readback(root, roots, entries, works, grants, sources, sidecar)?;
+        let proof = inventory
+            .owner_close_proof
+            .ok_or_else(|| io::Error::other("prior entry owner not exactly closed"))?;
+        if inventory.entry_unsettled
+            || inventory.state_sidecar_outstanding_unknown
+            || proof.root_id != entry.root_id
+            || proof.owner_generation != terminal.owner_generation
+        {
+            return Err(io::Error::other(
+                "prior entry close or caller result changed",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Revisit one retained original source per idle tick. Only the serving
@@ -5911,6 +5987,27 @@ fn serve() -> io::Result<()> {
                     None => "state-route legacy\n".into(),
                 })
             } else {
+                // E and exact owner close share this fence. A previous
+                // unknown caller write, live root, pending debt or changed
+                // continuity cursor must refuse before a second reservation.
+                let _entry_guard = if matches!(operation, b'E' | b'e') {
+                    Some(admission_fences.lock().map_err(|_| {
+                        io::Error::other("root admission fence poisoned")
+                    })?)
+                } else {
+                    None
+                };
+                if _entry_guard.is_some() {
+                    require_prior_entries_closed(
+                        Path::new(&state),
+                        &registry,
+                        &entries,
+                        &works,
+                        &grants,
+                        &source_physical,
+                        broker_sidecar.as_ref(),
+                    )?;
+                }
                 dispatch_authenticated(
                     match operation {
                         b'e' => b'E',
@@ -8291,7 +8388,8 @@ fn serve_fresh_v30_at(
                         | FreshRecipientRequest::SettleRootTerminal { ref d_key }
                         | FreshRecipientRequest::RepairRootTerminal { ref d_key }
                         | FreshRecipientRequest::BeginRootPublication { ref d_key, .. }
-                        | FreshRecipientRequest::BeginRootCallerResult { ref d_key, .. } => {
+                        | FreshRecipientRequest::BeginRootCallerResult { ref d_key, .. }
+                        | FreshRecipientRequest::SettleRootCallerResult { ref d_key, .. } => {
                             let root = lane
                                 .released_handoff_for_child(&d_key, &recipient)
                                 .map_err(io::Error::other)?;
@@ -8326,12 +8424,17 @@ fn serve_fresh_v30_at(
                                     .begin_private_root_caller_result(
                                         &root, &recipient, &session, result,
                                     ),
+                                FreshRecipientRequest::SettleRootCallerResult {
+                                    result, ..
+                                } => lane.settle_private_root_caller_result(
+                                    &root, &recipient, &session, result,
+                                ),
                                 _ => unreachable!(),
                             }
                             .map_err(io::Error::other)?;
                             if matches!(
                                 &request,
-                                FreshRecipientRequest::BeginRootCallerResult { .. }
+                                FreshRecipientRequest::SettleRootCallerResult { .. }
                             ) {
                                 #[cfg(feature = "age319-private-broker-fixture")]
                                 if provider_writer_v3 {

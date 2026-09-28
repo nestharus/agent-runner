@@ -1507,6 +1507,12 @@ pub enum FreshRecipientRequest {
         d_key: String,
         result: oulipoly_state::mailbox::FreshRootCallerResult,
     },
+    /// The same pinned original actor reports that both Q-bound caller
+    /// streams were written and flushed. This is not a recipient read ACK.
+    SettleRootCallerResult {
+        d_key: String,
+        result: oulipoly_state::mailbox::FreshRootCallerResult,
+    },
     /// Explicit request by the original pinned root listener for a source
     /// registered response-only. An original async C can select notify itself.
     ActivateBashSource {
@@ -1623,6 +1629,7 @@ pub fn fresh_root_terminal_request_at(
             | FreshRecipientRequest::RepairRootTerminal { .. }
             | FreshRecipientRequest::BeginRootPublication { .. }
             | FreshRecipientRequest::BeginRootCallerResult { .. }
+            | FreshRecipientRequest::SettleRootCallerResult { .. }
     ) {
         return Err(io::Error::other("not a fresh root terminal request"));
     }

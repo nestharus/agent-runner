@@ -1,6 +1,6 @@
 // Private v30 terminal readback. Execution, recipient notification and caller
 // presentation have distinct authorities; this module never launches work,
-// transmits F to a recipient, or publishes output to a caller.
+// transmits F to a recipient, or writes output to a caller.
 use serde::{Deserialize, Serialize};
 
 const FRESH_ROOT_TERMINAL_VERIFY_BUFFER_BYTES: usize = 64 * 1024;
@@ -150,6 +150,33 @@ fn verify_fresh_root_terminal_schema(state: &Connection) -> Result<(), String> {
             "fresh_root_terminal_no_delete",
             "fresh_root_publication_no_update",
             "fresh_root_publication_no_delete",
+        ],
+    )
+}
+
+fn fresh_root_caller_settlement_schema_count(state: &Connection) -> Result<i64, String> {
+    state
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE (type='table' AND name='fresh_root_caller_settlement')
+             OR (type='trigger' AND name IN ('fresh_root_caller_settlement_no_update',
+             'fresh_root_caller_settlement_no_delete'))",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())
+}
+
+fn verify_fresh_root_caller_settlement_schema(state: &Connection) -> Result<(), String> {
+    if fresh_root_caller_settlement_schema_count(state)? != 3 {
+        return Err("fresh root caller settlement schema incomplete".into());
+    }
+    verify_fresh_sql_objects(
+        state,
+        FRESH_ROOT_CALLER_SETTLEMENT_SCHEMA,
+        "fresh_root_caller_settlement",
+        &[
+            "fresh_root_caller_settlement_no_update",
+            "fresh_root_caller_settlement_no_delete",
         ],
     )
 }
@@ -584,6 +611,18 @@ impl FreshV30Lane {
             "SELECT artifact_sha256,artifact_byte_len,phase FROM fresh_root_publication WHERE handoff_id=?1",
             [&root.handoff_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
         ).optional().map_err(|e| e.to_string())?;
+        let settlement: Option<(String, i64)> = state
+            .query_row(
+                "SELECT artifact_sha256,artifact_byte_len FROM fresh_root_caller_settlement
+                 WHERE handoff_id=?1",
+                [&root.handoff_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if publication.is_none() && settlement.is_some() {
+            return Err("root caller settlement without publication".into());
+        }
         if let Some((sha, len, phase)) = publication {
             if phase != "unknown" || len < 0 || result.execution.is_none() {
                 return Err("root caller publication conflict".into());
@@ -593,6 +632,21 @@ impl FreshV30Lane {
             result
                 .artifacts
                 .push(format!("caller-artifact:{sha}:{len}"));
+            if let Some((settled_sha, settled_len)) = settlement {
+                let execution = serde_json::to_vec(
+                    result.execution.as_ref().ok_or("root execution absent")?,
+                )
+                .map_err(|error| error.to_string())?;
+                if settled_sha != sha
+                    || settled_len != len
+                    || sha != format!("{:x}", Sha256::digest(&execution))
+                    || len != i64::try_from(execution.len()).map_err(|_| "caller artifact too large")?
+                {
+                    return Err("root caller settlement identity conflict".into());
+                }
+                result.publication_state = "settled".into();
+                result.artifacts.push(format!("caller-settled:{sha}:{len}"));
+            }
         }
         result.terminal_state = if result.execution_state == "unknown" {
             result.refusal = Some("execution_evidence_incomplete".into());
@@ -935,5 +989,46 @@ impl FreshV30Lane {
             return Err("caller publication artifact replay conflict".into());
         }
         Ok(read)
+    }
+
+    /// Only the original pinned caller can request this after its two
+    /// Q-verified stream writes and flushes returned success. A lost reply
+    /// reopens the same immutable record; an interrupted write leaves unknown.
+    pub fn settle_private_root_caller_result(
+        &self,
+        root: &FreshReleasedHandoff,
+        actor: &FreshRecipientIdentity,
+        session: &FreshV30Session,
+        offered: &FreshRootCallerResult,
+    ) -> Result<FreshRootTerminalReadback, String> {
+        let read = self.begin_private_root_caller_result(root, actor, session, offered)?;
+        if read.execution_state == "unknown" || !read.unresolved_child_request_ids.is_empty() {
+            return Err("root caller settlement terminal unresolved".into());
+        }
+        let sha = read
+            .publication_sha256
+            .as_ref()
+            .ok_or("root caller publication absent")?;
+        let artifact = serde_json::to_vec(read.execution.as_ref().ok_or("root execution absent")?)
+            .map_err(|error| error.to_string())?;
+        let len = i64::try_from(artifact.len()).map_err(|_| "caller artifact too large")?;
+        let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        state
+            .execute_batch("PRAGMA synchronous=FULL")
+            .map_err(|error| error.to_string())?;
+        state
+            .execute(
+                "INSERT OR IGNORE INTO fresh_root_caller_settlement VALUES(?1,?2,?3,?4)",
+                params![root.handoff_id, sha, len, Utc::now().to_rfc3339()],
+            )
+            .map_err(|error| error.to_string())?;
+        let settled = self.read_private_root_terminal(root, actor, session)?;
+        if settled.publication_state != "settled"
+            || settled.publication_sha256.as_ref() != Some(sha)
+            || settled.execution != read.execution
+        {
+            return Err("root caller settlement readback changed".into());
+        }
+        Ok(settled)
     }
 }

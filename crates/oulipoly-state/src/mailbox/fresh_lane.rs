@@ -33,6 +33,8 @@ const FRESH_BASH_SOURCE_SCHEMA: &str = include_str!("migrations/0035_fresh_bash_
 const FRESH_BASH_NOTIFY_SCHEMA: &str = include_str!("migrations/0036_fresh_bash_notify.sql");
 const FRESH_BASH_LISTENER_SCHEMA: &str = include_str!("migrations/0037_fresh_bash_listener.sql");
 const FRESH_ROOT_TERMINAL_SCHEMA: &str = include_str!("migrations/0038_fresh_root_terminal.sql");
+const FRESH_ROOT_CALLER_SETTLEMENT_SCHEMA: &str =
+    include_str!("migrations/0046_fresh_root_caller_settlement.sql");
 const FRESH_ROOT_H_DELEGATION_SCHEMA: &str =
     include_str!("migrations/0044_fresh_root_h_delegation.sql");
 const FRESH_BASH_SYNC_PUBLICATION_SCHEMA: &str =
@@ -467,7 +469,7 @@ impl FreshV30Lane {
         let state_conn = Connection::open(&state_path).map_err(|e| e.to_string())?;
         state_conn
             .execute_batch(&format!(
-                "{FRESH_STATE_SCHEMA}\n{FRESH_RECIPIENT_STATE_SCHEMA}\n{FRESH_CHILD_REQUEST_SCHEMA}\n{FRESH_HANDOFF_SCHEMA}\n{FRESH_ROOT_EFFECT_SCHEMA}\n{FRESH_BASH_CHILD_SCHEMA}\n{FRESH_ROOT_H_DELEGATION_SCHEMA}\n{FRESH_BASH_SOURCE_SCHEMA}\n{FRESH_BASH_NOTIFY_SCHEMA}\n{FRESH_ROOT_TERMINAL_SCHEMA}\n{FRESH_BASH_SYNC_PUBLICATION_SCHEMA}"
+                "{FRESH_STATE_SCHEMA}\n{FRESH_RECIPIENT_STATE_SCHEMA}\n{FRESH_CHILD_REQUEST_SCHEMA}\n{FRESH_HANDOFF_SCHEMA}\n{FRESH_ROOT_EFFECT_SCHEMA}\n{FRESH_BASH_CHILD_SCHEMA}\n{FRESH_BASH_SOURCE_SCHEMA}\n{FRESH_BASH_NOTIFY_SCHEMA}\n{FRESH_ROOT_TERMINAL_SCHEMA}\n{FRESH_ROOT_CALLER_SETTLEMENT_SCHEMA}\n{FRESH_ROOT_H_DELEGATION_SCHEMA}\n{FRESH_BASH_SYNC_PUBLICATION_SCHEMA}"
             ))
             .map_err(|e| e.to_string())?;
         state_conn
@@ -1017,6 +1019,14 @@ impl FreshV30Lane {
             _ => return Err("fresh root terminal schema incomplete".into()),
         }
         verify_fresh_root_terminal_schema(&state_conn)?;
+        match fresh_root_caller_settlement_schema_count(&state_conn)? {
+            0 => state_conn
+                .execute_batch(FRESH_ROOT_CALLER_SETTLEMENT_SCHEMA)
+                .map_err(|e| e.to_string())?,
+            3 => {}
+            _ => return Err("fresh root caller settlement schema incomplete".into()),
+        }
+        verify_fresh_root_caller_settlement_schema(&state_conn)?;
         match fresh_bash_sync_publication_schema_count(&state_conn)? {
             0 => state_conn
                 .execute_batch(FRESH_BASH_SYNC_PUBLICATION_SCHEMA)

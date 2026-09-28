@@ -1662,6 +1662,8 @@ fn inner() {
     let mode = std::env::var("AGE319_PRIVATE_JOIN_MODE").unwrap_or_else(|_| "help".into());
     let old_pending_debt = mode == "normal_model_provider_native_codex_f_turn_old_pending_debt";
     let native_f_turn = mode == "normal_model_provider_native_codex_f_turn" || old_pending_debt;
+    let closed_refusal_probe =
+        native_f_turn && std::env::var_os("AGE319_PRIVATE_SECOND_ENTRY_REFUSAL_V1").is_some();
     let native_f_candidate =
         mode == "normal_model_provider_native_codex_f_candidate" || native_f_turn;
     let native_ack_mode =
@@ -5184,7 +5186,7 @@ fn inner() {
                     assert_eq!(
                         terminal.publication_state,
                         if caller_mode {
-                            "unknown"
+                            "settled"
                         } else {
                             "not_started"
                         },
@@ -5230,7 +5232,7 @@ fn inner() {
                     let parent_publication = lane
                         .begin_private_root_caller_result(&root, &actor, &session, &offered)
                         .unwrap();
-                    assert_eq!(parent_publication.publication_state, "unknown");
+                    assert_eq!(parent_publication.publication_state, "settled");
                     assert_eq!(
                         parent_publication.execution.as_ref().unwrap().child_event,
                         Some(event.clone())
@@ -5271,7 +5273,7 @@ fn inner() {
                         lane.read_private_root_terminal(&root, &actor, &session)
                             .unwrap()
                             .publication_state,
-                        "unknown"
+                        "settled"
                     );
                 }
                 stop(&mut broker);
@@ -6621,7 +6623,7 @@ fn inner() {
                         .unwrap();
                     assert_eq!(terminal.execution, original.execution);
                     assert_eq!(terminal.execution_state, "success");
-                    assert_eq!(terminal.publication_state, "unknown");
+                    assert_eq!(terminal.publication_state, "settled");
                     let entry_record: serde_json::Value = serde_json::from_slice(
                         &fs::read(
                             broker_state
@@ -7630,6 +7632,36 @@ fn inner() {
                 let v29_wal = historical_data.join("pid-identity.db-wal");
                 let v29_wal_before = fs::read(&v29_wal).ok();
                 fs::write(gate.join("child-effect"), b"yes").unwrap();
+                if closed_refusal_probe && !old_pending_debt {
+                    let concurrent = Command::new(&runner)
+                        .arg("--help")
+                        .env("OULIPOLY_DATA_DIR", &data)
+                        .env("OULIPOLY_CONFIG_HOME", &config_home)
+                        .env("OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1", "1")
+                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+                        .env("AGE319_PRIVATE_OFFLINE_ROOT_V1", "1")
+                        .env_remove("LD_LIBRARY_PATH")
+                        .output()
+                        .unwrap();
+                    assert!(
+                        !concurrent.status.success(),
+                        "concurrent second E succeeded"
+                    );
+                    assert_eq!(
+                        fs::read_dir(broker_state.join("entries"))
+                            .unwrap()
+                            .filter_map(Result::ok)
+                            .filter(|entry| entry
+                                .path()
+                                .extension()
+                                .is_some_and(|ext| ext == "json"))
+                            .count(),
+                        1,
+                        "concurrent second E reserved an entry: {}",
+                        String::from_utf8_lossy(&concurrent.stderr)
+                    );
+                }
                 if mode.ends_with("shared_pending") {
                     let provider_dir = broker_state.join("v30/fresh-provider");
                     eventually(|| {
@@ -9797,6 +9829,26 @@ fn inner() {
                                             settled_entry["entry_original_exited"], true,
                                             "{settled_entry}"
                                         );
+                                        if closed_refusal_probe {
+                                            let published = lane
+                                                .read_private_root_terminal(
+                                                    &root,
+                                                    &recipient,
+                                                    &original_session,
+                                                )
+                                                .unwrap();
+                                            assert_eq!(published.publication_state, "not_started");
+                                            let entry_record: serde_json::Value =
+                                                serde_json::from_slice(
+                                                    &fs::read(broker_state.join("entries").join(
+                                                        format!("{}.json", prepared.root_id),
+                                                    ))
+                                                    .unwrap(),
+                                                )
+                                                .unwrap();
+                                            assert!(entry_record["terminal_settlement"].is_null());
+                                            assert_eq!(settled_entry["entry_unsettled"], true);
+                                        }
                                         // A new serving incarnation must read the retained
                                         // evidence again, including a changed child Q.
                                         let work_receipt = fs::read(&work_receipt_path).unwrap();
@@ -10466,6 +10518,46 @@ fn inner() {
                                                 ),
                                                 mailbox_diagnostic,
                                                 "Broker restart changed exact pending row"
+                                            );
+                                        }
+                                        if closed_refusal_probe {
+                                            let second_err =
+                                                gate.join("second-sequential-entry.err");
+                                            let mut second = Command::new(&runner)
+                                                .arg("--help")
+                                                .env("OULIPOLY_DATA_DIR", &data)
+                                                .env("OULIPOLY_CONFIG_HOME", &config_home)
+                                                .env("OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1", "1")
+                                                .env(
+                                                    "OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1",
+                                                    &socket,
+                                                )
+                                                .env(
+                                                    "OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1",
+                                                    &gate,
+                                                )
+                                                .env("AGE319_PRIVATE_OFFLINE_ROOT_V1", "1")
+                                                .env_remove("LD_LIBRARY_PATH")
+                                                .stdout(Stdio::null())
+                                                .stderr(Stdio::from(
+                                                    File::create(&second_err).unwrap(),
+                                                ))
+                                                .spawn()
+                                                .unwrap();
+                                            eventually(|| second.try_wait().unwrap().is_some());
+                                            assert!(!second.wait().unwrap().success());
+                                            assert_eq!(
+                                                fs::read_dir(broker_state.join("entries"))
+                                                    .unwrap()
+                                                    .filter_map(Result::ok)
+                                                    .filter(|entry| entry
+                                                        .path()
+                                                        .extension()
+                                                        .is_some_and(|ext| ext == "json"))
+                                                    .count(),
+                                                1,
+                                                "unsettled caller result or old debt allowed second E: {}",
+                                                fs::read_to_string(&second_err).unwrap()
                                             );
                                         }
                                         eprintln!("root PID1 drain restart readback: {}", restored);
@@ -12772,7 +12864,7 @@ fn inner() {
                             .unwrap()
                             .read_private_root_terminal(&receipt, &actor, &session)
                             .unwrap();
-                        assert_eq!(settled.publication_state, "unknown");
+                        assert_eq!(settled.publication_state, "settled");
                         assert!(settled.publication_sha256.is_some());
                         let record: serde_json::Value = serde_json::from_slice(
                             &fs::read(
@@ -12847,17 +12939,7 @@ fn inner() {
                             ))
                             .spawn()
                             .unwrap();
-                        eventually(|| {
-                            fs::read_dir(broker_state.join("entries"))
-                                .unwrap()
-                                .filter_map(Result::ok)
-                                .filter(|entry| {
-                                    entry.path().extension().is_some_and(|ext| ext == "json")
-                                })
-                                .count()
-                                >= 2
-                                || second.try_wait().unwrap().is_some()
-                        });
+                        eventually(|| second.try_wait().unwrap().is_some());
                         let entry_count = fs::read_dir(broker_state.join("entries"))
                             .unwrap()
                             .filter_map(Result::ok)
@@ -12867,16 +12949,12 @@ fn inner() {
                             .count();
                         assert_eq!(
                             entry_count,
-                            2,
-                            "second Runner E refused: {}",
+                            1,
+                            "second Runner E reserved before exact owner close: {}",
                             fs::read_to_string(gate.join("second-entry.err")).unwrap()
                         );
+                        assert!(!second.wait().unwrap().success());
                         if typed_terminal_v3 {
-                            eventually(|| second.try_wait().unwrap().is_some());
-                            let second_status = second.wait().unwrap();
-                            assert!(!second_status.success());
-                            let second_err =
-                                fs::read_to_string(gate.join("second-entry.err")).unwrap();
                             for channel in ["stdout", "stderr"] {
                                 let _ =
                                     fs::remove_file(gate.join(format!("caller-control-{channel}")));
@@ -12886,31 +12964,8 @@ fn inner() {
                                 )
                                 .unwrap();
                             }
-                            if mode.ends_with("physical_capacity_terminal") {
-                                assert!(
-                                    gate.join("v3-second-route-selection.json").exists(),
-                                    "capacity marker did not allow alias route: {second_err}"
-                                );
-                                let selected: serde_json::Value = serde_json::from_slice(
-                                    &fs::read(gate.join("v3-second-route-selection.json")).unwrap(),
-                                )
-                                .unwrap();
-                                assert_eq!(selected["model"], "alias");
-                                assert_eq!(selected["account_identity"], "physical-local");
-                                assert!(
-                                    second_err.contains("stopped after route before provider K"),
-                                    "{second_err}"
-                                );
-                            } else {
-                                assert!(!gate.join("v3-second-route-selection.json").exists());
-                                assert!(
-                                    second_err.contains("fresh route selection refused before K"),
-                                    "{second_err}"
-                                );
-                            }
-                        } else {
-                            stop(&mut second);
                         }
+                        assert!(!gate.join("v3-second-route-selection.json").exists());
                         assert_eq!(
                             fs::read_dir(&provider_dir)
                                 .unwrap()
@@ -13156,8 +13211,10 @@ fn inner() {
                     assert!(terminal.delivery_grant_id.is_none());
                     assert_eq!(
                         terminal.publication_state,
-                        if caller_mode || terminal_v3 || shared_mode {
+                        if caller_mode && (mode.ends_with("lost") || mode.ends_with("partial")) {
                             "unknown"
+                        } else if caller_mode || terminal_v3 || shared_mode {
+                            "settled"
                         } else {
                             "not_started"
                         }
@@ -13353,7 +13410,7 @@ fn inner() {
                             .read_private_root_terminal(&receipt, &actor, &session)
                             .unwrap();
                         assert_eq!(replay.execution, terminal.execution);
-                        assert_eq!(replay.publication_state, "unknown");
+                        assert_eq!(replay.publication_state, terminal.publication_state);
                         assert_eq!(
                             reopened
                                 .settle_private_root_terminal(&receipt, &actor, &session)

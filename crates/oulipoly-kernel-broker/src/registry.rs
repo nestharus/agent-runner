@@ -378,6 +378,14 @@ impl RootRegistry {
         self.live.iter()
     }
 
+    pub fn record(&self, root_id: &str) -> Option<&RootRecord> {
+        self.live
+            .iter()
+            .map(|root| &root.record)
+            .chain(self.debt.iter())
+            .find(|record| record.root_id == root_id)
+    }
+
     /// Durable exact-incarnation admission stop. A consumed grant can still
     /// finish its one-use launch; this fence never settles physical or State
     /// obligations. The serving broker serializes this write with the guarded
