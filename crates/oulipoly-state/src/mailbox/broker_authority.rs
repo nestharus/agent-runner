@@ -357,7 +357,7 @@ fn verify_acceptance_manifest_material(
 /// Zero rows do not certify that State, the fresh lane, or copied v29 WAL has
 /// no obligations. In particular, `consumed_without_evidence` preserves the
 /// gap between spending W and recording its physical result.
-#[derive(Debug, Clone, Default, serde::Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct BrokerSourceEffectObligations {
     pub reserved: usize,
     pub consumed_without_evidence: usize,
@@ -401,6 +401,100 @@ pub struct BrokerStateCloseCursor {
     pub admission_id: String,
     pub sidecar_generation: String,
     pub continuity_digest: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BrokerClosedOwner {
+    pub source_generation: String,
+    pub root_id: String,
+    pub owner_generation: String,
+    pub state_cursor: BrokerStateCloseCursor,
+    /// Serialized exact RootRecord and physical/ACK seal from the serving
+    /// Broker. The Broker checks these again on closed-phase readback.
+    pub root_record_json: String,
+    pub physical_proof_json: String,
+}
+
+struct OwnerCloseDuties {
+    registered_sources: usize,
+    retiring_listeners: usize,
+    deliverable_mailbox_rows: usize,
+    unresolved_attempts: usize,
+    native_grants_without_q: usize,
+    source_effect: BrokerSourceEffectObligations,
+}
+
+impl OwnerCloseDuties {
+    fn settled(&self) -> bool {
+        self.registered_sources == 0
+            && self.retiring_listeners == 0
+            && self.deliverable_mailbox_rows == 0
+            && self.unresolved_attempts == 0
+            && self.native_grants_without_q == 0
+            && self.source_effect.unsettled() == 0
+            && self.source_effect.accepted == 1
+    }
+}
+
+fn owner_close_duties_on(
+    conn: &Connection,
+    supervisor: &str,
+    source_generation: &str,
+    root_id: &str,
+    owner_generation: &str,
+) -> Result<OwnerCloseDuties, String> {
+    let scope = "WITH RECURSIVE supervisor_scope(authority_id) AS (
+        SELECT ?1 UNION SELECT predecessor_authority_id
+        FROM completion_supervisor_inheritance i JOIN supervisor_scope s
+        ON i.authority_id=s.authority_id)";
+    let count = |sql: &str, parameter: &str| -> Result<usize, String> {
+        let value: i64 = conn
+            .query_row(sql, [parameter], |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        usize::try_from(value).map_err(|_| "broker owner close count overflow".into())
+    };
+    Ok(OwnerCloseDuties {
+        registered_sources: count(
+            &format!(
+                "{scope} SELECT COUNT(*) FROM completion_continuation_source
+             WHERE supervisor_authority_id IN (SELECT authority_id FROM supervisor_scope)
+             AND phase='registered'"
+            ),
+            supervisor,
+        )?,
+        unresolved_attempts: count(
+            &format!(
+                "{scope} SELECT COUNT(*) FROM completion_continuation_attempt
+             WHERE supervisor_authority_id IN (SELECT authority_id FROM supervisor_scope)
+             AND phase NOT IN ('drained','never_started')"
+            ),
+            supervisor,
+        )?,
+        retiring_listeners: count(
+            "SELECT COUNT(*) FROM completion_event_listener WHERE retirement_pending=1 AND ?1!=''",
+            supervisor,
+        )?,
+        deliverable_mailbox_rows: count(
+            &format!(
+                "SELECT COUNT(*) FROM mailbox WHERE delivered_at IS NULL AND {} AND ?1!=''",
+                super::DELIVERABLE_MAILBOX_ERROR_PREDICATE
+            ),
+            supervisor,
+        )?,
+        native_grants_without_q: count(
+            "SELECT COUNT(*) FROM completion_native_grant_binding g
+             LEFT JOIN completion_native_kernel_q q ON q.attempt_id=g.attempt_id
+             WHERE g.owner_generation=?1 AND q.attempt_id IS NULL",
+            owner_generation,
+        )?,
+        source_effect: source_effect_obligations_on(
+            conn,
+            source_generation,
+            root_id,
+            owner_generation,
+        )?,
+    })
 }
 
 fn state_close_cursor(
@@ -1119,43 +1213,9 @@ impl BrokerSidecar {
         {
             return Err("broker owner close State/sidecar cursor absent or changed".into());
         }
-        let supervisor = &owner.supervisor_authority_id;
-        let scope = "WITH RECURSIVE supervisor_scope(authority_id) AS (
-            SELECT ?1 UNION SELECT predecessor_authority_id
-            FROM completion_supervisor_inheritance i JOIN supervisor_scope s
-            ON i.authority_id=s.authority_id)";
-        let count = |sql: &str| -> Result<usize, String> {
-            let value: i64 = tx
-                .query_row(sql, [supervisor], |row| row.get(0))
-                .map_err(|error| error.to_string())?;
-            usize::try_from(value).map_err(|_| "broker owner close count overflow".into())
-        };
-        let registered_sources = count(&format!(
-            "{scope} SELECT COUNT(*) FROM completion_continuation_source
-             WHERE supervisor_authority_id IN (SELECT authority_id FROM supervisor_scope)
-             AND phase='registered'"
-        ))?;
-        let unresolved_attempts = count(&format!(
-            "{scope} SELECT COUNT(*) FROM completion_continuation_attempt
-             WHERE supervisor_authority_id IN (SELECT authority_id FROM supervisor_scope)
-             AND phase NOT IN ('drained','never_started')"
-        ))?;
-        let retiring_listeners = count(
-            "SELECT COUNT(*) FROM completion_event_listener
-             WHERE retirement_pending=1 AND ?1!=''",
-        )?;
-        let deliverable_mailbox_rows = count(&format!(
-            "SELECT COUNT(*) FROM mailbox WHERE delivered_at IS NULL
-             AND {} AND ?1!=''",
-            super::DELIVERABLE_MAILBOX_ERROR_PREDICATE
-        ))?;
-        let native_grants_without_q = count(
-            "SELECT COUNT(*) FROM completion_native_grant_binding g
-             LEFT JOIN completion_native_kernel_q q ON q.attempt_id=g.attempt_id
-             WHERE g.owner_generation=?1 AND q.attempt_id IS NULL",
-        )?;
-        let source_effect = source_effect_obligations_on(
+        let duties = owner_close_duties_on(
             &tx,
+            &owner.supervisor_authority_id,
             &self.source_generation,
             root_id,
             &owner.owner_generation,
@@ -1178,13 +1238,227 @@ impl BrokerSidecar {
             state_projection_pending,
             state_native_channel_pending,
             state_cancelling_native_attempts,
-            registered_sources,
-            retiring_listeners,
-            deliverable_mailbox_rows,
-            unresolved_attempts,
-            native_grants_without_q,
-            source_effect,
+            registered_sources: duties.registered_sources,
+            retiring_listeners: duties.retiring_listeners,
+            deliverable_mailbox_rows: duties.deliverable_mailbox_rows,
+            unresolved_attempts: duties.unresolved_attempts,
+            native_grants_without_q: duties.native_grants_without_q,
+            source_effect: duties.source_effect,
         })
+    }
+
+    /// The only durable close point is the retained sidecar transaction:
+    /// it records the exact proof and stops the running owner together. State
+    /// is reserved first and remains reserved through that commit. A refusal
+    /// rolls both reservations back, leaving no partial closed phase.
+    pub fn close_exact_root_owner(
+        &mut self,
+        proof: &BrokerClosedOwner,
+        revalidate_physical: impl FnOnce() -> Result<(), String>,
+    ) -> Result<BrokerClosedOwner, String> {
+        self.check_mailbox_read(&proof.source_generation)?;
+        if proof.root_id.is_empty()
+            || proof.owner_generation.is_empty()
+            || proof.root_record_json.is_empty()
+            || proof.physical_proof_json.is_empty()
+            || proof.source_generation != self.source_generation
+            || self.bound_state_file_identity()? != proof.state_cursor.file
+        {
+            return Err("broker owner close proof identity changed".into());
+        }
+        let source = self
+            .state_source
+            .as_ref()
+            .ok_or("broker StateDb source binding absent")?;
+        verify_bound_state_source(source)?;
+        let state = StateDb::open(&source.path)?;
+        verify_bound_state_source(source)?;
+        state
+            .raw_connection()
+            .busy_timeout(std::time::Duration::ZERO)
+            .map_err(|error| error.to_string())?;
+        let state_tx =
+            Transaction::new_unchecked(state.raw_connection(), TransactionBehavior::Immediate)
+                .map_err(|error| format!("broker owner close State writer reservation: {error}"))?;
+        if state_close_cursor(&state, self.bound_state_file_identity()?)?.as_ref()
+            != Some(&proof.state_cursor)
+        {
+            return Err("broker owner close State cursor changed".into());
+        }
+        // The State reservation prevents any new admission until after the
+        // sidecar phase is committed. Recheck native duties under that lock.
+        let release = self.read_released_owner_for_root(&proof.root_id)?;
+        if release.owner.owner_generation != proof.owner_generation
+            || release.prepared.source_generation != proof.source_generation
+            || state.has_pending_native_channel_duty_for_domain(&release.owner.domain_id)?
+            || !state.cancelling_native_attempts()?.is_empty()
+        {
+            return Err("broker owner close State/owner duty changed".into());
+        }
+        self.mailbox
+            .conn
+            .busy_timeout(std::time::Duration::ZERO)
+            .map_err(|error| error.to_string())?;
+        let state_file = proof.state_cursor.file;
+        let sidecar_tx = self
+            .mailbox
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("broker owner close sidecar writer reservation: {error}"))?;
+        let head = completion_continuity_head_on(&sidecar_tx)?
+            .ok_or("broker owner close sidecar continuity head absent")?;
+        if sidecar_generation_on(&sidecar_tx)? != proof.state_cursor.sidecar_generation
+            || head.authority_ordinal != proof.state_cursor.authority_ordinal
+            || head.admission_id != proof.state_cursor.admission_id
+            || head.sidecar_generation != proof.state_cursor.sidecar_generation
+            || head.continuity_digest != proof.state_cursor.continuity_digest
+            || state.completion_repair_has_suffix(Some(&head))?
+            || state_close_cursor(&state, state_file)?.as_ref() != Some(&proof.state_cursor)
+        {
+            return Err("broker owner close State/sidecar continuity changed".into());
+        }
+        let duties = owner_close_duties_on(
+            &sidecar_tx,
+            &release.owner.supervisor_authority_id,
+            &proof.source_generation,
+            &proof.root_id,
+            &proof.owner_generation,
+        )?;
+        if !duties.settled()
+            || state.has_pending_native_channel_duty_for_domain(&release.owner.domain_id)?
+            || !state.cancelling_native_attempts()?.is_empty()
+        {
+            return Err("broker owner close retained duty changed".into());
+        }
+        // Broker rereads the exact root Q and both native ACK retirement
+        // seals here, while neither State nor sidecar can admit another write.
+        revalidate_physical()?;
+        let changed = sidecar_tx
+            .execute(
+                "UPDATE completion_continuation_owner SET phase='closing'
+             WHERE generation=?1 AND domain_id=?2 AND kernel_root_id=?3
+             AND supervisor_authority_id=?4 AND phase='running'",
+                params![
+                    proof.owner_generation,
+                    release.owner.domain_id,
+                    proof.root_id,
+                    release.owner.supervisor_authority_id
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err("broker owner close running generation changed".into());
+        }
+        sidecar_tx
+            .execute(
+                "UPDATE completion_supervisor_authority SET phase='retired'
+             WHERE authority_id=?1 AND domain_id=?2 AND phase='active'",
+                params![
+                    release.owner.supervisor_authority_id,
+                    release.owner.domain_id
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        sidecar_tx
+            .execute(
+                "INSERT INTO broker_owner_close(owner_generation,source_generation,root_id,
+             state_cursor_json,root_record_json,physical_proof_json,closed_at,phase)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,'closed')",
+                params![
+                    proof.owner_generation,
+                    proof.source_generation,
+                    proof.root_id,
+                    serde_json::to_string(&proof.state_cursor).map_err(|error| error.to_string())?,
+                    proof.root_record_json,
+                    proof.physical_proof_json,
+                    Utc::now().to_rfc3339()
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        sidecar_tx.commit().map_err(|error| error.to_string())?;
+        state_tx.commit().map_err(|error| error.to_string())?;
+        self.read_closed_root_owner(&proof.root_id, &proof.owner_generation)?
+            .ok_or("broker owner close commit readback absent".into())
+    }
+
+    /// Exact lost-reply/restart readback. A certificate alone is insufficient:
+    /// the sidecar phase, State inode/cursor and retained duties must agree.
+    pub fn read_closed_root_owner(
+        &self,
+        root_id: &str,
+        owner_generation: &str,
+    ) -> Result<Option<BrokerClosedOwner>, String> {
+        self.check_mailbox_read(&self.source_generation)?;
+        let row: Option<(String, String, String, String, String)> = self.mailbox.conn.query_row(
+            "SELECT source_generation,root_id,state_cursor_json,root_record_json,physical_proof_json
+             FROM broker_owner_close WHERE owner_generation=?1 AND phase='closed'",
+            [owner_generation],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        let Some((
+            source_generation,
+            recorded_root,
+            cursor_json,
+            root_record_json,
+            physical_proof_json,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        if recorded_root != root_id || source_generation != self.source_generation {
+            return Err("broker closed owner root/source changed".into());
+        }
+        let state_cursor: BrokerStateCloseCursor =
+            serde_json::from_str(&cursor_json).map_err(|error| error.to_string())?;
+        let owner: Option<(String, String, String)> = self
+            .mailbox
+            .conn
+            .query_row(
+                "SELECT domain_id,supervisor_authority_id,phase FROM completion_continuation_owner
+             WHERE generation=?1 AND kernel_root_id=?2",
+                params![owner_generation, root_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((domain, supervisor, phase)) = owner else {
+            return Err("broker closed owner row absent".into());
+        };
+        if phase != "closing" || self.bound_state_file_identity()? != state_cursor.file {
+            return Err("broker closed owner phase or State inode changed".into());
+        }
+        let state = self.bound_state()?;
+        let head = completion_continuity_head_on(&self.mailbox.conn)?
+            .ok_or("broker closed owner sidecar continuity absent")?;
+        if state_close_cursor(&state, state_cursor.file)?.as_ref() != Some(&state_cursor)
+            || head.authority_ordinal != state_cursor.authority_ordinal
+            || head.admission_id != state_cursor.admission_id
+            || head.sidecar_generation != state_cursor.sidecar_generation
+            || head.continuity_digest != state_cursor.continuity_digest
+            || self.mailbox.sidecar_generation()? != state_cursor.sidecar_generation
+            || state.completion_repair_has_suffix(Some(&head))?
+            || state.has_pending_native_channel_duty_for_domain(&domain)?
+            || !state.cancelling_native_attempts()?.is_empty()
+            || !owner_close_duties_on(
+                &self.mailbox.conn,
+                &supervisor,
+                &source_generation,
+                root_id,
+                owner_generation,
+            )?
+            .settled()
+        {
+            return Err("broker closed owner evidence changed".into());
+        }
+        self.check_mailbox_read(&self.source_generation)?;
+        Ok(Some(BrokerClosedOwner {
+            source_generation,
+            root_id: recorded_root,
+            owner_generation: owner_generation.into(),
+            state_cursor,
+            root_record_json,
+            physical_proof_json,
+        }))
     }
 
     pub(super) fn bound_state(&self) -> Result<StateDb, String> {
@@ -4444,7 +4718,7 @@ fn open_with_owner(path: &Path, owner: u32, anchor: &Path) -> Result<BrokerSidec
         .map_err(|error| format!("Failed to open broker sidecar: {error}"))?;
     authority.validate_opened_target()?;
     configure_writable_sidecar_connection(&conn)?;
-    if matches!(schema::sidecar_version(&conn)?, 32 | 33 | 34 | 35 | 36) {
+    if matches!(schema::sidecar_version(&conn)?, 32 | 33 | 34 | 35 | 36 | 37) {
         schema::validate_broker_owned(&conn)?;
         // Serialize both additive upgrades on the retained connection. The
         // historical four-column provenance table remains inert at v34.
@@ -4503,6 +4777,17 @@ fn open_with_owner(path: &Path, owner: u32, anchor: &Path) -> Result<BrokerSidec
                 schema::BROKER_NATIVE_RECIPIENT_GRANT_SCHEMA,
                 schema::BROKER_NATIVE_RECIPIENT_GRANT_RETAIN,
                 schema::BROKER_NATIVE_RECIPIENT_GRANT_GUARD,
+            ] {
+                tx.execute_batch(definition).map_err(|e| e.to_string())?;
+            }
+            tx.pragma_update(None, "user_version", 37)
+                .map_err(|e| e.to_string())?;
+        }
+        if schema::sidecar_version(&tx)? == 37 {
+            for definition in [
+                schema::BROKER_OWNER_CLOSE_SCHEMA,
+                schema::BROKER_OWNER_CLOSE_IMMUTABLE,
+                schema::BROKER_OWNER_CLOSE_RETAIN,
             ] {
                 tx.execute_batch(definition).map_err(|e| e.to_string())?;
             }
@@ -4600,6 +4885,9 @@ pub(super) fn activate_with_owner(
         schema::BROKER_NATIVE_RECIPIENT_GRANT_SCHEMA,
         schema::BROKER_NATIVE_RECIPIENT_GRANT_RETAIN,
         schema::BROKER_NATIVE_RECIPIENT_GRANT_GUARD,
+        schema::BROKER_OWNER_CLOSE_SCHEMA,
+        schema::BROKER_OWNER_CLOSE_IMMUTABLE,
+        schema::BROKER_OWNER_CLOSE_RETAIN,
         schema::BROKER_OWNER_RELEASE_IMMUTABLE,
         schema::BROKER_OWNER_RELEASE_RETAIN,
         schema::BROKER_OWNER_RELEASE_EXACT,
@@ -6011,6 +6299,9 @@ mod tests {
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(
             "PRAGMA wal_autocheckpoint=0;
+             DROP TRIGGER broker_owner_close_immutable;
+             DROP TRIGGER broker_owner_close_retain;
+             DROP TABLE broker_owner_close;
              DROP TRIGGER broker_native_recipient_grant_guard;
              DROP TRIGGER broker_native_recipient_grant_retain;
              DROP TABLE broker_native_recipient_grant;
@@ -6037,7 +6328,10 @@ mod tests {
         assert_eq!(schema::sidecar_version(&conn).unwrap(), 32);
         let upgraded = open_with_owner(&path, uid, root.path()).unwrap();
         assert_eq!(upgraded.source_generation(), generation);
-        assert_eq!(schema::sidecar_version(&upgraded.mailbox.conn).unwrap(), 37);
+        assert_eq!(
+            schema::sidecar_version(&upgraded.mailbox.conn).unwrap(),
+            schema::BROKER_OWNED_VERSION
+        );
         let value: String = upgraded
             .mailbox
             .conn
@@ -6064,6 +6358,9 @@ mod tests {
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(
             "PRAGMA wal_autocheckpoint=0;
+             DROP TRIGGER broker_owner_close_immutable;
+             DROP TRIGGER broker_owner_close_retain;
+             DROP TABLE broker_owner_close;
              DROP TRIGGER broker_native_recipient_grant_guard;
              DROP TRIGGER broker_native_recipient_grant_retain;
              DROP TABLE broker_native_recipient_grant;
@@ -6087,7 +6384,10 @@ mod tests {
         assert_eq!(schema::sidecar_version(&conn).unwrap(), 33);
         let upgraded = open_with_owner(&path, uid, root.path()).unwrap();
         assert_eq!(upgraded.source_generation(), generation);
-        assert_eq!(schema::sidecar_version(&upgraded.mailbox.conn).unwrap(), 37);
+        assert_eq!(
+            schema::sidecar_version(&upgraded.mailbox.conn).unwrap(),
+            schema::BROKER_OWNED_VERSION
+        );
         let old: String = upgraded
             .mailbox
             .conn
@@ -6134,6 +6434,9 @@ mod tests {
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(
             "PRAGMA wal_autocheckpoint=0;
+             DROP TRIGGER broker_owner_close_immutable;
+             DROP TRIGGER broker_owner_close_retain;
+             DROP TABLE broker_owner_close;
              DROP TRIGGER broker_native_recipient_grant_guard;
              DROP TRIGGER broker_native_recipient_grant_retain;
              DROP TABLE broker_native_recipient_grant;
@@ -6153,7 +6456,10 @@ mod tests {
         .unwrap();
         let upgraded = open_with_owner(&path, uid, root.path()).unwrap();
         assert_eq!(upgraded.source_generation(), generation);
-        assert_eq!(schema::sidecar_version(&upgraded.mailbox.conn).unwrap(), 37);
+        assert_eq!(
+            schema::sidecar_version(&upgraded.mailbox.conn).unwrap(),
+            schema::BROKER_OWNED_VERSION
+        );
         let value: String = upgraded
             .mailbox
             .conn
@@ -6180,6 +6486,9 @@ mod tests {
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(
             "PRAGMA wal_autocheckpoint=0;
+             DROP TRIGGER broker_owner_close_immutable;
+             DROP TRIGGER broker_owner_close_retain;
+             DROP TABLE broker_owner_close;
              DROP TRIGGER broker_native_recipient_grant_guard;
              DROP TRIGGER broker_native_recipient_grant_retain;
              DROP TABLE broker_native_recipient_grant;
@@ -6193,7 +6502,10 @@ mod tests {
         .unwrap();
         let upgraded = open_with_owner(&path, uid, root.path()).unwrap();
         assert_eq!(upgraded.source_generation(), generation);
-        assert_eq!(schema::sidecar_version(&upgraded.mailbox.conn).unwrap(), 37);
+        assert_eq!(
+            schema::sidecar_version(&upgraded.mailbox.conn).unwrap(),
+            schema::BROKER_OWNED_VERSION
+        );
         let value: String = upgraded
             .mailbox
             .conn
@@ -6220,6 +6532,9 @@ mod tests {
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(
             "PRAGMA wal_autocheckpoint=0;
+             DROP TRIGGER broker_owner_close_immutable;
+             DROP TRIGGER broker_owner_close_retain;
+             DROP TABLE broker_owner_close;
              DROP TRIGGER broker_native_recipient_grant_guard;
              DROP TRIGGER broker_native_recipient_grant_retain;
              DROP TABLE broker_native_recipient_grant;
@@ -6230,13 +6545,59 @@ mod tests {
         .unwrap();
         let upgraded = open_with_owner(&path, uid, root.path()).unwrap();
         assert_eq!(upgraded.source_generation(), generation);
-        assert_eq!(schema::sidecar_version(&upgraded.mailbox.conn).unwrap(), 37);
+        assert_eq!(
+            schema::sidecar_version(&upgraded.mailbox.conn).unwrap(),
+            schema::BROKER_OWNED_VERSION
+        );
         let value: String = upgraded
             .mailbox
             .conn
             .query_row("SELECT value FROM retained_v36_wal", [], |r| r.get(0))
             .unwrap();
         assert_eq!(value, "committed");
+        schema::validate_broker_owned(&upgraded.mailbox.conn).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_v37_upgrade_adds_exact_owner_close_without_losing_wal() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("sidecar");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join("pid-identity.db");
+        drop(MailboxDb::open(&path).unwrap());
+        for artifact in [path.clone(), mailbox_authority_path(&path)] {
+            fs::set_permissions(artifact, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let uid = unsafe { libc::geteuid() };
+        let generation = activate_with_owner(&path, uid, root.path()).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "PRAGMA wal_autocheckpoint=0;
+             DROP TRIGGER broker_owner_close_immutable;
+             DROP TRIGGER broker_owner_close_retain;
+             DROP TABLE broker_owner_close;
+             CREATE TABLE retained_v37_wal(value TEXT NOT NULL);
+             INSERT INTO retained_v37_wal VALUES('committed');
+             PRAGMA user_version=37;",
+        )
+        .unwrap();
+        let upgraded = open_with_owner(&path, uid, root.path()).unwrap();
+        assert_eq!(upgraded.source_generation(), generation);
+        assert_eq!(
+            schema::sidecar_version(&upgraded.mailbox.conn).unwrap(),
+            schema::BROKER_OWNED_VERSION
+        );
+        assert_eq!(
+            upgraded
+                .mailbox
+                .conn
+                .query_row("SELECT value FROM retained_v37_wal", [], |row| row
+                    .get::<_, String>(0),)
+                .unwrap(),
+            "committed"
+        );
         schema::validate_broker_owned(&upgraded.mailbox.conn).unwrap();
     }
 

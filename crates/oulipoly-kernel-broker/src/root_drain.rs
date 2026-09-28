@@ -8,10 +8,10 @@ use crate::registry::{OwnerCloseIntent, RootRecord, RootRegistry};
 use crate::source_physical::SourcePhysicalRegistry;
 use crate::work_registry::{LiveWork, WorkRecord, WorkRegistry};
 use oulipoly_state::mailbox::{
-    BrokerOwnerCloseInventory, BrokerSidecar, BrokerSourceEffectObligations, FreshV30Lane,
-    PreparedProcessStamp,
+    BrokerClosedOwner, BrokerOwnerCloseInventory, BrokerSidecar, BrokerSourceEffectObligations,
+    FreshV30Lane, PreparedProcessStamp,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::io;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -19,6 +19,73 @@ use std::io;
 pub enum DrainState {
     Blocked,
     Unknown,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RootPhysicalCloseProof {
+    pub root_id: String,
+    pub pid1: String,
+    pub pid1_echild_receipt: bool,
+    pub pid1_terminal_proof: bool,
+    pub pid1_parent_wait_proof: bool,
+    pub entry_physical_settled: bool,
+    pub entry_original_exited: bool,
+    pub work_records: usize,
+    pub work_retired: usize,
+    pub source_physical_records: usize,
+    pub source_physical_retired: usize,
+    pub source_effect: BrokerSourceEffectObligations,
+}
+
+/// The registries recheck the exact Q and both native ACK seals on every
+/// readback. These selected facts are stable across Broker restart.
+pub fn physical_close_proof(inventory: &RootDrainInventory) -> io::Result<RootPhysicalCloseProof> {
+    let source_effect = inventory
+        .source_effect
+        .as_ref()
+        .ok_or_else(|| io::Error::other("owner close source effect absent"))?;
+    if !inventory.fenced
+        || inventory.pid1 != "terminal_echild_absent"
+        || inventory.pid1_exact_live
+        || !inventory.pid1_echild_receipt
+        || !inventory.pid1_terminal_proof
+        || !inventory.pid1_parent_wait_proof
+        || !inventory.entry_physical_settled
+        || !inventory.entry_original_exited
+        || inventory.prepared_grants != 0
+        || inventory.spent_without_work != 0
+        || inventory.live_works != 0
+        || inventory.work_debt != 0
+        || inventory.work_records == 0
+        || inventory.work_retired != inventory.work_records
+        || inventory.work_outstanding != 0
+        || inventory.native_prepared != 0
+        || inventory.native_spent != 0
+        || inventory.source_physical_records != 1
+        || inventory.source_physical_retired != 1
+        || inventory.source_physical_outstanding != 0
+        || inventory.source_effect_readback_uncertain
+        || inventory.uncertain_registry_or_incarnation
+        || source_effect.unsettled() != 0
+        || source_effect.accepted != 1
+    {
+        return Err(io::Error::other("owner close physical Q/ACK proof changed"));
+    }
+    Ok(RootPhysicalCloseProof {
+        root_id: inventory.root_id.clone(),
+        pid1: inventory.pid1.into(),
+        pid1_echild_receipt: inventory.pid1_echild_receipt,
+        pid1_terminal_proof: inventory.pid1_terminal_proof,
+        pid1_parent_wait_proof: inventory.pid1_parent_wait_proof,
+        entry_physical_settled: inventory.entry_physical_settled,
+        entry_original_exited: inventory.entry_original_exited,
+        work_records: inventory.work_records,
+        work_retired: inventory.work_retired,
+        source_physical_records: inventory.source_physical_records,
+        source_physical_retired: inventory.source_physical_retired,
+        source_effect: source_effect.clone(),
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -77,6 +144,9 @@ pub struct RootDrainInventory {
     pub owner_close_preflight: bool,
     /// Exact durable intent, if issued. It does not close or release the owner.
     pub owner_close_intent: Option<OwnerCloseIntent>,
+    /// The sidecar's atomic closed phase, checked against current State and
+    /// the exact retained physical Q/ACK seals on this readback.
+    pub owner_close_proof: Option<BrokerClosedOwner>,
     /// No joined State/sidecar writer fence or atomic close is supplied by
     /// this inventory. An empty count is never a drain certificate.
     pub close_eligible: bool,
@@ -388,6 +458,7 @@ pub fn readback(
         state_sidecar_outstanding_unknown: true,
         owner_close_preflight: false,
         owner_close_intent: roots.read_close_intent(expected)?,
+        owner_close_proof: None,
         close_eligible: false,
     };
     if let Some(owner_generation) = inventory
@@ -398,6 +469,25 @@ pub fn readback(
         inventory.owner_close_preflight =
             ready_for_owner_close_preflight(&inventory, &expected.root_id, &owner_generation)
                 .is_ok();
+    }
+    if let Some(intent) = &inventory.owner_close_intent {
+        if let Some(sidecar) = sidecar {
+            if let Some(proof) = sidecar
+                .read_closed_root_owner(&expected.root_id, &intent.owner_generation)
+                .map_err(io::Error::other)?
+            {
+                if proof.source_generation != intent.source_generation
+                    || proof.state_cursor != intent.state_cursor
+                    || serde_json::from_str::<RootRecord>(&proof.root_record_json)? != *expected
+                    || serde_json::from_str::<RootPhysicalCloseProof>(&proof.physical_proof_json)?
+                        != physical_close_proof(&inventory)?
+                {
+                    return Err(io::Error::other("closed owner root/physical proof changed"));
+                }
+                inventory.owner_close_proof = Some(proof);
+                inventory.state_sidecar_outstanding_unknown = false;
+            }
+        }
     }
     Ok(inventory)
 }
@@ -572,6 +662,7 @@ mod tests {
             state_sidecar_outstanding_unknown: true,
             owner_close_preflight: false,
             owner_close_intent: None,
+            owner_close_proof: None,
             close_eligible: false,
         }
     }

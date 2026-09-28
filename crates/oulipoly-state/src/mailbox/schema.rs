@@ -318,7 +318,7 @@ fn classify_completion_summary(summary: CompletionProtocolSummary) -> Option<&'s
 // v30 was assigned to the broker-owned sidecar. Keep that ordinal reserved so
 // an ordinary opener can never mistake an old broker cutover for an upgrade.
 pub(super) const CURRENT_VERSION: i64 = 31;
-pub(super) const BROKER_OWNED_VERSION: i64 = 37;
+pub(super) const BROKER_OWNED_VERSION: i64 = 38;
 const MAX_SUPPORTED_VERSION: i64 = CURRENT_VERSION;
 const SCHEMA_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -754,7 +754,7 @@ pub(super) fn validate_broker_owned(conn: &Connection) -> Result<String, String>
     if version == 30 {
         return Err("persisted broker-owned v30 sidecar requires separate disposition; in-place migration is unsupported".into());
     }
-    if !matches!(version, 32 | 33 | 34 | 35 | 36 | BROKER_OWNED_VERSION) {
+    if !matches!(version, 32 | 33 | 34 | 35 | 36 | 37 | BROKER_OWNED_VERSION) {
         return Err(format!(
             "broker sidecar requires schema version {BROKER_OWNED_VERSION}"
         ));
@@ -769,6 +769,8 @@ pub(super) fn validate_broker_owned(conn: &Connection) -> Result<String, String>
         super::completion_continuation::validate_broker_v35_schema_on(&tx)?;
     } else if version == 36 {
         super::completion_continuation::validate_broker_v36_schema_on(&tx)?;
+    } else if version == 37 {
+        super::completion_continuation::validate_broker_v37_schema_on(&tx)?;
     } else {
         super::completion_continuation::validate_broker_schema_on(&tx)?;
     }
@@ -960,7 +962,7 @@ pub(super) fn validate_broker_owned(conn: &Connection) -> Result<String, String>
             }
         }
     }
-    if version == BROKER_OWNED_VERSION {
+    if version >= 37 {
         for (name, expected) in [
             (
                 "broker_native_recipient_grant",
@@ -984,6 +986,24 @@ pub(super) fn validate_broker_owned(conn: &Connection) -> Result<String, String>
                 .map_err(|e| format!("broker native recipient schema missing: {e}"))?;
             if actual != expected {
                 return Err("broker native recipient schema changed".into());
+            }
+        }
+    }
+    if version == BROKER_OWNED_VERSION {
+        for (name, expected) in [
+            ("broker_owner_close", BROKER_OWNER_CLOSE_SCHEMA),
+            ("broker_owner_close_immutable", BROKER_OWNER_CLOSE_IMMUTABLE),
+            ("broker_owner_close_retain", BROKER_OWNER_CLOSE_RETAIN),
+        ] {
+            let actual: String = tx
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE name=?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("broker owner close schema missing: {e}"))?;
+            if actual != expected {
+                return Err("broker owner close schema changed".into());
             }
         }
     }
@@ -1366,6 +1386,22 @@ BEGIN SELECT RAISE(ABORT,'broker release is immutable'); END";
 pub(super) const BROKER_OWNER_RELEASE_RETAIN: &str = "CREATE TRIGGER broker_owner_release_retain
 BEFORE DELETE ON broker_owner_release
 BEGIN SELECT RAISE(ABORT,'broker release must be retained'); END";
+
+/// The sidecar owner phase and this exact certificate commit in one SQLite
+/// transaction. The certificate is the durable close point, not the earlier
+/// root-drain close intent.
+pub(super) const BROKER_OWNER_CLOSE_SCHEMA: &str = "CREATE TABLE broker_owner_close (
+    owner_generation TEXT PRIMARY KEY REFERENCES completion_continuation_owner(generation),
+    source_generation TEXT NOT NULL, root_id TEXT NOT NULL,
+    state_cursor_json TEXT NOT NULL, root_record_json TEXT NOT NULL,
+    physical_proof_json TEXT NOT NULL, closed_at TEXT NOT NULL,
+    phase TEXT NOT NULL CHECK(phase='closed'))";
+pub(super) const BROKER_OWNER_CLOSE_IMMUTABLE: &str = "CREATE TRIGGER broker_owner_close_immutable
+BEFORE UPDATE ON broker_owner_close
+BEGIN SELECT RAISE(ABORT,'broker owner close is immutable'); END";
+pub(super) const BROKER_OWNER_CLOSE_RETAIN: &str = "CREATE TRIGGER broker_owner_close_retain
+BEFORE DELETE ON broker_owner_close
+BEGIN SELECT RAISE(ABORT,'broker owner close must be retained'); END";
 
 pub(super) const BROKER_OWNER_RELEASE_EXACT: &str = "CREATE TRIGGER broker_owner_release_exact
 BEFORE INSERT ON broker_owner_release

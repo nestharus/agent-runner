@@ -16,6 +16,7 @@ const FRESH_ROUTE_REPLY_READ_BYTES: u64 = 4097;
 
 use crate::installed_launch::InstalledLaunchSpec;
 use crate::registry::{OwnerCloseIntent, RootRecord};
+use oulipoly_state::mailbox::BrokerClosedOwner;
 use std::io::{self, Read, Write};
 #[cfg(feature = "age319-private-broker-fixture")]
 use std::os::fd::FromRawFd;
@@ -101,6 +102,47 @@ pub fn owner_close_intent_at(
         ));
     }
     Ok(intent)
+}
+
+/// Host-root exact close commit/readback. A lost commit reply is reconciled
+/// with `commit=false`; the Broker rechecks State, sidecar and physical seals.
+pub fn owner_close_at(
+    path: &Path,
+    expected: &RootRecord,
+    owner_generation: &str,
+    commit: bool,
+) -> io::Result<BrokerClosedOwner> {
+    let mut stream = checked_connection(path)?;
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let request = OwnerCloseIntentRequest {
+        expected: expected.clone(),
+        owner_generation: owner_generation.into(),
+    };
+    let mut frame = vec![if commit { 0x82 } else { 0x83 }];
+    frame.extend_from_slice(&challenge);
+    frame.extend_from_slice(&serde_json::to_vec(&request)?);
+    if frame.len() > 2048 {
+        return Err(io::Error::other("owner close request too large"));
+    }
+    stream.write_all(&frame)?;
+    let mut response = Vec::new();
+    stream.take(8193).read_to_end(&mut response)?;
+    if response.len() > 8192 || !response.ends_with(b"\n") {
+        return Err(io::Error::other("owner close response uncertain"));
+    }
+    let response = String::from_utf8(response).map_err(io::Error::other)?;
+    let body = response
+        .strip_prefix("owner-close-v1 ")
+        .ok_or_else(|| io::Error::other(response.clone()))?;
+    let proof: BrokerClosedOwner = serde_json::from_str(body.trim_end())?;
+    if proof.root_id != expected.root_id
+        || proof.owner_generation != owner_generation
+        || serde_json::from_str::<RootRecord>(&proof.root_record_json)? != *expected
+    {
+        return Err(io::Error::other("owner close reply identity changed"));
+    }
+    Ok(proof)
 }
 
 /// Host-root request for the exact fenced PID1. The broker independently

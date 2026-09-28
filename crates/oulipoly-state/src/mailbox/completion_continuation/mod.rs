@@ -593,6 +593,7 @@ pub(in crate::mailbox) fn domain_on(conn: &Connection) -> Result<Option<String>,
         33 => validate_broker_v33_schema_on(conn)?,
         34 => validate_broker_v34_schema_on(conn)?,
         35 => validate_broker_v35_schema_on(conn)?,
+        37 => validate_broker_v37_schema_on(conn)?,
         version if version == super::schema::BROKER_OWNED_VERSION => {
             validate_broker_schema_on(conn)?
         }
@@ -637,6 +638,10 @@ pub(super) fn validate_broker_schema_on(conn: &Connection) -> Result<(), String>
 
 pub(super) fn validate_broker_v36_schema_on(conn: &Connection) -> Result<(), String> {
     validate_schema_version_on(conn, 36, true)
+}
+
+pub(super) fn validate_broker_v37_schema_on(conn: &Connection) -> Result<(), String> {
+    validate_schema_version_on(conn, 37, true)
 }
 
 pub(super) fn validate_broker_v32_schema_on(conn: &Connection) -> Result<(), String> {
