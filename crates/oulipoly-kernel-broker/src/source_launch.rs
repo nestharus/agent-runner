@@ -238,11 +238,16 @@ fn create_init(
     let mut context = context;
     context.control = init_control;
     context.gate = init_gate;
+    let (reservation, parent_permit, child_permit) = super::namespace_helper_reaper::prepare()?;
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         return Err(io::Error::last_os_error());
     }
     if pid == 0 {
+        drop(parent_permit);
+        if !super::namespace_helper_reaper::await_permit(child_permit, reservation.broker_pidfd()) {
+            unsafe { libc::_exit(70) };
+        }
         drop(broker_control);
         drop(broker_gate);
         if close_other_descriptors(&[
@@ -316,7 +321,8 @@ fn create_init(
         };
     }
     drop(context);
-    work_launch::reap_namespace_helper(pid)?;
+    drop(child_permit);
+    super::namespace_helper_reaper::activate(reservation, pid, parent_permit)?;
     source_stage("waiting-entered-credential");
     let entered_credential = child_credential(&broker_control, b'E')?;
     source_stage("waiting-pid1-credential");

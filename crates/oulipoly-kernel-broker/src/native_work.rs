@@ -388,11 +388,16 @@ fn create_init(
     }
     context.control = init_control;
     context.gate = init_gate;
+    let (reservation, parent_permit, child_permit) = super::namespace_helper_reaper::prepare()?;
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         return Err(io::Error::last_os_error());
     }
     if pid == 0 {
+        drop(parent_permit);
+        if !super::namespace_helper_reaper::await_permit(child_permit, reservation.broker_pidfd()) {
+            unsafe { libc::_exit(70) };
+        }
         drop(broker_control);
         drop(broker_gate);
         if unsafe { libc::setns(parent_namespace.as_raw_fd(), libc::CLONE_NEWPID) } != 0 {
@@ -436,7 +441,8 @@ fn create_init(
         unsafe { libc::_exit(if recorded { 0 } else { 70 }) };
     }
     drop(context);
-    work_launch::reap_namespace_helper(pid)?;
+    drop(child_permit);
+    super::namespace_helper_reaper::activate(reservation, pid, parent_permit)?;
     let credential = work_launch::child_credential(&broker_control, b'I')?;
     if credential.uid != 0 || credential.pid <= 0 {
         return Err(io::Error::other("native PID1 identity refused"));
