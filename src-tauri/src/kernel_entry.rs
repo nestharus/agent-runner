@@ -2152,11 +2152,18 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
                 receipt.root_work_intent,
                 oulipoly_state::mailbox::FreshRootWorkIntent::NormalCli(_)
             ) {
-                prepare_normal_work(receipt, session)?;
+                let model_invocation = prepare_normal_work(receipt, session)?;
                 #[cfg(feature = "age319-private-broker-fixture")]
                 if std::env::var_os("AGE319_PRIVATE_FRESH_PROVIDER_V1").is_some() {
-                    return private_fresh_provider(FreshEntryAuthority { receipt, session });
+                    let invocation = model_invocation
+                        .ok_or("private provider requires a held headless model invocation")?;
+                    return private_fresh_provider(
+                        FreshEntryAuthority { receipt, session },
+                        invocation,
+                    );
                 }
+                #[cfg(not(feature = "age319-private-broker-fixture"))]
+                let _ = model_invocation;
                 return Err("normal provider route held: native K/Q, result and physical custody are absent".into());
             }
             if !private_help {
@@ -2186,7 +2193,7 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
             receipt.root_work_intent,
             oulipoly_state::mailbox::FreshRootWorkIntent::NormalCli(_)
         ) {
-            prepare_normal_work(&receipt, &session)?;
+            let _ = prepare_normal_work(&receipt, &session)?;
             return Err(
                 "normal provider route held: native K/Q, result and physical custody are absent"
                     .into(),
@@ -2203,7 +2210,7 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
 fn prepare_normal_work(
     receipt: &oulipoly_state::mailbox::FreshReleasedHandoff,
     session: &oulipoly_state::mailbox::FreshV30Session,
-) -> Result<(), String> {
+) -> Result<Option<oulipoly_state::mailbox::FreshHeadlessModelInvocation>, String> {
     let socket = broker_socket().with_file_name("v30.sock");
     let preparation = protocol::prepare_fresh_normal_work_at(&socket, &receipt.d_key)
         .or_else(|_| {
@@ -2220,6 +2227,14 @@ fn prepare_normal_work(
     {
         return Err("normal work preparation readback conflict".into());
     }
+    let model_invocation = match &preparation.intent {
+        oulipoly_state::mailbox::FreshRootWorkIntent::NormalCli(args)
+            if args.first().is_some_and(|arg| arg == "--model") =>
+        {
+            Some(preparation.headless_model_invocation(receipt, session)?)
+        }
+        _ => None,
+    };
     #[cfg(feature = "age319-private-broker-fixture")]
     if std::env::var_os("AGE319_PRIVATE_NORMAL_ROOT_V1").is_some() {
         let repeated = protocol::prepare_fresh_normal_work_at(&socket, &receipt.d_key)
@@ -2228,7 +2243,7 @@ fn prepare_normal_work(
             return Err("normal work retry minted a second preparation".into());
         }
     }
-    Ok(())
+    Ok(model_invocation)
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]
@@ -3565,25 +3580,19 @@ fn private_verified_output(
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]
-fn private_fresh_provider(authority: FreshEntryAuthority<'_>) -> Result<ExitCode, String> {
+fn private_fresh_provider(
+    authority: FreshEntryAuthority<'_>,
+    invocation: oulipoly_state::mailbox::FreshHeadlessModelInvocation,
+) -> Result<ExitCode, String> {
     use oulipoly_kernel_broker::protocol::{
         self, FreshAccountEffectKind, FreshAccountEffectRequest, FreshPlanRole, FreshRouteRequest,
     };
     use oulipoly_runtime::executor::cli::fresh_remote::{
         load_fresh_headless_pool, prepare_fresh_headless, run_prepared_fresh_headless,
     };
-    let (model_name, provider_pin, prompt) = match &authority.receipt.root_work_intent {
-        oulipoly_state::mailbox::FreshRootWorkIntent::NormalCli(args) => match args.as_slice() {
-            [flag, model, prompt] if flag == "--model" => (model.as_str(), None, prompt.as_str()),
-            [flag, model, pin_flag, pin, prompt]
-                if flag == "--model" && pin_flag == "--pin-provider" =>
-            {
-                (model.as_str(), Some(pin.as_str()), prompt.as_str())
-            }
-            _ => return Err("fresh provider CLI shape unsupported before K".into()),
-        },
-        _ => return Err("fresh provider root intent unsupported before K".into()),
-    };
+    let model_name = invocation.model.as_str();
+    let provider_pin = invocation.provider_pin.as_deref();
+    let prompt = invocation.prompt.as_str();
     if authority.session.session_id.is_empty() || authority.receipt.d_key.is_empty() {
         return Err("private fresh entry authority incomplete".into());
     }

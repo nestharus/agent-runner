@@ -13834,6 +13834,60 @@ fn inner() {
                             .unwrap()
                             .contains("normal provider route held")
                     );
+                    let settled_lane = FreshV30Lane::open_at(&broker_state).unwrap();
+                    let preparation = settled_lane
+                        .read_normal_work(&receipt, &actor, &session)
+                        .unwrap()
+                        .unwrap();
+                    let invocation = preparation
+                        .headless_model_invocation(&receipt, &session)
+                        .unwrap();
+                    assert_eq!(invocation.root_id, receipt.old_release.prepared.root_id);
+                    assert_eq!(
+                        invocation.owner_generation,
+                        receipt.old_release.prepared.owner_generation
+                    );
+                    assert_eq!(invocation.actor, actor);
+                    assert_eq!(invocation.model, "fixture-model");
+                    assert_eq!(invocation.provider_pin, None);
+                    assert_eq!(invocation.prompt, "hello fixture");
+                    let mut swapped_actor = preparation.clone();
+                    swapped_actor.actor.starttime_ticks += 1;
+                    assert!(
+                        swapped_actor
+                            .headless_model_invocation(&receipt, &session)
+                            .is_err()
+                    );
+                    let mut swapped_session = session.clone();
+                    swapped_session.session_id = uuid::Uuid::new_v4().to_string();
+                    assert!(
+                        preparation
+                            .headless_model_invocation(&receipt, &swapped_session)
+                            .is_err()
+                    );
+                    let mut swapped_root = receipt.clone();
+                    swapped_root.old_release.prepared.root_id = uuid::Uuid::new_v4().to_string();
+                    assert!(
+                        preparation
+                            .headless_model_invocation(&swapped_root, &session)
+                            .is_err()
+                    );
+                    let mut malformed = preparation.clone();
+                    malformed.intent =
+                        oulipoly_state::mailbox::FreshRootWorkIntent::NormalCli(vec![
+                            "--model".into(),
+                            "fixture-model".into(),
+                            "--pin-provider".into(),
+                            "".into(),
+                            "hello fixture".into(),
+                        ]);
+                    let mut matching_receipt = receipt.clone();
+                    matching_receipt.root_work_intent = malformed.intent.clone();
+                    assert!(
+                        malformed
+                            .headless_model_invocation(&matching_receipt, &session)
+                            .is_err()
+                    );
                     let held: (String, String) = fresh_state.query_row(
                         "SELECT state,intent_json FROM fresh_normal_work_preparation WHERE handoff_id=?1",
                         [&receipt.handoff_id],
