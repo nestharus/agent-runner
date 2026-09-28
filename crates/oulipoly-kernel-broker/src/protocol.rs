@@ -627,12 +627,68 @@ pub fn observe_fresh_normal_plan_at(
     normal_plan_request_at(path, 0x87, d_key, descriptors)
 }
 
+/// Reserve a durable, no-effect admission for the previously held plan.
+pub fn admit_fresh_normal_provider_at(
+    path: &Path,
+    d_key: &str,
+    descriptors: [RawFd; 3],
+) -> io::Result<oulipoly_state::mailbox::FreshNormalProviderAdmission> {
+    normal_admission_request_at(path, 0x88, d_key, descriptors)?
+        .ok_or_else(|| io::Error::other("normal provider admission absent"))
+}
+
+pub fn observe_fresh_normal_provider_admission_at(
+    path: &Path,
+    d_key: &str,
+    descriptors: [RawFd; 3],
+) -> io::Result<Option<oulipoly_state::mailbox::FreshNormalProviderAdmission>> {
+    normal_admission_request_at(path, 0x89, d_key, descriptors)
+}
+
+fn normal_admission_request_at(
+    path: &Path,
+    operation: u8,
+    d_key: &str,
+    descriptors: [RawFd; 3],
+) -> io::Result<Option<oulipoly_state::mailbox::FreshNormalProviderAdmission>> {
+    let reply = normal_plan_wire_at(path, operation, d_key, descriptors)?;
+    if reply == "fresh-normal-admission absent\n" {
+        return Ok(None);
+    }
+    let body = reply
+        .strip_prefix("fresh-normal-admission ")
+        .and_then(|value| value.strip_suffix('\n'))
+        .ok_or_else(|| io::Error::other("normal admission readback invalid"))?;
+    serde_json::from_str(body)
+        .map(Some)
+        .map_err(io::Error::other)
+}
+
 fn normal_plan_request_at(
     path: &Path,
     operation: u8,
     d_key: &str,
     descriptors: [RawFd; 3],
 ) -> io::Result<Option<oulipoly_state::mailbox::FreshNormalExecutablePlan>> {
+    let reply = normal_plan_wire_at(path, operation, d_key, descriptors)?;
+    if reply == "fresh-normal-plan absent\n" {
+        return Ok(None);
+    }
+    let body = reply
+        .strip_prefix("fresh-normal-plan ")
+        .and_then(|value| value.strip_suffix('\n'))
+        .ok_or_else(|| io::Error::other("normal plan readback invalid"))?;
+    serde_json::from_str(body)
+        .map(Some)
+        .map_err(io::Error::other)
+}
+
+fn normal_plan_wire_at(
+    path: &Path,
+    operation: u8,
+    d_key: &str,
+    descriptors: [RawFd; 3],
+) -> io::Result<String> {
     let id =
         uuid::Uuid::parse_str(d_key).map_err(|_| io::Error::other("invalid normal plan D key"))?;
     if id.is_nil() || id.to_string() != d_key {
@@ -687,16 +743,7 @@ fn normal_plan_request_at(
     if let Some(error) = reply.strip_prefix("error ") {
         return Err(io::Error::other(error.trim_end().to_owned()));
     }
-    if reply == "fresh-normal-plan absent\n" {
-        return Ok(None);
-    }
-    let body = reply
-        .strip_prefix("fresh-normal-plan ")
-        .and_then(|value| value.strip_suffix('\n'))
-        .ok_or_else(|| io::Error::other("normal plan readback invalid"))?;
-    serde_json::from_str(body)
-        .map(Some)
-        .map_err(io::Error::other)
+    Ok(reply)
 }
 
 fn normal_model_request_at(

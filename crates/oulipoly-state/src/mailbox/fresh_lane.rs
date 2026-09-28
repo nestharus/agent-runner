@@ -43,6 +43,8 @@ const FRESH_NORMAL_WORK_SCHEMA: &str = include_str!("migrations/0034_fresh_norma
 const FRESH_NORMAL_MODEL_SELECTION_SCHEMA: &str =
     include_str!("migrations/0047_fresh_normal_model_selection.sql");
 const FRESH_NORMAL_PLAN_SCHEMA: &str = include_str!("migrations/0048_fresh_normal_plan.sql");
+const FRESH_NORMAL_PROVIDER_ADMISSION_SCHEMA: &str =
+    include_str!("migrations/0049_fresh_normal_provider_admission.sql");
 const FRESH_RECIPIENT_SCHEMA: &str = include_str!("migrations/0030_fresh_recipient.sql");
 const FRESH_RECIPIENT_ACK_SCHEMA: &str = include_str!("migrations/0039_fresh_recipient_ack.sql");
 const FRESH_NATIVE_F_PREPARATION_SCHEMA: &str =
@@ -239,6 +241,17 @@ pub struct FreshNormalExecutablePlan {
     pub stdin_sha256: String,
     pub stdin_len: u64,
     pub plan_sha256: String,
+    pub state: String,
+}
+
+/// Durable reservation for a later physical K. The admission ID is minted
+/// once, but this record has no launch or effect authority by itself.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreshNormalProviderAdmission {
+    pub handoff_id: String,
+    pub plan_sha256: String,
+    pub admission_id: String,
     pub state: String,
 }
 
@@ -1219,6 +1232,22 @@ impl FreshV30Lane {
                 "fresh_normal_executable_plan_no_delete",
             ],
         )?;
+        match fresh_normal_provider_admission_schema_count(&state_conn)? {
+            0 => state_conn
+                .execute_batch(FRESH_NORMAL_PROVIDER_ADMISSION_SCHEMA)
+                .map_err(|e| e.to_string())?,
+            3 => {}
+            _ => return Err("fresh normal provider admission schema incomplete".into()),
+        }
+        verify_fresh_sql_objects(
+            &state_conn,
+            FRESH_NORMAL_PROVIDER_ADMISSION_SCHEMA,
+            "fresh_normal_provider_admission",
+            &[
+                "fresh_normal_provider_admission_no_update",
+                "fresh_normal_provider_admission_no_delete",
+            ],
+        )?;
         let normal_trigger_count: i64 = state_conn
             .query_row(
                 "SELECT count(*) FROM sqlite_master WHERE type='trigger' AND tbl_name='fresh_normal_work_preparation'",
@@ -1941,6 +1970,78 @@ impl FreshV30Lane {
         Ok(Some(plan))
     }
 
+    pub fn admit_normal_provider_plan(
+        &self,
+        receipt: &FreshReleasedHandoff,
+        actor: &FreshRecipientIdentity,
+        session: &FreshV30Session,
+        plan: &FreshNormalExecutablePlan,
+    ) -> Result<FreshNormalProviderAdmission, String> {
+        let retained = self
+            .read_normal_executable_plan(receipt, actor, session)?
+            .ok_or("normal provider admission requires executable plan")?;
+        if retained != *plan {
+            return Err("normal provider admission plan changed".into());
+        }
+        let admission = FreshNormalProviderAdmission {
+            handoff_id: receipt.handoff_id.clone(),
+            plan_sha256: plan.plan_sha256.clone(),
+            admission_id: uuid::Uuid::new_v4().to_string(),
+            state: "admitted_no_effect".into(),
+        };
+        let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        state
+            .execute_batch("PRAGMA synchronous=FULL; BEGIN IMMEDIATE")
+            .map_err(|e| e.to_string())?;
+        state
+            .execute(
+                "INSERT INTO fresh_normal_provider_admission(handoff_id,admission_json,admitted_at)
+                 VALUES(?1,?2,?3) ON CONFLICT(handoff_id) DO NOTHING",
+                params![
+                    receipt.handoff_id,
+                    serde_json::to_string(&admission).map_err(|e| e.to_string())?,
+                    Utc::now().to_rfc3339()
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        state.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+        self.read_normal_provider_admission(receipt, actor, session)?
+            .ok_or("normal provider admission disappeared".into())
+    }
+
+    pub fn read_normal_provider_admission(
+        &self,
+        receipt: &FreshReleasedHandoff,
+        actor: &FreshRecipientIdentity,
+        session: &FreshV30Session,
+    ) -> Result<Option<FreshNormalProviderAdmission>, String> {
+        let plan = self
+            .read_normal_executable_plan(receipt, actor, session)?
+            .ok_or("normal provider admission requires executable plan")?;
+        let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let row: Option<String> = state
+            .query_row(
+                "SELECT admission_json FROM fresh_normal_provider_admission WHERE handoff_id=?1",
+                [&receipt.handoff_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some(row) = row else { return Ok(None) };
+        let admission: FreshNormalProviderAdmission =
+            serde_json::from_str(&row).map_err(|e| e.to_string())?;
+        let id = uuid::Uuid::parse_str(&admission.admission_id).map_err(|e| e.to_string())?;
+        if admission.handoff_id != receipt.handoff_id
+            || admission.plan_sha256 != plan.plan_sha256
+            || admission.state != "admitted_no_effect"
+            || id.is_nil()
+            || id.to_string() != admission.admission_id
+        {
+            return Err("normal provider admission readback changed".into());
+        }
+        Ok(Some(admission))
+    }
+
     /// The intended caller is a released Runner root retaining both UUIDs
     /// across U and D. The broker supplies the pinned peer identity; caller
     /// JSON cannot select an actor. Release and invocation linkage are still
@@ -2415,6 +2516,19 @@ fn fresh_normal_plan_schema_count(state: &Connection) -> Result<i64, String> {
         .map_err(|e| e.to_string())
 }
 
+fn fresh_normal_provider_admission_schema_count(state: &Connection) -> Result<i64, String> {
+    state
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE
+         (type='table' AND name='fresh_normal_provider_admission') OR
+         (type='trigger' AND name IN
+          ('fresh_normal_provider_admission_no_update','fresh_normal_provider_admission_no_delete'))",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod normal_model_selection_tests {
     use super::*;
@@ -2523,7 +2637,14 @@ mod normal_model_selection_tests {
             )
             .unwrap();
         state.execute_batch(FRESH_NORMAL_PLAN_SCHEMA).unwrap();
+        state
+            .execute_batch(FRESH_NORMAL_PROVIDER_ADMISSION_SCHEMA)
+            .unwrap();
         assert_eq!(fresh_normal_plan_schema_count(&state).unwrap(), 3);
+        assert_eq!(
+            fresh_normal_provider_admission_schema_count(&state).unwrap(),
+            3
+        );
         verify_fresh_sql_objects(
             &state,
             FRESH_NORMAL_PLAN_SCHEMA,
@@ -2557,6 +2678,52 @@ mod normal_model_selection_tests {
                 .unwrap(),
             "first"
         );
+        state
+            .execute(
+                "INSERT INTO fresh_normal_provider_admission VALUES(?1,?2,?3)",
+                params!["held-handoff", "admitted", "now"],
+            )
+            .unwrap();
+        state
+            .execute(
+                "INSERT INTO fresh_normal_provider_admission VALUES(?1,?2,?3)
+                 ON CONFLICT(handoff_id) DO NOTHING",
+                params!["held-handoff", "different", "later"],
+            )
+            .unwrap();
+        assert_eq!(
+            state
+                .query_row(
+                    "SELECT admission_json FROM fresh_normal_provider_admission",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "admitted"
+        );
+        assert!(
+            state
+                .execute(
+                    "UPDATE fresh_normal_provider_admission SET admission_json='changed'",
+                    [],
+                )
+                .is_err()
+        );
+        assert!(
+            state
+                .execute("DELETE FROM fresh_normal_provider_admission", [])
+                .is_err()
+        );
+        verify_fresh_sql_objects(
+            &state,
+            FRESH_NORMAL_PROVIDER_ADMISSION_SCHEMA,
+            "fresh_normal_provider_admission",
+            &[
+                "fresh_normal_provider_admission_no_update",
+                "fresh_normal_provider_admission_no_delete",
+            ],
+        )
+        .unwrap();
         assert!(
             state
                 .execute(
