@@ -3208,6 +3208,76 @@ impl oulipoly_runtime::executor::cli::fresh_remote::FreshProviderBackend
                 serde_json::to_vec(&bash_result).map_err(|e| e.to_string())?,
             )
             .map_err(|e| self.unknown(Some(&grant), "native Bash result report", &e.to_string()))?;
+            if std::env::var_os("AGE319_PRIVATE_NATIVE_TURN_RECEIPT_V1").is_some() {
+                let ready = std::path::Path::new(&gate).join("native-turn-ready");
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+                while !ready.exists() {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(self.unknown(
+                            Some(&grant),
+                            "native turn source custody",
+                            "original row not ready",
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                // * is one-shot. A lost submit reply is observed through /;
+                // never send a second turn/start after an unknown outcome.
+                let submitted = protocol::private_fresh_provider_at(
+                    &socket,
+                    &self.authority.receipt.d_key,
+                    b'*',
+                    None,
+                );
+                if let Ok(reply) = &submitted {
+                    if reply != &format!("native-turn-submitted {grant}\n") {
+                        return Err(self.unknown(
+                            Some(&grant),
+                            "native turn submission",
+                            "invalid reply",
+                        ));
+                    }
+                }
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(150);
+                let receipt = loop {
+                    let state = protocol::private_fresh_provider_at(
+                        &socket,
+                        &self.authority.receipt.d_key,
+                        b'/',
+                        None,
+                    )
+                    .map_err(|error| {
+                        self.unknown(
+                            Some(&grant),
+                            "native turn readback",
+                            &format!("submission={submitted:?}; observation={error}"),
+                        )
+                    })?;
+                    if let Some(body) = state.strip_prefix("native-turn-receipt ") {
+                        break serde_json::from_str::<serde_json::Value>(body.trim_end()).map_err(
+                            |error| {
+                                self.unknown(
+                                    Some(&grant),
+                                    "native turn receipt",
+                                    &error.to_string(),
+                                )
+                            },
+                        )?;
+                    }
+                    if state.starts_with("native-turn-unknown ")
+                        || state != "native-turn-pending\n"
+                        || std::time::Instant::now() >= deadline
+                    {
+                        return Err(self.unknown(Some(&grant), "native turn receipt", &state));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                };
+                std::fs::write(
+                    std::path::Path::new(&gate).join("native-turn-receipt.json"),
+                    serde_json::to_vec(&receipt).map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| self.unknown(Some(&grant), "native turn report", &e.to_string()))?;
+            }
             protocol::private_fresh_provider_at(&socket, &self.authority.receipt.d_key, b'7', None)
                 .map_err(|e| self.unknown(Some(&grant), "native K cancellation", &e.to_string()))?;
             let deadline = std::time::Instant::now() + PRIVATE_PROVIDER_RESULT_WAIT;

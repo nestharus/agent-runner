@@ -1465,7 +1465,9 @@ fn terminate_postcommit_original_owner(broker_state: &Path) {
 
 fn inner() {
     let mode = std::env::var("AGE319_PRIVATE_JOIN_MODE").unwrap_or_else(|_| "help".into());
-    let native_codex_mode = mode == "normal_model_provider_native_codex_root_h_notify_row";
+    let native_turn_mode = mode == "normal_model_provider_native_codex_turn_receipt";
+    let native_codex_mode =
+        native_turn_mode || mode == "normal_model_provider_native_codex_root_h_notify_row";
     let root_terminal_drain = matches!(
         mode.as_str(),
         "normal_model_provider_bash_causal_root_h_delegate_drain"
@@ -1647,6 +1649,11 @@ fn inner() {
     fs::set_permissions(&gate, fs::Permissions::from_mode(0o700)).unwrap();
     if native_codex_mode {
         fs::create_dir(gate.join("native-codex-home")).unwrap();
+        if native_turn_mode {
+            let auth = std::env::var("AGE319_TEST_CODEX_AUTH")
+                .expect("private native turn test requires an auth.json source");
+            fs::copy(auth, gate.join("native-codex-home/auth.json")).unwrap();
+        }
     }
     if root_terminal_drain {
         fs::write(gate.join("terminal-drain-mode"), b"held").unwrap();
@@ -1675,9 +1682,10 @@ fn inner() {
             | "normal_model_provider_bash_causal_root_h_notify_wake_lost"
             | "normal_model_provider_bash_causal_root_h_notify_wake_unknown"
             | "normal_model_provider_native_codex_root_h_notify_row"
+            | "normal_model_provider_native_codex_turn_receipt"
     );
     let root_h_lost = mode == "normal_model_provider_bash_causal_root_h_lost";
-    let root_h_notify = root_h_delegate && mode.contains("_notify_");
+    let root_h_notify = root_h_delegate && (mode.contains("_notify_") || native_turn_mode);
     let root_h_wake = mode.contains("root_h_notify_wake");
     let root_h_wake_lost = mode.ends_with("root_h_notify_wake_lost");
     let root_h_wake_unknown = mode.ends_with("root_h_notify_wake_unknown");
@@ -2211,8 +2219,9 @@ fn inner() {
         None
     };
     if handoff_mode {
-        rusqlite::Connection::open(broker_state.join("sidecar/pid-identity.db"))
-            .unwrap()
+        let sidecar =
+            rusqlite::Connection::open(broker_state.join("sidecar/pid-identity.db")).unwrap();
+        sidecar
             .execute(
                 "INSERT INTO mailbox(session_id,kind,handle,payload_json,enqueued_at,
                  state_dir,meta_path,log_path,rc_path,rc)
@@ -2274,6 +2283,7 @@ fn inner() {
             )
         }))
         .envs(native_codex_mode.then_some(("AGE319_PRIVATE_NATIVE_BASH_DROP_REPLY_V1", "1")))
+        .envs(native_turn_mode.then_some(("AGE319_PRIVATE_NATIVE_TURN_DROP_REPLY_V1", "1")))
         .envs(native_lost_reply.map(|stage| ("AGE319_PRIVATE_NATIVE_F_DROP_REPLY_V1", stage)))
         .envs(
             (mode == "normal_model_provider_bash_causal_success" || root_h_delegate)
@@ -2570,6 +2580,7 @@ fn inner() {
             .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
             .envs(native_codex_mode.then_some(("AGE319_PRIVATE_NATIVE_CODEX_V1", "1")))
             .envs(native_codex_mode.then_some(("AGE319_PRIVATE_NATIVE_BASH_NOTIFY_V1", "1")))
+            .envs(native_turn_mode.then_some(("AGE319_PRIVATE_NATIVE_TURN_RECEIPT_V1", "1")))
             .envs(resident_mode.then_some(("AGE319_PRIVATE_NATIVE_STORE", &native_store)))
             .envs(resident_mode.then_some(("AGE319_PRIVATE_ROOT_PTY_RESIDENT_V1", "1")))
             .envs(
@@ -2777,7 +2788,7 @@ fn inner() {
                     }),
             )
             .envs(
-                (mode.contains("_notify_") || resident_notify)
+                (root_h_notify || mode.contains("_notify_") || resident_notify)
                     .then_some(("AGE319_PRIVATE_BASH_ORIGINAL_NOTIFY_V1", "1")),
             )
             .envs(
@@ -6939,6 +6950,7 @@ fn inner() {
                         | "normal_model_provider_path"
                         | "normal_model_provider_prefix"
                         | "normal_model_provider_native_codex_root_h_notify_row"
+                        | "normal_model_provider_native_codex_turn_receipt"
                 )
             {
                 let marker: serde_json::Value =
@@ -8705,6 +8717,48 @@ fn inner() {
                             format!("{:x}", Sha256::digest(&payload))
                         );
                         assert_eq!(custody.payload_byte_len, payload.len() as i64);
+                        if native_turn_mode {
+                            fs::write(gate.join("native-turn-ready"), b"row retained").unwrap();
+                            let until = Instant::now() + Duration::from_secs(150);
+                            while !gate.join("native-turn-receipt.json").exists()
+                                && entry.try_wait().unwrap().is_none()
+                                && Instant::now() < until
+                            {
+                                std::thread::sleep(Duration::from_millis(50));
+                            }
+                            assert!(
+                                gate.join("native-turn-receipt.json").exists(),
+                                "native turn receipt absent: entry={} broker={}",
+                                fs::read_to_string(&err).unwrap_or_default(),
+                                fs::read_to_string(&broker_log).unwrap_or_default()
+                            );
+                            let receipt: serde_json::Value = serde_json::from_slice(
+                                &fs::read(gate.join("native-turn-receipt.json")).unwrap(),
+                            )
+                            .unwrap();
+                            assert_eq!(receipt["readback"], native);
+                            assert_eq!(receipt["status"], "completed");
+                            assert_eq!(receipt["original_row_acknowledged"], false);
+                            let attempt: serde_json::Value = serde_json::from_slice(
+                                &fs::read(physical_dir.join(format!(
+                                    "{}.native-turn-attempt.json",
+                                    native["grant_id"].as_str().unwrap()
+                                )))
+                                .unwrap(),
+                            )
+                            .unwrap();
+                            assert_eq!(attempt["readback"], native);
+                            assert_eq!(attempt["nonce"], receipt["nonce"]);
+                            assert!(
+                                gate.join("native-turn-reply-dropped").exists(),
+                                "native turn submission reply was not dropped"
+                            );
+                            let pending: i64 = side.query_row(
+                                "SELECT count(*) FROM mailbox WHERE seq=?1 AND delivered_at IS NULL",
+                                [custody.row_seq], |row| row.get(0),
+                            ).unwrap();
+                            assert_eq!(pending, 1, "native turn must not ACK original row");
+                        }
                         stop(&mut broker);
                         return;
                     }
@@ -14930,6 +14984,7 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_model_provider_bash_causal_root_h_lost",
         "normal_model_provider_bash_causal_root_h_notify_row",
         "normal_model_provider_native_codex_root_h_notify_row",
+        "normal_model_provider_native_codex_turn_receipt",
         "normal_model_provider_bash_causal_root_h_notify_row_drain",
         "normal_model_provider_bash_causal_root_h_notify_wake",
         "normal_model_provider_bash_causal_root_h_notify_wake_drain",

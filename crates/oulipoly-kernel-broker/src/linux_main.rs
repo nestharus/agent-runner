@@ -788,7 +788,7 @@ fn recv_request(
         b'=' | b'V' | b'S' | b's' | b'T' | b'H' | b'K' | b'B' | b'N' | b'k' | b't' | b'R'
         | b'W' | b'Y' | b'0' | b'1' | b'2' | b'3' | b'4' => (18..=2048 + 17).contains(&read),
         #[cfg(feature = "age319-private-broker-fixture")]
-        b'5' | b'6' | b'7' | b'8' | b'9' | b'b' | b'y' | b'x' | b'$' => {
+        b'5' | b'6' | b'7' | b'8' | b'9' | b'b' | b'y' | b'x' | b'$' | b'*' | b'/' => {
             (18..=2048 + 17).contains(&read)
         }
         #[cfg(feature = "age319-private-broker-fixture")]
@@ -870,10 +870,12 @@ fn recv_request(
             request: serde_json::from_slice(&request[17..read as usize])?,
         },
         #[cfg(feature = "age319-private-broker-fixture")]
-        b'5' | b'6' | b'7' | b'b' | b'y' | b'x' => RequestPayload::FreshProviderRequest {
-            request: serde_json::from_slice(&request[17..read as usize])?,
-            descriptors,
-        },
+        b'5' | b'6' | b'7' | b'b' | b'y' | b'x' | b'*' | b'/' => {
+            RequestPayload::FreshProviderRequest {
+                request: serde_json::from_slice(&request[17..read as usize])?,
+                descriptors,
+            }
+        }
         #[cfg(feature = "age319-private-broker-fixture")]
         b'$' => RequestPayload::PrivateNativeBashExec {
             request: serde_json::from_slice(&request[17..read as usize])?,
@@ -6148,6 +6150,8 @@ fn serve_fresh_v30_at(
         HashMap::new();
     #[cfg(feature = "age319-private-broker-fixture")]
     let mut native_bash_execs: HashMap<String, fresh_provider::NativeBashExec> = HashMap::new();
+    #[cfg(feature = "age319-private-broker-fixture")]
+    let mut native_turn_execs: HashMap<String, fresh_provider::NativeTurnExec> = HashMap::new();
     for incoming in listener.incoming() {
         let Ok(mut stream) = incoming else { continue };
         stream.set_read_timeout(Some(FRESH_V30_READ_TIMEOUT))?;
@@ -6157,6 +6161,8 @@ fn serve_fresh_v30_at(
         let mut drop_provider_k_reply = false;
         #[cfg(feature = "age319-private-broker-fixture")]
         let mut drop_native_bash_reply = false;
+        #[cfg(feature = "age319-private-broker-fixture")]
+        let mut drop_native_turn_reply = false;
         #[cfg(feature = "age319-private-broker-fixture")]
         let mut drop_interactive_k_reply = false;
         #[cfg(feature = "age319-private-broker-fixture")]
@@ -7044,9 +7050,9 @@ fn serve_fresh_v30_at(
                     }
                 }
                 #[cfg(feature = "age319-private-broker-fixture")]
-                b'5' | b'6' | b'7' | b'8' | b'9' | b'b' | b'y' | b'x' | b'$' | b'h' | b'f'
-                | b'(' | b')' | b'm' | b'n' | b'o' | b'#' | b'{' | b'}' | b']' | b'|' | b'~'
-                | b'?' => {
+                b'5' | b'6' | b'7' | b'8' | b'9' | b'b' | b'y' | b'x' | b'$' | b'*' | b'/'
+                | b'h' | b'f' | b'(' | b')' | b'm' | b'n' | b'o' | b'#' | b'{' | b'}' | b']'
+                | b'|' | b'~' | b'?' => {
                     if !private_fixture() {
                         return Err(io::Error::other("fresh provider fixture route closed"));
                     }
@@ -7819,6 +7825,29 @@ fn serve_fresh_v30_at(
                         })?;
                         return execution.observe(&binding);
                     }
+                    if operation == b'*' {
+                        if native_turn_execs.contains_key(&grant) {
+                            return Err(io::Error::other(
+                                "native turn already reserved; no replay",
+                            ));
+                        }
+                        let execution = native_bash_execs.get_mut(&grant).ok_or_else(|| {
+                            io::Error::other("native Bash result absent; native turn refused")
+                        })?;
+                        let control = execution.take_control(&binding)?;
+                        let turn = control.begin_turn(&directory, state_root, &binding)?;
+                        native_turn_execs.insert(grant.clone(), turn);
+                        if std::env::var_os("AGE319_PRIVATE_NATIVE_TURN_DROP_REPLY_V1").is_some() {
+                            drop_native_turn_reply = true;
+                        }
+                        return Ok(format!("native-turn-submitted {grant}\n"));
+                    }
+                    if operation == b'/' {
+                        let execution = native_turn_execs.get_mut(&grant).ok_or_else(|| {
+                            io::Error::other("native turn control absent; unknown, no replay")
+                        })?;
+                        return execution.observe(&binding);
+                    }
                     if let Some(v3) = provider_readback_v3.as_ref() {
                         if provider_writer_v3 {
                             fresh_provider::settle_v3_provider(v3, &directory, &binding, &grant)?;
@@ -8276,6 +8305,7 @@ fn serve_fresh_v30_at(
         #[cfg(feature = "age319-private-broker-fixture")]
         if drop_provider_k_reply
             || drop_native_bash_reply
+            || drop_native_turn_reply
             || drop_provider_q_reply
             || drop_account_effect_reply
             || drop_route_reply
@@ -8283,7 +8313,9 @@ fn serve_fresh_v30_at(
             || drop_root_h_reply
         {
             if let Some(gate) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1") {
-                let marker = if drop_native_bash_reply {
+                let marker = if drop_native_turn_reply {
+                    "native-turn-reply-dropped"
+                } else if drop_native_bash_reply {
                     "native-bash-reply-dropped"
                 } else if drop_root_h_reply {
                     "root-h-reply-dropped"
