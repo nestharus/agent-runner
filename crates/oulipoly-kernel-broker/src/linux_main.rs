@@ -511,6 +511,10 @@ enum RequestPayload {
     FreshBashPrivateResult {
         result: oulipoly_state::mailbox::FreshBashPrivateResult,
     },
+    FreshNormalModelRequest {
+        request: FreshRootEffectRequest,
+        config_dir: File,
+    },
     #[cfg(feature = "age319-private-broker-fixture")]
     FreshProviderRequest {
         request: FreshRootEffectRequest,
@@ -804,7 +808,9 @@ fn recv_request(
         }
         #[cfg(feature = "age319-private-broker-fixture")]
         b'#' | b'{' | b'}' | b']' | b'|' | b'~' | b'?' => (18..=2048 + 17).contains(&read),
-        b'@' | b'[' | 0x7f | 0x80 | 0x81 | 0x82 | 0x83 => (18..=2048 + 17).contains(&read),
+        b'@' | b'[' | 0x7f | 0x80 | 0x81 | 0x82 | 0x83 | 0x84 | 0x85 => {
+            (18..=2048 + 17).contains(&read)
+        }
         b'F' => (18..=8192 + 17).contains(&read),
         b'O' => (18..=1024 + 17).contains(&read),
         b'U' => (18..=512 + 17).contains(&read),
@@ -822,6 +828,7 @@ fn recv_request(
             b'N' | b't' => descriptors.len() != 3,
             b'k' => descriptors.len() != 4,
             b'K' => descriptors.len() != 7,
+            0x84 | 0x85 => descriptors.len() != 1,
             #[cfg(feature = "age319-private-broker-fixture")]
             b'5' | b'b' => descriptors.len() != 4,
             #[cfg(feature = "age319-private-broker-fixture")]
@@ -878,6 +885,10 @@ fn recv_request(
         },
         b'0' | b'1' | b'2' | b'3' | b'4' => RequestPayload::FreshRootEffectRequest {
             request: serde_json::from_slice(&request[17..read as usize])?,
+        },
+        0x84 | 0x85 => RequestPayload::FreshNormalModelRequest {
+            request: serde_json::from_slice(&request[17..read as usize])?,
+            config_dir: descriptors.into_iter().next().unwrap(),
         },
         #[cfg(feature = "age319-private-broker-fixture")]
         b'5' | b'6' | b'7' | b'b' | b'y' | b'x' | b'*' | b'/' | b'>' | b'_' => {
@@ -7487,6 +7498,104 @@ fn serve_fresh_v30_at(
                         )),
                         None => Ok("fresh-normal-work absent\n".into()),
                     }
+                }
+                0x84 | 0x85 => {
+                    let RequestPayload::FreshNormalModelRequest {
+                        request,
+                        config_dir,
+                    } = payload
+                    else {
+                        return Err(io::Error::other("normal model request absent"));
+                    };
+                    if request.success.is_some() {
+                        return Err(io::Error::other(
+                            "normal model request cannot return an effect",
+                        ));
+                    }
+                    if operation == 0x84 && instance.is_closed() {
+                        return Err(io::Error::other("normal model selection gate closed"));
+                    }
+                    let receipt = lane
+                        .released_handoff_for_child(&request.d_key, &recipient)
+                        .map_err(io::Error::other)?;
+                    let spec = StateReadSpec {
+                        protocol: "broker-release-attest-v30".into(),
+                        source_generation: receipt.old_release.prepared.source_generation.clone(),
+                        root_id: receipt.old_release.prepared.root_id.clone(),
+                        owner_generation: receipt.old_release.prepared.owner_generation.clone(),
+                        attempt_id: None,
+                    };
+                    let bridge = handoff_tx.as_ref().ok_or_else(|| {
+                        io::Error::other("in-process release authority unavailable")
+                    })?;
+                    if bridge_released_handoff(
+                        bridge,
+                        spec,
+                        peer,
+                        lane.identity(),
+                        true,
+                        &runner_image,
+                    )? != receipt
+                    {
+                        return Err(io::Error::other("normal model release readback changed"));
+                    }
+                    let session = lane
+                        .read_session(&request.d_key)
+                        .map_err(io::Error::other)?
+                        .ok_or_else(|| io::Error::other("normal model D absent"))?;
+                    lane.require_released_invocation(&receipt, &recipient, &session)
+                        .map_err(io::Error::other)?;
+                    let selection = if operation == 0x84 {
+                        let guard = admission_fences
+                            .lock()
+                            .map_err(|_| io::Error::other("root admission fence poisoned"))?;
+                        if guard.contains(&receipt.old_release.prepared.root_id) {
+                            return Err(io::Error::other("exact root admission fenced"));
+                        }
+                        oulipoly_kernel_broker::normal_model_selection::select(
+                            &lane,
+                            &receipt,
+                            &recipient,
+                            &session,
+                            &config_dir,
+                        )?
+                    } else {
+                        match oulipoly_kernel_broker::normal_model_selection::observe(
+                            &lane,
+                            &receipt,
+                            &recipient,
+                            &session,
+                            &config_dir,
+                        )? {
+                            Some(selection) => selection,
+                            None => return Ok("fresh-normal-model absent\n".into()),
+                        }
+                    };
+                    if oulipoly_kernel_broker::normal_model_selection::observe(
+                        &lane,
+                        &receipt,
+                        &recipient,
+                        &session,
+                        &config_dir,
+                    )? != Some(selection.clone())
+                    {
+                        return Err(io::Error::other("normal model selection readback changed"));
+                    }
+                    let live = PinnedProcess::open(recipient.host_pid)?;
+                    if live.boot_id != recipient.boot_id
+                        || live.starttime_ticks != recipient.starttime_ticks
+                        || live.pidns_dev != recipient.pidns_dev
+                        || live.pidns_ino != recipient.pidns_ino
+                    {
+                        return Err(io::Error::other(
+                            "normal model actor changed during selection",
+                        ));
+                    }
+                    live.verify()?;
+                    Ok(format!(
+                        "fresh-normal-model {}\n",
+                        serde_json::to_string(&selection)?
+                    ))
                 }
                 #[cfg(feature = "age319-private-broker-fixture")]
                 b'5' | b'6' | b'7' | b'8' | b'9' | b'b' | b'y' | b'x' | b'$' | b'*' | b'/'

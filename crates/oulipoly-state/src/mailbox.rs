@@ -69,12 +69,12 @@ pub use fresh_lane::{
     FreshHeadlessNativeFProof, FreshHeadlessNativeFRequest, FreshInteractiveResidentRegistration,
     FreshNativeFAutoAck, FreshNativeFCallerResult, FreshNativeFObservedTurn,
     FreshNativeFPreparation, FreshNativeFPrepareRequest, FreshNativeFReceipt,
-    FreshNativeFSubmission, FreshNativeFTransport, FreshNormalWorkPreparation,
-    FreshPhysicalTerminal, FreshRecipientIdentity, FreshReleasedHandoff, FreshRootCallerResult,
-    FreshRootEffect, FreshRootEffectState, FreshRootHConsumption, FreshRootHDelegation,
-    FreshRootHSelectedK, FreshRootTerminalExecution, FreshRootTerminalReadback,
-    FreshRootWorkIntent, FreshV30Lane, FreshV30LaneIdentity, FreshV30Session,
-    normal_root_arguments,
+    FreshNativeFSubmission, FreshNativeFTransport, FreshNormalModelSelection,
+    FreshNormalModelSource, FreshNormalWorkPreparation, FreshPhysicalTerminal,
+    FreshRecipientIdentity, FreshReleasedHandoff, FreshRootCallerResult, FreshRootEffect,
+    FreshRootEffectState, FreshRootHConsumption, FreshRootHDelegation, FreshRootHSelectedK,
+    FreshRootTerminalExecution, FreshRootTerminalReadback, FreshRootWorkIntent, FreshV30Lane,
+    FreshV30LaneIdentity, FreshV30Session, normal_root_arguments,
 };
 pub use native_publication::NativePublication;
 #[path = "mailbox/schema.rs"]

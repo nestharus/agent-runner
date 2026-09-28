@@ -39,6 +39,7 @@
 - `crates/oulipoly-state/src/mailbox/migrations/0032_fresh_root_effect.sql`
 - `crates/oulipoly-state/src/mailbox/migrations/0033_fresh_bash_child.sql`
 - `crates/oulipoly-state/src/mailbox/migrations/0034_fresh_normal_work.sql`
+- `crates/oulipoly-state/src/mailbox/migrations/0047_fresh_normal_model_selection.sql`
 - `crates/oulipoly-state/src/mailbox/migrations/0035_fresh_bash_source.sql`
 - `crates/oulipoly-state/src/mailbox/migrations/0036_fresh_bash_notify.sql`
 - `crates/oulipoly-state/src/mailbox/migrations/0037_fresh_bash_listener.sql`

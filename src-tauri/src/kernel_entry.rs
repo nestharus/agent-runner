@@ -2235,12 +2235,55 @@ fn prepare_normal_work(
         }
         _ => None,
     };
+    #[cfg(not(feature = "age319-private-broker-fixture"))]
+    if let Some(invocation) = model_invocation.as_ref() {
+        let config_dir = oulipoly_state::paths::config_dir()?;
+        let source = File::open(&config_dir)
+            .map_err(|e| format!("normal model config source unavailable: {e}"))?;
+        let selection =
+            protocol::select_fresh_normal_model_at(&socket, &receipt.d_key, source.as_raw_fd())
+                .or_else(|selection_error| {
+                    match protocol::observe_fresh_normal_model_at(
+                        &socket,
+                        &receipt.d_key,
+                        source.as_raw_fd(),
+                    ) {
+                        Ok(Some(value)) => Ok(value),
+                        Ok(None) => Err(selection_error),
+                        Err(readback_error) => Err(std::io::Error::other(format!(
+                            "{selection_error}; exact readback refused: {readback_error}",
+                        ))),
+                    }
+                })
+                .map_err(|e| format!("normal model selection refused: {e}"))?;
+        if selection.invocation != *invocation || selection.state != "selected_no_effect" {
+            return Err("normal model selection readback differs from held invocation".into());
+        }
+    }
     #[cfg(feature = "age319-private-broker-fixture")]
     if std::env::var_os("AGE319_PRIVATE_NORMAL_ROOT_V1").is_some() {
         let repeated = protocol::prepare_fresh_normal_work_at(&socket, &receipt.d_key)
             .map_err(|e| format!("private normal preparation retry failed: {e}"))?;
         if repeated != preparation {
             return Err("normal work retry minted a second preparation".into());
+        }
+    }
+    #[cfg(feature = "age319-private-broker-fixture")]
+    if std::env::var_os("AGE319_PRIVATE_MODEL_SELECTION_PROBE_V1").is_some() {
+        let invocation = model_invocation
+            .as_ref()
+            .ok_or("private model selection probe has no held invocation")?;
+        let config_dir = oulipoly_state::paths::config_dir()?;
+        let source = File::open(&config_dir).map_err(|e| e.to_string())?;
+        let selected =
+            protocol::select_fresh_normal_model_at(&socket, &receipt.d_key, source.as_raw_fd())
+                .map_err(|e| e.to_string())?;
+        let repeated =
+            protocol::observe_fresh_normal_model_at(&socket, &receipt.d_key, source.as_raw_fd())
+                .map_err(|e| e.to_string())?
+                .ok_or("private model selection readback absent")?;
+        if selected != repeated || selected.invocation != *invocation {
+            return Err("private model selection readback changed".into());
         }
     }
     Ok(model_invocation)

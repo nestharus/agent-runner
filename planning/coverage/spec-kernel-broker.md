@@ -13,6 +13,7 @@
 - `crates/oulipoly-kernel-broker/src/fresh_index.rs`
 - `crates/oulipoly-kernel-broker/src/fresh_rebuild.rs`
 - `crates/oulipoly-kernel-broker/src/manual_quota.rs`
+- `crates/oulipoly-kernel-broker/src/normal_model_selection.rs`
 - `crates/oulipoly-kernel-broker/src/fresh_provider_fixture.rs`
 - `crates/oulipoly-kernel-broker/src/lib.rs`
 - `crates/oulipoly-kernel-broker/src/linux_main.rs`
@@ -43,7 +44,7 @@
 
 ## Preconditions
 
-- The broker source remains uninstalled. The opt-in Runner host entry starts a pinned completion guardian after a positive broker grant and requests a one-use root child join. Fresh NormalCli syntax reaches only a held preparation without separate effect authority.
+- The broker source remains uninstalled. The opt-in Runner host entry starts a pinned completion guardian after a positive broker grant and requests a one-use root child join. Fresh `--model` syntax can retain one source and account selection after held preparation; neither row has effect authority.
 - State and mailbox domains are initialized separately before this opt-in entry; preflight is read-only.
 - An installed service would require host root in the initial user/PID namespaces, protected binary and state paths, and a fixed Runner image.
 - Only trusted in-process broker code can call `insert_prepared`, after a separate positive accepted-work check. There is no work-registration socket opcode.
@@ -63,6 +64,7 @@
 | Root or work PID1 missing/changed on restart. | Durable unknown debt, never a drain receipt. |
 | Exact live v30 driver requests the broker-selected reserved source. | The retained sidecar supplies admitted registration/listener bytes. The broker checks original registration, environment and image inodes/hashes, holds one nested PID1 worker before exec, consumes the exact grant once in FULL WAL, fsyncs the physical record and confirmation, rechecks the original names, then opens the worker gate. A lost response never permits a second launch. The Runner driver does not call this route yet. |
 | Fresh D request UUID is sent to the versioned broker socket. | Broker commits an exact new-lane State session admission before the mailbox allocation. It returns only when both rows match the request, lane, source generation, session and allocation UUIDs. A lost reply returns the same pair; a State-first interruption is reconciled only by the same D key. d refuses the incomplete pair and never repairs it. Neither pair grants an invocation, owner, effect, result or ACK. |
+| Exact held `--model` root asks the fresh broker to select through a pinned config directory descriptor. | Broker derives the model/account from current config bytes and physical file identities, refuses missing/duplicate physical identity, unknown quota and unpinned multi-account policy, and retains one immutable State choice bound to root, owner, handoff, session and actor. Exact readback rechecks the source; the choice has no K, result or effect authority. |
 | Private held normal J has released U/D and the exact joined Runner submits descriptor-backed provider K. | Broker reattests the old release, actor/root and held row, seals the selected ELF, recipe and stdin, fsyncs a distinct one-use fresh grant before fork, then opens a nested PID1/provider gate only after exact attach. Provider exit, complete hashed output and PID1/parent wait Q are separate readbacks. A lost K reply observes the same grant; duplicate K refuses. The ordinary runtime result backend remains closed. |
 | Private causal Bash C/D has a consumed parent provider K and its own selected child work plan. | The broker binds child K to that distinct plan, then freezes a tree event only after exact physical child Q and verified raw output. W accepts the captured receipt through State without replaying K. Original response-only C has no F; original notify C settles W into an F request, while submission and ACK remain distinct. |
 | Original interactive root survives a broker restart after accepted Bash W. | The root remains the sole reader of its original PTY master and reattests the live resident provider before sending input. After EOF it submits the complete transcript and original master; the broker rechecks D/session/actor, selected interactive K/account/plan, attach/provider identity, live control pair, physical wait/tree/PID1 drain and PTY EOF. A matching raw prefix may be completed after an interrupted append. A changed prefix, lost root or wrong control pair leaves explicit unknown debt without a second K or Q. |
