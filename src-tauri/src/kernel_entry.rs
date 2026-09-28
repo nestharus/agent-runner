@@ -516,10 +516,7 @@ pub(crate) fn verify_installed_entry_route() -> Result<(), String> {
     }
     let route = protocol::observe_entry_gate_at(&broker_socket())
         .map_err(|error| format!("installed broker entry gate unavailable: {error}"))?;
-    #[cfg(feature = "age319-private-broker-fixture")]
-    if route == EntryRoute::BrokerV30Closed
-        && (private_prepared_mode() || private_normal_mode() || private_v30_child_mode())
-    {
+    if route == EntryRoute::BrokerV30Closed && private_userns_broker_socket().is_some() {
         return Ok(());
     }
     require_legacy_entry_route(route)
@@ -2193,11 +2190,14 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
             receipt.root_work_intent,
             oulipoly_state::mailbox::FreshRootWorkIntent::NormalCli(_)
         ) {
-            let _ = prepare_normal_work(&receipt, &session)?;
-            return Err(
-                "normal provider route held: native K/Q, result and physical custody are absent"
-                    .into(),
-            );
+            let invocation = prepare_normal_work(&receipt, &session)?;
+            if let Some(invocation) = invocation {
+                #[cfg(not(feature = "age319-private-broker-fixture"))]
+                return run_normal_model(&receipt, &session, &invocation);
+                #[cfg(feature = "age319-private-broker-fixture")]
+                let _ = invocation;
+            }
+            return Err("normal root intent has no caller result route".into());
         }
         return Err("root entry intent has no returnable effect/result path".into());
     }
@@ -2205,6 +2205,149 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
     let result = crate::process_entrypoint();
     return_root_effect(&receipt, &session, result == ExitCode::SUCCESS)?;
     Ok(result)
+}
+
+#[cfg(not(feature = "age319-private-broker-fixture"))]
+fn run_normal_model(
+    receipt: &oulipoly_state::mailbox::FreshReleasedHandoff,
+    _session: &oulipoly_state::mailbox::FreshV30Session,
+    invocation: &oulipoly_state::mailbox::FreshHeadlessModelInvocation,
+) -> Result<ExitCode, String> {
+    let socket = broker_socket().with_file_name("v30.sock");
+    let config_dir = oulipoly_state::paths::config_dir()?;
+    let source = File::open(config_dir).map_err(|e| e.to_string())?;
+    let cwd = File::open(std::env::current_dir().map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    let environment = sealed_normal_plan_environment()?;
+    let descriptors = [source.as_raw_fd(), cwd.as_raw_fd(), environment.as_raw_fd()];
+    let admission =
+        protocol::observe_fresh_normal_provider_admission_at(&socket, &receipt.d_key, descriptors)
+            .map_err(|e| format!("normal admission readback refused: {e}"))?
+            .ok_or("normal admission absent before K")?;
+    let plan = protocol::observe_fresh_normal_plan_at(&socket, &receipt.d_key, descriptors)
+        .map_err(|e| format!("normal plan readback refused: {e}"))?
+        .ok_or("normal plan absent before K")?;
+    if plan.selection.invocation != *invocation
+        || admission.handoff_id != receipt.handoff_id
+        || admission.plan_sha256 != plan.plan_sha256
+        || admission.state != "admitted_no_effect"
+    {
+        return Err("normal K plan or admission changed".into());
+    }
+    let lost_k_fixture = private_userns_broker_socket().is_some()
+        && std::env::var_os("AGE319_TEST_FEATURELESS_LOST_K_V1").is_some();
+    let launch = if lost_k_fixture {
+        protocol::launch_fresh_normal_provider_without_reply_at(
+            &socket,
+            &receipt.d_key,
+            descriptors,
+        )
+        .map_err(|error| format!("lost K fixture send: {error}"))?;
+        let gate = PathBuf::from(
+            std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                .ok_or("lost K fixture gate absent")?,
+        );
+        std::fs::write(gate.join("featureless-k-sent"), b"sent")
+            .map_err(|error| error.to_string())?;
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !gate.join("featureless-k-resume").exists() {
+            if std::time::Instant::now() >= until {
+                return Err("lost K fixture restart gate expired; K unknown".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        protocol::observe_fresh_normal_provider_at(&socket, &receipt.d_key, descriptors)
+            .and_then(|value| value.ok_or_else(|| std::io::Error::other("lost K absent")))
+    } else {
+        protocol::launch_fresh_normal_provider_at(&socket, &receipt.d_key, descriptors)
+    };
+    let first = launch
+        .or_else(|launch_error| {
+            match protocol::observe_fresh_normal_provider_at(&socket, &receipt.d_key, descriptors) {
+                Ok(Some(value)) => Ok(value),
+                Ok(None) => Err(launch_error),
+                Err(read_error) => Err(std::io::Error::other(format!(
+                    "normal K uncertain: {launch_error}; readback refused: {read_error}"
+                ))),
+            }
+        })
+        .map_err(|e| format!("normal K refused or unknown: {e}"))?;
+    let k = first.get("k").ok_or("normal K readback absent")?;
+    if k["handoff_id"] != receipt.handoff_id
+        || k["admission_id"] != admission.admission_id
+        || k["plan_sha256"] != plan.plan_sha256
+        || k["state"] != "consumed"
+    {
+        return Err("normal K readback changed exact admission".into());
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    loop {
+        let read = protocol::observe_fresh_normal_provider_at(&socket, &receipt.d_key, descriptors)
+            .map_err(|e| format!("normal Q unknown; exact readback refused: {e}"))?
+            .ok_or("normal Q unknown; consumed K disappeared")?;
+        if read.get("k") != Some(k) {
+            return Err("normal Q unknown; K identity changed".into());
+        }
+        if read["state"] == "drained" {
+            let q = read.get("q").ok_or("normal drained Q absent")?;
+            if q["admission_id"] != admission.admission_id
+                || q["plan_sha256"] != plan.plan_sha256
+                || q["tree_drained"] != true
+            {
+                return Err("normal drained Q changed admission or plan".into());
+            }
+            break;
+        }
+        if read["state"] != "unknown" {
+            return Err("normal Q state invalid".into());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "normal Q unknown after wait; K spent without replay: {}",
+                read["unknown_reason"]
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let publication =
+        protocol::publish_fresh_normal_provider_at(
+            &socket,
+            &receipt.d_key,
+            std::io::stdout().as_raw_fd(),
+            std::io::stderr().as_raw_fd(),
+        )
+        .or_else(|publish_error| {
+            protocol::observe_fresh_normal_publication_at(&socket, &receipt.d_key)
+            .map_err(|read_error| std::io::Error::other(format!(
+                "caller publication uncertain: {publish_error}; readback refused: {read_error}"
+            )))
+        })
+        .map_err(|e| format!("normal caller publication unknown: {e}"))?;
+    if private_userns_broker_socket().is_some()
+        && std::env::var_os("AGE319_TEST_FEATURELESS_DUP_PUBLISH_V1").is_some()
+    {
+        let duplicate = protocol::publish_fresh_normal_provider_at(
+            &socket,
+            &receipt.d_key,
+            std::io::stdout().as_raw_fd(),
+            std::io::stderr().as_raw_fd(),
+        )
+        .map_err(|e| format!("normal caller duplicate readback refused: {e}"))?;
+        if duplicate != publication {
+            return Err("normal caller duplicate changed publication".into());
+        }
+    }
+    if publication["admission_id"] != admission.admission_id
+        || publication["plan_sha256"] != plan.plan_sha256
+        || publication["state"] != "settled"
+    {
+        return Err("normal caller publication unknown; output replay refused".into());
+    }
+    let code = publication["exit_code"]
+        .as_u64()
+        .and_then(|value| u8::try_from(value).ok())
+        .ok_or("normal caller settled exit code absent")?;
+    Ok(ExitCode::from(code))
 }
 
 fn prepare_normal_work(
@@ -5891,9 +6034,7 @@ fn supported_host_mode() -> Result<(), String> {
     #[cfg(not(feature = "age319-private-broker-fixture"))]
     let private_entry_fixture = false;
     if !private_entry_fixture && !protocol::supported_entry_args(&args) {
-        return Err(
-            "unsupported kernel CLI mode: only help and offline diagnostics are admitted".into(),
-        );
+        return Err("unsupported kernel CLI mode".into());
     }
     if (0..=2).any(|fd| unsafe { libc::isatty(fd) } != 0) {
         return Err("TTY entry needs a separate descriptor handoff".into());
@@ -5905,16 +6046,24 @@ fn supported_host_mode() -> Result<(), String> {
 // UID 0 is not host root. It permits a private unprivileged broker-like fixture
 // to run the production bootstrap code without installing a host service.
 fn broker_socket() -> PathBuf {
-    #[cfg(feature = "age319-private-broker-fixture")]
+    if let Some(path) = private_userns_broker_socket() {
+        return path;
+    }
+    PathBuf::from(protocol::INSTALLED_SOCKET)
+}
+
+/// A disposable user-namespace fixture may use its own broker socket. The
+/// host-root installed image always uses the fixed installed socket.
+fn private_userns_broker_socket() -> Option<PathBuf> {
     if unsafe { libc::geteuid() } == 0
         && std::fs::read_to_string("/proc/self/uid_map")
             .ok()
             .is_some_and(|map| map.split_ascii_whitespace().nth(2) == Some("1"))
         && let Some(path) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1")
     {
-        return PathBuf::from(path);
+        return Some(PathBuf::from(path));
     }
-    PathBuf::from(protocol::INSTALLED_SOCKET)
+    None
 }
 
 #[cfg(feature = "age319-private-broker-fixture")]
@@ -6646,6 +6795,21 @@ fn v30_host_entry() -> Result<ExitCode, String> {
     if pid == 0 {
         drop(entry);
         let result = (|| {
+            // The guardian and its driver are control processes. Keep their
+            // diagnostics off the model caller's binary stderr channel; the
+            // joined actor retains the original descriptors for publication.
+            #[cfg(not(feature = "age319-private-broker-fixture"))]
+            if std::env::args().nth(1).as_deref() == Some("--model") {
+                let sink = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open("/dev/null")
+                    .map_err(|e| e.to_string())?;
+                for channel in [libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+                    if unsafe { libc::dup2(sink.as_raw_fd(), channel) } != channel {
+                        return Err(std::io::Error::last_os_error().to_string());
+                    }
+                }
+            }
             #[cfg(feature = "age319-private-broker-fixture")]
             if std::env::var_os("AGE319_PRIVATE_CALLER_OUTPUT_V1").is_some() {
                 use std::os::unix::fs::OpenOptionsExt as _;

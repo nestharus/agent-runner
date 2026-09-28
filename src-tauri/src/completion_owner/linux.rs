@@ -296,7 +296,6 @@ fn kernel_owner_witness(
 }
 
 pub(super) fn owner_broker_socket() -> PathBuf {
-    #[cfg(feature = "age319-private-broker-fixture")]
     if unsafe { libc::geteuid() } == 0
         && std::fs::read_to_string("/proc/self/uid_map")
             .ok()
