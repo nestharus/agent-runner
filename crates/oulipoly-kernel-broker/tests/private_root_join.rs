@@ -8709,6 +8709,22 @@ fn inner() {
                                 refusal.to_string().contains("source Q is live"),
                                 "{refusal}"
                             );
+                            let accepted: oulipoly_kernel_broker::accepted_grant::GrantRecord =
+                                serde_json::from_value(durable_h.clone()).unwrap();
+                            let works = oulipoly_kernel_broker::WorkRegistry::open(
+                                broker_state.join("works"),
+                                &roots,
+                            )
+                            .unwrap();
+                            let refusal = works
+                                .physical_q(
+                                    &expected,
+                                    &roots,
+                                    &accepted,
+                                    &broker_state.join("terminals"),
+                                )
+                                .unwrap_err();
+                            assert!(refusal.to_string().contains("still live"), "{refusal}");
                         }
                         fs::write(gate.join("source-adopted-started.release"), b"drain").unwrap();
                         let original_session = lane.read_session(&root.d_key).unwrap().unwrap();
@@ -9276,6 +9292,75 @@ fn inner() {
                                         assert_eq!(after["source_physical_outstanding"], 0);
                                         assert_eq!(after["source_physical_retired"], 1);
                                         assert_eq!(after["close_eligible"], false);
+                                        let accepted: oulipoly_kernel_broker::accepted_grant::GrantRecord =
+                                            serde_json::from_value(durable_h.clone()).unwrap();
+                                        let works_dir = broker_state.join("works");
+                                        let terminal_dir = broker_state.join("terminals");
+                                        eventually(|| {
+                                            let works = oulipoly_kernel_broker::WorkRegistry::open(
+                                                &works_dir, &roots,
+                                            )
+                                            .unwrap();
+                                            works
+                                                .physical_q(
+                                                    &expected,
+                                                    &roots,
+                                                    &accepted,
+                                                    &terminal_dir,
+                                                )
+                                                .is_ok()
+                                        });
+                                        let works = oulipoly_kernel_broker::WorkRegistry::open(
+                                            &works_dir, &roots,
+                                        )
+                                        .unwrap();
+                                        let work_q = works
+                                            .physical_q(&expected, &roots, &accepted, &terminal_dir)
+                                            .unwrap();
+                                        assert_eq!(work_q.grant_id, accepted.grant_id);
+                                        assert_eq!(work_q.work_id, accepted.work_id);
+                                        assert_eq!(work_q.pid1_wait_status, 0);
+                                        let reopened_work =
+                                            oulipoly_kernel_broker::WorkRegistry::open(
+                                                &works_dir, &roots,
+                                            )
+                                            .unwrap();
+                                        assert_eq!(
+                                            reopened_work
+                                                .physical_q(
+                                                    &expected,
+                                                    &roots,
+                                                    &accepted,
+                                                    &terminal_dir,
+                                                )
+                                                .unwrap(),
+                                            work_q
+                                        );
+                                        let work_receipt_path = terminal_dir
+                                            .join(format!("{}.json", work_q.work_incarnation,));
+                                        let work_receipt = fs::read(&work_receipt_path).unwrap();
+                                        fs::write(&work_receipt_path, b"changed child Q").unwrap();
+                                        assert!(
+                                            reopened_work
+                                                .physical_q(
+                                                    &expected,
+                                                    &roots,
+                                                    &accepted,
+                                                    &terminal_dir,
+                                                )
+                                                .is_err()
+                                        );
+                                        fs::write(&work_receipt_path, work_receipt).unwrap();
+                                        assert!(
+                                            reopened_work
+                                                .physical_q(
+                                                    &expected,
+                                                    &roots,
+                                                    &accepted,
+                                                    &terminal_dir,
+                                                )
+                                                .is_ok()
+                                        );
                                         let receipt_path = source_dir.join(format!(
                                             "{}.terminal.json",
                                             custody.source_grant_id
