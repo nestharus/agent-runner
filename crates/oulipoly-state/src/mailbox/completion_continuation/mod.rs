@@ -635,6 +635,10 @@ pub(super) fn validate_broker_schema_on(conn: &Connection) -> Result<(), String>
     validate_schema_version_on(conn, super::schema::BROKER_OWNED_VERSION, true)
 }
 
+pub(super) fn validate_broker_v36_schema_on(conn: &Connection) -> Result<(), String> {
+    validate_schema_version_on(conn, 36, true)
+}
+
 pub(super) fn validate_broker_v32_schema_on(conn: &Connection) -> Result<(), String> {
     validate_schema_version_on(conn, 32, true)
 }

@@ -318,7 +318,7 @@ fn classify_completion_summary(summary: CompletionProtocolSummary) -> Option<&'s
 // v30 was assigned to the broker-owned sidecar. Keep that ordinal reserved so
 // an ordinary opener can never mistake an old broker cutover for an upgrade.
 pub(super) const CURRENT_VERSION: i64 = 31;
-pub(super) const BROKER_OWNED_VERSION: i64 = 36;
+pub(super) const BROKER_OWNED_VERSION: i64 = 37;
 const MAX_SUPPORTED_VERSION: i64 = CURRENT_VERSION;
 const SCHEMA_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -754,7 +754,7 @@ pub(super) fn validate_broker_owned(conn: &Connection) -> Result<String, String>
     if version == 30 {
         return Err("persisted broker-owned v30 sidecar requires separate disposition; in-place migration is unsupported".into());
     }
-    if !matches!(version, 32 | 33 | 34 | 35 | BROKER_OWNED_VERSION) {
+    if !matches!(version, 32 | 33 | 34 | 35 | 36 | BROKER_OWNED_VERSION) {
         return Err(format!(
             "broker sidecar requires schema version {BROKER_OWNED_VERSION}"
         ));
@@ -767,6 +767,8 @@ pub(super) fn validate_broker_owned(conn: &Connection) -> Result<String, String>
         super::completion_continuation::validate_broker_v34_schema_on(&tx)?;
     } else if version == 35 {
         super::completion_continuation::validate_broker_v35_schema_on(&tx)?;
+    } else if version == 36 {
+        super::completion_continuation::validate_broker_v36_schema_on(&tx)?;
     } else {
         super::completion_continuation::validate_broker_schema_on(&tx)?;
     }
@@ -931,7 +933,7 @@ pub(super) fn validate_broker_owned(conn: &Connection) -> Result<String, String>
             }
         }
     }
-    if version == BROKER_OWNED_VERSION {
+    if version >= 36 {
         for (name, expected) in [
             (
                 "broker_v2_recipient_grant",
@@ -955,6 +957,33 @@ pub(super) fn validate_broker_owned(conn: &Connection) -> Result<String, String>
                 .map_err(|e| format!("broker v2 recipient schema missing: {e}"))?;
             if actual != expected {
                 return Err("broker v2 recipient schema changed".into());
+            }
+        }
+    }
+    if version == BROKER_OWNED_VERSION {
+        for (name, expected) in [
+            (
+                "broker_native_recipient_grant",
+                BROKER_NATIVE_RECIPIENT_GRANT_SCHEMA,
+            ),
+            (
+                "broker_native_recipient_grant_retain",
+                BROKER_NATIVE_RECIPIENT_GRANT_RETAIN,
+            ),
+            (
+                "broker_native_recipient_grant_guard",
+                BROKER_NATIVE_RECIPIENT_GRANT_GUARD,
+            ),
+        ] {
+            let actual: String = tx
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE name=?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("broker native recipient schema missing: {e}"))?;
+            if actual != expected {
+                return Err("broker native recipient schema changed".into());
             }
         }
     }
@@ -1262,6 +1291,52 @@ WHEN NEW.grant_id!=OLD.grant_id OR NEW.source_grant_id!=OLD.source_grant_id
       OR (OLD.phase='unknown' AND NEW.phase='submitted')
       OR (OLD.phase='submitted' AND NEW.phase='acked'))
 BEGIN SELECT RAISE(ABORT,'broker v2 recipient grant transition invalid'); END";
+
+// The selected Codex K is the recipient. Its assistant response and turn
+// receipt are independent of the older broker-image wake recipient.
+pub(super) const BROKER_NATIVE_RECIPIENT_GRANT_SCHEMA: &str =
+    "CREATE TABLE broker_native_recipient_grant (
+    grant_id TEXT PRIMARY KEY,
+    source_grant_id TEXT NOT NULL UNIQUE REFERENCES broker_source_effect_grant(grant_id),
+    source_generation TEXT NOT NULL, root_id TEXT NOT NULL, owner_generation TEXT NOT NULL,
+    registration_id TEXT NOT NULL, source_id TEXT NOT NULL,
+    listener_id TEXT NOT NULL, session_id TEXT NOT NULL,
+    owner_invocation_uuid TEXT NOT NULL, row_seq INTEGER NOT NULL UNIQUE,
+    payload_sha256 TEXT NOT NULL, payload_byte_len INTEGER NOT NULL CHECK(payload_byte_len>=0),
+    selected_k_json TEXT NOT NULL, native_session_id TEXT NOT NULL,
+    envelope_sha256 TEXT NOT NULL, delivery_token TEXT NOT NULL UNIQUE,
+    phase TEXT NOT NULL CHECK(phase IN ('reserved','unknown','submitted','acked')),
+    turn_id TEXT, turn_receipt_sha256 TEXT, ack_response_sha256 TEXT,
+    created_at TEXT NOT NULL, sending_at TEXT, submitted_at TEXT, acknowledged_at TEXT,
+    CHECK ((phase='reserved' AND sending_at IS NULL AND submitted_at IS NULL AND acknowledged_at IS NULL
+            AND turn_id IS NULL AND turn_receipt_sha256 IS NULL AND ack_response_sha256 IS NULL)
+        OR (phase='unknown' AND sending_at IS NOT NULL AND submitted_at IS NULL AND acknowledged_at IS NULL
+            AND turn_id IS NULL AND turn_receipt_sha256 IS NULL AND ack_response_sha256 IS NULL)
+        OR (phase='submitted' AND sending_at IS NOT NULL AND submitted_at IS NOT NULL AND acknowledged_at IS NULL
+            AND turn_id IS NOT NULL AND turn_receipt_sha256 IS NOT NULL AND ack_response_sha256 IS NULL)
+        OR (phase='acked' AND sending_at IS NOT NULL AND submitted_at IS NOT NULL AND acknowledged_at IS NOT NULL
+            AND turn_id IS NOT NULL AND turn_receipt_sha256 IS NOT NULL AND ack_response_sha256 IS NOT NULL))
+)";
+pub(super) const BROKER_NATIVE_RECIPIENT_GRANT_RETAIN: &str =
+    "CREATE TRIGGER broker_native_recipient_grant_retain
+BEFORE DELETE ON broker_native_recipient_grant
+BEGIN SELECT RAISE(ABORT,'broker native recipient grant retained'); END";
+pub(super) const BROKER_NATIVE_RECIPIENT_GRANT_GUARD: &str =
+    "CREATE TRIGGER broker_native_recipient_grant_guard
+BEFORE UPDATE ON broker_native_recipient_grant
+WHEN NEW.grant_id!=OLD.grant_id OR NEW.source_grant_id!=OLD.source_grant_id
+ OR NEW.source_generation!=OLD.source_generation OR NEW.root_id!=OLD.root_id
+ OR NEW.owner_generation!=OLD.owner_generation OR NEW.registration_id!=OLD.registration_id
+ OR NEW.source_id!=OLD.source_id OR NEW.listener_id!=OLD.listener_id
+ OR NEW.session_id!=OLD.session_id OR NEW.owner_invocation_uuid!=OLD.owner_invocation_uuid
+ OR NEW.row_seq!=OLD.row_seq OR NEW.payload_sha256!=OLD.payload_sha256
+ OR NEW.payload_byte_len!=OLD.payload_byte_len OR NEW.selected_k_json!=OLD.selected_k_json
+ OR NEW.native_session_id!=OLD.native_session_id OR NEW.envelope_sha256!=OLD.envelope_sha256
+ OR NEW.delivery_token!=OLD.delivery_token OR NEW.created_at!=OLD.created_at
+ OR NOT ((OLD.phase='reserved' AND NEW.phase='unknown')
+      OR (OLD.phase='unknown' AND NEW.phase='submitted')
+      OR (OLD.phase='submitted' AND NEW.phase='acked'))
+BEGIN SELECT RAISE(ABORT,'broker native recipient grant transition invalid'); END";
 
 pub(super) const BROKER_SOURCE_EVIDENCE_UPDATE_GUARD: &str =
     "CREATE TRIGGER broker_source_evidence_update_guard

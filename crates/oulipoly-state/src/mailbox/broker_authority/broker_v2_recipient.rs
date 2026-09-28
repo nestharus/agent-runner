@@ -30,7 +30,7 @@ pub struct BrokerV2RecipientGrant {
 }
 
 impl BrokerSidecar {
-    fn verify_v2_recipient_row(
+    pub(super) fn verify_v2_recipient_row(
         &self,
         binding: &BrokerV2RecipientBinding,
         phase: &str,
@@ -137,6 +137,8 @@ impl BrokerSidecar {
                 .conn
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM broker_v2_recipient_grant
+                 WHERE source_grant_id=?1 OR row_seq=?2)
+                 OR EXISTS(SELECT 1 FROM broker_native_recipient_grant
                  WHERE source_grant_id=?1 OR row_seq=?2)",
                     params![binding.source_grant_id, binding.row_seq],
                     |r| r.get::<_, bool>(0),
@@ -163,7 +165,9 @@ impl BrokerSidecar {
                WHERE m.seq=?11 AND m.session_id=?9 AND m.delivered_at IS NULL
                AND m.payload_sha256=?12 AND m.payload_byte_len=?13
                AND l.listener_id=?8 AND l.owner_invocation_uuid=?10
-               AND l.active=1 AND l.acknowledged_at IS NULL)",
+               AND l.active=1 AND l.acknowledged_at IS NULL)
+               AND NOT EXISTS(SELECT 1 FROM broker_native_recipient_grant
+                   WHERE source_grant_id=?2 OR row_seq=?11)",
                 params![
                     grant_id,
                     binding.source_grant_id,

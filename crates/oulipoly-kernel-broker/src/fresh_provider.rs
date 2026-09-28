@@ -7845,6 +7845,17 @@ fn native_rollout_turn(
     turn_id: &str,
     envelope: &str,
 ) -> io::Result<Option<String>> {
+    let Some(bytes) = native_rollout_snapshot(home, session, anchor)? else {
+        return Ok(None);
+    };
+    native_rollout_turn_bytes(&bytes, anchor, turn_id, envelope)
+}
+
+fn native_rollout_snapshot(
+    home: &Path,
+    session: &str,
+    anchor: &NativeRolloutAnchor,
+) -> io::Result<Option<Vec<u8>>> {
     let Some(path) = native_rollout_path(home, session)? else {
         return Ok(None);
     };
@@ -7867,6 +7878,15 @@ fn native_rollout_turn(
             "native Codex pre-send rollout anchor changed",
         ));
     }
+    Ok(Some(bytes))
+}
+
+fn native_rollout_turn_bytes(
+    bytes: &[u8],
+    anchor: &NativeRolloutAnchor,
+    turn_id: &str,
+    envelope: &str,
+) -> io::Result<Option<String>> {
     let mut started = 0;
     let mut completed = 0;
     let mut completion_seen = false;
@@ -7947,6 +7967,72 @@ fn native_rollout_turn(
         .map(ToOwned::to_owned)
         .map(Some)
         .ok_or_else(|| io::Error::other("native rollout user item ID absent"))
+}
+
+/// Only a provider-written assistant message in the completed, exact input
+/// turn can authorize the native action. A user echo, RPC reply or tool result
+/// cannot be interpreted as this response.
+fn native_rollout_assistant(
+    home: &Path,
+    session: &str,
+    anchor: &NativeRolloutAnchor,
+    turn_id: &str,
+    envelope: &str,
+    token: &str,
+) -> io::Result<Option<(String, String)>> {
+    let Some(bytes) = native_rollout_snapshot(home, session, anchor)? else {
+        return Ok(None);
+    };
+    let Some(user_id) = native_rollout_turn_bytes(&bytes, anchor, turn_id, envelope)? else {
+        return Ok(None);
+    };
+    let mut exact_user_seen = false;
+    let mut complete = false;
+    let mut assistant = Vec::new();
+    for line in bytes[anchor.prefix_len..]
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let record: serde_json::Value = serde_json::from_slice(line)?;
+        if record["type"] == "response_item" && record["payload"]["type"] == "message" {
+            let role = record["payload"]["role"].as_str().unwrap_or_default();
+            if role == "user" && record["payload"]["id"] == user_id {
+                exact_user_seen = true;
+            } else if role == "assistant" {
+                if !exact_user_seen || complete {
+                    return Err(io::Error::other(
+                        "native assistant outside exact completed turn",
+                    ));
+                }
+                let content = record["payload"]["content"]
+                    .as_array()
+                    .ok_or_else(|| io::Error::other("native assistant content absent"))?;
+                if content.len() != 1 || content[0]["type"] != "output_text" {
+                    return Err(io::Error::other("native assistant response ambiguous"));
+                }
+                let response = content[0]["text"]
+                    .as_str()
+                    .ok_or_else(|| io::Error::other("native assistant response text absent"))?;
+                assistant.push(response.to_owned());
+            }
+        } else if record["type"] == "response_item" && record["payload"]["type"] == "function_call"
+        {
+            return Err(io::Error::other("native assistant used a tool in ACK turn"));
+        } else if record["type"] == "event_msg" && record["payload"]["type"] == "task_complete" {
+            complete = true;
+        }
+    }
+    match assistant.as_slice() {
+        [response] if response.trim() == format!("AGE319_ACK {token}") => Ok(Some((
+            response.clone(),
+            format!("{:x}", Sha256::digest(response.as_bytes())),
+        ))),
+        [] => Err(io::Error::other("native assistant ACK output absent")),
+        [_] => Err(io::Error::other(
+            "native assistant returned wrong ACK token",
+        )),
+        _ => Err(io::Error::other("native assistant ACK output ambiguous")),
+    }
 }
 
 fn verify_native_original_custody(
@@ -8422,6 +8508,7 @@ impl NativeCodexControl {
         directory: &Path,
         state_root: &Path,
         binding: &Binding,
+        native_ack: bool,
     ) -> io::Result<NativeTurnExec> {
         let readback = self.readback(directory, binding)?;
         let physical = oulipoly_kernel_broker::source_physical::SourcePhysicalRegistry::open(
@@ -8497,10 +8584,14 @@ impl NativeCodexControl {
         let anchor = serde_json::json!({"thread": summary["thread"], "rollout": rollout_anchor});
         self.provider.verify()?;
         let nonce = uuid::Uuid::new_v4().to_string();
+        let ack_token = native_ack.then(|| uuid::Uuid::new_v4().to_string());
         let envelope = serde_json::json!({
             "format": "age319-native-recipient-input/v1",
-            "instruction": "Acknowledge this notification in one short sentence without running tools.",
+            "instruction": ack_token.as_ref().map(|token|
+                format!("Read this notification and respond with exactly AGE319_ACK {token}. Do not use tools or add any other text."))
+                .unwrap_or_else(|| "Acknowledge this notification in one short sentence without running tools.".into()),
             "nonce": nonce,
+            "ack_token": ack_token,
             "selected_k": readback,
             "original": {
                 "source_grant_id": custody.source_grant_id,
@@ -8518,6 +8609,35 @@ impl NativeCodexControl {
             },
             "payload_json": payload,
         }).to_string();
+        let native_grant = if let Some(token) = ack_token.as_deref() {
+            let original = oulipoly_state::mailbox::BrokerV2RecipientBinding {
+                source_grant_id: custody.source_grant_id.clone(),
+                source_id: custody.source_id.clone(),
+                registration_id: custody.registration_id.clone(),
+                source_generation: custody.source_generation.clone(),
+                root_id: custody.root_id.clone(),
+                owner_generation: custody.owner_generation.clone(),
+                listener_id: custody.listener_id.clone(),
+                session_id: custody.session_id.clone(),
+                owner_invocation_uuid: custody.owner_invocation_uuid.clone(),
+                row_seq: custody.row_seq,
+                payload_sha256: custody.payload_sha256.clone(),
+                payload_byte_len: custody.payload_byte_len,
+            };
+            Some(
+                sidecar
+                    .reserve_native_recipient_grant(
+                        &original,
+                        &serde_json::to_string(&readback)?,
+                        &readback.native_session_id,
+                        &format!("{:x}", Sha256::digest(envelope.as_bytes())),
+                        token,
+                    )
+                    .map_err(io::Error::other)?,
+            )
+        } else {
+            None
+        };
         let attempt_path = directory.join(format!("{}.native-turn-attempt.json", self.grant_id));
         let attempt = serde_json::json!({
             "format": "age319-native-turn-attempt/v1",
@@ -8525,6 +8645,7 @@ impl NativeCodexControl {
             "readback": readback,
             "anchor": anchor,
             "nonce": nonce,
+            "native_ack_grant_id": native_grant.as_ref().map(|grant| &grant.grant_id),
             "envelope_sha256": format!("{:x}", Sha256::digest(envelope.as_bytes())),
             "envelope_byte_len": envelope.len(),
         });
@@ -8542,6 +8663,7 @@ impl NativeCodexControl {
         let binding = binding.clone();
         let worker_binding = binding.clone();
         let state_root = state_root.to_path_buf();
+        let directory = directory.to_path_buf();
         std::thread::Builder::new()
             .name("selected-k-native-turn".into())
             .spawn(move || {
@@ -8555,6 +8677,8 @@ impl NativeCodexControl {
                         &state_root,
                         &custody,
                         &rollout_anchor,
+                        &directory,
+                        native_grant.as_ref(),
                     )
                     .map_err(|error| error.to_string());
                 let _ = sender.send(result);
@@ -8576,6 +8700,8 @@ impl NativeCodexControl {
         state_root: &Path,
         custody: &oulipoly_kernel_broker::source_acceptance::V2RecipientCustody,
         rollout_anchor: &NativeRolloutAnchor,
+        directory: &Path,
+        native_grant: Option<&oulipoly_state::mailbox::BrokerNativeRecipientGrant>,
     ) -> io::Result<serde_json::Value> {
         if &self.binding != binding {
             return Err(io::Error::other("native turn binding changed"));
@@ -8585,6 +8711,16 @@ impl NativeCodexControl {
         self.provider.verify()?;
         self.verify_native_home()?;
         verify_native_original_custody(state_root, custody)?;
+        if let Some(grant) = native_grant {
+            let mut sidecar = oulipoly_state::mailbox::BrokerSidecar::open_existing(
+                &state_root.join("sidecar/pid-identity.db"),
+                state_root,
+            )
+            .map_err(io::Error::other)?;
+            sidecar
+                .begin_native_recipient_send(grant)
+                .map_err(io::Error::other)?;
+        }
         let submitted = native_codex_message(
             &mut self.endpoint,
             &self.provider,
@@ -8653,6 +8789,103 @@ impl NativeCodexControl {
                 file.write_all(b"\n")?;
                 file.sync_all()?;
                 File::open(receipt_path.parent().unwrap())?.sync_all()?;
+                if let Some(grant) = native_grant {
+                    let receipt_sha256 = format!("{:x}", Sha256::digest(fs::read(receipt_path)?));
+                    let mut sidecar = oulipoly_state::mailbox::BrokerSidecar::open_existing(
+                        &state_root.join("sidecar/pid-identity.db"),
+                        state_root,
+                    )
+                    .map_err(io::Error::other)?;
+                    sidecar
+                        .mark_native_recipient_submitted(grant, turn_id, &receipt_sha256)
+                        .map_err(io::Error::other)?;
+                    let (_, response_sha256) = native_rollout_assistant(
+                        &self.native_home,
+                        &readback.native_session_id,
+                        rollout_anchor,
+                        turn_id,
+                        envelope,
+                        &grant.delivery_token,
+                    )?
+                    .ok_or_else(|| io::Error::other("native assistant ACK output absent"))?;
+                    if self.readback(directory, binding)? != *readback {
+                        return Err(io::Error::other("native ACK selected K changed"));
+                    }
+                    let thread = native_codex_message(
+                        &mut self.endpoint,
+                        &self.provider,
+                        8,
+                        "thread/read",
+                        serde_json::json!({"threadId": readback.native_session_id}),
+                    )?;
+                    if thread
+                        .pointer("/thread/id")
+                        .and_then(serde_json::Value::as_str)
+                        != Some(readback.native_session_id.as_str())
+                        || thread
+                            .pointer("/thread/status/type")
+                            .and_then(serde_json::Value::as_str)
+                            != Some("idle")
+                    {
+                        return Err(io::Error::other("native ACK thread changed"));
+                    }
+                    self.provider.verify()?;
+                    self.verify_native_home()?;
+                    verify_native_original_custody(state_root, custody)?;
+                    let selected_k_json = serde_json::to_string(readback)?;
+                    let settled = sidecar.acknowledge_native_recipient(
+                        &custody.source_grant_id,
+                        &selected_k_json,
+                        &grant.delivery_token,
+                        turn_id,
+                        &receipt_sha256,
+                        &response_sha256,
+                    );
+                    #[cfg(feature = "age319-private-broker-fixture")]
+                    let settled = if std::env::var_os("AGE319_PRIVATE_NATIVE_ACK_DROP_REPLY_V1")
+                        .is_some()
+                    {
+                        settled
+                            .and_then(|_| Err("private native ACK transaction reply lost".into()))
+                    } else {
+                        settled
+                    };
+                    let settled = match settled {
+                        Ok(value) => value,
+                        Err(error) => {
+                            // A lost SQLite reply permits only readback, never another send.
+                            let readback = sidecar
+                                .read_native_recipient_grant(&custody.source_grant_id)
+                                .map_err(io::Error::other)?;
+                            match readback {
+                                Some(value)
+                                    if value.phase == "acked"
+                                        && value.ack_response_sha256.as_deref()
+                                            == Some(&response_sha256)
+                                        && value.turn_receipt_sha256.as_deref()
+                                            == Some(&receipt_sha256)
+                                        && value.turn_id.as_deref() == Some(turn_id)
+                                        && value.delivery_token == grant.delivery_token =>
+                                {
+                                    value
+                                }
+                                _ => return Err(io::Error::other(error)),
+                            }
+                        }
+                    };
+                    return Ok(serde_json::json!({
+                        "format": "age319-native-recipient-ack/v1",
+                        "readback": readback,
+                        "turn_id": turn_id,
+                        "nonce": nonce,
+                        "status": "completed",
+                        "original_row_acknowledged": true,
+                        "native_recipient_grant_id": settled.grant_id,
+                        "original_row_seq": settled.binding.row_seq,
+                        "turn_receipt_sha256": receipt_sha256,
+                        "ack_response_sha256": response_sha256,
+                    }));
+                }
                 return Ok(receipt);
             }
             if Instant::now() >= deadline {
@@ -9500,6 +9733,111 @@ mod tests {
         )
         .unwrap();
         assert!(native_rollout_turn(temp.path(), &session, &anchor, "turn-one", envelope).is_err());
+    }
+
+    #[test]
+    fn native_assistant_ack_requires_one_exact_provider_message_in_completed_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        let directory = temp.path().join("sessions/2026/09/27");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(format!("rollout-{session}.jsonl"));
+        let prefix = format!(
+            "{}\n",
+            serde_json::json!({"type":"session_meta","payload":{"id":session}})
+        );
+        fs::write(&path, &prefix).unwrap();
+        let anchor = native_rollout_anchor(temp.path(), &session).unwrap();
+        let token = uuid::Uuid::new_v4().to_string();
+        let envelope = format!("input with {token}");
+        let start = serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-one"}});
+        let user = serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","id":"user-one","content":[{"type":"input_text","text":envelope}]}});
+        let assistant = serde_json::json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":format!("AGE319_ACK {token}")}]}});
+        let done = serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-one"}});
+        fs::write(&path, format!("{prefix}{start}\n{user}\n{done}\n")).unwrap();
+        assert!(
+            native_rollout_assistant(
+                temp.path(),
+                &session,
+                &anchor,
+                "turn-one",
+                &envelope,
+                &token
+            )
+            .is_err(),
+            "user echo is not an ACK"
+        );
+        fs::write(
+            &path,
+            format!("{prefix}{start}\n{user}\n{assistant}\n{done}\n"),
+        )
+        .unwrap();
+        let (response, digest) = native_rollout_assistant(
+            temp.path(),
+            &session,
+            &anchor,
+            "turn-one",
+            &envelope,
+            &token,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(response, format!("AGE319_ACK {token}"));
+        assert_eq!(digest, format!("{:x}", Sha256::digest(response.as_bytes())));
+        assert!(
+            native_rollout_assistant(
+                temp.path(),
+                &session,
+                &anchor,
+                "turn-one",
+                &envelope,
+                "wrong"
+            )
+            .is_err()
+        );
+        assert!(
+            native_rollout_assistant(
+                temp.path(),
+                &session,
+                &anchor,
+                "turn-two",
+                &envelope,
+                &token
+            )
+            .is_err()
+        );
+        fs::write(
+            &path,
+            format!("{prefix}{start}\n{user}\n{assistant}\n{assistant}\n{done}\n"),
+        )
+        .unwrap();
+        assert!(
+            native_rollout_assistant(
+                temp.path(),
+                &session,
+                &anchor,
+                "turn-one",
+                &envelope,
+                &token
+            )
+            .is_err()
+        );
+        fs::write(
+            &path,
+            format!("{prefix}{start}\n{user}\n{done}\n{assistant}\n"),
+        )
+        .unwrap();
+        assert!(
+            native_rollout_assistant(
+                temp.path(),
+                &session,
+                &anchor,
+                "turn-one",
+                &envelope,
+                &token
+            )
+            .is_err()
+        );
     }
 
     fn fixture_grant(binding: Binding, plan_sha256: String) -> Grant {

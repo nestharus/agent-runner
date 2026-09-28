@@ -3297,7 +3297,7 @@ impl oulipoly_runtime::executor::cli::fresh_remote::FreshProviderBackend
                 }
                 std::thread::sleep(PRIVATE_PROVIDER_RESULT_POLL);
             }
-            return Err("private native Codex K launched and drained after same-K Bash; native F/receipt/ACK not yet joined".into());
+            return Err("private native Codex K drained after same-K Bash; fresh F settlement and root close are not joined".into());
         }
         let causal = std::env::var_os("AGE319_PRIVATE_PROVIDER_CAUSAL_BASH_V1").is_some();
         let direct_caller = std::env::var_os("AGE319_PRIVATE_CALLER_OUTPUT_V1").is_some();

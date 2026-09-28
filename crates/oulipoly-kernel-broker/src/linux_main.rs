@@ -7835,7 +7835,12 @@ fn serve_fresh_v30_at(
                             io::Error::other("native Bash result absent; native turn refused")
                         })?;
                         let control = execution.take_control(&binding)?;
-                        let turn = control.begin_turn(&directory, state_root, &binding)?;
+                        let turn = control.begin_turn(
+                            &directory,
+                            state_root,
+                            &binding,
+                            std::env::var_os("AGE319_PRIVATE_NATIVE_RECIPIENT_ACK_V1").is_some(),
+                        )?;
                         native_turn_execs.insert(grant.clone(), turn);
                         if std::env::var_os("AGE319_PRIVATE_NATIVE_TURN_DROP_REPLY_V1").is_some() {
                             drop_native_turn_reply = true;
