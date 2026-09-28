@@ -3,7 +3,6 @@
 const SOURCE_TICKET_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 const BROKER_ACCEPT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 const NORMAL_CLOSE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
-#[cfg(feature = "age319-private-broker-fixture")]
 const ORDINARY_BASH_COMPLETION_POLL_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(100);
 const BROKER_INGRESS_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -15,19 +14,15 @@ const FRESH_HANDOFF_QUEUE_CAPACITY: usize = 8;
 const RELEASED_HANDOFF_REPLY_CAPACITY: usize = 1;
 
 const REQUEST_RECEIVE_BUFFER_BYTES: usize = 64 * 1024;
-#[cfg(feature = "age319-private-broker-fixture")]
 const SYNC_STREAM_VERIFY_BUFFER_BYTES: usize = 64 * 1024;
 
-#[cfg(feature = "age319-private-broker-fixture")]
 #[path = "fresh_provider.rs"]
 mod fresh_provider;
 // Opt-in AGE-319 route and original-provider writer index. Account/effect/manual
 // eligibility readers still use retained evidence; this is not activation.
-#[cfg(feature = "age319-private-broker-fixture")]
 #[path = "fresh_index.rs"]
 #[allow(dead_code)]
 mod fresh_index;
-#[cfg(feature = "age319-private-broker-fixture")]
 #[path = "manual_quota.rs"]
 mod manual_quota;
 #[path = "namespace_helper_reaper.rs"]
@@ -100,7 +95,6 @@ use std::collections::HashMap;
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Write};
-#[cfg(feature = "age319-private-broker-fixture")]
 use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::IntoRawFd;
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -321,7 +315,6 @@ fn private_fixture() -> bool {
             .is_some_and(|map| map.split_ascii_whitespace().nth(2) == Some("1"))
         && std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1").is_some()
 }
-#[cfg(feature = "age319-private-broker-fixture")]
 fn open_exact_sync_stream(
     directory: &Path,
     grant: &str,
@@ -375,6 +368,25 @@ fn private_native_f_drop_reply(stage: &str) {
 #[cfg(not(feature = "age319-private-broker-fixture"))]
 fn private_fixture() -> bool {
     false
+}
+
+fn pinned_bash_image(pair: Option<&InstalledPair>) -> io::Result<Option<File>> {
+    if let Some(pair) = pair {
+        let Some(digest) = pair.bash_sha256.as_deref() else {
+            return Ok(None);
+        };
+        let path = Path::new(installed_pair::BASH);
+        let image = File::open(path)?;
+        pair.verify_file(path, digest, true, &image)?;
+        return Ok(Some(image));
+    }
+    #[cfg(feature = "age319-private-broker-fixture")]
+    if private_fixture() {
+        return std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_BASH_V1")
+            .map(File::open)
+            .transpose();
+    }
+    Ok(None)
 }
 
 fn checked_root_path(path: &Path, directory: bool) -> io::Result<()> {
@@ -494,16 +506,10 @@ enum RequestPayload {
     FreshRootEffectRequest {
         request: FreshRootEffectRequest,
     },
-    #[allow(
-        dead_code,
-        reason = "fresh Bash lane is closed without the private fixture"
-    )]
     FreshBashChildRequest {
         request_id: String,
         listener_policy: Option<FreshBashListenerPolicy>,
-        #[cfg(feature = "age319-private-broker-fixture")]
         ordinary_command: Option<fresh_provider::OrdinaryBashCommand>,
-        #[cfg(feature = "age319-private-broker-fixture")]
         ordinary_k_digest: Option<[u8; 32]>,
     },
     #[allow(
@@ -666,7 +672,6 @@ enum RequestPayload {
     },
 }
 
-#[cfg(feature = "age319-private-broker-fixture")]
 fn read_ordinary_bash_command_descriptor(
     mut file: File,
 ) -> io::Result<fresh_provider::OrdinaryBashCommand> {
@@ -789,15 +794,17 @@ fn recv_request(
         b'G' | b'g' => read == 65,
         b'P' | b'p' => read == 37,
         b'Q' | b'Z' | b'q' | b'z' | b'D' | b'd' | b'c' => read == 33,
+        b'9' => {
+            read == 33
+                || cfg!(feature = "age319-private-broker-fixture")
+                    && (18..=2048 + 17).contains(&read)
+        }
         b'C' => read == 33 || read == 34,
-        #[cfg(feature = "age319-private-broker-fixture")]
         b'X' => read == 34,
-        #[cfg(feature = "age319-private-broker-fixture")]
         b'%' | b'!' | b'<' => read == 33,
-        #[cfg(feature = "age319-private-broker-fixture")]
         b'u' | b'v' => read == 33,
-        #[cfg(feature = "age319-private-broker-fixture")]
         b'^' => read == 65,
+        0x90 => read == 17,
         // Legacy E has no body; fresh Bash E carries a request UUID on its
         // separate socket. Preserve both exact wire shapes for pinned images.
         b'E' => read == 17 || read == 33,
@@ -812,8 +819,9 @@ fn recv_request(
         b'=' | b'V' | b'S' | b's' | b'T' | b'H' | b'K' | b'B' | b'N' | b'k' | b't' | b'R'
         | b'W' | b'Y' | b'0' | b'1' | b'2' | b'3' | b'4' => (18..=2048 + 17).contains(&read),
         #[cfg(feature = "age319-private-broker-fixture")]
-        b'5' | b'6' | b'7' | b'8' | b'9' | b'b' | b'y' | b'x' | b'$' | b'*' | b'/' | b'>'
-        | b'_' => (18..=2048 + 17).contains(&read),
+        b'5' | b'6' | b'7' | b'8' | b'b' | b'y' | b'x' | b'$' | b'*' | b'/' | b'>' | b'_' => {
+            (18..=2048 + 17).contains(&read)
+        }
         #[cfg(feature = "age319-private-broker-fixture")]
         b'h' | b'f' | b'(' | b')' | b'm' | b'n' | b'o' | b'w' | b'r' => {
             (18..=48 * 1024 + 17).contains(&read)
@@ -845,11 +853,9 @@ fn recv_request(
             0x8d => !descriptors.is_empty(),
             #[cfg(feature = "age319-private-broker-fixture")]
             b'5' | b'b' => descriptors.len() != 4,
-            #[cfg(feature = "age319-private-broker-fixture")]
             b'9' => !(read == 33 && descriptors.is_empty()) && descriptors.len() != 4,
             #[cfg(feature = "age319-private-broker-fixture")]
             b'h' | b'(' => descriptors.len() != 5,
-            #[cfg(feature = "age319-private-broker-fixture")]
             b'X' | b'^' | b'f' | b')' | b'w' | b'~' | b'?' => descriptors.len() != 1,
             #[cfg(feature = "age319-private-broker-fixture")]
             b'#' => descriptors.len() != 2,
@@ -977,16 +983,13 @@ fn recv_request(
             } else {
                 None
             },
-            #[cfg(feature = "age319-private-broker-fixture")]
             ordinary_command: if request[0] == b'C' && read > 34 {
                 Some(serde_json::from_slice(&request[34..read as usize])?)
             } else {
                 None
             },
-            #[cfg(feature = "age319-private-broker-fixture")]
             ordinary_k_digest: None,
         },
-        #[cfg(feature = "age319-private-broker-fixture")]
         b'X' => RequestPayload::FreshBashChildRequest {
             request_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
             listener_policy: Some(match request[33] {
@@ -999,14 +1002,12 @@ fn recv_request(
             )?),
             ordinary_k_digest: None,
         },
-        #[cfg(feature = "age319-private-broker-fixture")]
         b'%' | b'!' | b'8' | b'9' | b'v' | b'u' | b'<' => RequestPayload::FreshBashChildRequest {
             request_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
             listener_policy: None,
             ordinary_command: None,
             ordinary_k_digest: None,
         },
-        #[cfg(feature = "age319-private-broker-fixture")]
         b'^' => RequestPayload::FreshBashChildRequest {
             request_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
             listener_policy: None,
@@ -1018,9 +1019,7 @@ fn recv_request(
         b'E' if read == 33 => RequestPayload::FreshBashChildRequest {
             request_id: uuid::Uuid::from_bytes(request[17..33].try_into().unwrap()).to_string(),
             listener_policy: None,
-            #[cfg(feature = "age319-private-broker-fixture")]
             ordinary_command: None,
-            #[cfg(feature = "age319-private-broker-fixture")]
             ordinary_k_digest: None,
         },
         b'O' => RequestPayload::FreshBashPrivateResult {
@@ -5219,6 +5218,7 @@ fn serve() -> io::Result<()> {
     if fs::symlink_metadata(&fresh_root).is_ok() {
         let fresh_state_root = PathBuf::from(&state);
         let fresh_runner_image = runner_image.try_clone()?;
+        let fresh_bash_image = pinned_bash_image(installed_pair.as_ref())?;
         let fresh_handoff_tx = handoff_tx.clone();
         let fresh_terminal_tx = terminal_tx.clone();
         let fresh_drain_tx = drain_tx.clone();
@@ -5235,6 +5235,7 @@ fn serve() -> io::Result<()> {
                     &fresh_state_root,
                     &fresh_socket,
                     fresh_runner_image,
+                    fresh_bash_image,
                     Some(fresh_handoff_tx),
                     Some(fresh_terminal_tx),
                     Some(fresh_drain_tx),
@@ -6496,7 +6497,7 @@ fn serve_fresh_v30() -> io::Result<()> {
     } else {
         RUNNER.into()
     };
-    if !fixture {
+    let installed_pair = if !fixture {
         checked_root_path(Path::new(&state_root), true)?;
         checked_root_path(Path::new("/run/oulipoly-kernel-broker"), true)?;
         checked_root_path(Path::new(&runner), false)?;
@@ -6510,7 +6511,11 @@ fn serve_fresh_v30() -> io::Result<()> {
         )?;
         let image = File::open(&runner)?;
         pair.verify_file(Path::new(&runner), &pair.runner_sha256, true, &image)?;
-    }
+        Some(pair)
+    } else {
+        None
+    };
+    let bash_image = pinned_bash_image(installed_pair.as_ref())?;
     let roots = RootRegistry::open(&state_root)?;
     let admission_fences = Arc::new(Mutex::new(
         roots
@@ -6522,6 +6527,7 @@ fn serve_fresh_v30() -> io::Result<()> {
         Path::new(&state_root),
         Path::new(&socket),
         File::open(&runner)?,
+        bash_image,
         None,
         None,
         None,
@@ -6529,7 +6535,6 @@ fn serve_fresh_v30() -> io::Result<()> {
     )
 }
 
-#[cfg(feature = "age319-private-broker-fixture")]
 fn fresh_bash_parent(
     state_root: &Path,
     lane: &FreshV30Lane,
@@ -6616,7 +6621,6 @@ fn fixed_private_bash_child_plan() -> io::Result<fresh_provider::Plan> {
     )
 }
 
-#[cfg(feature = "age319-private-broker-fixture")]
 fn settle_ordinary_bash_q(state_root: &Path, request_id: &str) -> io::Result<bool> {
     let directory = state_root.join("v30/fresh-provider");
     let mut lane = FreshV30Lane::open_at(state_root).map_err(io::Error::other)?;
@@ -6655,7 +6659,6 @@ fn settle_ordinary_bash_q(state_root: &Path, request_id: &str) -> io::Result<boo
     Ok(true)
 }
 
-#[cfg(feature = "age319-private-broker-fixture")]
 fn ordinary_bash_completion_worker(
     state_root: PathBuf,
     receiver: Receiver<String>,
@@ -6680,6 +6683,7 @@ fn serve_fresh_v30_at(
     state_root: &Path,
     socket: &Path,
     runner_image: File,
+    bash_image: Option<File>,
     handoff_tx: Option<SyncSender<FreshHandoffBridgeRequest>>,
     terminal_tx: Option<SyncSender<FreshTerminalBridgeRequest>>,
     drain_tx: Option<SyncSender<FreshDrainBridgeRequest>>,
@@ -6690,24 +6694,22 @@ fn serve_fresh_v30_at(
     oulipoly_kernel_broker::json_artifact::require_no_pending(
         &state_root.join("v30/fresh-provider"),
     )?;
-    #[cfg(feature = "age319-private-broker-fixture")]
-    if private_fixture() {
-        if let Err(error) = lane.repair_captured_private_bash_sources() {
-            eprintln!("fresh Bash source repair remains unknown: {error}");
-        }
-        if let Err(error) = lane.repair_private_bash_listener_notifications() {
-            eprintln!("fresh Bash listener repair remains pending: {error}");
-        }
-        if let Err(error) = lane.repair_private_bash_notifications() {
-            eprintln!("fresh Bash notification repair remains pending: {error}");
-        }
+    if let Err(error) = lane.repair_captured_private_bash_sources() {
+        eprintln!("fresh Bash source repair remains unknown: {error}");
+    }
+    if let Err(error) = lane.repair_private_bash_listener_notifications() {
+        eprintln!("fresh Bash listener repair remains pending: {error}");
+    }
+    if let Err(error) = lane.repair_private_bash_notifications() {
+        eprintln!("fresh Bash notification repair remains pending: {error}");
     }
     // The lease spans all broker requests, including route, grant, provider K,
     // quota/auth/manual intent and K, and their readback paths. Offline index
     // rebuild takes the exclusive side before reading any retained evidence.
-    #[cfg(feature = "age319-private-broker-fixture")]
-    let admission = fresh_index::broker_admission_lease(&state_root.join("v30/fresh-provider"))
+    let _admission = fresh_index::broker_admission_lease(&state_root.join("v30/fresh-provider"))
         .map_err(io::Error::other)?;
+    #[cfg(feature = "age319-private-broker-fixture")]
+    let admission = &_admission;
     #[cfg(feature = "age319-private-broker-fixture")]
     let provider_readback_v3 = {
         let root = state_root.join("v30/fresh-provider");
@@ -6800,26 +6802,9 @@ fn serve_fresh_v30_at(
         Some(_) => return Err(io::Error::other("route reader probe switch invalid")),
         None => route_index,
     };
+    #[cfg(not(feature = "age319-private-broker-fixture"))]
+    let route_index: Option<fresh_index::Index> = None;
     let instance = EntryGate::open(&state_root.join("v30"))?;
-    // An installed Bash child must match the package's pinned digest. Private
-    // fixtures supply their built source binary only at broker startup.
-    #[cfg(feature = "age319-private-broker-fixture")]
-    let bash_image = if private_fixture() {
-        std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_BASH_V1")
-            .map(File::open)
-            .transpose()?
-    } else {
-        let pair = InstalledPair::load(Path::new(installed_pair::MANIFEST), true)?;
-        pair.bash_sha256
-            .as_deref()
-            .map(|digest| -> io::Result<File> {
-                let path = Path::new(installed_pair::BASH);
-                let image = File::open(path)?;
-                pair.verify_file(path, digest, true, &image)?;
-                Ok(image)
-            })
-            .transpose()?
-    };
     match fs::symlink_metadata(socket) {
         Ok(meta) if meta.file_type().is_socket() && meta.uid() == 0 && meta.nlink() == 1 => {
             fs::remove_file(socket)?;
@@ -6830,8 +6815,7 @@ fn serve_fresh_v30_at(
     }
     let listener = UnixListener::bind(socket)?;
     fs::set_permissions(socket, fs::Permissions::from_mode(0o660))?;
-    #[cfg(feature = "age319-private-broker-fixture")]
-    let ordinary_completion_tx = if private_fixture() {
+    let ordinary_completion_tx = {
         let (sender, receiver) = mpsc::channel();
         let directory = state_root.join("v30/fresh-provider");
         let startup_requests = if directory.exists() {
@@ -6845,9 +6829,7 @@ fn serve_fresh_v30_at(
             .spawn(move || {
                 ordinary_bash_completion_worker(state_root, receiver, startup_requests)
             })?;
-        Some(sender)
-    } else {
-        None
+        sender
     };
     #[cfg(feature = "age319-private-broker-fixture")]
     let mut native_codex_controls: HashMap<String, fresh_provider::NativeCodexControl> =
@@ -6879,12 +6861,10 @@ fn serve_fresh_v30_at(
         let mut drop_account_effect_reply = false;
         #[cfg(feature = "age319-private-broker-fixture")]
         let mut drop_root_h_reply = false;
-        #[cfg(feature = "age319-private-broker-fixture")]
         let mut provider_output_files: Option<Vec<File>> = None;
         let mut drop_route_reply = false;
         let mut diagnostic_opcode = b'?';
         let mut diagnostic_stage = "request_decode";
-        #[cfg(feature = "age319-private-broker-fixture")]
         let mut diagnostic_key_hash = String::from("unavailable");
         let answer = (|| -> io::Result<String> {
             let (operation, payload, peer) = peer_from_request(&mut stream)?;
@@ -6909,9 +6889,7 @@ fn serve_fresh_v30_at(
                     request: FreshRecipientRequest::Lookup { .. }
                 } | RequestPayload::FreshBashChildRequest { .. }
                     | RequestPayload::FreshBashPrivateResult { .. }
-            ) || (operation == 0x90
-                && matches!(payload, RequestPayload::None)
-                && private_fixture());
+            ) || (operation == 0x90 && matches!(payload, RequestPayload::None));
             // The shared front door has its own pinned image. It may observe
             // the live lane identity, but it cannot acquire Runner authority.
             // Every effect-bearing operation still requires the fresh Runner
@@ -7083,17 +7061,7 @@ fn serve_fresh_v30_at(
                         request.request_id, request.invocation_uuid
                     ))
                 }
-                #[cfg(not(feature = "age319-private-broker-fixture"))]
-                b'C' | b'X' | b'c' | b'E' | b'O' | b'^' | b'v' | b'u' | b'<' => {
-                    Err(io::Error::other(
-                        "fresh Bash child/work/result closed until normal root grant and physical result custody",
-                    ))
-                }
-                #[cfg(feature = "age319-private-broker-fixture")]
                 0x90 => {
-                    if !private_fixture() {
-                        return Err(io::Error::other("fresh Bash parent probe unavailable"));
-                    }
                     let (root, _, parent) =
                         fresh_bash_parent(state_root, &lane, &peer, bash_image.as_ref())?;
                     let session = lane
@@ -7112,20 +7080,20 @@ fn serve_fresh_v30_at(
                         })
                     ))
                 }
-                #[cfg(feature = "age319-private-broker-fixture")]
                 b'C' | b'X' | b'c' | b'E' | b'O' | b'%' | b'!' | b'8' | b'9' | b'^' | b'v'
                 | b'u' | b'<'
                     if !matches!(operation, b'8' | b'9')
                         || matches!(&payload, RequestPayload::FreshBashChildRequest { .. }) =>
                 {
                     diagnostic_stage = "bash_child_parent_readback";
-                    if !private_fixture() {
-                        return Err(io::Error::other(
-                            "fresh Bash child/work/result closed until normal root grant and physical result custody",
-                        ));
+                    if !private_fixture()
+                        && !matches!(operation, b'X' | b'c' | b'^' | b'9' | b'%' | b'v' | b'u')
+                    {
+                        return Err(io::Error::other("unsupported fresh Bash mode"));
                     }
-                    if matches!(operation, b'E' | b'8' | b'^') && instance.is_closed() {
-                        return Err(io::Error::other("fresh Bash private work gate closed"));
+                    if matches!(operation, b'C' | b'X' | b'E' | b'8' | b'^') && instance.is_closed()
+                    {
+                        return Err(io::Error::other("fresh Bash work gate closed"));
                     }
                     let (request_id, listener_policy, ordinary_command, ordinary_k_digest) =
                         match &payload {
@@ -7239,6 +7207,7 @@ fn serve_fresh_v30_at(
                             .consume_root_h_delegation(&root, &root_actor, &child, &selected)
                             .map_err(io::Error::other)?;
                         peer.process.verify()?;
+                        #[cfg(feature = "age319-private-broker-fixture")]
                         if std::env::var_os("AGE319_PRIVATE_DROP_ROOT_H_REPLY_V1").is_some() {
                             drop_root_h_reply = true;
                         }
@@ -7328,10 +7297,19 @@ fn serve_fresh_v30_at(
                                         plan,
                                     )?;
                                 } else {
-                                    let plan = fixed_private_bash_child_plan()?;
-                                    fresh_provider::select_private_child_work(
-                                        &directory, &child, &binding, &plan,
-                                    )?;
+                                    #[cfg(feature = "age319-private-broker-fixture")]
+                                    {
+                                        let plan = fixed_private_bash_child_plan()?;
+                                        fresh_provider::select_private_child_work(
+                                            &directory, &child, &binding, &plan,
+                                        )?;
+                                    }
+                                    #[cfg(not(feature = "age319-private-broker-fixture"))]
+                                    {
+                                        return Err(io::Error::other(
+                                            "private Bash recipe unavailable",
+                                        ));
+                                    }
                                 }
                             } else {
                                 let root_init = PinnedProcess::open(
@@ -7344,9 +7322,33 @@ fn serve_fresh_v30_at(
                                     &parent_work,
                                     &root_init,
                                 )?;
-                                fresh_provider::child_selection_is_ordinary(
+                                if !fresh_provider::child_selection_is_ordinary(
                                     &directory, &child, &binding,
-                                )?;
+                                )? && !private_fixture()
+                                {
+                                    return Err(io::Error::other("ordinary Bash selection absent"));
+                                }
+                            }
+                            #[cfg(feature = "age319-private-broker-fixture")]
+                            if operation == b'X'
+                                && private_fixture()
+                                && std::env::var_os("AGE319_PRIVATE_BASH_PAUSE_AFTER_C_V1")
+                                    .is_some()
+                            {
+                                let gate = PathBuf::from(
+                                    std::env::var("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+                                        .map_err(io::Error::other)?,
+                                );
+                                fs::write(gate.join("ordinary-paused"), &child.request_id)?;
+                                let deadline = Instant::now() + std::time::Duration::from_secs(30);
+                                while !gate.join("ordinary-release").exists() {
+                                    if Instant::now() >= deadline {
+                                        return Err(io::Error::other(
+                                            "private Bash C pause expired",
+                                        ));
+                                    }
+                                    std::thread::sleep(std::time::Duration::from_millis(20));
+                                }
                             }
                             Ok(format!(
                                 "fresh-bash-child {}\n",
@@ -7372,7 +7374,6 @@ fn serve_fresh_v30_at(
                                 serde_json::to_string(&result)?
                             ))
                         }
-                        #[cfg(feature = "age319-private-broker-fixture")]
                         b'8' | b'9' | b'!' | b'%' | b'^' => {
                             diagnostic_stage = match operation {
                                 b'8' => "bash_child_physical_k",
@@ -7411,8 +7412,10 @@ fn serve_fresh_v30_at(
                                         directory.display()
                                     ))
                                 })?;
-                                if std::env::var_os("AGE319_PRIVATE_SOURCE_W_CAPTURE_ONLY_V1")
-                                    .is_some()
+                                if cfg!(feature = "age319-private-broker-fixture")
+                                    && private_fixture()
+                                    && std::env::var_os("AGE319_PRIVATE_SOURCE_W_CAPTURE_ONLY_V1")
+                                        .is_some()
                                 {
                                     return Err(io::Error::other(format!(
                                         "source W captured before State; exact repair debt at {}",
@@ -7487,7 +7490,16 @@ fn serve_fresh_v30_at(
                                     )?;
                                     fresh_provider::ordinary_bash_plan(command, Some(source))?
                                 } else {
-                                    fixed_private_bash_child_plan()?
+                                    #[cfg(feature = "age319-private-broker-fixture")]
+                                    {
+                                        fixed_private_bash_child_plan()?
+                                    }
+                                    #[cfg(not(feature = "age319-private-broker-fixture"))]
+                                    {
+                                        return Err(io::Error::other(
+                                            "private Bash recipe unavailable",
+                                        ));
+                                    }
                                 };
                                 fresh_provider::require_admitted_child_work_plan(
                                     &directory, &child, &binding, &plan,
@@ -7503,12 +7515,6 @@ fn serve_fresh_v30_at(
                                 )?;
                                 if ordinary {
                                     ordinary_completion_tx
-                                        .as_ref()
-                                        .ok_or_else(|| {
-                                            io::Error::other(
-                                                "ordinary Bash completion worker absent after K",
-                                            )
-                                        })?
                                         .send(child.request_id.clone())
                                         .map_err(|_| {
                                             io::Error::other(
@@ -9694,7 +9700,6 @@ fn serve_fresh_v30_at(
             let _ = stream.write_all(&response.as_bytes()[..response.len().min(16)]);
             continue;
         }
-        #[cfg(feature = "age319-private-broker-fixture")]
         if let Some(files) = provider_output_files {
             let fds: Vec<_> = files.iter().map(AsRawFd::as_raw_fd).collect();
             let mut iov = libc::iovec {
@@ -10185,6 +10190,41 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "age319-private-broker-fixture"))]
+    #[test]
+    fn featureless_bash_probe_and_result_frames_keep_their_exact_lengths() {
+        for (operation, body_len, accepted) in [
+            (0x90, 0, true),
+            (0x90, 16, false),
+            (b'9', 16, true),
+            (b'9', 0, false),
+            (b'%', 16, true),
+            (b'v', 16, true),
+            (b'u', 16, true),
+        ] {
+            let (mut server, mut client) = UnixStream::pair().unwrap();
+            let receiver = thread::spawn(move || recv_request(&mut server));
+            let mut challenge = [0u8; 16];
+            client.read_exact(&mut challenge).unwrap();
+            let mut frame = vec![operation];
+            frame.extend_from_slice(&challenge);
+            frame.extend_from_slice(&vec![0x5a; body_len]);
+            client.write_all(&frame).unwrap();
+            let result = receiver.join().unwrap();
+            assert_eq!(result.is_ok(), accepted, "opcode={operation:#x}");
+            if let Ok((_, payload, _, _)) = result {
+                if operation == 0x90 {
+                    assert!(matches!(payload, RequestPayload::None));
+                } else {
+                    assert!(matches!(
+                        payload,
+                        RequestPayload::FreshBashChildRequest { .. }
+                    ));
+                }
+            }
+        }
+    }
+
     #[test]
     fn state_write_frame_is_challenged_and_carries_no_path_or_row_authority() {
         let (mut server, mut client) = UnixStream::pair().unwrap();
@@ -10245,9 +10285,7 @@ mod tests {
                 RequestPayload::FreshBashChildRequest {
                     request_id: uuid::Uuid::new_v4().to_string(),
                     listener_policy: None,
-                    #[cfg(feature = "age319-private-broker-fixture")]
                     ordinary_command: None,
-                    #[cfg(feature = "age319-private-broker-fixture")]
                     ordinary_k_digest: None,
                 },
                 &entry,

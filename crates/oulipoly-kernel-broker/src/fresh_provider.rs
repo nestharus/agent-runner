@@ -1,7 +1,6 @@
-//! Private first provider K: the broker, not a Runner worker, forks the pinned
-//! executable. Private socket opcodes carry descriptor-backed plans; the
-//! ordinary CLI route remains closed; a private typed runtime backend consumes
-//! Q-gated readbacks and an exact caller path can settle the State terminal.
+//! Broker-owned physical K/Q and source custody. The ordinary Bash tree path
+//! is shared by installed and private v30 lanes. Other provider, account, and
+//! interactive routes remain private at the socket dispatch boundary.
 
 const CANCELLATION_ESCALATION_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 const PID1_REAP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);

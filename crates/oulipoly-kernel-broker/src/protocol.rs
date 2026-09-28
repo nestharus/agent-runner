@@ -1,6 +1,8 @@
 //! One connection, one challenged request. Entry operations cannot select an
 //! executable, UID, namespace, or mount. The accepted-work guardian operation
 //! carries the initiator's already pinned executable and accepted descriptors.
+//! Linux builds share the v30 protocol types with the ordinary Bash source
+//! verifier. Wire parsing and effect dispatch still gate unsupported modes.
 
 const FRESH_RECIPIENT_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const ENTRY_OBSERVATION_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -11,14 +13,14 @@ const RELEASED_HANDOFF_REPLY_READ_BYTES: u64 = 8193;
 const FRESH_SESSION_REPLY_READ_BYTES: u64 = 1025;
 const STATE_FRAME_REPLY_READ_BYTES: u64 = 4097;
 const BROKER_RESPONSE_READ_BYTES: u64 = 257;
-#[cfg(feature = "age319-private-broker-fixture")]
+#[cfg(target_os = "linux")]
 const FRESH_ROUTE_REPLY_READ_BYTES: u64 = 4097;
 
 use crate::installed_launch::InstalledLaunchSpec;
 use crate::registry::{OwnerCloseIntent, RootRecord};
 use oulipoly_state::mailbox::BrokerClosedOwner;
 use std::io::{self, Read, Write};
-#[cfg(feature = "age319-private-broker-fixture")]
+#[cfg(target_os = "linux")]
 use std::os::fd::FromRawFd;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
@@ -303,7 +305,7 @@ pub fn private_native_bash_at(path: &Path, request: &PrivateNativeBashExec) -> i
     Ok(answer)
 }
 
-#[cfg(feature = "age319-private-broker-fixture")]
+#[cfg(target_os = "linux")]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FreshRouteRequest {
@@ -326,7 +328,7 @@ pub struct FreshRouteRequest {
     pub environment_sha256: Option<String>,
 }
 
-#[cfg(feature = "age319-private-broker-fixture")]
+#[cfg(target_os = "linux")]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct FreshAccountEffectRequest {
@@ -339,7 +341,7 @@ pub struct FreshAccountEffectRequest {
     pub environment: Vec<(String, String)>,
 }
 
-#[cfg(feature = "age319-private-broker-fixture")]
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FreshAccountEffectKind {
@@ -348,7 +350,7 @@ pub enum FreshAccountEffectKind {
     QuotaRetry,
 }
 
-#[cfg(feature = "age319-private-broker-fixture")]
+#[cfg(target_os = "linux")]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FreshAccountEffectReadback {
@@ -365,7 +367,7 @@ pub struct FreshAccountEffectReadback {
     pub peer_artifact: Option<String>,
 }
 
-#[cfg(feature = "age319-private-broker-fixture")]
+#[cfg(target_os = "linux")]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FreshQuotaWindow {
@@ -378,7 +380,7 @@ pub struct FreshQuotaWindow {
 /// A local manual request names an idempotency key, never a script or a K.
 /// The broker resolves the account and physical identity from the pinned
 /// config descriptor and mints the one-use K itself.
-#[cfg(feature = "age319-private-broker-fixture")]
+#[cfg(target_os = "linux")]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ManualQuotaRequest {
@@ -389,14 +391,14 @@ pub struct ManualQuotaRequest {
     pub environment: Vec<(String, String)>,
 }
 
-#[cfg(feature = "age319-private-broker-fixture")]
+#[cfg(target_os = "linux")]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManualQuotaObserveRequest {
     pub operation_id: String,
 }
 
-#[cfg(feature = "age319-private-broker-fixture")]
+#[cfg(target_os = "linux")]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManualQuotaReadback {
@@ -410,7 +412,7 @@ pub struct ManualQuotaReadback {
     pub artifact: String,
 }
 
-#[cfg(feature = "age319-private-broker-fixture")]
+#[cfg(target_os = "linux")]
 pub fn private_manual_quota_at(
     path: &Path,
     request: &ManualQuotaRequest,
@@ -434,7 +436,7 @@ pub fn private_manual_quota_at(
     manual_quota_frame_at(path, b'w', &serde_json::to_vec(request)?, config_dir)
 }
 
-#[cfg(feature = "age319-private-broker-fixture")]
+#[cfg(target_os = "linux")]
 pub fn private_manual_quota_observe_at(
     path: &Path,
     operation_id: &str,
@@ -454,7 +456,7 @@ pub fn private_manual_quota_observe_at(
     )
 }
 
-#[cfg(feature = "age319-private-broker-fixture")]
+#[cfg(target_os = "linux")]
 fn manual_quota_frame_at(
     path: &Path,
     operation: u8,
@@ -510,7 +512,7 @@ fn manual_quota_frame_at(
     serde_json::from_str(value.trim_end()).map_err(io::Error::other)
 }
 
-#[cfg(feature = "age319-private-broker-fixture")]
+#[cfg(target_os = "linux")]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct FreshRouteSelection {
@@ -528,7 +530,7 @@ pub struct FreshRouteSelection {
     pub quota_remaining_basis_points: Option<u32>,
 }
 
-#[cfg(feature = "age319-private-broker-fixture")]
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FreshPlanRole {
@@ -536,7 +538,7 @@ pub enum FreshPlanRole {
     Interactive,
 }
 
-#[cfg(feature = "age319-private-broker-fixture")]
+#[cfg(target_os = "linux")]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct FreshInteractivePlanSelection {
@@ -1046,7 +1048,7 @@ pub fn private_fresh_provider_at(
 /// A pre-K PTY handoff assertion. This does not launch a provider, create a
 /// runtime generation, or authorize native F. Both descriptors must come in
 /// the challenged request from the original released Runner process.
-#[cfg(feature = "age319-private-broker-fixture")]
+#[cfg(target_os = "linux")]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrivateFreshPtyHandoff {
@@ -1059,7 +1061,7 @@ pub struct PrivateFreshPtyHandoff {
     pub control_path: std::path::PathBuf,
 }
 
-#[cfg(feature = "age319-private-broker-fixture")]
+#[cfg(target_os = "linux")]
 pub fn private_fresh_pty_handoff_at(
     path: &Path,
     request: &PrivateFreshPtyHandoff,
@@ -1071,7 +1073,7 @@ pub fn private_fresh_pty_handoff_at(
 
 /// Exact admission recheck for the selected interactive plan and live pair.
 /// A successful reply is still pre-K and grants no launch or Q authority.
-#[cfg(feature = "age319-private-broker-fixture")]
+#[cfg(target_os = "linux")]
 pub fn private_fresh_interactive_k_preparation_at(
     path: &Path,
     request: &PrivateFreshPtyHandoff,
@@ -1082,7 +1084,7 @@ pub fn private_fresh_interactive_k_preparation_at(
 
 /// This is the one-use physical K. An uncertain reply must be followed only
 /// by `private_fresh_interactive_q_at`, never another submission.
-#[cfg(feature = "age319-private-broker-fixture")]
+#[cfg(target_os = "linux")]
 pub fn private_fresh_interactive_k_at(
     path: &Path,
     request: &PrivateFreshPtyHandoff,
@@ -1091,7 +1093,7 @@ pub fn private_fresh_interactive_k_at(
     private_fresh_pty_request_at(path, request, b'}', &descriptors)
 }
 
-#[cfg(feature = "age319-private-broker-fixture")]
+#[cfg(target_os = "linux")]
 pub fn private_fresh_interactive_q_at(
     path: &Path,
     request: &PrivateFreshPtyHandoff,
@@ -1102,7 +1104,7 @@ pub fn private_fresh_interactive_q_at(
 /// Present the original root's completed PTY transcript and held master.
 /// The broker may publish Q only after its independent physical wait/drain
 /// checks and an EOF challenge of this exact master.
-#[cfg(feature = "age319-private-broker-fixture")]
+#[cfg(target_os = "linux")]
 pub fn private_fresh_interactive_finalize_at(
     path: &Path,
     request: &PrivateFreshPtyHandoff,
@@ -1115,7 +1117,7 @@ pub fn private_fresh_interactive_finalize_at(
 /// Read the broker-attested running K and register/read its one fresh-sidecar
 /// generation while the original root still holds the PTY master. This does
 /// not request Q or authorize any provider input.
-#[cfg(feature = "age319-private-broker-fixture")]
+#[cfg(target_os = "linux")]
 pub fn private_fresh_interactive_resident_at(
     path: &Path,
     request: &PrivateFreshPtyHandoff,
@@ -1129,7 +1131,7 @@ pub fn private_fresh_interactive_resident_at(
     serde_json::from_str(value).map_err(io::Error::other)
 }
 
-#[cfg(feature = "age319-private-broker-fixture")]
+#[cfg(target_os = "linux")]
 pub fn private_fresh_interactive_resident_readback_at(
     path: &Path,
     request: &PrivateFreshPtyHandoff,
@@ -1143,7 +1145,7 @@ pub fn private_fresh_interactive_resident_readback_at(
     serde_json::from_str(value).map_err(io::Error::other)
 }
 
-#[cfg(feature = "age319-private-broker-fixture")]
+#[cfg(target_os = "linux")]
 fn private_fresh_pty_request_at(
     path: &Path,
     request: &PrivateFreshPtyHandoff,
@@ -1224,7 +1226,7 @@ fn private_fresh_pty_request_at(
 
 /// Register one sealed candidate plan, then durably select/read back the
 /// complete pool. The same D-bound broker socket authenticates every step.
-#[cfg(feature = "age319-private-broker-fixture")]
+#[cfg(target_os = "linux")]
 pub fn private_fresh_route_at(
     path: &Path,
     request: &FreshRouteRequest,
@@ -1239,7 +1241,7 @@ pub fn private_fresh_route_at(
         .transpose()
 }
 
-#[cfg(feature = "age319-private-broker-fixture")]
+#[cfg(target_os = "linux")]
 fn private_fresh_route_raw_at(
     path: &Path,
     request: &FreshRouteRequest,
@@ -1332,7 +1334,7 @@ fn private_fresh_route_raw_at(
     Ok(Some(value.trim_end().to_owned()))
 }
 
-#[cfg(feature = "age319-private-broker-fixture")]
+#[cfg(target_os = "linux")]
 pub fn private_fresh_interactive_route_at(
     path: &Path,
     request: &FreshRouteRequest,
@@ -1351,7 +1353,7 @@ pub fn private_fresh_interactive_route_at(
 
 /// Begin a single D/account/kind-bound broker effect or read back that exact
 /// effect. An uncertain begin response is followed only by observe (`n`).
-#[cfg(feature = "age319-private-broker-fixture")]
+#[cfg(target_os = "linux")]
 pub fn private_fresh_account_effect_at(
     path: &Path,
     request: &FreshAccountEffectRequest,
@@ -1390,7 +1392,7 @@ pub fn private_fresh_account_effect_at(
 /// Read the latest certified physical quota Q for this actor's exact candidate.
 /// `None` means the physical account has no quota Q yet. An uncertain response
 /// must not be converted into a new physical probe.
-#[cfg(feature = "age319-private-broker-fixture")]
+#[cfg(target_os = "linux")]
 pub fn private_shared_quota_at(
     path: &Path,
     request: &FreshAccountEffectRequest,
@@ -1428,7 +1430,7 @@ pub fn private_shared_quota_at(
 
 /// Q-gated output readback. The broker sends its verified regular files by
 /// descriptor; a text status without both descriptors is never a completion.
-#[cfg(feature = "age319-private-broker-fixture")]
+#[cfg(target_os = "linux")]
 pub struct PrivateFreshProviderOutput {
     pub grant_id: String,
     pub wait_status: i32,
@@ -1441,7 +1443,7 @@ pub struct PrivateFreshProviderOutput {
     pub cancelled: bool,
 }
 
-#[cfg(feature = "age319-private-broker-fixture")]
+#[cfg(target_os = "linux")]
 pub fn private_fresh_provider_output_at(
     path: &Path,
     d_key: &str,
@@ -1551,7 +1553,7 @@ pub fn private_fresh_provider_output_at(
     })
 }
 
-#[cfg(feature = "age319-private-broker-fixture")]
+#[cfg(target_os = "linux")]
 pub struct PrivateFreshInteractiveOutput {
     pub grant_id: String,
     pub wait_status: i32,
@@ -1561,7 +1563,7 @@ pub struct PrivateFreshInteractiveOutput {
 }
 
 /// Transfer the Q-verified PTY transcript by descriptor to the original root.
-#[cfg(feature = "age319-private-broker-fixture")]
+#[cfg(target_os = "linux")]
 pub fn private_fresh_interactive_output_at(
     path: &Path,
     request: &PrivateFreshPtyHandoff,
