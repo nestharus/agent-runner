@@ -1,6 +1,150 @@
 use base64::Engine as _;
 use std::os::unix::fs::FileTypeExt;
 
+/// Read-only cross-lane evidence for a separate F delivery. This does not
+/// reserve native input, transfer the root recipient's token, or ACK F.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FreshNativeKFCandidate {
+    pub fresh: FreshDeliveryReadback,
+    pub fresh_physical_grant_id: String,
+    pub fresh_parent_work_grant_id: String,
+    pub original_native_grant_id: String,
+    pub original_source_grant_id: String,
+    pub original_row_seq: i64,
+    pub native_session_id: String,
+    pub original_turn_id: String,
+    pub original_turn_receipt_sha256: String,
+}
+
+impl FreshV30Lane {
+    /// Prove that a root-authorized F grant is a distinct child completion
+    /// under the selected K whose original v2 row already received a native
+    /// ACK. Every call rechecks both retained rows and the physical W event.
+    pub fn attest_native_k_f_candidate(
+        &self,
+        request_id: &str,
+        delivery_request_id: &str,
+        delivery_token: &str,
+        recipient: &FreshRecipientIdentity,
+        original_source_grant_id: &str,
+        selected_k_json: &str,
+    ) -> Result<FreshNativeKFCandidate, String> {
+        validate_request_id(delivery_request_id)?;
+        validate_request_id(delivery_token)?;
+        validate_request_id(original_source_grant_id)?;
+        let event = self.selected_private_bash_event(request_id)?;
+        let (root, actor) = self.released_handoff_for_root(&event.root_id)?;
+        if recipient != &actor {
+            return Err("native K F candidate is not the original root recipient".into());
+        }
+        let session = self.read_session(&root.d_key)?.ok_or("native K F root D absent")?;
+        let fresh = self.read_recipient_delivery_by_request(delivery_request_id, recipient)?
+            .ok_or("native K F grant absent for original recipient")?;
+        if !matches!(fresh.phase.as_str(), "unknown" | "submitted")
+            || fresh.source_id != event.source_id
+            || fresh.attempt_id != event.attempt_id
+            || fresh.lane_id != event.lane_id
+            || fresh.source_generation != event.source_generation
+            || fresh.root_id != event.root_id
+            || fresh.owner_generation != event.owner_generation
+            || fresh.session_id != session.session_id
+        {
+            return Err("native K F grant differs from accepted W/root/session".into());
+        }
+        let exact_token: bool = self.sidecar.mailbox().conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM fresh_recipient_grant WHERE grant_id=?1
+             AND delivery_request_id=?2 AND delivery_token=?3 AND recipient_identity=?4
+             AND phase IN ('unknown','submitted'))",
+            params![fresh.grant_id, delivery_request_id, delivery_token,
+                Self::recipient_identity_json(recipient)?],
+            |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        if !exact_token {
+            return Err("native K F original delivery token changed or absent".into());
+        }
+        let accepted = self.accepted_source_for_row(
+            &session, fresh.seq, &fresh.payload_sha256, fresh.payload_byte_len,
+            &fresh.root_id, &fresh.owner_generation,
+        )?;
+        if accepted != (fresh.source_id.clone(), fresh.attempt_id.clone()) {
+            return Err("native K F row has another accepted source".into());
+        }
+        let payload = self.lookup_payload(&fresh.lane_id, &fresh.session_id, fresh.seq)?;
+        if payload.len() as i64 != fresh.payload_byte_len
+            || sha256_hex(&payload) != fresh.payload_sha256 {
+            return Err("native K F retained row bytes changed".into());
+        }
+        let body: serde_json::Value = serde_json::from_slice(&payload).map_err(|e| e.to_string())?;
+        if body["protocol"] != "fresh-bash-complete-v30"
+            || body["source"] != serde_json::to_value(&event).map_err(|e| e.to_string())? {
+            return Err("native K F row is not exact accepted W".into());
+        }
+        for (key, expected_sha, expected_len) in [
+            ("stdout_bytes", &event.stdout_sha256, event.stdout_len),
+            ("stderr_bytes", &event.stderr_sha256, event.stderr_len),
+        ] {
+            let bytes: Vec<u8> = serde_json::from_value(body[key].clone())
+                .map_err(|e| format!("native K F {key} bytes malformed: {e}"))?;
+            if bytes.len() as u64 != expected_len || sha256_hex(&bytes) != *expected_sha {
+                return Err("native K F physical output differs from W row".into());
+            }
+        }
+        let broker_root = self.state_path.parent().and_then(|path| path.parent())
+            .ok_or("native K F broker root absent")?;
+        let original_sidecar = BrokerSidecar::open_existing(
+            &broker_root.join("sidecar/pid-identity.db"), broker_root,
+        )?;
+        let original = original_sidecar.read_native_recipient_grant(original_source_grant_id)?
+            .ok_or("native K F original native grant absent")?;
+        let original_ack: bool = original_sidecar.mailbox().conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM completion_event_listener l
+             JOIN mailbox m ON m.seq=l.mailbox_seq
+             WHERE l.mailbox_seq=?1 AND l.listener_id=?2 AND l.session_id=?3
+               AND l.owner_invocation_uuid=?4 AND l.active=1
+               AND l.acknowledgement_reason='explicit_native_codex_assistant_ack'
+               AND l.acknowledged_at IS NOT NULL AND m.delivered_at=l.acknowledged_at
+               AND m.delivered_by_invocation_uuid=?4 AND m.delivery_attempts=1
+               AND m.payload_sha256=?5 AND m.payload_byte_len=?6)",
+            params![original.binding.row_seq, original.binding.listener_id,
+                original.binding.session_id, original.binding.owner_invocation_uuid,
+                original.binding.payload_sha256, original.binding.payload_byte_len],
+            |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        let selected: serde_json::Value = serde_json::from_str(selected_k_json)
+            .map_err(|_| "native K F selected readback invalid")?;
+        if !original_ack
+            || original.phase != "acked"
+            || original.selected_k_json != selected_k_json
+            || original.binding.root_id != fresh.root_id
+            || original.binding.owner_generation != fresh.owner_generation
+            || original.binding.session_id != fresh.session_id
+            || original.binding.owner_invocation_uuid != root.invocation_uuid
+            || original.binding.source_id == fresh.source_id
+            || original.binding.payload_sha256 == fresh.payload_sha256
+            || original.native_session_id == fresh.session_id
+            || original.turn_id.as_deref().is_none_or(str::is_empty)
+            || original.turn_receipt_sha256.as_deref().is_none_or(str::is_empty)
+            || original.ack_response_sha256.as_deref().is_none_or(str::is_empty)
+            || selected["grant_id"] != event.parent_work_grant_id
+            || selected["work_id"] != event.parent_work_id
+            || selected["native_session_id"] != original.native_session_id
+        {
+            return Err("native K F and ACKed original have different lineage or source".into());
+        }
+        Ok(FreshNativeKFCandidate {
+            fresh,
+            fresh_physical_grant_id: event.physical_grant_id,
+            fresh_parent_work_grant_id: event.parent_work_grant_id,
+            original_native_grant_id: original.grant_id,
+            original_source_grant_id: original.binding.source_grant_id,
+            original_row_seq: original.binding.row_seq,
+            native_session_id: original.native_session_id,
+            original_turn_id: original.turn_id.unwrap(),
+            original_turn_receipt_sha256: original.turn_receipt_sha256.unwrap(),
+        })
+    }
+}
+
 /// Private pre-send input plan. The Tail token is supplied by the original
 /// Runner after a typed native Tail read; this record itself is not a receipt.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

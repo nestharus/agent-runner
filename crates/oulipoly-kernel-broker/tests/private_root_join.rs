@@ -1465,7 +1465,9 @@ fn terminate_postcommit_original_owner(broker_state: &Path) {
 
 fn inner() {
     let mode = std::env::var("AGE319_PRIVATE_JOIN_MODE").unwrap_or_else(|_| "help".into());
-    let native_ack_mode = mode == "normal_model_provider_native_codex_recipient_ack";
+    let native_f_candidate = mode == "normal_model_provider_native_codex_f_candidate";
+    let native_ack_mode =
+        mode == "normal_model_provider_native_codex_recipient_ack" || native_f_candidate;
     let native_turn_mode =
         native_ack_mode || mode == "normal_model_provider_native_codex_turn_receipt";
     let native_codex_mode =
@@ -1686,6 +1688,7 @@ fn inner() {
             | "normal_model_provider_native_codex_root_h_notify_row"
             | "normal_model_provider_native_codex_turn_receipt"
             | "normal_model_provider_native_codex_recipient_ack"
+            | "normal_model_provider_native_codex_f_candidate"
     );
     let root_h_lost = mode == "normal_model_provider_bash_causal_root_h_lost";
     let root_h_notify = root_h_delegate && (mode.contains("_notify_") || native_turn_mode);
@@ -2586,6 +2589,10 @@ fn inner() {
             .envs(native_codex_mode.then_some(("AGE319_PRIVATE_NATIVE_CODEX_V1", "1")))
             .envs(native_codex_mode.then_some(("AGE319_PRIVATE_NATIVE_BASH_NOTIFY_V1", "1")))
             .envs(native_turn_mode.then_some(("AGE319_PRIVATE_NATIVE_TURN_RECEIPT_V1", "1")))
+            .envs(
+                native_f_candidate
+                    .then_some(("AGE319_PRIVATE_BASH_RECIPIENT_MODE_V1", "native_k_pending")),
+            )
             .envs(resident_mode.then_some(("AGE319_PRIVATE_NATIVE_STORE", &native_store)))
             .envs(resident_mode.then_some(("AGE319_PRIVATE_ROOT_PTY_RESIDENT_V1", "1")))
             .envs(
@@ -6957,6 +6964,7 @@ fn inner() {
                         | "normal_model_provider_native_codex_root_h_notify_row"
                         | "normal_model_provider_native_codex_turn_receipt"
                         | "normal_model_provider_native_codex_recipient_ack"
+                        | "normal_model_provider_native_codex_f_candidate"
                 )
             {
                 let marker: serde_json::Value =
@@ -8842,6 +8850,122 @@ fn inner() {
                                     )
                                     .unwrap();
                                 assert_eq!(attempts, 1);
+                                if native_f_candidate {
+                                    eventually(|| gate.join("bash-recipient-output").exists());
+                                    let f_report: serde_json::Value = serde_json::from_slice(
+                                        &fs::read(gate.join("bash-recipient-output")).unwrap(),
+                                    )
+                                    .unwrap();
+                                    assert_eq!(f_report["mode"], "native_k_pending");
+                                    let f = &f_report["grant"];
+                                    let recipient =
+                                        oulipoly_state::mailbox::FreshRecipientIdentity {
+                                            host_pid: prepared.joined_child.host_pid,
+                                            boot_id: prepared.joined_child.boot_id.clone(),
+                                            starttime_ticks: prepared.joined_child.starttime_ticks,
+                                            pidns_dev: prepared.joined_child.pidns_dev,
+                                            pidns_ino: prepared.joined_child.pidns_ino,
+                                        };
+                                    let delivery_request =
+                                        f_report["delivery_request_id"].as_str().unwrap();
+                                    let token = f["delivery_token"].as_str().unwrap();
+                                    let witness = lane
+                                        .attest_native_k_f_candidate(
+                                            &bash_request,
+                                            delivery_request,
+                                            token,
+                                            &recipient,
+                                            &custody.source_grant_id,
+                                            &selected,
+                                        )
+                                        .unwrap();
+                                    assert_eq!(witness.fresh.grant_id, f["grant_id"]);
+                                    assert_eq!(witness.fresh.phase, "submitted");
+                                    assert_eq!(witness.original_row_seq, custody.row_seq);
+                                    assert_ne!(witness.fresh.source_id, custody.source_id);
+                                    assert_eq!(
+                                        witness.native_session_id,
+                                        native["native_session_id"]
+                                    );
+                                    assert_eq!(witness.original_turn_id, turn);
+                                    assert_eq!(witness.original_turn_receipt_sha256, turn_digest);
+                                    assert_eq!(
+                                        witness.fresh_parent_work_grant_id,
+                                        native["grant_id"]
+                                    );
+                                    assert_eq!(
+                                        witness,
+                                        lane.attest_native_k_f_candidate(
+                                            &bash_request,
+                                            delivery_request,
+                                            token,
+                                            &recipient,
+                                            &custody.source_grant_id,
+                                            &selected,
+                                        )
+                                        .unwrap()
+                                    );
+                                    assert!(
+                                        lane.attest_native_k_f_candidate(
+                                            &bash_request,
+                                            delivery_request,
+                                            "wrong-token",
+                                            &recipient,
+                                            &custody.source_grant_id,
+                                            &selected,
+                                        )
+                                        .is_err()
+                                    );
+                                    assert!(
+                                        lane.attest_native_k_f_candidate(
+                                            &uuid::Uuid::new_v4().to_string(),
+                                            delivery_request,
+                                            token,
+                                            &recipient,
+                                            &custody.source_grant_id,
+                                            &selected,
+                                        )
+                                        .is_err()
+                                    );
+                                    assert!(
+                                        lane.attest_native_k_f_candidate(
+                                            &bash_request,
+                                            delivery_request,
+                                            token,
+                                            &recipient,
+                                            &custody.source_grant_id,
+                                            "wrong-K",
+                                        )
+                                        .is_err()
+                                    );
+                                    let fresh_side = rusqlite::Connection::open(
+                                        broker_state.join("v30/sidecar/pid-identity.db"),
+                                    )
+                                    .unwrap();
+                                    let fresh_row: (Option<String>, i64) = fresh_side
+                                        .query_row(
+                                            "SELECT delivered_at,delivery_attempts FROM mailbox
+                                         WHERE session_id=?1 AND seq=?2",
+                                            rusqlite::params![
+                                                witness.fresh.session_id,
+                                                witness.fresh.seq
+                                            ],
+                                            |row| Ok((row.get(0)?, row.get(1)?)),
+                                        )
+                                        .unwrap();
+                                    assert_eq!(fresh_row, (None, 0));
+                                    let terminal = lane
+                                        .read_private_root_terminal(
+                                            &root,
+                                            &recipient,
+                                            &original_session,
+                                        )
+                                        .unwrap();
+                                    assert_eq!(
+                                        terminal.notification_state,
+                                        "f_submitted_native_pending"
+                                    );
+                                }
                             } else {
                                 assert_eq!(pending, 1, "native turn must not ACK original row");
                             }
@@ -15073,6 +15197,7 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_model_provider_native_codex_root_h_notify_row",
         "normal_model_provider_native_codex_turn_receipt",
         "normal_model_provider_native_codex_recipient_ack",
+        "normal_model_provider_native_codex_f_candidate",
         "normal_model_provider_bash_causal_root_h_notify_row_drain",
         "normal_model_provider_bash_causal_root_h_notify_wake",
         "normal_model_provider_bash_causal_root_h_notify_wake_drain",
