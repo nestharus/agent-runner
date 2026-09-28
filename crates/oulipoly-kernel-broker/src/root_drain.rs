@@ -690,6 +690,25 @@ pub fn ready_for_owner_close_preflight(
 /// fenced readback revalidates every retained source and child work seal.
 /// Zero records and an empty count alone cannot authorize PID1 exit.
 pub fn ready_for_pid1_request(inventory: &RootDrainInventory) -> io::Result<()> {
+    ready_for_pid1_request_with_fence(inventory, true)
+}
+
+/// Before the durable fence, the Broker needs the same exact physical and
+/// publication prerequisites as the PID1 request. The original caller's
+/// settlement must also be retained before autonomous progression begins.
+pub fn ready_for_normal_admission_fence(inventory: &RootDrainInventory) -> io::Result<()> {
+    if inventory.normal.is_none() || inventory.entry_unsettled {
+        return Err(io::Error::other(
+            "normal caller settlement absent before fence",
+        ));
+    }
+    ready_for_pid1_request_with_fence(inventory, false)
+}
+
+fn ready_for_pid1_request_with_fence(
+    inventory: &RootDrainInventory,
+    require_fenced: bool,
+) -> io::Result<()> {
     let normal = inventory.normal.as_ref().is_some_and(|normal| {
         normal.physical.state == "drained"
             && normal.physical.q.is_some()
@@ -698,7 +717,7 @@ pub fn ready_for_pid1_request(inventory: &RootDrainInventory) -> io::Result<()> 
             && inventory.work_records == 0
             && inventory.source_physical_records == 0
     });
-    if !inventory.fenced
+    if (require_fenced && !inventory.fenced)
         || !inventory.entry_physical_settled
         || !inventory.entry_original_exited
         || inventory.prepared_grants != 0

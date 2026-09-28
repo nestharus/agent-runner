@@ -48,29 +48,16 @@ fn normal_drain(socket: &Path, root: &RootRecord, fence: bool) -> serde_json::Va
     serde_json::from_str(reply.strip_prefix("root-drain-v1 ").unwrap()).unwrap()
 }
 
-fn close_normal_root(socket: &Path, state: &Path, root_id: &str, owner: &str) {
+fn await_normal_owner_close(socket: &Path, state: &Path, root_id: &str, owner: &str) {
     let root = normal_root_record(state, root_id);
-    let fenced = normal_drain(socket, &root, true);
-    assert_eq!(fenced["fenced"], true);
-    assert_eq!(fenced["normal"]["physical"]["state"], "drained");
-    assert_eq!(fenced["normal"]["publication"]["state"], "settled");
-    protocol::root_pid1_drain_at(socket, &root).unwrap();
-    eventually(|| normal_drain(socket, &root, false)["pid1_parent_wait_proof"] == true);
-    let drained = normal_drain(socket, &root, false);
-    assert_eq!(drained["owner_close_preflight"], true, "{drained}");
-    let intent = protocol::owner_close_intent_at(socket, &root, owner, true).unwrap();
-    assert_eq!(intent.root, root);
-    let closed = protocol::owner_close_at(socket, &root, owner, true).unwrap();
-    assert_eq!(closed.root_id, root_id);
-    assert_eq!(closed.owner_generation, owner);
-    assert_eq!(
-        protocol::owner_close_at(socket, &root, owner, false).unwrap(),
-        closed
-    );
-    assert_eq!(
-        normal_drain(socket, &root, false)["owner_close_proof"]["root_id"],
-        root_id
-    );
+    eventually(|| normal_drain(socket, &root, false)["owner_close_proof"]["root_id"] == root_id);
+    let read = normal_drain(socket, &root, false);
+    assert_eq!(read["fenced"], true);
+    assert_eq!(read["normal"]["physical"]["state"], "drained");
+    assert_eq!(read["normal"]["publication"]["state"], "settled");
+    assert_eq!(read["pid1_parent_wait_proof"], true);
+    assert_eq!(read["owner_close_intent"]["owner_generation"], owner);
+    assert_eq!(read["owner_close_proof"]["owner_generation"], owner);
 }
 
 fn bash_retention_check(bash: &str, registration: &str) -> String {
@@ -3374,29 +3361,66 @@ fn inner() {
                 };
                 let denied_out = temp.path().join("second-before-close.out");
                 let denied_err = temp.path().join("second-before-close.err");
-                let denied = launch_second(&denied_out, &denied_err).wait().unwrap();
-                assert!(!denied.success(), "second E reserved before first close");
-                assert_eq!(
-                    fs::read_dir(broker_state.join("entries")).unwrap().count(),
-                    1
-                );
-                assert_eq!(fs::read_to_string(&normal_effect).unwrap(), "one\n");
+                if let Ok(phase) = std::env::var("AGE319_TEST_AUTO_RESTART_PHASE_V1") {
+                    let marker = match phase.as_str() {
+                        "fence" => broker_state.join(format!("root-drains/{first_root}.json")),
+                        "pid1" => broker_state.join(format!("root-pid1/{first_root}.request.json")),
+                        "intent" => {
+                            broker_state.join(format!("root-drains/{first_root}.close-intent.json"))
+                        }
+                        "publication-unknown" => publication.join("caller-intent.json"),
+                        _ => panic!("unknown normal auto restart phase: {phase}"),
+                    };
+                    eventually(|| {
+                        marker.exists()
+                            && fs::read_dir(marker.parent().unwrap())
+                                .unwrap()
+                                .all(|entry| {
+                                    !entry
+                                        .unwrap()
+                                        .file_name()
+                                        .to_string_lossy()
+                                        .starts_with(".json-pending-")
+                                })
+                    });
+                    let phase_root = normal_root_record(&broker_state, &first_root);
+                    let phase_read = normal_drain(&socket, &phase_root, false);
+                    assert!(phase_read["owner_close_proof"].is_null(), "{phase_read}");
+                    if phase == "intent" {
+                        assert_eq!(
+                            phase_read["owner_close_intent"]["owner_generation"],
+                            first_owner
+                        );
+                    }
+                    stop(&mut broker);
+                    let restart_log = temp.path().join("normal-auto-phase-restart.log");
+                    broker =
+                        restart_source_broker(&socket, &broker_state, &runner, &gate, &restart_log);
+                    if phase == "intent" {
+                        fs::write(gate.join("auto-intent-resume"), b"restart readback").unwrap();
+                    }
+                }
                 if partial || lost {
                     let root = normal_root_record(&broker_state, &first_root);
-                    let blocked = normal_drain(&socket, &root, true);
+                    let blocked = normal_drain(&socket, &root, false);
                     assert_eq!(blocked["normal"]["physical"]["state"], "drained");
                     assert_eq!(blocked["normal"]["publication"]["state"], "unknown");
-                    assert!(protocol::root_pid1_drain_at(&socket, &root).is_err());
+                    assert_eq!(blocked["fenced"], false);
                     assert_ne!(blocked["owner_close_preflight"], true);
+                    assert!(blocked["owner_close_intent"].is_null());
+                    assert!(blocked["owner_close_proof"].is_null());
+                    let denied = launch_second(&denied_out, &denied_err).wait().unwrap();
                     assert!(
-                        protocol::owner_close_intent_at(&socket, &root, &first_owner, true)
-                            .is_err()
+                        !denied.success(),
+                        "second E reserved with unknown publication"
+                    );
+                    assert_eq!(
+                        fs::read_dir(broker_state.join("entries")).unwrap().count(),
+                        1
                     );
                 } else {
                     let root = normal_root_record(&broker_state, &first_root);
                     if std::env::var_os("AGE319_TEST_FEATURELESS_OLD_PENDING_V1").is_some() {
-                        normal_drain(&socket, &root, true);
-                        protocol::root_pid1_drain_at(&socket, &root).unwrap();
                         eventually(|| {
                             normal_drain(&socket, &root, false)["pid1_parent_wait_proof"] == true
                         });
@@ -3406,10 +3430,8 @@ fn inner() {
                             1
                         );
                         assert_ne!(blocked["owner_close_preflight"], true);
-                        assert!(
-                            protocol::owner_close_intent_at(&socket, &root, &first_owner, true)
-                                .is_err()
-                        );
+                        assert!(blocked["owner_close_intent"].is_null());
+                        assert!(blocked["owner_close_proof"].is_null());
                         let denied = launch_second(&denied_out, &denied_err).wait().unwrap();
                         assert!(!denied.success());
                         assert_eq!(
@@ -3417,7 +3439,7 @@ fn inner() {
                             1
                         );
                     } else {
-                        close_normal_root(&socket, &broker_state, &first_root, &first_owner);
+                        await_normal_owner_close(&socket, &broker_state, &first_root, &first_owner);
                         stop(&mut broker);
                         let restart_log = temp.path().join("normal-closed-restart.log");
                         broker = restart_source_broker(
@@ -3428,9 +3450,7 @@ fn inner() {
                             &restart_log,
                         );
                         assert_eq!(
-                            protocol::owner_close_at(&socket, &root, &first_owner, false)
-                                .unwrap()
-                                .root_id,
+                            normal_drain(&socket, &root, false)["owner_close_proof"]["root_id"],
                             first_root
                         );
                         let second_out = temp.path().join("second-normal.out");
@@ -3490,11 +3510,14 @@ fn inner() {
                             broker_state.join("v30/normal-provider").join(&second_k);
                         assert!(second_physical.join("q.json").exists());
                         assert!(second_physical.join("caller-settled.json").exists());
-                        close_normal_root(&socket, &broker_state, &second_root, &second_owner);
+                        await_normal_owner_close(
+                            &socket,
+                            &broker_state,
+                            &second_root,
+                            &second_owner,
+                        );
                         assert_eq!(
-                            protocol::owner_close_at(&socket, &root, &first_owner, false)
-                                .unwrap()
-                                .root_id,
+                            normal_drain(&socket, &root, false)["owner_close_proof"]["root_id"],
                             first_root
                         );
                         stop(&mut broker);
@@ -3507,16 +3530,12 @@ fn inner() {
                             &second_restart_log,
                         );
                         assert_eq!(
-                            protocol::owner_close_at(&socket, &root, &first_owner, false)
-                                .unwrap()
-                                .root_id,
+                            normal_drain(&socket, &root, false)["owner_close_proof"]["root_id"],
                             first_root
                         );
                         let second_record = normal_root_record(&broker_state, &second_root);
                         assert_eq!(
-                            protocol::owner_close_at(&socket, &second_record, &second_owner, false)
-                                .unwrap()
-                                .root_id,
+                            normal_drain(&socket, &second_record, false)["owner_close_proof"]["root_id"],
                             second_root
                         );
                     }
@@ -9959,11 +9978,27 @@ fn inner() {
                                         let grants = oulipoly_kernel_broker::accepted_grant::GrantRegistry::open(
                                             broker_state.join("grants"),
                                         ).unwrap();
-                                        let reopened_work =
-                                            oulipoly_kernel_broker::WorkRegistry::open(
+                                        let mut reopened_work = None;
+                                        eventually(|| {
+                                            match oulipoly_kernel_broker::WorkRegistry::open(
                                                 &works_dir, &roots,
-                                            )
-                                            .unwrap();
+                                            ) {
+                                                Ok(work) => {
+                                                    reopened_work = Some(work);
+                                                    true
+                                                }
+                                                Err(error)
+                                                    if error.to_string()
+                                                        == "unresolved broker JSON publication" =>
+                                                {
+                                                    false
+                                                }
+                                                Err(error) => {
+                                                    panic!("real F work registry readback: {error}")
+                                                }
+                                            }
+                                        });
+                                        let reopened_work = reopened_work.unwrap();
                                         let work_retirement = reopened_work
                                             .retirement(
                                                 &expected,
