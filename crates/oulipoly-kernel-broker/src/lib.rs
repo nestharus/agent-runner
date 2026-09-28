@@ -7,6 +7,7 @@ pub mod accepted_grant;
 pub mod codex_raw_verifier;
 pub mod cutover_gate;
 pub mod entry_registry;
+pub mod first_install_activation;
 pub mod identity;
 pub mod installed_launch;
 pub mod installed_pair;

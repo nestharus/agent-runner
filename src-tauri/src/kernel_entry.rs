@@ -538,6 +538,9 @@ fn require_pair_route(
     if pair.version != observed.version || pair.generation != observed.generation {
         return Err("installed broker and Runner generation differ".into());
     }
+    if pair.schema != 1 {
+        return Err("fresh-only installed Runner entry is not yet implemented".into());
+    }
     require_legacy_entry_route(observed.route)
 }
 
@@ -552,6 +555,7 @@ fn require_paired_launch_mode(host_entry: bool, child_entry: bool) -> Result<(),
 fn require_legacy_entry_route(route: EntryRoute) -> Result<(), String> {
     match route {
         EntryRoute::LegacyOpen => Ok(()),
+        EntryRoute::FreshOnlyOpen => Err("fresh-only Runner entry is not yet implemented".into()),
         EntryRoute::Draining => Err("installed broker entry gate is draining".into()),
         EntryRoute::BrokerV30Closed => Err("installed Runner has no v30 route".into()),
     }
@@ -7470,6 +7474,7 @@ mod tests {
             version: pair.version.clone(),
             generation: pair.generation.clone(),
             route: EntryRoute::LegacyOpen,
+            source_generation: None,
         };
         assert!(needs_installed_entry_gate(
             std::path::Path::new(INSTALLED_RUNNER),
@@ -7498,6 +7503,13 @@ mod tests {
         assert!(require_pair_route(&pair, &old).is_err());
         old.route = EntryRoute::BrokerV30Closed;
         assert!(require_pair_route(&pair, &old).is_err());
+        old.route = EntryRoute::FreshOnlyOpen;
+        old.source_generation = Some(uuid::Uuid::new_v4().to_string());
+        assert!(require_pair_route(&pair, &old).is_err());
+        let mut fresh_pair = pair.clone();
+        fresh_pair.schema = 2;
+        old.route = EntryRoute::LegacyOpen;
+        assert!(require_pair_route(&fresh_pair, &old).is_err());
     }
 
     #[test]

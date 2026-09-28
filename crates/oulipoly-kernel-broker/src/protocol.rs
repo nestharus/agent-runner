@@ -3968,6 +3968,7 @@ pub fn request_at(path: &Path, operation: Operation) -> io::Result<String> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EntryRoute {
     LegacyOpen,
+    FreshOnlyOpen,
     Draining,
     BrokerV30Closed,
 }
@@ -3977,6 +3978,8 @@ pub struct InstalledPairObservation {
     pub version: String,
     pub generation: String,
     pub route: EntryRoute,
+    /// The activated bootstrap source, separate from the pair generation.
+    pub source_generation: Option<String>,
 }
 
 pub fn observe_installed_pair_at(path: &Path) -> io::Result<InstalledPairObservation> {
@@ -3989,7 +3992,7 @@ fn parse_installed_pair_response(response: &str) -> io::Result<InstalledPairObse
         return Err(io::Error::other("invalid installed pair response"));
     }
     let fields: Vec<_> = response.trim_end_matches('\n').split(' ').collect();
-    if fields.len() != 4
+    if !matches!(fields.len(), 4 | 5)
         || fields[0] != "installed-pair-v1"
         || uuid::Uuid::parse_str(fields[2])
             .ok()
@@ -3999,14 +4002,33 @@ fn parse_installed_pair_response(response: &str) -> io::Result<InstalledPairObse
     }
     let route = match fields[3] {
         "legacy-open" => EntryRoute::LegacyOpen,
+        "fresh-only-open" => EntryRoute::FreshOnlyOpen,
         "draining" => EntryRoute::Draining,
         "broker-v30-closed" => EntryRoute::BrokerV30Closed,
         _ => return Err(io::Error::other("invalid installed pair route")),
+    };
+    let source_generation = if route == EntryRoute::FreshOnlyOpen {
+        let source = *fields
+            .get(4)
+            .ok_or_else(|| io::Error::other("fresh source absent"))?;
+        if uuid::Uuid::parse_str(source)
+            .ok()
+            .is_none_or(|id| id.to_string() != source)
+        {
+            return Err(io::Error::other("fresh source generation invalid"));
+        }
+        Some(source.into())
+    } else {
+        if fields.len() != 4 {
+            return Err(io::Error::other("unexpected installed pair source"));
+        }
+        None
     };
     Ok(InstalledPairObservation {
         version: fields[1].into(),
         generation: fields[2].into(),
         route,
+        source_generation,
     })
 }
 
@@ -4023,6 +4045,29 @@ mod installed_pair_response_tests {
             parse_installed_pair_response("installed-pair-v1 0.1.0 bad legacy-open\n").is_err()
         );
         assert!(parse_installed_pair_response("installed-pair-v1 0.1.0 bad legacy-open").is_err());
+        let pair = uuid::Uuid::new_v4();
+        let source = uuid::Uuid::new_v4();
+        let observed = parse_installed_pair_response(&format!(
+            "installed-pair-v1 0.1.0 {pair} fresh-only-open {source}\n"
+        ))
+        .unwrap();
+        assert_eq!(observed.route, EntryRoute::FreshOnlyOpen);
+        assert_eq!(
+            observed.source_generation.as_deref(),
+            Some(source.to_string().as_str())
+        );
+        assert!(
+            parse_installed_pair_response(&format!(
+                "installed-pair-v1 0.1.0 {pair} fresh-only-open\n"
+            ))
+            .is_err()
+        );
+        assert!(
+            parse_installed_pair_response(&format!(
+                "installed-pair-v1 0.1.0 {pair} legacy-open {source}\n"
+            ))
+            .is_err()
+        );
     }
 }
 
@@ -4031,6 +4076,7 @@ mod installed_pair_response_tests {
 pub fn observe_entry_gate_at(path: &Path) -> io::Result<EntryRoute> {
     match request_at(path, Operation::ObserveEntryGate)?.as_str() {
         "entry-gate-v1 legacy-open\n" => Ok(EntryRoute::LegacyOpen),
+        "entry-gate-v1 fresh-only-open\n" => Ok(EntryRoute::FreshOnlyOpen),
         "entry-gate-v1 draining\n" => Ok(EntryRoute::Draining),
         "entry-gate-v1 broker-v30-closed\n" => Ok(EntryRoute::BrokerV30Closed),
         _ => Err(io::Error::other("unrecognized broker entry gate response")),
@@ -4170,7 +4216,8 @@ fn request_frame_at(path: &Path, operation: Operation, payload: Payload) -> io::
     request[0] = match operation {
         Operation::Classify => b'C',
         Operation::ObserveEntryGate => b'i',
-        Operation::ObserveInstalledPair => b'v',
+        // `v` belongs to a fresh Bash child request and requires a UUID.
+        Operation::ObserveInstalledPair => 0x91,
         Operation::CloseEntryGate => b'X',
         Operation::AbortEntryGate => b'x',
         Operation::ReserveEntry if matches!(payload, Payload::Prepare(..)) => b'P',

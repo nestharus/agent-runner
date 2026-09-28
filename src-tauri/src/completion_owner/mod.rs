@@ -377,6 +377,7 @@ pub fn require_legacy_recipient_effect_route() -> Result<(), String> {
         }
         return match protocol::observe_entry_gate_at(&socket) {
             Ok(EntryRoute::LegacyOpen) => Ok(()),
+            Ok(EntryRoute::FreshOnlyOpen) => Err("fresh-only recipient route requires broker grant".into()),
             Ok(EntryRoute::BrokerV30Closed) => Err(
                 "v30 recipient write requires broker-authenticated recipient grant; retired sidecar refused"
                     .into(),

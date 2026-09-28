@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Build and durably stage an inert, fresh-only schema-2 Linux image set.
 
-This tool has no install, selector, alias, service, or State writer. The current
-production entry paths cannot activate this image set; see the AGE-319 report.
+This tool has no install, selector, alias, service, or State writer. Activation
+is a separate offline Broker operation after the final files are installed.
 """
 
 import argparse

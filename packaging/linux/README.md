@@ -25,12 +25,11 @@ python3 packaging/linux/first_install_v30.py stage \
 python3 packaging/linux/first_install_v30.py check /root/first-install-v30-stage
 ```
 
-This is the narrow source prerequisite for a clean first install. The current
-installed launcher refuses production launches, the Runner's installed pair
-gate refuses a `broker-v30-closed` route, and Bash's production ordinary v30
-call is gated on a private user namespace. This tool therefore has **no
-activation command**. The exact blockers and host action are recorded in
-`planning/age353-queue/AGE319-FIRST-INSTALL-V30-REPORT.md`.
+This package remains inert. A separate offline Broker command activates only
+after an administrator has installed its final four images and schema-2
+`install-v1.json` at the fixed `/usr/local/libexec/oulipoly` paths. The
+installed launcher still refuses production launches and Runner fresh-only
+entry is a later slice.
 
 The featureless Broker also has an explicit offline storage command:
 `oulipoly-kernel-broker --bootstrap-empty-v30-state`. As root, it publishes
@@ -39,8 +38,19 @@ contains a current empty State database, completion-domain sidecar, fresh v30
 lane, exact inode-bound State source bindings, and an identity marker. A retry
 reads back that same identity; an incompatible root or abandoned stage is a
 refusal. This command does not start the Broker service or activate the image
-package. The first-install activation and installed caller routes remain
-separate work.
+package.
+
+With the final files in place, run the installed Broker as root with
+`--activate-first-install-v30` before its first service start. It accepts only
+the exact unserved empty bootstrap root. It pins the manifest and all four
+named images by SHA-256, device and inode, and atomically publishes
+`/var/lib/oulipoly-kernel-broker/first-install-activation-v1.json`. A retry
+prints the identical source and pair identity. An old root, incomplete stage,
+changed file, or already served root refuses. On startup the Broker validates
+that record before reporting `fresh-only-open`; its installed-pair observation
+includes both pair generation and bootstrap source generation. No startup path
+creates the activation record. Production L, launcher result/status, and
+Runner fresh-only execution remain closed.
 
 ## Separate old/new staging fixture
 
