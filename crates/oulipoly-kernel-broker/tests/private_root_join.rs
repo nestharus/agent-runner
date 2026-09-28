@@ -8675,15 +8675,10 @@ fn inner() {
                         );
                         eventually(|| gate.join("source-adopted-started").exists());
                         if native_f_turn {
-                            let expected: RootRecord = serde_json::from_slice(
-                                &fs::read(broker_state.join(format!("{}.json", prepared.root_id)))
-                                    .unwrap(),
-                            )
-                            .unwrap();
                             let roots =
                                 oulipoly_kernel_broker::registry::RootRegistry::open(&broker_state)
                                     .unwrap();
-                            let mut source =
+                            let source =
                                 SourcePhysicalRegistry::open(broker_state.join("source-physical"))
                                     .unwrap();
                             let grant_id = source.records()[0].grant.grant_id.clone();
@@ -8691,49 +8686,25 @@ fn inner() {
                                 source.observe(&grant_id).unwrap(),
                                 SourceObservation::Live { .. }
                             ));
-                            let mut retained = BrokerSidecar::open_existing(
-                                &broker_state.join("sidecar/pid-identity.db"),
-                                &broker_state,
-                            )
-                            .unwrap();
-                            let refusal = source
-                                .retire_after_native_acks(
-                                    &expected,
-                                    &roots,
-                                    &mut retained,
-                                    &lane,
-                                    &grant_id,
-                                )
-                                .unwrap_err();
-                            assert!(
-                                refusal.to_string().contains("source Q is live"),
-                                "{refusal}"
-                            );
+                            assert!(source.retirement(&grant_id).unwrap().is_none());
                             let accepted: oulipoly_kernel_broker::accepted_grant::GrantRecord =
                                 serde_json::from_value(durable_h.clone()).unwrap();
-                            let mut works = oulipoly_kernel_broker::WorkRegistry::open(
+                            let works = oulipoly_kernel_broker::WorkRegistry::open(
                                 broker_state.join("works"),
                                 &roots,
                             )
                             .unwrap();
-                            let grants =
-                                oulipoly_kernel_broker::accepted_grant::GrantRegistry::open(
-                                    broker_state.join("grants"),
-                                )
-                                .unwrap();
-                            let refusal = works
-                                .retire_after_native_acks(
-                                    &expected,
-                                    &roots,
-                                    &grants,
-                                    &source,
-                                    &retained,
-                                    &lane,
-                                    &accepted,
-                                    &broker_state.join("terminals"),
-                                )
-                                .unwrap_err();
-                            assert!(refusal.to_string().contains("still live"), "{refusal}");
+                            assert!(
+                                !broker_state
+                                    .join("works")
+                                    .join(format!("{}.retired.json", accepted.grant_id))
+                                    .exists()
+                            );
+                            let expected: RootRecord = serde_json::from_slice(
+                                &fs::read(broker_state.join(format!("{}.json", prepared.root_id)))
+                                    .unwrap(),
+                            )
+                            .unwrap();
                             let refusal = works
                                 .physical_q(
                                     &expected,
@@ -8743,6 +8714,16 @@ fn inner() {
                                 )
                                 .unwrap_err();
                             assert!(refusal.to_string().contains("still live"), "{refusal}");
+                            let before =
+                                protocol::root_drain_readback_at(&socket, &expected, false)
+                                    .unwrap();
+                            let before: serde_json::Value = serde_json::from_str(
+                                before.strip_prefix("root-drain-v1 ").unwrap().trim_end(),
+                            )
+                            .unwrap();
+                            assert_eq!(before["source_physical_outstanding"], 1);
+                            assert_eq!(before["work_outstanding"], 1);
+                            assert_eq!(before["close_eligible"], false);
                         }
                         fs::write(gate.join("source-adopted-started.release"), b"drain").unwrap();
                         let original_session = lane.read_session(&root.d_key).unwrap().unwrap();
@@ -8928,6 +8909,27 @@ fn inner() {
                                     .unwrap();
                                 assert_eq!(attempts, 1);
                                 if native_f_candidate {
+                                    if native_f_turn {
+                                        // The original ACK alone cannot retire either Q.
+                                        assert!(
+                                            !broker_state
+                                                .join("source-physical")
+                                                .join(format!(
+                                                    "{}.retired.json",
+                                                    custody.source_grant_id
+                                                ))
+                                                .exists()
+                                        );
+                                        assert!(
+                                            !broker_state
+                                                .join("works")
+                                                .join(format!(
+                                                    "{}.retired.json",
+                                                    h_grant["grant_id"].as_str().unwrap()
+                                                ))
+                                                .exists()
+                                        );
+                                    }
                                     eventually(|| gate.join("bash-recipient-output").exists());
                                     let f_report: serde_json::Value = serde_json::from_slice(
                                         &fs::read(gate.join("bash-recipient-output")).unwrap(),
@@ -9243,135 +9245,68 @@ fn inner() {
                                             )
                                             .unwrap();
                                         let source_dir = broker_state.join("source-physical");
-                                        let mut physical =
+                                        let accepted: oulipoly_kernel_broker::accepted_grant::GrantRecord =
+                                            serde_json::from_value(durable_h.clone()).unwrap();
+                                        let works_dir = broker_state.join("works");
+                                        let terminal_dir = broker_state.join("terminals");
+                                        // The serving Broker writes both seals after the real
+                                        // terminal and dual ACKs; this test only observes them.
+                                        eventually(|| {
+                                            SourcePhysicalRegistry::open(&source_dir)
+                                                .ok()
+                                                .and_then(|physical| {
+                                                    physical
+                                                        .retirement(&custody.source_grant_id)
+                                                        .ok()
+                                                        .flatten()
+                                                })
+                                                .is_some()
+                                                && works_dir
+                                                    .join(format!(
+                                                        "{}.retired.json",
+                                                        accepted.grant_id
+                                                    ))
+                                                    .exists()
+                                        });
+                                        let reopened =
                                             SourcePhysicalRegistry::open(&source_dir).unwrap();
-                                        let mut retained = BrokerSidecar::open_existing(
-                                            &broker_state.join("sidecar/pid-identity.db"),
-                                            &broker_state,
-                                        )
-                                        .unwrap();
-                                        let mut stale = expected.clone();
-                                        stale.init_starttime_ticks += 1;
-                                        assert!(
-                                            physical
-                                                .retire_after_native_acks(
-                                                    &stale,
-                                                    &roots,
-                                                    &mut retained,
-                                                    &lane,
-                                                    &custody.source_grant_id,
-                                                )
-                                                .is_err()
-                                        );
-                                        let retired = physical
-                                            .retire_after_native_acks(
-                                                &expected,
-                                                &roots,
-                                                &mut retained,
-                                                &lane,
-                                                &custody.source_grant_id,
-                                            )
+                                        let retired = reopened
+                                            .retirement(&custody.source_grant_id)
+                                            .unwrap()
                                             .unwrap();
                                         assert_eq!(
                                             retired.source_grant_id,
                                             custody.source_grant_id
                                         );
                                         assert_ne!(retired.original_turn_id, retired.fresh_turn_id);
-                                        assert_eq!(
-                                            physical
-                                                .retire_after_native_acks(
-                                                    &expected,
-                                                    &roots,
-                                                    &mut retained,
-                                                    &lane,
-                                                    &custody.source_grant_id,
-                                                )
-                                                .unwrap(),
-                                            retired
-                                        );
-                                        let reopened =
-                                            SourcePhysicalRegistry::open(&source_dir).unwrap();
-                                        assert_eq!(
-                                            reopened.retirement(&custody.source_grant_id).unwrap(),
-                                            Some(retired)
-                                        );
-                                        let after = protocol::root_drain_readback_at(
-                                            &socket, &expected, false,
+                                        let retained = BrokerSidecar::open_existing(
+                                            &broker_state.join("sidecar/pid-identity.db"),
+                                            &broker_state,
                                         )
                                         .unwrap();
-                                        let after: serde_json::Value = serde_json::from_str(
-                                            after
-                                                .strip_prefix("root-drain-v1 ")
-                                                .unwrap()
-                                                .trim_end(),
-                                        )
-                                        .unwrap();
-                                        assert_eq!(after["source_physical_records"], 1);
-                                        assert_eq!(after["source_physical_outstanding"], 0);
-                                        assert_eq!(after["source_physical_retired"], 1);
-                                        assert_eq!(after["work_records"], 1);
-                                        assert_eq!(after["work_retired"], 0);
-                                        assert_eq!(after["work_outstanding"], 1);
-                                        assert_eq!(after["close_eligible"], false);
-                                        let accepted: oulipoly_kernel_broker::accepted_grant::GrantRecord =
-                                            serde_json::from_value(durable_h.clone()).unwrap();
-                                        let works_dir = broker_state.join("works");
-                                        let terminal_dir = broker_state.join("terminals");
-                                        eventually(|| {
-                                            let works = oulipoly_kernel_broker::WorkRegistry::open(
+                                        let grants = oulipoly_kernel_broker::accepted_grant::GrantRegistry::open(
+                                            broker_state.join("grants"),
+                                        ).unwrap();
+                                        let reopened_work =
+                                            oulipoly_kernel_broker::WorkRegistry::open(
                                                 &works_dir, &roots,
                                             )
                                             .unwrap();
-                                            works
-                                                .physical_q(
-                                                    &expected,
-                                                    &roots,
-                                                    &accepted,
-                                                    &terminal_dir,
-                                                )
-                                                .is_ok()
-                                        });
-                                        let mut works = oulipoly_kernel_broker::WorkRegistry::open(
-                                            &works_dir, &roots,
-                                        )
-                                        .unwrap();
-                                        let work_q = works
-                                            .physical_q(&expected, &roots, &accepted, &terminal_dir)
-                                            .unwrap();
-                                        assert_eq!(work_q.grant_id, accepted.grant_id);
-                                        assert_eq!(work_q.work_id, accepted.work_id);
-                                        assert_eq!(work_q.pid1_wait_status, 0);
-                                        let grants = oulipoly_kernel_broker::accepted_grant::GrantRegistry::open(
-                                            broker_state.join("grants"),
-                                        )
-                                        .unwrap();
-                                        let mut stale = expected.clone();
-                                        stale.init_starttime_ticks += 1;
-                                        assert!(
-                                            works
-                                                .retire_after_native_acks(
-                                                    &stale,
-                                                    &roots,
-                                                    &grants,
-                                                    &reopened,
-                                                    &retained,
-                                                    &lane,
-                                                    &accepted,
-                                                    &terminal_dir,
-                                                )
-                                                .is_err()
-                                        );
-                                        let work_retirement = works
-                                            .retire_after_native_acks(
+                                        let work_retirement = reopened_work
+                                            .retirement(
                                                 &expected,
                                                 &roots,
                                                 &grants,
                                                 &reopened,
-                                                &retained,
-                                                &lane,
+                                                Some(&retained),
+                                                Some(&lane),
                                                 &accepted,
                                                 &terminal_dir,
                                             )
+                                            .unwrap()
+                                            .unwrap();
+                                        let work_q = reopened_work
+                                            .physical_q(&expected, &roots, &accepted, &terminal_dir)
                                             .unwrap();
                                         assert_eq!(work_retirement.physical_q, work_q);
                                         assert_eq!(
@@ -9381,41 +9316,6 @@ fn inner() {
                                         assert_ne!(
                                             work_retirement.original_turn_id,
                                             work_retirement.fresh_turn_id
-                                        );
-                                        assert_eq!(
-                                            works
-                                                .retire_after_native_acks(
-                                                    &expected,
-                                                    &roots,
-                                                    &grants,
-                                                    &reopened,
-                                                    &retained,
-                                                    &lane,
-                                                    &accepted,
-                                                    &terminal_dir,
-                                                )
-                                                .unwrap(),
-                                            work_retirement
-                                        );
-                                        let reopened_work =
-                                            oulipoly_kernel_broker::WorkRegistry::open(
-                                                &works_dir, &roots,
-                                            )
-                                            .unwrap();
-                                        assert_eq!(
-                                            reopened_work
-                                                .retirement(
-                                                    &expected,
-                                                    &roots,
-                                                    &grants,
-                                                    &reopened,
-                                                    Some(&retained),
-                                                    Some(&lane),
-                                                    &accepted,
-                                                    &terminal_dir,
-                                                )
-                                                .unwrap(),
-                                            Some(work_retirement.clone())
                                         );
                                         let after_work = protocol::root_drain_readback_at(
                                             &socket, &expected, false,
@@ -9428,6 +9328,8 @@ fn inner() {
                                                 .trim_end(),
                                         )
                                         .unwrap();
+                                        assert_eq!(after_work["source_physical_records"], 1);
+                                        assert_eq!(after_work["source_physical_retired"], 1);
                                         assert_eq!(after_work["source_physical_outstanding"], 0);
                                         assert_eq!(after_work["work_records"], 1);
                                         assert_eq!(after_work["work_retired"], 1);
@@ -9435,17 +9337,6 @@ fn inner() {
                                         assert_eq!(after_work["live_works"], 0);
                                         assert_eq!(after_work["work_debt"], 0);
                                         assert_eq!(after_work["close_eligible"], false);
-                                        assert_eq!(
-                                            reopened_work
-                                                .physical_q(
-                                                    &expected,
-                                                    &roots,
-                                                    &accepted,
-                                                    &terminal_dir,
-                                                )
-                                                .unwrap(),
-                                            work_q
-                                        );
                                         let work_receipt_path = terminal_dir
                                             .join(format!("{}.json", work_q.work_incarnation,));
                                         let work_receipt = fs::read(&work_receipt_path).unwrap();
@@ -9550,14 +9441,14 @@ fn inner() {
                                         )
                                         .unwrap();
                                         assert!(
-                                            works
-                                                .retire_after_native_acks(
+                                            reopened_work
+                                                .retirement(
                                                     &expected,
                                                     &roots,
                                                     &grants,
                                                     &reopened,
-                                                    &retained,
-                                                    &lane,
+                                                    Some(&retained),
+                                                    Some(&lane),
                                                     &accepted,
                                                     &terminal_dir,
                                                 )
@@ -9628,6 +9519,85 @@ fn inner() {
                                                 .unwrap(),
                                             Some(work_retirement)
                                         );
+                                        // A new serving incarnation must read the retained
+                                        // evidence again, including a changed child Q.
+                                        let work_receipt = fs::read(&work_receipt_path).unwrap();
+                                        stop(&mut broker);
+                                        fs::write(&work_receipt_path, b"changed after restart")
+                                            .unwrap();
+                                        broker = Command::new(env!(
+                                            "CARGO_BIN_EXE_oulipoly-kernel-broker"
+                                        ))
+                                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                                        .env(
+                                            "OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1",
+                                            &broker_state,
+                                        )
+                                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
+                                        .env(
+                                            "OULIPOLY_KERNEL_BROKER_FIXTURE_BASH_V1",
+                                            bash.as_ref().unwrap(),
+                                        )
+                                        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", &gate)
+                                        .env(
+                                            "OULIPOLY_KERNEL_BROKER_PRIVATE_NATIVE_CODEX_SHA256_V1",
+                                            format!(
+                                                "{:x}",
+                                                Sha256::digest(fs::read(&provider_image).unwrap())
+                                            ),
+                                        )
+                                        .stderr(Stdio::from(
+                                            File::create(
+                                                temp.path().join("retirement-restart.log"),
+                                            )
+                                            .unwrap(),
+                                        ))
+                                        .spawn()
+                                        .unwrap();
+                                        eventually(|| {
+                                            protocol::root_drain_readback_at(
+                                                &socket, &expected, false,
+                                            )
+                                            .is_ok()
+                                        });
+                                        let changed = protocol::root_drain_readback_at(
+                                            &socket, &expected, false,
+                                        )
+                                        .unwrap();
+                                        let changed: serde_json::Value = serde_json::from_str(
+                                            changed
+                                                .strip_prefix("root-drain-v1 ")
+                                                .unwrap()
+                                                .trim_end(),
+                                        )
+                                        .unwrap();
+                                        assert_eq!(changed["source_physical_retired"], 1);
+                                        assert_eq!(changed["work_retired"], 0);
+                                        assert_eq!(changed["work_outstanding"], 1);
+                                        assert_eq!(
+                                            changed["uncertain_registry_or_incarnation"],
+                                            true
+                                        );
+                                        assert_eq!(changed["close_eligible"], false);
+                                        fs::write(&work_receipt_path, work_receipt).unwrap();
+                                        eventually(|| {
+                                            protocol::root_drain_readback_at(
+                                                &socket, &expected, false,
+                                            )
+                                            .ok()
+                                            .and_then(|reply| {
+                                                serde_json::from_str::<serde_json::Value>(
+                                                    reply
+                                                        .strip_prefix("root-drain-v1 ")?
+                                                        .trim_end(),
+                                                )
+                                                .ok()
+                                            })
+                                            .is_some_and(|inventory| {
+                                                inventory["work_retired"] == 1
+                                                    && inventory["work_outstanding"] == 0
+                                            })
+                                        });
                                     }
                                 }
                             } else {

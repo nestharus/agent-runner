@@ -4137,6 +4137,90 @@ fn settle_entry_from_terminal(
         .map_err(|_| io::Error::other("terminal entry settlement response uncertain"))?
 }
 
+/// Revisit one retained original source per idle tick. Only the serving
+/// Broker owns these registries; neither workload ingress nor drain readback
+/// calls this transition. The seals themselves re-read terminal State, both
+/// native ACKs and the exact physical witnesses before writing or readback.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the two existing seals retain separate authorities"
+)]
+fn reconcile_one_native_retirement(
+    cursor: &mut usize,
+    completed: &mut HashSet<String>,
+    state_root: &Path,
+    roots: &RootRegistry,
+    sources: &mut SourcePhysicalRegistry,
+    works: &mut WorkRegistry,
+    grants: &GrantRegistry,
+    sidecar: &mut BrokerSidecar,
+    terminal_dir: &Path,
+) {
+    let count = sources.records().len();
+    if count == 0 {
+        return;
+    }
+    let index = *cursor % count;
+    *cursor = index.wrapping_add(1);
+    let source = &sources.records()[index];
+    let source_id = source.grant.grant_id.clone();
+    if completed.contains(&source_id) || !roots.admission_fenced(&source.grant.root_id) {
+        return;
+    }
+    let Some(root) = roots
+        .live_roots()
+        .map(|live| &live.record)
+        .chain(roots.debt_records())
+        .find(|root| root.root_id == source.grant.root_id)
+        .cloned()
+    else {
+        return;
+    };
+    let matching_grants: Vec<_> = grants
+        .records()
+        .iter()
+        .filter(|grant| {
+            grant.consumed
+                && grant.root_id == root.root_id
+                && grant.joined_child == source.joined_child
+                && grant.guardian == source.guardian
+        })
+        .collect();
+    if matching_grants.is_empty() {
+        return;
+    }
+    let Ok(lane) = FreshV30Lane::open_at(state_root) else {
+        return;
+    };
+    if sources
+        .retire_after_native_acks(&root, roots, sidecar, &lane, &source_id)
+        .is_err()
+    {
+        return;
+    }
+    let mut all_retired = true;
+    for grant in matching_grants {
+        if works
+            .retire_after_native_acks(
+                &root,
+                roots,
+                grants,
+                sources,
+                sidecar,
+                &lane,
+                grant,
+                terminal_dir,
+            )
+            .is_err()
+        {
+            all_retired = false;
+        }
+    }
+    if all_retired {
+        completed.insert(source_id);
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "old gate and fresh identity are separate authorities"
@@ -4589,6 +4673,9 @@ fn serve() -> io::Result<()> {
     let mut grants = GrantRegistry::open(&grants_path)?;
     let broker_incarnation = uuid::Uuid::new_v4().to_string();
     let mut settled_native_q = HashSet::new();
+    let mut retirement_cursor = 0usize;
+    // Process-local only: restart retries and revalidates every durable seal.
+    let mut completed_native_retirements = HashSet::<String>::new();
     #[cfg(feature = "age319-private-broker-fixture")]
     let mut attempted_v2_wakes = HashSet::<String>::new();
     // Ephemeral by design: a broker restart invalidates every pre-wire source
@@ -4754,6 +4841,17 @@ fn serve() -> io::Result<()> {
                         &broker_incarnation,
                         &terminal_path,
                         &mut settled_native_q,
+                    );
+                    reconcile_one_native_retirement(
+                        &mut retirement_cursor,
+                        &mut completed_native_retirements,
+                        Path::new(&state),
+                        &registry,
+                        &mut source_physical,
+                        &mut works,
+                        &grants,
+                        sidecar,
+                        &terminal_path,
                     );
                 }
                 std::thread::sleep(BROKER_ACCEPT_POLL_INTERVAL);
