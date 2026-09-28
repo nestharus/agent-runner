@@ -1465,7 +1465,9 @@ fn terminate_postcommit_original_owner(broker_state: &Path) {
 
 fn inner() {
     let mode = std::env::var("AGE319_PRIVATE_JOIN_MODE").unwrap_or_else(|_| "help".into());
-    let native_turn_mode = mode == "normal_model_provider_native_codex_turn_receipt";
+    let native_ack_mode = mode == "normal_model_provider_native_codex_recipient_ack";
+    let native_turn_mode =
+        native_ack_mode || mode == "normal_model_provider_native_codex_turn_receipt";
     let native_codex_mode =
         native_turn_mode || mode == "normal_model_provider_native_codex_root_h_notify_row";
     let root_terminal_drain = matches!(
@@ -1683,6 +1685,7 @@ fn inner() {
             | "normal_model_provider_bash_causal_root_h_notify_wake_unknown"
             | "normal_model_provider_native_codex_root_h_notify_row"
             | "normal_model_provider_native_codex_turn_receipt"
+            | "normal_model_provider_native_codex_recipient_ack"
     );
     let root_h_lost = mode == "normal_model_provider_bash_causal_root_h_lost";
     let root_h_notify = root_h_delegate && (mode.contains("_notify_") || native_turn_mode);
@@ -2284,6 +2287,8 @@ fn inner() {
         }))
         .envs(native_codex_mode.then_some(("AGE319_PRIVATE_NATIVE_BASH_DROP_REPLY_V1", "1")))
         .envs(native_turn_mode.then_some(("AGE319_PRIVATE_NATIVE_TURN_DROP_REPLY_V1", "1")))
+        .envs(native_ack_mode.then_some(("AGE319_PRIVATE_NATIVE_RECIPIENT_ACK_V1", "1")))
+        .envs(native_ack_mode.then_some(("AGE319_PRIVATE_NATIVE_ACK_DROP_REPLY_V1", "1")))
         .envs(native_lost_reply.map(|stage| ("AGE319_PRIVATE_NATIVE_F_DROP_REPLY_V1", stage)))
         .envs(
             (mode == "normal_model_provider_bash_causal_success" || root_h_delegate)
@@ -6951,6 +6956,7 @@ fn inner() {
                         | "normal_model_provider_prefix"
                         | "normal_model_provider_native_codex_root_h_notify_row"
                         | "normal_model_provider_native_codex_turn_receipt"
+                        | "normal_model_provider_native_codex_recipient_ack"
                 )
             {
                 let marker: serde_json::Value =
@@ -8738,7 +8744,7 @@ fn inner() {
                             .unwrap();
                             assert_eq!(receipt["readback"], native);
                             assert_eq!(receipt["status"], "completed");
-                            assert_eq!(receipt["original_row_acknowledged"], false);
+                            assert_eq!(receipt["original_row_acknowledged"], native_ack_mode);
                             let attempt: serde_json::Value = serde_json::from_slice(
                                 &fs::read(physical_dir.join(format!(
                                     "{}.native-turn-attempt.json",
@@ -8757,7 +8763,88 @@ fn inner() {
                                 "SELECT count(*) FROM mailbox WHERE seq=?1 AND delivered_at IS NULL",
                                 [custody.row_seq], |row| row.get(0),
                             ).unwrap();
-                            assert_eq!(pending, 1, "native turn must not ACK original row");
+                            if native_ack_mode {
+                                assert_eq!(pending, 0, "native recipient did not ACK original row");
+                                let (reason, digest): (String, String) = side.query_row(
+                                    "SELECT l.acknowledgement_reason,g.ack_response_sha256
+                                     FROM completion_event_listener l JOIN broker_native_recipient_grant g
+                                     ON g.row_seq=l.mailbox_seq WHERE l.mailbox_seq=?1",
+                                    [custody.row_seq], |row| Ok((row.get(0)?,row.get(1)?)),
+                                ).unwrap();
+                                assert_eq!(reason, "explicit_native_codex_assistant_ack");
+                                assert_eq!(digest, receipt["ack_response_sha256"]);
+                                let grant = retained
+                                    .read_native_recipient_grant(&custody.source_grant_id)
+                                    .unwrap()
+                                    .unwrap();
+                                let selected = grant.selected_k_json.clone();
+                                assert_eq!(
+                                    serde_json::from_str::<serde_json::Value>(&selected).unwrap(),
+                                    native
+                                );
+                                let turn = receipt["turn_id"].as_str().unwrap();
+                                let turn_digest = receipt["turn_receipt_sha256"].as_str().unwrap();
+                                let response_digest =
+                                    receipt["ack_response_sha256"].as_str().unwrap();
+                                assert_eq!(grant.phase, "acked");
+                                assert!(
+                                    retained
+                                        .acknowledge_native_recipient(
+                                            &custody.source_grant_id,
+                                            &selected,
+                                            "wrong-token",
+                                            turn,
+                                            turn_digest,
+                                            response_digest
+                                        )
+                                        .is_err()
+                                );
+                                assert!(
+                                    retained
+                                        .acknowledge_native_recipient(
+                                            &custody.source_grant_id,
+                                            &selected,
+                                            &grant.delivery_token,
+                                            "wrong-turn",
+                                            turn_digest,
+                                            response_digest
+                                        )
+                                        .is_err()
+                                );
+                                assert!(
+                                    retained
+                                        .acknowledge_native_recipient(
+                                            &custody.source_grant_id,
+                                            "wrong-K",
+                                            &grant.delivery_token,
+                                            turn,
+                                            turn_digest,
+                                            response_digest
+                                        )
+                                        .is_err()
+                                );
+                                let same = retained
+                                    .acknowledge_native_recipient(
+                                        &custody.source_grant_id,
+                                        &selected,
+                                        &grant.delivery_token,
+                                        turn,
+                                        turn_digest,
+                                        response_digest,
+                                    )
+                                    .unwrap();
+                                assert_eq!(same, grant, "lost ACK reply must read one settlement");
+                                let attempts: i64 = side
+                                    .query_row(
+                                        "SELECT delivery_attempts FROM mailbox WHERE seq=?1",
+                                        [custody.row_seq],
+                                        |row| row.get(0),
+                                    )
+                                    .unwrap();
+                                assert_eq!(attempts, 1);
+                            } else {
+                                assert_eq!(pending, 1, "native turn must not ACK original row");
+                            }
                         }
                         stop(&mut broker);
                         return;
@@ -14985,6 +15072,7 @@ fn original_runner_joins_once_behind_persistent_root_pid1() {
         "normal_model_provider_bash_causal_root_h_notify_row",
         "normal_model_provider_native_codex_root_h_notify_row",
         "normal_model_provider_native_codex_turn_receipt",
+        "normal_model_provider_native_codex_recipient_ack",
         "normal_model_provider_bash_causal_root_h_notify_row_drain",
         "normal_model_provider_bash_causal_root_h_notify_wake",
         "normal_model_provider_bash_causal_root_h_notify_wake_drain",

@@ -11,6 +11,8 @@ use std::path::Component;
 
 mod broker_v2_recipient;
 pub use broker_v2_recipient::{BrokerV2RecipientBinding, BrokerV2RecipientGrant};
+mod broker_native_recipient;
+pub use broker_native_recipient::BrokerNativeRecipientGrant;
 
 /// Retains the broker's live SQLite connection and its broker-minted source
 /// generation. Legacy v4 native grants and pre-cutover attempts are not made
@@ -4277,7 +4279,7 @@ fn open_with_owner(path: &Path, owner: u32, anchor: &Path) -> Result<BrokerSidec
         .map_err(|error| format!("Failed to open broker sidecar: {error}"))?;
     authority.validate_opened_target()?;
     configure_writable_sidecar_connection(&conn)?;
-    if matches!(schema::sidecar_version(&conn)?, 32 | 33 | 34 | 35) {
+    if matches!(schema::sidecar_version(&conn)?, 32 | 33 | 34 | 35 | 36) {
         schema::validate_broker_owned(&conn)?;
         // Serialize both additive upgrades on the retained connection. The
         // historical four-column provenance table remains inert at v34.
@@ -4325,6 +4327,17 @@ fn open_with_owner(path: &Path, owner: u32, anchor: &Path) -> Result<BrokerSidec
                 schema::BROKER_V2_RECIPIENT_GRANT_SCHEMA,
                 schema::BROKER_V2_RECIPIENT_GRANT_RETAIN,
                 schema::BROKER_V2_RECIPIENT_GRANT_GUARD,
+            ] {
+                tx.execute_batch(definition).map_err(|e| e.to_string())?;
+            }
+            tx.pragma_update(None, "user_version", 36)
+                .map_err(|e| e.to_string())?;
+        }
+        if schema::sidecar_version(&tx)? == 36 {
+            for definition in [
+                schema::BROKER_NATIVE_RECIPIENT_GRANT_SCHEMA,
+                schema::BROKER_NATIVE_RECIPIENT_GRANT_RETAIN,
+                schema::BROKER_NATIVE_RECIPIENT_GRANT_GUARD,
             ] {
                 tx.execute_batch(definition).map_err(|e| e.to_string())?;
             }
@@ -4419,6 +4432,9 @@ pub(super) fn activate_with_owner(
         schema::BROKER_V2_RECIPIENT_GRANT_SCHEMA,
         schema::BROKER_V2_RECIPIENT_GRANT_RETAIN,
         schema::BROKER_V2_RECIPIENT_GRANT_GUARD,
+        schema::BROKER_NATIVE_RECIPIENT_GRANT_SCHEMA,
+        schema::BROKER_NATIVE_RECIPIENT_GRANT_RETAIN,
+        schema::BROKER_NATIVE_RECIPIENT_GRANT_GUARD,
         schema::BROKER_OWNER_RELEASE_IMMUTABLE,
         schema::BROKER_OWNER_RELEASE_RETAIN,
         schema::BROKER_OWNER_RELEASE_EXACT,
@@ -5830,6 +5846,9 @@ mod tests {
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(
             "PRAGMA wal_autocheckpoint=0;
+             DROP TRIGGER broker_native_recipient_grant_guard;
+             DROP TRIGGER broker_native_recipient_grant_retain;
+             DROP TABLE broker_native_recipient_grant;
              DROP TRIGGER broker_v2_recipient_grant_guard;
              DROP TRIGGER broker_v2_recipient_grant_retain;
              DROP TABLE broker_v2_recipient_grant;
@@ -5853,7 +5872,7 @@ mod tests {
         assert_eq!(schema::sidecar_version(&conn).unwrap(), 32);
         let upgraded = open_with_owner(&path, uid, root.path()).unwrap();
         assert_eq!(upgraded.source_generation(), generation);
-        assert_eq!(schema::sidecar_version(&upgraded.mailbox.conn).unwrap(), 36);
+        assert_eq!(schema::sidecar_version(&upgraded.mailbox.conn).unwrap(), 37);
         let value: String = upgraded
             .mailbox
             .conn
@@ -5880,6 +5899,9 @@ mod tests {
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(
             "PRAGMA wal_autocheckpoint=0;
+             DROP TRIGGER broker_native_recipient_grant_guard;
+             DROP TRIGGER broker_native_recipient_grant_retain;
+             DROP TABLE broker_native_recipient_grant;
              DROP TRIGGER broker_v2_recipient_grant_guard;
              DROP TRIGGER broker_v2_recipient_grant_retain;
              DROP TABLE broker_v2_recipient_grant;
@@ -5900,7 +5922,7 @@ mod tests {
         assert_eq!(schema::sidecar_version(&conn).unwrap(), 33);
         let upgraded = open_with_owner(&path, uid, root.path()).unwrap();
         assert_eq!(upgraded.source_generation(), generation);
-        assert_eq!(schema::sidecar_version(&upgraded.mailbox.conn).unwrap(), 36);
+        assert_eq!(schema::sidecar_version(&upgraded.mailbox.conn).unwrap(), 37);
         let old: String = upgraded
             .mailbox
             .conn
@@ -5947,6 +5969,9 @@ mod tests {
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(
             "PRAGMA wal_autocheckpoint=0;
+             DROP TRIGGER broker_native_recipient_grant_guard;
+             DROP TRIGGER broker_native_recipient_grant_retain;
+             DROP TABLE broker_native_recipient_grant;
              DROP TRIGGER broker_v2_recipient_grant_guard;
              DROP TRIGGER broker_v2_recipient_grant_retain;
              DROP TABLE broker_v2_recipient_grant;
@@ -5963,7 +5988,7 @@ mod tests {
         .unwrap();
         let upgraded = open_with_owner(&path, uid, root.path()).unwrap();
         assert_eq!(upgraded.source_generation(), generation);
-        assert_eq!(schema::sidecar_version(&upgraded.mailbox.conn).unwrap(), 36);
+        assert_eq!(schema::sidecar_version(&upgraded.mailbox.conn).unwrap(), 37);
         let value: String = upgraded
             .mailbox
             .conn
@@ -5990,6 +6015,9 @@ mod tests {
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(
             "PRAGMA wal_autocheckpoint=0;
+             DROP TRIGGER broker_native_recipient_grant_guard;
+             DROP TRIGGER broker_native_recipient_grant_retain;
+             DROP TABLE broker_native_recipient_grant;
              DROP TRIGGER broker_v2_recipient_grant_guard;
              DROP TRIGGER broker_v2_recipient_grant_retain;
              DROP TABLE broker_v2_recipient_grant;
@@ -6000,11 +6028,48 @@ mod tests {
         .unwrap();
         let upgraded = open_with_owner(&path, uid, root.path()).unwrap();
         assert_eq!(upgraded.source_generation(), generation);
-        assert_eq!(schema::sidecar_version(&upgraded.mailbox.conn).unwrap(), 36);
+        assert_eq!(schema::sidecar_version(&upgraded.mailbox.conn).unwrap(), 37);
         let value: String = upgraded
             .mailbox
             .conn
             .query_row("SELECT value FROM retained_v35_wal", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(value, "committed");
+        schema::validate_broker_owned(&upgraded.mailbox.conn).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_v36_upgrade_adds_native_grant_without_losing_wal() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("sidecar");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join("pid-identity.db");
+        drop(MailboxDb::open(&path).unwrap());
+        for artifact in [path.clone(), mailbox_authority_path(&path)] {
+            fs::set_permissions(artifact, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let uid = unsafe { libc::geteuid() };
+        let generation = activate_with_owner(&path, uid, root.path()).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "PRAGMA wal_autocheckpoint=0;
+             DROP TRIGGER broker_native_recipient_grant_guard;
+             DROP TRIGGER broker_native_recipient_grant_retain;
+             DROP TABLE broker_native_recipient_grant;
+             CREATE TABLE retained_v36_wal(value TEXT NOT NULL);
+             INSERT INTO retained_v36_wal VALUES('committed');
+             PRAGMA user_version=36;",
+        )
+        .unwrap();
+        let upgraded = open_with_owner(&path, uid, root.path()).unwrap();
+        assert_eq!(upgraded.source_generation(), generation);
+        assert_eq!(schema::sidecar_version(&upgraded.mailbox.conn).unwrap(), 37);
+        let value: String = upgraded
+            .mailbox
+            .conn
+            .query_row("SELECT value FROM retained_v36_wal", [], |r| r.get(0))
             .unwrap();
         assert_eq!(value, "committed");
         schema::validate_broker_owned(&upgraded.mailbox.conn).unwrap();
