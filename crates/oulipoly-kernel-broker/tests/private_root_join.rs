@@ -8711,11 +8711,29 @@ fn inner() {
                             );
                             let accepted: oulipoly_kernel_broker::accepted_grant::GrantRecord =
                                 serde_json::from_value(durable_h.clone()).unwrap();
-                            let works = oulipoly_kernel_broker::WorkRegistry::open(
+                            let mut works = oulipoly_kernel_broker::WorkRegistry::open(
                                 broker_state.join("works"),
                                 &roots,
                             )
                             .unwrap();
+                            let grants =
+                                oulipoly_kernel_broker::accepted_grant::GrantRegistry::open(
+                                    broker_state.join("grants"),
+                                )
+                                .unwrap();
+                            let refusal = works
+                                .retire_after_native_acks(
+                                    &expected,
+                                    &roots,
+                                    &grants,
+                                    &source,
+                                    &retained,
+                                    &lane,
+                                    &accepted,
+                                    &broker_state.join("terminals"),
+                                )
+                                .unwrap_err();
+                            assert!(refusal.to_string().contains("still live"), "{refusal}");
                             let refusal = works
                                 .physical_q(
                                     &expected,
@@ -9291,6 +9309,9 @@ fn inner() {
                                         assert_eq!(after["source_physical_records"], 1);
                                         assert_eq!(after["source_physical_outstanding"], 0);
                                         assert_eq!(after["source_physical_retired"], 1);
+                                        assert_eq!(after["work_records"], 1);
+                                        assert_eq!(after["work_retired"], 0);
+                                        assert_eq!(after["work_outstanding"], 1);
                                         assert_eq!(after["close_eligible"], false);
                                         let accepted: oulipoly_kernel_broker::accepted_grant::GrantRecord =
                                             serde_json::from_value(durable_h.clone()).unwrap();
@@ -9310,7 +9331,7 @@ fn inner() {
                                                 )
                                                 .is_ok()
                                         });
-                                        let works = oulipoly_kernel_broker::WorkRegistry::open(
+                                        let mut works = oulipoly_kernel_broker::WorkRegistry::open(
                                             &works_dir, &roots,
                                         )
                                         .unwrap();
@@ -9320,11 +9341,100 @@ fn inner() {
                                         assert_eq!(work_q.grant_id, accepted.grant_id);
                                         assert_eq!(work_q.work_id, accepted.work_id);
                                         assert_eq!(work_q.pid1_wait_status, 0);
+                                        let grants = oulipoly_kernel_broker::accepted_grant::GrantRegistry::open(
+                                            broker_state.join("grants"),
+                                        )
+                                        .unwrap();
+                                        let mut stale = expected.clone();
+                                        stale.init_starttime_ticks += 1;
+                                        assert!(
+                                            works
+                                                .retire_after_native_acks(
+                                                    &stale,
+                                                    &roots,
+                                                    &grants,
+                                                    &reopened,
+                                                    &retained,
+                                                    &lane,
+                                                    &accepted,
+                                                    &terminal_dir,
+                                                )
+                                                .is_err()
+                                        );
+                                        let work_retirement = works
+                                            .retire_after_native_acks(
+                                                &expected,
+                                                &roots,
+                                                &grants,
+                                                &reopened,
+                                                &retained,
+                                                &lane,
+                                                &accepted,
+                                                &terminal_dir,
+                                            )
+                                            .unwrap();
+                                        assert_eq!(work_retirement.physical_q, work_q);
+                                        assert_eq!(
+                                            work_retirement.source_grant_id,
+                                            custody.source_grant_id
+                                        );
+                                        assert_ne!(
+                                            work_retirement.original_turn_id,
+                                            work_retirement.fresh_turn_id
+                                        );
+                                        assert_eq!(
+                                            works
+                                                .retire_after_native_acks(
+                                                    &expected,
+                                                    &roots,
+                                                    &grants,
+                                                    &reopened,
+                                                    &retained,
+                                                    &lane,
+                                                    &accepted,
+                                                    &terminal_dir,
+                                                )
+                                                .unwrap(),
+                                            work_retirement
+                                        );
                                         let reopened_work =
                                             oulipoly_kernel_broker::WorkRegistry::open(
                                                 &works_dir, &roots,
                                             )
                                             .unwrap();
+                                        assert_eq!(
+                                            reopened_work
+                                                .retirement(
+                                                    &expected,
+                                                    &roots,
+                                                    &grants,
+                                                    &reopened,
+                                                    Some(&retained),
+                                                    Some(&lane),
+                                                    &accepted,
+                                                    &terminal_dir,
+                                                )
+                                                .unwrap(),
+                                            Some(work_retirement.clone())
+                                        );
+                                        let after_work = protocol::root_drain_readback_at(
+                                            &socket, &expected, false,
+                                        )
+                                        .unwrap();
+                                        let after_work: serde_json::Value = serde_json::from_str(
+                                            after_work
+                                                .strip_prefix("root-drain-v1 ")
+                                                .unwrap()
+                                                .trim_end(),
+                                        )
+                                        .unwrap();
+                                        assert_eq!(after_work["source_physical_outstanding"], 0);
+                                        assert_eq!(after_work["work_records"], 1);
+                                        assert_eq!(after_work["work_retired"], 1);
+                                        assert_eq!(after_work["work_outstanding"], 0);
+                                        assert_eq!(after_work["live_works"], 0);
+                                        assert_eq!(after_work["work_debt"], 0);
+                                        assert_eq!(after_work["close_eligible"], false);
                                         assert_eq!(
                                             reopened_work
                                                 .physical_q(
@@ -9350,6 +9460,38 @@ fn inner() {
                                                 )
                                                 .is_err()
                                         );
+                                        assert!(
+                                            reopened_work
+                                                .retirement(
+                                                    &expected,
+                                                    &roots,
+                                                    &grants,
+                                                    &reopened,
+                                                    Some(&retained),
+                                                    Some(&lane),
+                                                    &accepted,
+                                                    &terminal_dir,
+                                                )
+                                                .is_err()
+                                        );
+                                        let changed = protocol::root_drain_readback_at(
+                                            &socket, &expected, false,
+                                        )
+                                        .unwrap();
+                                        let changed: serde_json::Value = serde_json::from_str(
+                                            changed
+                                                .strip_prefix("root-drain-v1 ")
+                                                .unwrap()
+                                                .trim_end(),
+                                        )
+                                        .unwrap();
+                                        assert_eq!(changed["work_outstanding"], 1);
+                                        assert_eq!(changed["work_retired"], 0);
+                                        assert_eq!(changed["live_works"], 1);
+                                        assert_eq!(
+                                            changed["uncertain_registry_or_incarnation"],
+                                            true
+                                        );
                                         fs::write(&work_receipt_path, work_receipt).unwrap();
                                         assert!(
                                             reopened_work
@@ -9361,6 +9503,67 @@ fn inner() {
                                                 )
                                                 .is_ok()
                                         );
+                                        assert_eq!(
+                                            reopened_work
+                                                .retirement(
+                                                    &expected,
+                                                    &roots,
+                                                    &grants,
+                                                    &reopened,
+                                                    Some(&retained),
+                                                    Some(&lane),
+                                                    &accepted,
+                                                    &terminal_dir,
+                                                )
+                                                .unwrap(),
+                                            Some(work_retirement.clone())
+                                        );
+                                        let grant_path = broker_state
+                                            .join("grants")
+                                            .join(format!("{}.json", accepted.grant_id));
+                                        let grant_bytes = fs::read(&grant_path).unwrap();
+                                        fs::write(&grant_path, b"changed consumed grant").unwrap();
+                                        assert!(
+                                            reopened_work
+                                                .retirement(
+                                                    &expected,
+                                                    &roots,
+                                                    &grants,
+                                                    &reopened,
+                                                    Some(&retained),
+                                                    Some(&lane),
+                                                    &accepted,
+                                                    &terminal_dir,
+                                                )
+                                                .is_err()
+                                        );
+                                        fs::write(&grant_path, grant_bytes).unwrap();
+                                        let seal_path = works_dir
+                                            .join(format!("{}.retired.json", accepted.grant_id));
+                                        let seal_bytes = fs::read(&seal_path).unwrap();
+                                        let mut conflict: serde_json::Value =
+                                            serde_json::from_slice(&seal_bytes).unwrap();
+                                        conflict["fresh_turn_id"] = "conflicting-turn".into();
+                                        fs::write(
+                                            &seal_path,
+                                            serde_json::to_vec(&conflict).unwrap(),
+                                        )
+                                        .unwrap();
+                                        assert!(
+                                            works
+                                                .retire_after_native_acks(
+                                                    &expected,
+                                                    &roots,
+                                                    &grants,
+                                                    &reopened,
+                                                    &retained,
+                                                    &lane,
+                                                    &accepted,
+                                                    &terminal_dir,
+                                                )
+                                                .is_err()
+                                        );
+                                        fs::write(&seal_path, seal_bytes).unwrap();
                                         let receipt_path = source_dir.join(format!(
                                             "{}.terminal.json",
                                             custody.source_grant_id
@@ -9370,12 +9573,60 @@ fn inner() {
                                         assert!(
                                             reopened.retirement(&custody.source_grant_id).is_err()
                                         );
+                                        assert!(
+                                            reopened_work
+                                                .retirement(
+                                                    &expected,
+                                                    &roots,
+                                                    &grants,
+                                                    &reopened,
+                                                    Some(&retained),
+                                                    Some(&lane),
+                                                    &accepted,
+                                                    &terminal_dir,
+                                                )
+                                                .is_err()
+                                        );
                                         fs::write(&receipt_path, original_receipt).unwrap();
                                         assert!(
                                             reopened
                                                 .retirement(&custody.source_grant_id)
                                                 .unwrap()
                                                 .is_some()
+                                        );
+                                        let output_path = source_dir
+                                            .join(format!("{}.stdout", custody.source_grant_id));
+                                        let output_bytes = fs::read(&output_path).unwrap();
+                                        fs::write(&output_path, b"changed parent output").unwrap();
+                                        assert!(
+                                            reopened_work
+                                                .retirement(
+                                                    &expected,
+                                                    &roots,
+                                                    &grants,
+                                                    &reopened,
+                                                    Some(&retained),
+                                                    Some(&lane),
+                                                    &accepted,
+                                                    &terminal_dir,
+                                                )
+                                                .is_err()
+                                        );
+                                        fs::write(&output_path, output_bytes).unwrap();
+                                        assert_eq!(
+                                            reopened_work
+                                                .retirement(
+                                                    &expected,
+                                                    &roots,
+                                                    &grants,
+                                                    &reopened,
+                                                    Some(&retained),
+                                                    Some(&lane),
+                                                    &accepted,
+                                                    &terminal_dir,
+                                                )
+                                                .unwrap(),
+                                            Some(work_retirement)
                                         );
                                     }
                                 }

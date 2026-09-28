@@ -7,7 +7,9 @@ use crate::identity::ChildExit;
 use crate::registry::{RootRecord, RootRegistry};
 use crate::source_physical::SourcePhysicalRegistry;
 use crate::work_registry::{LiveWork, WorkRecord, WorkRegistry};
-use oulipoly_state::mailbox::{BrokerSidecar, BrokerSourceEffectObligations, PreparedProcessStamp};
+use oulipoly_state::mailbox::{
+    BrokerSidecar, BrokerSourceEffectObligations, FreshV30Lane, PreparedProcessStamp,
+};
 use serde::Serialize;
 use std::io;
 
@@ -29,6 +31,12 @@ pub struct RootDrainInventory {
     pub spent_without_work: usize,
     pub live_works: usize,
     pub work_debt: usize,
+    /// Total retained child work records, including sealed retirements.
+    pub work_records: usize,
+    /// Child seals revalidated against Q, selected K, State and both ACKs.
+    pub work_retired: usize,
+    /// Unsealed or changed child work remains a drain obligation.
+    pub work_outstanding: usize,
     pub native_prepared: usize,
     pub native_spent: usize,
     /// Total retained source records, including sealed retirements.
@@ -146,6 +154,69 @@ pub fn readback(
         .iter()
         .filter(|work| work.root_id == expected.root_id)
         .collect();
+    let lane = FreshV30Lane::open_at(works.broker_root()?).ok();
+    let terminal_dir = works.broker_root()?.join("terminals");
+    let mut work_retired = 0;
+    let mut work_outstanding = 0;
+    let mut live_works = 0;
+    let mut work_debt = 0;
+    let mut work_retirement_uncertain = false;
+    for work in root_live
+        .iter()
+        .map(|work| &work.record)
+        .chain(root_debt.iter().copied())
+    {
+        let result = root_grants
+            .iter()
+            .find(|grant| work.accepted_grant_id.as_deref() == Some(grant.grant_id.as_str()))
+            .ok_or_else(|| io::Error::other("work grant absent"))
+            .and_then(|grant| {
+                works.retirement(
+                    expected,
+                    roots,
+                    grants,
+                    sources,
+                    sidecar,
+                    lane.as_ref(),
+                    grant,
+                    &terminal_dir,
+                )
+            });
+        match result {
+            Ok(Some(_)) => work_retired += 1,
+            Ok(None) => {
+                work_outstanding += 1;
+                if root_live
+                    .iter()
+                    .any(|live| live.record.work_incarnation == work.work_incarnation)
+                {
+                    live_works += 1;
+                }
+                if root_debt
+                    .iter()
+                    .any(|debt| debt.work_incarnation == work.work_incarnation)
+                {
+                    work_debt += 1;
+                }
+            }
+            Err(_) => {
+                work_outstanding += 1;
+                work_retirement_uncertain = true;
+                if root_live
+                    .iter()
+                    .any(|live| live.record.work_incarnation == work.work_incarnation)
+                {
+                    live_works += 1;
+                }
+                if root_debt
+                    .iter()
+                    .any(|debt| debt.work_incarnation == work.work_incarnation)
+                {
+                    work_debt += 1;
+                }
+            }
+        }
+    }
     let source_records: Vec<_> = sources
         .records()
         .iter()
@@ -167,7 +238,8 @@ pub fn readback(
     let entry = entries.record(&expected.root_id);
     let entry_unsettled = entry.is_none_or(|entry| entry.terminal_settlement.is_none());
     let uncertain_registry_or_incarnation = roots.has_debt()
-        || works.has_debt()
+        || works.has_uncertain_write()
+        || work_retirement_uncertain
         || grants.has_debt()
         || sources.has_debt()
         || source_retirement_uncertain
@@ -214,8 +286,8 @@ pub fn readback(
             entry_unsettled,
             prepared_grants,
             spent_without_work,
-            root_live.len(),
-            root_debt.len(),
+            live_works,
+            work_debt,
             native_prepared,
             native_spent,
             source_physical_outstanding,
@@ -227,8 +299,11 @@ pub fn readback(
         entry_unsettled,
         prepared_grants,
         spent_without_work,
-        live_works: root_live.len(),
-        work_debt: root_debt.len(),
+        live_works,
+        work_debt,
+        work_records: root_live.len() + root_debt.len(),
+        work_retired,
+        work_outstanding,
         native_prepared,
         native_spent,
         source_physical_records: source_records.len(),
