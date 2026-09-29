@@ -2,6 +2,7 @@
 
 use base64::Engine as _;
 use oulipoly_kernel_broker::first_install_activation::{FirstInstallActivation, PairPaths};
+use oulipoly_kernel_broker::identity::PinnedProcess;
 use oulipoly_kernel_broker::installed_launch_ledger::InstalledLaunchLedger;
 use oulipoly_kernel_broker::installed_pair::InstalledPair;
 use oulipoly_kernel_broker::protocol::{self, EntryRoute, Operation};
@@ -462,16 +463,15 @@ fn disposable_root_featureless_l_help_lost_reply_and_duplicate() {
     assert_eq!(publications, 1);
     drop(fresh);
 
-    // The original installed Runner remains live while an actual async Bash
-    // child completes. The provider waits only as a namespace lifetime barrier;
-    // it cannot manufacture the Runner's separately received F bytes.
+    // The provider exits before the held Bash child reaches W. Normal PID1
+    // retains the child's physical reservation and the original D-bound
+    // Runner stays live through Q; the provider cannot supply F bytes.
     fs::write(
         &provider,
         br#"#!/bin/sh
 export OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1="$AGE319_BASH_CONTROL_SOCKET"
 response=$("$AGE319_BASH_IMAGE" run --delivery async -- /bin/sh -c 'while [ ! -f "$AGE319_CHILD_RELEASE_FILE" ]; do sleep 0.02; done; printf "async\n" >> "$AGE319_EFFECT_FILE"; printf "async-child-out\n"; printf "async-child-err\n" >&2') || exit
 printf '%s\n' "$response"
-while [ ! -f "$AGE319_PROVIDER_RELEASE_FILE" ]; do sleep 0.02; done
 "#,
     )
     .unwrap();
@@ -479,7 +479,6 @@ while [ ! -f "$AGE319_PROVIDER_RELEASE_FILE" ]; do sleep 0.02; done
     let async_out = temp.path().join("async.out");
     let async_err = temp.path().join("async.err");
     let child_release = temp.path().join("async-child-release");
-    let provider_release = temp.path().join("async-provider-release");
     let mut async_launch = Command::new(&launcher)
         .args(["--model", "fixture-model", "hello async"])
         .env_clear()
@@ -491,7 +490,6 @@ while [ ! -f "$AGE319_PROVIDER_RELEASE_FILE" ]; do sleep 0.02; done
         .env("AGE319_BASH_IMAGE", &bash)
         .env("AGE319_BASH_CONTROL_SOCKET", &socket)
         .env("AGE319_CHILD_RELEASE_FILE", &child_release)
-        .env("AGE319_PROVIDER_RELEASE_FILE", &provider_release)
         .env("AGE319_TEST_FEATURELESS_DROP_F_REPLY_V1", "1")
         .env("AGE319_TEST_FEATURELESS_DROP_ACK_REPLY_V1", "1")
         .env("AGE319_TEST_FEATURELESS_REPLAY_ACK_V1", "1")
@@ -522,6 +520,48 @@ while [ ! -f "$AGE319_PROVIDER_RELEASE_FILE" ]; do sleep 0.02; done
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(async_launch.try_wait().unwrap().is_none());
+    let (async_root, async_parent): (String, String) =
+        rusqlite::Connection::open(state.join("v30/state.db"))
+            .unwrap()
+            .query_row(
+                "SELECT root_id,json_extract(receipt_json,'$.parent_work_grant_id')
+             FROM fresh_bash_child WHERE root_id!=?1",
+                [&terminal.physical.root_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+    let physical = state.join("v30/normal-provider").join(async_parent);
+    while !physical.join("provider-exit.json").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "provider did not exit before child W: {} / {}",
+            fs::read_to_string(&async_err).unwrap(),
+            fs::read_to_string(&broker_log).unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !physical.join("q.json").exists(),
+        "normal Q preceded live child"
+    );
+    let lane = FreshV30Lane::open_at(&state).unwrap();
+    let (_, original_actor) = lane.released_handoff_for_root(&async_root).unwrap();
+    let pinned_original = PinnedProcess::open(original_actor.host_pid).unwrap();
+    pinned_original.verify().unwrap();
+    assert!(
+        !pinned_original.exited().unwrap(),
+        "original Runner exited before W"
+    );
+    assert_eq!(
+        pinned_original.starttime_ticks,
+        original_actor.starttime_ticks
+    );
+    assert!(
+        pinned_original
+            .same_executable_as(&File::open(&runner).unwrap())
+            .unwrap()
+    );
+    assert!(async_launch.try_wait().unwrap().is_none());
     fs::write(&child_release, b"release").unwrap();
     let selected: FreshBashSourceEvent = loop {
         let fresh = rusqlite::Connection::open(state.join("v30/state.db")).unwrap();
@@ -551,11 +591,6 @@ while [ ! -f "$AGE319_PROVIDER_RELEASE_FILE" ]; do sleep 0.02; done
         std::thread::sleep(Duration::from_millis(20));
     };
     assert!(selected.tree_drained && selected.output_closed);
-    assert!(
-        async_launch.try_wait().unwrap().is_none(),
-        "provider lifetime barrier failed"
-    );
-    fs::write(&provider_release, b"release").unwrap();
     let async_status = loop {
         if let Some(status) = async_launch.try_wait().unwrap() {
             break status;
@@ -591,6 +626,36 @@ while [ ! -f "$AGE319_PROVIDER_RELEASE_FILE" ]; do sleep 0.02; done
     assert_eq!(dispatch["dispatch_state"], "broker-k-consumed");
     assert_eq!(dispatch["request_id"], selected.request_id);
     let async_terminal = ledger.read_terminal(&async_id).unwrap().unwrap();
+    let lane = FreshV30Lane::open_at(&state).unwrap();
+    let obligation = lane
+        .read_bash_wake_obligation(&selected.request_id)
+        .unwrap()
+        .expect("selected async W lacks durable wake obligation");
+    assert_eq!(obligation.source_id, selected.source_id);
+    assert_eq!(obligation.attempt_id, selected.attempt_id);
+    assert_eq!(obligation.root_id, selected.root_id);
+    assert_eq!(obligation.owner_generation, selected.owner_generation);
+    assert_eq!(obligation.lane_id, selected.lane_id);
+    assert_eq!(obligation.source_generation, selected.source_generation);
+    let (original_root, original_actor) =
+        lane.released_handoff_for_root(&selected.root_id).unwrap();
+    assert_eq!(
+        obligation.session_id,
+        lane.read_session(&original_root.d_key)
+            .unwrap()
+            .unwrap()
+            .session_id
+    );
+    assert_eq!(obligation.original_identity, original_actor);
+    let wake_count: i64 = rusqlite::Connection::open(state.join("v30/state.db"))
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM fresh_bash_wake_obligation WHERE root_id=?1",
+            [&selected.root_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(wake_count, 1);
     assert_eq!(async_terminal.exit_code, 0);
     assert!(async_terminal.physical.pid1_echild_receipt);
     assert!(async_terminal.physical.pid1_parent_wait_proof);
@@ -620,6 +685,12 @@ while [ ! -f "$AGE319_PROVIDER_RELEASE_FILE" ]; do sleep 0.02; done
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(receipt["payload_base64"].as_str().unwrap())
         .unwrap();
+    assert_eq!(
+        obligation.payload_sha256,
+        format!("{:x}", Sha256::digest(&bytes))
+    );
+    assert_eq!(obligation.payload_byte_len, bytes.len() as i64);
+    assert_eq!(obligation.seq, receipt["grant"]["seq"].as_i64().unwrap());
     assert_eq!(
         receipt["grant"]["payload_sha256"],
         format!("{:x}", Sha256::digest(&bytes))
@@ -681,6 +752,13 @@ while [ ! -f "$AGE319_PROVIDER_RELEASE_FILE" ]; do sleep 0.02; done
     assert_eq!(
         ledger.read_terminal(&async_id).unwrap().unwrap(),
         async_terminal
+    );
+    assert_eq!(
+        FreshV30Lane::open_at(&state)
+            .unwrap()
+            .read_bash_wake_obligation(&selected.request_id)
+            .unwrap(),
+        Some(obligation.clone())
     );
     let stored_receipt = fs::read(receipt_path).unwrap();
     fs::set_permissions(receipt_path, fs::Permissions::from_mode(0o600)).unwrap();
