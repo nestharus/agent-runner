@@ -352,7 +352,6 @@ fn run_init(context: InitContext) -> io::Result<()> {
     }
     #[cfg(not(feature = "age319-private-broker-fixture"))]
     let _ = held_v30;
-    #[cfg(feature = "age319-private-broker-fixture")]
     if super::private_fixture() {
         let path = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1")
             .ok_or_else(|| io::Error::other("private broker socket absent"))?;

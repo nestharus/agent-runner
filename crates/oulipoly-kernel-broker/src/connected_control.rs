@@ -41,10 +41,7 @@ impl ControlGrant {
         image: &File,
         source_generation: &str,
         root_id: &str,
-        #[cfg(feature = "age319-private-broker-fixture")] fixture_paths: Option<(
-            &std::path::Path,
-            &std::path::Path,
-        )>,
+        fixture_paths: Option<(&std::path::Path, &std::path::Path)>,
     ) -> io::Result<Self> {
         let (mut broker, control) = UnixStream::pair()?;
         // Command's stdio setup can replace descriptors 0..2 before
@@ -89,7 +86,6 @@ impl ControlGrant {
         );
         command.env("OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1", "1");
         command.env(FD_ENV, control.as_raw_fd().to_string());
-        #[cfg(feature = "age319-private-broker-fixture")]
         if let Some((socket, manifest)) = fixture_paths {
             command.env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", socket);
             command.env("OULIPOLY_KERNEL_BROKER_FIXTURE_PAIR_V1", manifest);
@@ -120,12 +116,14 @@ impl ControlGrant {
         let present = spec.stdio_present;
         let uid = launcher.uid;
         let gid = launcher.gid;
-        #[cfg(feature = "age319-private-broker-fixture")]
         let private_root_mapped = std::fs::read_to_string("/proc/self/uid_map")
             .ok()
-            .is_some_and(|map| map.split_ascii_whitespace().nth(2) == Some("1"));
-        #[cfg(not(feature = "age319-private-broker-fixture"))]
-        let private_root_mapped = false;
+            .is_some_and(|map| {
+                let mut fields = map.split_ascii_whitespace();
+                fields.next() == Some("0")
+                    && fields.next().is_some_and(|host_uid| host_uid != "0")
+                    && fields.next() == Some("1")
+            });
         unsafe {
             command.pre_exec(move || {
                 let current_uid = libc::geteuid();
@@ -313,17 +311,8 @@ mod tests {
         };
         let image = File::open(std::env::current_exe().unwrap()).unwrap();
         let cwd = File::open(".").unwrap();
-        let mut grant = ControlGrant::spawn(
-            &spec,
-            &[cwd],
-            &launcher,
-            &image,
-            &source,
-            &root,
-            #[cfg(feature = "age319-private-broker-fixture")]
-            None,
-        )
-        .unwrap();
+        let mut grant =
+            ControlGrant::spawn(&spec, &[cwd], &launcher, &image, &source, &root, None).unwrap();
         assert_eq!(grant.message.request_id, request);
         assert_eq!(grant.message.pair_generation, pair);
         assert_eq!(grant.message.source_generation, source);

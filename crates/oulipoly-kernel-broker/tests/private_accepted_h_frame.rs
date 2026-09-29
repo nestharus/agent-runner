@@ -433,6 +433,7 @@ fn inner(
             joined_child: Some(ProcessStamp::from(&source)),
             prepared_driver: None,
             terminal_settlement: None,
+            offline_close_sha256: None,
         })
         .unwrap(),
     )

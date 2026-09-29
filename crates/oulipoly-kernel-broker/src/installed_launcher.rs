@@ -26,39 +26,121 @@ fn main() {
         std::process::exit(code);
     }
 
-    let result = (|| -> std::io::Result<(String, String, std::io::Result<String>)> {
-        let pair = InstalledPair::load(Path::new(installed_pair::MANIFEST), true)?;
-        let digest = pair
-            .launcher_sha256
-            .as_deref()
-            .ok_or_else(|| std::io::Error::other("installed pair lacks launcher image"))?;
-        pair.verify_image(Path::new(installed_pair::LAUNCHER), digest, true)?;
-        let captured = installed_launch::capture_from(
-            &pair.generation,
-            std::env::args_os().collect(),
-            std::env::vars_os().collect(),
-            stdio,
-        )?;
-        let descriptors: Vec<_> = captured
-            .descriptors
-            .iter()
-            .map(AsRawFd::as_raw_fd)
-            .collect();
-        let response = protocol::submit_installed_launch_at(
-            Path::new(protocol::INSTALLED_SOCKET),
-            &captured.spec,
-            &descriptors,
-        );
-        Ok((captured.spec.request_id, pair.generation, response))
-    })();
+    let result =
+        (|| -> std::io::Result<(String, String, std::path::PathBuf, std::io::Result<String>)> {
+            // A root-mapped user namespace may exercise the installed protocol
+            // against disposable images. Host-root entry always uses fixed paths.
+            let disposable = unsafe { libc::geteuid() } == 0
+                && std::fs::read_to_string("/proc/self/uid_map")
+                    .ok()
+                    .is_some_and(|map| {
+                        let mut fields = map.split_ascii_whitespace();
+                        fields.next() == Some("0")
+                            && fields.next().is_some_and(|host_uid| host_uid != "0")
+                            && fields.next() == Some("1")
+                    });
+            let manifest = if disposable {
+                std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_PAIR_V1")
+                    .map(std::path::PathBuf::from)
+                    .ok_or_else(|| std::io::Error::other("disposable pair absent"))?
+            } else {
+                Path::new(installed_pair::MANIFEST).to_path_buf()
+            };
+            let image = if disposable {
+                std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_LAUNCHER_V1")
+                    .map(std::path::PathBuf::from)
+                    .ok_or_else(|| std::io::Error::other("disposable launcher absent"))?
+            } else {
+                Path::new(installed_pair::LAUNCHER).to_path_buf()
+            };
+            let socket = if disposable {
+                std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1")
+                    .map(std::path::PathBuf::from)
+                    .ok_or_else(|| std::io::Error::other("disposable socket absent"))?
+            } else {
+                Path::new(protocol::INSTALLED_SOCKET).to_path_buf()
+            };
+            let pair = InstalledPair::load(&manifest, !disposable)?;
+            let digest = pair
+                .launcher_sha256
+                .as_deref()
+                .ok_or_else(|| std::io::Error::other("installed pair lacks launcher image"))?;
+            pair.verify_image(&image, digest, !disposable)?;
+            let environment = std::env::vars_os()
+                .filter(|(key, _)| {
+                    use std::os::unix::ffi::OsStrExt;
+                    !disposable
+                        || (!key
+                            .as_bytes()
+                            .starts_with(b"OULIPOLY_KERNEL_BROKER_FIXTURE_")
+                            && !key.as_bytes().starts_with(b"OULIPOLY_AGE319_PRIVATE_"))
+                })
+                .collect();
+            let mut captured = installed_launch::capture_from(
+                &pair.generation,
+                std::env::args_os().collect(),
+                environment,
+                stdio,
+            )?;
+            let descriptors: Vec<_> = captured
+                .descriptors
+                .iter()
+                .map(AsRawFd::as_raw_fd)
+                .collect();
+            if disposable
+                && let Some(request_id) = std::env::var_os("OULIPOLY_AGE319_PRIVATE_REQUEST_ID_V1")
+            {
+                captured.spec.request_id = request_id.to_string_lossy().into_owned();
+            }
+            let response = if disposable
+                && std::env::var_os("OULIPOLY_AGE319_PRIVATE_DROP_L_REPLY_V1").is_some()
+            {
+                protocol::submit_installed_launch_drop_reply_at(
+                    &socket,
+                    &captured.spec,
+                    &descriptors,
+                )
+                .and_then(|()| {
+                    protocol::installed_launch_status_at(
+                        &socket,
+                        &captured.spec.request_id,
+                        &pair.generation,
+                    )
+                })
+            } else {
+                protocol::submit_installed_launch_at(&socket, &captured.spec, &descriptors)
+            };
+            if disposable && std::env::var_os("OULIPOLY_AGE319_PRIVATE_DUPLICATE_L_V1").is_some() {
+                let duplicate =
+                    protocol::submit_installed_launch_at(&socket, &captured.spec, &descriptors)?;
+                if !duplicate.starts_with(&format!(
+                    "pending {} {}",
+                    captured.spec.request_id, pair.generation
+                )) && installed_launch::drained_exit_code(&duplicate, &captured.spec.request_id)
+                    .is_none()
+                {
+                    return Err(std::io::Error::other(
+                        "duplicate L changed admission status",
+                    ));
+                }
+            }
+            Ok((captured.spec.request_id, pair.generation, socket, response))
+        })();
     match result {
-        Ok((request_id, generation, response)) => {
-            match wait_for_terminal(
-                Path::new(protocol::INSTALLED_SOCKET),
-                &request_id,
-                &generation,
-                response,
-            ) {
+        Ok((request_id, generation, socket, response)) => {
+            let response = match response {
+                Ok(ref refusal) if refusal.starts_with("error ") => {
+                    match protocol::installed_launch_status_at(&socket, &request_id, &generation) {
+                        Ok(status) if status.starts_with("error ") => {
+                            eprintln!("OULIPOLY_INSTALLED_LAUNCH_GAP={}", refusal.trim());
+                            std::process::exit(70);
+                        }
+                        readback => readback,
+                    }
+                }
+                other => other,
+            };
+            match wait_for_terminal(&socket, &request_id, &generation, response) {
                 Ok(code) => std::process::exit(i32::from(code)),
                 Err(reason) => eprintln!(
                     "OULIPOLY_INSTALLED_LAUNCH_UNKNOWN=request {request_id} generation {generation}: {reason}"
@@ -83,12 +165,7 @@ fn wait_for_terminal(
 ) -> Result<u8, String> {
     use oulipoly_kernel_broker::{installed_launch, protocol};
     use std::time::{Duration, Instant};
-    let mut response = match initial {
-        Ok(ref status) if status.starts_with("error ") => {
-            protocol::installed_launch_status_at(socket, request_id, generation)
-        }
-        other => other,
-    };
+    let mut response = initial;
     let mut outage = None;
     #[cfg(feature = "age319-private-broker-fixture")]
     let mut certificate_paused = false;

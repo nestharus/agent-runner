@@ -3601,6 +3601,21 @@ pub fn submit_installed_launch_at(
     submit_installed_launch_on(stream, spec, descriptors)
 }
 
+/// Disposable user-namespace control: send the same L frame and discard its
+/// reply. The launcher must recover through read-only status under this ID.
+pub fn submit_installed_launch_drop_reply_at(
+    path: &Path,
+    spec: &InstalledLaunchSpec,
+    descriptors: &[RawFd],
+) -> io::Result<()> {
+    drop(send_installed_launch_on(
+        checked_connection(path)?,
+        spec,
+        descriptors,
+    )?);
+    Ok(())
+}
+
 /// Read only the exact request admitted by this same pinned launcher process.
 /// This opcode has no launch or cancellation effect.
 pub fn installed_launch_status_at(
@@ -3670,10 +3685,18 @@ pub fn private_installed_control_at(
 }
 
 fn submit_installed_launch_on(
-    mut stream: UnixStream,
+    stream: UnixStream,
     spec: &InstalledLaunchSpec,
     descriptors: &[RawFd],
 ) -> io::Result<String> {
+    read_response(send_installed_launch_on(stream, spec, descriptors)?)
+}
+
+fn send_installed_launch_on(
+    mut stream: UnixStream,
+    spec: &InstalledLaunchSpec,
+    descriptors: &[RawFd],
+) -> io::Result<UnixStream> {
     crate::installed_launch::validate(spec, descriptors)?;
     let body = serde_json::to_vec(spec)?;
     if body.len() > 48 * 1024 {
@@ -3712,7 +3735,7 @@ fn submit_installed_launch_on(
     {
         return Err(io::Error::other("installed launch submission uncertain"));
     }
-    read_response(stream)
+    Ok(stream)
 }
 
 #[cfg(test)]

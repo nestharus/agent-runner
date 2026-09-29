@@ -37,7 +37,7 @@ impl ProcessStamp {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct EntryRecord {
     pub version: u32,
@@ -67,6 +67,11 @@ pub struct EntryRecord {
     /// one-use entry. An unknown caller presentation remains in State.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_settlement: Option<EntryTerminalSettlement>,
+    /// Hash of an independently validated installed offline terminal. Help
+    /// has no normal publication settlement, but must cease to be old debt
+    /// before another connected CLI may reserve E.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline_close_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -109,6 +114,11 @@ impl EntryRegistry {
                 || record.joined_child.is_some() && !record.join_consumed
                 || record.prepared_driver.is_some() && record.joined_child.is_none()
                 || record.terminal_settlement.is_some() && record.joined_child.is_none()
+                || record.offline_close_sha256.is_some()
+                    && (record.joined_child.is_none() || record.terminal_settlement.is_some())
+                || record.offline_close_sha256.as_ref().is_some_and(|hash| {
+                    hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
                 || record
                     .terminal_settlement
                     .as_ref()
@@ -156,8 +166,31 @@ impl EntryRegistry {
         entry: &PinnedProcess,
         root_id: &str,
     ) -> io::Result<String> {
-        if self.has_debt()
-            || self.has_unsettled_join()
+        self.reserve_exact_checked(uid, entry, root_id, false)
+    }
+
+    /// The v30 Broker calls this only under its admission fence after
+    /// `require_prior_entries_closed` has joined every historical root to its
+    /// physical close and, for help, its offline caller certificate. Offline
+    /// entries intentionally have no normal terminal settlement in this row.
+    pub fn reserve_exact_after_prior_close(
+        &mut self,
+        uid: u32,
+        entry: &PinnedProcess,
+        root_id: &str,
+    ) -> io::Result<String> {
+        self.reserve_exact_checked(uid, entry, root_id, true)
+    }
+
+    fn reserve_exact_checked(
+        &mut self,
+        uid: u32,
+        entry: &PinnedProcess,
+        root_id: &str,
+        prior_closed: bool,
+    ) -> io::Result<String> {
+        if self.poisoned
+            || (!prior_closed && (self.has_debt() || self.has_unsettled_join()))
             || uuid::Uuid::parse_str(root_id)
                 .ok()
                 .is_none_or(|id| id.to_string() != root_id)
@@ -186,6 +219,7 @@ impl EntryRegistry {
             joined_child: None,
             prepared_driver: None,
             terminal_settlement: None,
+            offline_close_sha256: None,
         };
         let path = self.directory.join(format!("{root_id}.json"));
         let result = (|| {
@@ -444,6 +478,69 @@ impl EntryRegistry {
         self.replace(index, settled, &entry, &guardian)
     }
 
+    /// Called only after Broker has revalidated the exact installed offline
+    /// terminal and physical close. The original actors may already be dead.
+    pub fn settle_offline_close(
+        &mut self,
+        root_id: &str,
+        certificate_sha256: &str,
+    ) -> io::Result<()> {
+        if certificate_sha256.len() != 64
+            || !certificate_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(io::Error::other("offline certificate digest invalid"));
+        }
+        let index = self
+            .records
+            .iter()
+            .position(|row| row.root_id == root_id)
+            .ok_or_else(|| io::Error::other("offline entry absent"))?;
+        let current = &self.records[index];
+        if !current.join_consumed
+            || current.joined_child.is_none()
+            || current.terminal_settlement.is_some()
+            || current
+                .offline_close_sha256
+                .as_deref()
+                .is_some_and(|old| old != certificate_sha256)
+        {
+            return Err(io::Error::other("offline entry identity changed"));
+        }
+        if current.offline_close_sha256.is_some() {
+            return Ok(());
+        }
+        let path = self.directory.join(format!("{root_id}.json"));
+        let stored: EntryRecord = serde_json::from_slice(&fs::read(&path)?)?;
+        if &stored != current {
+            return Err(io::Error::other("offline entry changed on disk"));
+        }
+        let mut settled = current.clone();
+        settled.offline_close_sha256 = Some(certificate_sha256.into());
+        let tmp = self
+            .directory
+            .join(format!(".{root_id}.{}.tmp", uuid::Uuid::new_v4()));
+        let result = (|| {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            serde_json::to_writer(&mut file, &settled)?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            fs::rename(&tmp, &path)?;
+            File::open(&self.directory)?.sync_all()
+        })();
+        if let Err(error) = result {
+            self.poisoned = true;
+            return Err(error);
+        }
+        self.records[index] = settled;
+        Ok(())
+    }
+
     fn replace(
         &mut self,
         index: usize,
@@ -497,7 +594,7 @@ impl EntryRegistry {
             || self
                 .records
                 .iter()
-                .filter(|r| r.terminal_settlement.is_none())
+                .filter(|r| r.terminal_settlement.is_none() && r.offline_close_sha256.is_none())
                 .any(|r| {
                     boot_id().ok().as_deref() != Some(r.entry.boot_id.as_str())
                         || PinnedProcess::open(r.entry.host_pid)
@@ -522,7 +619,9 @@ impl EntryRegistry {
     pub fn has_unsettled_join(&self) -> bool {
         self.records.iter().any(|record| {
             record.join_consumed
-                && (record.joined_child.is_none() || record.terminal_settlement.is_none())
+                && (record.joined_child.is_none()
+                    || record.terminal_settlement.is_none()
+                        && record.offline_close_sha256.is_none())
         })
     }
 }

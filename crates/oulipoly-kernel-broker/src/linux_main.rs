@@ -312,7 +312,6 @@ fn read_native_f_auto_ack_with_source(
     lane.read_native_f_auto_ack(request, recipient)
 }
 
-#[cfg(feature = "age319-private-broker-fixture")]
 fn private_fixture() -> bool {
     (unsafe { libc::geteuid() }) == 0
         && fs::read_to_string("/proc/self/uid_map")
@@ -374,11 +373,6 @@ fn private_native_f_drop_reply(stage: &str) {
     }
     std::process::exit(82);
 }
-#[cfg(not(feature = "age319-private-broker-fixture"))]
-fn private_fixture() -> bool {
-    false
-}
-
 fn pinned_bash_image(pair: Option<&InstalledPair>) -> io::Result<Option<File>> {
     if let Some(pair) = pair {
         let Some(digest) = pair.bash_sha256.as_deref() else {
@@ -4269,13 +4263,23 @@ fn require_prior_entries_closed(
     state_root: &Path,
     installed: Option<&InstalledLaunchLedger>,
     roots: &mut RootRegistry,
-    entries: &EntryRegistry,
+    entries: &mut EntryRegistry,
     works: &mut WorkRegistry,
     grants: &GrantRegistry,
     sources: &SourcePhysicalRegistry,
     sidecar: Option<&BrokerSidecar>,
 ) -> io::Result<()> {
     if entries.records().is_empty() {
+        if roots.live_roots().next().is_some()
+            || !roots.debt_records().is_empty()
+            || works.live_works().next().is_some()
+            || !works.debt_records().is_empty()
+            || !grants.records().is_empty()
+            || !grants.native_records().is_empty()
+            || !sources.records().is_empty()
+        {
+            return Err(io::Error::other("root or work exists without an entry"));
+        }
         return Ok(());
     }
     let known: HashSet<&str> = entries
@@ -4308,6 +4312,7 @@ fn require_prior_entries_closed(
     }
     let lane = FreshV30Lane::open_at(state_root).map_err(io::Error::other)?;
     let mut closed_cursors: Vec<oulipoly_state::mailbox::BrokerStateCloseCursor> = Vec::new();
+    let mut offline_closes = Vec::new();
     for entry in entries.records() {
         let root = roots
             .record(&entry.root_id)
@@ -4399,6 +4404,10 @@ fn require_prior_entries_closed(
             {
                 return Err(io::Error::other("prior offline caller certificate changed"));
             }
+            offline_closes.push((
+                entry.root_id.clone(),
+                format!("{:x}", Sha256::digest(serde_json::to_vec(&certificate)?)),
+            ));
         }
         if (inventory.entry_unsettled && !offline)
             || (offline && inventory.offline.is_none())
@@ -4433,6 +4442,9 @@ fn require_prior_entries_closed(
     for entry in entries.records() {
         roots.admit_closed_historical(&entry.root_id)?;
         works.admit_closed_historical(&entry.root_id);
+    }
+    for (root_id, certificate_sha256) in offline_closes {
+        entries.settle_offline_close(&root_id, &certificate_sha256)?;
     }
     Ok(())
 }
@@ -5464,27 +5476,20 @@ fn serve() -> io::Result<()> {
         Err(error) => return Err(error),
     }
     let installed_pair = if fixture {
-        #[cfg(feature = "age319-private-broker-fixture")]
-        {
-            std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_PAIR_V1")
-                .map(|manifest| -> io::Result<InstalledPair> {
-                    let pair = InstalledPair::load(Path::new(&manifest), false)?;
-                    let broker = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_BROKER_V1")
-                        .ok_or_else(|| io::Error::other("private Broker image absent"))?;
-                    pair.verify_image_against(
-                        Path::new(&broker),
-                        &pair.broker_sha256,
-                        false,
-                        &host_proc_file("self/exe")?,
-                    )?;
-                    Ok(pair)
-                })
-                .transpose()?
-        }
-        #[cfg(not(feature = "age319-private-broker-fixture"))]
-        {
-            None
-        }
+        std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_PAIR_V1")
+            .map(|manifest| -> io::Result<InstalledPair> {
+                let pair = InstalledPair::load(Path::new(&manifest), false)?;
+                let broker = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_BROKER_V1")
+                    .ok_or_else(|| io::Error::other("private Broker image absent"))?;
+                pair.verify_image_against(
+                    Path::new(&broker),
+                    &pair.broker_sha256,
+                    false,
+                    &host_proc_file("self/exe")?,
+                )?;
+                Ok(pair)
+            })
+            .transpose()?
     } else {
         let pair = InstalledPair::load(Path::new(installed_pair::MANIFEST), true)?;
         pair.verify_image_against(
@@ -6189,20 +6194,26 @@ fn serve() -> io::Result<()> {
                     return Err(io::Error::other("fresh-only pair/source binding changed"));
                 }
                 require_fresh_cli_shape(&spec, &descriptors)?;
+                // The disposable connected path is proven for help and a
+                // normal provider, but the featureless Bash parent probe can
+                // still see a previously closed root as debt. Keep host-root
+                // installed admission closed until that cross-lane proof and
+                // real non-root caller tests pass.
+                if !fixture {
+                    return Err(io::Error::other("production installed CLI admission remains closed"));
+                }
                 let ledger = installed_launches
                     .as_ref()
                     .ok_or_else(|| io::Error::other("installed launch ledger absent"))?;
                 // Publication precedes the only possible spawn. A duplicate
                 // or recovered request has no captured descriptors or grant.
                 if let Admission::New { root_id } = ledger.reserve_request(&spec, &peer)? {
-                    #[cfg(feature = "age319-private-broker-fixture")]
                     let fixture_manifest = if fixture {
                         std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_PAIR_V1").map(PathBuf::from)
                     } else { None };
                     match ControlGrant::spawn(
                         &spec, &descriptors, &peer, &runner_image,
                         &activation.source.source_generation, &root_id,
-                        #[cfg(feature = "age319-private-broker-fixture")]
                         fixture_manifest.as_deref().map(|manifest| (Path::new(&socket), manifest)),
                     ) {
                         Ok(grant) => {
@@ -7062,7 +7073,7 @@ fn serve() -> io::Result<()> {
                         Path::new(&state),
                         installed_launches.as_ref(),
                         &mut registry,
-                        &entries,
+                        &mut entries,
                         &mut works,
                         &grants,
                         &source_physical,
@@ -7103,7 +7114,7 @@ fn serve() -> io::Result<()> {
                         Path::new(&state),
                         installed_launches.as_ref(),
                         &mut registry,
-                        &entries,
+                        &mut entries,
                         &mut works,
                         &grants,
                         &source_physical,
@@ -7133,7 +7144,7 @@ fn serve() -> io::Result<()> {
                             ledger.verify_root_binding(&grant.message.request_id, &grant.message.root_id).is_ok());
                     let answer = if exact {
                         grant.consume(&peer).and_then(|root_id|
-                            entries.reserve_exact(peer.uid, &peer.process, &root_id)
+                            entries.reserve_exact_after_prior_close(peer.uid, &peer.process, &root_id)
                                 .map(|reserved| format!("reserved {reserved}\n")))
                     } else {
                         Err(io::Error::other("connected control E pair/source changed"))
