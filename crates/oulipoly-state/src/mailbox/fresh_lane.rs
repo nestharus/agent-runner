@@ -65,6 +65,8 @@ const FRESH_SUCCESSOR_SIDECAR_SCHEMA: &str =
     include_str!("migrations/0051_fresh_successor_sidecar.sql");
 const FRESH_SUCCESSOR_STATE_SCHEMA: &str =
     include_str!("migrations/0051_fresh_successor_state.sql");
+const FRESH_SUCCESSOR_DELIVERY_SCHEMA: &str =
+    include_str!("migrations/0052_fresh_successor_delivery.sql");
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FreshV30LaneIdentity {
@@ -261,7 +263,11 @@ fn require_bootstrap_parent(parent: &Path) -> Result<(), String> {
     #[cfg(feature = "age319-private-broker-fixture")]
     if fs::read_to_string("/proc/self/uid_map")
         .ok()
-        .is_some_and(|map| map.split_ascii_whitespace().nth(2) == Some("1"))
+        .is_some_and(|map| {
+            map.split_ascii_whitespace()
+                .nth(1)
+                .is_some_and(|host| host != "0")
+        })
     {
         return require_broker_root(parent);
     }
@@ -855,7 +861,7 @@ impl FreshV30Lane {
             .mailbox()
             .conn
             .execute_batch(&format!(
-                "{FRESH_SCHEMA}\n{FRESH_RECIPIENT_SCHEMA}\n{FRESH_RECIPIENT_ACK_SCHEMA}\n{FRESH_NATIVE_F_PREPARATION_SCHEMA}\n{FRESH_NATIVE_F_SUBMISSION_SCHEMA}\n{FRESH_SUCCESSOR_SIDECAR_SCHEMA}"
+                "{FRESH_SCHEMA}\n{FRESH_RECIPIENT_SCHEMA}\n{FRESH_RECIPIENT_ACK_SCHEMA}\n{FRESH_NATIVE_F_PREPARATION_SCHEMA}\n{FRESH_NATIVE_F_SUBMISSION_SCHEMA}\n{FRESH_SUCCESSOR_SIDECAR_SCHEMA}\n{FRESH_SUCCESSOR_DELIVERY_SCHEMA}"
             ))
             .map_err(|e| e.to_string())?;
         sidecar
@@ -1046,6 +1052,61 @@ impl FreshV30Lane {
                 FRESH_SUCCESSOR_SIDECAR_SCHEMA,
                 table,
                 &triggers,
+            )?;
+        }
+        let delivery_objects: i64 = sidecar
+            .mailbox()
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name IN
+             ('fresh_successor_grant','fresh_successor_grant_no_delete',
+              'fresh_successor_grant_update_guard','fresh_successor_receipt',
+              'fresh_successor_receipt_no_update','fresh_successor_receipt_no_delete',
+              'fresh_successor_ack_evidence','fresh_successor_ack_no_update',
+              'fresh_successor_ack_no_delete')",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        match delivery_objects {
+            0 => sidecar
+                .mailbox()
+                .conn
+                .execute_batch(&format!(
+                    "BEGIN IMMEDIATE;\n{FRESH_SUCCESSOR_DELIVERY_SCHEMA}\nCOMMIT;"
+                ))
+                .map_err(|e| e.to_string())?,
+            9 => {}
+            _ => return Err("fresh successor delivery schema incomplete".into()),
+        }
+        for (table, triggers) in [
+            (
+                "fresh_successor_grant",
+                &[
+                    "fresh_successor_grant_no_delete",
+                    "fresh_successor_grant_update_guard",
+                ][..],
+            ),
+            (
+                "fresh_successor_receipt",
+                &[
+                    "fresh_successor_receipt_no_update",
+                    "fresh_successor_receipt_no_delete",
+                ][..],
+            ),
+            (
+                "fresh_successor_ack_evidence",
+                &[
+                    "fresh_successor_ack_no_update",
+                    "fresh_successor_ack_no_delete",
+                ][..],
+            ),
+        ] {
+            verify_fresh_sql_objects(
+                &sidecar.mailbox().conn,
+                FRESH_SUCCESSOR_DELIVERY_SCHEMA,
+                table,
+                triggers,
             )?;
         }
         let ack_schema_count: i64 = sidecar
@@ -3323,7 +3384,11 @@ fn require_broker_root(path: &Path) -> Result<(), String> {
     #[cfg(feature = "age319-private-broker-fixture")]
     if fs::read_to_string("/proc/self/uid_map")
         .ok()
-        .is_some_and(|map| map.split_ascii_whitespace().nth(2) == Some("1"))
+        .is_some_and(|map| {
+            map.split_ascii_whitespace()
+                .nth(1)
+                .is_some_and(|host| host != "0")
+        })
     {
         let meta = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
         if path.is_absolute()

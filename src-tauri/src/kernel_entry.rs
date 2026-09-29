@@ -563,6 +563,176 @@ pub(crate) fn private_successor_offer_entry() -> Option<ExitCode> {
             serde_json::to_vec(&admission["admission"]).map_err(|e| e.to_string())?,
         )
         .map_err(|e| e.to_string())?;
+        if std::env::var_os("AGE319_PRIVATE_SUCCESSOR_FACK_V1").is_some() {
+            let request = uuid::Uuid::new_v4().to_string();
+            let submission = FreshRecipientRequest::SubmitSuccessor {
+                offer_request_id: args[5].clone(),
+                delivery_request_id: request.clone(),
+            };
+            let delivery = protocol::fresh_recipient_request_at(&socket, &submission)
+                .map_err(|e| format!("successor F submit: {e}"))?;
+            let grant = &delivery["delivery"]["grant"];
+            if delivery["kind"] != "successor_delivery"
+                || delivery["delivery"]["generation"] != offer["offer"]["generation"]
+                || grant["session_id"] != offer["offer"]["session_id"]
+                || grant["seq"] != seq
+                || grant["source_id"] != args[4]
+                || grant["attempt_id"] != offer["offer"]["attempt_id"]
+            {
+                return Err("successor F grant differs from admitted row/source".into());
+            }
+            let token = delivery["delivery_token"]
+                .as_str()
+                .ok_or("successor F token absent")?
+                .to_owned();
+            if protocol::fresh_recipient_request_at(
+                &socket,
+                &FreshRecipientRequest::AcknowledgeSuccessor {
+                    delivery_request_id: request.clone(),
+                    delivery_token: token.clone(),
+                },
+            )
+            .is_ok()
+            {
+                return Err("successor ACK succeeded without receiver receipt".into());
+            }
+            if protocol::fresh_recipient_request_at(&socket, &submission).is_ok() {
+                return Err("successor duplicate F created a second grant".into());
+            }
+            let read = protocol::fresh_recipient_request_at(
+                &socket,
+                &FreshRecipientRequest::ReadSuccessorDelivery {
+                    delivery_request_id: request.clone(),
+                },
+            )
+            .map_err(|e| e.to_string())?;
+            if read["delivery"]["grant"]["grant_id"] != grant["grant_id"]
+                || read["delivery"]["generation"] != delivery["delivery"]["generation"]
+                || read["delivery"]["offer_request_id"] != delivery["delivery"]["offer_request_id"]
+                || read["delivery"]["grant"]["phase"] != "submitted"
+            {
+                return Err("successor F exact readback changed".into());
+            }
+            let recovered = protocol::fresh_recipient_request_at(
+                &socket,
+                &FreshRecipientRequest::RecoverSuccessorDelivery {
+                    delivery_request_id: request.clone(),
+                },
+            )
+            .map_err(|e| e.to_string())?;
+            if recovered["payload_base64"] != delivery["payload_base64"]
+                || recovered["delivery_token"] != token
+                || recovered["delivery"] != read["delivery"]
+            {
+                return Err("successor lost F reply recovery changed bytes/token".into());
+            }
+            let actor: oulipoly_state::mailbox::FreshRecipientIdentity =
+                serde_json::from_value(offer["offer"]["successor_identity"].clone())
+                    .map_err(|e| e.to_string())?;
+            let bytes = protocol::persist_successor_receiver_receipt(&recovered, &actor)
+                .map_err(|e| format!("successor receiver receipt: {e}"))?;
+            std::fs::write(directory.join("successor-received.bin"), &bytes)
+                .map_err(|e| e.to_string())?;
+            let event: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+            if event["protocol"] != "fresh-bash-complete-v30"
+                || event["source"]["source_id"] != args[4]
+                || event["source"]["wait_status"] != 0
+                || event["source"]["tree_drained"] != true
+                || event["source"]["output_closed"] != true
+            {
+                return Err("successor received bytes lack real Bash W/Q".into());
+            }
+            for (stream, expected) in [
+                ("stdout", b"async-child-out\n".as_slice()),
+                ("stderr", b"async-child-err\n".as_slice()),
+            ] {
+                let raw: Vec<u8> = serde_json::from_value(event[format!("{stream}_bytes")].clone())
+                    .map_err(|e| e.to_string())?;
+                if raw != expected {
+                    return Err(format!("successor {stream} differs from Bash W"));
+                }
+            }
+            if protocol::fresh_recipient_request_at(
+                &socket,
+                &FreshRecipientRequest::AcknowledgeSuccessor {
+                    delivery_request_id: request.clone(),
+                    delivery_token: token.clone(),
+                },
+            )
+            .is_ok()
+            {
+                return Err("successor ACK succeeded before receipt certification".into());
+            }
+            let receipt = protocol::fresh_recipient_request_at(
+                &socket,
+                &FreshRecipientRequest::CertifySuccessorReceipt {
+                    delivery_request_id: request.clone(),
+                },
+            )
+            .map_err(|e| e.to_string())?;
+            let receipt_read = protocol::fresh_recipient_request_at(
+                &socket,
+                &FreshRecipientRequest::ReadSuccessorReceipt {
+                    delivery_request_id: request.clone(),
+                },
+            )
+            .map_err(|e| e.to_string())?;
+            if receipt["receipt_sha256"] != receipt_read["receipt_sha256"]
+                || !receipt["receipt_sha256"].is_string()
+            {
+                return Err("successor durable receipt readback changed".into());
+            }
+            if protocol::fresh_recipient_request_at(
+                &socket,
+                &FreshRecipientRequest::AcknowledgeSuccessor {
+                    delivery_request_id: request.clone(),
+                    delivery_token: uuid::Uuid::new_v4().to_string(),
+                },
+            )
+            .is_ok()
+            {
+                return Err("successor ACK accepted wrong token".into());
+            }
+            let ack = protocol::fresh_recipient_request_at(
+                &socket,
+                &FreshRecipientRequest::AcknowledgeSuccessor {
+                    delivery_request_id: request.clone(),
+                    delivery_token: token.clone(),
+                },
+            )
+            .map_err(|e| e.to_string())?;
+            if protocol::fresh_recipient_request_at(
+                &socket,
+                &FreshRecipientRequest::AcknowledgeSuccessor {
+                    delivery_request_id: request.clone(),
+                    delivery_token: token,
+                },
+            )
+            .is_ok()
+            {
+                return Err("successor ACK token reused".into());
+            }
+            let ack_read = protocol::fresh_recipient_request_at(
+                &socket,
+                &FreshRecipientRequest::ReadSuccessorAck {
+                    delivery_request_id: request.clone(),
+                },
+            )
+            .map_err(|e| e.to_string())?;
+            if ack["ack"] != ack_read["ack"] || ack["ack"]["grant"]["phase"] != "acked" {
+                return Err("successor durable ACK readback changed".into());
+            }
+            std::fs::write(
+                directory.join("successor-fack.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "delivery_request_id":request,"delivery":delivery["delivery"],
+                    "receipt":receipt,"ack":ack["ack"]
+                }))
+                .map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+        }
         Ok(())
     })();
     Some(match result {
@@ -2774,6 +2944,7 @@ fn connected_async_bash_recipient(
                     &offer_request_id,
                     directory.to_str().ok_or("successor directory invalid")?,
                 ])
+                .env("AGE319_PRIVATE_SUCCESSOR_FACK_V1", "1")
                 .spawn()
                 .map_err(|e| e.to_string())?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -2853,7 +3024,20 @@ fn connected_async_bash_recipient(
         {
             return Err("original F remained open after successor admission".into());
         }
-        return Err("successor admitted; F/ACK and root terminal join pending".into());
+        let terminal = protocol::fresh_recipient_request_at(
+            socket,
+            &FreshRecipientRequest::ReadRootTerminal {
+                d_key: d_key.into(),
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        if terminal["terminal"]["notification_state"] != "pending_f" {
+            return Err(format!(
+                "successor ACK changed original terminal state: {}",
+                terminal["terminal"]["notification_state"]
+            ));
+        }
+        return Err("successor F/ACK complete; root terminal join pending".into());
     }
     let delivery_request_id = uuid::Uuid::new_v4().to_string();
     let delivery = protocol::fresh_recipient_request_at(

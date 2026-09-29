@@ -18,7 +18,9 @@ const FRESH_ROUTE_REPLY_READ_BYTES: u64 = 4097;
 
 use crate::installed_launch::InstalledLaunchSpec;
 use crate::registry::{OwnerCloseIntent, RootRecord};
+use base64::Engine as _;
 use oulipoly_state::mailbox::BrokerClosedOwner;
+use sha2::{Digest as _, Sha256};
 use std::io::{self, Read, Write};
 #[cfg(target_os = "linux")]
 use std::os::fd::FromRawFd;
@@ -1875,6 +1877,29 @@ pub enum FreshRecipientRequest {
     ReadSuccessorAdmission {
         offer_request_id: String,
     },
+    SubmitSuccessor {
+        offer_request_id: String,
+        delivery_request_id: String,
+    },
+    ReadSuccessorDelivery {
+        delivery_request_id: String,
+    },
+    RecoverSuccessorDelivery {
+        delivery_request_id: String,
+    },
+    CertifySuccessorReceipt {
+        delivery_request_id: String,
+    },
+    ReadSuccessorReceipt {
+        delivery_request_id: String,
+    },
+    AcknowledgeSuccessor {
+        delivery_request_id: String,
+        delivery_token: String,
+    },
+    ReadSuccessorAck {
+        delivery_request_id: String,
+    },
     /// Private exact root result/readback. D and the socket's pinned original
     /// actor must both match; this never performs K, F, ACK or caller output.
     ReadRootTerminal {
@@ -2012,6 +2037,144 @@ pub fn fresh_recipient_request_at(
         ));
     }
     serde_json::from_slice(&answer).map_err(io::Error::other)
+}
+
+/// Persist an independent receiver receipt from the actual Broker F bytes.
+/// The reply is the only payload input; this never consults a State lookup.
+/// An existing exact receipt is usable after a lost certification reply.
+pub fn persist_successor_receiver_receipt(
+    reply: &serde_json::Value,
+    recipient: &oulipoly_state::mailbox::FreshRecipientIdentity,
+) -> io::Result<Vec<u8>> {
+    use oulipoly_state::mailbox::{FreshSuccessorDeliveryReadback, FreshSuccessorReceiverReceipt};
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    let kind = reply["kind"]
+        .as_str()
+        .ok_or_else(|| io::Error::other("F reply kind absent"))?;
+    if kind != "successor_delivery" && kind != "recovered_successor_delivery" {
+        return Err(io::Error::other("reply is not successor F bytes"));
+    }
+    let read: FreshSuccessorDeliveryReadback =
+        serde_json::from_value(reply["delivery"].clone()).map_err(io::Error::other)?;
+    let token = reply["delivery_token"]
+        .as_str()
+        .ok_or_else(|| io::Error::other("successor F token absent"))?;
+    let payload = base64::engine::general_purpose::STANDARD
+        .decode(
+            reply["payload_base64"]
+                .as_str()
+                .ok_or_else(|| io::Error::other("successor F payload absent"))?,
+        )
+        .map_err(io::Error::other)?;
+    if i64::try_from(payload.len()).ok() != Some(read.grant.payload_byte_len)
+        || format!("{:x}", Sha256::digest(&payload)) != read.grant.payload_sha256
+    {
+        return Err(io::Error::other(
+            "successor F reply bytes differ from grant",
+        ));
+    }
+    let path = std::path::Path::new(
+        reply["receipt_path"]
+            .as_str()
+            .ok_or_else(|| io::Error::other("successor receipt path absent"))?,
+    );
+    let uid = unsafe { libc::geteuid() };
+    let uid_directory = uid.to_string();
+    if !path.is_absolute()
+        || path.file_name().and_then(|s| s.to_str())
+            != Some(format!("{}.json", read.grant.grant_id).as_str())
+        || path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            != Some(uid_directory.as_str())
+        || !path
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            .is_some_and(|name| name.ends_with("-successor-receipts"))
+    {
+        return Err(io::Error::other("successor receipt path invalid"));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("receipt parent absent"))?;
+    let parent_meta = std::fs::symlink_metadata(parent)?;
+    let root_meta = std::fs::symlink_metadata(
+        parent
+            .parent()
+            .ok_or_else(|| io::Error::other("receipt root absent"))?,
+    )?;
+    if !root_meta.is_dir()
+        || root_meta.file_type().is_symlink()
+        || root_meta.uid() != 0
+        || root_meta.mode() & 0o777 != 0o711
+    {
+        return Err(io::Error::other("successor receipt root untrusted"));
+    }
+    if !parent_meta.is_dir()
+        || parent_meta.file_type().is_symlink()
+        || parent_meta.uid() != uid
+        || parent_meta.mode() & 0o777 != 0o700
+    {
+        return Err(io::Error::other("successor receipt parent untrusted"));
+    }
+    let receipt = FreshSuccessorReceiverReceipt {
+        grant_id: read.grant.grant_id,
+        delivery_request_id: reply["delivery_request_id"]
+            .as_str()
+            .ok_or_else(|| io::Error::other("successor F request absent"))?
+            .into(),
+        offer_request_id: read.offer_request_id,
+        generation: read.generation,
+        session_id: read.grant.session_id,
+        seq: read.grant.seq,
+        source_id: read.grant.source_id,
+        attempt_id: read.grant.attempt_id,
+        successor_identity: recipient.clone(),
+        payload_sha256: read.grant.payload_sha256,
+        payload_byte_len: read.grant.payload_byte_len,
+        delivery_token_sha256: format!("{:x}", Sha256::digest(token.as_bytes())),
+    };
+    let bytes = serde_json::to_vec(&receipt).map_err(io::Error::other)?;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o400)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(mut file) => {
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let mut existing = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(path)?;
+            let meta = existing.metadata()?;
+            if !meta.is_file()
+                || meta.uid() != uid
+                || meta.nlink() != 1
+                || meta.mode() & 0o777 != 0o400
+                || meta.len() != bytes.len() as u64
+            {
+                return Err(io::Error::other("existing successor receipt untrusted"));
+            }
+            let mut stored = Vec::new();
+            existing.read_to_end(&mut stored)?;
+            if stored != bytes {
+                return Err(io::Error::other("existing successor receipt differs"));
+            }
+            existing.sync_all()?;
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        Err(error) => return Err(error),
+    }
+    Ok(payload)
 }
 
 pub fn fresh_root_terminal_request_at(
