@@ -1,4 +1,4 @@
-# AGE-319 paired Linux artifact (prerequisite only)
+# AGE-319 paired Linux first host install
 
 ## Fresh-only first-install image package
 
@@ -6,11 +6,9 @@
 featureless Runner, Broker, Bash, and installed launcher. Its schema-2
 `install-v1.json` uses the same image-derived generation as the paired bundle;
 the outer manifest also pins the service unit. The archive contains no aliases,
-selector, State database, or install command. All image members have mode
-`0400`. `verify` checks the exact member set, image digests, service digest,
-manifest, and generation. `stage` writes an exclusive, fsynced, non-executable
-directory and `check` rereads it. Production staging requires root ownership
-and safe ancestry; `--fixture` permits a disposable non-root check.
+selector, or State database. Its members remain mode `0400`. `verify` checks the
+exact member set, image digests, service digest, manifest, and generation.
+`stage` and `check` retain the original inert staging interface.
 
 ```bash
 python3 packaging/linux/first_install_v30.py build \
@@ -25,11 +23,53 @@ python3 packaging/linux/first_install_v30.py stage \
 python3 packaging/linux/first_install_v30.py check /root/first-install-v30-stage
 ```
 
-This package remains inert. A separate offline Broker command activates only
-after an administrator has installed its final four images and schema-2
-`install-v1.json` at the fixed `/usr/local/libexec/oulipoly` paths. The
-installed launcher still refuses production launches and Runner fresh-only
-entry is a later slice.
+`install_first_host_v30.py` is the fixed-path first host procedure. Run it from
+this source checkout with the **featureless** four-image package. It requires
+root and an existing `oulipoly` group. `install` refuses any existing Broker
+State root, image directory, or service unit. It publishes the exact four image
+bytes at `/usr/local/libexec/oulipoly` as root-owned mode `0555`, the schema-2
+manifest as `0444`, and the exact unit at
+`/etc/systemd/system/oulipoly-kernel-broker.service` as `0444`. An interrupted
+install is visible to `check`; do not overwrite an existing destination.
+The package's service bytes must equal this checkout's service source.
+
+```bash
+# On the intended clean host, inspect existing paths and group first.
+getent group oulipoly || sudo groupadd --system oulipoly
+sudo python3 packaging/linux/install_first_host_v30.py install /path/to/first-install-v30-inert.tar.gz
+sudo python3 packaging/linux/install_first_host_v30.py check /path/to/first-install-v30-inert.tar.gz
+sudo python3 packaging/linux/install_first_host_v30.py activate /path/to/first-install-v30-inert.tar.gz
+sudo python3 packaging/linux/install_first_host_v30.py start /path/to/first-install-v30-inert.tar.gz
+sudo python3 packaging/linux/install_first_host_v30.py readback /path/to/first-install-v30-inert.tar.gz
+```
+
+`activate` runs the **installed** Broker's `--bootstrap-empty-v30-state` and
+`--activate-first-install-v30` offline, in that order. It compares their exact
+source and pair identities. `start` reloads systemd, starts the installed unit,
+then queries the Broker's existing challenged `entry-gate-v1` socket operation.
+The procedure requires the live response `entry-gate-v1 fresh-only-open` and
+reads the exact pair generation from the installed manifest and source
+generation from the bootstrap/activation records. Broker startup validates
+that exact binding before it serves the open route. The separate installed-pair
+socket operation requires a pinned Runner peer and cannot be called by this
+Python operator tool. `start` does not enable the
+unit for boot. `activate` may be retried after a lost reply against the same
+marked bootstrap root; a previous service start or unmarked State refuses.
+
+For a disposable filesystem proof, pass `--fixture-root /absolute/disposable/root`
+to `install` and `check`. They map fixed paths underneath that root and do not
+run Broker or systemd. Broker offline commands use hardcoded `/usr/local` and
+`/var/lib` paths and have no fixture override here. Fixture proof is not a host
+activation or benchmark.
+
+Public alias publication is separate from this procedure. It does not create
+or replace `/usr/local/bin/agents`, `/usr/local/bin/oulipoly-agent-runner`, or
+`/usr/local/bin/agent-bash`. The first two would enter the installed launcher;
+the current launcher captures a Runner CLI/GUI handoff. The Bash path is a
+distinct image and must not be pointed at the Runner launcher. Existing
+`~/.local/bin/{agents,oulipoly-agent-runner,agent-bash}` currently shadow
+system paths on this host and remain untouched. No production alias or
+workload admission is claimed by the service readback.
 
 The featureless Broker also has an explicit offline storage command:
 `oulipoly-kernel-broker --bootstrap-empty-v30-state`. As root, it publishes
@@ -40,8 +80,9 @@ reads back that same identity; an incompatible root or abandoned stage is a
 refusal. This command does not start the Broker service or activate the image
 package.
 
-With the final files in place, run the installed Broker as root with
-`--activate-first-install-v30` before its first service start. It accepts only
+With the final files in place, the procedure runs the installed Broker as root
+with `--activate-first-install-v30` before its first service start. It accepts
+only
 the exact unserved empty bootstrap root. It pins the manifest and all four
 named images by SHA-256, device and inode, and atomically publishes
 `/var/lib/oulipoly-kernel-broker/first-install-activation-v1.json`. A retry
@@ -187,8 +228,9 @@ gate, or v30 route refuses.
 
 ## Cutover requirements still open
 
-There is **no supported installer activation** for this artifact yet. The
-service currently owns only the broker and uses `KillMode=process`; it cannot
+The first-install procedure establishes an empty fresh-only Broker route, not
+a production workload cutover. The service currently owns only the broker and
+uses `KillMode=process`; it cannot
 inventory or stop CLI/GUI/helper descendants. WSL here has no usable writable
 unified cgroup-v2 subtree for that purpose. The broker currently admits only
 help/offline diagnostic host entry and lacks a normal GUI/PTY or provider-work
