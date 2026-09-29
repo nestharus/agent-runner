@@ -41,6 +41,8 @@ pub struct RootPhysicalCloseProof {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub successor_ack: Option<FreshSuccessorTerminalAck>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_receipt: Option<oulipoly_state::mailbox::FreshOriginalReceiptIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub normal: Option<NormalRootEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offline: Option<OfflineRootEvidence>,
@@ -74,6 +76,38 @@ pub fn exact_successor_ack_for_root(
         return Err(io::Error::other("successor terminal ACK remains unknown"));
     }
     Ok(terminal.successor_ack)
+}
+
+pub fn exact_original_receipt_for_root(
+    lane: &FreshV30Lane,
+    root_id: &str,
+) -> io::Result<Option<oulipoly_state::mailbox::FreshOriginalReceiptIdentity>> {
+    if !lane
+        .original_manual_ack_exists_for_root(root_id)
+        .map_err(io::Error::other)?
+    {
+        return Ok(None);
+    }
+    let (released, actor) = lane
+        .released_handoff_for_root(root_id)
+        .map_err(io::Error::other)?;
+    let session = lane
+        .read_session(&released.d_key)
+        .map_err(io::Error::other)?
+        .ok_or_else(|| io::Error::other("original receipt D session absent"))?;
+    let terminal = lane
+        .read_private_root_terminal(&released, &actor, &session)
+        .map_err(io::Error::other)?;
+    if terminal.notification_state != "acked" || terminal.ack_basis.as_deref() != Some("manual_ack")
+    {
+        return Err(io::Error::other(
+            "original receiver receipt terminal unknown",
+        ));
+    }
+    terminal
+        .original_receipt
+        .ok_or_else(|| io::Error::other("original receiver receipt absent"))
+        .map(Some)
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -155,6 +189,7 @@ pub fn physical_close_proof(inventory: &RootDrainInventory) -> io::Result<RootPh
         || inventory.normal_uncertain
         || inventory.offline_uncertain
         || inventory.successor_ack_unknown
+        || inventory.original_receipt_unknown
         || inventory.normal.as_ref().is_some_and(|normal| {
             normal.physical.state != "drained"
                 || normal.physical.q.is_none()
@@ -178,6 +213,7 @@ pub fn physical_close_proof(inventory: &RootDrainInventory) -> io::Result<RootPh
         source_physical_retired: inventory.source_physical_retired,
         source_effect: source_effect.clone(),
         successor_ack: inventory.successor_ack.clone(),
+        original_receipt: inventory.original_receipt.clone(),
         normal: inventory.normal.clone(),
         offline: inventory.offline.clone(),
     })
@@ -234,6 +270,9 @@ pub struct RootDrainInventory {
     pub successor_ack_unknown: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub successor_ack: Option<FreshSuccessorTerminalAck>,
+    pub original_receipt_unknown: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_receipt: Option<oulipoly_state::mailbox::FreshOriginalReceiptIdentity>,
     pub normal: Option<NormalRootEvidence>,
     pub normal_uncertain: bool,
     /// The released U intent selects the no-effect route even before its
@@ -375,6 +414,11 @@ pub fn readback(
     });
     let successor_ack_unknown = successor_ack_read.is_err();
     let successor_ack = successor_ack_read.ok().flatten();
+    let original_receipt_read = lane.as_ref().map_or(Ok(None), |lane| {
+        exact_original_receipt_for_root(lane, &expected.root_id)
+    });
+    let original_receipt_unknown = original_receipt_read.is_err();
+    let original_receipt = original_receipt_read.ok().flatten();
     let terminal_dir = works.broker_root()?.join("terminals");
     let mut work_retired = 0;
     let mut work_outstanding = 0;
@@ -742,6 +786,8 @@ pub fn readback(
         source_effect_readback_uncertain,
         successor_ack_unknown,
         successor_ack,
+        original_receipt_unknown,
+        original_receipt,
         normal,
         normal_uncertain,
         offline_intent,
@@ -854,6 +900,7 @@ pub fn ready_for_owner_close_preflight(
         || inventory.source_physical_outstanding != 0
         || inventory.source_effect_readback_uncertain
         || inventory.successor_ack_unknown
+        || inventory.original_receipt_unknown
         || inventory.normal_uncertain
         || inventory.offline_uncertain
         || inventory.uncertain_registry_or_incarnation
@@ -992,6 +1039,8 @@ mod tests {
             source_effect_readback_uncertain: false,
             successor_ack_unknown: false,
             successor_ack: None,
+            original_receipt_unknown: false,
+            original_receipt: None,
             normal: None,
             normal_uncertain: false,
             offline_intent: false,

@@ -66,6 +66,8 @@ pub struct NormalTerminalCertificate {
     pub owner: BrokerClosedOwner,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub successor_ack: Option<oulipoly_state::mailbox::FreshSuccessorTerminalAck>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_receipt: Option<oulipoly_state::mailbox::FreshOriginalReceiptIdentity>,
 }
 
 pub enum Admission {
@@ -302,11 +304,27 @@ impl InstalledLaunchLedger {
             || certificate.physical.root_id != request.root_id.as_deref().unwrap_or("")
             || certificate.owner.root_id != certificate.physical.root_id
             || certificate.owner.source_generation != request.source_generation
+            || certificate.physical.original_receipt != certificate.original_receipt
             || serde_json::from_str::<RootPhysicalCloseProof>(
                 &certificate.owner.physical_proof_json,
             )? != certificate.physical
         {
             return Err(io::Error::other("installed terminal identity mismatch"));
+        }
+        if certificate.original_receipt.is_some() {
+            let state_root = self
+                .directory
+                .parent()
+                .ok_or_else(|| io::Error::other("installed State root absent"))?;
+            let lane = oulipoly_state::mailbox::FreshV30Lane::open_at(state_root)
+                .map_err(io::Error::other)?;
+            let current = crate::root_drain::exact_original_receipt_for_root(
+                &lane,
+                &certificate.physical.root_id,
+            )?;
+            if current != certificate.original_receipt {
+                return Err(io::Error::other("installed original receipt changed"));
+            }
         }
         Ok(Some(certificate))
     }
