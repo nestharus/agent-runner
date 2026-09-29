@@ -222,6 +222,15 @@ impl FreshV30Lane {
             .optional()
             .map_err(|e| e.to_string())?
             .ok_or("no ungranted pending fresh recipient row")?;
+        let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let successor_admitted: bool = state.query_row(
+            "SELECT EXISTS(SELECT 1 FROM fresh_lane_successor_admission
+             WHERE session_id=?1 AND seq=?2)",
+            params![session.session_id,row.seq], |r| r.get(0),
+        ).map_err(|e| e.to_string())?;
+        if successor_admitted {
+            return Err("original F row reserved by durable successor admission".into());
+        }
         let sha = row
             .payload_sha256
             .as_deref()

@@ -58,6 +58,11 @@ fn root_mapped_connected_l_delivers_real_bash_async_to_recipient_and_acks() {
 }
 
 #[test]
+fn root_mapped_connected_l_admits_distinct_v30_successor_without_f_or_ack() {
+    run_connected_case_with_bash_mode(true, ProofFault::None, true, true, true);
+}
+
+#[test]
 fn root_mapped_connected_l_refuses_missing_q_after_certificate() {
     run_connected_case(true, ProofFault::MissingQ);
 }
@@ -92,6 +97,16 @@ fn run_connected_case_with_bash(
     real_bash: bool,
     async_bash: bool,
 ) {
+    run_connected_case_with_bash_mode(normal, fault, real_bash, async_bash, false);
+}
+
+fn run_connected_case_with_bash_mode(
+    normal: bool,
+    fault: ProofFault,
+    real_bash: bool,
+    async_bash: bool,
+    successor_admission: bool,
+) {
     assert!(!async_bash || real_bash);
     let Ok(runner_bin) = std::env::var("AGE319_CONNECTED_RUNNER_BIN") else {
         return;
@@ -101,39 +116,43 @@ fn run_connected_case_with_bash(
             .expect("real Bash case requires AGE319_CONNECTED_BASH_BIN")
     });
     if std::env::var_os("AGE319_CONNECTED_CHILD_TEST").is_none() {
-        let test_name = match (normal, fault, real_bash, async_bash) {
-            (true, ProofFault::None, true, true) => {
-                "root_mapped_connected_l_delivers_real_bash_async_to_recipient_and_acks"
-            }
-            (true, ProofFault::None, true, false) => {
-                "root_mapped_connected_l_runs_real_bash_sync_child_and_closes_owner"
-            }
-            (false, ProofFault::None, false, false) => {
-                "root_mapped_connected_l_reaches_ordinary_help_with_exact_one_use_custody"
-            }
-            (false, ProofFault::Diagnostics, false, false) => {
-                "root_mapped_connected_diagnostics_help_closes_without_effect"
-            }
-            (false, ProofFault::Restart, false, false) => {
-                "root_mapped_connected_help_revalidates_offline_close_after_restart"
-            }
-            (false, ProofFault::OfflineTamper, false, false) => {
-                "root_mapped_connected_help_refuses_tampered_no_effect_certificate"
-            }
-            (true, ProofFault::None, false, false) => {
-                "root_mapped_connected_l_runs_normal_model_and_closes_owner"
-            }
-            (true, ProofFault::MissingQ, false, false) => {
-                "root_mapped_connected_l_refuses_missing_q_after_certificate"
-            }
-            (true, ProofFault::ChangedQ, false, false) => {
-                "root_mapped_connected_l_refuses_changed_q_after_certificate"
-            }
-            (true, ProofFault::Restart, false, false) => {
-                "root_mapped_connected_l_revalidates_certificate_after_broker_restart"
-            }
-            _ => {
-                unreachable!()
+        let test_name = if successor_admission {
+            "root_mapped_connected_l_admits_distinct_v30_successor_without_f_or_ack"
+        } else {
+            match (normal, fault, real_bash, async_bash) {
+                (true, ProofFault::None, true, true) => {
+                    "root_mapped_connected_l_delivers_real_bash_async_to_recipient_and_acks"
+                }
+                (true, ProofFault::None, true, false) => {
+                    "root_mapped_connected_l_runs_real_bash_sync_child_and_closes_owner"
+                }
+                (false, ProofFault::None, false, false) => {
+                    "root_mapped_connected_l_reaches_ordinary_help_with_exact_one_use_custody"
+                }
+                (false, ProofFault::Diagnostics, false, false) => {
+                    "root_mapped_connected_diagnostics_help_closes_without_effect"
+                }
+                (false, ProofFault::Restart, false, false) => {
+                    "root_mapped_connected_help_revalidates_offline_close_after_restart"
+                }
+                (false, ProofFault::OfflineTamper, false, false) => {
+                    "root_mapped_connected_help_refuses_tampered_no_effect_certificate"
+                }
+                (true, ProofFault::None, false, false) => {
+                    "root_mapped_connected_l_runs_normal_model_and_closes_owner"
+                }
+                (true, ProofFault::MissingQ, false, false) => {
+                    "root_mapped_connected_l_refuses_missing_q_after_certificate"
+                }
+                (true, ProofFault::ChangedQ, false, false) => {
+                    "root_mapped_connected_l_refuses_changed_q_after_certificate"
+                }
+                (true, ProofFault::Restart, false, false) => {
+                    "root_mapped_connected_l_revalidates_certificate_after_broker_restart"
+                }
+                _ => {
+                    unreachable!()
+                }
             }
         };
         let status = Command::new("unshare")
@@ -349,6 +368,7 @@ printf '%s\n' "$response"
             temp.path().join("child-release"),
         )))
         .envs(async_bash.then_some(("AGE319_CONNECTED_ASYNC_RECIPIENT_DIR_V1", &recipient)))
+        .envs(successor_admission.then_some(("AGE319_CONNECTED_SUCCESSOR_ADMISSION_V1", "1")))
         .env("AGE319_PRIVATE_CONNECTED_J_REPLAY_V1", "1")
         .env("AGE319_CONNECTED_PAUSE_DIR", &pause)
         .envs(
@@ -585,6 +605,79 @@ printf '%s\n' "$response"
     assert_eq!(control_exit["launcher"], launch_record["launcher"]);
     assert_eq!(control_exit["control"], reserved["entry"]);
     assert_eq!(control_exit["e_consumed"], true);
+    if successor_admission {
+        assert_ne!(
+            control_exit["code"], 0,
+            "admission slice must stop before F/ACK and root terminal"
+        );
+        let offer: serde_json::Value = serde_json::from_slice(
+            &fs::read(recipient.join("successor-offer.json")).unwrap_or_else(|error| {
+                panic!(
+                    "successor offer absent: {error}; caller={} broker={}",
+                    fs::read_to_string(&caller_err).unwrap_or_default(),
+                    fs::read_to_string(&broker_log).unwrap_or_default()
+                )
+            }),
+        )
+        .unwrap();
+        let read: serde_json::Value =
+            serde_json::from_slice(&fs::read(recipient.join("successor-admission.json")).unwrap())
+                .unwrap();
+        assert_eq!(read["offer"], offer);
+        assert_ne!(offer["original_identity"], offer["successor_identity"]);
+        assert_eq!(offer["root_id"], root_id);
+        let state_db = rusqlite::Connection::open(&fresh_db).unwrap();
+        let side_db =
+            rusqlite::Connection::open(state.join("v30/sidecar/pid-identity.db")).unwrap();
+        let original_attachment: String = state_db.query_row(
+            "SELECT recipient_identity FROM fresh_lane_recipient_attachment WHERE session_id=?1",
+            [offer["session_id"].as_str().unwrap()], |r| r.get(0)).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&original_attachment).unwrap(),
+            offer["original_identity"]
+        );
+        let state_generation: String = state_db.query_row(
+            "SELECT generation FROM fresh_lane_successor_admission WHERE session_id=?1 AND seq=?2",
+            rusqlite::params![offer["session_id"].as_str().unwrap(),offer["seq"].as_i64().unwrap()],
+            |r| r.get(0)).unwrap();
+        let side_generation: String = side_db
+            .query_row(
+                "SELECT generation FROM fresh_successor_admission WHERE session_id=?1 AND seq=?2",
+                rusqlite::params![
+                    offer["session_id"].as_str().unwrap(),
+                    offer["seq"].as_i64().unwrap()
+                ],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state_generation, side_generation);
+        assert_eq!(state_generation, offer["generation"]);
+        assert_eq!(
+            side_db
+                .query_row("SELECT count(*) FROM fresh_recipient_grant", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            side_db
+                .query_row(
+                    "SELECT count(*) FROM fresh_recipient_ack_evidence",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert!(
+            fs::read_to_string(&caller_err)
+                .unwrap_or_default()
+                .contains("F/ACK and root terminal join pending")
+        );
+        broker.kill().unwrap();
+        broker.wait().unwrap();
+        return;
+    }
     assert_eq!(
         control_exit["code"],
         0,

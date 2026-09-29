@@ -12,6 +12,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Component;
 
 include!("fresh_recipient.rs");
+include!("fresh_successor.rs");
 include!("fresh_native_f.rs");
 include!("fresh_headless_native_f.rs");
 include!("fresh_bash_child.rs");
@@ -60,6 +61,10 @@ const FRESH_HEADLESS_NATIVE_F_SCHEMA: &str =
     include_str!("migrations/0045_fresh_headless_native_f.sql");
 const FRESH_RECIPIENT_STATE_SCHEMA: &str =
     include_str!("migrations/0030_fresh_recipient_state.sql");
+const FRESH_SUCCESSOR_SIDECAR_SCHEMA: &str =
+    include_str!("migrations/0051_fresh_successor_sidecar.sql");
+const FRESH_SUCCESSOR_STATE_SCHEMA: &str =
+    include_str!("migrations/0051_fresh_successor_state.sql");
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FreshV30LaneIdentity {
@@ -850,7 +855,7 @@ impl FreshV30Lane {
             .mailbox()
             .conn
             .execute_batch(&format!(
-                "{FRESH_SCHEMA}\n{FRESH_RECIPIENT_SCHEMA}\n{FRESH_RECIPIENT_ACK_SCHEMA}\n{FRESH_NATIVE_F_PREPARATION_SCHEMA}\n{FRESH_NATIVE_F_SUBMISSION_SCHEMA}"
+                "{FRESH_SCHEMA}\n{FRESH_RECIPIENT_SCHEMA}\n{FRESH_RECIPIENT_ACK_SCHEMA}\n{FRESH_NATIVE_F_PREPARATION_SCHEMA}\n{FRESH_NATIVE_F_SUBMISSION_SCHEMA}\n{FRESH_SUCCESSOR_SIDECAR_SCHEMA}"
             ))
             .map_err(|e| e.to_string())?;
         sidecar
@@ -872,7 +877,7 @@ impl FreshV30Lane {
         let state_conn = Connection::open(&state_path).map_err(|e| e.to_string())?;
         state_conn
             .execute_batch(&format!(
-                "{FRESH_STATE_SCHEMA}\n{FRESH_RECIPIENT_STATE_SCHEMA}\n{FRESH_CHILD_REQUEST_SCHEMA}\n{FRESH_HANDOFF_SCHEMA}\n{FRESH_ROOT_EFFECT_SCHEMA}\n{FRESH_BASH_CHILD_SCHEMA}\n{FRESH_BASH_SOURCE_SCHEMA}\n{FRESH_BASH_NOTIFY_SCHEMA}\n{FRESH_ROOT_TERMINAL_SCHEMA}\n{FRESH_ROOT_CALLER_SETTLEMENT_SCHEMA}\n{FRESH_ROOT_H_DELEGATION_SCHEMA}\n{FRESH_BASH_SYNC_PUBLICATION_SCHEMA}\n{FRESH_NORMAL_WORK_SCHEMA}\n{FRESH_NORMAL_MODEL_SELECTION_SCHEMA}"
+                "{FRESH_STATE_SCHEMA}\n{FRESH_RECIPIENT_STATE_SCHEMA}\n{FRESH_SUCCESSOR_STATE_SCHEMA}\n{FRESH_CHILD_REQUEST_SCHEMA}\n{FRESH_HANDOFF_SCHEMA}\n{FRESH_ROOT_EFFECT_SCHEMA}\n{FRESH_BASH_CHILD_SCHEMA}\n{FRESH_BASH_SOURCE_SCHEMA}\n{FRESH_BASH_NOTIFY_SCHEMA}\n{FRESH_ROOT_TERMINAL_SCHEMA}\n{FRESH_ROOT_CALLER_SETTLEMENT_SCHEMA}\n{FRESH_ROOT_H_DELEGATION_SCHEMA}\n{FRESH_BASH_SYNC_PUBLICATION_SCHEMA}\n{FRESH_NORMAL_WORK_SCHEMA}\n{FRESH_NORMAL_MODEL_SELECTION_SCHEMA}"
             ))
             .map_err(|e| e.to_string())?;
         state_conn
@@ -996,6 +1001,52 @@ impl FreshV30Lane {
             .map_err(|e| e.to_string())?;
         if recipient_schema_count != 16 {
             return Err("fresh recipient authority schema is incomplete".into());
+        }
+        let successor_objects: i64 = sidecar
+            .mailbox()
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name IN
+             ('fresh_successor_offer','fresh_successor_offer_no_update',
+              'fresh_successor_offer_no_delete','fresh_successor_admission',
+              'fresh_successor_admission_no_update','fresh_successor_admission_no_delete')",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        match successor_objects {
+            0 => sidecar
+                .mailbox()
+                .conn
+                .execute_batch(&format!(
+                    "BEGIN IMMEDIATE;\n{FRESH_SUCCESSOR_SIDECAR_SCHEMA}\nCOMMIT;"
+                ))
+                .map_err(|e| e.to_string())?,
+            6 => {}
+            _ => return Err("fresh successor sidecar schema incomplete".into()),
+        }
+        for (table, triggers) in [
+            (
+                "fresh_successor_offer",
+                [
+                    "fresh_successor_offer_no_update",
+                    "fresh_successor_offer_no_delete",
+                ],
+            ),
+            (
+                "fresh_successor_admission",
+                [
+                    "fresh_successor_admission_no_update",
+                    "fresh_successor_admission_no_delete",
+                ],
+            ),
+        ] {
+            verify_fresh_sql_objects(
+                &sidecar.mailbox().conn,
+                FRESH_SUCCESSOR_SIDECAR_SCHEMA,
+                table,
+                &triggers,
+            )?;
         }
         let ack_schema_count: i64 = sidecar
             .mailbox()
@@ -1286,6 +1337,33 @@ impl FreshV30Lane {
         if accepted_schema_count != 6 {
             return Err("fresh accepted source schema is incomplete".into());
         }
+        let successor_count: i64 = state_conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name IN
+             ('fresh_lane_successor_admission','fresh_lane_successor_admission_no_update',
+              'fresh_lane_successor_admission_no_delete')",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        match successor_count {
+            0 => state_conn
+                .execute_batch(&format!(
+                    "BEGIN IMMEDIATE;\n{FRESH_SUCCESSOR_STATE_SCHEMA}\nCOMMIT;"
+                ))
+                .map_err(|e| e.to_string())?,
+            3 => {}
+            _ => return Err("fresh State successor schema incomplete".into()),
+        }
+        verify_fresh_sql_objects(
+            &state_conn,
+            FRESH_SUCCESSOR_STATE_SCHEMA,
+            "fresh_lane_successor_admission",
+            &[
+                "fresh_lane_successor_admission_no_update",
+                "fresh_lane_successor_admission_no_delete",
+            ],
+        )?;
         // This embedded SQL is the additive upgrade for a previously
         // published empty v30 lane. Identity and all pre-existing fresh
         // schemas are checked before any write. The immediate transaction

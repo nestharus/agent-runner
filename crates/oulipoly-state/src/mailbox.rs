@@ -74,8 +74,9 @@ pub use fresh_lane::{
     FreshNormalProviderK, FreshNormalWorkPreparation, FreshPhysicalTerminal,
     FreshRecipientIdentity, FreshReleasedHandoff, FreshRootCallerResult, FreshRootEffect,
     FreshRootEffectState, FreshRootHConsumption, FreshRootHDelegation, FreshRootHSelectedK,
-    FreshRootTerminalExecution, FreshRootTerminalReadback, FreshRootWorkIntent, FreshV30Lane,
-    FreshV30LaneIdentity, FreshV30Session, normal_root_arguments,
+    FreshRootTerminalExecution, FreshRootTerminalReadback, FreshRootWorkIntent,
+    FreshSuccessorAdmission, FreshSuccessorOffer, FreshV30Lane, FreshV30LaneIdentity,
+    FreshV30Session, normal_root_arguments,
 };
 pub use native_publication::NativePublication;
 #[path = "mailbox/schema.rs"]

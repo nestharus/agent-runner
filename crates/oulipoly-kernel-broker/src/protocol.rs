@@ -1855,6 +1855,26 @@ pub fn reserve_fresh_v30_child_request_at(
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FreshRecipientRequest {
+    /// The socket's pinned successor offers itself for one exact pending row.
+    /// The original released root must approve it separately.
+    OfferSuccessor {
+        allocation_request_id: String,
+        offer_request_id: String,
+        seq: i64,
+        source_id: String,
+    },
+    ReadSuccessorOffer {
+        offer_request_id: String,
+    },
+    /// Only the original D-bound root socket peer may admit the offered live
+    /// process generation. Repeating the exact request repairs a partial write.
+    AdmitSuccessor {
+        d_key: String,
+        offer_request_id: String,
+    },
+    ReadSuccessorAdmission {
+        offer_request_id: String,
+    },
     /// Private exact root result/readback. D and the socket's pinned original
     /// actor must both match; this never performs K, F, ACK or caller output.
     ReadRootTerminal {
