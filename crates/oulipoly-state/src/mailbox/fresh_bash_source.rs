@@ -30,6 +30,20 @@ pub struct FreshBashSourceEvent {
     pub stdout_len: u64,
     pub stderr_sha256: String,
     pub stderr_len: u64,
+    /// Frozen by the Broker when it captures this physical Q, before W can be
+    /// selected. None means the normal parent lifecycle was not proved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normal_provider_selection: Option<NormalProviderSelection>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NormalProviderSelection {
+    pub admission_id: String,
+    pub mode: String,
+    pub provider_local_pid: Option<i32>,
+    pub provider: Option<FreshRecipientIdentity>,
+    pub provider_wait_status: Option<i32>,
 }
 
 fn bash_source_registration_digest(child: &FreshBashChild) -> Result<String, String> {
@@ -358,6 +372,33 @@ impl FreshV30Lane {
                 {
                     return Err("normal causal parent K or PID1 changed at W".into());
                 }
+                if let Some(selection) = &event.normal_provider_selection {
+                    if selection.admission_id != k.admission_id {
+                        return Err("normal provider selection admission changed".into());
+                    }
+                    match selection.mode.as_str() {
+                        "sleeping" if selection.provider.is_none() && selection.provider_local_pid.is_none() && selection.provider_wait_status.is_some() => {
+                            let exit = physical_json(&normal_directory, "provider-exit.json")?;
+                            if exit["admission_id"] != k.admission_id
+                                || exit["provider_wait_status"].as_i64()
+                                    != selection.provider_wait_status.map(i64::from)
+                            {
+                                return Err("normal provider wait receipt changed".into());
+                            }
+                        }
+                        "busy" if selection.provider.is_some() && selection.provider_local_pid.is_some_and(|pid| pid > 1) && selection.provider_wait_status.is_none() => {
+                            let start = physical_json(&normal_directory, "provider-start.json")?;
+                            if start["admission_id"] != k.admission_id
+                                || start["local_pid"].as_i64() != selection.provider_local_pid.map(i64::from)
+                                || start["host_pid"].as_i64() != selection.provider.as_ref().map(|provider| i64::from(provider.host_pid))
+                                || start["starttime_ticks"].as_u64() != selection.provider.as_ref().map(|provider| provider.starttime_ticks)
+                            {
+                                return Err("normal provider live identity changed".into());
+                            }
+                        }
+                        _ => return Err("normal provider selection evidence malformed".into()),
+                    }
+                }
                 let binding = &root.old_release.prepared.joined_child;
                 // Normal K is the immutable State consumption. Normalize its
                 // readback with PID1's retained receipt for the common child
@@ -384,6 +425,9 @@ impl FreshV30Lane {
                 });
                 (grant.clone(), false, grant, attach)
             } else {
+                if event.normal_provider_selection.is_some() {
+                    return Err("non-normal parent has normal provider selection".into());
+                }
                 let (grant, interactive) = physical_parent_for_bash(&directory, &child)?;
                 let consumed = physical_json(
                     &directory,

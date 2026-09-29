@@ -11,6 +11,7 @@ use oulipoly_runtime::executor::cli::fresh_remote::FreshProviderPlan;
 use oulipoly_state::mailbox::{
     FreshNormalExecutablePlan, FreshNormalProviderAdmission, FreshNormalProviderK,
     FreshRecipientIdentity, FreshReleasedHandoff, FreshV30Lane, FreshV30Session,
+    NormalProviderSelection,
 };
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
@@ -86,6 +87,149 @@ struct BashParent {
     pid1_starttime_ticks: u64,
     pidns_dev: u64,
     pidns_ino: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderStart {
+    admission_id: String,
+    local_pid: i32,
+    host_pid: i32,
+    starttime_ticks: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderExit {
+    admission_id: String,
+    provider_wait_status: i32,
+}
+
+/// Capture the provider lifecycle while the Broker freezes the Bash physical
+/// source event. An absent wait receipt is busy only with a matching live
+/// pidfd identity; missing or racing observations stay unknown.
+pub fn capture_provider_selection(
+    state_root: &Path,
+    admission_id: &str,
+    handoff_id: &str,
+    root_id: &str,
+) -> io::Result<Option<NormalProviderSelection>> {
+    let directory = id_path(&store_root(state_root)?, admission_id)?;
+    capture_provider_selection_in(&directory, admission_id, handoff_id, root_id)
+}
+
+fn capture_provider_selection_in(
+    directory: &Path,
+    admission_id: &str,
+    handoff_id: &str,
+    root_id: &str,
+) -> io::Result<Option<NormalProviderSelection>> {
+    let parent: BashParent = read_optional(&directory, "bash-parent.json")?
+        .ok_or_else(|| io::Error::other("normal Bash parent absent at source capture"))?;
+    if parent.admission_id != admission_id
+        || parent.handoff_id != handoff_id
+        || parent.root_id != root_id
+    {
+        return Err(io::Error::other(
+            "normal Bash parent changed at source capture",
+        ));
+    }
+    let exit: Option<ProviderExit> = read_optional(&directory, "provider-exit.json")?;
+    if let Some(exit) = exit {
+        if exit.admission_id != admission_id {
+            return Err(io::Error::other("normal provider exit admission changed"));
+        }
+        return Ok(Some(NormalProviderSelection {
+            admission_id: admission_id.into(),
+            mode: "sleeping".into(),
+            provider_local_pid: None,
+            provider: None,
+            provider_wait_status: Some(exit.provider_wait_status),
+        }));
+    }
+    let Some(start): Option<ProviderStart> = read_optional(&directory, "provider-start.json")?
+    else {
+        return Ok(None);
+    };
+    if start.admission_id != admission_id || start.local_pid <= 1 {
+        return Err(io::Error::other("normal provider start admission changed"));
+    }
+    let Ok(provider) = PinnedProcess::open(start.host_pid) else {
+        return Ok(None);
+    };
+    if provider.starttime_ticks != start.starttime_ticks
+        || provider.namespace_pid()? != start.local_pid
+        || !provider.direct_child_of(&PinnedProcess::open(parent.pid1_host_pid)?)?
+        || provider.exited()?
+    {
+        return Ok(None);
+    }
+    let identity = FreshRecipientIdentity {
+        host_pid: provider.host_pid,
+        boot_id: provider.boot_id,
+        starttime_ticks: provider.starttime_ticks,
+        pidns_dev: provider.pidns_dev,
+        pidns_ino: provider.pidns_ino,
+    };
+    Ok(Some(NormalProviderSelection {
+        admission_id: admission_id.into(),
+        mode: "busy".into(),
+        provider_local_pid: Some(start.local_pid),
+        provider: Some(identity),
+        provider_wait_status: None,
+    }))
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    #[test]
+    fn missing_or_damaged_wait_never_claims_sleeping() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path();
+        let admission_id = uuid::Uuid::new_v4().to_string();
+        write_new(
+            directory,
+            "bash-parent.json",
+            &BashParent {
+                handoff_id: "handoff".into(),
+                admission_id: admission_id.clone(),
+                plan_sha256: "plan".into(),
+                root_id: "root".into(),
+                pid1_host_pid: 1,
+                pid1_starttime_ticks: 1,
+                pidns_dev: 1,
+                pidns_ino: 1,
+            },
+        )
+        .unwrap();
+        assert!(
+            capture_provider_selection_in(directory, &admission_id, "handoff", "root")
+                .unwrap()
+                .is_none()
+        );
+        fs::write(directory.join("provider-exit.json"), b"{").unwrap();
+        assert!(
+            capture_provider_selection_in(directory, &admission_id, "handoff", "root").is_err()
+        );
+        fs::remove_file(directory.join("provider-exit.json")).unwrap();
+        write_new(
+            directory,
+            "provider-exit.json",
+            &ProviderExit {
+                admission_id: admission_id.clone(),
+                provider_wait_status: 0,
+            },
+        )
+        .unwrap();
+        let selected = capture_provider_selection_in(directory, &admission_id, "handoff", "root")
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.mode, "sleeping");
+        assert_eq!(selected.admission_id, admission_id);
+        assert_eq!(selected.provider_wait_status, Some(0));
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -244,6 +388,45 @@ fn own_host_pid_and_starttime() -> io::Result<(i32, u64)> {
         .parse()
         .map_err(io::Error::other)?;
     Ok((host_pid, starttime))
+}
+
+fn provider_host_start_for_local(
+    pid1_host_pid: i32,
+    local_pid: i32,
+) -> io::Result<Option<(i32, u64)>> {
+    let mut children = String::new();
+    host_proc_file(&format!("{pid1_host_pid}/task/{pid1_host_pid}/children"))?
+        .read_to_string(&mut children)?;
+    for host_pid in children.split_ascii_whitespace() {
+        let host_pid: i32 = host_pid.parse().map_err(io::Error::other)?;
+        let mut status = String::new();
+        host_proc_file(&format!("{host_pid}/status"))?.read_to_string(&mut status)?;
+        let namespace_pid = status
+            .lines()
+            .find_map(|line| line.strip_prefix("NSpid:"))
+            .and_then(|line| line.split_ascii_whitespace().last())
+            .and_then(|value| value.parse::<i32>().ok());
+        let parent_pid = status
+            .lines()
+            .find_map(|line| line.strip_prefix("PPid:"))
+            .and_then(|value| value.trim().parse::<i32>().ok());
+        if namespace_pid == Some(local_pid) && parent_pid == Some(pid1_host_pid) {
+            let mut stat = String::new();
+            host_proc_file(&format!("{host_pid}/stat"))?.read_to_string(&mut stat)?;
+            let fields = stat
+                .rsplit_once(") ")
+                .ok_or_else(|| io::Error::other("normal provider host stat invalid"))?
+                .1;
+            let starttime_ticks = fields
+                .split_ascii_whitespace()
+                .nth(19)
+                .ok_or_else(|| io::Error::other("normal provider host starttime absent"))?
+                .parse()
+                .map_err(io::Error::other)?;
+            return Ok(Some((host_pid, starttime_ticks)));
+        }
+    }
+    Ok(None)
 }
 
 pub fn parent_for_bash(
@@ -962,6 +1145,20 @@ fn pid1_run(
     actor.verify()?;
     let provider = command.spawn()?;
     let provider_pid = provider.id() as i32;
+    if let Ok(Some((host_pid, starttime_ticks))) =
+        provider_host_start_for_local(pid1_host_pid, provider_pid)
+    {
+        let _ = write_new(
+            directory,
+            "provider-start.json",
+            &ProviderStart {
+                admission_id: recipe.k.admission_id.clone(),
+                local_pid: provider_pid,
+                host_pid,
+                starttime_ticks,
+            },
+        );
+    }
     let mut provider_wait = None;
     loop {
         let mut status = 0;
@@ -983,15 +1180,15 @@ fn pid1_run(
     }
     let provider_wait_status =
         provider_wait.ok_or_else(|| io::Error::other("normal provider wait absent"))?;
-    // This interim observation is useful to fixture and diagnostics; failure
-    // to publish it must not terminate PID1 with an attached child still live.
-    let _ = write_new(
+    // The wait is the only durable sleeping witness. Publish it before Q and
+    // fail closed if it cannot be retained.
+    let provider_exit_result = write_new(
         directory,
         "provider-exit.json",
-        &serde_json::json!({
-            "admission_id": recipe.k.admission_id,
-            "provider_wait_status": provider_wait_status,
-        }),
+        &ProviderExit {
+            admission_id: recipe.k.admission_id.clone(),
+            provider_wait_status,
+        },
     );
     // A Broker-spawned Bash child shares this PID namespace but is not this
     // PID1's process child. ECHILD alone cannot certify its lifetime. The
@@ -1009,6 +1206,9 @@ fn pid1_run(
         }
         std::thread::sleep(CHILD_DRAIN_POLL);
     };
+    // A failed wait receipt cannot classify sleeping, but PID1 still must
+    // retain the namespace until every reserved Bash child has drained.
+    provider_exit_result?;
     let q = PhysicalQ {
         admission_id: recipe.k.admission_id.clone(),
         plan_sha256: recipe.k.plan_sha256.clone(),

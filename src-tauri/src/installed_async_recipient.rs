@@ -57,8 +57,73 @@ pub(crate) fn settle_pending_original(
     if terminal.listener_policy.as_deref() != Some("notify") {
         return Err("pending original F has no async notify listener".into());
     }
-    if disposable_fixture && socket.with_file_name("successor-mode").exists() {
-        return settle_pending_successor(socket, d_key, &terminal, true);
+    let wake_request_id = terminal
+        .child_request_id
+        .as_ref()
+        .ok_or("selected async W request absent")?;
+    let event = terminal
+        .selected_child_event
+        .as_ref()
+        .ok_or("selected async W physical event absent")?;
+    if event.request_id != *wake_request_id || event.root_id != terminal.root_id {
+        return Err("selected async W physical event changed".into());
+    }
+    let prior = protocol::fresh_recipient_request_at(
+        socket,
+        &FreshRecipientRequest::ReadBashWakeSuccessorDecision {
+            d_key: d_key.into(),
+            wake_request_id: wake_request_id.clone(),
+        },
+    )
+    .map_err(|e| format!("selected W decision readback unknown: {e}"))?;
+    if prior["kind"] != "bash_wake_successor_decision_readback" {
+        return Err("selected W decision readback kind changed".into());
+    }
+    let prior_offer = if prior["decision"].is_null() {
+        None
+    } else {
+        if prior["decision"]["wake_request_id"] != *wake_request_id
+            || prior["decision"]["obligation"]["root_id"] != terminal.root_id
+            || prior["decision"]["obligation"]["session_id"] != terminal.session_id
+            || prior["decision"]["obligation"]["seq"].as_i64() != terminal.mailbox_seq
+        {
+            return Err("selected W prior decision changed terminal row".into());
+        }
+        Some(
+            prior["decision"]["offer_request_id"]
+                .as_str()
+                .ok_or("selected W prior offer ID absent")?,
+        )
+    };
+    let selected = event
+        .normal_provider_selection
+        .as_ref()
+        .ok_or("selected W provider lifecycle evidence absent")?;
+    match selected.mode.as_str() {
+        "sleeping"
+            if selected.provider.is_none()
+                && selected.provider_local_pid.is_none()
+                && selected.provider_wait_status.is_some() =>
+        {
+            return settle_pending_successor(
+                socket,
+                d_key,
+                &terminal,
+                prior_offer,
+                disposable_fixture
+                    && std::env::var_os("AGE319_TEST_FEATURELESS_DROP_START_REPLY_V1").is_some(),
+            );
+        }
+        "busy"
+            if selected.provider.is_some()
+                && selected.provider_local_pid.is_some_and(|pid| pid > 1)
+                && selected.provider_wait_status.is_none() =>
+        {
+            if prior_offer.is_some() {
+                return Err("busy W already has a successor decision".into());
+            }
+        }
+        _ => return Err("selected W provider lifecycle evidence malformed".into()),
     }
     let directory = receipt_directory()?;
     let intent_path = directory.join(format!("{d_key}.intent.json"));
@@ -174,13 +239,16 @@ fn settle_pending_successor(
     socket: &Path,
     d_key: &str,
     terminal: &FreshRootTerminalReadback,
+    prior_offer: Option<&str>,
     drop_start_reply: bool,
 ) -> Result<(), String> {
     let wake_request_id = terminal
         .child_request_id
         .as_ref()
         .ok_or("selected successor W request absent")?;
-    let offer_id = uuid::Uuid::new_v4().to_string();
+    let offer_id = prior_offer
+        .map(str::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let decision_request = FreshRecipientRequest::DecideBashWakeSuccessor {
         d_key: d_key.into(),
         wake_request_id: wake_request_id.clone(),
@@ -263,8 +331,10 @@ fn settle_pending_successor(
         },
     )
     .map_err(|e| format!("installed candidate admission readback unknown: {e}"))?;
-    if prior_admission["admission"].is_object() {
-        return Err("installed candidate was admitted before original approval".into());
+    if prior_admission["admission"].is_object()
+        && prior_admission["admission"]["offer"]["offer_request_id"] != offer_id
+    {
+        return Err("installed candidate prior admission changed offer".into());
     }
     if protocol::fresh_recipient_request_at(socket, &start_request).is_ok()
         || protocol::fresh_recipient_request_at(

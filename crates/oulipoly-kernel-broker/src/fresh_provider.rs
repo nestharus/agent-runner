@@ -10207,6 +10207,23 @@ pub(super) fn select_bash_tree_event(
     } else {
         None
     };
+    let state_root = directory
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| io::Error::other("fresh Bash State root absent"))?;
+    let normal_parent = state_root
+        .join("v30/normal-provider")
+        .join(&child.parent_work_grant_id);
+    let normal_provider_selection = if normal_parent.exists() {
+        oulipoly_kernel_broker::normal_physical::capture_provider_selection(
+            state_root,
+            &child.parent_work_grant_id,
+            &child.root_handoff_id,
+            &child.root_id,
+        )?
+    } else {
+        None
+    };
     let event = FreshBashSourceEvent {
         request_id: child.request_id.clone(),
         source_id: child.handle.clone(),
@@ -10238,6 +10255,7 @@ pub(super) fn select_bash_tree_event(
         stdout_len,
         stderr_sha256,
         stderr_len,
+        normal_provider_selection,
     };
     durable_new(directory, &name, &event)?;
     Ok(event)
@@ -13342,6 +13360,7 @@ mod tests {
             stdout_len: 0,
             stderr_sha256: "b".repeat(64),
             stderr_len: 0,
+            normal_provider_selection: None,
         };
         durable_new(
             temp.path(),
