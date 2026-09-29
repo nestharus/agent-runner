@@ -26,6 +26,8 @@ mod completion_owner;
 mod diagnostics_payloads;
 mod dispatch;
 mod error_emit;
+#[cfg(all(target_os = "linux", not(feature = "age319-private-broker-fixture")))]
+mod installed_async_recipient;
 mod invocation;
 mod json_error;
 #[cfg(target_os = "linux")]
