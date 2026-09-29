@@ -2915,7 +2915,7 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
 
 fn run_normal_model(
     receipt: &oulipoly_state::mailbox::FreshReleasedHandoff,
-    _session: &oulipoly_state::mailbox::FreshV30Session,
+    session: &oulipoly_state::mailbox::FreshV30Session,
     invocation: &oulipoly_state::mailbox::FreshHeadlessModelInvocation,
 ) -> Result<ExitCode, String> {
     let socket = broker_socket().with_file_name("v30.sock");
@@ -3026,6 +3026,35 @@ fn run_normal_model(
         &receipt.d_key,
         private_userns_broker_socket().is_some(),
     )?;
+    let terminal = protocol::fresh_root_terminal_request_at(
+        &socket,
+        &protocol::FreshRecipientRequest::SettleRootTerminal {
+            d_key: receipt.d_key.clone(),
+        },
+    )
+    .or_else(|settle_error| {
+        protocol::fresh_root_terminal_request_at(
+            &socket,
+            &protocol::FreshRecipientRequest::ReadRootTerminal {
+                d_key: receipt.d_key.clone(),
+            },
+        )
+        .map_err(|read_error| std::io::Error::other(format!(
+            "normal terminal settlement uncertain: {settle_error}; readback refused: {read_error}"
+        )))
+    })
+    .map_err(|e| format!("normal terminal settlement unknown: {e}"))?;
+    if terminal.handoff_id != receipt.handoff_id
+        || terminal.d_key != receipt.d_key
+        || terminal.session_id != session.session_id
+        || terminal.execution_state == "unknown"
+        || terminal
+            .execution
+            .as_ref()
+            .is_none_or(|execution| execution.parent.grant_id != admission.admission_id)
+    {
+        return Err("normal terminal settlement did not retain exact K/Q".into());
+    }
     let publication =
         protocol::publish_fresh_normal_provider_at(
             &socket,
