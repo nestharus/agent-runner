@@ -49,7 +49,12 @@ fn root_mapped_connected_l_runs_normal_model_and_closes_owner() {
 
 #[test]
 fn root_mapped_connected_l_runs_real_bash_sync_child_and_closes_owner() {
-    run_connected_case_with_bash(true, ProofFault::None, true);
+    run_connected_case_with_bash(true, ProofFault::None, true, false);
+}
+
+#[test]
+fn root_mapped_connected_l_delivers_real_bash_async_to_recipient_and_acks() {
+    run_connected_case_with_bash(true, ProofFault::None, true, true);
 }
 
 #[test]
@@ -78,10 +83,16 @@ enum ProofFault {
 }
 
 fn run_connected_case(normal: bool, fault: ProofFault) {
-    run_connected_case_with_bash(normal, fault, false);
+    run_connected_case_with_bash(normal, fault, false, false);
 }
 
-fn run_connected_case_with_bash(normal: bool, fault: ProofFault, real_bash: bool) {
+fn run_connected_case_with_bash(
+    normal: bool,
+    fault: ProofFault,
+    real_bash: bool,
+    async_bash: bool,
+) {
+    assert!(!async_bash || real_bash);
     let Ok(runner_bin) = std::env::var("AGE319_CONNECTED_RUNNER_BIN") else {
         return;
     };
@@ -90,32 +101,35 @@ fn run_connected_case_with_bash(normal: bool, fault: ProofFault, real_bash: bool
             .expect("real Bash case requires AGE319_CONNECTED_BASH_BIN")
     });
     if std::env::var_os("AGE319_CONNECTED_CHILD_TEST").is_none() {
-        let test_name = match (normal, fault, real_bash) {
-            (true, ProofFault::None, true) => {
+        let test_name = match (normal, fault, real_bash, async_bash) {
+            (true, ProofFault::None, true, true) => {
+                "root_mapped_connected_l_delivers_real_bash_async_to_recipient_and_acks"
+            }
+            (true, ProofFault::None, true, false) => {
                 "root_mapped_connected_l_runs_real_bash_sync_child_and_closes_owner"
             }
-            (false, ProofFault::None, false) => {
+            (false, ProofFault::None, false, false) => {
                 "root_mapped_connected_l_reaches_ordinary_help_with_exact_one_use_custody"
             }
-            (false, ProofFault::Diagnostics, false) => {
+            (false, ProofFault::Diagnostics, false, false) => {
                 "root_mapped_connected_diagnostics_help_closes_without_effect"
             }
-            (false, ProofFault::Restart, false) => {
+            (false, ProofFault::Restart, false, false) => {
                 "root_mapped_connected_help_revalidates_offline_close_after_restart"
             }
-            (false, ProofFault::OfflineTamper, false) => {
+            (false, ProofFault::OfflineTamper, false, false) => {
                 "root_mapped_connected_help_refuses_tampered_no_effect_certificate"
             }
-            (true, ProofFault::None, false) => {
+            (true, ProofFault::None, false, false) => {
                 "root_mapped_connected_l_runs_normal_model_and_closes_owner"
             }
-            (true, ProofFault::MissingQ, false) => {
+            (true, ProofFault::MissingQ, false, false) => {
                 "root_mapped_connected_l_refuses_missing_q_after_certificate"
             }
-            (true, ProofFault::ChangedQ, false) => {
+            (true, ProofFault::ChangedQ, false, false) => {
                 "root_mapped_connected_l_refuses_changed_q_after_certificate"
             }
-            (true, ProofFault::Restart, false) => {
+            (true, ProofFault::Restart, false, false) => {
                 "root_mapped_connected_l_revalidates_certificate_after_broker_restart"
             }
             _ => {
@@ -143,13 +157,30 @@ fn run_connected_case_with_bash(normal: bool, fault: ProofFault, real_bash: bool
     fs::create_dir(&data_dir).unwrap();
     let config_home = temp.path().join("config-home");
     let effect = temp.path().join("provider-effect");
+    let recipient = temp.path().join("recipient");
+    if async_bash {
+        fs::create_dir(&recipient).unwrap();
+    }
     if normal {
         let config = config_home.join("oulipoly-agent-runner");
         fs::create_dir_all(config.join("models")).unwrap();
         let provider = temp.path().join("provider.sh");
         fs::write(
             &provider,
-            if real_bash {
+            if async_bash {
+                br#"#!/bin/sh
+export OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1="$AGE319_BASH_CONTROL_SOCKET"
+response=$("$AGE319_BASH_IMAGE" run --delivery async -- /bin/sh -c 'printf "one\n" >> "$AGE319_EFFECT_FILE"; printf "async-child-out\n"; printf "async-child-err\n" >&2') || exit
+printf '%s\n' "$response"
+grant=$(printf '%s' "$response" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["physical_grant_id"])') || exit
+attempt=0
+while [ ! -f "$AGE319_BASH_SOURCE_DIR/$grant.source-event.json" ]; do
+    attempt=$((attempt+1))
+    [ "$attempt" -lt 1500 ] || exit 1
+    sleep 0.02
+done
+"#.as_slice()
+            } else if real_bash {
                 b"#!/bin/sh\nexport OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1=\"$AGE319_BASH_CONTROL_SOCKET\"\n\"$AGE319_BASH_IMAGE\" run --delivery sync -- /bin/sh -c 'printf \"one\\n\" >> \"$AGE319_EFFECT_FILE\"; printf \"bash-child-out\\n\"; printf \"bash-child-err\\n\" >&2'\n".as_slice()
             } else {
                 b"#!/bin/sh\nprintf 'one\\n' >> \"$AGE319_EFFECT_FILE\"\nprintf 'normal-provider-out:'\ncat\nprintf 'normal-provider-err\\n' >&2\n".as_slice()
@@ -320,6 +351,8 @@ fn run_connected_case_with_bash(normal: bool, fault: ProofFault, real_bash: bool
         .envs(normal.then_some(("AGE319_EFFECT_FILE", &effect)))
         .envs(real_bash.then_some(("AGE319_BASH_IMAGE", &bash)))
         .envs(real_bash.then_some(("AGE319_BASH_CONTROL_SOCKET", &socket)))
+        .envs(async_bash.then_some(("AGE319_BASH_SOURCE_DIR", state.join("v30/fresh-provider"))))
+        .envs(async_bash.then_some(("AGE319_CONNECTED_ASYNC_RECIPIENT_DIR_V1", &recipient)))
         .env("AGE319_PRIVATE_CONNECTED_J_REPLAY_V1", "1")
         .env("AGE319_CONNECTED_PAUSE_DIR", &pause)
         .envs(
@@ -381,7 +414,7 @@ fn run_connected_case_with_bash(normal: bool, fault: ProofFault, real_bash: bool
     let reserved: serde_json::Value = serde_json::from_slice(&fs::read(&entry).unwrap()).unwrap();
     assert_eq!(reserved["root_id"], root_id);
     assert_eq!(fs::read_dir(state.join("entries")).unwrap().count(), 1);
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(if async_bash { 50 } else { 20 });
     let joined = loop {
         let record: serde_json::Value = serde_json::from_slice(&fs::read(&entry).unwrap()).unwrap();
         if record["join_consumed"] == true && record["joined_child"].is_object() {
@@ -579,7 +612,9 @@ fn run_connected_case_with_bash(normal: bool, fault: ProofFault, real_bash: bool
     }
     let output = loop {
         let output = fs::read_to_string(&caller_out).unwrap_or_default();
-        if output.contains(if real_bash {
+        if output.contains(if async_bash {
+            "\"dispatch_state\":\"broker-k-consumed\""
+        } else if real_bash {
             "\"dispatch_state\":\"sync-child-result\""
         } else if normal {
             "normal-provider-out:"
@@ -597,7 +632,9 @@ fn run_connected_case_with_bash(normal: bool, fault: ProofFault, real_bash: bool
         std::thread::sleep(Duration::from_millis(20));
     };
     assert!(
-        output.contains(if real_bash {
+        output.contains(if async_bash {
+            "\"schema_version\":30"
+        } else if real_bash {
             "\"schema_version\":31"
         } else if normal {
             "normal-provider-out:hello fixture"
@@ -634,7 +671,11 @@ fn run_connected_case_with_bash(normal: bool, fault: ProofFault, real_bash: bool
             "normal close warning: {broker_errors}"
         );
         assert_eq!(fs::read_to_string(&effect).unwrap(), "one\n");
-        if real_bash {
+        if async_bash {
+            assert_real_bash_async_child(
+                &state, &fresh_db, &root_id, &handoff, &output, &recipient,
+            );
+        } else if real_bash {
             assert_real_bash_sync_child(&state, &fresh_db, &root_id, &handoff, &output);
         } else {
             assert!(
@@ -761,6 +802,14 @@ fn run_connected_case_with_bash(normal: bool, fault: ProofFault, real_bash: bool
     let session = lane.read_session(&released.d_key).unwrap().unwrap();
     lane.require_released_invocation(&released, &actor, &session)
         .unwrap();
+    if async_bash {
+        let terminal = lane
+            .read_private_root_terminal(&released, &actor, &session)
+            .unwrap();
+        assert_eq!(terminal.notification_origin, "original_c_notify");
+        assert_eq!(terminal.notification_state, "acked");
+        assert_eq!(terminal.ack_basis.as_deref(), Some("manual_ack"));
+    }
     let terminal_path = state.join("installed-normal-terminals").join(format!(
         "{}.json",
         launch_record["request_id"].as_str().unwrap()
@@ -844,7 +893,7 @@ fn run_connected_case_with_bash(normal: bool, fault: ProofFault, real_bash: bool
         }
         fs::write(certificate_pause.join("release"), b"release").unwrap();
     }
-    let caller_deadline = Instant::now() + Duration::from_secs(10);
+    let caller_deadline = Instant::now() + Duration::from_secs(if async_bash { 50 } else { 10 });
     let launcher_status = loop {
         if let Some(status) = launcher_child.try_wait().unwrap() {
             break status;
@@ -1057,7 +1106,12 @@ fn assert_real_bash_sync_child(
     )
     .unwrap();
     assert_eq!(source_event, *event);
-    assert!(physical.join(format!("{grant_id}.drain.json")).exists());
+    let drain: serde_json::Value =
+        serde_json::from_slice(&fs::read(physical.join(format!("{grant_id}.drain.json"))).unwrap())
+            .unwrap();
+    assert_eq!(drain["grant_id"], grant_id);
+    assert_eq!(drain["zero_remaining"], true);
+    assert_eq!(drain["cancelled"], false);
     for (stream, expected) in [
         ("stdout", b"bash-child-out\n".as_slice()),
         ("stderr", b"bash-child-err\n".as_slice()),
@@ -1076,4 +1130,231 @@ fn assert_real_bash_sync_child(
             format!("{:x}", Sha256::digest(expected))
         );
     }
+}
+
+fn assert_real_bash_async_child(
+    state: &Path,
+    fresh_db: &Path,
+    root_id: &str,
+    handoff: &serde_json::Value,
+    output: &str,
+    recipient: &Path,
+) {
+    let dispatch: serde_json::Value = serde_json::from_str(output).unwrap();
+    assert_eq!(dispatch["schema_version"], 30);
+    assert_eq!(dispatch["dispatch_state"], "broker-k-consumed");
+    assert_eq!(dispatch["delivery_mode"], "async");
+    assert_eq!(dispatch["effects_possible"], true);
+    let request_id = dispatch["request_id"].as_str().unwrap();
+    let grant_id = dispatch["physical_grant_id"].as_str().unwrap();
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&fs::read(recipient.join("receipt.json")).unwrap()).unwrap();
+    let ack: serde_json::Value =
+        serde_json::from_slice(&fs::read(recipient.join("ack.json")).unwrap()).unwrap();
+    let delivery = &receipt["grant"];
+    assert_eq!(delivery["phase"], "unknown");
+    assert_eq!(ack["kind"], "readback");
+    assert_eq!(ack["grant"]["phase"], "acked");
+    for key in [
+        "grant_id",
+        "session_id",
+        "seq",
+        "source_id",
+        "attempt_id",
+        "lane_id",
+        "source_generation",
+        "root_id",
+        "owner_generation",
+        "payload_sha256",
+        "payload_byte_len",
+    ] {
+        assert_eq!(ack["grant"][key], delivery[key], "ACK changed {key}");
+    }
+    assert_eq!(delivery["root_id"], root_id);
+    let payload = base64::engine::general_purpose::STANDARD
+        .decode(receipt["payload_base64"].as_str().unwrap())
+        .unwrap();
+    let payload_value: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+    assert_eq!(receipt["observed_sha256"], digest_bytes(&payload));
+    assert_eq!(delivery["payload_sha256"], digest_bytes(&payload));
+    assert_eq!(delivery["payload_byte_len"], payload.len());
+    assert_eq!(payload_value["protocol"], "fresh-bash-complete-v30");
+    let event = &payload_value["source"];
+    assert_eq!(event["request_id"], request_id);
+    assert_eq!(event["source_id"], delivery["source_id"]);
+    assert_eq!(event["attempt_id"], delivery["attempt_id"]);
+    assert_eq!(event["physical_grant_id"], grant_id);
+    assert_eq!(event["root_id"], root_id);
+    assert_ne!(event["session_id"], delivery["session_id"]);
+    assert_eq!(event["tree_drained"], true);
+    assert_eq!(event["output_closed"], true);
+    assert_eq!(event["wait_status"], 0);
+    for (key, expected) in [
+        ("stdout", b"async-child-out\n".as_slice()),
+        ("stderr", b"async-child-err\n".as_slice()),
+    ] {
+        let raw: Vec<u8> =
+            serde_json::from_value(payload_value[format!("{key}_bytes")].clone()).unwrap();
+        assert_eq!(raw, expected);
+        assert_eq!(event[format!("{key}_len")], expected.len());
+        assert_eq!(event[format!("{key}_sha256")], digest_bytes(expected));
+        assert_eq!(
+            fs::read(
+                state
+                    .join("v30/fresh-provider")
+                    .join(format!("{grant_id}.{key}"))
+            )
+            .unwrap(),
+            expected
+        );
+    }
+    let db =
+        rusqlite::Connection::open_with_flags(fresh_db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let (child_json, policy): (String, String) = db
+        .query_row(
+            "SELECT c.receipt_json,l.listener_policy FROM fresh_bash_child c
+             JOIN fresh_bash_listener_registration l ON l.request_id=c.request_id
+             WHERE c.request_id=?1",
+            [request_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let child: serde_json::Value = serde_json::from_str(&child_json).unwrap();
+    assert_eq!(policy, "notify");
+    assert_eq!(child["listener_policy"], "notify");
+    assert_eq!(child["handle"], delivery["source_id"]);
+    assert_eq!(child["invocation_uuid"], delivery["attempt_id"]);
+    assert_eq!(child["root_id"], root_id);
+    assert_eq!(child["root_handoff_id"], handoff["handoff_id"]);
+    assert_eq!(child["parent_invocation_uuid"], handoff["invocation_uuid"]);
+    assert_eq!(child["parent_work_grant_id"], event["parent_work_grant_id"]);
+    assert_eq!(child["parent_work_id"], event["parent_work_id"]);
+    let child_session: String = db
+        .query_row(
+            "SELECT session_id FROM fresh_lane_session_admission WHERE request_id=?1",
+            [child["d_key"].as_str().unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(event["session_id"], child_session);
+    let selected: String = db
+        .query_row(
+            "SELECT receipt_json FROM fresh_bash_selected_event WHERE request_id=?1",
+            [request_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&selected).unwrap(),
+        *event
+    );
+    let (notify_source, notify_session): (String, String) = db
+        .query_row(
+            "SELECT source_id,listener_session_id FROM fresh_bash_notify_request WHERE request_id=?1",
+            [request_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(notify_source, delivery["source_id"]);
+    assert_eq!(notify_session, delivery["session_id"]);
+    let physical = state.join("v30/fresh-provider");
+    let consumed: serde_json::Value = serde_json::from_slice(
+        &fs::read(physical.join(format!("{grant_id}.consumed.json"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(consumed["id"], grant_id);
+    assert_eq!(consumed["binding"]["grant_key"], request_id);
+    let source_event: serde_json::Value = serde_json::from_slice(
+        &fs::read(physical.join(format!("{grant_id}.source-event.json"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(source_event, *event);
+    assert!(physical.join(format!("{grant_id}.drain.json")).exists());
+    assert_eq!(
+        fs::read_dir(&physical)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".consumed.json"))
+            .count(),
+        1,
+        "async Bash child K repeated"
+    );
+    let parent_grant = child["parent_work_grant_id"].as_str().unwrap();
+    let parent_k: String = db
+        .query_row(
+            "SELECT k_json FROM fresh_normal_provider_k WHERE handoff_id=?1",
+            [handoff["handoff_id"].as_str().unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let parent_k: serde_json::Value = serde_json::from_str(&parent_k).unwrap();
+    assert_eq!(parent_k["admission_id"], parent_grant);
+    let sidecar = rusqlite::Connection::open_with_flags(
+        state.join("v30/sidecar/pid-identity.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let (phase, delivered_at, attempts, ack_basis, token_sha, recipient_identity): (
+        String,
+        String,
+        i64,
+        String,
+        String,
+        String,
+    ) = sidecar
+        .query_row(
+            "SELECT g.phase,m.delivered_at,m.delivery_attempts,e.basis,e.delivery_token_sha256,
+                    g.recipient_identity
+             FROM fresh_recipient_grant g
+             JOIN mailbox m ON m.session_id=g.session_id AND m.seq=g.seq
+             JOIN fresh_recipient_ack_evidence e ON e.grant_id=g.grant_id
+             JOIN fresh_recipient_row_source r ON r.session_id=g.session_id AND r.seq=g.seq
+             WHERE g.grant_id=?1 AND g.delivery_request_id=?2
+               AND g.source_id=?3 AND g.attempt_id=?4
+               AND g.payload_sha256=?5 AND g.payload_byte_len=?6
+               AND r.source_id=g.source_id AND r.attempt_id=g.attempt_id
+               AND r.payload_sha256=g.payload_sha256 AND r.payload_byte_len=g.payload_byte_len
+               AND e.acknowledged_at=m.delivered_at AND g.acknowledged_at=m.delivered_at",
+            rusqlite::params![
+                delivery["grant_id"].as_str().unwrap(),
+                receipt["delivery_request_id"].as_str().unwrap(),
+                delivery["source_id"].as_str().unwrap(),
+                delivery["attempt_id"].as_str().unwrap(),
+                delivery["payload_sha256"].as_str().unwrap(),
+                delivery["payload_byte_len"].as_i64().unwrap(),
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(phase, "acked");
+    assert!(!delivered_at.is_empty());
+    assert_eq!(attempts, 1);
+    assert_eq!(ack_basis, "manual_ack");
+    assert_eq!(
+        token_sha,
+        digest_bytes(delivery["delivery_token"].as_str().unwrap().as_bytes())
+    );
+    let lane = FreshV30Lane::open_at(state).unwrap();
+    let (_, root_actor) = lane.released_handoff_for_root(root_id).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&recipient_identity).unwrap(),
+        serde_json::to_value(root_actor).unwrap()
+    );
+}
+
+fn digest_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }

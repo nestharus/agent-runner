@@ -2501,6 +2501,12 @@ fn run_normal_model(
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
+    #[cfg(feature = "age319-private-broker-fixture")]
+    if private_userns_broker_socket().is_some()
+        && let Some(directory) = std::env::var_os("AGE319_CONNECTED_ASYNC_RECIPIENT_DIR_V1")
+    {
+        connected_async_bash_recipient(&socket, &receipt.d_key, &PathBuf::from(directory))?;
+    }
     let publication =
         protocol::publish_fresh_normal_provider_at(
             &socket,
@@ -2540,6 +2546,177 @@ fn run_normal_model(
         .and_then(|value| u8::try_from(value).ok())
         .ok_or("normal caller settled exit code absent")?;
     Ok(ExitCode::from(code))
+}
+
+/// The installed connected test's original root Runner is the independently
+/// pinned recipient. It acquires the Broker's actual F bytes and persists its
+/// own receipt before spending the token; no test process can forge its ACK.
+#[cfg(feature = "age319-private-broker-fixture")]
+fn connected_async_bash_recipient(
+    socket: &std::path::Path,
+    d_key: &str,
+    directory: &std::path::Path,
+) -> Result<(), String> {
+    use base64::Engine as _;
+    use protocol::FreshRecipientRequest;
+    use sha2::{Digest as _, Sha256};
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let terminal = protocol::fresh_recipient_request_at(
+            socket,
+            &FreshRecipientRequest::ReadRootTerminal {
+                d_key: d_key.into(),
+            },
+        )
+        .map_err(|e| format!("connected async recipient terminal read: {e}"))?;
+        let state = terminal["terminal"]["notification_state"].as_str();
+        if state == Some("pending_f") {
+            break;
+        }
+        if !matches!(
+            state,
+            Some("not_applicable" | "awaiting_w" | "repair_required")
+        ) || std::time::Instant::now() >= deadline
+        {
+            return Err(format!(
+                "connected async recipient F unavailable: {terminal}"
+            ));
+        }
+        if state == Some("repair_required") {
+            protocol::fresh_recipient_request_at(
+                socket,
+                &FreshRecipientRequest::RepairRootTerminal {
+                    d_key: d_key.into(),
+                },
+            )
+            .map_err(|e| format!("connected async recipient repair: {e}"))?;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let delivery_request_id = uuid::Uuid::new_v4().to_string();
+    let delivery = protocol::fresh_recipient_request_at(
+        socket,
+        &FreshRecipientRequest::Submit {
+            allocation_request_id: d_key.into(),
+            delivery_request_id: delivery_request_id.clone(),
+        },
+    )
+    .map_err(|e| format!("connected async recipient F submit: {e}"))?;
+    if delivery["kind"] != "delivery" {
+        return Err("connected async recipient F reply changed".into());
+    }
+    let grant = &delivery["grant"];
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(
+            delivery["payload_base64"]
+                .as_str()
+                .ok_or("F payload absent")?,
+        )
+        .map_err(|e| e.to_string())?;
+    let payload: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| format!("F payload invalid: {e}"))?;
+    let sha = format!("{:x}", Sha256::digest(&bytes));
+    if payload["protocol"] != "fresh-bash-complete-v30"
+        || payload["source"]["source_id"] != grant["source_id"]
+        || payload["source"]["attempt_id"] != grant["attempt_id"]
+        || payload["source"]["root_id"] != grant["root_id"]
+        || payload["source"]["lane_id"] != grant["lane_id"]
+        || payload["source"]["source_generation"] != grant["source_generation"]
+        || grant["payload_sha256"] != sha
+        || grant["payload_byte_len"].as_u64() != Some(bytes.len() as u64)
+    {
+        return Err("connected async recipient F payload/source identity changed".into());
+    }
+    if payload["source"]["wait_status"] != 0
+        || payload["source"]["tree_drained"] != true
+        || payload["source"]["output_closed"] != true
+    {
+        return Err("connected async recipient Bash completion is not drained success".into());
+    }
+    for (stream, expected) in [
+        ("stdout", b"async-child-out\n".as_slice()),
+        ("stderr", b"async-child-err\n".as_slice()),
+    ] {
+        let raw: Vec<u8> = serde_json::from_value(payload[format!("{stream}_bytes")].clone())
+            .map_err(|e| format!("connected async recipient {stream} malformed: {e}"))?;
+        if raw != expected
+            || payload["source"][format!("{stream}_len")].as_u64() != Some(raw.len() as u64)
+            || payload["source"][format!("{stream}_sha256")]
+                != format!("{:x}", Sha256::digest(&raw))
+        {
+            return Err(format!("connected async recipient {stream} differs from W"));
+        }
+    }
+    let lookup = protocol::fresh_recipient_request_at(
+        socket,
+        &FreshRecipientRequest::Lookup {
+            lane_id: grant["lane_id"].as_str().ok_or("F lane absent")?.into(),
+            session_id: grant["session_id"]
+                .as_str()
+                .ok_or("F session absent")?
+                .into(),
+            seq: grant["seq"].as_i64().ok_or("F sequence absent")?,
+        },
+    )
+    .map_err(|e| format!("connected async recipient payload lookup: {e}"))?;
+    if lookup["payload_base64"] != delivery["payload_base64"] {
+        return Err("connected async recipient lookup bytes changed".into());
+    }
+    let mut receipt = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(directory.join("receipt.json"))
+        .map_err(|e| e.to_string())?;
+    let evidence = serde_json::json!({
+        "delivery_request_id": delivery_request_id,
+        "grant": grant,
+        "payload_base64": delivery["payload_base64"],
+        "observed_sha256": sha,
+    });
+    receipt
+        .write_all(&serde_json::to_vec(&evidence).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    receipt.sync_all().map_err(|e| e.to_string())?;
+    File::open(directory)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|e| e.to_string())?;
+    let grant_id = grant["grant_id"].as_str().ok_or("F grant absent")?;
+    let token = grant["delivery_token"].as_str().ok_or("F token absent")?;
+    let ack = protocol::fresh_recipient_request_at(
+        socket,
+        &FreshRecipientRequest::Acknowledge {
+            grant_id: grant_id.into(),
+            delivery_token: token.into(),
+        },
+    )
+    .map_err(|e| format!("connected async recipient ACK: {e}"))?;
+    let read = protocol::fresh_recipient_request_at(
+        socket,
+        &FreshRecipientRequest::Read {
+            delivery_request_id,
+        },
+    )
+    .map_err(|e| format!("connected async recipient ACK readback: {e}"))?;
+    if ack["grant"]["phase"] != "acked"
+        || read["grant"] != ack["grant"]
+        || read["grant"]["grant_id"] != grant_id
+    {
+        return Err("connected async recipient durable ACK changed".into());
+    }
+    let mut ack_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(directory.join("ack.json"))
+        .map_err(|e| e.to_string())?;
+    ack_file
+        .write_all(&serde_json::to_vec(&read).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    ack_file.sync_all().map_err(|e| e.to_string())?;
+    File::open(directory)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 fn prepare_normal_work(
