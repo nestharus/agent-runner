@@ -7136,6 +7136,20 @@ fn v30_host_entry() -> Result<ExitCode, String> {
             .parse()
             .map_err(|_| "v30 held child PID invalid")?;
         #[cfg(feature = "age319-private-broker-fixture")]
+        if std::env::var_os("AGE319_PRIVATE_CONNECTED_J_REPLAY_V1").is_some() {
+            let (_replay_receipt, replay_completion) =
+                UnixStream::pair().map_err(|e| e.to_string())?;
+            let replay = protocol::join_held_v30_at(
+                &broker,
+                &join,
+                [0, 1, 2, cwd.as_raw_fd(), replay_completion.as_raw_fd()],
+            )
+            .map_err(|e| format!("connected held J replay result uncertain: {e}"))?;
+            if !replay.starts_with("error ") {
+                return Err(format!("connected held J replay was not refused: {replay}"));
+            }
+        }
+        #[cfg(feature = "age319-private-broker-fixture")]
         if private_normal_mode() {
             let (_replay_receipt, replay_completion) =
                 UnixStream::pair().map_err(|e| e.to_string())?;

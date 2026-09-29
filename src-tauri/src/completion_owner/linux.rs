@@ -1153,8 +1153,7 @@ fn start_v30_driver(
     let mode = std::ffi::CString::new(super::driver::DRIVER_ARG).unwrap();
     // The selected v30 branch never opens this legacy positional argument.
     // Its root selector and owner frame are checked against broker R.
-    let retired = std::ffi::CString::new(MailboxDb::default_path()?.as_os_str().as_bytes())
-        .map_err(|_| "legacy driver path contains NUL")?;
+    let retired = std::ffi::CString::new("v30-unused-legacy-path").unwrap();
     let fd_arg = std::ffi::CString::new(gate.as_raw_fd().to_string()).unwrap();
     let root =
         std::ffi::CString::new(pin.root_id.as_str()).map_err(|_| "broker root contains NUL")?;

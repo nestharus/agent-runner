@@ -336,7 +336,15 @@ fn run_init(context: InitContext) -> io::Result<()> {
         );
     }
     #[cfg(feature = "age319-private-broker-fixture")]
-    if held_v30 && super::private_fixture() {
+    if held_v30
+        && super::private_fixture()
+        // The connected-install fixture exercises the ordinary child path;
+        // only the private child test mode is omitted from that child.
+        && !spec
+            .environment
+            .iter()
+            .any(|(name, _)| name == "AGE319_PRIVATE_CONNECTED_ORDINARY_CHILD_V1")
+    {
         command.env("OULIPOLY_KERNEL_V30_PRIVATE_CHILD_V1", "1");
         if let Some(directory) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1") {
             command.env("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1", directory);
