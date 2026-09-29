@@ -1116,6 +1116,13 @@ pub(crate) fn verify_installed_entry_route() -> Result<(), String> {
         let observation = protocol::observe_installed_pair_at(&broker_socket())
             .map_err(|error| format!("installed pair broker unavailable: {error}"))?;
         require_pair_route(&pair, &observation)?;
+        if pair.schema == 2
+            && std::env::var_os(REQUIRED_ENV).is_none()
+            && std::env::var_os(CHILD_FD_ENV).is_none()
+            && crate::completion_owner::verify_installed_driver_entry()?
+        {
+            return Ok(());
+        }
         require_pair_launch_mode(
             pair.schema,
             std::env::var_os(REQUIRED_ENV).is_some(),
