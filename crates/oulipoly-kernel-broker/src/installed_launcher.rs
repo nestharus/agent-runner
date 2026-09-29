@@ -52,58 +52,90 @@ fn main() {
         Ok((captured.spec.request_id, pair.generation, response))
     })();
     match result {
-        Ok((request_id, generation, Ok(response))) => {
-            if let Some(code) = installed_launch::drained_exit_code(&response, &request_id) {
-                std::process::exit(code as i32);
-            }
-            let readback = protocol::installed_launch_status_at(
+        Ok((request_id, generation, response)) => {
+            match wait_for_terminal(
                 Path::new(protocol::INSTALLED_SOCKET),
                 &request_id,
                 &generation,
-            );
-            if let Ok(status) = &readback {
-                if let Some(code) = installed_launch::drained_exit_code(status, &request_id) {
-                    std::process::exit(code as i32);
-                }
+                response,
+            ) {
+                Ok(code) => std::process::exit(i32::from(code)),
+                Err(reason) => eprintln!(
+                    "OULIPOLY_INSTALLED_LAUNCH_UNKNOWN=request {request_id} generation {generation}: {reason}"
+                ),
             }
-            if response
-                .strip_prefix("error ")
-                .and_then(|body| body.strip_suffix('\n'))
-                .is_some_and(|body| !body.contains('\n'))
-                && !readback
-                    .as_ref()
-                    .is_ok_and(|status| status == &format!("pending {request_id} {generation}\n"))
-            {
-                eprintln!(
-                    "OULIPOLY_INSTALLED_LAUNCH_GAP=request {request_id}: {}",
-                    response.trim_end()
-                );
-            } else {
-                eprintln!(
-                    "OULIPOLY_INSTALLED_LAUNCH_UNKNOWN=request {request_id} generation {generation}: {response:?}; status {readback:?}"
-                );
-            }
-        }
-        Ok((request_id, generation, Err(error))) => {
-            let readback = protocol::installed_launch_status_at(
-                Path::new(protocol::INSTALLED_SOCKET),
-                &request_id,
-                &generation,
-            );
-            if let Ok(status) = &readback {
-                if let Some(code) = installed_launch::drained_exit_code(status, &request_id) {
-                    std::process::exit(code as i32);
-                }
-            }
-            eprintln!(
-                "OULIPOLY_INSTALLED_LAUNCH_UNKNOWN=request {request_id} generation {generation}: {error}; status {readback:?}"
-            );
         }
         Err(error) => {
             eprintln!("OULIPOLY_INSTALLED_LAUNCH_GAP={error}");
         }
     }
     std::process::exit(70);
+}
+
+/// Pending is allowed for the whole model run. Only loss of the read-only
+/// status channel has a bounded recovery window; no second L is submitted.
+#[cfg(target_os = "linux")]
+fn wait_for_terminal(
+    socket: &std::path::Path,
+    request_id: &str,
+    generation: &str,
+    initial: std::io::Result<String>,
+) -> Result<u8, String> {
+    use oulipoly_kernel_broker::{installed_launch, protocol};
+    use std::time::{Duration, Instant};
+    let mut response = match initial {
+        Ok(ref status) if status.starts_with("error ") => {
+            protocol::installed_launch_status_at(socket, request_id, generation)
+        }
+        other => other,
+    };
+    let mut outage = None;
+    #[cfg(feature = "age319-private-broker-fixture")]
+    let mut certificate_paused = false;
+    loop {
+        match response {
+            Ok(ref status) => {
+                outage = None;
+                if let Some(code) = installed_launch::drained_exit_code(status, request_id) {
+                    #[cfg(feature = "age319-private-broker-fixture")]
+                    if !certificate_paused
+                        && let Some(directory) =
+                            std::env::var_os("AGE319_CONNECTED_CERTIFICATE_PAUSE_DIR")
+                    {
+                        certificate_paused = true;
+                        let directory = std::path::PathBuf::from(directory);
+                        std::fs::write(directory.join("ready"), b"certificate observed")
+                            .map_err(|error| error.to_string())?;
+                        let deadline = Instant::now() + Duration::from_secs(10);
+                        while !directory.join("release").exists() {
+                            if Instant::now() >= deadline {
+                                return Err("certificate fixture pause expired".into());
+                            }
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        response =
+                            protocol::installed_launch_status_at(socket, request_id, generation);
+                        continue;
+                    }
+                    return Ok(code);
+                }
+                if status == &format!("unknown {request_id} {generation}\n") {
+                    return Err("Broker reported unknown terminal evidence".into());
+                }
+                if status != &format!("pending {request_id} {generation}\n") {
+                    return Err(format!("unexpected status {status:?}"));
+                }
+            }
+            Err(ref error) => {
+                let since = outage.get_or_insert_with(Instant::now);
+                if since.elapsed() >= Duration::from_secs(30) {
+                    return Err(format!("status unavailable for 30s: {error}"));
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        response = protocol::installed_launch_status_at(socket, request_id, generation);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -219,20 +251,14 @@ fn private_main(mut stdio: [std::os::fd::RawFd; 3]) -> i32 {
                 ));
             }
         }
-        let expected = format!(" drained {}\n", captured.spec.request_id);
-        if let Some(exit) = response
-            .strip_suffix(&expected)
-            .and_then(|prefix| prefix.strip_prefix("exit "))
-        {
-            let code: i32 = exit
-                .parse()
-                .map_err(|_| std::io::Error::other("invalid private Runner exit"))?;
-            return Ok(code);
-        }
-        Err(std::io::Error::other(format!(
-            "private broker launch refused: {}",
-            response.trim()
-        )))
+        wait_for_terminal(
+            Path::new(&socket),
+            &captured.spec.request_id,
+            &generation,
+            Ok(response),
+        )
+        .map(i32::from)
+        .map_err(std::io::Error::other)
     })();
     match result {
         Ok(code) => code,

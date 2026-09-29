@@ -110,7 +110,9 @@ impl RootRegistry {
                 continue;
             }
             // Opened and validated by the serving Broker before this scan.
-            if (name == "installed-launches" || name == "installed-control-exits")
+            if (name == "installed-launches"
+                || name == "installed-control-exits"
+                || name == "installed-normal-terminals")
                 && empty_bootstrap
                 && registry
                     .directory

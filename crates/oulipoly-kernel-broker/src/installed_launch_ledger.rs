@@ -5,6 +5,8 @@ use crate::entry_registry::ProcessStamp;
 use crate::identity::PeerIdentity;
 use crate::installed_launch::InstalledLaunchSpec;
 use crate::json_artifact;
+use crate::root_drain::RootPhysicalCloseProof;
+use oulipoly_state::mailbox::BrokerClosedOwner;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
@@ -50,6 +52,18 @@ pub struct ControlExitRecord {
 }
 
 const CONTROL_EXIT_PROTOCOL: &str = "installed-control-exit-v1";
+const TERMINAL_PROTOCOL: &str = "installed-normal-terminal-v1";
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NormalTerminalCertificate {
+    pub protocol: String,
+    pub request: RequestRecord,
+    pub control_exit: ControlExitRecord,
+    pub exit_code: u8,
+    pub physical: RootPhysicalCloseProof,
+    pub owner: BrokerClosedOwner,
+}
 
 pub enum Admission {
     New { root_id: String },
@@ -59,6 +73,7 @@ pub enum Admission {
 pub struct InstalledLaunchLedger {
     directory: PathBuf,
     exit_directory: PathBuf,
+    terminal_directory: PathBuf,
     pair_generation: String,
     source_generation: String,
 }
@@ -79,7 +94,8 @@ impl InstalledLaunchLedger {
         }
         let directory = state.join("installed-launches");
         let exit_directory = state.join("installed-control-exits");
-        for path in [&directory, &exit_directory] {
+        let terminal_directory = state.join("installed-normal-terminals");
+        for path in [&directory, &exit_directory, &terminal_directory] {
             if !path.exists() {
                 fs::DirBuilder::new().mode(0o700).create(path)?;
                 File::open(state)?.sync_all()?;
@@ -94,18 +110,21 @@ impl InstalledLaunchLedger {
             return Err(io::Error::other("unsafe installed launch ledger directory"));
         }
         json_artifact::require_no_pending(&directory)?;
-        let exit_meta = fs::symlink_metadata(&exit_directory)?;
-        if !exit_meta.is_dir()
-            || exit_meta.file_type().is_symlink()
-            || exit_meta.uid() != unsafe { libc::geteuid() }
-            || exit_meta.mode() & 0o777 != 0o700
-        {
-            return Err(io::Error::other("unsafe installed control exit directory"));
+        for path in [&exit_directory, &terminal_directory] {
+            let meta = fs::symlink_metadata(path)?;
+            if !meta.is_dir()
+                || meta.file_type().is_symlink()
+                || meta.uid() != unsafe { libc::geteuid() }
+                || meta.mode() & 0o777 != 0o700
+            {
+                return Err(io::Error::other("unsafe installed evidence directory"));
+            }
+            json_artifact::require_no_pending(path)?;
         }
-        json_artifact::require_no_pending(&exit_directory)?;
         let ledger = Self {
             directory,
             exit_directory,
+            terminal_directory,
             pair_generation: pair_generation.into(),
             source_generation: source_generation.into(),
         };
@@ -134,6 +153,16 @@ impl InstalledLaunchLedger {
                 .strip_suffix(".json")
                 .ok_or_else(|| io::Error::other("installed control exit filename mismatch"))?;
             ledger.read_control_exit(request_id)?;
+        }
+        for entry in fs::read_dir(&ledger.terminal_directory)? {
+            let name = entry?.file_name();
+            let name = name.to_string_lossy();
+            let request_id = name
+                .strip_suffix(".json")
+                .ok_or_else(|| io::Error::other("installed terminal filename mismatch"))?;
+            if !canonical_uuid(request_id) {
+                return Err(io::Error::other("installed terminal filename mismatch"));
+            }
         }
         Ok(ledger)
     }
@@ -179,11 +208,74 @@ impl InstalledLaunchLedger {
         Ok(record)
     }
 
-    fn read(&self, request_id: &str) -> io::Result<RequestRecord> {
+    pub fn read(&self, request_id: &str) -> io::Result<RequestRecord> {
         if !canonical_uuid(request_id) {
             return Err(io::Error::other("invalid installed launch request ID"));
         }
         self.read_path(&self.directory.join(format!("{request_id}.json")))
+    }
+
+    pub fn read_terminal(&self, request_id: &str) -> io::Result<Option<NormalTerminalCertificate>> {
+        let request = self.read(request_id)?;
+        let path = self.terminal_directory.join(format!("{request_id}.json"));
+        let file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let meta = file.metadata()?;
+        let named = fs::symlink_metadata(&path)?;
+        if !meta.is_file()
+            || meta.uid() != unsafe { libc::geteuid() }
+            || meta.mode() & 0o777 != 0o600
+            || meta.nlink() != 1
+            || meta.len() > 65536
+            || meta.dev() != named.dev()
+            || meta.ino() != named.ino()
+        {
+            return Err(io::Error::other("unsafe installed terminal record"));
+        }
+        let certificate: NormalTerminalCertificate =
+            json_artifact::read_open(file, &path, "installed_normal_terminal")?;
+        if certificate.protocol != TERMINAL_PROTOCOL
+            || certificate.request != request
+            || Some(certificate.control_exit.clone()) != self.read_control_exit(request_id)?
+            || certificate.control_exit.code != Some(i32::from(certificate.exit_code))
+            || certificate.physical.root_id != request.root_id.as_deref().unwrap_or("")
+            || certificate.physical.normal.is_none()
+            || certificate.owner.root_id != certificate.physical.root_id
+            || certificate.owner.source_generation != request.source_generation
+            || serde_json::from_str::<RootPhysicalCloseProof>(
+                &certificate.owner.physical_proof_json,
+            )? != certificate.physical
+        {
+            return Err(io::Error::other("installed terminal identity mismatch"));
+        }
+        Ok(Some(certificate))
+    }
+
+    pub fn publish_terminal(
+        &self,
+        mut certificate: NormalTerminalCertificate,
+    ) -> io::Result<NormalTerminalCertificate> {
+        certificate.protocol = TERMINAL_PROTOCOL.into();
+        let name = format!("{}.json", certificate.request.request_id);
+        match json_artifact::create_new(&self.terminal_directory, &name, &certificate) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+        let stored = self
+            .read_terminal(&certificate.request.request_id)?
+            .ok_or_else(|| io::Error::other("installed terminal publication absent"))?;
+        if stored != certificate {
+            return Err(io::Error::other("installed terminal changed"));
+        }
+        Ok(stored)
     }
 
     /// Read back a saved direct-child wait only after validating it against

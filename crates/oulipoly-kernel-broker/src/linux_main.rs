@@ -59,7 +59,9 @@ use oulipoly_kernel_broker::identity::{
     PeerIdentity, PinnedProcess, host_proc_file, host_proc_uid, install_detached_host_proc,
 };
 use oulipoly_kernel_broker::installed_launch::{self, InstalledLaunchSpec};
-use oulipoly_kernel_broker::installed_launch_ledger::{Admission, InstalledLaunchLedger};
+use oulipoly_kernel_broker::installed_launch_ledger::{
+    Admission, InstalledLaunchLedger, NormalTerminalCertificate,
+};
 use oulipoly_kernel_broker::installed_pair::{self, InstalledPair};
 use oulipoly_kernel_broker::native_receipt::{
     BoundNativeAuthority, verify as verify_native_receipt,
@@ -4402,6 +4404,162 @@ fn require_prior_entries_closed(
     Ok(())
 }
 
+/// Rebuild the exact normal caller result on every status read, including
+/// after restart. A stored terminal is only useful while all source evidence
+/// still agrees with it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "terminal joins the existing independent registries"
+)]
+fn installed_normal_status(
+    ledger: &InstalledLaunchLedger,
+    request_id: &str,
+    generation: &str,
+    peer: &PeerIdentity,
+    state_root: &Path,
+    roots: &RootRegistry,
+    entries: &EntryRegistry,
+    works: &WorkRegistry,
+    grants: &GrantRegistry,
+    sources: &SourcePhysicalRegistry,
+    sidecar: &BrokerSidecar,
+    control_live: bool,
+) -> io::Result<String> {
+    // Authenticate before disclosing either a durable result or an unknown.
+    let pending = ledger.status(request_id, generation, peer)?;
+    let request = ledger.read(request_id)?;
+    let unknown = || format!("unknown {request_id} {generation}\n");
+    let control = match ledger.read_control_exit(request_id) {
+        Ok(Some(control)) => control,
+        Ok(None) if control_live => return Ok(pending),
+        Ok(None) | Err(_) => return Ok(unknown()),
+    };
+    if !control.e_consumed || control.code.is_none() {
+        return Ok(unknown());
+    }
+    let Some(root_id) = request.root_id.as_deref() else {
+        return Ok(unknown());
+    };
+    let intent = FreshV30Lane::open_at(state_root)
+        .ok()
+        .and_then(|lane| lane.released_handoff_for_root(root_id).ok())
+        .map(|(handoff, _)| handoff.root_work_intent);
+    if !matches!(
+        intent,
+        Some(oulipoly_state::mailbox::FreshRootWorkIntent::NormalCli(_))
+    ) {
+        return Ok(unknown());
+    }
+    let proof = (|| -> io::Result<(root_drain::RootPhysicalCloseProof, oulipoly_state::mailbox::BrokerClosedOwner)> {
+        let root = roots.record(root_id).ok_or_else(|| io::Error::other("installed root absent"))?;
+        let entry = entries.record(root_id).ok_or_else(|| io::Error::other("installed E absent"))?;
+        if entry.entry != control.control || entry.owner_uid != request.owner_uid {
+            return Err(io::Error::other("installed E/control identity changed"));
+        }
+        let lane = FreshV30Lane::open_at(state_root).map_err(io::Error::other)?;
+        let (handoff, actor) = lane.released_handoff_for_root(root_id).map_err(io::Error::other)?;
+        if !matches!(handoff.root_work_intent, oulipoly_state::mailbox::FreshRootWorkIntent::NormalCli(_))
+            || handoff.old_release.prepared.entry.host_pid != control.control.host_pid
+            || handoff.old_release.prepared.entry.boot_id != control.control.boot_id
+            || handoff.old_release.prepared.entry.starttime_ticks != control.control.starttime_ticks
+            || handoff.old_release.prepared.entry.pidns_dev != control.control.pidns_dev
+            || handoff.old_release.prepared.entry.pidns_ino != control.control.pidns_ino
+        {
+            return Err(io::Error::other("installed normal release/control identity changed"));
+        }
+        let session = lane.read_session(&handoff.d_key).map_err(io::Error::other)?
+            .ok_or_else(|| io::Error::other("installed D absent"))?;
+        lane.require_released_invocation(&handoff, &actor, &session).map_err(io::Error::other)?;
+        if !lane.normal_provider_k_present(&handoff, &actor, &session).map_err(io::Error::other)? {
+            return Err(io::Error::other("installed normal K absent"));
+        }
+        let inventory = root_drain::readback(root, roots, entries, works, grants, sources, Some(sidecar))?;
+        let normal = inventory.normal.as_ref().ok_or_else(|| io::Error::other("installed normal Q absent"))?;
+        let settlement = entry.terminal_settlement.as_ref()
+            .ok_or_else(|| io::Error::other("installed caller settlement absent"))?;
+        if settlement.d_key != handoff.d_key
+            || settlement.handoff_id != handoff.handoff_id
+            || settlement.invocation_uuid != handoff.invocation_uuid
+            || settlement.session_id != session.session_id
+            || settlement.actor != (ProcessStamp { host_pid: actor.host_pid, boot_id: actor.boot_id.clone(), starttime_ticks: actor.starttime_ticks, pidns_dev: actor.pidns_dev, pidns_ino: actor.pidns_ino })
+            || settlement.parent_grant_id != normal.publication.admission_id
+            || Some(settlement.publication_sha256.as_str()) != normal.publication.publication_sha256.as_deref()
+            || normal.publication.exit_code.map(i32::from) != control.code
+            || normal.physical.q.as_ref().is_none_or(|q| q.admission_id != normal.publication.admission_id || !q.tree_drained)
+        {
+            return Err(io::Error::other("installed State/Q/publication identity changed"));
+        }
+        let physical = root_drain::physical_close_proof(&inventory)?;
+        let owner = inventory.owner_close_proof
+            .ok_or_else(|| io::Error::other("installed owner close absent"))?;
+        if owner.owner_generation != handoff.old_release.prepared.owner_generation
+            || owner.source_generation != request.source_generation {
+            return Err(io::Error::other("installed closed owner identity changed"));
+        }
+        Ok((physical, owner))
+    })();
+    let stored = ledger.read_terminal(request_id);
+    match (proof, stored) {
+        (Ok((physical, owner)), Ok(stored)) => {
+            let certificate = NormalTerminalCertificate {
+                protocol: String::new(),
+                request,
+                control_exit: control,
+                exit_code: physical
+                    .normal
+                    .as_ref()
+                    .and_then(|n| n.publication.exit_code)
+                    .ok_or_else(|| io::Error::other("installed caller code absent"))?,
+                physical,
+                owner,
+            };
+            let current = if let Some(stored) = stored {
+                stored
+            } else {
+                ledger.publish_terminal(certificate.clone())?
+            };
+            if current.request != certificate.request
+                || current.control_exit != certificate.control_exit
+                || current.exit_code != certificate.exit_code
+                || current.physical != certificate.physical
+                || current.owner != certificate.owner
+            {
+                return Ok(unknown());
+            }
+            Ok(format!("exit {} drained {request_id}\n", current.exit_code))
+        }
+        (Err(_), Ok(None)) => {
+            let progressing = roots
+                .record(root_id)
+                .and_then(|root| {
+                    root_drain::readback(
+                        root,
+                        roots,
+                        entries,
+                        works,
+                        grants,
+                        sources,
+                        Some(sidecar),
+                    )
+                    .ok()
+                })
+                .is_some_and(|inventory| {
+                    !inventory.normal_uncertain
+                        && !inventory.uncertain_registry_or_incarnation
+                        && inventory.normal.as_ref().is_some_and(|normal| {
+                            normal.physical.state == "drained"
+                                && normal.physical.q.is_some()
+                                && normal.publication.state == "settled"
+                                && normal.publication.publication_sha256.is_some()
+                        })
+                        && (inventory.pid1_exact_live || inventory.owner_close_preflight)
+                });
+            Ok(if progressing { pending } else { unknown() })
+        }
+        _ => Ok(unknown()),
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "exact close joins all retained authorities"
@@ -5824,7 +5982,12 @@ fn serve() -> io::Result<()> {
                         }
                     }
                 }
-                Ok(ledger.status(&spec.request_id, &spec.generation, &peer)?)
+                installed_normal_status(
+                    ledger, &spec.request_id, &spec.generation, &peer, Path::new(&state),
+                    &registry, &entries, &works, &grants, &source_physical, sidecar,
+                    control_grants.values().chain(consumed_controls.iter())
+                        .any(|grant| grant.message.request_id == spec.request_id),
+                )
             } else if operation == b'l' || operation == b'M' {
                 #[cfg(feature = "age319-private-broker-fixture")]
                 if fixture && std::env::var_os("OULIPOLY_AGE319_PRIVATE_CONNECTED_CONTROL_V1").is_none() {
@@ -5882,10 +6045,15 @@ fn serve() -> io::Result<()> {
                 {
                     return Err(io::Error::other("fresh-only pair/source binding changed"));
                 }
-                installed_launches
+                let ledger = installed_launches
                     .as_ref()
-                    .ok_or_else(|| io::Error::other("installed launch ledger absent"))?
-                    .status(&request_id, &generation, &peer)
+                    .ok_or_else(|| io::Error::other("installed launch ledger absent"))?;
+                installed_normal_status(
+                    ledger, &request_id, &generation, &peer, Path::new(&state),
+                    &registry, &entries, &works, &grants, &source_physical, sidecar,
+                    control_grants.values().chain(consumed_controls.iter())
+                        .any(|grant| grant.message.request_id == request_id),
+                )
             } else if operation == b'X' || operation == b'x' {
                 if peer.uid != 0 || !peer.process.in_namespace(&host_namespace)? {
                     return Err(io::Error::other("host-root gate transition required"));
