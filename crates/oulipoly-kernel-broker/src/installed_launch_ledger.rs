@@ -141,6 +141,17 @@ impl InstalledLaunchLedger {
         self.read_path(&self.directory.join(format!("{request_id}.json")))
     }
 
+    /// E reopens the fsynced L identity before spending an incarnation-local
+    /// connected grant. A changed or incomplete record is unknown, not a new
+    /// launch opportunity.
+    pub fn verify_root_binding(&self, request_id: &str, root_id: &str) -> io::Result<()> {
+        let record = self.read(request_id)?;
+        if record.protocol != ROOT_BOUND_PROTOCOL || record.root_id.as_deref() != Some(root_id) {
+            return Err(io::Error::other("connected control ledger root changed"));
+        }
+        Ok(())
+    }
+
     fn unused_root_id(&self) -> io::Result<String> {
         let mut used = std::collections::HashSet::new();
         for entry in fs::read_dir(&self.directory)? {
@@ -319,6 +330,12 @@ mod tests {
         assert_eq!(bound.protocol, ROOT_BOUND_PROTOCOL);
         let root_id = bound.root_id.unwrap();
         assert!(canonical_uuid(&root_id));
+        restarted.verify_root_binding(&request, &root_id).unwrap();
+        assert!(
+            restarted
+                .verify_root_binding(&request, &uuid::Uuid::new_v4().to_string())
+                .is_err()
+        );
         assert_eq!(
             restarted.status(&request, &pair, &peer()).unwrap(),
             format!("pending {request} {pair}\n")

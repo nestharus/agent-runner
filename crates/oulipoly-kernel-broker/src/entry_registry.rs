@@ -145,8 +145,23 @@ impl EntryRegistry {
     }
 
     pub fn reserve(&mut self, uid: u32, entry: &PinnedProcess) -> io::Result<String> {
+        self.reserve_exact(uid, entry, &uuid::Uuid::new_v4().to_string())
+    }
+
+    /// The installed launch ledger has already durably chosen this root ID.
+    /// It must never be replaced by a separately sampled E reservation.
+    pub fn reserve_exact(
+        &mut self,
+        uid: u32,
+        entry: &PinnedProcess,
+        root_id: &str,
+    ) -> io::Result<String> {
         if self.has_debt()
             || self.has_unsettled_join()
+            || uuid::Uuid::parse_str(root_id)
+                .ok()
+                .is_none_or(|id| id.to_string() != root_id)
+            || self.records.iter().any(|r| r.root_id == root_id)
             || self
                 .records
                 .iter()
@@ -157,7 +172,7 @@ impl EntryRegistry {
             ));
         }
         entry.verify()?;
-        let root_id = uuid::Uuid::new_v4().to_string();
+        let root_id = root_id.to_owned();
         let record = EntryRecord {
             version: 1,
             root_id: root_id.clone(),

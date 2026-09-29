@@ -49,6 +49,7 @@ use base64::Engine as _;
 #[cfg(feature = "age319-private-broker-fixture")]
 use oulipoly_kernel_broker::accepted_grant::DelegatedRootHGrant;
 use oulipoly_kernel_broker::accepted_grant::{Acceptance, GrantRegistry};
+use oulipoly_kernel_broker::connected_control::ControlGrant;
 use oulipoly_kernel_broker::cutover_gate::EntryGate;
 use oulipoly_kernel_broker::entry_registry::{
     EntryRegistry, EntryTerminalSettlement, ProcessStamp,
@@ -58,7 +59,7 @@ use oulipoly_kernel_broker::identity::{
     PeerIdentity, PinnedProcess, host_proc_file, host_proc_uid, install_detached_host_proc,
 };
 use oulipoly_kernel_broker::installed_launch::{self, InstalledLaunchSpec};
-use oulipoly_kernel_broker::installed_launch_ledger::InstalledLaunchLedger;
+use oulipoly_kernel_broker::installed_launch_ledger::{Admission, InstalledLaunchLedger};
 use oulipoly_kernel_broker::installed_pair::{self, InstalledPair};
 use oulipoly_kernel_broker::native_receipt::{
     BoundNativeAuthority, verify as verify_native_receipt,
@@ -5367,6 +5368,10 @@ fn serve() -> io::Result<()> {
     // Only this serving incarnation owns the pre-exec gate. A restart opens
     // durable J/prepared debt but cannot recreate or release a lost gate.
     let mut held_joins = BTreeMap::<String, root_join::HeldRootJoin>::new();
+    // Incarnation-local: restart never reconstructs a connected grant from a
+    // durable request. Reaped grants cannot be presented to E again.
+    let mut control_grants = BTreeMap::<i32, ControlGrant>::new();
+    let mut consumed_controls = Vec::<ControlGrant>::new();
     #[cfg(feature = "age319-private-broker-fixture")]
     let mut private_launches = private_launches;
     let terminal_path = Path::new(&state).join("terminals");
@@ -5446,6 +5451,8 @@ fn serve() -> io::Result<()> {
     let mut completed_auto_normal = HashSet::<String>::new();
     let mut last_auto_normal = Instant::now() - NORMAL_CLOSE_POLL_INTERVAL;
     loop {
+        control_grants.retain(|_, grant| !grant.reap_if_done());
+        consumed_controls.retain_mut(|grant| !grant.reap_if_done());
         if let Ok(request) = drain_rx.try_recv() {
             let result = (|| {
                 registry.exact_record(&request.root)?;
@@ -5688,7 +5695,7 @@ fn serve() -> io::Result<()> {
                 }
             } else if operation == b'L' {
                 #[cfg(feature = "age319-private-broker-fixture")]
-                if fixture {
+                if fixture && std::env::var_os("OULIPOLY_AGE319_PRIVATE_CONNECTED_CONTROL_V1").is_none() {
                     let RequestPayload::InstalledLaunch { spec, descriptors } = payload else {
                         return Err(io::Error::other("invalid private installed launch request"));
                     };
@@ -5753,11 +5760,31 @@ fn serve() -> io::Result<()> {
                 let ledger = installed_launches
                     .as_ref()
                     .ok_or_else(|| io::Error::other("installed launch ledger absent"))?;
-                // A new request durably binds its future root ID here. It is
-                // still inert: no control process or root may be forked until
-                // Broker owns the connected host grant and exact E admission.
-                // A duplicate cannot take that future first-attempt path.
-                let _admission = ledger.reserve_request(&spec, &peer)?;
+                // Publication precedes the only possible spawn. A duplicate
+                // or recovered request has no captured descriptors or grant.
+                if let Admission::New { root_id } = ledger.reserve_request(&spec, &peer)? {
+                    #[cfg(feature = "age319-private-broker-fixture")]
+                    let fixture_manifest = if fixture {
+                        std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_PAIR_V1").map(PathBuf::from)
+                    } else { None };
+                    match ControlGrant::spawn(
+                        &spec, &descriptors, &peer, &runner_image,
+                        &activation.source.source_generation, &root_id,
+                        #[cfg(feature = "age319-private-broker-fixture")]
+                        fixture_manifest.as_deref().map(|manifest| (Path::new(&socket), manifest)),
+                    ) {
+                        Ok(grant) => {
+                            if control_grants.insert(grant.process.host_pid, grant).is_some() {
+                                return Err(io::Error::other("connected control PID reused"));
+                            }
+                        }
+                        Err(error) => {
+                            // The V2 record is now unknown. Never retry its
+                            // spawn even if a child survived a lost reply.
+                            eprintln!("installed connected control unknown {}: {error}", spec.request_id);
+                        }
+                    }
+                }
                 Ok(ledger.status(&spec.request_id, &spec.generation, &peer)?)
             } else if operation == b'l' || operation == b'M' {
                 #[cfg(feature = "age319-private-broker-fixture")]
@@ -6633,6 +6660,37 @@ fn serve() -> io::Result<()> {
                         &source_physical,
                         broker_sidecar.as_ref(),
                     )?;
+                }
+                if matches!(operation, b'E' | b'e')
+                    && installed_pair.as_ref().is_some_and(|pair| pair.schema == 2)
+                {
+                    let activation = fresh_activation.as_ref()
+                        .ok_or_else(|| io::Error::other("fresh-only E activation absent"))?;
+                    if !root_launch_admitted(
+                        &peer, &classify_scope(&peer, &host_namespace, &registry, &works),
+                        &host_namespace,
+                    ) || !peer.process.same_executable_as(&runner_image)?
+                        || !matches!(payload, RequestPayload::None)
+                    {
+                        return Err(io::Error::other("connected control E admission denied"));
+                    }
+                    let mut grant = control_grants.remove(&peer.process.host_pid)
+                        .ok_or_else(|| io::Error::other("connected control E grant absent"))?;
+                    let exact = grant.message.pair_generation == activation.pair_generation
+                        && grant.message.source_generation == activation.source.source_generation
+                        && broker_sidecar.as_ref().is_some_and(|sidecar|
+                            sidecar.source_generation() == grant.message.source_generation)
+                        && installed_launches.as_ref().is_some_and(|ledger|
+                            ledger.verify_root_binding(&grant.message.request_id, &grant.message.root_id).is_ok());
+                    let answer = if exact {
+                        grant.consume(&peer).and_then(|root_id|
+                            entries.reserve_exact(peer.uid, &peer.process, &root_id)
+                                .map(|reserved| format!("reserved {reserved}\n")))
+                    } else {
+                        Err(io::Error::other("connected control E pair/source changed"))
+                    };
+                    consumed_controls.push(grant);
+                    return answer;
                 }
                 dispatch_authenticated(
                     match operation {
