@@ -4490,11 +4490,23 @@ pub(super) fn require_root_owned_ancestors(path: &Path) -> Result<(), String> {
         return Err("cutover storage root must be absolute".into());
     }
     let mut current = path;
+    // In a disposable single-UID user namespace, host-root ancestors such as
+    // / and /home appear as the overflow UID. They remain nonwritable to the
+    // mapped user; installed host-root service paths still require UID 0.
+    let mapped_root = unsafe { libc::geteuid() } == 0
+        && fs::read_to_string("/proc/self/uid_map")
+            .ok()
+            .is_some_and(|map| {
+                let mut fields = map.split_ascii_whitespace();
+                fields.next() == Some("0")
+                    && fields.next().is_some_and(|host_uid| host_uid != "0")
+                    && fields.next() == Some("1")
+            });
     loop {
         let meta = fs::symlink_metadata(current).map_err(|error| error.to_string())?;
         if !meta.is_dir()
             || meta.file_type().is_symlink()
-            || meta.uid() != 0
+            || (meta.uid() != 0 && !(mapped_root && meta.uid() == 65534))
             || meta.mode() & 0o022 != 0
         {
             return Err("cutover storage has an untrusted ancestor".into());

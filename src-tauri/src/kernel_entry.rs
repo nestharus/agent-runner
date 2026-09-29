@@ -888,7 +888,6 @@ pub(crate) fn verify_installed_entry_route() -> Result<(), String> {
         }
         return Ok(());
     }
-    #[cfg(feature = "age319-private-broker-fixture")]
     if let (Some(socket), Some(manifest)) = (
         private_userns_broker_socket(),
         std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_PAIR_V1"),
@@ -7624,7 +7623,7 @@ fn v30_host_entry() -> Result<ExitCode, String> {
     let root = response
         .strip_prefix("reserved ")
         .and_then(|s| s.strip_suffix('\n'))
-        .ok_or("v30 E did not reserve a root")?
+        .ok_or_else(|| format!("v30 E did not reserve a root: {}", response.trim()))?
         .to_owned();
     if root != grant.root_id {
         return Err("v30 E changed the connected root ID".into());

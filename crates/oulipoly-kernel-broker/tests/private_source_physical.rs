@@ -255,6 +255,7 @@ fn inner() {
         joined_child: Some(ProcessStamp::from(joined)),
         prepared_driver: Some(ProcessStamp::from(driver)),
         terminal_settlement: None,
+        offline_close_sha256: None,
     };
     let source_generation = uuid::Uuid::new_v4().to_string();
     let grant = BrokerSourceEffectGrant {
