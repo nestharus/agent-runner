@@ -63,6 +63,16 @@ fn root_mapped_connected_l_delivers_real_bash_async_to_admitted_successor_and_ac
 }
 
 #[test]
+fn root_mapped_connected_l_successor_ack_revalidates_after_broker_restart() {
+    run_connected_case_with_bash_mode(true, ProofFault::Restart, true, true, true);
+}
+
+#[test]
+fn root_mapped_connected_l_successor_changed_receipt_refuses_certificate() {
+    run_connected_case_with_bash_mode(true, ProofFault::SuccessorReceiptTamper, true, true, true);
+}
+
+#[test]
 fn root_mapped_connected_l_refuses_missing_q_after_certificate() {
     run_connected_case(true, ProofFault::MissingQ);
 }
@@ -84,6 +94,7 @@ enum ProofFault {
     ChangedQ,
     Restart,
     OfflineTamper,
+    SuccessorReceiptTamper,
     Diagnostics,
 }
 
@@ -117,7 +128,18 @@ fn run_connected_case_with_bash_mode(
     });
     if std::env::var_os("AGE319_CONNECTED_CHILD_TEST").is_none() {
         let test_name = if successor_admission {
-            "root_mapped_connected_l_delivers_real_bash_async_to_admitted_successor_and_acks"
+            match fault {
+                ProofFault::None => {
+                    "root_mapped_connected_l_delivers_real_bash_async_to_admitted_successor_and_acks"
+                }
+                ProofFault::Restart => {
+                    "root_mapped_connected_l_successor_ack_revalidates_after_broker_restart"
+                }
+                ProofFault::SuccessorReceiptTamper => {
+                    "root_mapped_connected_l_successor_changed_receipt_refuses_certificate"
+                }
+                _ => unreachable!(),
+            }
         } else {
             match (normal, fault, real_bash, async_bash) {
                 (true, ProofFault::None, true, true) => {
@@ -626,10 +648,6 @@ printf '%s\n' "$response"
     assert_eq!(control_exit["control"], reserved["entry"]);
     assert_eq!(control_exit["e_consumed"], true);
     if successor_admission {
-        assert_ne!(
-            control_exit["code"], 0,
-            "successor F/ACK slice must stop before root terminal"
-        );
         let offer: serde_json::Value = serde_json::from_slice(
             &fs::read(recipient.join("successor-offer.json")).unwrap_or_else(|error| {
                 panic!(
@@ -802,14 +820,23 @@ printf '%s\n' "$response"
             receiver_receipt["successor_identity"],
             offer["successor_identity"]
         );
-        assert!(
-            fs::read_to_string(&caller_err)
-                .unwrap_or_default()
-                .contains("successor F/ACK complete; root terminal join pending")
+        let terminal: serde_json::Value =
+            serde_json::from_slice(&fs::read(recipient.join("successor-terminal.json")).unwrap())
+                .unwrap();
+        let ack = &terminal["terminal"]["successor_ack"];
+        assert_eq!(terminal["terminal"]["notification_state"], "acked");
+        assert_eq!(
+            terminal["terminal"]["notification_origin"],
+            "admitted_successor"
         );
-        broker.kill().unwrap();
-        broker.wait().unwrap();
-        return;
+        assert_eq!(
+            terminal["terminal"]["ack_basis"],
+            "successor_receiver_receipt_ack"
+        );
+        assert_eq!(ack["generation"], state_generation);
+        assert_eq!(ack["grant_id"], grant["grant_id"]);
+        assert_eq!(ack["receipt_sha256"], receipt_sha);
+        assert_eq!(ack["recipient_uid"], 0);
     }
     assert_eq!(
         control_exit["code"],
@@ -919,13 +946,13 @@ printf '%s\n' "$response"
             "normal close warning: {broker_errors}"
         );
         assert_eq!(fs::read_to_string(&effect).unwrap(), "one\n");
-        if async_bash {
+        if async_bash && !successor_admission {
             assert_real_bash_async_child(
                 &state, &fresh_db, &root_id, &handoff, &output, &recipient,
             );
-        } else if real_bash {
+        } else if real_bash && !async_bash {
             assert_real_bash_sync_child(&state, &fresh_db, &root_id, &handoff, &output);
-        } else {
+        } else if !real_bash {
             assert!(
                 fs::read_to_string(&caller_err)
                     .unwrap()
@@ -1054,9 +1081,23 @@ printf '%s\n' "$response"
         let terminal = lane
             .read_private_root_terminal(&released, &actor, &session)
             .unwrap();
-        assert_eq!(terminal.notification_origin, "original_c_notify");
+        assert_eq!(
+            terminal.notification_origin,
+            if successor_admission {
+                "admitted_successor"
+            } else {
+                "original_c_notify"
+            }
+        );
         assert_eq!(terminal.notification_state, "acked");
-        assert_eq!(terminal.ack_basis.as_deref(), Some("manual_ack"));
+        assert_eq!(
+            terminal.ack_basis.as_deref(),
+            Some(if successor_admission {
+                "successor_receiver_receipt_ack"
+            } else {
+                "manual_ack"
+            })
+        );
     }
     let terminal_path = state.join("installed-normal-terminals").join(format!(
         "{}.json",
@@ -1137,6 +1178,23 @@ printf '%s\n' "$response"
                 changed["physical"]["offline"]["effect"]["state"] = serde_json::json!("started");
                 fs::write(&terminal_path, serde_json::to_vec(&changed).unwrap()).unwrap();
             }
+            ProofFault::SuccessorReceiptTamper => {
+                let grant_id = terminal["successor_ack"]["grant_id"].as_str().unwrap();
+                let receipt_path = state
+                    .parent()
+                    .unwrap()
+                    .join("state-successor-receipts/0")
+                    .join(format!("{grant_id}.json"));
+                fs::set_permissions(receipt_path, fs::Permissions::from_mode(0o600)).unwrap();
+                let root: RootRecord = serde_json::from_slice(
+                    &fs::read(state.join(format!("{root_id}.json"))).unwrap(),
+                )
+                .unwrap();
+                assert!(
+                    protocol::root_drain_readback_at(&socket, &root, false).is_err(),
+                    "closed owner readback accepted changed receiver receipt"
+                );
+            }
             ProofFault::None | ProofFault::Diagnostics => unreachable!(),
         }
         fs::write(certificate_pause.join("release"), b"release").unwrap();
@@ -1193,6 +1251,29 @@ printf '%s\n' "$response"
             assert_eq!(terminal["physical"]["source_physical_records"], 0);
         }
         assert_eq!(terminal["owner"]["root_id"], root_id);
+        if successor_admission {
+            let root_terminal: serde_json::Value = serde_json::from_slice(
+                &fs::read(recipient.join("successor-terminal.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                terminal["successor_ack"],
+                root_terminal["terminal"]["successor_ack"]
+            );
+            assert_eq!(terminal["successor_ack"]["root_id"], root_id);
+            assert_eq!(
+                terminal["owner"]["root_id"],
+                terminal["successor_ack"]["root_id"]
+            );
+            let owner_physical: serde_json::Value =
+                serde_json::from_str(terminal["owner"]["physical_proof_json"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(owner_physical["successor_ack"], terminal["successor_ack"]);
+            assert_eq!(
+                terminal["physical"]["successor_ack"],
+                terminal["successor_ack"]
+            );
+        }
     } else {
         assert_eq!(launcher_status.code(), Some(70));
         let diagnostic = fs::read_to_string(&caller_err).unwrap();

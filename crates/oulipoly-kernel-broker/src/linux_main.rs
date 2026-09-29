@@ -4341,6 +4341,7 @@ fn require_prior_entries_closed(
             .normal_provider_k_present(&handoff, &actor, &session)
             .map_err(io::Error::other)?
         {
+            root_drain::exact_successor_ack_for_root(&lane, &entry.root_id)?;
             let stored = entry
                 .terminal_settlement
                 .as_ref()
@@ -4494,7 +4495,7 @@ fn installed_normal_status(
     ) {
         return Ok(unknown());
     }
-    let proof = (|| -> io::Result<(root_drain::RootPhysicalCloseProof, oulipoly_state::mailbox::BrokerClosedOwner)> {
+    let proof = (|| -> io::Result<(root_drain::RootPhysicalCloseProof, oulipoly_state::mailbox::BrokerClosedOwner, Option<oulipoly_state::mailbox::FreshSuccessorTerminalAck>)> {
         let root = roots.record(root_id).ok_or_else(|| io::Error::other("installed root absent"))?;
         let entry = entries.record(root_id).ok_or_else(|| io::Error::other("installed E absent"))?;
         if entry.entry != control.control || entry.owner_uid != request.owner_uid {
@@ -4517,6 +4518,7 @@ fn installed_normal_status(
         if !lane.normal_provider_k_present(&handoff, &actor, &session).map_err(io::Error::other)? {
             return Err(io::Error::other("installed normal K absent"));
         }
+        let successor_ack = root_drain::exact_successor_ack_for_root(&lane, root_id)?;
         let inventory = root_drain::readback(root, roots, entries, works, grants, sources, Some(sidecar))?;
         let normal = inventory.normal.as_ref().ok_or_else(|| io::Error::other("installed normal Q absent"))?;
         let settlement = entry.terminal_settlement.as_ref()
@@ -4534,17 +4536,20 @@ fn installed_normal_status(
             return Err(io::Error::other("installed State/Q/publication identity changed"));
         }
         let physical = root_drain::physical_close_proof(&inventory)?;
+        if physical.successor_ack != successor_ack {
+            return Err(io::Error::other("installed successor ACK and owner proof differ"));
+        }
         let owner = inventory.owner_close_proof
             .ok_or_else(|| io::Error::other("installed owner close absent"))?;
         if owner.owner_generation != handoff.old_release.prepared.owner_generation
             || owner.source_generation != request.source_generation {
             return Err(io::Error::other("installed closed owner identity changed"));
         }
-        Ok((physical, owner))
+        Ok((physical, owner, successor_ack))
     })();
     let stored = ledger.read_terminal(request_id);
     match (proof, stored) {
-        (Ok((physical, owner)), Ok(stored)) => {
+        (Ok((physical, owner, successor_ack)), Ok(stored)) => {
             let certificate = NormalTerminalCertificate {
                 protocol: String::new(),
                 request,
@@ -4556,6 +4561,7 @@ fn installed_normal_status(
                     .ok_or_else(|| io::Error::other("installed caller code absent"))?,
                 physical,
                 owner,
+                successor_ack,
             };
             let current = if let Some(stored) = stored {
                 stored
@@ -4567,6 +4573,7 @@ fn installed_normal_status(
                 || current.exit_code != certificate.exit_code
                 || current.physical != certificate.physical
                 || current.owner != certificate.owner
+                || current.successor_ack != certificate.successor_ack
             {
                 return Ok(unknown());
             }
@@ -4708,6 +4715,7 @@ fn installed_offline_status(
                 exit_code: code as u8,
                 physical,
                 owner,
+                successor_ack: None,
             };
             let current = if let Some(stored) = stored {
                 stored
@@ -4719,6 +4727,7 @@ fn installed_offline_status(
                 || current.exit_code != certificate.exit_code
                 || current.physical != certificate.physical
                 || current.owner != certificate.owner
+                || current.successor_ack != certificate.successor_ack
             {
                 return Ok(unknown());
             }
@@ -4800,6 +4809,12 @@ fn commit_exact_owner_close(
     sidecar: &mut Option<BrokerSidecar>,
     write: bool,
 ) -> io::Result<oulipoly_state::mailbox::BrokerClosedOwner> {
+    let successor_ack = if state_root.join("v30/state.db").exists() {
+        let lane = FreshV30Lane::open_at(state_root).map_err(io::Error::other)?;
+        root_drain::exact_successor_ack_for_root(&lane, &expected.root_id)?
+    } else {
+        None
+    };
     let intent = registry
         .read_close_intent(expected)?
         .ok_or_else(|| io::Error::other("owner close intent absent"))?;
@@ -4833,6 +4848,9 @@ fn commit_exact_owner_close(
             return Err(io::Error::other("owner close intent cursor changed"));
         }
         let physical = root_drain::physical_close_proof(&inventory)?;
+        if physical.successor_ack != successor_ack {
+            return Err(io::Error::other("owner close successor ACK changed"));
+        }
         let candidate = oulipoly_state::mailbox::BrokerClosedOwner {
             source_generation: intent.source_generation.clone(),
             root_id: expected.root_id.clone(),
@@ -4851,6 +4869,15 @@ fn commit_exact_owner_close(
             .as_mut()
             .ok_or_else(|| io::Error::other("owner close retained sidecar absent"))?
             .close_exact_root_owner(&candidate, || {
+                if state_root.join("v30/state.db").exists() {
+                    let lane = FreshV30Lane::open_at(state_root)?;
+                    if root_drain::exact_successor_ack_for_root(&lane, &expected.root_id)
+                        .map_err(|error| error.to_string())?
+                        != successor_ack
+                    {
+                        return Err("owner close successor ACK changed under writers".into());
+                    }
+                }
                 let observer = BrokerSidecar::open_existing(&sidecar_path, state_root)?;
                 let again = root_drain::readback(
                     expected,
@@ -4969,6 +4996,9 @@ fn advance_one_normal_owner(
             continue;
         }
         let expected_owner = &released.old_release.prepared.owner_generation;
+        if root_drain::exact_successor_ack_for_root(&lane, &root.root_id).is_err() {
+            continue;
+        }
         if let Some(proof) = &inventory.owner_close_proof {
             if &proof.owner_generation != expected_owner {
                 return Err(io::Error::other("normal closed owner generation changed"));

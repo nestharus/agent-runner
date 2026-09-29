@@ -64,6 +64,8 @@ pub struct NormalTerminalCertificate {
     pub exit_code: u8,
     pub physical: RootPhysicalCloseProof,
     pub owner: BrokerClosedOwner,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub successor_ack: Option<oulipoly_state::mailbox::FreshSuccessorTerminalAck>,
 }
 
 pub enum Admission {

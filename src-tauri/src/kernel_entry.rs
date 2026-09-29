@@ -3009,6 +3009,18 @@ fn connected_async_bash_recipient(
         if admitted["admission"] != read["admission"] || read["admission"]["offer"] != offer {
             return Err("original root successor admission readback changed".into());
         }
+        let pending = protocol::fresh_recipient_request_at(
+            socket,
+            &FreshRecipientRequest::ReadRootTerminal {
+                d_key: d_key.into(),
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        if pending["terminal"]["notification_state"] != "pending_f"
+            || !pending["terminal"]["successor_ack"].is_null()
+        {
+            return Err("successor admission counted as terminal ACK".into());
+        }
         std::fs::write(directory.join("successor-readback"), b"read").map_err(|e| e.to_string())?;
         if !successor.wait().map_err(|e| e.to_string())?.success() {
             return Err("successor peer admission readback failed".into());
@@ -3031,13 +3043,22 @@ fn connected_async_bash_recipient(
             },
         )
         .map_err(|e| e.to_string())?;
-        if terminal["terminal"]["notification_state"] != "pending_f" {
+        if terminal["terminal"]["notification_state"] != "acked"
+            || terminal["terminal"]["ack_basis"] != "successor_receiver_receipt_ack"
+            || terminal["terminal"]["successor_ack"]["generation"] != offer["generation"]
+            || terminal["terminal"]["successor_ack"]["successor_identity"]
+                != offer["successor_identity"]
+        {
             return Err(format!(
-                "successor ACK changed original terminal state: {}",
-                terminal["terminal"]["notification_state"]
+                "successor ACK did not settle original terminal: {terminal}"
             ));
         }
-        return Err("successor F/ACK complete; root terminal join pending".into());
+        std::fs::write(
+            directory.join("successor-terminal.json"),
+            serde_json::to_vec(&terminal).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        return Ok(());
     }
     let delivery_request_id = uuid::Uuid::new_v4().to_string();
     let delivery = protocol::fresh_recipient_request_at(
