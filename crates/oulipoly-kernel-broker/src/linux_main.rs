@@ -4254,8 +4254,8 @@ fn settle_entry_from_terminal(
         .map_err(|_| io::Error::other("terminal entry settlement response uncertain"))?
 }
 
-/// Every older entry must have both the original caller's immutable settled
-/// Q result and the broker's exact physical/State owner close certificate.
+/// Every older entry must have either its settled Q publication or its exact
+/// installed offline caller certificate, plus the physical/State owner close.
 /// This runs on the old writer loop under the shared fresh admission mutex.
 #[expect(
     clippy::too_many_arguments,
@@ -4263,6 +4263,7 @@ fn settle_entry_from_terminal(
 )]
 fn require_prior_entries_closed(
     state_root: &Path,
+    installed: Option<&InstalledLaunchLedger>,
     roots: &mut RootRegistry,
     entries: &EntryRegistry,
     works: &mut WorkRegistry,
@@ -4272,15 +4273,6 @@ fn require_prior_entries_closed(
 ) -> io::Result<()> {
     if entries.records().is_empty() {
         return Ok(());
-    }
-    // A fresh lane call can itself wait on this old writer loop for terminal
-    // settlement. Refuse its known-absent prerequisite before opening State.
-    if entries
-        .records()
-        .iter()
-        .any(|entry| entry.terminal_settlement.is_none())
-    {
-        return Err(io::Error::other("prior entry caller result unsettled"));
     }
     let known: HashSet<&str> = entries
         .records()
@@ -4316,10 +4308,6 @@ fn require_prior_entries_closed(
         let root = roots
             .record(&entry.root_id)
             .ok_or_else(|| io::Error::other("prior entry has no exact root"))?;
-        let stored = entry
-            .terminal_settlement
-            .as_ref()
-            .ok_or_else(|| io::Error::other("prior entry caller result unsettled"))?;
         let (handoff, actor) = lane
             .released_handoff_for_root(&entry.root_id)
             .map_err(io::Error::other)?;
@@ -4327,10 +4315,32 @@ fn require_prior_entries_closed(
             .read_session(&handoff.d_key)
             .map_err(io::Error::other)?
             .ok_or_else(|| io::Error::other("prior entry session absent"))?;
-        if lane
+        let offline = matches!(
+            &handoff.root_work_intent,
+            oulipoly_state::mailbox::FreshRootWorkIntent::CliHelp(_)
+                | oulipoly_state::mailbox::FreshRootWorkIntent::CliDiagnostics(_)
+        );
+        if offline {
+            let effect = lane
+                .read_root_effect(&handoff, &actor, &session)
+                .map_err(io::Error::other)?
+                .ok_or_else(|| io::Error::other("prior offline State result absent"))?;
+            if !matches!(
+                effect.state,
+                oulipoly_state::mailbox::FreshRootEffectState::ReturnedSuccess
+                    | oulipoly_state::mailbox::FreshRootEffectState::ReturnedFailure
+            ) || entry.terminal_settlement.is_some()
+            {
+                return Err(io::Error::other("prior offline result changed"));
+            }
+        } else if lane
             .normal_provider_k_present(&handoff, &actor, &session)
             .map_err(io::Error::other)?
         {
+            let stored = entry
+                .terminal_settlement
+                .as_ref()
+                .ok_or_else(|| io::Error::other("prior entry caller result unsettled"))?;
             let publication = normal_physical::observe_publication(
                 &lane, &handoff, &actor, &session, state_root,
             )?;
@@ -4356,6 +4366,10 @@ fn require_prior_entries_closed(
                 ));
             }
         } else {
+            let stored = entry
+                .terminal_settlement
+                .as_ref()
+                .ok_or_else(|| io::Error::other("prior entry caller result unsettled"))?;
             let terminal = lane
                 .read_private_root_terminal(&handoff, &actor, &session)
                 .map_err(io::Error::other)?;
@@ -4367,8 +4381,22 @@ fn require_prior_entries_closed(
             root_drain::readback(root, roots, entries, works, grants, sources, sidecar)?;
         let proof = inventory
             .owner_close_proof
+            .as_ref()
             .ok_or_else(|| io::Error::other("prior entry owner not exactly closed"))?;
-        if inventory.entry_unsettled
+        if offline {
+            let certificate = installed
+                .ok_or_else(|| io::Error::other("prior installed offline ledger absent"))?
+                .terminal_for_root(&entry.root_id)?
+                .ok_or_else(|| io::Error::other("prior offline caller certificate absent"))?;
+            if certificate.physical.offline.is_none()
+                || certificate.physical != root_drain::physical_close_proof(&inventory)?
+                || &certificate.owner != proof
+            {
+                return Err(io::Error::other("prior offline caller certificate changed"));
+            }
+        }
+        if (inventory.entry_unsettled && !offline)
+            || (offline && inventory.offline.is_none())
             || inventory.state_sidecar_outstanding_unknown
             || proof.root_id != entry.root_id
             || proof.owner_generation != handoff.old_release.prepared.owner_generation
@@ -4377,7 +4405,7 @@ fn require_prior_entries_closed(
                 "prior entry close or caller result changed",
             ));
         }
-        closed_cursors.push(proof.state_cursor);
+        closed_cursors.push(proof.state_cursor.clone());
     }
     // Directory enumeration after restart has no generation order. Compare
     // the immutable ordinals themselves and reject aliasing or a source swap.
@@ -4444,6 +4472,18 @@ fn installed_normal_status(
         .ok()
         .and_then(|lane| lane.released_handoff_for_root(root_id).ok())
         .map(|(handoff, _)| handoff.root_work_intent);
+    if matches!(
+        intent,
+        Some(
+            oulipoly_state::mailbox::FreshRootWorkIntent::CliHelp(_)
+                | oulipoly_state::mailbox::FreshRootWorkIntent::CliDiagnostics(_)
+        )
+    ) {
+        return installed_offline_status(
+            ledger, request_id, request, control, pending, state_root, roots, entries, works,
+            grants, sources, sidecar,
+        );
+    }
     if !matches!(
         intent,
         Some(oulipoly_state::mailbox::FreshRootWorkIntent::NormalCli(_))
@@ -4552,6 +4592,154 @@ fn installed_normal_status(
                                 && normal.publication.state == "settled"
                                 && normal.publication.publication_sha256.is_some()
                         })
+                        && (inventory.pid1_exact_live || inventory.owner_close_preflight)
+                });
+            Ok(if progressing { pending } else { unknown() })
+        }
+        _ => Ok(unknown()),
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "offline certificate joins all retained authorities"
+)]
+fn installed_offline_status(
+    ledger: &InstalledLaunchLedger,
+    request_id: &str,
+    request: oulipoly_kernel_broker::installed_launch_ledger::RequestRecord,
+    control: oulipoly_kernel_broker::installed_launch_ledger::ControlExitRecord,
+    pending: String,
+    state_root: &Path,
+    roots: &RootRegistry,
+    entries: &EntryRegistry,
+    works: &WorkRegistry,
+    grants: &GrantRegistry,
+    sources: &SourcePhysicalRegistry,
+    sidecar: &BrokerSidecar,
+) -> io::Result<String> {
+    let generation = request.pair_generation.clone();
+    let unknown = || format!("unknown {request_id} {generation}\n");
+    let Some(code) = control.code else {
+        return Ok(unknown());
+    };
+    if !control.e_consumed {
+        return Ok(unknown());
+    }
+    let proof = (|| -> io::Result<_> {
+        let root_id = request
+            .root_id
+            .as_deref()
+            .ok_or_else(|| io::Error::other("offline root ID absent"))?;
+        let root = roots
+            .record(root_id)
+            .ok_or_else(|| io::Error::other("offline root absent"))?;
+        let entry = entries
+            .record(root_id)
+            .ok_or_else(|| io::Error::other("offline E absent"))?;
+        if entry.entry != control.control || entry.owner_uid != request.owner_uid {
+            return Err(io::Error::other("offline E/control identity changed"));
+        }
+        let lane = FreshV30Lane::open_at(state_root).map_err(io::Error::other)?;
+        let (handoff, actor) = lane
+            .released_handoff_for_root(root_id)
+            .map_err(io::Error::other)?;
+        if !matches!(
+            &handoff.root_work_intent,
+            oulipoly_state::mailbox::FreshRootWorkIntent::CliHelp(_)
+                | oulipoly_state::mailbox::FreshRootWorkIntent::CliDiagnostics(_)
+        ) || handoff.old_release.prepared.entry.host_pid != control.control.host_pid
+            || handoff.old_release.prepared.entry.boot_id != control.control.boot_id
+            || handoff.old_release.prepared.entry.starttime_ticks != control.control.starttime_ticks
+            || handoff.old_release.prepared.entry.pidns_dev != control.control.pidns_dev
+            || handoff.old_release.prepared.entry.pidns_ino != control.control.pidns_ino
+        {
+            return Err(io::Error::other("offline release/control identity changed"));
+        }
+        let session = lane
+            .read_session(&handoff.d_key)
+            .map_err(io::Error::other)?
+            .ok_or_else(|| io::Error::other("offline D absent"))?;
+        lane.require_released_invocation(&handoff, &actor, &session)
+            .map_err(io::Error::other)?;
+        let inventory =
+            root_drain::readback(root, roots, entries, works, grants, sources, Some(sidecar))?;
+        if inventory.offline.as_ref().is_none_or(|offline| {
+            offline.effect.handoff_id != handoff.handoff_id
+                || offline.effect.invocation_uuid != handoff.invocation_uuid
+                || offline.effect.session_id != session.session_id
+                || offline.effect.actor != actor
+                || offline.effect.intent != handoff.root_work_intent
+                || !matches!(
+                    (&offline.effect.state, code),
+                    (
+                        oulipoly_state::mailbox::FreshRootEffectState::ReturnedSuccess,
+                        0
+                    ) | (
+                        oulipoly_state::mailbox::FreshRootEffectState::ReturnedFailure,
+                        1..=255
+                    )
+                )
+        }) {
+            return Err(io::Error::other("offline State result absent or changed"));
+        }
+        let physical = root_drain::physical_close_proof(&inventory)?;
+        let owner = inventory
+            .owner_close_proof
+            .ok_or_else(|| io::Error::other("offline closed owner absent"))?;
+        if owner.owner_generation != handoff.old_release.prepared.owner_generation
+            || owner.source_generation != request.source_generation
+        {
+            return Err(io::Error::other("offline closed owner identity changed"));
+        }
+        Ok((physical, owner))
+    })();
+    let stored = ledger.read_terminal(request_id);
+    match (proof, stored) {
+        (Ok((physical, owner)), Ok(stored)) => {
+            let certificate = NormalTerminalCertificate {
+                protocol: String::new(),
+                request,
+                control_exit: control,
+                exit_code: code as u8,
+                physical,
+                owner,
+            };
+            let current = if let Some(stored) = stored {
+                stored
+            } else {
+                ledger.publish_terminal(certificate.clone())?
+            };
+            if current.request != certificate.request
+                || current.control_exit != certificate.control_exit
+                || current.exit_code != certificate.exit_code
+                || current.physical != certificate.physical
+                || current.owner != certificate.owner
+            {
+                return Ok(unknown());
+            }
+            Ok(format!("exit {code} drained {request_id}\n"))
+        }
+        (Err(_), Ok(None)) => {
+            let progressing = request
+                .root_id
+                .as_deref()
+                .and_then(|root_id| roots.record(root_id))
+                .and_then(|root| {
+                    root_drain::readback(
+                        root,
+                        roots,
+                        entries,
+                        works,
+                        grants,
+                        sources,
+                        Some(sidecar),
+                    )
+                    .ok()
+                })
+                .is_some_and(|inventory| {
+                    root_drain::offline_no_effect(&inventory)
+                        && !inventory.uncertain_registry_or_incarnation
                         && (inventory.pid1_exact_live || inventory.owner_close_preflight)
                 });
             Ok(if progressing { pending } else { unknown() })
@@ -4733,12 +4921,17 @@ fn advance_one_normal_owner(
         let Ok((released, actor)) = lane.released_handoff_for_root(&root.root_id) else {
             continue;
         };
-        // U can be visible while D is still publishing its session across
-        // State and the retained mailbox. A root without K cannot select
-        // normal close, so defer the full D readback until K is recorded.
-        if !lane
-            .normal_provider_k_recorded(&released.handoff_id)
-            .map_err(io::Error::other)?
+        let offline = matches!(
+            &released.root_work_intent,
+            oulipoly_state::mailbox::FreshRootWorkIntent::CliHelp(_)
+                | oulipoly_state::mailbox::FreshRootWorkIntent::CliDiagnostics(_)
+        );
+        // U can be visible while D is still publishing. The normal route
+        // cannot advance from an empty K; offline has its own State return.
+        if !offline
+            && !lane
+                .normal_provider_k_recorded(&released.handoff_id)
+                .map_err(io::Error::other)?
         {
             continue;
         }
@@ -4748,9 +4941,10 @@ fn advance_one_normal_owner(
         else {
             continue;
         };
-        if !lane
-            .normal_provider_k_present(&released, &actor, &session)
-            .map_err(io::Error::other)?
+        if !offline
+            && !lane
+                .normal_provider_k_present(&released, &actor, &session)
+                .map_err(io::Error::other)?
         {
             continue;
         }
@@ -4763,9 +4957,11 @@ fn advance_one_normal_owner(
             sources,
             sidecar.as_ref(),
         )?;
-        // No-effect, unknown K, partial publication, and other root routes
-        // cannot select normal progression from an empty physical set.
-        if inventory.normal.is_none() || inventory.normal_uncertain {
+        if (offline && inventory.offline.is_none())
+            || (!offline && inventory.normal.is_none())
+            || inventory.normal_uncertain
+            || inventory.offline_uncertain
+        {
             continue;
         }
         let expected_owner = &released.old_release.prepared.owner_generation;
@@ -4784,7 +4980,12 @@ fn advance_one_normal_owner(
             continue;
         }
         if !inventory.fenced {
-            if root_drain::ready_for_normal_admission_fence(&inventory).is_err() {
+            let ready = if offline {
+                root_drain::ready_for_offline_admission_fence(&inventory)
+            } else {
+                root_drain::ready_for_normal_admission_fence(&inventory)
+            };
+            if ready.is_err() {
                 continue;
             }
             let mut fences = admission_fences
@@ -6816,10 +7017,16 @@ fn serve() -> io::Result<()> {
                 if entries
                     .records()
                     .iter()
-                    .all(|entry| entry.terminal_settlement.is_some())
+                    .all(|entry| {
+                        entry.terminal_settlement.is_some()
+                            || installed_launches.as_ref().is_some_and(|ledger| {
+                                ledger.terminal_for_root(&entry.root_id).ok().flatten().is_some()
+                            })
+                    })
                 {
                     require_prior_entries_closed(
                         Path::new(&state),
+                        installed_launches.as_ref(),
                         &mut registry,
                         &entries,
                         &mut works,
@@ -6860,6 +7067,7 @@ fn serve() -> io::Result<()> {
                 if _entry_guard.is_some() {
                     require_prior_entries_closed(
                         Path::new(&state),
+                        installed_launches.as_ref(),
                         &mut registry,
                         &entries,
                         &mut works,

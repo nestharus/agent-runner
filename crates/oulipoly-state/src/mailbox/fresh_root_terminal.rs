@@ -459,6 +459,20 @@ impl FreshV30Lane {
         Ok((selected_id, unresolved))
     }
 
+    /// Offline CLI close has no parent K/Q. A child C or selected W under
+    /// the released root is therefore debt, even if no Broker work remains.
+    pub fn no_root_child_requests(
+        &self,
+        root: &FreshReleasedHandoff,
+        actor: &FreshRecipientIdentity,
+        session: &FreshV30Session,
+    ) -> Result<bool, String> {
+        self.require_released_invocation(root, actor, session)?;
+        let (selected, unresolved) =
+            self.root_child_requests(&root.old_release.prepared.root_id)?;
+        Ok(selected.is_none() && unresolved.is_empty())
+    }
+
     /// Record complete physical work only. A missing parent Q or child W is
     /// read back as unknown; it never authorizes a second K.
     pub fn settle_private_root_terminal(

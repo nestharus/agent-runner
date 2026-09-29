@@ -27,6 +27,21 @@ fn root_mapped_connected_l_reaches_ordinary_help_with_exact_one_use_custody() {
 }
 
 #[test]
+fn root_mapped_connected_diagnostics_help_closes_without_effect() {
+    run_connected_case(false, ProofFault::Diagnostics);
+}
+
+#[test]
+fn root_mapped_connected_help_revalidates_offline_close_after_restart() {
+    run_connected_case(false, ProofFault::Restart);
+}
+
+#[test]
+fn root_mapped_connected_help_refuses_tampered_no_effect_certificate() {
+    run_connected_case(false, ProofFault::OfflineTamper);
+}
+
+#[test]
 fn root_mapped_connected_l_runs_normal_model_and_closes_owner() {
     run_connected_case(true, ProofFault::None);
 }
@@ -52,6 +67,8 @@ enum ProofFault {
     MissingQ,
     ChangedQ,
     Restart,
+    OfflineTamper,
+    Diagnostics,
 }
 
 fn run_connected_case(normal: bool, fault: ProofFault) {
@@ -60,8 +77,17 @@ fn run_connected_case(normal: bool, fault: ProofFault) {
     };
     if std::env::var_os("AGE319_CONNECTED_CHILD_TEST").is_none() {
         let test_name = match (normal, fault) {
-            (false, _) => {
+            (false, ProofFault::None) => {
                 "root_mapped_connected_l_reaches_ordinary_help_with_exact_one_use_custody"
+            }
+            (false, ProofFault::Diagnostics) => {
+                "root_mapped_connected_diagnostics_help_closes_without_effect"
+            }
+            (false, ProofFault::Restart) => {
+                "root_mapped_connected_help_revalidates_offline_close_after_restart"
+            }
+            (false, ProofFault::OfflineTamper) => {
+                "root_mapped_connected_help_refuses_tampered_no_effect_certificate"
             }
             (true, ProofFault::None) => {
                 "root_mapped_connected_l_runs_normal_model_and_closes_owner"
@@ -74,6 +100,9 @@ fn run_connected_case(normal: bool, fault: ProofFault) {
             }
             (true, ProofFault::Restart) => {
                 "root_mapped_connected_l_revalidates_certificate_after_broker_restart"
+            }
+            (true, ProofFault::OfflineTamper | ProofFault::Diagnostics) | (false, _) => {
+                unreachable!()
             }
         };
         let status = Command::new("unshare")
@@ -230,7 +259,11 @@ fn run_connected_case(normal: bool, fault: ProofFault) {
     let caller_out = temp.path().join("caller.out");
     let caller_err = temp.path().join("caller.err");
     let mut launch = Command::new(&launcher);
-    launch.arg(if normal { "--model" } else { "--help" });
+    if fault == ProofFault::Diagnostics {
+        launch.args(["diagnostics", "--help"]);
+    } else {
+        launch.arg(if normal { "--model" } else { "--help" });
+    }
     if normal {
         launch.args(["fixture-model", "hello fixture"]);
     }
@@ -248,7 +281,7 @@ fn run_connected_case(normal: bool, fault: ProofFault) {
         .env("AGE319_PRIVATE_CONNECTED_J_REPLAY_V1", "1")
         .env("AGE319_CONNECTED_PAUSE_DIR", &pause)
         .envs(
-            (fault != ProofFault::None)
+            (!matches!(fault, ProofFault::None | ProofFault::Diagnostics))
                 .then_some(("AGE319_CONNECTED_CERTIFICATE_PAUSE_DIR", &certificate_pause)),
         )
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
@@ -353,7 +386,13 @@ fn run_connected_case(normal: bool, fault: ProofFault) {
     );
     assert_eq!(
         handoff["root_work_intent"]["kind"],
-        if normal { "normal_cli" } else { "cli_help" }
+        if normal {
+            "normal_cli"
+        } else if fault == ProofFault::Diagnostics {
+            "cli_diagnostics"
+        } else {
+            "cli_help"
+        }
     );
     let d_key = handoff["d_key"].as_str().unwrap();
     let fresh_db = state.join("v30/state.db");
@@ -463,11 +502,16 @@ fn run_connected_case(normal: bool, fault: ProofFault) {
         );
         std::thread::sleep(Duration::from_millis(20));
     };
-    assert!(output.contains(if normal {
-        "normal-provider-out:hello fixture"
-    } else {
-        "oulipoly-agent-runner"
-    }));
+    assert!(
+        output.contains(if normal {
+            "normal-provider-out:hello fixture"
+        } else if fault == ProofFault::Diagnostics {
+            "diagnostics"
+        } else {
+            "oulipoly-agent-runner"
+        }),
+        "unexpected ordinary output: {output}"
+    );
     if normal {
         let root: RootRecord =
             serde_json::from_slice(&fs::read(state.join(format!("{root_id}.json"))).unwrap())
@@ -573,6 +617,33 @@ fn run_connected_case(normal: bool, fault: ProofFault) {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+        let root: RootRecord =
+            serde_json::from_slice(&fs::read(state.join(format!("{root_id}.json"))).unwrap())
+                .unwrap();
+        let drained = loop {
+            let reply = protocol::root_drain_readback_at(&socket, &root, false).unwrap();
+            let read: serde_json::Value =
+                serde_json::from_str(reply.strip_prefix("root-drain-v1 ").unwrap()).unwrap();
+            if read["owner_close_proof"]["root_id"] == root_id {
+                break read;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "offline owner close stalled: read={read} broker={}",
+                fs::read_to_string(&broker_log).unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(drained["offline"]["effect"]["state"], "returned_success");
+        assert_eq!(drained["grant_records"], 0);
+        assert_eq!(drained["native_records"], 0);
+        assert_eq!(drained["work_records"], 0);
+        assert_eq!(drained["source_physical_records"], 0);
+        assert_eq!(drained["source_effect"]["accepted"], 0);
+        assert_eq!(drained["pid1_echild_receipt"], true);
+        assert_eq!(drained["pid1_parent_wait_proof"], true);
+        assert_eq!(drained["entry_physical_settled"], true);
+        assert_eq!(drained["owner_close_intent"]["root"]["root_id"], root_id);
     }
     // The normal close scanner may race D's multi-store publication. After
     // the root returns, the invocation/session/registration readback must
@@ -586,7 +657,7 @@ fn run_connected_case(normal: bool, fault: ProofFault) {
         "{}.json",
         launch_record["request_id"].as_str().unwrap()
     ));
-    if fault != ProofFault::None {
+    if !matches!(fault, ProofFault::None | ProofFault::Diagnostics) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !certificate_pause.join("ready").exists() {
             assert!(
@@ -656,7 +727,12 @@ fn run_connected_case(normal: bool, fault: ProofFault) {
                     std::thread::sleep(Duration::from_millis(20));
                 }
             }
-            ProofFault::None => unreachable!(),
+            ProofFault::OfflineTamper => {
+                let mut changed = terminal.clone();
+                changed["physical"]["offline"]["effect"]["state"] = serde_json::json!("started");
+                fs::write(&terminal_path, serde_json::to_vec(&changed).unwrap()).unwrap();
+            }
+            ProofFault::None | ProofFault::Diagnostics => unreachable!(),
         }
         fs::write(certificate_pause.join("release"), b"release").unwrap();
     }
@@ -673,7 +749,10 @@ fn run_connected_case(normal: bool, fault: ProofFault) {
         );
         std::thread::sleep(Duration::from_millis(20));
     };
-    if normal && matches!(fault, ProofFault::None | ProofFault::Restart) {
+    if matches!(
+        fault,
+        ProofFault::None | ProofFault::Restart | ProofFault::Diagnostics
+    ) {
         assert_eq!(
             launcher_status.code(),
             Some(0),
@@ -689,23 +768,26 @@ fn run_connected_case(normal: bool, fault: ProofFault) {
         assert_eq!(terminal["physical"]["root_id"], root_id);
         assert_eq!(terminal["physical"]["pid1_echild_receipt"], true);
         assert_eq!(terminal["physical"]["pid1_parent_wait_proof"], true);
-        assert_eq!(
-            terminal["physical"]["normal"]["physical"]["q"]["tree_drained"],
-            true
-        );
-        assert_eq!(
-            terminal["physical"]["normal"]["publication"]["state"],
-            "settled"
-        );
+        if normal {
+            assert_eq!(
+                terminal["physical"]["normal"]["physical"]["q"]["tree_drained"],
+                true
+            );
+            assert_eq!(
+                terminal["physical"]["normal"]["publication"]["state"],
+                "settled"
+            );
+        } else {
+            assert_eq!(terminal["protocol"], "installed-offline-terminal-v1");
+            assert_eq!(
+                terminal["physical"]["offline"]["effect"]["state"],
+                "returned_success"
+            );
+            assert!(terminal["physical"]["normal"].is_null());
+            assert_eq!(terminal["physical"]["work_records"], 0);
+            assert_eq!(terminal["physical"]["source_physical_records"], 0);
+        }
         assert_eq!(terminal["owner"]["root_id"], root_id);
-    } else if fault == ProofFault::None {
-        assert_eq!(launcher_status.code(), Some(70));
-        assert!(!terminal_path.exists());
-        let diagnostic = fs::read_to_string(&caller_err).unwrap();
-        assert!(
-            diagnostic.contains("Broker reported unknown terminal evidence"),
-            "{diagnostic}"
-        );
     } else {
         assert_eq!(launcher_status.code(), Some(70));
         let diagnostic = fs::read_to_string(&caller_err).unwrap();
@@ -713,7 +795,9 @@ fn run_connected_case(normal: bool, fault: ProofFault) {
             diagnostic.contains("Broker reported unknown terminal evidence"),
             "{diagnostic}"
         );
-        assert_eq!(fs::read_to_string(&effect).unwrap(), "one\n");
+        if normal {
+            assert_eq!(fs::read_to_string(&effect).unwrap(), "one\n");
+        }
     }
     assert!(!temp.path().join("state.db").exists());
     assert!(!temp.path().join("pid-identity.db").exists());

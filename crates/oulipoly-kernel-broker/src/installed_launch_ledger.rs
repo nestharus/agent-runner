@@ -6,7 +6,7 @@ use crate::identity::PeerIdentity;
 use crate::installed_launch::InstalledLaunchSpec;
 use crate::json_artifact;
 use crate::root_drain::RootPhysicalCloseProof;
-use oulipoly_state::mailbox::BrokerClosedOwner;
+use oulipoly_state::mailbox::{BrokerClosedOwner, FreshRootEffectState};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
@@ -53,6 +53,7 @@ pub struct ControlExitRecord {
 
 const CONTROL_EXIT_PROTOCOL: &str = "installed-control-exit-v1";
 const TERMINAL_PROTOCOL: &str = "installed-normal-terminal-v1";
+const OFFLINE_TERMINAL_PROTOCOL: &str = "installed-offline-terminal-v1";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -215,6 +216,21 @@ impl InstalledLaunchLedger {
         self.read_path(&self.directory.join(format!("{request_id}.json")))
     }
 
+    /// Resolve a prior installed root through the immutable L ledger, then
+    /// revalidate its certificate. A root ID alone cannot supply an exit.
+    pub fn terminal_for_root(
+        &self,
+        root_id: &str,
+    ) -> io::Result<Option<NormalTerminalCertificate>> {
+        for entry in fs::read_dir(&self.directory)? {
+            let request = self.read_path(&entry?.path())?;
+            if request.root_id.as_deref() == Some(root_id) {
+                return self.read_terminal(&request.request_id);
+            }
+        }
+        Ok(None)
+    }
+
     pub fn read_terminal(&self, request_id: &str) -> io::Result<Option<NormalTerminalCertificate>> {
         let request = self.read(request_id)?;
         let path = self.terminal_directory.join(format!("{request_id}.json"));
@@ -241,12 +257,28 @@ impl InstalledLaunchLedger {
         }
         let certificate: NormalTerminalCertificate =
             json_artifact::read_open(file, &path, "installed_normal_terminal")?;
-        if certificate.protocol != TERMINAL_PROTOCOL
+        let normal = certificate.protocol == TERMINAL_PROTOCOL
+            && certificate.physical.normal.is_some()
+            && certificate.physical.offline.is_none();
+        let offline = certificate.protocol == OFFLINE_TERMINAL_PROTOCOL
+            && certificate.physical.offline.is_some()
+            && certificate.physical.normal.is_none()
+            && certificate
+                .physical
+                .offline
+                .as_ref()
+                .is_some_and(|offline| {
+                    matches!(
+                        (&offline.effect.state, certificate.exit_code),
+                        (FreshRootEffectState::ReturnedSuccess, 0)
+                            | (FreshRootEffectState::ReturnedFailure, 1..=255)
+                    )
+                });
+        if !(normal || offline)
             || certificate.request != request
             || Some(certificate.control_exit.clone()) != self.read_control_exit(request_id)?
             || certificate.control_exit.code != Some(i32::from(certificate.exit_code))
             || certificate.physical.root_id != request.root_id.as_deref().unwrap_or("")
-            || certificate.physical.normal.is_none()
             || certificate.owner.root_id != certificate.physical.root_id
             || certificate.owner.source_generation != request.source_generation
             || serde_json::from_str::<RootPhysicalCloseProof>(
@@ -262,7 +294,12 @@ impl InstalledLaunchLedger {
         &self,
         mut certificate: NormalTerminalCertificate,
     ) -> io::Result<NormalTerminalCertificate> {
-        certificate.protocol = TERMINAL_PROTOCOL.into();
+        certificate.protocol =
+            if certificate.physical.offline.is_some() && certificate.physical.normal.is_none() {
+                OFFLINE_TERMINAL_PROTOCOL.into()
+            } else {
+                TERMINAL_PROTOCOL.into()
+            };
         let name = format!("{}.json", certificate.request.request_id);
         match json_artifact::create_new(&self.terminal_directory, &name, &certificate) {
             Ok(()) => {}
