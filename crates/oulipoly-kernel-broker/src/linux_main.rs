@@ -4575,6 +4575,15 @@ fn advance_one_normal_owner(
         let Ok((released, actor)) = lane.released_handoff_for_root(&root.root_id) else {
             continue;
         };
+        // U can be visible while D is still publishing its session across
+        // State and the retained mailbox. A root without K cannot select
+        // normal close, so defer the full D readback until K is recorded.
+        if !lane
+            .normal_provider_k_recorded(&released.handoff_id)
+            .map_err(io::Error::other)?
+        {
+            continue;
+        }
         let Some(session) = lane
             .read_session(&released.d_key)
             .map_err(io::Error::other)?

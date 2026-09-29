@@ -2363,8 +2363,22 @@ impl FreshV30Lane {
         Ok((retained, inserted))
     }
 
-    /// Distinguish the normal physical route from a released root whose work
-    /// uses another K. Presence is not a Q or caller-result certificate.
+    /// This is only a prefilter for the close scanner while D can still be
+    /// publishing across State and the retained mailbox. A true result must
+    /// be followed by the full released-invocation check below.
+    pub fn normal_provider_k_recorded(&self, handoff_id: &str) -> Result<bool, String> {
+        validate_request_id(handoff_id)?;
+        let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        state
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM fresh_normal_provider_k WHERE handoff_id=?1)",
+                [handoff_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    /// Exact actor-bound K presence, never a Q or caller-result certificate.
     pub fn normal_provider_k_present(
         &self,
         receipt: &FreshReleasedHandoff,
@@ -2372,14 +2386,7 @@ impl FreshV30Lane {
         session: &FreshV30Session,
     ) -> Result<bool, String> {
         self.require_released_invocation(receipt, actor, session)?;
-        let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        state
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM fresh_normal_provider_k WHERE handoff_id=?1)",
-                [&receipt.handoff_id],
-                |row| row.get::<_, bool>(0),
-            )
-            .map_err(|error| error.to_string())
+        self.normal_provider_k_recorded(&receipt.handoff_id)
     }
 
     pub fn read_normal_provider_k(
