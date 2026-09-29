@@ -10,7 +10,7 @@ use crate::source_physical::SourcePhysicalRegistry;
 use crate::work_registry::{LiveWork, WorkRecord, WorkRegistry};
 use oulipoly_state::mailbox::{
     BrokerClosedOwner, BrokerOwnerCloseInventory, BrokerSidecar, BrokerSourceEffectObligations,
-    FreshV30Lane, PreparedProcessStamp,
+    FreshRootEffect, FreshRootEffectState, FreshRootWorkIntent, FreshV30Lane, PreparedProcessStamp,
 };
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -39,6 +39,8 @@ pub struct RootPhysicalCloseProof {
     pub source_effect: BrokerSourceEffectObligations,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub normal: Option<NormalRootEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline: Option<OfflineRootEvidence>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -48,6 +50,38 @@ pub struct NormalRootEvidence {
     pub publication: PublicationReadback,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OfflineRootEvidence {
+    /// State's exact released U/D actor and returned CLI result. There is no
+    /// provider K or Q on this route.
+    pub effect: FreshRootEffect,
+}
+
+pub fn offline_no_effect(inventory: &RootDrainInventory) -> bool {
+    inventory.offline_intent
+        && inventory.offline.as_ref().is_some_and(|offline| {
+            matches!(
+                offline.effect.state,
+                FreshRootEffectState::ReturnedSuccess | FreshRootEffectState::ReturnedFailure
+            ) && matches!(
+                offline.effect.intent,
+                FreshRootWorkIntent::CliHelp(_) | FreshRootWorkIntent::CliDiagnostics(_)
+            )
+        })
+        && !inventory.offline_uncertain
+        && inventory.normal.is_none()
+        && !inventory.normal_uncertain
+        && inventory.grant_records == 0
+        && inventory.native_records == 0
+        && inventory.work_records == 0
+        && inventory.source_physical_records == 0
+        && inventory
+            .source_effect
+            .as_ref()
+            .is_some_and(|effect| *effect == Default::default())
+}
+
 /// The registries recheck the exact Q and both native ACK seals on every
 /// readback. These selected facts are stable across Broker restart.
 pub fn physical_close_proof(inventory: &RootDrainInventory) -> io::Result<RootPhysicalCloseProof> {
@@ -55,7 +89,9 @@ pub fn physical_close_proof(inventory: &RootDrainInventory) -> io::Result<RootPh
         .source_effect
         .as_ref()
         .ok_or_else(|| io::Error::other("owner close source effect absent"))?;
-    if !inventory.fenced
+    let offline = offline_no_effect(inventory);
+    if (inventory.offline_intent && !offline)
+        || !inventory.fenced
         || inventory.pid1 != "terminal_echild_absent"
         || inventory.pid1_exact_live
         || !inventory.pid1_echild_receipt
@@ -67,23 +103,24 @@ pub fn physical_close_proof(inventory: &RootDrainInventory) -> io::Result<RootPh
         || inventory.spent_without_work != 0
         || inventory.live_works != 0
         || inventory.work_debt != 0
-        || (inventory.normal.is_none() && inventory.work_records == 0)
+        || (inventory.normal.is_none() && !offline && inventory.work_records == 0)
         || inventory.work_retired != inventory.work_records
         || inventory.work_outstanding != 0
         || inventory.native_prepared != 0
         || inventory.native_spent != 0
-        || (inventory.normal.is_none() && inventory.source_physical_records != 1)
+        || (inventory.normal.is_none() && !offline && inventory.source_physical_records != 1)
         || inventory.source_physical_retired != inventory.source_physical_records
         || inventory.source_physical_outstanding != 0
         || inventory.source_effect_readback_uncertain
         || inventory.uncertain_registry_or_incarnation
         || source_effect.unsettled() != 0
-        || (inventory.normal.is_none() && source_effect.accepted != 1)
+        || (inventory.normal.is_none() && !offline && source_effect.accepted != 1)
         || (inventory.normal.is_some()
             && (source_effect.accepted != 0
                 || inventory.work_records != 0
                 || inventory.source_physical_records != 0))
         || inventory.normal_uncertain
+        || inventory.offline_uncertain
         || inventory.normal.as_ref().is_some_and(|normal| {
             normal.physical.state != "drained"
                 || normal.physical.q.is_none()
@@ -107,6 +144,7 @@ pub fn physical_close_proof(inventory: &RootDrainInventory) -> io::Result<RootPh
         source_physical_retired: inventory.source_physical_retired,
         source_effect: source_effect.clone(),
         normal: inventory.normal.clone(),
+        offline: inventory.offline.clone(),
     })
 }
 
@@ -135,6 +173,7 @@ pub struct RootDrainInventory {
     pub entry_original_exited: bool,
     pub entry_unsettled: bool,
     pub prepared_grants: usize,
+    pub grant_records: usize,
     pub spent_without_work: usize,
     pub live_works: usize,
     pub work_debt: usize,
@@ -146,6 +185,7 @@ pub struct RootDrainInventory {
     pub work_outstanding: usize,
     pub native_prepared: usize,
     pub native_spent: usize,
+    pub native_records: usize,
     /// Total retained source records, including sealed retirements.
     pub source_physical_records: usize,
     /// Seals whose exact physical Q still revalidates on this readback.
@@ -158,6 +198,11 @@ pub struct RootDrainInventory {
     pub source_effect_readback_uncertain: bool,
     pub normal: Option<NormalRootEvidence>,
     pub normal_uncertain: bool,
+    /// The released U intent selects the no-effect route even before its
+    /// terminal row exists. Mixed effects cannot fall through to legacy Q.
+    pub offline_intent: bool,
+    pub offline: Option<OfflineRootEvidence>,
+    pub offline_uncertain: bool,
     /// Exact State/retained-sidecar debt preview for the released owner. The
     /// fresh lane and a State writer fence are still required for close.
     pub owner_close_inventory: Option<BrokerOwnerCloseInventory>,
@@ -368,6 +413,16 @@ pub fn readback(
         }
     }
     let entry = entries.record(&expected.root_id);
+    let offline_intent = lane.as_ref().is_some_and(|lane| {
+        lane.released_handoff_for_root(&expected.root_id)
+            .ok()
+            .is_some_and(|(handoff, _)| {
+                matches!(
+                    handoff.root_work_intent,
+                    FreshRootWorkIntent::CliHelp(_) | FreshRootWorkIntent::CliDiagnostics(_)
+                )
+            })
+    });
     // A normal --model root has one State K and a broker-owned Q instead of
     // source/work grants. Read it only through the exact released D/actor.
     let normal_read = (|| -> io::Result<Option<NormalRootEvidence>> {
@@ -443,6 +498,87 @@ pub fn readback(
     })();
     let normal_uncertain = normal_read.is_err();
     let normal = normal_read.ok().flatten();
+    let offline_read = (|| -> io::Result<Option<OfflineRootEvidence>> {
+        let Some(lane) = lane.as_ref() else {
+            return Ok(None);
+        };
+        let Ok((handoff, actor)) = lane.released_handoff_for_root(&expected.root_id) else {
+            return Ok(None);
+        };
+        if !matches!(
+            &handoff.root_work_intent,
+            FreshRootWorkIntent::CliHelp(_) | FreshRootWorkIntent::CliDiagnostics(_)
+        ) {
+            return Ok(None);
+        }
+        let session = lane
+            .read_session(&handoff.d_key)
+            .map_err(io::Error::other)?
+            .ok_or_else(|| io::Error::other("offline D session absent"))?;
+        lane.require_released_invocation(&handoff, &actor, &session)
+            .map_err(io::Error::other)?;
+        if lane
+            .normal_provider_k_recorded(&handoff.handoff_id)
+            .map_err(io::Error::other)?
+        {
+            return Err(io::Error::other("offline root has provider K"));
+        }
+        if !lane
+            .no_root_child_requests(&handoff, &actor, &session)
+            .map_err(io::Error::other)?
+        {
+            return Err(io::Error::other("offline root has State child work"));
+        }
+        let effect = lane
+            .read_root_effect(&handoff, &actor, &session)
+            .map_err(io::Error::other)?
+            .ok_or_else(|| io::Error::other("offline State terminal absent"))?;
+        if !matches!(
+            effect.state,
+            FreshRootEffectState::ReturnedSuccess | FreshRootEffectState::ReturnedFailure
+        ) {
+            return Ok(None);
+        }
+        let prepared = &handoff.old_release.prepared;
+        let same = |stamp: &ProcessStamp, original: &PreparedProcessStamp| {
+            stamp.host_pid == original.host_pid
+                && stamp.boot_id == original.boot_id
+                && stamp.starttime_ticks == original.starttime_ticks
+                && stamp.pidns_dev == original.pidns_dev
+                && stamp.pidns_ino == original.pidns_ino
+        };
+        if prepared.root_id != expected.root_id
+            || prepared.owner_uid != expected.owner_uid
+            || prepared.root_init.host_pid != expected.init_host_pid
+            || prepared.root_init.boot_id != expected.boot_id
+            || prepared.root_init.starttime_ticks != expected.init_starttime_ticks
+            || prepared.root_init.pidns_dev != expected.pidns_dev
+            || prepared.root_init.pidns_ino != expected.pidns_ino
+            || entry.is_none_or(|entry| {
+                !same(&entry.entry, &prepared.entry)
+                    || entry
+                        .guardian
+                        .as_ref()
+                        .is_none_or(|stamp| !same(stamp, &prepared.guardian))
+                    || entry
+                        .prepared_driver
+                        .as_ref()
+                        .is_none_or(|stamp| !same(stamp, &prepared.driver))
+                    || entry.joined_child.as_ref().is_none_or(|joined| {
+                        joined.host_pid != actor.host_pid
+                            || joined.boot_id != actor.boot_id
+                            || joined.starttime_ticks != actor.starttime_ticks
+                            || joined.pidns_dev != actor.pidns_dev
+                            || joined.pidns_ino != actor.pidns_ino
+                    })
+            })
+        {
+            return Err(io::Error::other("offline root/actor identity changed"));
+        }
+        Ok(Some(OfflineRootEvidence { effect }))
+    })();
+    let offline_uncertain = offline_read.is_err();
+    let offline = offline_read.ok().flatten();
     let entry_unsettled = entry.is_none_or(|entry| entry.terminal_settlement.is_none());
     let entry_physical_settled = entry.is_some_and(|entry| {
         entry.join_consumed
@@ -450,7 +586,7 @@ pub fn readback(
                 && entry.joined_child.as_ref() == Some(&source_records[0].joined_child)
                 && entry.prepared_driver.as_ref() == Some(&source_records[0].driver)
                 && entry.guardian.as_ref() == Some(&source_records[0].guardian))
-                || (normal.is_some()
+                || ((normal.is_some() || offline.is_some())
                     && source_records.is_empty()
                     && entry.joined_child.is_some()
                     && entry.prepared_driver.is_some()
@@ -546,6 +682,7 @@ pub fn readback(
         entry_original_exited,
         entry_unsettled,
         prepared_grants,
+        grant_records: root_grants.len(),
         spent_without_work,
         live_works,
         work_debt,
@@ -554,6 +691,7 @@ pub fn readback(
         work_outstanding,
         native_prepared,
         native_spent,
+        native_records: root_native.len(),
         source_physical_records: source_records.len(),
         source_physical_retired,
         source_physical_outstanding,
@@ -561,6 +699,9 @@ pub fn readback(
         source_effect_readback_uncertain,
         normal,
         normal_uncertain,
+        offline_intent,
+        offline,
+        offline_uncertain,
         owner_close_inventory,
         uncertain_registry_or_incarnation,
         state_sidecar_outstanding_unknown: true,
@@ -626,7 +767,9 @@ pub fn ready_for_owner_close_preflight(
             && inventory.source_physical_records == 0
             && owner.source_effect.accepted == 0
     });
-    if inventory.root_id != expected_root_id
+    let offline = offline_no_effect(inventory);
+    if (inventory.offline_intent && !offline)
+        || inventory.root_id != expected_root_id
         || owner.root_id != expected_root_id
         || owner.owner_generation != expected_owner_generation
         || owner.source_generation.is_empty()
@@ -656,20 +799,21 @@ pub fn ready_for_owner_close_preflight(
         || inventory.spent_without_work != 0
         || inventory.live_works != 0
         || inventory.work_debt != 0
-        || (!normal && inventory.work_records == 0)
+        || (!normal && !offline && inventory.work_records == 0)
         || inventory.work_retired != inventory.work_records
         || inventory.work_outstanding != 0
         || inventory.native_prepared != 0
         || inventory.native_spent != 0
-        || (!normal && inventory.source_physical_records != 1)
+        || (!normal && !offline && inventory.source_physical_records != 1)
         || inventory.source_physical_retired != inventory.source_physical_records
         || inventory.source_physical_outstanding != 0
         || inventory.source_effect_readback_uncertain
         || inventory.normal_uncertain
+        || inventory.offline_uncertain
         || inventory.uncertain_registry_or_incarnation
         || inventory.source_effect.as_ref() != Some(&owner.source_effect)
         || owner.source_effect.unsettled() != 0
-        || (!normal && owner.source_effect.accepted != 1)
+        || (!normal && !offline && owner.source_effect.accepted != 1)
         || owner.state_projection_pending
         || owner.state_native_channel_pending
         || owner.state_cancelling_native_attempts != 0
@@ -705,6 +849,15 @@ pub fn ready_for_normal_admission_fence(inventory: &RootDrainInventory) -> io::R
     ready_for_pid1_request_with_fence(inventory, false)
 }
 
+/// No-effect CLI roots have no provider K/Q or source/child grant. Their
+/// positive State return and exact empty registries select a separate fence.
+pub fn ready_for_offline_admission_fence(inventory: &RootDrainInventory) -> io::Result<()> {
+    if !offline_no_effect(inventory) {
+        return Err(io::Error::other("offline no-effect evidence absent"));
+    }
+    ready_for_pid1_request_with_fence(inventory, false)
+}
+
 fn ready_for_pid1_request_with_fence(
     inventory: &RootDrainInventory,
     require_fenced: bool,
@@ -717,23 +870,26 @@ fn ready_for_pid1_request_with_fence(
             && inventory.work_records == 0
             && inventory.source_physical_records == 0
     });
-    if (require_fenced && !inventory.fenced)
+    let offline = offline_no_effect(inventory);
+    if (inventory.offline_intent && !offline)
+        || (require_fenced && !inventory.fenced)
         || !inventory.entry_physical_settled
         || !inventory.entry_original_exited
         || inventory.prepared_grants != 0
         || inventory.spent_without_work != 0
         || inventory.live_works != 0
         || inventory.work_debt != 0
-        || (!normal && inventory.work_records == 0)
+        || (!normal && !offline && inventory.work_records == 0)
         || inventory.work_outstanding != 0
         || inventory.work_retired != inventory.work_records
         || inventory.native_prepared != 0
         || inventory.native_spent != 0
-        || (!normal && inventory.source_physical_records == 0)
+        || (!normal && !offline && inventory.source_physical_records == 0)
         || inventory.source_physical_outstanding != 0
         || inventory.source_physical_retired != inventory.source_physical_records
         || inventory.source_effect_readback_uncertain
         || inventory.normal_uncertain
+        || inventory.offline_uncertain
         || inventory
             .source_effect
             .as_ref()
@@ -751,7 +907,9 @@ fn ready_for_pid1_request_with_fence(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oulipoly_state::mailbox::{BoundStateFileIdentity, BrokerStateCloseCursor};
+    use oulipoly_state::mailbox::{
+        BoundStateFileIdentity, BrokerStateCloseCursor, FreshRecipientIdentity,
+    };
 
     fn settled_owner_inventory() -> RootDrainInventory {
         let effect = BrokerSourceEffectObligations {
@@ -771,6 +929,7 @@ mod tests {
             entry_original_exited: true,
             entry_unsettled: true,
             prepared_grants: 0,
+            grant_records: 1,
             spent_without_work: 0,
             live_works: 0,
             work_debt: 0,
@@ -779,6 +938,7 @@ mod tests {
             work_outstanding: 0,
             native_prepared: 0,
             native_spent: 0,
+            native_records: 0,
             source_physical_records: 1,
             source_physical_retired: 1,
             source_physical_outstanding: 0,
@@ -786,6 +946,9 @@ mod tests {
             source_effect_readback_uncertain: false,
             normal: None,
             normal_uncertain: false,
+            offline_intent: false,
+            offline: None,
+            offline_uncertain: false,
             owner_close_inventory: Some(BrokerOwnerCloseInventory {
                 source_generation: "source".into(),
                 root_id: "root".into(),
@@ -864,6 +1027,118 @@ mod tests {
             .unwrap()
             .owner_generation = "other".into();
         assert!(ready_for_owner_close_preflight(&changed, "root", "owner").is_err());
+    }
+
+    fn returned_offline_inventory() -> RootDrainInventory {
+        let mut inventory = settled_owner_inventory();
+        inventory.grant_records = 0;
+        inventory.work_records = 0;
+        inventory.work_retired = 0;
+        inventory.source_physical_records = 0;
+        inventory.source_physical_retired = 0;
+        inventory.source_effect = Some(Default::default());
+        inventory.offline_intent = true;
+        inventory
+            .owner_close_inventory
+            .as_mut()
+            .unwrap()
+            .source_effect = Default::default();
+        inventory.offline = Some(OfflineRootEvidence {
+            effect: FreshRootEffect {
+                handoff_id: "handoff".into(),
+                invocation_uuid: "invocation".into(),
+                session_id: "session".into(),
+                actor: FreshRecipientIdentity {
+                    host_pid: 12,
+                    boot_id: "boot".into(),
+                    starttime_ticks: 3,
+                    pidns_dev: 4,
+                    pidns_ino: 5,
+                },
+                intent: FreshRootWorkIntent::CliHelp(vec!["--help".into()]),
+                state: FreshRootEffectState::ReturnedSuccess,
+            },
+        });
+        inventory
+    }
+
+    #[test]
+    fn offline_close_requires_positive_return_and_exact_empty_effect_registries() {
+        let settled = returned_offline_inventory();
+        assert!(ready_for_owner_close_preflight(&settled, "root", "owner").is_ok());
+        let proof = physical_close_proof(&settled).unwrap();
+        assert!(proof.normal.is_none());
+        assert_eq!(proof.offline, settled.offline);
+        let mut diagnostics = settled.clone();
+        diagnostics.offline.as_mut().unwrap().effect.intent =
+            FreshRootWorkIntent::CliDiagnostics(vec!["diagnostics".into()]);
+        assert!(physical_close_proof(&diagnostics).is_ok());
+        diagnostics.offline.as_mut().unwrap().effect.state = FreshRootEffectState::ReturnedFailure;
+        assert!(physical_close_proof(&diagnostics).is_ok());
+
+        let mut candidate = settled.clone();
+        candidate.pid1_exact_live = true;
+        candidate.pid1 = "live";
+        assert!(ready_for_offline_admission_fence(&candidate).is_ok());
+        candidate.offline = None;
+        assert!(ready_for_offline_admission_fence(&candidate).is_err());
+
+        for changed in [
+            {
+                let mut value = settled.clone();
+                value.grant_records = 1;
+                value
+            },
+            {
+                let mut value = settled.clone();
+                value.native_records = 1;
+                value
+            },
+            {
+                let mut value = settled.clone();
+                value.work_records = 1;
+                value
+            },
+            {
+                let mut value = settled.clone();
+                value.source_physical_records = 1;
+                value
+            },
+            {
+                let mut value = settled.clone();
+                value.source_effect.as_mut().unwrap().accepted = 1;
+                value
+            },
+            {
+                let mut value = settled.clone();
+                value.offline_uncertain = true;
+                value
+            },
+            {
+                let mut value = settled.clone();
+                value.normal_uncertain = true;
+                value
+            },
+            {
+                let mut value = settled.clone();
+                value.offline = None;
+                value
+            },
+            {
+                let mut value = settled.clone();
+                value.offline.as_mut().unwrap().effect.state = FreshRootEffectState::Started;
+                value
+            },
+            {
+                let mut value = settled.clone();
+                value.offline.as_mut().unwrap().effect.intent =
+                    FreshRootWorkIntent::NormalCli(vec!["--model".into()]);
+                value
+            },
+        ] {
+            assert!(physical_close_proof(&changed).is_err());
+            assert!(ready_for_owner_close_preflight(&changed, "root", "owner").is_err());
+        }
     }
 
     #[test]

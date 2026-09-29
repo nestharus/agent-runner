@@ -443,7 +443,38 @@ fn close_proof_source_acceptances(physical_proof_json: &str) -> Result<usize, St
     let object = proof
         .as_object()
         .ok_or("broker owner physical proof invalid")?;
-    if object.get("normal").is_some_and(|value| !value.is_null()) {
+    let normal = object.get("normal").is_some_and(|value| !value.is_null());
+    let offline = object.get("offline").filter(|value| !value.is_null());
+    if normal && offline.is_some() {
+        return Err("broker owner physical proof has mixed routes".into());
+    }
+    if normal {
+        Ok(0)
+    } else if let Some(offline) = offline {
+        let kind = offline
+            .pointer("/effect/intent/kind")
+            .and_then(|value| value.as_str());
+        let returned = offline
+            .pointer("/effect/state")
+            .and_then(|value| value.as_str());
+        let source_effect: BrokerSourceEffectObligations = serde_json::from_value(
+            object
+                .get("source_effect")
+                .cloned()
+                .ok_or("offline source effect absent")?,
+        )
+        .map_err(|error| error.to_string())?;
+        if !matches!(kind, Some("cli_help" | "cli_diagnostics"))
+            || !matches!(returned, Some("returned_success" | "returned_failure"))
+            || object.get("work_records").and_then(|value| value.as_u64()) != Some(0)
+            || object
+                .get("source_physical_records")
+                .and_then(|value| value.as_u64())
+                != Some(0)
+            || source_effect != BrokerSourceEffectObligations::default()
+        {
+            return Err("broker owner offline proof invalid or mixed".into());
+        }
         Ok(0)
     } else {
         Ok(1)
@@ -5136,6 +5167,52 @@ fn check_storage(path: &Path, owner: u32, anchor: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offline_owner_close_accepts_only_returned_zero_source_proof() {
+        let proof = serde_json::json!({
+            "offline": {"effect": {"intent": {"kind": "cli_help"}, "state": "returned_success"}},
+            "work_records": 0,
+            "source_physical_records": 0,
+            "source_effect": BrokerSourceEffectObligations::default(),
+        });
+        assert_eq!(
+            close_proof_source_acceptances(&proof.to_string()).unwrap(),
+            0
+        );
+        let mut failed_diagnostics = proof.clone();
+        failed_diagnostics["offline"]["effect"]["intent"]["kind"] =
+            serde_json::json!("cli_diagnostics");
+        failed_diagnostics["offline"]["effect"]["state"] = serde_json::json!("returned_failure");
+        assert_eq!(
+            close_proof_source_acceptances(&failed_diagnostics.to_string()).unwrap(),
+            0
+        );
+        for changed in [
+            {
+                let mut value = proof.clone();
+                value["normal"] = serde_json::json!({});
+                value
+            },
+            {
+                let mut value = proof.clone();
+                value["offline"]["effect"]["state"] = serde_json::json!("started");
+                value
+            },
+            {
+                let mut value = proof.clone();
+                value["work_records"] = serde_json::json!(1);
+                value
+            },
+            {
+                let mut value = proof.clone();
+                value["source_effect"]["accepted"] = serde_json::json!(1);
+                value
+            },
+        ] {
+            assert!(close_proof_source_acceptances(&changed.to_string()).is_err());
+        }
+    }
 
     #[test]
     fn historical_close_cursor_survives_three_real_continuity_admissions_and_restart() {
