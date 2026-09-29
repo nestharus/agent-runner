@@ -5451,8 +5451,38 @@ fn serve() -> io::Result<()> {
     let mut completed_auto_normal = HashSet::<String>::new();
     let mut last_auto_normal = Instant::now() - NORMAL_CLOSE_POLL_INTERVAL;
     loop {
-        control_grants.retain(|_, grant| !grant.reap_if_done());
-        consumed_controls.retain_mut(|grant| !grant.reap_if_done());
+        control_grants.retain(|_, grant| match grant.reap_if_done() {
+            Ok(None) => true,
+            Ok(Some(status)) => installed_launches.as_ref().is_none_or(|ledger| {
+                match ledger.record_control_exit(grant, status) {
+                    Ok(_) => false,
+                    Err(error) => {
+                        eprintln!("installed control wait retention blocked: {error}");
+                        true
+                    }
+                }
+            }),
+            Err(error) => {
+                eprintln!("installed control wait unknown: {error}");
+                true
+            }
+        });
+        consumed_controls.retain_mut(|grant| match grant.reap_if_done() {
+            Ok(None) => true,
+            Ok(Some(status)) => installed_launches.as_ref().is_none_or(|ledger| {
+                match ledger.record_control_exit(grant, status) {
+                    Ok(_) => false,
+                    Err(error) => {
+                        eprintln!("installed consumed control wait retention blocked: {error}");
+                        true
+                    }
+                }
+            }),
+            Err(error) => {
+                eprintln!("installed consumed control wait unknown: {error}");
+                true
+            }
+        });
         if let Ok(request) = drain_rx.try_recv() {
             let result = (|| {
                 registry.exact_record(&request.root)?;
@@ -5788,7 +5818,7 @@ fn serve() -> io::Result<()> {
                 Ok(ledger.status(&spec.request_id, &spec.generation, &peer)?)
             } else if operation == b'l' || operation == b'M' {
                 #[cfg(feature = "age319-private-broker-fixture")]
-                if fixture {
+                if fixture && std::env::var_os("OULIPOLY_AGE319_PRIVATE_CONNECTED_CONTROL_V1").is_none() {
                     let RequestPayload::PrivateLaunchStatus {
                         request_id,
                         generation,
@@ -6689,6 +6719,9 @@ fn serve() -> io::Result<()> {
                     } else {
                         Err(io::Error::other("connected control E pair/source changed"))
                     };
+                    if answer.is_ok() {
+                        grant.mark_e_accepted();
+                    }
                     consumed_controls.push(grant);
                     return answer;
                 }

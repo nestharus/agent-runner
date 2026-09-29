@@ -1,5 +1,6 @@
 //! Durable first-install request/root binding. Publication precedes any future
 //! root effect. A published request is never launchable again by resubmission.
+use crate::connected_control::ControlGrant;
 use crate::entry_registry::ProcessStamp;
 use crate::identity::PeerIdentity;
 use crate::installed_launch::InstalledLaunchSpec;
@@ -9,7 +10,9 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 
 const REQUEST_ONLY_PROTOCOL: &str = "installed-launch-request-v1";
 const ROOT_BOUND_PROTOCOL: &str = "installed-launch-request-v2";
@@ -29,6 +32,25 @@ pub struct RequestRecord {
     pub root_id: Option<String>,
 }
 
+/// A kernel wait observation for the one control Runner. This is deliberately
+/// not a caller result or physical drain certificate.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ControlExitRecord {
+    pub protocol: String,
+    pub request_id: String,
+    pub pair_generation: String,
+    pub source_generation: String,
+    pub root_id: String,
+    pub launcher: ProcessStamp,
+    pub control: ProcessStamp,
+    pub e_consumed: bool,
+    pub code: Option<i32>,
+    pub signal: Option<i32>,
+}
+
+const CONTROL_EXIT_PROTOCOL: &str = "installed-control-exit-v1";
+
 pub enum Admission {
     New { root_id: String },
     Existing,
@@ -36,6 +58,7 @@ pub enum Admission {
 
 pub struct InstalledLaunchLedger {
     directory: PathBuf,
+    exit_directory: PathBuf,
     pair_generation: String,
     source_generation: String,
 }
@@ -55,9 +78,12 @@ impl InstalledLaunchLedger {
             return Err(io::Error::other("invalid installed launch generation"));
         }
         let directory = state.join("installed-launches");
-        if !directory.exists() {
-            fs::DirBuilder::new().mode(0o700).create(&directory)?;
-            File::open(state)?.sync_all()?;
+        let exit_directory = state.join("installed-control-exits");
+        for path in [&directory, &exit_directory] {
+            if !path.exists() {
+                fs::DirBuilder::new().mode(0o700).create(path)?;
+                File::open(state)?.sync_all()?;
+            }
         }
         let meta = fs::symlink_metadata(&directory)?;
         if !meta.is_dir()
@@ -68,8 +94,18 @@ impl InstalledLaunchLedger {
             return Err(io::Error::other("unsafe installed launch ledger directory"));
         }
         json_artifact::require_no_pending(&directory)?;
+        let exit_meta = fs::symlink_metadata(&exit_directory)?;
+        if !exit_meta.is_dir()
+            || exit_meta.file_type().is_symlink()
+            || exit_meta.uid() != unsafe { libc::geteuid() }
+            || exit_meta.mode() & 0o777 != 0o700
+        {
+            return Err(io::Error::other("unsafe installed control exit directory"));
+        }
+        json_artifact::require_no_pending(&exit_directory)?;
         let ledger = Self {
             directory,
+            exit_directory,
             pair_generation: pair_generation.into(),
             source_generation: source_generation.into(),
         };
@@ -89,6 +125,15 @@ impl InstalledLaunchLedger {
             {
                 return Err(io::Error::other("duplicate installed launch root ID"));
             }
+        }
+        for entry in fs::read_dir(&ledger.exit_directory)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let request_id = name
+                .strip_suffix(".json")
+                .ok_or_else(|| io::Error::other("installed control exit filename mismatch"))?;
+            ledger.read_control_exit(request_id)?;
         }
         Ok(ledger)
     }
@@ -139,6 +184,96 @@ impl InstalledLaunchLedger {
             return Err(io::Error::other("invalid installed launch request ID"));
         }
         self.read_path(&self.directory.join(format!("{request_id}.json")))
+    }
+
+    /// Read back a saved direct-child wait only after validating it against
+    /// the immutable L record. An absent wait remains unknown across restart.
+    pub fn read_control_exit(&self, request_id: &str) -> io::Result<Option<ControlExitRecord>> {
+        let request = self.read(request_id)?;
+        let path = self.exit_directory.join(format!("{request_id}.json"));
+        let file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let meta = file.metadata()?;
+        let named = fs::symlink_metadata(&path)?;
+        if !meta.is_file()
+            || meta.uid() != unsafe { libc::geteuid() }
+            || meta.mode() & 0o777 != 0o600
+            || meta.nlink() != 1
+            || meta.len() > 4096
+            || meta.dev() != named.dev()
+            || meta.ino() != named.ino()
+        {
+            return Err(io::Error::other("unsafe installed control exit record"));
+        }
+        let exit: ControlExitRecord =
+            json_artifact::read_open(file, &path, "installed_control_exit")?;
+        if exit.protocol != CONTROL_EXIT_PROTOCOL
+            || exit.request_id != request.request_id
+            || exit.pair_generation != request.pair_generation
+            || exit.source_generation != request.source_generation
+            || Some(exit.root_id.as_str()) != request.root_id.as_deref()
+            || exit.launcher != request.launcher
+            || exit.control == exit.launcher
+            || (exit.code.is_some() == exit.signal.is_some())
+            || exit.code.is_some_and(|code| !(0..=255).contains(&code))
+            || exit.signal.is_some_and(|signal| signal <= 0)
+        {
+            return Err(io::Error::other("installed control exit identity mismatch"));
+        }
+        Ok(Some(exit))
+    }
+
+    /// Called only by the Broker holding the original Child after try_wait.
+    /// Repeated writes accept the same observation and reject changed facts.
+    pub fn record_control_exit(
+        &self,
+        grant: &ControlGrant,
+        status: ExitStatus,
+    ) -> io::Result<ControlExitRecord> {
+        let request = self.read(&grant.message.request_id)?;
+        if request.protocol != ROOT_BOUND_PROTOCOL
+            || request.pair_generation != grant.message.pair_generation
+            || request.source_generation != grant.message.source_generation
+            || request.root_id.as_deref() != Some(grant.message.root_id.as_str())
+            || request.launcher == grant.process
+        {
+            return Err(io::Error::other("installed control wait binding changed"));
+        }
+        let exit = ControlExitRecord {
+            protocol: CONTROL_EXIT_PROTOCOL.into(),
+            request_id: request.request_id.clone(),
+            pair_generation: request.pair_generation,
+            source_generation: request.source_generation,
+            root_id: grant.message.root_id.clone(),
+            launcher: request.launcher,
+            control: grant.process.clone(),
+            e_consumed: grant.e_accepted(),
+            code: status.code(),
+            signal: status.signal(),
+        };
+        if exit.code.is_some() == exit.signal.is_some() {
+            return Err(io::Error::other("unrepresentable control wait status"));
+        }
+        let name = format!("{}.json", exit.request_id);
+        match json_artifact::create_new(&self.exit_directory, &name, &exit) {
+            Ok(()) => Ok(exit),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let old = self.read_control_exit(&exit.request_id)?;
+                if old.as_ref() == Some(&exit) {
+                    Ok(exit)
+                } else {
+                    Err(io::Error::other("installed control exit changed"))
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// E reopens the fsynced L identity before spending an incarnation-local
@@ -454,6 +589,62 @@ mod tests {
             serde_json::to_vec(&altered).unwrap(),
         )
         .unwrap();
+        assert!(InstalledLaunchLedger::open(state.path(), &pair, &source).is_err());
+    }
+
+    #[test]
+    fn control_wait_readback_is_bound_but_never_promotes_pending_to_exit() {
+        let state = tempfile::tempdir().unwrap();
+        let pair = uuid::Uuid::new_v4().to_string();
+        let source = uuid::Uuid::new_v4().to_string();
+        let request = uuid::Uuid::new_v4().to_string();
+        let ledger = InstalledLaunchLedger::open(state.path(), &pair, &source).unwrap();
+        let Admission::New { root_id } = ledger
+            .reserve_request(&spec(&pair, &request), &peer())
+            .unwrap()
+        else {
+            panic!("request was not new");
+        };
+        assert!(ledger.read_control_exit(&request).unwrap().is_none());
+        let launcher = ProcessStamp::from(&peer().process);
+        let mut control = launcher.clone();
+        control.host_pid += 1;
+        let exit = ControlExitRecord {
+            protocol: CONTROL_EXIT_PROTOCOL.into(),
+            request_id: request.clone(),
+            pair_generation: pair.clone(),
+            source_generation: source.clone(),
+            root_id,
+            launcher,
+            control,
+            e_consumed: true,
+            code: Some(0),
+            signal: None,
+        };
+        json_artifact::create_new(&ledger.exit_directory, &format!("{request}.json"), &exit)
+            .unwrap();
+        let restarted = InstalledLaunchLedger::open(state.path(), &pair, &source).unwrap();
+        assert_eq!(
+            restarted.read_control_exit(&request).unwrap(),
+            Some(exit.clone())
+        );
+        assert_eq!(
+            restarted.status(&request, &pair, &peer()).unwrap(),
+            format!("pending {request} {pair}\n")
+        );
+        let path = ledger.exit_directory.join(format!("{request}.json"));
+        let mut changed = exit.clone();
+        changed.root_id = uuid::Uuid::new_v4().to_string();
+        fs::write(&path, serde_json::to_vec(&changed).unwrap()).unwrap();
+        assert!(InstalledLaunchLedger::open(state.path(), &pair, &source).is_err());
+        fs::write(&path, serde_json::to_vec(&exit).unwrap()).unwrap();
+        changed = exit.clone();
+        changed.code = None;
+        changed.signal = Some(9);
+        fs::write(&path, serde_json::to_vec(&changed).unwrap()).unwrap();
+        assert!(InstalledLaunchLedger::open(state.path(), &pair, &source).is_ok());
+        changed.signal = Some(0);
+        fs::write(&path, serde_json::to_vec(&changed).unwrap()).unwrap();
         assert!(InstalledLaunchLedger::open(state.path(), &pair, &source).is_err());
     }
 }

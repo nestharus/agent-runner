@@ -3,7 +3,7 @@
 use oulipoly_kernel_broker::first_install_activation::{FirstInstallActivation, PairPaths};
 use oulipoly_kernel_broker::installed_pair::InstalledPair;
 use oulipoly_kernel_broker::protocol::{EntryRoute, Operation, observe_entry_gate_at, request_at};
-use oulipoly_state::mailbox::EmptyV30BootstrapIdentity;
+use oulipoly_state::mailbox::{EmptyV30BootstrapIdentity, FreshV30Lane};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::os::fd::AsRawFd;
@@ -93,7 +93,11 @@ fn root_mapped_connected_l_reaches_ordinary_help_with_exact_one_use_custody() {
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     while observe_entry_gate_at(&socket).ok() != Some(EntryRoute::FreshOnlyOpen) {
-        assert!(broker.try_wait().unwrap().is_none(), "Broker exited");
+        assert!(
+            broker.try_wait().unwrap().is_none(),
+            "Broker exited: {}",
+            fs::read_to_string(&broker_log).unwrap_or_default()
+        );
         assert!(Instant::now() < deadline, "Broker did not activate");
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -153,6 +157,7 @@ fn root_mapped_connected_l_reaches_ordinary_help_with_exact_one_use_custody() {
         .env("HOME", temp.path())
         .env("PATH", "/usr/bin:/bin")
         .env("OULIPOLY_AGE319_PRIVATE_DUPLICATE_L_V1", "1")
+        .env("OULIPOLY_AGE319_PRIVATE_CONNECTED_STATUS_V1", "1")
         .env("AGE319_PRIVATE_CONNECTED_ORDINARY_CHILD_V1", "1")
         .env("AGE319_PRIVATE_CONNECTED_J_REPLAY_V1", "1")
         .env("AGE319_CONNECTED_PAUSE_DIR", &pause)
@@ -185,16 +190,17 @@ fn root_mapped_connected_l_reaches_ordinary_help_with_exact_one_use_custody() {
     );
     assert_eq!(fs::read_dir(state.join("entries")).unwrap().count(), 0);
     fs::write(pause.join("release"), b"release").unwrap();
-    let root_id = loop {
+    let launch_record = loop {
         let mut files = fs::read_dir(state.join("installed-launches")).unwrap();
         if let Some(file) = files.next() {
             let record: serde_json::Value =
                 serde_json::from_slice(&fs::read(file.unwrap().path()).unwrap()).unwrap();
-            break record["root_id"].as_str().unwrap().to_owned();
+            break record;
         }
         assert!(Instant::now() < deadline, "L did not publish");
         std::thread::sleep(Duration::from_millis(20));
     };
+    let root_id = launch_record["root_id"].as_str().unwrap().to_owned();
     let entry = state.join("entries").join(format!("{root_id}.json"));
     while !entry.exists() {
         assert!(
@@ -282,6 +288,38 @@ fn root_mapped_connected_l_reaches_ordinary_help_with_exact_one_use_custody() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+    let exit_path = state.join("installed-control-exits").join(format!(
+        "{}.json",
+        launch_record["request_id"].as_str().unwrap()
+    ));
+    let control_exit: serde_json::Value = loop {
+        if let Ok(bytes) = fs::read(&exit_path)
+            && let Ok(exit) = serde_json::from_slice(&bytes)
+        {
+            break exit;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "actual control wait was not retained: broker={}",
+            fs::read_to_string(&broker_log).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(control_exit["request_id"], launch_record["request_id"]);
+    assert_eq!(
+        control_exit["pair_generation"],
+        launch_record["pair_generation"]
+    );
+    assert_eq!(
+        control_exit["source_generation"],
+        launch_record["source_generation"]
+    );
+    assert_eq!(control_exit["root_id"], root_id);
+    assert_eq!(control_exit["launcher"], launch_record["launcher"]);
+    assert_eq!(control_exit["control"], reserved["entry"]);
+    assert_eq!(control_exit["e_consumed"], true);
+    assert_eq!(control_exit["code"], 0);
+    assert!(control_exit["signal"].is_null());
     let fresh_sidecar = state.join("v30/sidecar/pid-identity.db");
     loop {
         let allocated = rusqlite::Connection::open_with_flags(
@@ -345,6 +383,14 @@ fn root_mapped_connected_l_reaches_ordinary_help_with_exact_one_use_custody() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+    // The normal close scanner may race D's multi-store publication. After
+    // the root returns, the invocation/session/registration readback must
+    // resolve to the exact released child rather than remain conflicted.
+    let lane = FreshV30Lane::open_at(&state).unwrap();
+    let (released, actor) = lane.released_handoff_for_root(&root_id).unwrap();
+    let session = lane.read_session(&released.d_key).unwrap().unwrap();
+    lane.require_released_invocation(&released, &actor, &session)
+        .unwrap();
     assert!(!temp.path().join("state.db").exists());
     assert!(!temp.path().join("pid-identity.db").exists());
     assert!(

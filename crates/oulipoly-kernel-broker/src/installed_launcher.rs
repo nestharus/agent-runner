@@ -206,6 +206,19 @@ fn private_main(mut stdio: [std::os::fd::RawFd; 3]) -> i32 {
                 ));
             }
         }
+        if std::env::var_os("OULIPOLY_AGE319_PRIVATE_CONNECTED_STATUS_V1").is_some() {
+            let status = protocol::private_installed_control_at(
+                Path::new(&socket),
+                &captured.spec.request_id,
+                &generation,
+                false,
+            )?;
+            if status != format!("pending {} {generation}\n", captured.spec.request_id) {
+                return Err(std::io::Error::other(
+                    "connected status promoted without drain proof",
+                ));
+            }
+        }
         let expected = format!(" drained {}\n", captured.spec.request_id);
         if let Some(exit) = response
             .strip_suffix(&expected)
