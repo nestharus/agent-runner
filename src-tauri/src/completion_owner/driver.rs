@@ -20,16 +20,91 @@ use std::collections::{BTreeSet, HashMap};
 use std::io::Read;
 #[cfg(feature = "age319-private-broker-fixture")]
 use std::io::Write;
-use std::os::fd::{FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 pub(super) const DRIVER_ARG: &str = "__completion-driver-v1";
+static INSTALLED_OWNER: std::sync::OnceLock<CompletionDomainOwner> = std::sync::OnceLock::new();
 const STATE_REPAIR_SUFFIX_BATCH: usize = 64;
 const SOURCE_RECOVERY_BATCH: usize = 16;
 const SOURCE_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 const DRIVER_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// The internal argv only locates the held guardian channel. Admission comes
+/// from its live parent and the Broker's exact running-driver readback after
+/// release. Retain the consumed frame so dispatch does not read it twice.
+pub(super) fn verify_installed_entry() -> Result<bool, String> {
+    let args: Vec<_> = std::env::args().collect();
+    if args.get(1).map(String::as_str) != Some(DRIVER_ARG) {
+        return Ok(false);
+    }
+    if args.len() != 5 {
+        return Err("installed completion driver requires its held root channel".into());
+    }
+    let fd: RawFd = args[3]
+        .parse()
+        .map_err(|_| "completion driver channel is invalid")?;
+    if fd < 3 {
+        return Err("completion driver channel is invalid".into());
+    }
+    // Duplicate a valid open descriptor without taking custody of the original
+    // descriptor that entry() will later use for its completion receipt.
+    let fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let mut channel = unsafe { UnixStream::from_raw_fd(fd) };
+    let mut peer: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut size = std::mem::size_of_val(&peer) as libc::socklen_t;
+    if unsafe {
+        libc::getsockopt(
+            channel.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut peer as *mut libc::ucred).cast(),
+            &mut size,
+        )
+    } != 0
+        || size as usize != std::mem::size_of_val(&peer)
+        || peer.pid <= 0
+        || peer.pid != unsafe { libc::getppid() }
+        || peer.uid != unsafe { libc::geteuid() }
+    {
+        return Err("completion driver channel is not its live guardian's".into());
+    }
+    let guardian = oulipoly_kernel_broker::identity::PinnedProcess::open(peer.pid)
+        .map_err(|e| e.to_string())?;
+    let image = std::fs::File::open("/proc/self/exe").map_err(|e| e.to_string())?;
+    if !guardian
+        .same_executable_as(&image)
+        .map_err(|e| e.to_string())?
+    {
+        return Err("completion driver guardian image changed".into());
+    }
+    // The original guardian publishes this frame only after preparation and
+    // release. Waiting keeps the execed driver alive for those Broker pins;
+    // loss of guardian custody closes the channel and refuses admission.
+    let owner = super::linux::read_driver_owner(&mut channel)?;
+    if owner.driver_identity != super::linux::current_identity()?
+        || owner.guardian_identity != super::linux::identity(i64::from(peer.pid))?
+        || peer.pid != unsafe { libc::getppid() }
+    {
+        return Err("completion driver owner incarnation changed".into());
+    }
+    guardian.verify().map_err(|e| e.to_string())?;
+    let route = super::broker_route::V30OwnerRoute::driver(
+        &super::linux::owner_broker_socket(),
+        &args[4],
+        &owner,
+    )?;
+    route.read_running(&owner, None)?;
+    INSTALLED_OWNER
+        .set(owner)
+        .map_err(|_| "installed completion driver owner already consumed")?;
+    Ok(true)
+}
 
 pub(super) fn entry() -> Result<(), String> {
     let path = std::env::args_os()
@@ -48,7 +123,10 @@ pub(super) fn entry() -> Result<(), String> {
     // allocator, recorder, control-thread, or SQLite state from its
     // multi-threaded process can survive the fork boundary.
     let mut channel = unsafe { UnixStream::from_raw_fd(fd) };
-    let owner = super::linux::read_driver_owner(&mut channel)?;
+    let owner = match INSTALLED_OWNER.get() {
+        Some(owner) => owner.clone(),
+        None => super::linux::read_driver_owner(&mut channel)?,
+    };
     unsafe { std::env::set_var(super::ENDPOINT_ENV, &owner.endpoint) };
     // A held-J v30 guardian supplies the root selector. The broker still
     // authenticates this process and derives the source from I; argv is never

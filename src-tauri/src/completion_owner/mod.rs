@@ -410,6 +410,11 @@ pub fn require_unqualified_legacy_session(session_id: &str) -> Result<(), String
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) fn verify_installed_driver_entry() -> Result<bool, String> {
+    driver::verify_installed_entry()
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn custodian_entry() -> Option<Result<(), String>> {
     match std::env::args().nth(1).as_deref() {
         Some(driver::DRIVER_ARG) => Some(driver::entry()),
