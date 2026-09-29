@@ -9,6 +9,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
@@ -18,6 +19,12 @@ fn successor_peer() {
     if std::env::var_os("AGE319_SUCCESSOR_PEER").is_none() {
         return;
     }
+    assert_eq!(unsafe { libc::geteuid() }, 1001);
+    let state_root = std::env::var("AGE319_SUCCESSOR_BROKER_ROOT").unwrap();
+    assert!(
+        fs::metadata(Path::new(&state_root).join("v30/state.db")).is_err(),
+        "non-root successor traversed Broker State"
+    );
     let socket = std::env::var("AGE319_SUCCESSOR_SOCKET").unwrap();
     let directory = std::env::var("AGE319_SUCCESSOR_DIR").unwrap();
     let allocation = std::env::var("AGE319_SUCCESSOR_ALLOCATION").unwrap();
@@ -402,17 +409,45 @@ fn run_successor_fixture(fack: bool) {
         } else {
             "durable_exact_successor_offer_and_cross_store_readback"
         };
+        // The mapped root and UID 1001 cannot traverse Cargo's owner-only
+        // target directory. Stage only executable images in a traversable
+        // temporary directory before entering the user namespace.
+        let images = tempfile::tempdir().unwrap();
+        fs::set_permissions(images.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let test_image = images.path().join("successor-test");
+        let broker_image = images.path().join("broker");
+        fs::copy(std::env::current_exe().unwrap(), &test_image).unwrap();
+        fs::copy(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"), &broker_image).unwrap();
+        fs::set_permissions(&test_image, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&broker_image, fs::Permissions::from_mode(0o755)).unwrap();
         let status = Command::new("unshare")
-            .args(["-Urpfm", "--mount-proc"])
-            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--map-auto",
+                "--setuid",
+                "0",
+                "--setgid",
+                "0",
+                "-pfm",
+                "--mount-proc",
+            ])
+            .arg(&test_image)
             .args(["--exact", name, "--nocapture"])
             .env("AGE319_SUCCESSOR_FIXTURE", "1")
+            .env("AGE319_SUCCESSOR_BROKER_IMAGE", &broker_image)
             .status()
             .unwrap();
         assert!(status.success());
         return;
     }
     let temp = tempfile::tempdir().unwrap();
+    // The Broker's State remains 0700. This ancestor permits traversal to
+    // the separate, root-owned receipt root and to the test socket.
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o711)).unwrap();
+    let peer_dir = temp.path().join("peer");
+    fs::create_dir(&peer_dir).unwrap();
+    let peer_path = std::ffi::CString::new(peer_dir.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::chown(peer_path.as_ptr(), 1001, 1001) }, 0);
+    fs::set_permissions(&peer_dir, fs::Permissions::from_mode(0o700)).unwrap();
     let broker_root = temp.path().join("broker");
     fs::create_dir(&broker_root).unwrap();
     fs::set_permissions(&broker_root, fs::Permissions::from_mode(0o700)).unwrap();
@@ -565,26 +600,38 @@ fn run_successor_fixture(fack: bool) {
     let socket = temp.path().join("v30.sock");
     let runner = std::env::current_exe().unwrap();
     let mut broker = start_broker(&broker_root, &socket, &runner);
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::uid(
+            &fs::metadata(format!("/proc/{}", broker.id())).unwrap()
+        ),
+        0,
+        "Broker must remain root while successor runs as UID 1001"
+    );
+    let socket_path = std::ffi::CString::new(socket.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::chown(socket_path.as_ptr(), 0, 1001) }, 0);
     let request = uuid::Uuid::new_v4().to_string();
     let mut peer = Command::new(&runner)
         .args(["--exact", "successor_peer", "--nocapture"])
         .env("AGE319_SUCCESSOR_PEER", "1")
         .env("AGE319_SUCCESSOR_SOCKET", &socket)
-        .env("AGE319_SUCCESSOR_DIR", temp.path())
+        .env("AGE319_SUCCESSOR_DIR", &peer_dir)
+        .env("AGE319_SUCCESSOR_BROKER_ROOT", &broker_root)
         .env("AGE319_SUCCESSOR_ALLOCATION", &allocation)
         .env("AGE319_SUCCESSOR_SOURCE", &source)
         .env("AGE319_SUCCESSOR_SEQ", seq.to_string())
         .env("AGE319_SUCCESSOR_REQUEST", &request)
         .envs(fack.then_some(("AGE319_SUCCESSOR_FACK", "1")))
+        .uid(1001)
+        .gid(1001)
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !temp.path().join("offer.json").exists() {
+    while !peer_dir.join("offer.json").exists() {
         assert!(Instant::now() < deadline, "successor peer offer absent");
         std::thread::sleep(Duration::from_millis(20));
     }
     let offer: serde_json::Value =
-        serde_json::from_slice(&fs::read(temp.path().join("offer.json")).unwrap()).unwrap();
+        serde_json::from_slice(&fs::read(peer_dir.join("offer.json")).unwrap()).unwrap();
     assert_ne!(
         offer["successor_identity"],
         serde_json::to_value(&original).unwrap()
@@ -707,8 +754,9 @@ fn run_successor_fixture(fack: bool) {
     broker.kill().unwrap();
     broker.wait().unwrap();
     let mut broker = start_broker(&broker_root, &socket, &runner);
-    fs::write(temp.path().join("readback"), b"go").unwrap();
-    while !temp.path().join("readback.json").exists() {
+    assert_eq!(unsafe { libc::chown(socket_path.as_ptr(), 0, 1001) }, 0);
+    fs::write(peer_dir.join("readback"), b"go").unwrap();
+    while !peer_dir.join("readback.json").exists() {
         assert!(
             Instant::now() < deadline + Duration::from_secs(10),
             "restart readback absent"
@@ -727,14 +775,14 @@ fn run_successor_fixture(fack: bool) {
             .is_err(),
             "copied offer ID authorized original/wrong peer"
         );
-        fs::write(temp.path().join("f-go"), b"go").unwrap();
+        fs::write(peer_dir.join("f-go"), b"go").unwrap();
         let deadline = Instant::now() + Duration::from_secs(15);
-        while !temp.path().join("f.json").exists() {
+        while !peer_dir.join("f.json").exists() {
             assert!(Instant::now() < deadline, "successor F recovery absent");
             std::thread::sleep(Duration::from_millis(20));
         }
         let f: serde_json::Value =
-            serde_json::from_slice(&fs::read(temp.path().join("f.json")).unwrap()).unwrap();
+            serde_json::from_slice(&fs::read(peer_dir.join("f.json")).unwrap()).unwrap();
         let delivery_request_id = f["delivery_request_id"].as_str().unwrap();
         let token = f["delivery_token"].as_str().unwrap();
         assert!(
@@ -762,18 +810,61 @@ fn run_successor_fixture(fack: bool) {
             .status()
             .unwrap();
         assert!(sibling.success(), "sibling gained copied F/token authority");
-        let receipt_path = broker_root.join("v30/successor-receipts").join(format!(
-            "{}.json",
-            f["delivery"]["grant"]["grant_id"].as_str().unwrap()
-        ));
+        let receipt_path = std::path::PathBuf::from(f["receipt_path"].as_str().unwrap());
+        assert_eq!(receipt_path.parent().unwrap().file_name().unwrap(), "1001");
+        assert!(!receipt_path.starts_with(&broker_root));
+        assert_eq!(
+            side.query_row(
+                "SELECT recipient_uid FROM fresh_successor_grant WHERE grant_id=?1",
+                [f["delivery"]["grant"]["grant_id"].as_str().unwrap()],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1001
+        );
+        assert!(
+            FreshV30Lane::open_at(&broker_root)
+                .unwrap()
+                .read_successor_delivery(delivery_request_id, &successor, 0)
+                .unwrap()
+                .is_none(),
+            "same process identity with a different UID recovered F"
+        );
+        let receipt_root = receipt_path.parent().unwrap().parent().unwrap();
+        assert_eq!(
+            std::os::unix::fs::MetadataExt::uid(&fs::symlink_metadata(receipt_root).unwrap()),
+            0
+        );
+        assert_eq!(
+            fs::symlink_metadata(receipt_root)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o711
+        );
+        assert_eq!(
+            std::os::unix::fs::MetadataExt::uid(
+                &fs::symlink_metadata(receipt_path.parent().unwrap()).unwrap()
+            ),
+            1001
+        );
+        assert_eq!(
+            fs::symlink_metadata(receipt_path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
         assert!(
             !receipt_path.exists(),
             "Broker manufactured receiver receipt"
         );
         assert_eq!(f["delivery"]["grant"]["source_id"], source);
         assert_eq!(f["delivery"]["grant"]["attempt_id"], attempt);
-        fs::write(temp.path().join("f-check"), b"go").unwrap();
-        while !temp.path().join("fack.json").exists() {
+        fs::write(peer_dir.join("f-check"), b"go").unwrap();
+        while !peer_dir.join("fack.json").exists() {
             assert!(
                 Instant::now() < deadline + Duration::from_secs(15),
                 "successor ACK absent"
@@ -781,9 +872,9 @@ fn run_successor_fixture(fack: bool) {
             std::thread::sleep(Duration::from_millis(20));
         }
         let fack: serde_json::Value =
-            serde_json::from_slice(&fs::read(temp.path().join("fack.json")).unwrap()).unwrap();
+            serde_json::from_slice(&fs::read(peer_dir.join("fack.json")).unwrap()).unwrap();
         assert_eq!(
-            fs::read(temp.path().join("received.bin")).unwrap(),
+            fs::read(peer_dir.join("received.bin")).unwrap(),
             payload,
             "F reply bytes differ from retained source"
         );
@@ -825,6 +916,10 @@ fn run_successor_fixture(fack: bool) {
             0o400
         );
         assert_eq!(
+            std::os::unix::fs::MetadataExt::uid(&fs::symlink_metadata(&receipt_path).unwrap()),
+            1001
+        );
+        assert_eq!(
             side.query_row("SELECT count(*) FROM fresh_recipient_grant", [], |r| r
                 .get::<_, i64>(0))
                 .unwrap(),
@@ -833,8 +928,9 @@ fn run_successor_fixture(fack: bool) {
         broker.kill().unwrap();
         broker.wait().unwrap();
         let mut broker = start_broker(&broker_root, &socket, &runner);
-        fs::write(temp.path().join("restart-ack"), b"go").unwrap();
-        while !temp.path().join("restart-ack.json").exists() {
+        assert_eq!(unsafe { libc::chown(socket_path.as_ptr(), 0, 1001) }, 0);
+        fs::write(peer_dir.join("restart-ack"), b"go").unwrap();
+        while !peer_dir.join("restart-ack.json").exists() {
             assert!(
                 Instant::now() < deadline + Duration::from_secs(30),
                 "successor ACK restart readback absent"
@@ -842,8 +938,7 @@ fn run_successor_fixture(fack: bool) {
             std::thread::sleep(Duration::from_millis(20));
         }
         let restart: serde_json::Value =
-            serde_json::from_slice(&fs::read(temp.path().join("restart-ack.json")).unwrap())
-                .unwrap();
+            serde_json::from_slice(&fs::read(peer_dir.join("restart-ack.json")).unwrap()).unwrap();
         assert_eq!(restart["ack"], fack["ack"]);
         assert!(peer.wait().unwrap().success());
         broker.kill().unwrap();
@@ -895,7 +990,10 @@ fn process_identity(pid: i32) -> FreshRecipientIdentity {
 }
 
 fn start_broker(root: &Path, socket: &Path, runner: &Path) -> Child {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
+    let broker_image = std::env::var_os("AGE319_SUCCESSOR_BROKER_IMAGE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_oulipoly-kernel-broker").into());
+    let mut child = Command::new(broker_image)
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", root)
         .env(
             "OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1",

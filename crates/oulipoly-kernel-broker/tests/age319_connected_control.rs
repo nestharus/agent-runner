@@ -427,12 +427,32 @@ printf '%s\n' "$response"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    let reserved: serde_json::Value = serde_json::from_slice(&fs::read(&entry).unwrap()).unwrap();
+    let reserved: serde_json::Value = loop {
+        if let Ok(record) = fs::read(&entry).and_then(|bytes| {
+            serde_json::from_slice::<serde_json::Value>(&bytes).map_err(std::io::Error::other)
+        }) {
+            break record;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "connected E entry remained incomplete"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
     assert_eq!(reserved["root_id"], root_id);
     assert_eq!(fs::read_dir(state.join("entries")).unwrap().count(), 1);
     let deadline = Instant::now() + Duration::from_secs(if async_bash { 50 } else { 20 });
     let joined = loop {
-        let record: serde_json::Value = serde_json::from_slice(&fs::read(&entry).unwrap()).unwrap();
+        let Ok(record) = fs::read(&entry).and_then(|bytes| {
+            serde_json::from_slice::<serde_json::Value>(&bytes).map_err(std::io::Error::other)
+        }) else {
+            assert!(
+                Instant::now() < deadline,
+                "connected J entry remained incomplete"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        };
         if record["join_consumed"] == true && record["joined_child"].is_object() {
             break record;
         }
@@ -766,7 +786,9 @@ printf '%s\n' "$response"
         assert_eq!(receipt_sha, ack_sha);
         assert_eq!(receipt_sha, fack["receipt"]["receipt_sha256"]);
         let receipt_path = state
-            .join("v30/successor-receipts")
+            .parent()
+            .unwrap()
+            .join("state-successor-receipts/0")
             .join(format!("{}.json", grant["grant_id"].as_str().unwrap()));
         let receipt_meta = fs::symlink_metadata(&receipt_path).unwrap();
         assert_eq!(receipt_meta.permissions().mode() & 0o777, 0o400);

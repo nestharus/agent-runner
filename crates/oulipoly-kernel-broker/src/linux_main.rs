@@ -317,7 +317,11 @@ fn private_fixture() -> bool {
     (unsafe { libc::geteuid() }) == 0
         && fs::read_to_string("/proc/self/uid_map")
             .ok()
-            .is_some_and(|map| map.split_ascii_whitespace().nth(2) == Some("1"))
+            .is_some_and(|map| {
+                map.split_ascii_whitespace()
+                    .nth(1)
+                    .is_some_and(|host| host != "0")
+            })
         && std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1").is_some()
 }
 fn open_exact_sync_stream(
@@ -10070,6 +10074,7 @@ fn serve_fresh_v30_at(
                                     &offer_request_id,
                                     &delivery_request_id,
                                     &recipient,
+                                    peer.uid,
                                 )
                                 .map_err(io::Error::other)?;
                             submitted_successor_grant =
@@ -10088,7 +10093,7 @@ fn serve_fresh_v30_at(
                             delivery_request_id,
                         } => {
                             let delivery = lane
-                                .read_successor_delivery(&delivery_request_id, &recipient)
+                                .read_successor_delivery(&delivery_request_id, &recipient, peer.uid)
                                 .map_err(io::Error::other)?;
                             serde_json::json!({"kind":"successor_delivery_readback",
                                 "delivery":delivery})
@@ -10097,7 +10102,11 @@ fn serve_fresh_v30_at(
                             delivery_request_id,
                         } => {
                             let delivered = lane
-                                .recover_successor_delivery(&delivery_request_id, &recipient)
+                                .recover_successor_delivery(
+                                    &delivery_request_id,
+                                    &recipient,
+                                    peer.uid,
+                                )
                                 .map_err(io::Error::other)?;
                             serde_json::json!({
                                 "kind":"recovered_successor_delivery",
@@ -10113,7 +10122,11 @@ fn serve_fresh_v30_at(
                             delivery_request_id,
                         } => {
                             let digest = lane
-                                .certify_successor_receipt(&delivery_request_id, &recipient)
+                                .certify_successor_receipt(
+                                    &delivery_request_id,
+                                    &recipient,
+                                    peer.uid,
+                                )
                                 .map_err(io::Error::other)?;
                             serde_json::json!({"kind":"successor_receipt",
                                 "receipt_sha256":digest})
@@ -10122,7 +10135,7 @@ fn serve_fresh_v30_at(
                             delivery_request_id,
                         } => {
                             let digest = lane
-                                .read_successor_receipt(&delivery_request_id, &recipient)
+                                .read_successor_receipt(&delivery_request_id, &recipient, peer.uid)
                                 .map_err(io::Error::other)?;
                             serde_json::json!({"kind":"successor_receipt_readback",
                                 "receipt_sha256":digest})
@@ -10136,6 +10149,7 @@ fn serve_fresh_v30_at(
                                     &delivery_request_id,
                                     &delivery_token,
                                     &recipient,
+                                    peer.uid,
                                 )
                                 .map_err(io::Error::other)?;
                             serde_json::json!({"kind":"successor_ack","ack":ack})
@@ -10144,7 +10158,7 @@ fn serve_fresh_v30_at(
                             delivery_request_id,
                         } => {
                             let ack = lane
-                                .read_successor_ack(&delivery_request_id, &recipient)
+                                .read_successor_ack(&delivery_request_id, &recipient, peer.uid)
                                 .map_err(io::Error::other)?;
                             serde_json::json!({"kind":"successor_ack_readback","ack":ack})
                         }

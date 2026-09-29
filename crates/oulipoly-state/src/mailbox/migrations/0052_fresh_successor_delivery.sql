@@ -15,6 +15,7 @@ CREATE TABLE fresh_successor_grant (
  root_id TEXT NOT NULL,
  owner_generation TEXT NOT NULL,
  successor_identity TEXT NOT NULL,
+ recipient_uid INTEGER NOT NULL CHECK(recipient_uid>=0),
  payload_sha256 TEXT NOT NULL,
  payload_byte_len INTEGER NOT NULL CHECK(payload_byte_len>=0),
  phase TEXT NOT NULL CHECK(phase IN ('unknown','submitted','acked')),
@@ -33,6 +34,7 @@ WHEN NEW.grant_id!=OLD.grant_id OR NEW.delivery_request_id!=OLD.delivery_request
  OR NEW.lane_id!=OLD.lane_id OR NEW.source_generation!=OLD.source_generation
  OR NEW.root_id!=OLD.root_id OR NEW.owner_generation!=OLD.owner_generation
  OR NEW.successor_identity!=OLD.successor_identity
+ OR NEW.recipient_uid!=OLD.recipient_uid
  OR NEW.payload_sha256!=OLD.payload_sha256 OR NEW.payload_byte_len!=OLD.payload_byte_len
  OR NEW.created_at!=OLD.created_at
  OR NOT ((OLD.phase='unknown' AND NEW.phase IN ('submitted','acked'))

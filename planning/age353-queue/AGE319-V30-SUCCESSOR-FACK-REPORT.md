@@ -29,7 +29,61 @@ boundary. Production successor scheduling remains outside this slice. Root
 terminal and owner close do not claim successor delivery: the connected root
 still reads `pending_f` after successor ACK.
 
-## Verification
+## Installed-path correction before PR
+
+Review found that the original receipt path was under the root-only
+`<Broker State>/v30` ancestry. A normal successor could not traverse it.
+The corrected installed path is
+`/var/lib/oulipoly-kernel-broker-successor-receipts/<pinned peer UID>/<grant UUID>.json`.
+It is derived from the Broker's fixed State root and authenticated socket peer
+UID, never from a client `HOME` or supplied path. Broker creates and fsyncs the
+root-owned `0711` receipt root and the `0700` UID-owned child directory; it
+checks both types, modes, and owners on reuse. The UID is immutable in the F
+grant and required for F recovery, receipt certification, ACK, and readback.
+The successor alone creates the `0400` file from the actual F bytes and fsyncs
+it. Broker certifies the exact path, owner, device, inode, digest, generation,
+source, row, peer, and token, then rechecks it for ACK and restart readback.
+Broker State and its `0700` v30 ancestry remain root-only.
+
+The root-mapped socket fixture now maps UID 0 and UID 1001 independently. The
+Broker stays UID 0, the successor runs with UID/GID 1001, and the test proves
+the successor cannot read Broker State but can write the receipt, certify it,
+ACK, and read ACK after Broker restart. It asserts the durable grant UID,
+receipt owner and directory modes, and refuses a same-process readback with a
+different UID; original/wrong-peer, sibling, changed-receipt, and wrong-token
+refusals still pass. This is a mapped privilege proof, not an installed host
+deployment test. No host installation or live State was changed, so this
+report does not claim production readiness.
+
+Post-correction verification in the specified Runner worktree:
+
+```bash
+cargo build -p oulipoly-agent-runner --features age319-private-broker-fixture
+cargo test -p oulipoly-kernel-broker --features age319-private-broker-fixture \
+  --test age319_successor_admission durable_exact_successor -- --nocapture --test-threads=1
+cargo test -p oulipoly-kernel-broker --features age319-private-broker-fixture \
+  --test age319_fresh_recipient_socket \
+  private_fresh_recipient_delivery_ack_collision_and_restart -- --exact --nocapture
+AGE319_CONNECTED_RUNNER_BIN="$PWD/src-tauri/target/debug/oulipoly-agent-runner" \
+AGE319_CONNECTED_BASH_BIN="$PWD/src-tauri/target/age319-bash-featureless/debug/agent-bash" \
+  cargo test -p oulipoly-kernel-broker --features age319-private-broker-fixture \
+  --test age319_connected_control root_mapped_connected_l_delivers_real_bash_async_to_ \
+  -- --nocapture --test-threads=1
+cargo check -p oulipoly-state -p oulipoly-kernel-broker -p oulipoly-agent-runner
+cargo fmt --all --check
+git diff --check
+```
+
+The build, both successor socket cases, the original-recipient socket case,
+both connected async Bash cases, the default Rust check, format check, and
+diff check passed. The Rust check reported existing unused-code warnings. An
+initial original-recipient connected run hit a fixture race reading a
+partially written entry JSON; a direct rerun
+passed, then the fixture was corrected to wait for a complete entry and the
+two-case connected run passed. An intermediate fixture edit lacked a Rust type
+annotation and failed compilation; it was corrected before that final run.
+
+## Earlier verification (before path correction)
 
 Commands run in the specified Runner worktree, except the Bash build, which
 read the clean Bash trunk and wrote its target under the Runner worktree:

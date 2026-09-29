@@ -2078,6 +2078,8 @@ pub fn persist_successor_receiver_receipt(
             .as_str()
             .ok_or_else(|| io::Error::other("successor receipt path absent"))?,
     );
+    let uid = unsafe { libc::geteuid() };
+    let uid_directory = uid.to_string();
     if !path.is_absolute()
         || path.file_name().and_then(|s| s.to_str())
             != Some(format!("{}.json", read.grant.grant_id).as_str())
@@ -2085,7 +2087,13 @@ pub fn persist_successor_receiver_receipt(
             .parent()
             .and_then(|p| p.file_name())
             .and_then(|s| s.to_str())
-            != Some("successor-receipts")
+            != Some(uid_directory.as_str())
+        || !path
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            .is_some_and(|name| name.ends_with("-successor-receipts"))
     {
         return Err(io::Error::other("successor receipt path invalid"));
     }
@@ -2093,9 +2101,21 @@ pub fn persist_successor_receiver_receipt(
         .parent()
         .ok_or_else(|| io::Error::other("receipt parent absent"))?;
     let parent_meta = std::fs::symlink_metadata(parent)?;
+    let root_meta = std::fs::symlink_metadata(
+        parent
+            .parent()
+            .ok_or_else(|| io::Error::other("receipt root absent"))?,
+    )?;
+    if !root_meta.is_dir()
+        || root_meta.file_type().is_symlink()
+        || root_meta.uid() != 0
+        || root_meta.mode() & 0o777 != 0o711
+    {
+        return Err(io::Error::other("successor receipt root untrusted"));
+    }
     if !parent_meta.is_dir()
         || parent_meta.file_type().is_symlink()
-        || parent_meta.uid() != unsafe { libc::geteuid() }
+        || parent_meta.uid() != uid
         || parent_meta.mode() & 0o777 != 0o700
     {
         return Err(io::Error::other("successor receipt parent untrusted"));
@@ -2131,10 +2151,25 @@ pub fn persist_successor_receiver_receipt(
             std::fs::File::open(parent)?.sync_all()?;
         }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            if std::fs::read(path)? != bytes {
+            let mut existing = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(path)?;
+            let meta = existing.metadata()?;
+            if !meta.is_file()
+                || meta.uid() != uid
+                || meta.nlink() != 1
+                || meta.mode() & 0o777 != 0o400
+                || meta.len() != bytes.len() as u64
+            {
+                return Err(io::Error::other("existing successor receipt untrusted"));
+            }
+            let mut stored = Vec::new();
+            existing.read_to_end(&mut stored)?;
+            if stored != bytes {
                 return Err(io::Error::other("existing successor receipt differs"));
             }
-            std::fs::File::open(path)?.sync_all()?;
+            existing.sync_all()?;
             std::fs::File::open(parent)?.sync_all()?;
         }
         Err(error) => return Err(error),

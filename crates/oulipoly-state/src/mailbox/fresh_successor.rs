@@ -75,40 +75,81 @@ impl FreshV30Lane {
         Ok(admission)
     }
 
-    pub fn successor_receipt_path(&self, grant_id: &str) -> Result<std::path::PathBuf, String> {
-        validate_request_id(grant_id)?;
-        let parent = self.state_path.parent().ok_or("fresh lane root absent")?
-            .join("successor-receipts");
+    fn successor_receipt_root(&self) -> Result<std::path::PathBuf, String> {
+        let broker_root = self.state_path.parent().and_then(|p| p.parent())
+            .ok_or("fresh broker root absent")?;
+        let parent = broker_root.parent().ok_or("fresh broker root parent absent")?;
+        let name = broker_root.file_name().and_then(|n| n.to_str())
+            .ok_or("fresh broker root name absent")?;
+        Ok(parent.join(format!("{name}-successor-receipts")))
+    }
+
+    fn checked_successor_receipt_directory(&self, uid: u32) -> Result<std::path::PathBuf, String> {
+        let root = self.successor_receipt_root()?;
+        let root_meta = fs::symlink_metadata(&root).map_err(|e| e.to_string())?;
+        if !root_meta.is_dir() || root_meta.file_type().is_symlink() || root_meta.uid() != 0
+            || root_meta.mode() & 0o777 != 0o711 {
+            return Err("successor receipt root changed".into());
+        }
+        let parent = root.join(uid.to_string());
         let meta = fs::symlink_metadata(&parent).map_err(|e| e.to_string())?;
-        if !meta.is_dir() || meta.file_type().is_symlink() || meta.uid() != 0
+        if !meta.is_dir() || meta.file_type().is_symlink() || meta.uid() != uid
             || meta.mode() & 0o777 != 0o700 {
             return Err("successor receipt directory changed".into());
         }
-        Ok(parent.join(format!("{grant_id}.json")))
+        Ok(parent)
     }
 
-    fn ensure_successor_receipt_directory(&self) -> Result<(), String> {
-        let root = self.state_path.parent().ok_or("fresh lane root absent")?;
-        let parent = root.join("successor-receipts");
-        match fs::create_dir(&parent) {
+    pub fn successor_receipt_path(&self, grant_id: &str, uid: u32) -> Result<std::path::PathBuf, String> {
+        validate_request_id(grant_id)?;
+        Ok(self.checked_successor_receipt_directory(uid)?.join(format!("{grant_id}.json")))
+    }
+
+    fn ensure_successor_receipt_directory(&self, uid: u32) -> Result<(), String> {
+        require_root()?;
+        let root = self.successor_receipt_root()?;
+        let parent = root.parent().ok_or("successor receipt root parent absent")?;
+        let parent_meta = fs::symlink_metadata(parent).map_err(|e| e.to_string())?;
+        if !parent_meta.is_dir() || parent_meta.file_type().is_symlink()
+            || parent_meta.uid() != 0 || parent_meta.mode() & 0o022 != 0 {
+            return Err("successor receipt root ancestry untrusted".into());
+        }
+        match fs::create_dir(&root) {
             Ok(()) => {
-                fs::set_permissions(&parent, fs::Permissions::from_mode(0o700))
+                fs::set_permissions(&root, fs::Permissions::from_mode(0o711))
                     .map_err(|e| e.to_string())?;
-                File::open(root).and_then(|f| f.sync_all()).map_err(|e| e.to_string())?;
+                File::open(&root).and_then(|f| f.sync_all()).map_err(|e| e.to_string())?;
+                File::open(parent).and_then(|f| f.sync_all()).map_err(|e| e.to_string())?;
             }
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e.to_string()),
         }
-        let meta = fs::symlink_metadata(&parent).map_err(|e| e.to_string())?;
-        if !meta.is_dir() || meta.file_type().is_symlink() || meta.uid() != 0
-            || meta.mode() & 0o777 != 0o700 {
-            return Err("successor receipt directory changed".into());
+        let root_meta = fs::symlink_metadata(&root).map_err(|e| e.to_string())?;
+        if !root_meta.is_dir() || root_meta.file_type().is_symlink() || root_meta.uid() != 0
+            || root_meta.mode() & 0o777 != 0o711 {
+            return Err("successor receipt root changed".into());
         }
-        Ok(())
+        let user_dir = root.join(uid.to_string());
+        match fs::create_dir(&user_dir) {
+            Ok(()) => {
+                fs::set_permissions(&user_dir, fs::Permissions::from_mode(0o700))
+                    .map_err(|e| e.to_string())?;
+                let c_path = std::ffi::CString::new(user_dir.as_os_str().as_bytes())
+                    .map_err(|e| e.to_string())?;
+                if unsafe { libc::chown(c_path.as_ptr(), uid, u32::MAX) } != 0 {
+                    return Err(std::io::Error::last_os_error().to_string());
+                }
+                File::open(&user_dir).and_then(|f| f.sync_all()).map_err(|e| e.to_string())?;
+                File::open(&root).and_then(|f| f.sync_all()).map_err(|e| e.to_string())?;
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        self.checked_successor_receipt_directory(uid).map(|_| ())
     }
 
     fn successor_grant_by_request(
-        &self, delivery_request_id: &str, actor: &FreshRecipientIdentity,
+        &self, delivery_request_id: &str, actor: &FreshRecipientIdentity, uid: u32,
     ) -> Result<Option<(FreshSuccessorDeliveryReadback, String)>, String> {
         validate_request_id(delivery_request_id)?;
         let identity = Self::recipient_identity_json(actor)?;
@@ -119,8 +160,8 @@ impl FreshV30Lane {
                     r.receipt_sha256
              FROM fresh_successor_grant g LEFT JOIN fresh_successor_receipt r
                ON r.grant_id=g.grant_id
-             WHERE g.delivery_request_id=?1 AND g.successor_identity=?2",
-            params![delivery_request_id,identity],
+             WHERE g.delivery_request_id=?1 AND g.successor_identity=?2 AND g.recipient_uid=?3",
+            params![delivery_request_id,identity,uid],
             |r| Ok((
                 FreshSuccessorDeliveryReadback {
                     grant: FreshDeliveryReadback {
@@ -138,9 +179,9 @@ impl FreshV30Lane {
     }
 
     pub fn read_successor_delivery(
-        &self, delivery_request_id: &str, actor: &FreshRecipientIdentity,
+        &self, delivery_request_id: &str, actor: &FreshRecipientIdentity, uid: u32,
     ) -> Result<Option<FreshSuccessorDeliveryReadback>, String> {
-        let Some((read, _)) = self.successor_grant_by_request(delivery_request_id, actor)? else {
+        let Some((read, _)) = self.successor_grant_by_request(delivery_request_id, actor, uid)? else {
             return Ok(None);
         };
         let admission = self.admitted_successor(&read.offer_request_id, actor)?;
@@ -177,11 +218,11 @@ impl FreshV30Lane {
 
     pub fn submit_successor_delivery(
         &mut self, offer_request_id: &str, delivery_request_id: &str,
-        actor: &FreshRecipientIdentity,
+        actor: &FreshRecipientIdentity, uid: u32,
     ) -> Result<FreshSuccessorDelivery, String> {
         validate_request_id(delivery_request_id)?;
         let admission = self.admitted_successor(offer_request_id, actor)?;
-        if let Some((existing, _)) = self.successor_grant_by_request(delivery_request_id, actor)? {
+        if let Some((existing, _)) = self.successor_grant_by_request(delivery_request_id, actor, uid)? {
             self.verify_successor_grant(&existing, &admission)?;
             return Err("successor F already granted; use exact readback/recovery".into());
         }
@@ -199,7 +240,7 @@ impl FreshV30Lane {
         if i64::try_from(payload.len()).ok() != Some(len) || sha256_hex(&payload) != sha {
             return Err("successor F bytes differ from admitted payload".into());
         }
-        self.ensure_successor_receipt_directory()?;
+        self.ensure_successor_receipt_directory(uid)?;
         let grant_id = Uuid::new_v4().to_string();
         let token = Uuid::new_v4().to_string();
         let identity = Self::recipient_identity_json(actor)?;
@@ -207,10 +248,10 @@ impl FreshV30Lane {
             "INSERT INTO fresh_successor_grant
              (grant_id,delivery_request_id,delivery_token,generation,offer_request_id,
               session_id,seq,source_id,attempt_id,lane_id,source_generation,root_id,
-              owner_generation,successor_identity,payload_sha256,payload_byte_len,phase,created_at)
+              owner_generation,successor_identity,recipient_uid,payload_sha256,payload_byte_len,phase,created_at)
              SELECT ?1,?2,?3,a.generation,a.offer_request_id,a.session_id,a.seq,
                     a.source_id,a.attempt_id,a.lane_id,a.source_generation,a.root_id,
-                    a.owner_generation,a.successor_identity,a.payload_sha256,
+                    a.owner_generation,a.successor_identity,?10,a.payload_sha256,
                     a.payload_byte_len,'unknown',?5
              FROM fresh_successor_admission a
              JOIN mailbox m ON m.session_id=a.session_id AND m.seq=a.seq
@@ -225,23 +266,23 @@ impl FreshV30Lane {
                AND NOT EXISTS (SELECT 1 FROM fresh_recipient_grant g
                  WHERE g.session_id=a.session_id AND g.seq=a.seq)",
             params![grant_id,delivery_request_id,token,offer_request_id,
-                Utc::now().to_rfc3339(),identity,offer.generation,sha,len],
+                Utc::now().to_rfc3339(),identity,offer.generation,sha,len,uid],
         ).map_err(|e| format!("successor F grant refused: {e}"))?;
         if changed != 1 { return Err("successor F exact row changed before grant".into()); }
-        let (readback, _) = self.successor_grant_by_request(delivery_request_id, actor)?
+        let (readback, _) = self.successor_grant_by_request(delivery_request_id, actor, uid)?
             .ok_or("successor F grant readback absent")?;
         self.verify_successor_grant(&readback, &admission)?;
         Ok(FreshSuccessorDelivery {
-            receipt_path:self.successor_receipt_path(&grant_id)?
+            receipt_path:self.successor_receipt_path(&grant_id, uid)?
                 .to_string_lossy().into_owned(),
             readback,delivery_token:token,payload,
         })
     }
 
     pub fn recover_successor_delivery(
-        &self, delivery_request_id: &str, actor: &FreshRecipientIdentity,
+        &self, delivery_request_id: &str, actor: &FreshRecipientIdentity, uid: u32,
     ) -> Result<FreshSuccessorDelivery, String> {
-        let (readback, token) = self.successor_grant_by_request(delivery_request_id, actor)?
+        let (readback, token) = self.successor_grant_by_request(delivery_request_id, actor, uid)?
             .ok_or("successor F request has no durable grant")?;
         let admission = self.admitted_successor(&readback.offer_request_id, actor)?;
         self.verify_successor_grant(&readback, &admission)?;
@@ -252,7 +293,7 @@ impl FreshV30Lane {
             &readback.grant.lane_id,&readback.grant.session_id,readback.grant.seq
         )?;
         Ok(FreshSuccessorDelivery {
-            receipt_path:self.successor_receipt_path(&readback.grant.grant_id)?
+            receipt_path:self.successor_receipt_path(&readback.grant.grant_id, uid)?
                 .to_string_lossy().into_owned(),
             readback,delivery_token:token,payload,
         })
@@ -271,15 +312,15 @@ impl FreshV30Lane {
 
     fn read_successor_receipt_file(
         &self, read: &FreshSuccessorDeliveryReadback, token: &str,
-        actor: &FreshRecipientIdentity,
+        actor: &FreshRecipientIdentity, uid: u32,
     ) -> Result<(String, i64, i64), String> {
         use std::os::unix::fs::MetadataExt as _;
-        let path = self.successor_receipt_path(&read.grant.grant_id)?;
+        let path = self.successor_receipt_path(&read.grant.grant_id, uid)?;
         let file = OpenOptions::new().read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(&path).map_err(|e| format!("successor receiver receipt absent: {e}"))?;
         let meta = file.metadata().map_err(|e| e.to_string())?;
-        if !meta.is_file() || meta.uid() != 0 || meta.nlink() != 1
+        if !meta.is_file() || meta.uid() != uid || meta.nlink() != 1
             || meta.mode() & 0o777 != 0o400 || meta.len() > 8192 {
             return Err("successor receiver receipt file untrusted".into());
         }
@@ -310,14 +351,14 @@ impl FreshV30Lane {
     }
 
     pub fn certify_successor_receipt(
-        &mut self, delivery_request_id: &str, actor: &FreshRecipientIdentity,
+        &mut self, delivery_request_id: &str, actor: &FreshRecipientIdentity, uid: u32,
     ) -> Result<String, String> {
-        let (read,token) = self.successor_grant_by_request(delivery_request_id,actor)?
+        let (read,token) = self.successor_grant_by_request(delivery_request_id,actor,uid)?
             .ok_or("successor F grant absent for receipt")?;
         let admission = self.admitted_successor(&read.offer_request_id,actor)?;
         self.verify_successor_grant(&read,&admission)?;
         if read.grant.phase == "acked" { return Err("successor receipt already ACKed".into()); }
-        let (digest,device,inode) = self.read_successor_receipt_file(&read,&token,actor)?;
+        let (digest,device,inode) = self.read_successor_receipt_file(&read,&token,actor,uid)?;
         let identity = Self::recipient_identity_json(actor)?;
         self.sidecar.mailbox().conn.execute(
             "INSERT INTO fresh_successor_receipt
@@ -359,9 +400,9 @@ impl FreshV30Lane {
     }
 
     pub fn read_successor_receipt(
-        &self, delivery_request_id: &str, actor: &FreshRecipientIdentity,
+        &self, delivery_request_id: &str, actor: &FreshRecipientIdentity, uid: u32,
     ) -> Result<Option<String>, String> {
-        let Some((read,token)) = self.successor_grant_by_request(delivery_request_id,actor)?
+        let Some((read,token)) = self.successor_grant_by_request(delivery_request_id,actor,uid)?
             else { return Ok(None); };
         let admission = self.admitted_successor(&read.offer_request_id,actor)?;
         self.verify_successor_grant(&read,&admission)?;
@@ -379,7 +420,7 @@ impl FreshV30Lane {
             |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
         ).optional().map_err(|e| e.to_string())?;
         if let Some((sha,dev,ino)) = &durable {
-            if self.read_successor_receipt_file(&read,&token,actor)? !=
+            if self.read_successor_receipt_file(&read,&token,actor,uid)? !=
                 (sha.clone(),*dev,*ino) {
                 return Err("successor receiver receipt changed after certification".into());
             }
@@ -389,17 +430,17 @@ impl FreshV30Lane {
 
     pub fn acknowledge_successor_delivery(
         &mut self, delivery_request_id: &str, token: &str,
-        actor: &FreshRecipientIdentity,
+        actor: &FreshRecipientIdentity, uid: u32,
     ) -> Result<FreshSuccessorDeliveryReadback, String> {
         validate_request_id(token)?;
-        let (read,stored_token) = self.successor_grant_by_request(delivery_request_id,actor)?
+        let (read,stored_token) = self.successor_grant_by_request(delivery_request_id,actor,uid)?
             .ok_or("successor F grant absent for ACK")?;
         if read.grant.phase == "acked" || stored_token != token {
             return Err("successor ACK token consumed or wrong".into());
         }
         let admission = self.admitted_successor(&read.offer_request_id,actor)?;
         self.verify_successor_grant(&read,&admission)?;
-        let receipt = self.read_successor_receipt(delivery_request_id,actor)?
+        let receipt = self.read_successor_receipt(delivery_request_id,actor,uid)?
             .ok_or("successor receiver receipt absent; ACK refused")?;
         let identity = Self::recipient_identity_json(actor)?;
         let now = Utc::now().to_rfc3339();
@@ -464,17 +505,17 @@ impl FreshV30Lane {
             return Err("successor ACK immutable evidence absent".into());
         }
         tx.commit().map_err(|e| e.to_string())?;
-        self.read_successor_ack(delivery_request_id,actor)?
+        self.read_successor_ack(delivery_request_id,actor,uid)?
             .ok_or("successor ACK readback absent".into())
     }
 
     pub fn read_successor_ack(
-        &self, delivery_request_id: &str, actor: &FreshRecipientIdentity,
+        &self, delivery_request_id: &str, actor: &FreshRecipientIdentity, uid: u32,
     ) -> Result<Option<FreshSuccessorDeliveryReadback>, String> {
-        let Some(read) = self.read_successor_delivery(delivery_request_id,actor)?
+        let Some(read) = self.read_successor_delivery(delivery_request_id,actor,uid)?
             else { return Ok(None); };
         if read.grant.phase != "acked" { return Ok(None); }
-        let receipt = self.read_successor_receipt(delivery_request_id,actor)?
+        let receipt = self.read_successor_receipt(delivery_request_id,actor,uid)?
             .ok_or("successor ACK lacks durable receiver receipt")?;
         let identity = Self::recipient_identity_json(actor)?;
         let exact: bool = self.sidecar.mailbox().conn.query_row(

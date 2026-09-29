@@ -263,7 +263,11 @@ fn require_bootstrap_parent(parent: &Path) -> Result<(), String> {
     #[cfg(feature = "age319-private-broker-fixture")]
     if fs::read_to_string("/proc/self/uid_map")
         .ok()
-        .is_some_and(|map| map.split_ascii_whitespace().nth(2) == Some("1"))
+        .is_some_and(|map| {
+            map.split_ascii_whitespace()
+                .nth(1)
+                .is_some_and(|host| host != "0")
+        })
     {
         return require_broker_root(parent);
     }
@@ -3380,7 +3384,11 @@ fn require_broker_root(path: &Path) -> Result<(), String> {
     #[cfg(feature = "age319-private-broker-fixture")]
     if fs::read_to_string("/proc/self/uid_map")
         .ok()
-        .is_some_and(|map| map.split_ascii_whitespace().nth(2) == Some("1"))
+        .is_some_and(|map| {
+            map.split_ascii_whitespace()
+                .nth(1)
+                .is_some_and(|host| host != "0")
+        })
     {
         let meta = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
         if path.is_absolute()
