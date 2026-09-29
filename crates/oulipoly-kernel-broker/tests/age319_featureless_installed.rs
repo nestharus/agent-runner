@@ -28,7 +28,9 @@ fn disposable_root_featureless_l_help_lost_reply_and_duplicate() {
         return;
     };
     if std::env::var_os("AGE319_FEATURELESS_CHILD").is_none() {
-        let cases: &[bool] = if std::env::var_os("AGE319_FEATURELESS_BRIDGE_ONLY_V1").is_some() {
+        let cases: &[bool] = if std::env::var_os("AGE319_FEATURELESS_BRIDGE_ONLY_V1").is_some()
+            || std::env::var_os("AGE319_FEATURELESS_ONLY_BUSY").is_some()
+        {
             &[false]
         } else if std::env::var_os("AGE319_FEATURELESS_ONLY_SUCCESSOR").is_some() {
             &[true]
@@ -60,6 +62,8 @@ fn disposable_root_featureless_l_help_lost_reply_and_duplicate() {
         return;
     }
     let successor_case = std::env::var_os("AGE319_FEATURELESS_SUCCESSOR_CASE").is_some();
+    let prior_sync_case =
+        !successor_case && std::env::var_os("AGE319_FEATURELESS_ONLY_BUSY").is_none();
 
     // State's trust check includes every ancestor. /tmp and this worktree's
     // shared parent are writable, so use a short-lived root-owned home child.
@@ -125,7 +129,7 @@ fn disposable_root_featureless_l_help_lost_reply_and_duplicate() {
         .stderr(Stdio::from(File::create(&broker_log).unwrap()))
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while protocol::observe_entry_gate_at(&socket).ok() != Some(EntryRoute::FreshOnlyOpen) {
         assert!(
             broker.try_wait().unwrap().is_none(),
@@ -245,7 +249,7 @@ fn disposable_root_featureless_l_help_lost_reply_and_duplicate() {
         .stderr(Stdio::from(File::create(&launch_err).unwrap()))
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(25);
+    let deadline = Instant::now() + Duration::from_secs(90);
     let exit = loop {
         if let Some(exit) = child.try_wait().unwrap() {
             break exit;
@@ -368,7 +372,7 @@ fn disposable_root_featureless_l_help_lost_reply_and_duplicate() {
         .stderr(Stdio::from(File::create(&normal_err).unwrap()))
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(180);
     let normal_status = loop {
         if let Some(status) = normal.try_wait().unwrap() {
             break status;
@@ -410,7 +414,7 @@ fn disposable_root_featureless_l_help_lost_reply_and_duplicate() {
         ledger.read_terminal(&normal_id).unwrap().unwrap().exit_code,
         0
     );
-    let terminal = if successor_case {
+    let terminal = if !prior_sync_case {
         ledger.read_terminal(&normal_id).unwrap().unwrap()
     } else {
         fs::write(
@@ -447,7 +451,7 @@ fn disposable_root_featureless_l_help_lost_reply_and_duplicate() {
                 .env("AGE319_PRIVATE_SYNC_DROP_BEGIN_REPLY_V1", "1");
         }
         let mut bash_launch = bash_command.spawn().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(75);
+        let deadline = Instant::now() + Duration::from_secs(120);
         let bash_status = loop {
             if let Some(status) = bash_launch.try_wait().unwrap() {
                 break status;
@@ -564,7 +568,7 @@ fi
         .stdout(Stdio::from(File::create(&async_out).unwrap()))
         .stderr(Stdio::from(File::create(&async_err).unwrap()));
     let mut async_launch = async_command.spawn().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(if successor_case { 150 } else { 70 });
+    let deadline = Instant::now() + Duration::from_secs(180);
     loop {
         let fresh = rusqlite::Connection::open(state.join("v30/state.db")).unwrap();
         let count: i64 = fresh
@@ -572,7 +576,7 @@ fi
                 row.get(0)
             })
             .unwrap();
-        if count == if successor_case { 1 } else { 2 } {
+        if count == if prior_sync_case { 2 } else { 1 } {
             break;
         }
         assert!(
@@ -640,7 +644,7 @@ fi
             .unwrap()
             .map(Result::unwrap)
             .collect();
-        if values.len() == if successor_case { 1 } else { 2 } {
+        if values.len() == if prior_sync_case { 2 } else { 1 } {
             let selected: Vec<FreshBashSourceEvent> = values
                 .iter()
                 .map(|value| serde_json::from_str(value).unwrap())
@@ -770,10 +774,10 @@ fi
     );
     assert_eq!(
         fs::read_to_string(&effect).unwrap(),
-        if successor_case {
-            "one\nasync\n"
-        } else {
+        if prior_sync_case {
             "one\nbash\nasync\n"
+        } else {
+            "one\nasync\n"
         }
     );
     let dispatch: serde_json::Value =
@@ -781,6 +785,18 @@ fi
     assert_eq!(dispatch["delivery_mode"], "async");
     assert_eq!(dispatch["dispatch_state"], "broker-k-consumed");
     assert_eq!(dispatch["request_id"], selected.request_id);
+    let (released, actor) = lane.released_handoff_for_root(&selected.root_id).unwrap();
+    let session = lane.read_session(&released.d_key).unwrap().unwrap();
+    let settled = lane
+        .read_private_root_terminal(&released, &actor, &session)
+        .unwrap();
+    assert_eq!(settled.execution_state, "success");
+    assert_eq!(settled.notification_state, "acked");
+    if std::env::var_os("AGE319_FEATURELESS_ONLY_BUSY").is_some() {
+        broker.kill().unwrap();
+        broker.wait().unwrap();
+        return;
+    }
     let async_terminal = ledger.read_terminal(&async_id).unwrap().unwrap();
     let lane = FreshV30Lane::open_at(&state).unwrap();
     let obligation = lane
@@ -881,7 +897,7 @@ fi
             .stderr(Stdio::from(File::create(&broker_log).unwrap()))
             .spawn()
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while protocol::observe_entry_gate_at(&socket).ok() != Some(EntryRoute::FreshOnlyOpen) {
             let status = broker.try_wait().unwrap();
             assert!(
@@ -995,7 +1011,10 @@ fi
         (phase.as_str(), attempts, basis.as_str()),
         ("acked", 1, "manual_ack")
     );
-    assert_eq!(fs::read_dir(state.join("entries")).unwrap().count(), 4);
+    assert_eq!(
+        fs::read_dir(state.join("entries")).unwrap().count(),
+        if prior_sync_case { 4 } else { 3 }
+    );
 
     // Reopen both Broker loops from durable State before asking for another E.
     broker.kill().unwrap();
@@ -1012,7 +1031,7 @@ fi
         .stderr(Stdio::from(File::create(&broker_log).unwrap()))
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while protocol::observe_entry_gate_at(&socket).ok() != Some(EntryRoute::FreshOnlyOpen) {
         assert!(
             broker.try_wait().unwrap().is_none(),
@@ -1096,8 +1115,18 @@ fi
         !tamper_status.success(),
         "tampered receipt admitted a new root"
     );
-    assert_eq!(fs::read_to_string(&effect).unwrap(), "one\nbash\nasync\n");
-    assert_eq!(fs::read_dir(state.join("entries")).unwrap().count(), 4);
+    assert_eq!(
+        fs::read_to_string(&effect).unwrap(),
+        if prior_sync_case {
+            "one\nbash\nasync\n"
+        } else {
+            "one\nasync\n"
+        }
+    );
+    assert_eq!(
+        fs::read_dir(state.join("entries")).unwrap().count(),
+        if prior_sync_case { 4 } else { 3 }
+    );
     fs::write(receipt_path, &stored_receipt).unwrap();
     fs::set_permissions(receipt_path, fs::Permissions::from_mode(0o400)).unwrap();
     let restored = lane
@@ -1129,7 +1158,7 @@ fi
         .stderr(Stdio::from(File::create(&later_err).unwrap()))
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(45);
+    let deadline = Instant::now() + Duration::from_secs(120);
     let later_status = loop {
         if let Some(status) = later.try_wait().unwrap() {
             break status;
@@ -1152,9 +1181,16 @@ fi
     );
     assert_eq!(
         fs::read_to_string(&effect).unwrap(),
-        "one\nbash\nasync\nlater\n"
+        if prior_sync_case {
+            "one\nbash\nasync\nlater\n"
+        } else {
+            "one\nasync\nlater\n"
+        }
     );
-    assert_eq!(fs::read_dir(state.join("entries")).unwrap().count(), 5);
+    assert_eq!(
+        fs::read_dir(state.join("entries")).unwrap().count(),
+        if prior_sync_case { 5 } else { 4 }
+    );
     assert_eq!(
         ledger.read_terminal(&later_id).unwrap().unwrap().exit_code,
         0

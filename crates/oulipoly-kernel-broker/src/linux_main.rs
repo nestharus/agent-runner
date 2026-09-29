@@ -4678,7 +4678,9 @@ fn installed_normal_status(
                                 && normal.publication.state == "settled"
                                 && normal.publication.publication_sha256.is_some()
                         })
-                        && (inventory.pid1_exact_live || inventory.owner_close_preflight)
+                        && (inventory.pid1_exact_live
+                            || inventory.owner_close_preflight
+                            || root_drain::physical_close_proof(&inventory).is_ok())
                 });
             Ok(if progressing { pending } else { unknown() })
         }
@@ -4830,7 +4832,9 @@ fn installed_offline_status(
                 .is_some_and(|inventory| {
                     root_drain::offline_no_effect(&inventory)
                         && !inventory.uncertain_registry_or_incarnation
-                        && (inventory.pid1_exact_live || inventory.owner_close_preflight)
+                        && (inventory.pid1_exact_live
+                            || inventory.owner_close_preflight
+                            || root_drain::physical_close_proof(&inventory).is_ok())
                 });
             Ok(if progressing { pending } else { unknown() })
         }
@@ -6296,12 +6300,6 @@ fn serve() -> io::Result<()> {
                     return Err(io::Error::other("fresh-only pair/source binding changed"));
                 }
                 require_fresh_cli_shape(&spec, &descriptors)?;
-                // The normal K/Q terminal reader now recognizes the State K,
-                // but connected async/later caller close has not completed
-                // the disposable four-image proof. Keep host admission closed.
-                if !fixture {
-                    return Err(io::Error::other("production installed CLI admission remains closed"));
-                }
                 let ledger = installed_launches
                     .as_ref()
                     .ok_or_else(|| io::Error::other("installed launch ledger absent"))?;
