@@ -2774,6 +2774,12 @@ fn run_normal_model(
     {
         connected_async_bash_recipient(&socket, &receipt.d_key, &PathBuf::from(directory))?;
     }
+    #[cfg(not(feature = "age319-private-broker-fixture"))]
+    crate::installed_async_recipient::settle_pending_original(
+        &socket,
+        &receipt.d_key,
+        private_userns_broker_socket().is_some(),
+    )?;
     let publication =
         protocol::publish_fresh_normal_provider_at(
             &socket,

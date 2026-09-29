@@ -1,5 +1,6 @@
 #![cfg(all(target_os = "linux", not(feature = "age319-private-broker-fixture")))]
 
+use base64::Engine as _;
 use oulipoly_kernel_broker::first_install_activation::{FirstInstallActivation, PairPaths};
 use oulipoly_kernel_broker::installed_launch_ledger::InstalledLaunchLedger;
 use oulipoly_kernel_broker::installed_pair::InstalledPair;
@@ -461,6 +462,183 @@ fn disposable_root_featureless_l_help_lost_reply_and_duplicate() {
     assert_eq!(publications, 1);
     drop(fresh);
 
+    // The original installed Runner remains live while an actual async Bash
+    // child completes. The provider waits only as a namespace lifetime barrier;
+    // it cannot manufacture the Runner's separately received F bytes.
+    fs::write(
+        &provider,
+        br#"#!/bin/sh
+export OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1="$AGE319_BASH_CONTROL_SOCKET"
+response=$("$AGE319_BASH_IMAGE" run --delivery async -- /bin/sh -c 'while [ ! -f "$AGE319_CHILD_RELEASE_FILE" ]; do sleep 0.02; done; printf "async\n" >> "$AGE319_EFFECT_FILE"; printf "async-child-out\n"; printf "async-child-err\n" >&2') || exit
+printf '%s\n' "$response"
+while [ ! -f "$AGE319_PROVIDER_RELEASE_FILE" ]; do sleep 0.02; done
+"#,
+    )
+    .unwrap();
+    let async_id = uuid::Uuid::new_v4().to_string();
+    let async_out = temp.path().join("async.out");
+    let async_err = temp.path().join("async.err");
+    let child_release = temp.path().join("async-child-release");
+    let provider_release = temp.path().join("async-provider-release");
+    let mut async_launch = Command::new(&launcher)
+        .args(["--model", "fixture-model", "hello async"])
+        .env_clear()
+        .env("HOME", temp.path())
+        .env("PATH", "/usr/bin:/bin")
+        .env("OULIPOLY_CONFIG_HOME", &config_home)
+        .env("OULIPOLY_DATA_DIR", temp.path().join("data"))
+        .env("AGE319_EFFECT_FILE", &effect)
+        .env("AGE319_BASH_IMAGE", &bash)
+        .env("AGE319_BASH_CONTROL_SOCKET", &socket)
+        .env("AGE319_CHILD_RELEASE_FILE", &child_release)
+        .env("AGE319_PROVIDER_RELEASE_FILE", &provider_release)
+        .env("AGE319_TEST_FEATURELESS_DROP_F_REPLY_V1", "1")
+        .env("AGE319_TEST_FEATURELESS_DROP_ACK_REPLY_V1", "1")
+        .env("AGE319_TEST_FEATURELESS_REPLAY_ACK_V1", "1")
+        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_PAIR_V1", &manifest)
+        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_LAUNCHER_V1", &launcher)
+        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+        .env("OULIPOLY_AGE319_PRIVATE_REQUEST_ID_V1", &async_id)
+        .stdout(Stdio::from(File::create(&async_out).unwrap()))
+        .stderr(Stdio::from(File::create(&async_err).unwrap()))
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(70);
+    loop {
+        let fresh = rusqlite::Connection::open(state.join("v30/state.db")).unwrap();
+        let count: i64 = fresh
+            .query_row("SELECT count(*) FROM fresh_bash_child", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        if count == 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "async C absent: {}",
+            fs::read_to_string(&async_err).unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(async_launch.try_wait().unwrap().is_none());
+    fs::write(&child_release, b"release").unwrap();
+    let selected: FreshBashSourceEvent = loop {
+        let fresh = rusqlite::Connection::open(state.join("v30/state.db")).unwrap();
+        let values: Vec<String> = fresh
+            .prepare("SELECT receipt_json FROM fresh_bash_selected_event")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        if values.len() == 2 {
+            let selected: Vec<FreshBashSourceEvent> = values
+                .iter()
+                .map(|value| serde_json::from_str(value).unwrap())
+                .collect();
+            break selected
+                .into_iter()
+                .find(|value| value.root_id != terminal.physical.root_id)
+                .unwrap();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "async selected W absent: {} / {}",
+            fs::read_to_string(&async_err).unwrap(),
+            fs::read_to_string(&broker_log).unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(selected.tree_drained && selected.output_closed);
+    assert!(
+        async_launch.try_wait().unwrap().is_none(),
+        "provider lifetime barrier failed"
+    );
+    fs::write(&provider_release, b"release").unwrap();
+    let async_status = loop {
+        if let Some(status) = async_launch.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "async launcher timed out: {} / {}",
+            fs::read_to_string(&async_err).unwrap(),
+            fs::read_to_string(&broker_log).unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert!(
+        async_status.success(),
+        "async: {} / broker: {}",
+        fs::read_to_string(&async_err).unwrap(),
+        fs::read_to_string(&broker_log).unwrap()
+    );
+    assert_eq!(fs::read_to_string(&effect).unwrap(), "one\nbash\nasync\n");
+    let dispatch: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&async_out).unwrap()).unwrap();
+    assert_eq!(dispatch["delivery_mode"], "async");
+    assert_eq!(dispatch["dispatch_state"], "broker-k-consumed");
+    assert_eq!(dispatch["request_id"], selected.request_id);
+    let async_terminal = ledger.read_terminal(&async_id).unwrap().unwrap();
+    assert_eq!(async_terminal.exit_code, 0);
+    assert!(async_terminal.physical.pid1_echild_receipt);
+    assert!(async_terminal.physical.pid1_parent_wait_proof);
+    assert_eq!(
+        async_terminal.physical.work_retired,
+        async_terminal.physical.work_records
+    );
+    let receipt_dir = temp.path().join("data/async-recipient-receipts");
+    let receipts: Vec<_> = fs::read_dir(&receipt_dir)
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".receipt.json")
+        })
+        .collect();
+    let [receipt_file] = receipts.as_slice() else {
+        panic!("expected one independent async receiver receipt");
+    };
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&fs::read(receipt_file.path()).unwrap()).unwrap();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(receipt["payload_base64"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(
+        receipt["observed_sha256"],
+        format!("{:x}", Sha256::digest(&bytes))
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(payload["source"], serde_json::to_value(&selected).unwrap());
+    assert_eq!(
+        payload["stdout_bytes"],
+        serde_json::json!(b"async-child-out\n".to_vec())
+    );
+    assert_eq!(
+        payload["stderr_bytes"],
+        serde_json::json!(b"async-child-err\n".to_vec())
+    );
+    assert_eq!(receipt["grant"]["root_id"], async_terminal.physical.root_id);
+    let sidecar = rusqlite::Connection::open(state.join("v30/sidecar/pid-identity.db")).unwrap();
+    let (phase, attempts, basis): (String, i64, String) = sidecar
+        .query_row(
+            "SELECT g.phase,m.delivery_attempts,e.basis FROM fresh_recipient_grant g
+         JOIN mailbox m ON m.session_id=g.session_id AND m.seq=g.seq
+         JOIN fresh_recipient_ack_evidence e ON e.grant_id=g.grant_id
+         WHERE g.grant_id=?1",
+            [receipt["grant"]["grant_id"].as_str().unwrap()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (phase.as_str(), attempts, basis.as_str()),
+        ("acked", 1, "manual_ack")
+    );
+    assert_eq!(fs::read_dir(state.join("entries")).unwrap().count(), 4);
+
     // Reopen both Broker loops from durable State before asking for another E.
     broker.kill().unwrap();
     broker.wait().unwrap();
@@ -487,7 +665,12 @@ fn disposable_root_featureless_l_help_lost_reply_and_duplicate() {
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    // A fourth E must revalidate the fully closed Bash root as history.
+    assert_eq!(
+        ledger.read_terminal(&async_id).unwrap().unwrap(),
+        async_terminal
+    );
+
+    // A later E must revalidate the fully closed async root as history.
     fs::write(
         &provider,
         b"#!/bin/sh\ncat >/dev/null\nprintf 'later\\n' >> \"$AGE319_EFFECT_FILE\"\nprintf 'later-ok\\n'\n",
@@ -532,8 +715,11 @@ fn disposable_root_featureless_l_help_lost_reply_and_duplicate() {
         fs::read_to_string(&later_err).unwrap(),
         fs::read_to_string(&broker_log).unwrap()
     );
-    assert_eq!(fs::read_to_string(&effect).unwrap(), "one\nbash\nlater\n");
-    assert_eq!(fs::read_dir(state.join("entries")).unwrap().count(), 4);
+    assert_eq!(
+        fs::read_to_string(&effect).unwrap(),
+        "one\nbash\nasync\nlater\n"
+    );
+    assert_eq!(fs::read_dir(state.join("entries")).unwrap().count(), 5);
     assert_eq!(
         ledger.read_terminal(&later_id).unwrap().unwrap().exit_code,
         0

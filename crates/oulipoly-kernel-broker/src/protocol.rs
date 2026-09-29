@@ -2039,6 +2039,40 @@ pub fn fresh_recipient_request_at(
     serde_json::from_slice(&answer).map_err(io::Error::other)
 }
 
+/// Send one exact F operation and intentionally discard its answer. This is
+/// useful for exercising the ordinary request-ID recovery contract after an
+/// uncertain reply; it does not mint a second delivery request.
+pub fn fresh_recipient_request_without_reply_at(
+    path: &Path,
+    request: &FreshRecipientRequest,
+) -> io::Result<()> {
+    let body = serde_json::to_vec(request)?;
+    if body.len() > 8192 {
+        return Err(io::Error::other("fresh recipient request too large"));
+    }
+    let mut stream = checked_connection(path)?;
+    stream.set_read_timeout(Some(FRESH_RECIPIENT_IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(FRESH_RECIPIENT_IO_TIMEOUT))?;
+    let mut challenge = [0u8; 16];
+    stream.read_exact(&mut challenge)?;
+    let mut frame = Vec::with_capacity(17 + body.len());
+    frame.push(b'F');
+    frame.extend_from_slice(&challenge);
+    frame.extend_from_slice(&body);
+    if unsafe {
+        libc::send(
+            stream.as_raw_fd(),
+            frame.as_ptr().cast(),
+            frame.len(),
+            libc::MSG_NOSIGNAL,
+        )
+    } != frame.len() as isize
+    {
+        return Err(io::Error::other("short fresh recipient request"));
+    }
+    Ok(())
+}
+
 /// Persist an independent receiver receipt from the actual Broker F bytes.
 /// The reply is the only payload input; this never consults a State lookup.
 /// An existing exact receipt is usable after a lost certification reply.
