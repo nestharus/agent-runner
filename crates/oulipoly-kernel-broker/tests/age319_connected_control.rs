@@ -5,7 +5,7 @@ use oulipoly_kernel_broker::installed_pair::InstalledPair;
 use oulipoly_kernel_broker::protocol::{EntryRoute, Operation, observe_entry_gate_at, request_at};
 use oulipoly_state::mailbox::EmptyV30BootstrapIdentity;
 use sha2::{Digest, Sha256};
-use std::fs;
+use std::fs::{self, File};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
@@ -19,7 +19,7 @@ fn digest(path: &Path) -> String {
 }
 
 #[test]
-fn root_mapped_connected_l_reserves_exact_e_and_direct_runner_refuses() {
+fn root_mapped_connected_l_reaches_ordinary_help_with_exact_one_use_custody() {
     let Ok(runner_bin) = std::env::var("AGE319_CONNECTED_RUNNER_BIN") else {
         return;
     };
@@ -29,7 +29,7 @@ fn root_mapped_connected_l_reserves_exact_e_and_direct_runner_refuses() {
             .arg(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "root_mapped_connected_l_reserves_exact_e_and_direct_runner_refuses",
+                "root_mapped_connected_l_reaches_ordinary_help_with_exact_one_use_custody",
                 "--nocapture",
             ])
             .env("AGE319_CONNECTED_CHILD_TEST", "1")
@@ -77,6 +77,7 @@ fn root_mapped_connected_l_reserves_exact_e_and_direct_runner_refuses() {
     )
     .unwrap();
     let socket = temp.path().join("control.sock");
+    let broker_log = temp.path().join("broker.err");
     let mut broker = Command::new(&broker_image)
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &state)
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
@@ -86,6 +87,8 @@ fn root_mapped_connected_l_reserves_exact_e_and_direct_runner_refuses() {
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_LAUNCHER_V1", &launcher)
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_BASH_V1", &bash)
         .env("OULIPOLY_AGE319_PRIVATE_CONNECTED_CONTROL_V1", "1")
+        .env_remove("OULIPOLY_DATA_DIR")
+        .stderr(Stdio::from(File::create(&broker_log).unwrap()))
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -142,19 +145,24 @@ fn root_mapped_connected_l_reserves_exact_e_and_direct_runner_refuses() {
     assert_eq!(fs::read_dir(state.join("entries")).unwrap().count(), 0);
     let pause = temp.path().join("connected-pause");
     fs::create_dir(&pause).unwrap();
+    let caller_out = temp.path().join("caller.out");
+    let caller_err = temp.path().join("caller.err");
     let launcher_status = Command::new(&launcher)
         .arg("--help")
         .env_clear()
         .env("HOME", temp.path())
         .env("PATH", "/usr/bin:/bin")
         .env("OULIPOLY_AGE319_PRIVATE_DUPLICATE_L_V1", "1")
+        .env("AGE319_PRIVATE_CONNECTED_ORDINARY_CHILD_V1", "1")
+        .env("AGE319_PRIVATE_CONNECTED_J_REPLAY_V1", "1")
         .env("AGE319_CONNECTED_PAUSE_DIR", &pause)
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
         .env(
             "OULIPOLY_KERNEL_BROKER_FIXTURE_GENERATION_V1",
             &pair.generation,
         )
-        .stdout(Stdio::null())
+        .stdout(Stdio::from(File::create(&caller_out).unwrap()))
+        .stderr(Stdio::from(File::create(&caller_err).unwrap()))
         .status()
         .unwrap();
     assert_eq!(launcher_status.code(), Some(70)); // L remains pending/unknown.
@@ -198,6 +206,147 @@ fn root_mapped_connected_l_reserves_exact_e_and_direct_runner_refuses() {
     let reserved: serde_json::Value = serde_json::from_slice(&fs::read(&entry).unwrap()).unwrap();
     assert_eq!(reserved["root_id"], root_id);
     assert_eq!(fs::read_dir(state.join("entries")).unwrap().count(), 1);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let joined = loop {
+        let record: serde_json::Value = serde_json::from_slice(&fs::read(&entry).unwrap()).unwrap();
+        if record["join_consumed"] == true && record["joined_child"].is_object() {
+            break record;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "connected P/G/A/J stalled: entry={record} caller={} broker={}",
+            fs::read_to_string(&caller_err).unwrap_or_default(),
+            fs::read_to_string(&broker_log).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(joined["guardian"].is_object());
+    assert_eq!(joined["prepared_guardian"], joined["guardian"]);
+    assert!(joined["domain_id"].is_string());
+    assert!(joined["supervisor_authority_id"].is_string());
+    assert_ne!(joined["entry"], joined["guardian"]);
+    assert_ne!(joined["joined_child"], joined["guardian"]);
+    let handoff_path = state
+        .join("released-handoffs")
+        .join(format!("{root_id}.json"));
+    let handoff: serde_json::Value = loop {
+        if let Ok(bytes) = fs::read(&handoff_path)
+            && let Ok(handoff) = serde_json::from_slice(&bytes)
+        {
+            break handoff;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "connected release/U stalled: entry={} caller={} broker={}",
+            fs::read_to_string(&entry).unwrap_or_default(),
+            fs::read_to_string(&caller_err).unwrap_or_default(),
+            fs::read_to_string(&broker_log).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(handoff["old_release"]["prepared"]["root_id"], root_id);
+    assert_eq!(handoff["old_release"]["prepared"]["entry"], joined["entry"]);
+    assert_eq!(
+        handoff["old_release"]["prepared"]["guardian"],
+        joined["guardian"]
+    );
+    assert_eq!(
+        handoff["old_release"]["prepared"]["joined_child"],
+        joined["joined_child"]
+    );
+    assert_eq!(handoff["root_work_intent"]["kind"], "cli_help");
+    let d_key = handoff["d_key"].as_str().unwrap();
+    let fresh_db = state.join("v30/state.db");
+    loop {
+        let present = rusqlite::Connection::open_with_flags(
+            &fresh_db,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .ok()
+        .and_then(|db| {
+            db.query_row(
+                "SELECT count(*) FROM fresh_lane_session_admission WHERE request_id=?1",
+                [d_key],
+                |row| row.get::<_, i64>(0),
+            )
+            .ok()
+        });
+        if present == Some(1) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "connected D stalled: handoff={handoff} caller={} broker={}",
+            fs::read_to_string(&caller_err).unwrap_or_default(),
+            fs::read_to_string(&broker_log).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let fresh_sidecar = state.join("v30/sidecar/pid-identity.db");
+    loop {
+        let allocated = rusqlite::Connection::open_with_flags(
+            &fresh_sidecar,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .ok()
+        .and_then(|db| {
+            db.query_row(
+                "SELECT count(*) FROM fresh_lane_session WHERE request_id=?1",
+                [d_key],
+                |row| row.get::<_, i64>(0),
+            )
+            .ok()
+        });
+        if allocated == Some(1) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "connected D sidecar stalled: caller={} broker={}",
+            fs::read_to_string(&caller_err).unwrap_or_default(),
+            fs::read_to_string(&broker_log).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let help = loop {
+        let output = fs::read_to_string(&caller_out).unwrap_or_default();
+        if output.contains("Usage:") {
+            break output;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "ordinary --help did not run after D: stdout={output} caller={} broker={}",
+            fs::read_to_string(&caller_err).unwrap_or_default(),
+            fs::read_to_string(&broker_log).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(help.contains("oulipoly-agent-runner"));
+    loop {
+        let returned: String = rusqlite::Connection::open_with_flags(
+            &fresh_db,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap()
+        .query_row(
+            "SELECT state FROM fresh_root_effect WHERE handoff_id=?1",
+            [handoff["handoff_id"].as_str().unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+        if returned == "returned_success" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "ordinary --help did not return success: state={returned} caller={} broker={}",
+            fs::read_to_string(&caller_err).unwrap_or_default(),
+            fs::read_to_string(&broker_log).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!temp.path().join("state.db").exists());
+    assert!(!temp.path().join("pid-identity.db").exists());
     assert!(
         request_at(&socket, Operation::ReserveV30Entry)
             .unwrap()
