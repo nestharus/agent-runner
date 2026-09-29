@@ -25,6 +25,7 @@ pub mod root_pid1;
 pub mod source_acceptance;
 pub mod source_candidate;
 pub mod source_physical;
+pub mod successor_launch;
 pub mod work_registry;
 pub mod writer_census;
 

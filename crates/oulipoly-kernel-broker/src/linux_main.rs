@@ -84,6 +84,7 @@ use oulipoly_kernel_broker::source_acceptance::{
     read_v2_recipient_custody,
 };
 use oulipoly_kernel_broker::source_physical::{SourceObservation, SourcePhysicalRegistry};
+use oulipoly_kernel_broker::successor_launch::{Ledger as SuccessorLaunchLedger, LiveCandidate};
 use oulipoly_kernel_broker::work_registry::{
     Scope, WorkRegistry, classify_scope, classify_scope_readback,
 };
@@ -5807,6 +5808,18 @@ fn serve() -> io::Result<()> {
             )
         })
         .transpose()?;
+    // Validate both successor journals before the root registry classifies
+    // their names as installed evidence rather than root JSON records.
+    let _installed_successors = fresh_activation
+        .as_ref()
+        .map(|activation| {
+            SuccessorLaunchLedger::open(
+                Path::new(&state),
+                &activation.pair_generation,
+                &activation.source.source_generation,
+            )
+        })
+        .transpose()?;
     let host_namespace = host_proc_file("self/ns/pid")?;
     let mut registry = RootRegistry::open(&state)?;
     let admission_fences = Arc::new(Mutex::new(
@@ -7772,6 +7785,13 @@ fn serve_fresh_v30_at(
     let mut native_turn_execs: HashMap<String, fresh_provider::NativeTurnExec> = HashMap::new();
     #[cfg(feature = "age319-private-broker-fixture")]
     let mut native_f_execs: HashMap<String, fresh_provider::NativeFExec> = HashMap::new();
+    let successor_ledger = installed_identity
+        .as_ref()
+        .map(|(pair, source)| SuccessorLaunchLedger::open(state_root, pair, source))
+        .transpose()?;
+    // An old candidate record is readback only. Only this Broker incarnation
+    // owns an inherited gate and may authorize a first offer.
+    let mut live_successors = BTreeMap::<String, LiveCandidate>::new();
     for incoming in listener.incoming() {
         let Ok(mut stream) = incoming else { continue };
         stream.set_read_timeout(Some(FRESH_V30_READ_TIMEOUT))?;
@@ -10206,6 +10226,131 @@ fn serve_fresh_v30_at(
                             }
                             serde_json::json!({"kind":"bash_wake_successor_decision_readback","decision":decision})
                         }
+                        FreshRecipientRequest::StartInstalledSuccessor {
+                            d_key,
+                            offer_request_id,
+                        } => {
+                            if instance.is_closed() {
+                                return Err(io::Error::other("successor start entry gate closed"));
+                            }
+                            let ledger = successor_ledger.as_ref().ok_or_else(|| {
+                                io::Error::other("installed successor ledger absent")
+                            })?;
+                            if !private_fixture() && peer.uid == 0 {
+                                return Err(io::Error::other("host-root successor owner closed"));
+                            }
+                            let root = lane
+                                .released_handoff_for_child(&d_key, &recipient)
+                                .map_err(io::Error::other)?;
+                            let decision = lane
+                                .read_bash_wake_successor_decision_for_offer(&offer_request_id)
+                                .map_err(io::Error::other)?
+                                .ok_or_else(|| io::Error::other("successor W decision absent"))?;
+                            if decision.obligation.root_id != root.old_release.prepared.root_id
+                                || decision.obligation.original_identity != recipient
+                            {
+                                return Err(io::Error::other(
+                                    "successor start differs from pinned D",
+                                ));
+                            }
+                            let session = lane
+                                .read_session(&d_key)
+                                .map_err(io::Error::other)?
+                                .ok_or_else(|| {
+                                    io::Error::other("successor start D session absent")
+                                })?;
+                            let terminal = lane
+                                .read_private_root_terminal(&root, &recipient, &session)
+                                .map_err(io::Error::other)?;
+                            if terminal.notification_state != "pending_f"
+                                || terminal.listener_policy.as_deref() != Some("notify")
+                                || terminal.session_id != decision.obligation.session_id
+                                || terminal.mailbox_seq != Some(decision.obligation.seq)
+                                || terminal.delivery_payload_sha256.as_deref()
+                                    != Some(decision.obligation.payload_sha256.as_str())
+                                || terminal.delivery_grant_id.is_some()
+                                || terminal.original_receipt.is_some()
+                                || terminal.successor_ack.is_some()
+                                || terminal.ack_basis.is_some()
+                            {
+                                return Err(io::Error::other(
+                                    "successor start requires one pending W without F/ACK",
+                                ));
+                            }
+                            let _fence = admission_fences
+                                .lock()
+                                .map_err(|_| io::Error::other("root admission fence poisoned"))?;
+                            if _fence.contains(&decision.obligation.root_id) {
+                                return Err(io::Error::other("successor start root fenced"));
+                            }
+                            let start = ledger.reserve(&d_key, &decision, &peer)?;
+                            // A failure after reserve is a spent start, not a retryable launch.
+                            let manifest = if private_fixture() {
+                                std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_PAIR_V1")
+                                    .map(PathBuf::from)
+                            } else {
+                                None
+                            };
+                            let control_socket = if private_fixture() {
+                                std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1")
+                                    .map(PathBuf::from)
+                                    .ok_or_else(|| {
+                                        io::Error::other("successor fixture control socket absent")
+                                    })?
+                            } else {
+                                PathBuf::from(SOCKET)
+                            };
+                            let mut live = LiveCandidate::spawn(
+                                &runner_image,
+                                &start,
+                                &control_socket,
+                                manifest.as_deref(),
+                            )?;
+                            ledger.record_candidate(&start, &live.record)?;
+                            let candidate = live.record.clone();
+                            live.issue(&start, &candidate)?;
+                            live_successors.insert(offer_request_id, live);
+                            serde_json::json!({"kind":"installed_successor_start","start":start,"candidate":candidate})
+                        }
+                        FreshRecipientRequest::ReadInstalledSuccessorStart {
+                            d_key,
+                            offer_request_id,
+                        } => {
+                            let ledger = successor_ledger.as_ref().ok_or_else(|| {
+                                io::Error::other("installed successor ledger absent")
+                            })?;
+                            let root = lane
+                                .released_handoff_for_child(&d_key, &recipient)
+                                .map_err(io::Error::other)?;
+                            let start = ledger.read_start(&offer_request_id)?;
+                            if start.as_ref().is_some_and(|start| {
+                                start.d_key != d_key
+                                    || start.decision.obligation.root_id
+                                        != root.old_release.prepared.root_id
+                                    || start.decision.obligation.original_identity != recipient
+                                    || start.owner_uid != peer.uid
+                            }) {
+                                return Err(io::Error::other(
+                                    "successor start readback actor changed",
+                                ));
+                            }
+                            if let Some(start) = &start {
+                                let decision = lane
+                                    .read_bash_wake_successor_decision_for_offer(&offer_request_id)
+                                    .map_err(io::Error::other)?;
+                                if decision.as_ref() != Some(&start.decision) {
+                                    return Err(io::Error::other(
+                                        "successor start lost selected W decision",
+                                    ));
+                                }
+                            }
+                            let candidate = if start.is_some() {
+                                ledger.read_candidate(&offer_request_id)?
+                            } else {
+                                None
+                            };
+                            serde_json::json!({"kind":"installed_successor_start_readback","start":start,"candidate":candidate})
+                        }
                         FreshRecipientRequest::OfferSuccessor {
                             allocation_request_id,
                             offer_request_id,
@@ -10214,6 +10359,33 @@ fn serve_fresh_v30_at(
                         } => {
                             if instance.is_closed() {
                                 return Err(io::Error::other("fresh successor entry gate closed"));
+                            }
+                            #[cfg(not(feature = "age319-private-broker-fixture"))]
+                            {
+                                let ledger = successor_ledger
+                                    .as_ref()
+                                    .ok_or_else(|| io::Error::other("successor ledger absent"))?;
+                                let start = ledger
+                                    .read_start(&offer_request_id)?
+                                    .ok_or_else(|| io::Error::other("successor start absent"))?;
+                                let candidate =
+                                    ledger.read_candidate(&offer_request_id)?.ok_or_else(|| {
+                                        io::Error::other("successor candidate absent")
+                                    })?;
+                                if start.d_key != allocation_request_id
+                                    || start.decision.obligation.seq != seq
+                                    || start.decision.obligation.source_id != source_id
+                                    || candidate.process != ProcessStamp::from(&peer.process)
+                                    || candidate.owner_uid != peer.uid
+                                {
+                                    return Err(io::Error::other(
+                                        "successor offer differs from installed start",
+                                    ));
+                                }
+                                live_successors
+                                    .get_mut(&offer_request_id)
+                                    .ok_or_else(|| io::Error::other("successor live gate absent"))?
+                                    .consume_offer(&peer)?;
                             }
                             let session = lane
                                 .read_session(&allocation_request_id)
@@ -10279,6 +10451,44 @@ fn serve_fresh_v30_at(
                                 .map_err(io::Error::other)?;
                             serde_json::json!({"kind":"successor_offer_readback", "offer":offer})
                         }
+                        FreshRecipientRequest::ReadInstalledSuccessorOffer {
+                            d_key,
+                            offer_request_id,
+                        } => {
+                            let root = lane
+                                .released_handoff_for_child(&d_key, &recipient)
+                                .map_err(io::Error::other)?;
+                            let (offered_d, offer) = lane
+                                .read_successor_offer_for_root(&offer_request_id, &recipient)
+                                .map_err(io::Error::other)?;
+                            let ledger = successor_ledger
+                                .as_ref()
+                                .ok_or_else(|| io::Error::other("successor ledger absent"))?;
+                            let start = ledger
+                                .read_start(&offer_request_id)?
+                                .ok_or_else(|| io::Error::other("successor start absent"))?;
+                            let candidate = ledger
+                                .read_candidate(&offer_request_id)?
+                                .ok_or_else(|| io::Error::other("successor candidate absent"))?;
+                            if offered_d != d_key
+                                || start.d_key != d_key
+                                || offer.root_id != root.old_release.prepared.root_id
+                                || start.decision.obligation.root_id != offer.root_id
+                                || start.decision.obligation.original_identity != recipient
+                                || start.owner_uid != peer.uid
+                                || candidate.process.host_pid != offer.successor_identity.host_pid
+                                || candidate.process.boot_id != offer.successor_identity.boot_id
+                                || candidate.process.starttime_ticks
+                                    != offer.successor_identity.starttime_ticks
+                                || candidate.process.pidns_dev != offer.successor_identity.pidns_dev
+                                || candidate.process.pidns_ino != offer.successor_identity.pidns_ino
+                            {
+                                return Err(io::Error::other(
+                                    "installed successor offer/start/root changed",
+                                ));
+                            }
+                            serde_json::json!({"kind":"installed_successor_offer_readback", "offer":offer})
+                        }
                         FreshRecipientRequest::AdmitSuccessor {
                             d_key,
                             offer_request_id,
@@ -10326,6 +10536,19 @@ fn serve_fresh_v30_at(
                                 }
                             }
                             let successor = offered.successor_identity;
+                            #[cfg(not(feature = "age319-private-broker-fixture"))]
+                            live_successors
+                                .get_mut(&offer_request_id)
+                                .ok_or_else(|| {
+                                    io::Error::other("successor admission lost live Broker gate")
+                                })?
+                                .verify_offered_stamp(&ProcessStamp {
+                                    host_pid: successor.host_pid,
+                                    boot_id: successor.boot_id.clone(),
+                                    starttime_ticks: successor.starttime_ticks,
+                                    pidns_dev: successor.pidns_dev,
+                                    pidns_ino: successor.pidns_ino,
+                                })?;
                             let live_successor = if !lane
                                 .successor_state_committed_for_root(&offer_request_id, &recipient)
                                 .map_err(io::Error::other)?
@@ -10386,6 +10609,13 @@ fn serve_fresh_v30_at(
                                     "fresh successor F entry gate closed",
                                 ));
                             }
+                            #[cfg(not(feature = "age319-private-broker-fixture"))]
+                            live_successors
+                                .get_mut(&offer_request_id)
+                                .ok_or_else(|| {
+                                    io::Error::other("successor F lost live Broker gate")
+                                })?
+                                .verify_offered(&peer)?;
                             let admission = lane
                                 .admitted_successor(&offer_request_id, &recipient)
                                 .map_err(io::Error::other)?;
@@ -10447,6 +10677,25 @@ fn serve_fresh_v30_at(
                         FreshRecipientRequest::CertifySuccessorReceipt {
                             delivery_request_id,
                         } => {
+                            #[cfg(not(feature = "age319-private-broker-fixture"))]
+                            {
+                                let delivery = lane
+                                    .read_successor_delivery(
+                                        &delivery_request_id,
+                                        &recipient,
+                                        peer.uid,
+                                    )
+                                    .map_err(io::Error::other)?
+                                    .ok_or_else(|| {
+                                        io::Error::other("successor receipt delivery absent")
+                                    })?;
+                                live_successors
+                                    .get_mut(&delivery.offer_request_id)
+                                    .ok_or_else(|| {
+                                        io::Error::other("successor receipt lost live Broker gate")
+                                    })?
+                                    .verify_offered(&peer)?;
+                            }
                             let digest = lane
                                 .certify_successor_receipt(
                                     &delivery_request_id,
@@ -10470,6 +10719,26 @@ fn serve_fresh_v30_at(
                             delivery_request_id,
                             delivery_token,
                         } => {
+                            #[cfg(not(feature = "age319-private-broker-fixture"))]
+                            let offer_id = {
+                                let delivery = lane
+                                    .read_successor_delivery(
+                                        &delivery_request_id,
+                                        &recipient,
+                                        peer.uid,
+                                    )
+                                    .map_err(io::Error::other)?
+                                    .ok_or_else(|| {
+                                        io::Error::other("successor ACK delivery absent")
+                                    })?;
+                                live_successors
+                                    .get_mut(&delivery.offer_request_id)
+                                    .ok_or_else(|| {
+                                        io::Error::other("successor ACK lost live Broker gate")
+                                    })?
+                                    .verify_offered(&peer)?;
+                                delivery.offer_request_id
+                            };
                             let ack = lane
                                 .acknowledge_successor_delivery(
                                     &delivery_request_id,
@@ -10478,6 +10747,10 @@ fn serve_fresh_v30_at(
                                     peer.uid,
                                 )
                                 .map_err(io::Error::other)?;
+                            #[cfg(not(feature = "age319-private-broker-fixture"))]
+                            if let Some(live) = live_successors.remove(&offer_id) {
+                                live.reap_after_ack();
+                            }
                             serde_json::json!({"kind":"successor_ack","ack":ack})
                         }
                         FreshRecipientRequest::ReadSuccessorAck {

@@ -1868,6 +1868,16 @@ pub enum FreshRecipientRequest {
         d_key: String,
         wake_request_id: String,
     },
+    /// The original live D-bound peer spends its selected W decision once.
+    /// Broker persists the start before attempting the installed image spawn.
+    StartInstalledSuccessor {
+        d_key: String,
+        offer_request_id: String,
+    },
+    ReadInstalledSuccessorStart {
+        d_key: String,
+        offer_request_id: String,
+    },
     /// The socket's pinned successor offers itself for one exact pending row.
     /// The original released root must approve it separately.
     OfferSuccessor {
@@ -1877,6 +1887,11 @@ pub enum FreshRecipientRequest {
         source_id: String,
     },
     ReadSuccessorOffer {
+        offer_request_id: String,
+    },
+    /// The original D-bound peer reads the one Broker-started candidate.
+    ReadInstalledSuccessorOffer {
+        d_key: String,
         offer_request_id: String,
     },
     /// Only the original D-bound root socket peer may admit the offered live

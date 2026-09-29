@@ -418,14 +418,40 @@ impl FreshV30Lane {
             len,
         )?;
         if row.delivered_at.is_some() {
-            let acknowledged: bool = side.query_row(
+            let original_acknowledged: bool = side.query_row(
                 "SELECT EXISTS(SELECT 1 FROM fresh_recipient_grant WHERE session_id=?1 AND seq=?2
                  AND source_id=?3 AND attempt_id=?4 AND payload_sha256=?5 AND payload_byte_len=?6
                  AND phase='acked' AND acknowledged_at IS NOT NULL)",
                 params![root_session.session_id,row.seq,event.source_id,event.attempt_id,sha,len],
                 |r| r.get(0),
             ).map_err(|e| e.to_string())?;
-            if !acknowledged {
+            let successor_acknowledged = if original_acknowledged {
+                false
+            } else {
+                let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+                let offer: Option<String> = state.query_row(
+                    "SELECT offer_request_id FROM fresh_lane_successor_admission
+                     WHERE session_id=?1 AND seq=?2",
+                    params![root_session.session_id, row.seq],
+                    |r| r.get(0),
+                ).optional().map_err(|e| e.to_string())?;
+                match offer {
+                    Some(offer) => self.read_successor_terminal_ack(
+                        &offer,
+                        &root_actor,
+                        &root_session,
+                        row.seq,
+                        &event.source_id,
+                        &event.attempt_id,
+                        &event.root_id,
+                        &event.owner_generation,
+                        sha,
+                        len,
+                    )?.is_some(),
+                    None => false,
+                }
+            };
+            if !original_acknowledged && !successor_acknowledged {
                 return Err("fresh Bash row has no exact ACK provenance".into());
             }
         }

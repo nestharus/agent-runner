@@ -763,6 +763,237 @@ struct ConnectedRootGrant {
 
 static CONNECTED_ROOT_GRANT: std::sync::OnceLock<ConnectedRootGrant> = std::sync::OnceLock::new();
 
+struct InstalledSuccessorGrant {
+    message: oulipoly_kernel_broker::successor_launch::GateMessage,
+    _channel: UnixStream,
+}
+
+static INSTALLED_SUCCESSOR_GRANT: std::sync::OnceLock<InstalledSuccessorGrant> =
+    std::sync::OnceLock::new();
+
+fn verify_installed_successor_gate(
+    pair: &InstalledPair,
+    observed: &protocol::InstalledPairObservation,
+) -> Result<(), String> {
+    use oulipoly_kernel_broker::entry_registry::ProcessStamp;
+    use oulipoly_kernel_broker::identity::PinnedProcess;
+    use oulipoly_kernel_broker::successor_launch::{FD_ENV, GateMessage};
+    let number = std::env::var(FD_ENV).map_err(|_| "successor inherited descriptor absent")?;
+    let fd: i32 = number.parse().map_err(|_| "successor descriptor invalid")?;
+    if fd <= 2 || unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+        return Err("successor inherited descriptor unavailable".into());
+    }
+    let mut channel = unsafe { UnixStream::from_raw_fd(fd) };
+    let peer = socket_peer(fd)?;
+    let live = UnixStream::connect(broker_socket()).map_err(|e| e.to_string())?;
+    let live_peer = socket_peer(live.as_raw_fd())?;
+    if peer.uid != 0
+        || peer.pid <= 0
+        || peer.pid != live_peer.pid
+        || peer.uid != live_peer.uid
+        || unsafe { libc::getppid() } != peer.pid
+    {
+        return Err("successor descriptor is not held by its live Broker parent".into());
+    }
+    channel
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .map_err(|e| e.to_string())?;
+    let mut line = Vec::new();
+    loop {
+        if line.len() >= 4096 {
+            return Err("successor gate frame too large".into());
+        }
+        let mut byte = [0];
+        channel.read_exact(&mut byte).map_err(|e| e.to_string())?;
+        if byte == [b'\n'] {
+            break;
+        }
+        line.push(byte[0]);
+    }
+    let message: GateMessage = serde_json::from_slice(&line).map_err(|e| e.to_string())?;
+    let start = &message.start;
+    let candidate = &message.candidate;
+    let w = &start.decision.obligation;
+    let self_process = PinnedProcess::open(std::process::id() as i32).map_err(|e| e.to_string())?;
+    if message.protocol != "installed-successor-gate-v1"
+        || start.protocol != "installed-successor-start-v1"
+        || candidate.protocol != "installed-successor-candidate-v1"
+        || start.pair_generation != pair.generation
+        || observed.source_generation.as_deref() != Some(start.source_generation.as_str())
+        || w.original_identity.host_pid != start.original.host_pid
+        || w.original_identity.starttime_ticks != start.original.starttime_ticks
+        || w.original_identity.boot_id != start.original.boot_id
+        || w.original_identity.pidns_dev != start.original.pidns_dev
+        || w.original_identity.pidns_ino != start.original.pidns_ino
+        || start.decision.offer_request_id != candidate.offer_request_id
+        || candidate.owner_uid != unsafe { libc::geteuid() }
+        || start.owner_uid != candidate.owner_uid
+        || candidate.process != ProcessStamp::from(&self_process)
+        || candidate.process == start.original
+        || uuid::Uuid::parse_str(&start.d_key)
+            .ok()
+            .is_none_or(|id| id.to_string() != start.d_key)
+    {
+        return Err("successor gate pair/W/row/process identity changed".into());
+    }
+    channel.write_all(b"R").map_err(|e| e.to_string())?;
+    INSTALLED_SUCCESSOR_GRANT
+        .set(InstalledSuccessorGrant {
+            message,
+            _channel: channel,
+        })
+        .map_err(|_| "successor gate already installed".into())
+}
+
+pub(crate) fn installed_successor_entry() -> Option<ExitCode> {
+    if std::env::args().nth(1).as_deref()
+        != Some(oulipoly_kernel_broker::successor_launch::ENTRY_ARG)
+    {
+        return None;
+    }
+    let result = (|| -> Result<(), String> {
+        use oulipoly_state::mailbox::FreshRecipientIdentity;
+        use protocol::FreshRecipientRequest;
+        let grant = INSTALLED_SUCCESSOR_GRANT
+            .get()
+            .ok_or("installed successor grant absent")?;
+        let start = &grant.message.start;
+        let w = &start.decision.obligation;
+        let offer_id = &start.decision.offer_request_id;
+        let socket = broker_socket().with_file_name("v30.sock");
+        let offer = protocol::fresh_recipient_request_at(
+            &socket,
+            &FreshRecipientRequest::OfferSuccessor {
+                allocation_request_id: start.d_key.clone(),
+                offer_request_id: offer_id.clone(),
+                seq: w.seq,
+                source_id: w.source_id.clone(),
+            },
+        )
+        .or_else(|offer_error| {
+            let readback = protocol::fresh_recipient_request_at(
+                &socket,
+                &FreshRecipientRequest::ReadSuccessorOffer {
+                    offer_request_id: offer_id.clone(),
+                },
+            )?;
+            if !readback["offer"].is_object() {
+                return Err(std::io::Error::other(format!(
+                    "offer refused: {offer_error}; readback absent"
+                )));
+            }
+            Ok(readback)
+        })
+        .map_err(|e| format!("installed successor offer unknown: {e}"))?;
+        if offer["offer"]["root_id"] != w.root_id
+            || offer["offer"]["session_id"] != w.session_id
+            || offer["offer"]["seq"] != w.seq
+            || offer["offer"]["source_id"] != w.source_id
+            || offer["offer"]["attempt_id"] != w.attempt_id
+            || offer["offer"]["payload_sha256"] != w.payload_sha256
+            || offer["offer"]["successor_identity"]["host_pid"]
+                != grant.message.candidate.process.host_pid
+        {
+            return Err("installed successor offer changed selected W".into());
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            if protocol::fresh_recipient_request_at(
+                &socket,
+                &FreshRecipientRequest::ReadSuccessorAdmission {
+                    offer_request_id: offer_id.clone(),
+                },
+            )
+            .is_ok_and(|reply| reply["admission"].is_object())
+            {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("installed successor original approval absent".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let delivery_request_id = uuid::Uuid::new_v4().to_string();
+        let submission = FreshRecipientRequest::SubmitSuccessor {
+            offer_request_id: offer_id.clone(),
+            delivery_request_id: delivery_request_id.clone(),
+        };
+        let delivered = protocol::fresh_recipient_request_at(&socket, &submission)
+            .or_else(|_| {
+                protocol::fresh_recipient_request_at(
+                    &socket,
+                    &FreshRecipientRequest::RecoverSuccessorDelivery {
+                        delivery_request_id: delivery_request_id.clone(),
+                    },
+                )
+            })
+            .map_err(|e| format!("installed successor F unknown: {e}"))?;
+        let actor: FreshRecipientIdentity =
+            serde_json::from_value(offer["offer"]["successor_identity"].clone())
+                .map_err(|e| e.to_string())?;
+        let bytes = protocol::persist_successor_receiver_receipt(&delivered, &actor)
+            .map_err(|e| format!("installed successor receipt unknown: {e}"))?;
+        if delivered["delivery"]["grant"]["root_id"] != w.root_id
+            || delivered["delivery"]["grant"]["seq"] != w.seq
+            || delivered["delivery"]["grant"]["source_id"] != w.source_id
+            || delivered["delivery"]["grant"]["attempt_id"] != w.attempt_id
+            || delivered["delivery"]["grant"]["payload_sha256"] != w.payload_sha256
+            || i64::try_from(bytes.len()).ok() != Some(w.payload_byte_len)
+        {
+            return Err("installed successor F differs from selected W".into());
+        }
+        let certified = protocol::fresh_recipient_request_at(
+            &socket,
+            &FreshRecipientRequest::CertifySuccessorReceipt {
+                delivery_request_id: delivery_request_id.clone(),
+            },
+        )
+        .or_else(|_| {
+            protocol::fresh_recipient_request_at(
+                &socket,
+                &FreshRecipientRequest::ReadSuccessorReceipt {
+                    delivery_request_id: delivery_request_id.clone(),
+                },
+            )
+        })
+        .map_err(|e| format!("installed successor receipt certification unknown: {e}"))?;
+        if !certified["receipt_sha256"].is_string() {
+            return Err("installed successor receipt certificate absent".into());
+        }
+        let token = delivered["delivery_token"]
+            .as_str()
+            .ok_or("installed successor F token absent")?;
+        let ack = protocol::fresh_recipient_request_at(
+            &socket,
+            &FreshRecipientRequest::AcknowledgeSuccessor {
+                delivery_request_id: delivery_request_id.clone(),
+                delivery_token: token.into(),
+            },
+        );
+        let read = protocol::fresh_recipient_request_at(
+            &socket,
+            &FreshRecipientRequest::ReadSuccessorAck {
+                delivery_request_id,
+            },
+        )
+        .map_err(|e| format!("installed successor ACK readback unknown: {e}"))?;
+        if !read["ack"].is_object()
+            || ack.as_ref().is_ok_and(|reply| reply["ack"] != read["ack"])
+            || read["ack"]["grant"]["phase"] != "acked"
+        {
+            return Err("installed successor ACK changed exact receipt".into());
+        }
+        Ok(())
+    })();
+    Some(match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("OULIPOLY_SUCCESSOR_ENTRY_GAP={error}");
+            ExitCode::FAILURE
+        }
+    })
+}
+
 fn socket_peer(fd: i32) -> Result<libc::ucred, String> {
     let mut credentials = std::mem::MaybeUninit::<libc::ucred>::uninit();
     let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
@@ -866,6 +1097,13 @@ pub(crate) fn verify_installed_entry_route() -> Result<(), String> {
     if !needs_installed_entry_gate(&image, std::env::var_os(REQUIRED_ENV).is_some()) {
         return Ok(());
     }
+    let successor_entry = std::env::args().nth(1).as_deref()
+        == Some(oulipoly_kernel_broker::successor_launch::ENTRY_ARG);
+    if !successor_entry
+        && std::env::var_os(oulipoly_kernel_broker::successor_launch::FD_ENV).is_some()
+    {
+        return Err("successor descriptor on another Runner entry".into());
+    }
     if is_fixed_installed_image(&image) {
         let pair = InstalledPair::load(std::path::Path::new(installed_pair::MANIFEST), true)
             .map_err(|error| format!("installed pair manifest unavailable: {error}"))?;
@@ -884,7 +1122,11 @@ pub(crate) fn verify_installed_entry_route() -> Result<(), String> {
             std::env::var_os(CHILD_FD_ENV).is_some(),
         )?;
         if pair.schema == 2 && std::env::var_os(REQUIRED_ENV).is_some() {
-            verify_connected_root_grant(&pair, &observation)?;
+            if successor_entry {
+                verify_installed_successor_gate(&pair, &observation)?;
+            } else {
+                verify_connected_root_grant(&pair, &observation)?;
+            }
         }
         return Ok(());
     }
@@ -906,7 +1148,11 @@ pub(crate) fn verify_installed_entry_route() -> Result<(), String> {
                 std::env::var_os(CHILD_FD_ENV).is_some(),
             )?;
             if std::env::var_os(REQUIRED_ENV).is_some() {
-                verify_connected_root_grant(&pair, &observation)?;
+                if successor_entry {
+                    verify_installed_successor_gate(&pair, &observation)?;
+                } else {
+                    verify_connected_root_grant(&pair, &observation)?;
+                }
             }
             return Ok(());
         }

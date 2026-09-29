@@ -6,6 +6,7 @@ use oulipoly_kernel_broker::identity::PinnedProcess;
 use oulipoly_kernel_broker::installed_launch_ledger::InstalledLaunchLedger;
 use oulipoly_kernel_broker::installed_pair::InstalledPair;
 use oulipoly_kernel_broker::protocol::{self, EntryRoute, Operation};
+use oulipoly_kernel_broker::successor_launch::{self, Ledger as SuccessorLaunchLedger};
 use oulipoly_state::mailbox::{EmptyV30BootstrapIdentity, FreshBashSourceEvent, FreshV30Lane};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
@@ -27,22 +28,36 @@ fn disposable_root_featureless_l_help_lost_reply_and_duplicate() {
         return;
     };
     if std::env::var_os("AGE319_FEATURELESS_CHILD").is_none() {
-        let status = Command::new("unshare")
-            .args(["-Urpfm", "--mount-proc"])
-            .arg(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "disposable_root_featureless_l_help_lost_reply_and_duplicate",
-                "--nocapture",
-            ])
-            .env("AGE319_FEATURELESS_CHILD", "1")
-            .env("AGE319_FEATURELESS_RUNNER_BIN", runner_image)
-            .env("AGE319_FEATURELESS_BASH_BIN", bash_image)
-            .status()
-            .unwrap();
-        assert!(status.success(), "featureless disposable root failed");
+        let cases: &[bool] = if std::env::var_os("AGE319_FEATURELESS_ONLY_SUCCESSOR").is_some() {
+            &[true]
+        } else {
+            &[false, true]
+        };
+        for &successor_case in cases {
+            let mut command = Command::new("unshare");
+            command
+                .args(["-Urpfm", "--mount-proc"])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "disposable_root_featureless_l_help_lost_reply_and_duplicate",
+                    "--nocapture",
+                ])
+                .env("AGE319_FEATURELESS_CHILD", "1")
+                .env("AGE319_FEATURELESS_RUNNER_BIN", &runner_image)
+                .env("AGE319_FEATURELESS_BASH_BIN", &bash_image);
+            if successor_case {
+                command.env("AGE319_FEATURELESS_SUCCESSOR_CASE", "1");
+            }
+            let status = command.status().unwrap();
+            assert!(
+                status.success(),
+                "featureless disposable root failed (successor={successor_case})"
+            );
+        }
         return;
     }
+    let successor_case = std::env::var_os("AGE319_FEATURELESS_SUCCESSOR_CASE").is_some();
 
     // State's trust check includes every ancestor. /tmp and this worktree's
     // shared parent are writable, so use a short-lived root-owned home child.
@@ -123,10 +138,13 @@ fn disposable_root_featureless_l_help_lost_reply_and_duplicate() {
             .unwrap()
             .starts_with("error ")
     );
-    for copied_fd in [false, true] {
+    for (entry_arg, copied_fd) in ["--help", successor_launch::ENTRY_ARG]
+        .into_iter()
+        .flat_map(|arg| [false, true].into_iter().map(move |copied| (arg, copied)))
+    {
         let mut direct = Command::new(&runner);
         direct
-            .arg("--help")
+            .arg(entry_arg)
             .env_clear()
             .env("HOME", temp.path())
             .env("OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1", "1")
@@ -134,6 +152,7 @@ fn disposable_root_featureless_l_help_lost_reply_and_duplicate() {
             .env("OULIPOLY_KERNEL_BROKER_FIXTURE_PAIR_V1", &manifest);
         if copied_fd {
             direct.env("OULIPOLY_KERNEL_CONNECTED_CONTROL_FD_V1", "3");
+            direct.env(successor_launch::FD_ENV, "3");
         }
         direct.stdout(Stdio::null()).stderr(Stdio::null());
         assert!(!direct.status().unwrap().success());
@@ -368,100 +387,108 @@ fn disposable_root_featureless_l_help_lost_reply_and_duplicate() {
         ledger.read_terminal(&normal_id).unwrap().unwrap().exit_code,
         0
     );
-    fs::write(
+    let terminal = if successor_case {
+        ledger.read_terminal(&normal_id).unwrap().unwrap()
+    } else {
+        fs::write(
         &provider,
         b"#!/bin/sh\nexport OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1=\"$AGE319_BASH_CONTROL_SOCKET\"\n\"$AGE319_BASH_IMAGE\" run --delivery sync -- /bin/sh -c 'printf \"bash\\n\" >> \"$AGE319_EFFECT_FILE\"'\n",
     )
     .unwrap();
-    let bash_id = uuid::Uuid::new_v4().to_string();
-    let bash_out = temp.path().join("bash.out");
-    let bash_err = temp.path().join("bash.err");
-    let mut bash_launch = Command::new(&launcher)
-        .args(["--model", "fixture-model", "hello bash"])
-        .env_clear()
-        .env("HOME", temp.path())
-        .env("PATH", "/usr/bin:/bin")
-        .env("OULIPOLY_CONFIG_HOME", &config_home)
-        .env("OULIPOLY_DATA_DIR", temp.path().join("data"))
-        .env("AGE319_EFFECT_FILE", &effect)
-        .env("AGE319_BASH_IMAGE", &bash)
-        .env("AGE319_BASH_CONTROL_SOCKET", &socket)
-        .env("AGE319_PRIVATE_ORDINARY_DROP_C_REPLY_V1", "1")
-        .env("AGE319_PRIVATE_ORDINARY_DROP_K_REPLY_V1", "1")
-        .env("AGE319_PRIVATE_ORDINARY_DROP_Q_REPLY_V1", "1")
-        .env("AGE319_PRIVATE_ORDINARY_DROP_W_REPLY_V1", "1")
-        .env("AGE319_PRIVATE_SYNC_DROP_BEGIN_REPLY_V1", "1")
-        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_PAIR_V1", &manifest)
-        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_LAUNCHER_V1", &launcher)
-        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
-        .env("OULIPOLY_AGE319_PRIVATE_REQUEST_ID_V1", &bash_id)
-        .stdout(Stdio::from(File::create(&bash_out).unwrap()))
-        .stderr(Stdio::from(File::create(&bash_err).unwrap()))
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(75);
-    let bash_status = loop {
-        if let Some(status) = bash_launch.try_wait().unwrap() {
-            break status;
+        let bash_id = uuid::Uuid::new_v4().to_string();
+        let bash_out = temp.path().join("bash.out");
+        let bash_err = temp.path().join("bash.err");
+        let mut bash_command = Command::new(&launcher);
+        bash_command
+            .args(["--model", "fixture-model", "hello bash"])
+            .env_clear()
+            .env("HOME", temp.path())
+            .env("PATH", "/usr/bin:/bin")
+            .env("OULIPOLY_CONFIG_HOME", &config_home)
+            .env("OULIPOLY_DATA_DIR", temp.path().join("data"))
+            .env("AGE319_EFFECT_FILE", &effect)
+            .env("AGE319_BASH_IMAGE", &bash)
+            .env("AGE319_BASH_CONTROL_SOCKET", &socket)
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_PAIR_V1", &manifest)
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_LAUNCHER_V1", &launcher)
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+            .env("OULIPOLY_AGE319_PRIVATE_REQUEST_ID_V1", &bash_id)
+            .stdout(Stdio::from(File::create(&bash_out).unwrap()))
+            .stderr(Stdio::from(File::create(&bash_err).unwrap()));
+        if !successor_case {
+            bash_command
+                .env("AGE319_PRIVATE_ORDINARY_DROP_C_REPLY_V1", "1")
+                .env("AGE319_PRIVATE_ORDINARY_DROP_K_REPLY_V1", "1")
+                .env("AGE319_PRIVATE_ORDINARY_DROP_Q_REPLY_V1", "1")
+                .env("AGE319_PRIVATE_ORDINARY_DROP_W_REPLY_V1", "1")
+                .env("AGE319_PRIVATE_SYNC_DROP_BEGIN_REPLY_V1", "1");
         }
-        if Instant::now() >= deadline {
-            bash_launch.kill().unwrap();
-            panic!(
-                "Bash launcher timed out: {} / output: {} / effect: {} / broker: {}",
-                fs::read_to_string(&bash_err).unwrap(),
-                fs::read_to_string(&bash_out).unwrap(),
-                fs::read_to_string(&effect).unwrap_or_default(),
-                fs::read_to_string(&broker_log).unwrap()
-            );
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    };
-    assert!(
-        bash_status.success(),
-        "Bash: {} / broker: {}",
-        fs::read_to_string(&bash_err).unwrap(),
-        fs::read_to_string(&broker_log).unwrap()
-    );
-    assert_eq!(fs::read_to_string(&effect).unwrap(), "one\nbash\n");
-    assert_eq!(fs::read_dir(state.join("entries")).unwrap().count(), 3);
-    let terminal = ledger.read_terminal(&bash_id).unwrap().unwrap();
-    assert_eq!(terminal.exit_code, 0);
-    assert!(terminal.physical.pid1_echild_receipt);
-    assert!(terminal.physical.pid1_parent_wait_proof);
-    assert_eq!(terminal.physical.source_effect.accepted, 0);
-    assert_eq!(
-        terminal.physical.work_retired,
-        terminal.physical.work_records
-    );
-    let fresh = rusqlite::Connection::open(state.join("v30/state.db")).unwrap();
-    let events: Vec<String> = {
-        let mut statement = fresh
-            .prepare("SELECT receipt_json FROM fresh_bash_selected_event")
-            .unwrap();
-        statement
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect()
-    };
-    let [event] = events.as_slice() else {
-        panic!(
-            "expected one selected Bash source event, got {}",
-            events.len()
+        let mut bash_launch = bash_command.spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(75);
+        let bash_status = loop {
+            if let Some(status) = bash_launch.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                bash_launch.kill().unwrap();
+                panic!(
+                    "Bash launcher timed out: {} / output: {} / effect: {} / broker: {}",
+                    fs::read_to_string(&bash_err).unwrap(),
+                    fs::read_to_string(&bash_out).unwrap(),
+                    fs::read_to_string(&effect).unwrap_or_default(),
+                    fs::read_to_string(&broker_log).unwrap()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        assert!(
+            bash_status.success(),
+            "Bash: {} / broker: {}",
+            fs::read_to_string(&bash_err).unwrap(),
+            fs::read_to_string(&broker_log).unwrap()
         );
+        assert_eq!(fs::read_to_string(&effect).unwrap(), "one\nbash\n");
+        assert_eq!(fs::read_dir(state.join("entries")).unwrap().count(), 3);
+        let terminal = ledger.read_terminal(&bash_id).unwrap().unwrap();
+        assert_eq!(terminal.exit_code, 0);
+        assert!(terminal.physical.pid1_echild_receipt);
+        assert!(terminal.physical.pid1_parent_wait_proof);
+        assert_eq!(terminal.physical.source_effect.accepted, 0);
+        assert_eq!(
+            terminal.physical.work_retired,
+            terminal.physical.work_records
+        );
+        let fresh = rusqlite::Connection::open(state.join("v30/state.db")).unwrap();
+        let events: Vec<String> = {
+            let mut statement = fresh
+                .prepare("SELECT receipt_json FROM fresh_bash_selected_event")
+                .unwrap();
+            statement
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        let [event] = events.as_slice() else {
+            panic!(
+                "expected one selected Bash source event, got {}",
+                events.len()
+            );
+        };
+        let selected: FreshBashSourceEvent = serde_json::from_str(event).unwrap();
+        assert_eq!(selected.root_id, terminal.physical.root_id);
+        assert!(selected.tree_drained && selected.output_closed);
+        let publications: i64 = fresh
+            .query_row(
+                "SELECT count(*) FROM fresh_bash_sync_publication",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(publications, 1);
+        drop(fresh);
+        terminal
     };
-    let selected: FreshBashSourceEvent = serde_json::from_str(event).unwrap();
-    assert_eq!(selected.root_id, terminal.physical.root_id);
-    assert!(selected.tree_drained && selected.output_closed);
-    let publications: i64 = fresh
-        .query_row(
-            "SELECT count(*) FROM fresh_bash_sync_publication",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(publications, 1);
-    drop(fresh);
 
     // The provider exits before the held Bash child reaches W. Normal PID1
     // retains the child's physical reservation and the original D-bound
@@ -479,7 +506,11 @@ printf '%s\n' "$response"
     let async_out = temp.path().join("async.out");
     let async_err = temp.path().join("async.err");
     let child_release = temp.path().join("async-child-release");
-    let mut async_launch = Command::new(&launcher)
+    if successor_case {
+        fs::write(temp.path().join("successor-mode"), b"1").unwrap();
+    }
+    let mut async_command = Command::new(&launcher);
+    async_command
         .args(["--model", "fixture-model", "hello async"])
         .env_clear()
         .env("HOME", temp.path())
@@ -498,10 +529,9 @@ printf '%s\n' "$response"
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
         .env("OULIPOLY_AGE319_PRIVATE_REQUEST_ID_V1", &async_id)
         .stdout(Stdio::from(File::create(&async_out).unwrap()))
-        .stderr(Stdio::from(File::create(&async_err).unwrap()))
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(70);
+        .stderr(Stdio::from(File::create(&async_err).unwrap()));
+    let mut async_launch = async_command.spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(if successor_case { 150 } else { 70 });
     loop {
         let fresh = rusqlite::Connection::open(state.join("v30/state.db")).unwrap();
         let count: i64 = fresh
@@ -509,7 +539,7 @@ printf '%s\n' "$response"
                 row.get(0)
             })
             .unwrap();
-        if count == 2 {
+        if count == if successor_case { 1 } else { 2 } {
             break;
         }
         assert!(
@@ -572,7 +602,7 @@ printf '%s\n' "$response"
             .unwrap()
             .map(Result::unwrap)
             .collect();
-        if values.len() == 2 {
+        if values.len() == if successor_case { 1 } else { 2 } {
             let selected: Vec<FreshBashSourceEvent> = values
                 .iter()
                 .map(|value| serde_json::from_str(value).unwrap())
@@ -597,9 +627,16 @@ printf '%s\n' "$response"
         }
         assert!(
             Instant::now() < deadline,
-            "async launcher timed out: stderr={} stdout={} broker={} state={}",
+            "async launcher timed out: stderr={} stdout={} candidate={} starts={} candidates={} broker={} state={}",
             fs::read_to_string(&async_err).unwrap(),
             fs::read_to_string(&async_out).unwrap(),
+            fs::read_to_string(temp.path().join("successor-child.err")).unwrap_or_default(),
+            fs::read_dir(state.join("installed-successor-starts"))
+                .unwrap()
+                .count(),
+            fs::read_dir(state.join("installed-successor-candidates"))
+                .unwrap()
+                .count(),
             fs::read_to_string(&broker_log).unwrap(),
             {
                 let lane = FreshV30Lane::open_at(&state).unwrap();
@@ -615,11 +652,19 @@ printf '%s\n' "$response"
     };
     assert!(
         async_status.success(),
-        "async: {} / broker: {}",
+        "async: {} / candidate: {} / broker: {}",
         fs::read_to_string(&async_err).unwrap(),
+        fs::read_to_string(temp.path().join("successor-child.err")).unwrap_or_default(),
         fs::read_to_string(&broker_log).unwrap()
     );
-    assert_eq!(fs::read_to_string(&effect).unwrap(), "one\nbash\nasync\n");
+    assert_eq!(
+        fs::read_to_string(&effect).unwrap(),
+        if successor_case {
+            "one\nasync\n"
+        } else {
+            "one\nbash\nasync\n"
+        }
+    );
     let dispatch: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&async_out).unwrap()).unwrap();
     assert_eq!(dispatch["delivery_mode"], "async");
@@ -647,6 +692,118 @@ printf '%s\n' "$response"
             .session_id
     );
     assert_eq!(obligation.original_identity, original_actor);
+    if successor_case {
+        let decision = lane
+            .read_bash_wake_successor_decision(&selected.request_id, &original_actor)
+            .unwrap()
+            .unwrap_or_else(|| {
+                panic!(
+                    "original did not choose selected W: terminal={async_terminal:?} marker={} original_stderr={} broker={}",
+                    temp.path().join("successor-mode").exists(),
+                    fs::read_to_string(&async_err).unwrap(),
+                    fs::read_to_string(&broker_log).unwrap()
+                )
+            });
+        let launch_ledger =
+            SuccessorLaunchLedger::open(&state, &pair.generation, &source.source_generation)
+                .unwrap();
+        let start = launch_ledger
+            .read_start(&decision.offer_request_id)
+            .unwrap()
+            .expect("Broker did not persist start");
+        let candidate = launch_ledger
+            .read_candidate(&decision.offer_request_id)
+            .unwrap()
+            .expect("Broker did not persist candidate");
+        assert_eq!(start.decision, decision);
+        assert_eq!(start.original.host_pid, original_actor.host_pid);
+        assert_ne!(candidate.process.host_pid, original_actor.host_pid);
+        assert_eq!(candidate.owner_uid, start.owner_uid);
+        let candidate_actor = oulipoly_state::mailbox::FreshRecipientIdentity {
+            host_pid: candidate.process.host_pid,
+            boot_id: candidate.process.boot_id.clone(),
+            starttime_ticks: candidate.process.starttime_ticks,
+            pidns_dev: candidate.process.pidns_dev,
+            pidns_ino: candidate.process.pidns_ino,
+        };
+        let offer = lane
+            .read_successor_offer(&decision.offer_request_id, &candidate_actor)
+            .unwrap()
+            .expect("installed candidate did not offer");
+        assert_eq!(offer.root_id, obligation.root_id);
+        assert_eq!(offer.session_id, obligation.session_id);
+        assert_eq!(offer.seq, obligation.seq);
+        assert_eq!(offer.source_id, obligation.source_id);
+        assert_eq!(offer.attempt_id, obligation.attempt_id);
+        assert_eq!(offer.payload_sha256, obligation.payload_sha256);
+        let ack = async_terminal
+            .successor_ack
+            .as_ref()
+            .expect("installed terminal omitted successor ACK");
+        assert_eq!(async_terminal.exit_code, 0);
+        assert_eq!(ack.offer_request_id, decision.offer_request_id);
+        assert_eq!(ack.successor_identity, candidate_actor);
+        assert!(async_terminal.original_receipt.is_none());
+        assert_eq!(
+            fs::read_dir(state.join("installed-successor-starts"))
+                .unwrap()
+                .count(),
+            1
+        );
+        assert_eq!(
+            fs::read_dir(state.join("installed-successor-candidates"))
+                .unwrap()
+                .count(),
+            1
+        );
+        broker.kill().unwrap();
+        broker.wait().unwrap();
+        let mut broker = Command::new(&broker_image)
+            .env_clear()
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &state)
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_PAIR_V1", &manifest)
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_BROKER_V1", &broker_image)
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_LAUNCHER_V1", &launcher)
+            .env("OULIPOLY_KERNEL_BROKER_FIXTURE_BASH_V1", &bash)
+            .stderr(Stdio::from(File::create(&broker_log).unwrap()))
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while protocol::observe_entry_gate_at(&socket).ok() != Some(EntryRoute::FreshOnlyOpen) {
+            let status = broker.try_wait().unwrap();
+            assert!(
+                status.is_none(),
+                "successor Broker restart exited {status:?}: {}",
+                fs::read_to_string(&broker_log).unwrap()
+            );
+            assert!(
+                Instant::now() < deadline,
+                "successor Broker restart did not reopen: {}",
+                fs::read_to_string(&broker_log).unwrap()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let reopened =
+            SuccessorLaunchLedger::open(&state, &pair.generation, &source.source_generation)
+                .unwrap();
+        assert_eq!(
+            reopened.read_start(&decision.offer_request_id).unwrap(),
+            Some(start)
+        );
+        assert_eq!(
+            reopened.read_candidate(&decision.offer_request_id).unwrap(),
+            Some(candidate)
+        );
+        assert_eq!(
+            ledger.read_terminal(&async_id).unwrap().unwrap(),
+            async_terminal
+        );
+        broker.kill().unwrap();
+        broker.wait().unwrap();
+        return;
+    }
     assert!(
         lane.read_bash_wake_successor_decision(&selected.request_id, &original_actor)
             .unwrap()
@@ -891,6 +1048,7 @@ printf '%s\n' "$response"
         ledger.read_terminal(&later_id).unwrap().unwrap().exit_code,
         0
     );
+
     broker.kill().unwrap();
     broker.wait().unwrap();
 }

@@ -112,7 +112,9 @@ impl RootRegistry {
             // Opened and validated by the serving Broker before this scan.
             if (name == "installed-launches"
                 || name == "installed-control-exits"
-                || name == "installed-normal-terminals")
+                || name == "installed-normal-terminals"
+                || name == "installed-successor-starts"
+                || name == "installed-successor-candidates")
                 && empty_bootstrap
                 && registry
                     .directory

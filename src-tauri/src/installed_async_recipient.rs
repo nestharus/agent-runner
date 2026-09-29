@@ -31,6 +31,10 @@ pub(crate) fn settle_pending_original(
     let terminal = loop {
         let terminal = read_terminal(socket, d_key)?;
         match terminal.notification_state.as_str() {
+            "not_applicable"
+                if terminal.listener_policy.as_deref() == Some("notify")
+                    || terminal.child_request_id.is_some()
+                    || !terminal.unresolved_child_request_ids.is_empty() => {}
             "not_applicable" | "response_only" | "acked" => return Ok(()),
             "pending_f" | "f_unknown" | "f_submitted_native_pending" => break terminal,
             "repair_required" => {
@@ -52,6 +56,9 @@ pub(crate) fn settle_pending_original(
     };
     if terminal.listener_policy.as_deref() != Some("notify") {
         return Err("pending original F has no async notify listener".into());
+    }
+    if disposable_fixture && socket.with_file_name("successor-mode").exists() {
+        return settle_pending_successor(socket, d_key, &terminal, true);
     }
     let directory = receipt_directory()?;
     let intent_path = directory.join(format!("{d_key}.intent.json"));
@@ -159,6 +166,193 @@ pub(crate) fn settle_pending_original(
         return Err("async original terminal did not join exact ACK".into());
     }
     Ok(())
+}
+
+/// Original D-bound Runner alone chooses, starts and approves one installed
+/// candidate. The Broker owns both the durable start and the actual spawn.
+fn settle_pending_successor(
+    socket: &Path,
+    d_key: &str,
+    terminal: &FreshRootTerminalReadback,
+    drop_start_reply: bool,
+) -> Result<(), String> {
+    let wake_request_id = terminal
+        .child_request_id
+        .as_ref()
+        .ok_or("selected successor W request absent")?;
+    let offer_id = uuid::Uuid::new_v4().to_string();
+    let decision_request = FreshRecipientRequest::DecideBashWakeSuccessor {
+        d_key: d_key.into(),
+        wake_request_id: wake_request_id.clone(),
+        offer_request_id: offer_id.clone(),
+    };
+    let decision = protocol::fresh_recipient_request_at(socket, &decision_request)
+        .map_err(|e| format!("selected W decision refused: {e}"))?;
+    let decision_read = protocol::fresh_recipient_request_at(
+        socket,
+        &FreshRecipientRequest::ReadBashWakeSuccessorDecision {
+            d_key: d_key.into(),
+            wake_request_id: wake_request_id.clone(),
+        },
+    )
+    .map_err(|e| format!("selected W decision readback unknown: {e}"))?;
+    if decision["decision"] != decision_read["decision"]
+        || decision["decision"]["offer_request_id"] != offer_id
+        || decision["decision"]["obligation"]["root_id"] != terminal.root_id
+        || decision["decision"]["obligation"]["session_id"] != terminal.session_id
+        || decision["decision"]["obligation"]["seq"].as_i64() != terminal.mailbox_seq
+    {
+        return Err("selected W decision changed terminal row".into());
+    }
+    let start_request = FreshRecipientRequest::StartInstalledSuccessor {
+        d_key: d_key.into(),
+        offer_request_id: offer_id.clone(),
+    };
+    let started = if drop_start_reply {
+        protocol::fresh_recipient_request_without_reply_at(socket, &start_request)
+            .map_err(|e| format!("installed successor start send unknown: {e}"))?;
+        Err(std::io::Error::other("disposable start reply dropped"))
+    } else {
+        protocol::fresh_recipient_request_at(socket, &start_request)
+    };
+    let start = started
+        .or_else(|start_error| {
+            let readback = protocol::fresh_recipient_request_at(
+                socket,
+                &FreshRecipientRequest::ReadInstalledSuccessorStart {
+                    d_key: d_key.into(),
+                    offer_request_id: offer_id.clone(),
+                },
+            )?;
+            if !readback["candidate"].is_object() {
+                return Err(std::io::Error::other(format!(
+                    "start was spent without a candidate: {start_error}"
+                )));
+            }
+            Ok(readback)
+        })
+        .map_err(|e| format!("installed successor start unknown: {e}"))?;
+    let read_start = protocol::fresh_recipient_request_at(
+        socket,
+        &FreshRecipientRequest::ReadInstalledSuccessorStart {
+            d_key: d_key.into(),
+            offer_request_id: offer_id.clone(),
+        },
+    )
+    .map_err(|e| format!("installed successor start readback unknown: {e}"))?;
+    if !read_start["candidate"].is_object()
+        || read_start["start"] != start["start"]
+        || read_start["candidate"] != start["candidate"]
+        || read_start["start"]["decision"] != decision["decision"]
+        || read_start["candidate"]["process"]["host_pid"]
+            == read_start["start"]["original"]["host_pid"]
+    {
+        return Err("installed successor start changed exact W or original process".into());
+    }
+    let before_approval = read_terminal(socket, d_key)?;
+    if before_approval.notification_state != "pending_f"
+        || before_approval.successor_ack.is_some()
+        || before_approval.ack_basis.is_some()
+    {
+        return Err("installed candidate start became delivery authority".into());
+    }
+    let prior_admission = protocol::fresh_recipient_request_at(
+        socket,
+        &FreshRecipientRequest::ReadSuccessorAdmission {
+            offer_request_id: offer_id.clone(),
+        },
+    )
+    .map_err(|e| format!("installed candidate admission readback unknown: {e}"))?;
+    if prior_admission["admission"].is_object() {
+        return Err("installed candidate was admitted before original approval".into());
+    }
+    if protocol::fresh_recipient_request_at(socket, &start_request).is_ok()
+        || protocol::fresh_recipient_request_at(
+            socket,
+            &FreshRecipientRequest::StartInstalledSuccessor {
+                d_key: d_key.into(),
+                offer_request_id: uuid::Uuid::new_v4().to_string(),
+            },
+        )
+        .is_ok()
+    {
+        return Err("installed successor start replay or wrong offer accepted".into());
+    }
+    if protocol::fresh_recipient_request_at(
+        socket,
+        &FreshRecipientRequest::AdmitSuccessor {
+            d_key: d_key.into(),
+            offer_request_id: uuid::Uuid::new_v4().to_string(),
+        },
+    )
+    .is_ok()
+    {
+        return Err("installed successor wrong approval accepted".into());
+    }
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let offer = loop {
+        match protocol::fresh_recipient_request_at(
+            socket,
+            &FreshRecipientRequest::ReadInstalledSuccessorOffer {
+                d_key: d_key.into(),
+                offer_request_id: offer_id.clone(),
+            },
+        ) {
+            Ok(reply) if reply["offer"].is_object() => break reply,
+            _ if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(30)),
+            other => return Err(format!("installed successor offer absent: {other:?}")),
+        }
+    };
+    if offer["offer"]["successor_identity"]["host_pid"]
+        != read_start["candidate"]["process"]["host_pid"]
+        || offer["offer"]["root_id"] != terminal.root_id
+        || offer["offer"]["seq"].as_i64() != terminal.mailbox_seq
+    {
+        return Err("installed successor offer differs from selected W/start".into());
+    }
+    let admission = protocol::fresh_recipient_request_at(
+        socket,
+        &FreshRecipientRequest::AdmitSuccessor {
+            d_key: d_key.into(),
+            offer_request_id: offer_id.clone(),
+        },
+    )
+    .or_else(|_| {
+        protocol::fresh_recipient_request_at(
+            socket,
+            &FreshRecipientRequest::ReadSuccessorAdmission {
+                offer_request_id: offer_id.clone(),
+            },
+        )
+    })
+    .map_err(|e| format!("installed successor admission unknown: {e}"))?;
+    let admission_read = protocol::fresh_recipient_request_at(
+        socket,
+        &FreshRecipientRequest::ReadSuccessorAdmission {
+            offer_request_id: offer_id,
+        },
+    )
+    .map_err(|e| format!("installed successor admission readback unknown: {e}"))?;
+    if admission["admission"] != admission_read["admission"] {
+        return Err("installed successor admission changed".into());
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let terminal = read_terminal(socket, d_key)?;
+        if terminal.notification_state == "acked"
+            && terminal.ack_basis.as_deref() == Some("successor_receiver_receipt_ack")
+            && terminal.successor_ack.is_some()
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "installed successor F/ACK remains pending: {}",
+                terminal.notification_state
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
 }
 
 fn recover_delivery(
