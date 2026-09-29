@@ -647,6 +647,12 @@ printf '%s\n' "$response"
             .session_id
     );
     assert_eq!(obligation.original_identity, original_actor);
+    assert!(
+        lane.read_bash_wake_successor_decision(&selected.request_id, &original_actor)
+            .unwrap()
+            .is_none(),
+        "an original-recipient F must not invent a successor choice"
+    );
     let wake_count: i64 = rusqlite::Connection::open(state.join("v30/state.db"))
         .unwrap()
         .query_row(
@@ -759,6 +765,13 @@ printf '%s\n' "$response"
             .read_bash_wake_obligation(&selected.request_id)
             .unwrap(),
         Some(obligation.clone())
+    );
+    assert!(
+        FreshV30Lane::open_at(&state)
+            .unwrap()
+            .read_bash_wake_successor_decision(&selected.request_id, &original_actor)
+            .unwrap()
+            .is_none()
     );
     let stored_receipt = fs::read(receipt_path).unwrap();
     fs::set_permissions(receipt_path, fs::Permissions::from_mode(0o600)).unwrap();

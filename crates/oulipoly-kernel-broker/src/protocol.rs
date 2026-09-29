@@ -1857,6 +1857,17 @@ pub fn reserve_fresh_v30_child_request_at(
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FreshRecipientRequest {
+    /// Original pinned root reserves one immutable offer identity for its
+    /// selected W. A copied request ID is not a delivery capability.
+    DecideBashWakeSuccessor {
+        d_key: String,
+        wake_request_id: String,
+        offer_request_id: String,
+    },
+    ReadBashWakeSuccessorDecision {
+        d_key: String,
+        wake_request_id: String,
+    },
     /// The socket's pinned successor offers itself for one exact pending row.
     /// The original released root must approve it separately.
     OfferSuccessor {

@@ -2901,6 +2901,44 @@ fn connected_async_bash_recipient(
         let source = event["source"]["source_id"]
             .as_str()
             .ok_or("successor source absent")?;
+        let wake_request_id = event["source"]["request_id"]
+            .as_str()
+            .ok_or("successor selected W request absent")?;
+        let offer_request_id = uuid::Uuid::new_v4().to_string();
+        let decision_request = FreshRecipientRequest::DecideBashWakeSuccessor {
+            d_key: d_key.into(),
+            wake_request_id: wake_request_id.into(),
+            offer_request_id: offer_request_id.clone(),
+        };
+        let decision = protocol::fresh_recipient_request_at(socket, &decision_request)
+            .map_err(|e| format!("successor selected W decision: {e}"))?;
+        let retry = protocol::fresh_recipient_request_at(socket, &decision_request)
+            .map_err(|e| format!("successor selected W decision retry: {e}"))?;
+        let decision_read = protocol::fresh_recipient_request_at(
+            socket,
+            &FreshRecipientRequest::ReadBashWakeSuccessorDecision {
+                d_key: d_key.into(),
+                wake_request_id: wake_request_id.into(),
+            },
+        )
+        .map_err(|e| format!("successor selected W decision readback: {e}"))?;
+        if decision["decision"] != retry["decision"]
+            || decision["decision"] != decision_read["decision"]
+            || decision["decision"]["obligation"]["session_id"] != session.session_id
+            || decision["decision"]["obligation"]["seq"] != seq
+            || decision["decision"]["obligation"]["source_id"] != source
+            || protocol::fresh_recipient_request_at(
+                socket,
+                &FreshRecipientRequest::DecideBashWakeSuccessor {
+                    d_key: d_key.into(),
+                    wake_request_id: wake_request_id.into(),
+                    offer_request_id: uuid::Uuid::new_v4().to_string(),
+                },
+            )
+            .is_ok()
+        {
+            return Err("successor selected W decision lost exact one-use choice".into());
+        }
         let stale_request_id = uuid::Uuid::new_v4().to_string();
         let mut stale =
             std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
@@ -2936,7 +2974,6 @@ fn connected_async_bash_recipient(
         {
             return Err(format!("stale successor refusal changed: {stale_refusal}"));
         }
-        let offer_request_id = uuid::Uuid::new_v4().to_string();
         std::fs::write(directory.join("successor-request-id"), &offer_request_id)
             .map_err(|e| e.to_string())?;
         let mut successor =

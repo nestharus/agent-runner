@@ -10143,6 +10143,69 @@ fn serve_fresh_v30_at(
                         return Err(io::Error::other("fresh recipient request absent"));
                     };
                     let reply = match request {
+                        FreshRecipientRequest::DecideBashWakeSuccessor {
+                            d_key,
+                            wake_request_id,
+                            offer_request_id,
+                        } => {
+                            if instance.is_closed() {
+                                return Err(io::Error::other("fresh wake decision gate closed"));
+                            }
+                            let root = lane
+                                .released_handoff_for_child(&d_key, &recipient)
+                                .map_err(io::Error::other)?;
+                            let obligation = lane
+                                .read_bash_wake_obligation(&wake_request_id)
+                                .map_err(io::Error::other)?
+                                .ok_or_else(|| {
+                                    io::Error::other("selected Bash wake obligation absent")
+                                })?;
+                            if obligation.root_id != root.old_release.prepared.root_id
+                                || obligation.original_identity != recipient
+                            {
+                                return Err(io::Error::other(
+                                    "wake decision differs from pinned D",
+                                ));
+                            }
+                            let _guard = admission_fences
+                                .lock()
+                                .map_err(|_| io::Error::other("root admission fence poisoned"))?;
+                            if _guard.contains(&obligation.root_id) {
+                                return Err(io::Error::other("exact root admission fenced"));
+                            }
+                            let decision = lane
+                                .decide_bash_wake_successor(
+                                    &wake_request_id,
+                                    &offer_request_id,
+                                    &recipient,
+                                )
+                                .map_err(io::Error::other)?;
+                            if decision.obligation.root_id != root.old_release.prepared.root_id {
+                                return Err(io::Error::other(
+                                    "wake decision differs from pinned D",
+                                ));
+                            }
+                            serde_json::json!({"kind":"bash_wake_successor_decision","decision":decision})
+                        }
+                        FreshRecipientRequest::ReadBashWakeSuccessorDecision {
+                            d_key,
+                            wake_request_id,
+                        } => {
+                            let root = lane
+                                .released_handoff_for_child(&d_key, &recipient)
+                                .map_err(io::Error::other)?;
+                            let decision = lane
+                                .read_bash_wake_successor_decision(&wake_request_id, &recipient)
+                                .map_err(io::Error::other)?;
+                            if decision.as_ref().is_some_and(|decision| {
+                                decision.obligation.root_id != root.old_release.prepared.root_id
+                            }) {
+                                return Err(io::Error::other(
+                                    "wake decision differs from pinned D",
+                                ));
+                            }
+                            serde_json::json!({"kind":"bash_wake_successor_decision_readback","decision":decision})
+                        }
                         FreshRecipientRequest::OfferSuccessor {
                             allocation_request_id,
                             offer_request_id,
@@ -10156,6 +10219,23 @@ fn serve_fresh_v30_at(
                                 .read_session(&allocation_request_id)
                                 .map_err(io::Error::other)?
                                 .ok_or_else(|| io::Error::other("successor session absent"))?;
+                            #[cfg(not(feature = "age319-private-broker-fixture"))]
+                            {
+                                let decision = lane
+                                    .read_bash_wake_successor_decision_for_offer(&offer_request_id)
+                                    .map_err(io::Error::other)?
+                                    .ok_or_else(|| {
+                                        io::Error::other("successor lacks selected W decision")
+                                    })?;
+                                if decision.obligation.session_id != session.session_id
+                                    || decision.obligation.seq != seq
+                                    || decision.obligation.source_id != source_id
+                                {
+                                    return Err(io::Error::other(
+                                        "successor offer differs from W decision",
+                                    ));
+                                }
+                            }
                             let offer = lane
                                 .offer_successor(
                                     &offer_request_id,
@@ -10165,6 +10245,32 @@ fn serve_fresh_v30_at(
                                     &recipient,
                                 )
                                 .map_err(io::Error::other)?;
+                            #[cfg(not(feature = "age319-private-broker-fixture"))]
+                            {
+                                let decision = lane
+                                    .read_bash_wake_successor_decision_for_offer(&offer_request_id)
+                                    .map_err(io::Error::other)?
+                                    .ok_or_else(|| {
+                                        io::Error::other("successor W decision absent")
+                                    })?;
+                                let w = &decision.obligation;
+                                if offer.session_id != w.session_id
+                                    || offer.seq != w.seq
+                                    || offer.source_id != w.source_id
+                                    || offer.attempt_id != w.attempt_id
+                                    || offer.lane_id != w.lane_id
+                                    || offer.source_generation != w.source_generation
+                                    || offer.root_id != w.root_id
+                                    || offer.owner_generation != w.owner_generation
+                                    || offer.original_identity != w.original_identity
+                                    || offer.payload_sha256 != w.payload_sha256
+                                    || offer.payload_byte_len != w.payload_byte_len
+                                {
+                                    return Err(io::Error::other(
+                                        "successor offer differs from selected W",
+                                    ));
+                                }
+                            }
                             serde_json::json!({"kind":"successor_offer", "offer":offer})
                         }
                         FreshRecipientRequest::ReadSuccessorOffer { offer_request_id } => {
@@ -10194,6 +10300,30 @@ fn serve_fresh_v30_at(
                                 return Err(io::Error::other(
                                     "successor offer is outside original D/root",
                                 ));
+                            }
+                            #[cfg(not(feature = "age319-private-broker-fixture"))]
+                            {
+                                let decision = lane
+                                    .read_bash_wake_successor_decision_for_offer(&offer_request_id)
+                                    .map_err(io::Error::other)?
+                                    .ok_or_else(|| {
+                                        io::Error::other("successor W decision absent")
+                                    })?;
+                                let w = &decision.obligation;
+                                if offered.session_id != w.session_id
+                                    || offered.seq != w.seq
+                                    || offered.source_id != w.source_id
+                                    || offered.attempt_id != w.attempt_id
+                                    || offered.root_id != w.root_id
+                                    || offered.owner_generation != w.owner_generation
+                                    || offered.original_identity != w.original_identity
+                                    || offered.payload_sha256 != w.payload_sha256
+                                    || offered.payload_byte_len != w.payload_byte_len
+                                {
+                                    return Err(io::Error::other(
+                                        "successor admission differs from W decision",
+                                    ));
+                                }
                             }
                             let successor = offered.successor_identity;
                             let live_successor = if !lane

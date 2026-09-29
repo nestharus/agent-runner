@@ -565,7 +565,12 @@ printf '%s\n' "$response"
             {
                 break entry.path();
             }
-            assert!(Instant::now() < deadline, "normal physical grant absent");
+            assert!(
+                Instant::now() < deadline,
+                "normal physical grant absent: caller={} broker={}",
+                fs::read_to_string(&caller_err).unwrap_or_default(),
+                fs::read_to_string(&broker_log).unwrap_or_default(),
+            );
             std::thread::sleep(Duration::from_millis(20));
         };
         while !physical.join("provider-exit.json").exists() {
