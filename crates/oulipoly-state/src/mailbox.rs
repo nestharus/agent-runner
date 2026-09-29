@@ -75,7 +75,8 @@ pub use fresh_lane::{
     FreshRecipientIdentity, FreshReleasedHandoff, FreshRootCallerResult, FreshRootEffect,
     FreshRootEffectState, FreshRootHConsumption, FreshRootHDelegation, FreshRootHSelectedK,
     FreshRootTerminalExecution, FreshRootTerminalReadback, FreshRootWorkIntent,
-    FreshSuccessorAdmission, FreshSuccessorOffer, FreshV30Lane, FreshV30LaneIdentity,
+    FreshSuccessorAdmission, FreshSuccessorDelivery, FreshSuccessorDeliveryReadback,
+    FreshSuccessorOffer, FreshSuccessorReceiverReceipt, FreshV30Lane, FreshV30LaneIdentity,
     FreshV30Session, normal_root_arguments,
 };
 pub use native_publication::NativePublication;

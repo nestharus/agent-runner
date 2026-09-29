@@ -25,7 +25,495 @@ pub struct FreshSuccessorAdmission {
     pub admitted_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreshSuccessorDeliveryReadback {
+    pub grant: FreshDeliveryReadback,
+    pub generation: String,
+    pub offer_request_id: String,
+    pub receipt_sha256: Option<String>,
+}
+
+pub struct FreshSuccessorDelivery {
+    pub readback: FreshSuccessorDeliveryReadback,
+    pub delivery_token: String,
+    pub payload: Vec<u8>,
+    pub receipt_path: String,
+}
+
+/// Written by the receiving Runner from the actual F reply, with exclusive
+/// creation and file/parent fsync. Broker reads this file; a State lookup is
+/// never treated as a receiver receipt.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreshSuccessorReceiverReceipt {
+    pub grant_id: String,
+    pub delivery_request_id: String,
+    pub offer_request_id: String,
+    pub generation: String,
+    pub session_id: String,
+    pub seq: i64,
+    pub source_id: String,
+    pub attempt_id: String,
+    pub successor_identity: FreshRecipientIdentity,
+    pub payload_sha256: String,
+    pub payload_byte_len: i64,
+    pub delivery_token_sha256: String,
+}
+
 impl FreshV30Lane {
+    pub fn admitted_successor(
+        &self,
+        offer_request_id: &str,
+        actor: &FreshRecipientIdentity,
+    ) -> Result<FreshSuccessorAdmission, String> {
+        let admission = self.read_successor_admission(offer_request_id, actor)?
+            .ok_or("successor admission absent")?;
+        if admission.offer.successor_identity != *actor {
+            return Err("pinned peer is not admitted successor".into());
+        }
+        Ok(admission)
+    }
+
+    pub fn successor_receipt_path(&self, grant_id: &str) -> Result<std::path::PathBuf, String> {
+        validate_request_id(grant_id)?;
+        let parent = self.state_path.parent().ok_or("fresh lane root absent")?
+            .join("successor-receipts");
+        let meta = fs::symlink_metadata(&parent).map_err(|e| e.to_string())?;
+        if !meta.is_dir() || meta.file_type().is_symlink() || meta.uid() != 0
+            || meta.mode() & 0o777 != 0o700 {
+            return Err("successor receipt directory changed".into());
+        }
+        Ok(parent.join(format!("{grant_id}.json")))
+    }
+
+    fn ensure_successor_receipt_directory(&self) -> Result<(), String> {
+        let root = self.state_path.parent().ok_or("fresh lane root absent")?;
+        let parent = root.join("successor-receipts");
+        match fs::create_dir(&parent) {
+            Ok(()) => {
+                fs::set_permissions(&parent, fs::Permissions::from_mode(0o700))
+                    .map_err(|e| e.to_string())?;
+                File::open(root).and_then(|f| f.sync_all()).map_err(|e| e.to_string())?;
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        let meta = fs::symlink_metadata(&parent).map_err(|e| e.to_string())?;
+        if !meta.is_dir() || meta.file_type().is_symlink() || meta.uid() != 0
+            || meta.mode() & 0o777 != 0o700 {
+            return Err("successor receipt directory changed".into());
+        }
+        Ok(())
+    }
+
+    fn successor_grant_by_request(
+        &self, delivery_request_id: &str, actor: &FreshRecipientIdentity,
+    ) -> Result<Option<(FreshSuccessorDeliveryReadback, String)>, String> {
+        validate_request_id(delivery_request_id)?;
+        let identity = Self::recipient_identity_json(actor)?;
+        self.sidecar.mailbox().conn.query_row(
+            "SELECT g.grant_id,g.session_id,g.seq,g.source_id,g.attempt_id,g.lane_id,
+                    g.source_generation,g.root_id,g.owner_generation,g.payload_sha256,
+                    g.payload_byte_len,g.phase,g.generation,g.offer_request_id,g.delivery_token,
+                    r.receipt_sha256
+             FROM fresh_successor_grant g LEFT JOIN fresh_successor_receipt r
+               ON r.grant_id=g.grant_id
+             WHERE g.delivery_request_id=?1 AND g.successor_identity=?2",
+            params![delivery_request_id,identity],
+            |r| Ok((
+                FreshSuccessorDeliveryReadback {
+                    grant: FreshDeliveryReadback {
+                        grant_id:r.get(0)?,session_id:r.get(1)?,seq:r.get(2)?,
+                        source_id:r.get(3)?,attempt_id:r.get(4)?,lane_id:r.get(5)?,
+                        source_generation:r.get(6)?,root_id:r.get(7)?,
+                        owner_generation:r.get(8)?,payload_sha256:r.get(9)?,
+                        payload_byte_len:r.get(10)?,phase:r.get(11)?,
+                    },
+                    generation:r.get(12)?,offer_request_id:r.get(13)?,
+                    receipt_sha256:r.get(15)?,
+                },r.get(14)?
+            )),
+        ).optional().map_err(|e| e.to_string())
+    }
+
+    pub fn read_successor_delivery(
+        &self, delivery_request_id: &str, actor: &FreshRecipientIdentity,
+    ) -> Result<Option<FreshSuccessorDeliveryReadback>, String> {
+        let Some((read, _)) = self.successor_grant_by_request(delivery_request_id, actor)? else {
+            return Ok(None);
+        };
+        let admission = self.admitted_successor(&read.offer_request_id, actor)?;
+        self.verify_successor_grant(&read, &admission)?;
+        Ok(Some(read))
+    }
+
+    fn verify_successor_grant(
+        &self, read: &FreshSuccessorDeliveryReadback,
+        admission: &FreshSuccessorAdmission,
+    ) -> Result<(), String> {
+        let offer = &admission.offer;
+        let g = &read.grant;
+        if read.generation != offer.generation
+            || read.offer_request_id != offer.offer_request_id
+            || (g.session_id.as_str(),g.seq,g.source_id.as_str(),g.attempt_id.as_str(),
+                g.lane_id.as_str(),g.source_generation.as_str(),g.root_id.as_str(),
+                g.owner_generation.as_str(),g.payload_sha256.as_str(),g.payload_byte_len)
+             != (offer.session_id.as_str(),offer.seq,offer.source_id.as_str(),
+                 offer.attempt_id.as_str(),offer.lane_id.as_str(),
+                 offer.source_generation.as_str(),offer.root_id.as_str(),
+                 offer.owner_generation.as_str(),offer.payload_sha256.as_str(),
+                 offer.payload_byte_len)
+        {
+            return Err("successor grant differs from cross-store admission".into());
+        }
+        let payload = self.lookup_payload(&g.lane_id, &g.session_id, g.seq)?;
+        if i64::try_from(payload.len()).ok() != Some(g.payload_byte_len)
+            || sha256_hex(&payload) != g.payload_sha256 {
+            return Err("successor grant payload changed".into());
+        }
+        Ok(())
+    }
+
+    pub fn submit_successor_delivery(
+        &mut self, offer_request_id: &str, delivery_request_id: &str,
+        actor: &FreshRecipientIdentity,
+    ) -> Result<FreshSuccessorDelivery, String> {
+        validate_request_id(delivery_request_id)?;
+        let admission = self.admitted_successor(offer_request_id, actor)?;
+        if let Some((existing, _)) = self.successor_grant_by_request(delivery_request_id, actor)? {
+            self.verify_successor_grant(&existing, &admission)?;
+            return Err("successor F already granted; use exact readback/recovery".into());
+        }
+        let offer = &admission.offer;
+        let session = self.read_session_for_successor(offer)?;
+        let (sha,len,attempt) = self.require_pending_successor_row(
+            &session,offer.seq,&offer.source_id,&offer.root_id,&offer.owner_generation,
+            Some(&offer.generation)
+        )?;
+        if (sha.as_str(),len,attempt.as_str()) !=
+            (offer.payload_sha256.as_str(),offer.payload_byte_len,offer.attempt_id.as_str()) {
+            return Err("successor F row/source differs from admission".into());
+        }
+        let payload = self.lookup_payload(&offer.lane_id,&offer.session_id,offer.seq)?;
+        if i64::try_from(payload.len()).ok() != Some(len) || sha256_hex(&payload) != sha {
+            return Err("successor F bytes differ from admitted payload".into());
+        }
+        self.ensure_successor_receipt_directory()?;
+        let grant_id = Uuid::new_v4().to_string();
+        let token = Uuid::new_v4().to_string();
+        let identity = Self::recipient_identity_json(actor)?;
+        let changed = self.sidecar.mailbox().conn.execute(
+            "INSERT INTO fresh_successor_grant
+             (grant_id,delivery_request_id,delivery_token,generation,offer_request_id,
+              session_id,seq,source_id,attempt_id,lane_id,source_generation,root_id,
+              owner_generation,successor_identity,payload_sha256,payload_byte_len,phase,created_at)
+             SELECT ?1,?2,?3,a.generation,a.offer_request_id,a.session_id,a.seq,
+                    a.source_id,a.attempt_id,a.lane_id,a.source_generation,a.root_id,
+                    a.owner_generation,a.successor_identity,a.payload_sha256,
+                    a.payload_byte_len,'unknown',?5
+             FROM fresh_successor_admission a
+             JOIN mailbox m ON m.session_id=a.session_id AND m.seq=a.seq
+             JOIN fresh_recipient_row_source r ON r.session_id=a.session_id AND r.seq=a.seq
+             WHERE a.offer_request_id=?4 AND a.successor_identity=?6
+               AND a.generation=?7 AND a.payload_sha256=?8 AND a.payload_byte_len=?9
+               AND m.delivered_at IS NULL AND m.payload_sha256=a.payload_sha256
+               AND m.payload_byte_len=a.payload_byte_len
+               AND m.payload_retention_policy='until_terminal_disposition'
+               AND r.source_id=a.source_id AND r.attempt_id=a.attempt_id
+               AND r.payload_sha256=a.payload_sha256 AND r.payload_byte_len=a.payload_byte_len
+               AND NOT EXISTS (SELECT 1 FROM fresh_recipient_grant g
+                 WHERE g.session_id=a.session_id AND g.seq=a.seq)",
+            params![grant_id,delivery_request_id,token,offer_request_id,
+                Utc::now().to_rfc3339(),identity,offer.generation,sha,len],
+        ).map_err(|e| format!("successor F grant refused: {e}"))?;
+        if changed != 1 { return Err("successor F exact row changed before grant".into()); }
+        let (readback, _) = self.successor_grant_by_request(delivery_request_id, actor)?
+            .ok_or("successor F grant readback absent")?;
+        self.verify_successor_grant(&readback, &admission)?;
+        Ok(FreshSuccessorDelivery {
+            receipt_path:self.successor_receipt_path(&grant_id)?
+                .to_string_lossy().into_owned(),
+            readback,delivery_token:token,payload,
+        })
+    }
+
+    pub fn recover_successor_delivery(
+        &self, delivery_request_id: &str, actor: &FreshRecipientIdentity,
+    ) -> Result<FreshSuccessorDelivery, String> {
+        let (readback, token) = self.successor_grant_by_request(delivery_request_id, actor)?
+            .ok_or("successor F request has no durable grant")?;
+        let admission = self.admitted_successor(&readback.offer_request_id, actor)?;
+        self.verify_successor_grant(&readback, &admission)?;
+        if readback.grant.phase == "acked" {
+            return Err("successor F already ACKed".into());
+        }
+        let payload = self.lookup_payload(
+            &readback.grant.lane_id,&readback.grant.session_id,readback.grant.seq
+        )?;
+        Ok(FreshSuccessorDelivery {
+            receipt_path:self.successor_receipt_path(&readback.grant.grant_id)?
+                .to_string_lossy().into_owned(),
+            readback,delivery_token:token,payload,
+        })
+    }
+
+    pub fn mark_successor_submitted(&mut self, grant_id: &str) -> Result<(), String> {
+        if self.sidecar.mailbox_mut().conn.execute(
+            "UPDATE fresh_successor_grant SET phase='submitted',submitted_at=?2
+             WHERE grant_id=?1 AND phase='unknown'",
+            params![grant_id,Utc::now().to_rfc3339()],
+        ).map_err(|e| e.to_string())? != 1 {
+            return Err("successor F submission state changed".into());
+        }
+        Ok(())
+    }
+
+    fn read_successor_receipt_file(
+        &self, read: &FreshSuccessorDeliveryReadback, token: &str,
+        actor: &FreshRecipientIdentity,
+    ) -> Result<(String, i64, i64), String> {
+        use std::os::unix::fs::MetadataExt as _;
+        let path = self.successor_receipt_path(&read.grant.grant_id)?;
+        let file = OpenOptions::new().read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path).map_err(|e| format!("successor receiver receipt absent: {e}"))?;
+        let meta = file.metadata().map_err(|e| e.to_string())?;
+        if !meta.is_file() || meta.uid() != 0 || meta.nlink() != 1
+            || meta.mode() & 0o777 != 0o400 || meta.len() > 8192 {
+            return Err("successor receiver receipt file untrusted".into());
+        }
+        let mut bytes = Vec::new();
+        file.take(8193).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+        if bytes.len() as u64 != meta.len() {
+            return Err("successor receiver receipt changed during read".into());
+        }
+        let receipt: FreshSuccessorReceiverReceipt =
+            serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        let g = &read.grant;
+        if receipt != (FreshSuccessorReceiverReceipt {
+            grant_id:g.grant_id.clone(),
+            delivery_request_id:self.sidecar.mailbox().conn.query_row(
+                "SELECT delivery_request_id FROM fresh_successor_grant WHERE grant_id=?1",
+                [&g.grant_id],|r| r.get(0)).map_err(|e| e.to_string())?,
+            offer_request_id:read.offer_request_id.clone(),
+            generation:read.generation.clone(),
+            session_id:g.session_id.clone(),seq:g.seq,
+            source_id:g.source_id.clone(),attempt_id:g.attempt_id.clone(),
+            successor_identity:actor.clone(),payload_sha256:g.payload_sha256.clone(),
+            payload_byte_len:g.payload_byte_len,
+            delivery_token_sha256:sha256_hex(token.as_bytes()),
+        }) {
+            return Err("successor receiver receipt does not match F/peer/token".into());
+        }
+        Ok((sha256_hex(&bytes),meta.dev() as i64,meta.ino() as i64))
+    }
+
+    pub fn certify_successor_receipt(
+        &mut self, delivery_request_id: &str, actor: &FreshRecipientIdentity,
+    ) -> Result<String, String> {
+        let (read,token) = self.successor_grant_by_request(delivery_request_id,actor)?
+            .ok_or("successor F grant absent for receipt")?;
+        let admission = self.admitted_successor(&read.offer_request_id,actor)?;
+        self.verify_successor_grant(&read,&admission)?;
+        if read.grant.phase == "acked" { return Err("successor receipt already ACKed".into()); }
+        let (digest,device,inode) = self.read_successor_receipt_file(&read,&token,actor)?;
+        let identity = Self::recipient_identity_json(actor)?;
+        self.sidecar.mailbox().conn.execute(
+            "INSERT INTO fresh_successor_receipt
+             (grant_id,delivery_request_id,generation,session_id,seq,source_id,attempt_id,
+              successor_identity,payload_sha256,payload_byte_len,delivery_token_sha256,
+              receipt_sha256,receipt_device,receipt_inode,certified_at)
+             SELECT g.grant_id,g.delivery_request_id,g.generation,g.session_id,g.seq,
+                    g.source_id,g.attempt_id,g.successor_identity,g.payload_sha256,
+                    g.payload_byte_len,?4,?5,?6,?7,?8
+             FROM fresh_successor_grant g
+             JOIN fresh_successor_admission a ON a.generation=g.generation
+             JOIN fresh_recipient_row_source r ON r.session_id=g.session_id AND r.seq=g.seq
+             WHERE g.delivery_request_id=?1 AND g.successor_identity=?2
+               AND g.grant_id=?3 AND g.phase IN ('unknown','submitted')
+               AND a.offer_request_id=g.offer_request_id AND a.session_id=g.session_id
+               AND a.seq=g.seq AND a.source_id=g.source_id AND a.attempt_id=g.attempt_id
+               AND a.successor_identity=g.successor_identity
+               AND a.payload_sha256=g.payload_sha256 AND a.payload_byte_len=g.payload_byte_len
+               AND r.source_id=g.source_id AND r.attempt_id=g.attempt_id
+               AND r.payload_sha256=g.payload_sha256 AND r.payload_byte_len=g.payload_byte_len
+             ON CONFLICT(grant_id) DO NOTHING",
+            params![delivery_request_id,identity,read.grant.grant_id,
+                sha256_hex(token.as_bytes()),digest,device,inode,Utc::now().to_rfc3339()],
+        ).map_err(|e| e.to_string())?;
+        let persisted: Option<(String,i64,i64)> = self.sidecar.mailbox().conn.query_row(
+            "SELECT receipt_sha256,receipt_device,receipt_inode FROM fresh_successor_receipt
+             WHERE grant_id=?1 AND delivery_request_id=?2 AND generation=?3
+               AND successor_identity=?4 AND payload_sha256=?5 AND payload_byte_len=?6
+               AND delivery_token_sha256=?7",
+            params![read.grant.grant_id,delivery_request_id,read.generation,identity,
+                read.grant.payload_sha256,read.grant.payload_byte_len,
+                sha256_hex(token.as_bytes())],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).optional().map_err(|e| e.to_string())?;
+        if persisted != Some((digest.clone(),device,inode)) {
+            return Err("successor receipt certification conflicts with durable record".into());
+        }
+        Ok(digest)
+    }
+
+    pub fn read_successor_receipt(
+        &self, delivery_request_id: &str, actor: &FreshRecipientIdentity,
+    ) -> Result<Option<String>, String> {
+        let Some((read,token)) = self.successor_grant_by_request(delivery_request_id,actor)?
+            else { return Ok(None); };
+        let admission = self.admitted_successor(&read.offer_request_id,actor)?;
+        self.verify_successor_grant(&read,&admission)?;
+        let identity = Self::recipient_identity_json(actor)?;
+        let durable: Option<(String,i64,i64)> = self.sidecar.mailbox().conn.query_row(
+            "SELECT receipt_sha256,receipt_device,receipt_inode FROM fresh_successor_receipt
+             WHERE grant_id=?1 AND delivery_request_id=?2 AND generation=?3
+               AND session_id=?4 AND seq=?5 AND source_id=?6 AND attempt_id=?7
+               AND successor_identity=?8 AND payload_sha256=?9 AND payload_byte_len=?10
+               AND delivery_token_sha256=?11",
+            params![read.grant.grant_id,delivery_request_id,read.generation,
+                read.grant.session_id,read.grant.seq,read.grant.source_id,
+                read.grant.attempt_id,identity,read.grant.payload_sha256,
+                read.grant.payload_byte_len,sha256_hex(token.as_bytes())],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).optional().map_err(|e| e.to_string())?;
+        if let Some((sha,dev,ino)) = &durable {
+            if self.read_successor_receipt_file(&read,&token,actor)? !=
+                (sha.clone(),*dev,*ino) {
+                return Err("successor receiver receipt changed after certification".into());
+            }
+        }
+        Ok(durable.map(|v| v.0))
+    }
+
+    pub fn acknowledge_successor_delivery(
+        &mut self, delivery_request_id: &str, token: &str,
+        actor: &FreshRecipientIdentity,
+    ) -> Result<FreshSuccessorDeliveryReadback, String> {
+        validate_request_id(token)?;
+        let (read,stored_token) = self.successor_grant_by_request(delivery_request_id,actor)?
+            .ok_or("successor F grant absent for ACK")?;
+        if read.grant.phase == "acked" || stored_token != token {
+            return Err("successor ACK token consumed or wrong".into());
+        }
+        let admission = self.admitted_successor(&read.offer_request_id,actor)?;
+        self.verify_successor_grant(&read,&admission)?;
+        let receipt = self.read_successor_receipt(delivery_request_id,actor)?
+            .ok_or("successor receiver receipt absent; ACK refused")?;
+        let identity = Self::recipient_identity_json(actor)?;
+        let now = Utc::now().to_rfc3339();
+        let tx = self.sidecar.mailbox_mut().conn.transaction_with_behavior(
+            TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        let exact: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM fresh_successor_grant g
+             JOIN fresh_successor_admission a ON a.generation=g.generation
+             JOIN fresh_successor_receipt c ON c.grant_id=g.grant_id
+             JOIN fresh_recipient_row_source r ON r.session_id=g.session_id AND r.seq=g.seq
+             WHERE g.delivery_request_id=?1 AND g.delivery_token=?2
+               AND g.successor_identity=?3 AND g.grant_id=?4 AND g.phase IN ('unknown','submitted')
+               AND a.offer_request_id=g.offer_request_id AND a.session_id=g.session_id
+               AND a.seq=g.seq AND a.source_id=g.source_id AND a.attempt_id=g.attempt_id
+               AND a.successor_identity=g.successor_identity
+               AND a.payload_sha256=g.payload_sha256 AND a.payload_byte_len=g.payload_byte_len
+               AND c.generation=g.generation AND c.delivery_request_id=g.delivery_request_id
+               AND c.session_id=g.session_id AND c.seq=g.seq AND c.source_id=g.source_id
+               AND c.attempt_id=g.attempt_id AND c.successor_identity=g.successor_identity
+               AND c.payload_sha256=g.payload_sha256 AND c.payload_byte_len=g.payload_byte_len
+               AND c.delivery_token_sha256=?5 AND c.receipt_sha256=?6
+               AND r.source_id=g.source_id AND r.attempt_id=g.attempt_id
+               AND r.payload_sha256=g.payload_sha256 AND r.payload_byte_len=g.payload_byte_len)",
+            params![delivery_request_id,token,identity,read.grant.grant_id,
+                sha256_hex(token.as_bytes()),receipt],
+            |r| r.get(0),
+        ).map_err(|e| e.to_string())?;
+        if !exact { return Err("successor ACK evidence does not join admitted F".into()); }
+        if tx.execute(
+            "UPDATE mailbox SET delivered_at=?3,delivered_by_invocation_uuid=?4,
+              delivery_attempts=delivery_attempts+1,delivery_error=NULL
+             WHERE session_id=?1 AND seq=?2 AND delivered_at IS NULL
+               AND payload_sha256=?5 AND payload_byte_len=?6",
+            params![read.grant.session_id,read.grant.seq,now,read.grant.grant_id,
+                read.grant.payload_sha256,read.grant.payload_byte_len],
+        ).map_err(|e| e.to_string())? != 1 {
+            return Err("successor ACK row changed or already delivered".into());
+        }
+        if tx.execute(
+            "UPDATE fresh_successor_grant SET phase='acked',acknowledged_at=?2
+             WHERE grant_id=?1 AND phase IN ('unknown','submitted')",
+            params![read.grant.grant_id,now],
+        ).map_err(|e| e.to_string())? != 1 {
+            return Err("successor F grant changed before ACK".into());
+        }
+        if tx.execute(
+            "INSERT INTO fresh_successor_ack_evidence
+             (grant_id,delivery_request_id,generation,session_id,seq,source_id,attempt_id,
+              successor_identity,payload_sha256,payload_byte_len,delivery_token_sha256,
+              receipt_sha256,acknowledged_at)
+             SELECT g.grant_id,g.delivery_request_id,g.generation,g.session_id,g.seq,
+                    g.source_id,g.attempt_id,g.successor_identity,g.payload_sha256,
+                    g.payload_byte_len,c.delivery_token_sha256,c.receipt_sha256,?2
+             FROM fresh_successor_grant g JOIN fresh_successor_receipt c
+               ON c.grant_id=g.grant_id
+             JOIN mailbox m ON m.session_id=g.session_id AND m.seq=g.seq
+             WHERE g.grant_id=?1 AND g.phase='acked' AND g.acknowledged_at=?2
+               AND m.delivered_at=?2 AND m.delivered_by_invocation_uuid=?1
+               AND c.receipt_sha256=?3",
+            params![read.grant.grant_id,now,receipt],
+        ).map_err(|e| e.to_string())? != 1 {
+            return Err("successor ACK immutable evidence absent".into());
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        self.read_successor_ack(delivery_request_id,actor)?
+            .ok_or("successor ACK readback absent".into())
+    }
+
+    pub fn read_successor_ack(
+        &self, delivery_request_id: &str, actor: &FreshRecipientIdentity,
+    ) -> Result<Option<FreshSuccessorDeliveryReadback>, String> {
+        let Some(read) = self.read_successor_delivery(delivery_request_id,actor)?
+            else { return Ok(None); };
+        if read.grant.phase != "acked" { return Ok(None); }
+        let receipt = self.read_successor_receipt(delivery_request_id,actor)?
+            .ok_or("successor ACK lacks durable receiver receipt")?;
+        let identity = Self::recipient_identity_json(actor)?;
+        let exact: bool = self.sidecar.mailbox().conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM fresh_successor_ack_evidence e
+             JOIN fresh_successor_grant g ON g.grant_id=e.grant_id
+             JOIN fresh_successor_receipt c ON c.grant_id=e.grant_id
+             JOIN fresh_successor_admission a ON a.generation=e.generation
+             JOIN fresh_recipient_row_source r ON r.session_id=e.session_id AND r.seq=e.seq
+             JOIN mailbox m ON m.session_id=e.session_id AND m.seq=e.seq
+             WHERE e.delivery_request_id=?1 AND e.grant_id=?2 AND e.generation=?3
+               AND e.session_id=?4 AND e.seq=?5 AND e.source_id=?6 AND e.attempt_id=?7
+               AND e.successor_identity=?8 AND e.payload_sha256=?9 AND e.payload_byte_len=?10
+               AND e.receipt_sha256=?11 AND e.receipt_sha256=c.receipt_sha256
+               AND e.delivery_token_sha256=c.delivery_token_sha256
+               AND g.delivery_request_id=e.delivery_request_id AND g.generation=e.generation
+               AND g.session_id=e.session_id AND g.seq=e.seq
+               AND g.source_id=e.source_id AND g.attempt_id=e.attempt_id
+               AND g.successor_identity=e.successor_identity
+               AND g.payload_sha256=e.payload_sha256 AND g.payload_byte_len=e.payload_byte_len
+               AND g.phase='acked' AND g.acknowledged_at=e.acknowledged_at
+               AND a.offer_request_id=g.offer_request_id
+               AND a.session_id=e.session_id AND a.seq=e.seq
+               AND a.source_id=e.source_id AND a.attempt_id=e.attempt_id
+               AND a.successor_identity=e.successor_identity
+               AND a.payload_sha256=e.payload_sha256 AND a.payload_byte_len=e.payload_byte_len
+               AND r.source_id=e.source_id AND r.attempt_id=e.attempt_id
+               AND r.payload_sha256=e.payload_sha256 AND r.payload_byte_len=e.payload_byte_len
+               AND m.delivered_at=e.acknowledged_at
+               AND m.delivered_by_invocation_uuid=e.grant_id
+               AND m.payload_sha256=e.payload_sha256 AND m.payload_byte_len=e.payload_byte_len)",
+            params![delivery_request_id,read.grant.grant_id,read.generation,
+                read.grant.session_id,read.grant.seq,read.grant.source_id,read.grant.attempt_id,
+                identity,read.grant.payload_sha256,read.grant.payload_byte_len,receipt],
+            |r| r.get(0),
+        ).map_err(|e| e.to_string())?;
+        if !exact { return Err("successor ACK readback cross-store join incomplete".into()); }
+        Ok(Some(read))
+    }
+
     /// The Broker supplies `successor` from its pinned socket peer. The offer
     /// identifies a process generation but gives it no delivery authority.
     pub fn offer_successor(

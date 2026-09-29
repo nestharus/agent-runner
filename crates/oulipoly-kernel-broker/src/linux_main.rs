@@ -7591,6 +7591,7 @@ fn serve_fresh_v30_at(
         stream.set_read_timeout(Some(FRESH_V30_READ_TIMEOUT))?;
         stream.set_write_timeout(Some(FRESH_V30_WRITE_TIMEOUT))?;
         let mut submitted_grant = None;
+        let mut submitted_successor_grant = None;
         #[cfg(feature = "age319-private-broker-fixture")]
         let mut drop_provider_k_reply = false;
         #[cfg(feature = "age319-private-broker-fixture")]
@@ -10046,6 +10047,107 @@ fn serve_fresh_v30_at(
                                 .map_err(io::Error::other)?;
                             serde_json::json!({"kind":"successor_admission_readback", "admission":admission})
                         }
+                        FreshRecipientRequest::SubmitSuccessor {
+                            offer_request_id,
+                            delivery_request_id,
+                        } => {
+                            if instance.is_closed() {
+                                return Err(io::Error::other(
+                                    "fresh successor F entry gate closed",
+                                ));
+                            }
+                            let admission = lane
+                                .admitted_successor(&offer_request_id, &recipient)
+                                .map_err(io::Error::other)?;
+                            let _guard = admission_fences
+                                .lock()
+                                .map_err(|_| io::Error::other("root admission fence poisoned"))?;
+                            if _guard.contains(&admission.offer.root_id) {
+                                return Err(io::Error::other("exact root admission fenced"));
+                            }
+                            let delivered = lane
+                                .submit_successor_delivery(
+                                    &offer_request_id,
+                                    &delivery_request_id,
+                                    &recipient,
+                                )
+                                .map_err(io::Error::other)?;
+                            submitted_successor_grant =
+                                Some(delivered.readback.grant.grant_id.clone());
+                            serde_json::json!({
+                                "kind":"successor_delivery",
+                                "delivery_request_id":delivery_request_id,
+                                "delivery":delivered.readback,
+                                "delivery_token":delivered.delivery_token,
+                                "receipt_path":delivered.receipt_path,
+                                "payload_base64":base64::engine::general_purpose::STANDARD
+                                    .encode(delivered.payload),
+                            })
+                        }
+                        FreshRecipientRequest::ReadSuccessorDelivery {
+                            delivery_request_id,
+                        } => {
+                            let delivery = lane
+                                .read_successor_delivery(&delivery_request_id, &recipient)
+                                .map_err(io::Error::other)?;
+                            serde_json::json!({"kind":"successor_delivery_readback",
+                                "delivery":delivery})
+                        }
+                        FreshRecipientRequest::RecoverSuccessorDelivery {
+                            delivery_request_id,
+                        } => {
+                            let delivered = lane
+                                .recover_successor_delivery(&delivery_request_id, &recipient)
+                                .map_err(io::Error::other)?;
+                            serde_json::json!({
+                                "kind":"recovered_successor_delivery",
+                                "delivery_request_id":delivery_request_id,
+                                "delivery":delivered.readback,
+                                "delivery_token":delivered.delivery_token,
+                                "receipt_path":delivered.receipt_path,
+                                "payload_base64":base64::engine::general_purpose::STANDARD
+                                    .encode(delivered.payload),
+                            })
+                        }
+                        FreshRecipientRequest::CertifySuccessorReceipt {
+                            delivery_request_id,
+                        } => {
+                            let digest = lane
+                                .certify_successor_receipt(&delivery_request_id, &recipient)
+                                .map_err(io::Error::other)?;
+                            serde_json::json!({"kind":"successor_receipt",
+                                "receipt_sha256":digest})
+                        }
+                        FreshRecipientRequest::ReadSuccessorReceipt {
+                            delivery_request_id,
+                        } => {
+                            let digest = lane
+                                .read_successor_receipt(&delivery_request_id, &recipient)
+                                .map_err(io::Error::other)?;
+                            serde_json::json!({"kind":"successor_receipt_readback",
+                                "receipt_sha256":digest})
+                        }
+                        FreshRecipientRequest::AcknowledgeSuccessor {
+                            delivery_request_id,
+                            delivery_token,
+                        } => {
+                            let ack = lane
+                                .acknowledge_successor_delivery(
+                                    &delivery_request_id,
+                                    &delivery_token,
+                                    &recipient,
+                                )
+                                .map_err(io::Error::other)?;
+                            serde_json::json!({"kind":"successor_ack","ack":ack})
+                        }
+                        FreshRecipientRequest::ReadSuccessorAck {
+                            delivery_request_id,
+                        } => {
+                            let ack = lane
+                                .read_successor_ack(&delivery_request_id, &recipient)
+                                .map_err(io::Error::other)?;
+                            serde_json::json!({"kind":"successor_ack_readback","ack":ack})
+                        }
                         FreshRecipientRequest::FenceRootTerminal { ref d_key } => {
                             let root = lane
                                 .released_handoff_for_child(d_key, &recipient)
@@ -10613,6 +10715,9 @@ fn serve_fresh_v30_at(
         if write.is_ok() {
             if let Some(grant_id) = submitted_grant {
                 let _ = lane.mark_recipient_submitted(&grant_id);
+            }
+            if let Some(grant_id) = submitted_successor_grant {
+                let _ = lane.mark_successor_submitted(&grant_id);
             }
         }
     }

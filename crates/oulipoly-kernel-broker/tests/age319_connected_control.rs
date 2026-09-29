@@ -58,7 +58,7 @@ fn root_mapped_connected_l_delivers_real_bash_async_to_recipient_and_acks() {
 }
 
 #[test]
-fn root_mapped_connected_l_admits_distinct_v30_successor_without_f_or_ack() {
+fn root_mapped_connected_l_delivers_real_bash_async_to_admitted_successor_and_acks() {
     run_connected_case_with_bash_mode(true, ProofFault::None, true, true, true);
 }
 
@@ -117,7 +117,7 @@ fn run_connected_case_with_bash_mode(
     });
     if std::env::var_os("AGE319_CONNECTED_CHILD_TEST").is_none() {
         let test_name = if successor_admission {
-            "root_mapped_connected_l_admits_distinct_v30_successor_without_f_or_ack"
+            "root_mapped_connected_l_delivers_real_bash_async_to_admitted_successor_and_acks"
         } else {
             match (normal, fault, real_bash, async_bash) {
                 (true, ProofFault::None, true, true) => {
@@ -608,7 +608,7 @@ printf '%s\n' "$response"
     if successor_admission {
         assert_ne!(
             control_exit["code"], 0,
-            "admission slice must stop before F/ACK and root terminal"
+            "successor F/ACK slice must stop before root terminal"
         );
         let offer: serde_json::Value = serde_json::from_slice(
             &fs::read(recipient.join("successor-offer.json")).unwrap_or_else(|error| {
@@ -669,10 +669,121 @@ printf '%s\n' "$response"
                 .unwrap(),
             0
         );
+        let fack: serde_json::Value = serde_json::from_slice(
+            &fs::read(recipient.join("successor-fack.json")).unwrap_or_else(|error| {
+                panic!(
+                    "successor F/ACK absent: {error}; caller={} broker={}",
+                    fs::read_to_string(&caller_err).unwrap_or_default(),
+                    fs::read_to_string(&broker_log).unwrap_or_default()
+                )
+            }),
+        )
+        .unwrap();
+        let delivery = &fack["delivery"];
+        let grant = &delivery["grant"];
+        assert_eq!(delivery["generation"], state_generation);
+        assert_eq!(delivery["offer_request_id"], offer["offer_request_id"]);
+        assert_eq!(grant["source_id"], offer["source_id"]);
+        assert_eq!(grant["attempt_id"], offer["attempt_id"]);
+        assert_eq!(grant["phase"], "unknown");
+        assert_eq!(fack["ack"]["grant"]["phase"], "acked");
+        assert_eq!(fack["ack"]["generation"], state_generation);
+        let bytes = fs::read(recipient.join("successor-received.bin")).unwrap();
+        assert_eq!(grant["payload_sha256"], digest_bytes(&bytes));
+        assert_eq!(grant["payload_byte_len"], bytes.len());
+        let retained_path: String = side_db
+            .query_row(
+                "SELECT payload_file_path FROM mailbox WHERE session_id=?1 AND seq=?2",
+                rusqlite::params![
+                    grant["session_id"].as_str().unwrap(),
+                    grant["seq"].as_i64().unwrap()
+                ],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            bytes,
+            fs::read(retained_path).unwrap(),
+            "successor received bytes differ from Broker-retained source"
+        );
+        let event: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(event["source"]["tree_drained"], true);
+        assert_eq!(event["source"]["output_closed"], true);
+        assert_eq!(event["source"]["wait_status"], 0);
+        let child_grant = event["source"]["physical_grant_id"].as_str().unwrap();
+        let physical = state.join("v30/fresh-provider");
+        assert!(physical.join(format!("{child_grant}.drain.json")).exists());
+        assert!(
+            physical
+                .join(format!("{child_grant}.consumed.json"))
+                .exists()
+        );
+        assert_eq!(fs::read_to_string(&effect).unwrap(), "one\n");
+        for (stream, expected) in [
+            ("stdout", b"async-child-out\n".as_slice()),
+            ("stderr", b"async-child-err\n".as_slice()),
+        ] {
+            assert_eq!(
+                fs::read(physical.join(format!("{child_grant}.{stream}"))).unwrap(),
+                expected
+            );
+            let raw: Vec<u8> =
+                serde_json::from_value(event[format!("{stream}_bytes")].clone()).unwrap();
+            assert_eq!(raw, expected);
+        }
+        let (phase, attempts, receipt_sha, ack_sha): (String, i64, String, String) = side_db
+            .query_row(
+                "SELECT g.phase,m.delivery_attempts,c.receipt_sha256,e.receipt_sha256
+                 FROM fresh_successor_grant g
+                 JOIN fresh_successor_receipt c ON c.grant_id=g.grant_id
+                 JOIN fresh_successor_ack_evidence e ON e.grant_id=g.grant_id
+                 JOIN mailbox m ON m.session_id=g.session_id AND m.seq=g.seq
+                 JOIN fresh_successor_admission a ON a.generation=g.generation
+                 JOIN fresh_recipient_row_source r ON r.session_id=g.session_id AND r.seq=g.seq
+                 WHERE g.grant_id=?1 AND g.delivery_request_id=?2
+                   AND a.generation=?3 AND a.offer_request_id=g.offer_request_id
+                   AND a.session_id=g.session_id AND a.seq=g.seq
+                   AND a.source_id=g.source_id AND a.attempt_id=g.attempt_id
+                   AND a.successor_identity=g.successor_identity
+                   AND g.payload_sha256=a.payload_sha256
+                   AND g.payload_byte_len=a.payload_byte_len
+                   AND r.source_id=g.source_id AND r.attempt_id=g.attempt_id
+                   AND r.payload_sha256=g.payload_sha256
+                   AND r.payload_byte_len=g.payload_byte_len
+                   AND m.delivered_by_invocation_uuid=g.grant_id
+                   AND m.delivered_at=e.acknowledged_at
+                   AND e.delivery_token_sha256=c.delivery_token_sha256",
+                rusqlite::params![
+                    grant["grant_id"].as_str().unwrap(),
+                    fack["delivery_request_id"].as_str().unwrap(),
+                    state_generation
+                ],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(phase, "acked");
+        assert_eq!(attempts, 1);
+        assert_eq!(receipt_sha, ack_sha);
+        assert_eq!(receipt_sha, fack["receipt"]["receipt_sha256"]);
+        let receipt_path = state
+            .join("v30/successor-receipts")
+            .join(format!("{}.json", grant["grant_id"].as_str().unwrap()));
+        let receipt_meta = fs::symlink_metadata(&receipt_path).unwrap();
+        assert_eq!(receipt_meta.permissions().mode() & 0o777, 0o400);
+        let receiver_receipt: serde_json::Value =
+            serde_json::from_slice(&fs::read(receipt_path).unwrap()).unwrap();
+        assert_eq!(receiver_receipt["generation"], state_generation);
+        assert_eq!(receiver_receipt["source_id"], offer["source_id"]);
+        assert_eq!(receiver_receipt["attempt_id"], offer["attempt_id"]);
+        assert_eq!(receiver_receipt["payload_sha256"], grant["payload_sha256"]);
+        assert_eq!(
+            receiver_receipt["successor_identity"],
+            offer["successor_identity"]
+        );
         assert!(
             fs::read_to_string(&caller_err)
                 .unwrap_or_default()
-                .contains("F/ACK and root terminal join pending")
+                .contains("successor F/ACK complete; root terminal join pending")
         );
         broker.kill().unwrap();
         broker.wait().unwrap();
