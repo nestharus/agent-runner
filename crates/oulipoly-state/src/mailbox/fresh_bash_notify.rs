@@ -409,6 +409,14 @@ impl FreshV30Lane {
         {
             return Err("fresh Bash row source sidecar conflict".into());
         }
+        self.record_bash_wake_obligation(
+            &event,
+            &root_session,
+            row.seq,
+            &root_actor,
+            sha,
+            len,
+        )?;
         if row.delivered_at.is_some() {
             let acknowledged: bool = side.query_row(
                 "SELECT EXISTS(SELECT 1 FROM fresh_recipient_grant WHERE session_id=?1 AND seq=?2
