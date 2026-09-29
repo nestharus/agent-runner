@@ -9942,6 +9942,110 @@ fn serve_fresh_v30_at(
                         return Err(io::Error::other("fresh recipient request absent"));
                     };
                     let reply = match request {
+                        FreshRecipientRequest::OfferSuccessor {
+                            allocation_request_id,
+                            offer_request_id,
+                            seq,
+                            source_id,
+                        } => {
+                            if instance.is_closed() {
+                                return Err(io::Error::other("fresh successor entry gate closed"));
+                            }
+                            let session = lane
+                                .read_session(&allocation_request_id)
+                                .map_err(io::Error::other)?
+                                .ok_or_else(|| io::Error::other("successor session absent"))?;
+                            let offer = lane
+                                .offer_successor(
+                                    &offer_request_id,
+                                    &session,
+                                    seq,
+                                    &source_id,
+                                    &recipient,
+                                )
+                                .map_err(io::Error::other)?;
+                            serde_json::json!({"kind":"successor_offer", "offer":offer})
+                        }
+                        FreshRecipientRequest::ReadSuccessorOffer { offer_request_id } => {
+                            let offer = lane
+                                .read_successor_offer(&offer_request_id, &recipient)
+                                .map_err(io::Error::other)?;
+                            serde_json::json!({"kind":"successor_offer_readback", "offer":offer})
+                        }
+                        FreshRecipientRequest::AdmitSuccessor {
+                            d_key,
+                            offer_request_id,
+                        } => {
+                            if instance.is_closed() {
+                                return Err(io::Error::other("fresh successor entry gate closed"));
+                            }
+                            let root = lane
+                                .released_handoff_for_child(&d_key, &recipient)
+                                .map_err(io::Error::other)?;
+                            let (offer_d, offered) = lane
+                                .read_successor_offer_for_root(&offer_request_id, &recipient)
+                                .map_err(io::Error::other)?;
+                            if offer_d != d_key
+                                || offered.root_id != root.old_release.prepared.root_id
+                                || offered.owner_generation
+                                    != root.old_release.prepared.owner_generation
+                            {
+                                return Err(io::Error::other(
+                                    "successor offer is outside original D/root",
+                                ));
+                            }
+                            let successor = offered.successor_identity;
+                            let live_successor = if !lane
+                                .successor_state_committed_for_root(&offer_request_id, &recipient)
+                                .map_err(io::Error::other)?
+                            {
+                                let pinned =
+                                    PinnedProcess::open(successor.host_pid).map_err(|e| {
+                                        io::Error::other(format!(
+                                            "successor is not live for admission: {e}"
+                                        ))
+                                    })?;
+                                pinned.verify().map_err(|e| {
+                                    io::Error::other(format!(
+                                        "successor is not live for admission: {e}"
+                                    ))
+                                })?;
+                                let observed = FreshRecipientIdentity {
+                                    host_pid: pinned.host_pid,
+                                    boot_id: pinned.boot_id.clone(),
+                                    starttime_ticks: pinned.starttime_ticks,
+                                    pidns_dev: pinned.pidns_dev,
+                                    pidns_ino: pinned.pidns_ino,
+                                };
+                                if observed != successor
+                                    || !pinned.same_executable_as(&runner_image)?
+                                {
+                                    return Err(io::Error::other(
+                                        "successor is not a live exact Runner process",
+                                    ));
+                                }
+                                Some(pinned)
+                            } else {
+                                None
+                            };
+                            let _guard = admission_fences
+                                .lock()
+                                .map_err(|_| io::Error::other("root admission fence poisoned"))?;
+                            if _guard.contains(&offered.root_id) {
+                                return Err(io::Error::other("exact root admission fenced"));
+                            }
+                            let admission = lane
+                                .admit_successor(&offer_request_id, &recipient)
+                                .map_err(io::Error::other)?;
+                            drop(live_successor);
+                            serde_json::json!({"kind":"successor_admission", "admission":admission})
+                        }
+                        FreshRecipientRequest::ReadSuccessorAdmission { offer_request_id } => {
+                            let admission = lane
+                                .read_successor_admission(&offer_request_id, &recipient)
+                                .map_err(io::Error::other)?;
+                            serde_json::json!({"kind":"successor_admission_readback", "admission":admission})
+                        }
                         FreshRecipientRequest::FenceRootTerminal { ref d_key } => {
                             let root = lane
                                 .released_handoff_for_child(d_key, &recipient)

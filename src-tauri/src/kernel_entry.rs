@@ -476,6 +476,104 @@ pub(crate) fn private_consumed_h_source_decision_entry() -> Option<ExitCode> {
     })
 }
 
+/// Installed-image child used by the private connected admission fixture. Its
+/// only authority is to offer its own Broker-pinned process for one row; the
+/// original D-bound root must still approve it on its separate socket.
+#[cfg(feature = "age319-private-broker-fixture")]
+pub(crate) fn private_successor_offer_entry() -> Option<ExitCode> {
+    if std::env::args().nth(1).as_deref() != Some("__age319-private-successor-offer-v1") {
+        return None;
+    }
+    let result = (|| -> Result<(), String> {
+        use protocol::FreshRecipientRequest;
+        let args: Vec<String> = std::env::args().collect();
+        if args.len() != 7
+            || unsafe { libc::geteuid() } != 0
+            || std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1").is_none()
+            || !std::fs::read_to_string("/proc/self/uid_map")
+                .ok()
+                .is_some_and(|map| map.split_ascii_whitespace().nth(2) == Some("1"))
+        {
+            return Err("private successor offer entry is not an installed private child".into());
+        }
+        let socket = broker_socket().with_file_name("v30.sock");
+        let seq: i64 = args[3]
+            .parse()
+            .map_err(|_| "successor row sequence invalid")?;
+        let directory = std::path::Path::new(&args[6]);
+        let offer = protocol::fresh_recipient_request_at(
+            &socket,
+            &FreshRecipientRequest::OfferSuccessor {
+                allocation_request_id: args[2].clone(),
+                offer_request_id: args[5].clone(),
+                seq,
+                source_id: args[4].clone(),
+            },
+        )
+        .map_err(|e| format!("successor offer refused: {e}"))?;
+        if offer["kind"] != "successor_offer"
+            || offer["offer"]["seq"] != seq
+            || offer["offer"]["source_id"] != args[4]
+        {
+            return Err("successor offer reply changed row/source".into());
+        }
+        let read = protocol::fresh_recipient_request_at(
+            &socket,
+            &FreshRecipientRequest::ReadSuccessorOffer {
+                offer_request_id: args[5].clone(),
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        if read["offer"] != offer["offer"] {
+            return Err("successor offer exact readback changed".into());
+        }
+        let exit_after_offer =
+            std::env::var_os("AGE319_PRIVATE_SUCCESSOR_EXIT_AFTER_OFFER_V1").is_some();
+        std::fs::write(
+            directory.join(if exit_after_offer {
+                "stale-successor-offer.json"
+            } else {
+                "successor-offer.json"
+            }),
+            serde_json::to_vec(&offer["offer"]).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        if exit_after_offer {
+            return Ok(());
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !directory.join("successor-readback").exists() {
+            if std::time::Instant::now() >= deadline {
+                return Err("successor original root approval absent".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let admission = protocol::fresh_recipient_request_at(
+            &socket,
+            &FreshRecipientRequest::ReadSuccessorAdmission {
+                offer_request_id: args[5].clone(),
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        if admission["admission"]["offer"] != offer["offer"] {
+            return Err("successor admission exact readback changed".into());
+        }
+        std::fs::write(
+            directory.join("successor-admission.json"),
+            serde_json::to_vec(&admission["admission"]).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+    Some(match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("PRIVATE_SUCCESSOR_ADMISSION_GAP={error}");
+            ExitCode::FAILURE
+        }
+    })
+}
+
 #[cfg(feature = "age319-private-broker-fixture")]
 fn private_v30_child_mode() -> bool {
     std::env::var_os("OULIPOLY_KERNEL_V30_PRIVATE_CHILD_V1").is_some()
@@ -2593,6 +2691,169 @@ fn connected_async_bash_recipient(
             .map_err(|e| format!("connected async recipient repair: {e}"))?;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    if std::env::var_os("AGE319_CONNECTED_SUCCESSOR_ADMISSION_V1").is_some() {
+        let terminal = protocol::fresh_recipient_request_at(
+            socket,
+            &FreshRecipientRequest::ReadRootTerminal {
+                d_key: d_key.into(),
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        let seq = terminal["terminal"]["mailbox_seq"]
+            .as_i64()
+            .ok_or("successor exact pending row absent")?;
+        let session = protocol::read_fresh_v30_session_at(socket, d_key)
+            .map_err(|e| e.to_string())?
+            .ok_or("successor original D session absent")?;
+        let payload = protocol::fresh_recipient_request_at(
+            socket,
+            &FreshRecipientRequest::Lookup {
+                lane_id: session.lane_id.clone(),
+                session_id: session.session_id.clone(),
+                seq,
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(
+                payload["payload_base64"]
+                    .as_str()
+                    .ok_or("successor payload absent")?,
+            )
+            .map_err(|e| e.to_string())?;
+        let event: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        let source = event["source"]["source_id"]
+            .as_str()
+            .ok_or("successor source absent")?;
+        let stale_request_id = uuid::Uuid::new_v4().to_string();
+        let mut stale =
+            std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
+                .args([
+                    "__age319-private-successor-offer-v1",
+                    d_key,
+                    &seq.to_string(),
+                    source,
+                    &stale_request_id,
+                    directory.to_str().ok_or("successor directory invalid")?,
+                ])
+                .env("AGE319_PRIVATE_SUCCESSOR_EXIT_AFTER_OFFER_V1", "1")
+                .spawn()
+                .map_err(|e| e.to_string())?;
+        if !stale.wait().map_err(|e| e.to_string())?.success()
+            || !directory.join("stale-successor-offer.json").exists()
+        {
+            return Err("stale candidate did not produce a private offer".into());
+        }
+        let stale_refusal = match protocol::fresh_recipient_request_at(
+            socket,
+            &FreshRecipientRequest::AdmitSuccessor {
+                d_key: d_key.into(),
+                offer_request_id: stale_request_id,
+            },
+        ) {
+            Ok(_) => return Err("exited successor was admitted".into()),
+            Err(error) => error,
+        };
+        if !stale_refusal
+            .to_string()
+            .contains("successor is not live for admission")
+        {
+            return Err(format!("stale successor refusal changed: {stale_refusal}"));
+        }
+        let offer_request_id = uuid::Uuid::new_v4().to_string();
+        std::fs::write(directory.join("successor-request-id"), &offer_request_id)
+            .map_err(|e| e.to_string())?;
+        let mut successor =
+            std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
+                .args([
+                    "__age319-private-successor-offer-v1",
+                    d_key,
+                    &seq.to_string(),
+                    source,
+                    &offer_request_id,
+                    directory.to_str().ok_or("successor directory invalid")?,
+                ])
+                .spawn()
+                .map_err(|e| e.to_string())?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !directory.join("successor-offer.json").exists() {
+            if std::time::Instant::now() >= deadline {
+                return Err("successor live offer absent".into());
+            }
+            if let Some(status) = successor.try_wait().map_err(|e| e.to_string())? {
+                return Err(format!("successor offer child exited: {status}"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let offer: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(directory.join("successor-offer.json")).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        if offer["session_id"] != session.session_id
+            || offer["seq"] != seq
+            || offer["source_id"] != source
+        {
+            return Err("successor offer changed original row/source".into());
+        }
+        // Send a complete request and deliberately discard the first reply.
+        // The exact offer ID, rather than a new generation, is the retry key.
+        let admission_request = FreshRecipientRequest::AdmitSuccessor {
+            d_key: d_key.into(),
+            offer_request_id: offer_request_id.clone(),
+        };
+        let mut stream = UnixStream::connect(socket).map_err(|e| e.to_string())?;
+        let mut challenge = [0u8; 16];
+        stream
+            .read_exact(&mut challenge)
+            .map_err(|e| e.to_string())?;
+        let mut frame = vec![b'F'];
+        frame.extend_from_slice(&challenge);
+        frame
+            .extend_from_slice(&serde_json::to_vec(&admission_request).map_err(|e| e.to_string())?);
+        stream.write_all(&frame).map_err(|e| e.to_string())?;
+        drop(stream);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let read = loop {
+            let value = protocol::fresh_recipient_request_at(
+                socket,
+                &FreshRecipientRequest::ReadSuccessorAdmission {
+                    offer_request_id: offer_request_id.clone(),
+                },
+            );
+            match value {
+                Ok(read) if !read["admission"].is_null() => break read,
+                Err(_) | Ok(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                other => {
+                    return Err(format!(
+                        "lost successor admission readback absent: {other:?}"
+                    ));
+                }
+            }
+        };
+        let admitted = protocol::fresh_recipient_request_at(socket, &admission_request)
+            .map_err(|e| format!("exact successor admission retry refused: {e}"))?;
+        if admitted["admission"] != read["admission"] || read["admission"]["offer"] != offer {
+            return Err("original root successor admission readback changed".into());
+        }
+        std::fs::write(directory.join("successor-readback"), b"read").map_err(|e| e.to_string())?;
+        if !successor.wait().map_err(|e| e.to_string())?.success() {
+            return Err("successor peer admission readback failed".into());
+        }
+        if protocol::fresh_recipient_request_at(
+            socket,
+            &FreshRecipientRequest::Submit {
+                allocation_request_id: d_key.into(),
+                delivery_request_id: uuid::Uuid::new_v4().to_string(),
+            },
+        )
+        .is_ok()
+        {
+            return Err("original F remained open after successor admission".into());
+        }
+        return Err("successor admitted; F/ACK and root terminal join pending".into());
     }
     let delivery_request_id = uuid::Uuid::new_v4().to_string();
     let delivery = protocol::fresh_recipient_request_at(
