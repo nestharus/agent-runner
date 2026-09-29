@@ -305,6 +305,12 @@ impl FreshV30Lane {
             .parent()
             .ok_or("fresh State parent absent")?
             .join(FRESH_PROVIDER_DIRECTORY);
+        if self.normal_provider_k_recorded(&root.handoff_id)? {
+            if physical_entry_exists(&directory, &format!("{}.fresh-grant.json", root.handoff_id))? {
+                return Err("ambiguous parent provider K".into());
+            }
+            return self.physical_normal_root_terminal(root, actor, session);
+        }
         let grant = physical_json(&directory, &format!("{}.fresh-grant.json", root.handoff_id))?;
         let id = grant["id"].as_str().ok_or("parent K id absent")?;
         validate_request_id(id)?;
@@ -391,10 +397,78 @@ impl FreshV30Lane {
         })
     }
 
+    fn physical_normal_root_terminal(
+        &self,
+        root: &FreshReleasedHandoff,
+        actor: &FreshRecipientIdentity,
+        session: &FreshV30Session,
+    ) -> Result<FreshPhysicalTerminal, String> {
+        let k = self.read_normal_provider_k(root, actor, session)?
+            .ok_or("normal parent K absent")?;
+        let store = self.state_path.parent().ok_or("fresh State parent absent")?
+            .join("normal-provider");
+        let directory = store.join(&k.admission_id);
+        for path in [&store, &directory] {
+            let meta = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+            if !meta.is_dir() || meta.file_type().is_symlink() || meta.uid() != 0
+                || meta.mode() & 0o077 != 0
+            {
+                return Err("normal parent physical directory untrusted".into());
+            }
+        }
+        let q = physical_json(&directory, "q.json")?;
+        let wait = physical_json(&directory, "parent-wait.json")?;
+        let status = q["provider_wait_status"].as_i64()
+            .and_then(|value| i32::try_from(value).ok())
+            .ok_or("normal parent wait status invalid")?;
+        let parent_status = wait["pid1_wait_status"].as_i64()
+            .and_then(|value| i32::try_from(value).ok())
+            .ok_or("normal parent PID1 wait status invalid")?;
+        if q["admission_id"] != k.admission_id
+            || q["plan_sha256"] != k.plan_sha256
+            || q["tree_drained"] != true
+            || wait["admission_id"] != k.admission_id
+            || wait["pid1_parent_namespace_pid"].as_i64().is_none_or(|pid| pid <= 0)
+            || !libc::WIFEXITED(parent_status)
+            || libc::WEXITSTATUS(parent_status) != 0
+        {
+            return Err("normal parent physical Q or PID1 wait changed".into());
+        }
+        let (stdout_sha256, stdout_len) = self.physical_terminal_output(
+            &directory, "stdout", "stdout", &q,
+        )?;
+        let (stderr_sha256, stderr_len) = self.physical_terminal_output(
+            &directory, "stderr", "stderr", &q,
+        )?;
+        // The normal physical store keys both K and Q by the one admission.
+        Ok(FreshPhysicalTerminal {
+            grant_id: k.admission_id.clone(),
+            work_id: k.admission_id,
+            plan_sha256: k.plan_sha256,
+            wait_status: status,
+            outcome: physical_provider_outcome(status, false).into(),
+            cancelled: false,
+            stdout_sha256,
+            stdout_len,
+            stderr_sha256,
+            stderr_len,
+        })
+    }
+
     fn terminal_output(
         &self,
         directory: &Path,
         grant: &str,
+        stream: &str,
+        drain: &serde_json::Value,
+    ) -> Result<(String, u64), String> {
+        self.physical_terminal_output(directory, &format!("{grant}.{stream}"), stream, drain)
+    }
+
+    fn physical_terminal_output(
+        &self,
+        directory: &Path,
+        name: &str,
         stream: &str,
         drain: &serde_json::Value,
     ) -> Result<(String, u64), String> {
@@ -408,12 +482,13 @@ impl FreshV30Lane {
         let mut file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
-            .open(directory.join(format!("{grant}.{stream}")))
+            .open(directory.join(name))
             .map_err(|e| format!("parent {stream} absent: {e}"))?;
         let meta = file.metadata().map_err(|e| e.to_string())?;
         if !meta.is_file()
             || meta.uid() != 0
             || meta.nlink() != 1
+            || meta.mode() & 0o077 != 0
             || expected["device"] != meta.dev()
             || expected["inode"] != meta.ino()
             || meta.len() != len

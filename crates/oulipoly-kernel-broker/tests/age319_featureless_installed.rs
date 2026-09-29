@@ -28,7 +28,9 @@ fn disposable_root_featureless_l_help_lost_reply_and_duplicate() {
         return;
     };
     if std::env::var_os("AGE319_FEATURELESS_CHILD").is_none() {
-        let cases: &[bool] = if std::env::var_os("AGE319_FEATURELESS_ONLY_SUCCESSOR").is_some() {
+        let cases: &[bool] = if std::env::var_os("AGE319_FEATURELESS_BRIDGE_ONLY_V1").is_some() {
+            &[false]
+        } else if std::env::var_os("AGE319_FEATURELESS_ONLY_SUCCESSOR").is_some() {
             &[true]
         } else {
             &[false, true]
@@ -173,7 +175,28 @@ fn disposable_root_featureless_l_help_lost_reply_and_duplicate() {
     assert!(
         fs::read_to_string(&unsupported_err)
             .unwrap()
-            .contains("OULIPOLY_INSTALLED_LAUNCH_GAP=")
+            .contains("unsupported fresh-only CLI mode")
+    );
+    let wrong_image = installed.join("copied-launcher");
+    fs::copy(&launcher, &wrong_image).unwrap();
+    fs::set_permissions(&wrong_image, fs::Permissions::from_mode(0o755)).unwrap();
+    let wrong_image_err = temp.path().join("wrong-image.err");
+    let wrong_image_status = Command::new(&wrong_image)
+        .arg("--help")
+        .env_clear()
+        .env("HOME", temp.path())
+        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_PAIR_V1", &manifest)
+        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_LAUNCHER_V1", &launcher)
+        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(File::create(&wrong_image_err).unwrap()))
+        .status()
+        .unwrap();
+    assert!(!wrong_image_status.success());
+    assert!(
+        fs::read_to_string(&wrong_image_err)
+            .unwrap()
+            .contains("running executable is not the installed image")
     );
     let stale_manifest = installed.join("stale-install.json");
     let mut stale_pair = pair.clone();
@@ -196,7 +219,7 @@ fn disposable_root_featureless_l_help_lost_reply_and_duplicate() {
     assert!(
         fs::read_to_string(&stale_err)
             .unwrap()
-            .contains("OULIPOLY_INSTALLED_LAUNCH_GAP=")
+            .contains("installed launcher generation mismatch")
     );
     assert_eq!(
         fs::read_dir(state.join("installed-launches"))
@@ -673,6 +696,41 @@ fi
         assert_eq!(pending.selected_child_event, Some(selected.clone()));
         assert!(pending.execution.is_none(), "parent Q preceded busy W");
         fs::write(&provider_release, b"release").unwrap();
+    }
+    if std::env::var_os("AGE319_FEATURELESS_BRIDGE_ONLY_V1").is_some() {
+        let (root, actor) = lane.released_handoff_for_root(&async_root).unwrap();
+        let session = lane.read_session(&root.d_key).unwrap().unwrap();
+        assert!(
+            !state
+                .join("v30/fresh-provider")
+                .join(format!("{}.fresh-grant.json", root.handoff_id))
+                .exists(),
+            "normal K unexpectedly used the old physical grant"
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let read = loop {
+            let read = lane
+                .settle_private_root_terminal(&root, &actor, &session)
+                .unwrap();
+            if read.execution_state == "success" {
+                break read;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "normal K/Q terminal bridge did not settle: {read:?}"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        let parent = &read.execution.as_ref().unwrap().parent;
+        assert_eq!(parent.grant_id, async_parent);
+        assert_eq!(parent.work_id, async_parent);
+        assert_eq!(parent.outcome, "exit_success");
+        assert_eq!(read.selected_child_event, Some(selected));
+        async_launch.kill().unwrap();
+        async_launch.wait().unwrap();
+        broker.kill().unwrap();
+        broker.wait().unwrap();
+        return;
     }
     let async_status = loop {
         if let Some(status) = async_launch.try_wait().unwrap() {
