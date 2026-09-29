@@ -625,6 +625,48 @@ impl ParentWork {
     }
 }
 
+/// The installed normal-provider K has its own physical store. Its PID1
+/// publishes an exact parent receipt before it forks the selected provider.
+/// Preserve that causal namespace as the parent of a later Bash C.
+pub(super) fn parent_from_normal(
+    admission_id: String,
+    init: PinnedProcess,
+    bash: &PinnedProcess,
+    root: &PinnedProcess,
+) -> io::Result<ParentWork> {
+    if !init.is_namespace_init()?
+        || !root.is_namespace_init()?
+        || !in_namespace_lineage(bash, init.namespace())?
+    {
+        return Err(io::Error::other("Bash is outside exact normal provider K"));
+    }
+    let fd = unsafe { libc::ioctl(init.namespace().as_raw_fd(), libc::NS_GET_PARENT) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let parent_namespace = unsafe { File::from_raw_fd(fd) };
+    let parent_meta = parent_namespace.metadata()?;
+    if (parent_meta.dev(), parent_meta.ino()) != (root.pidns_dev, root.pidns_ino) {
+        return Err(io::Error::other(
+            "normal provider K is outside released root",
+        ));
+    }
+    bash.verify()?;
+    root.verify()?;
+    init.verify()?;
+    Ok(ParentWork {
+        stamp: ParentWorkStamp {
+            grant_id: admission_id.clone(),
+            work_id: admission_id,
+            init_pid: init.host_pid,
+            init_starttime: init.starttime_ticks,
+            pidns_dev: init.pidns_dev,
+            pidns_ino: init.pidns_ino,
+        },
+        init,
+    })
+}
+
 /// Walk kernel PID-namespace parents rather than process parents. A nested
 /// namespace, setsid, and later adoption leave this work relationship intact.
 fn in_namespace_lineage(actor: &PinnedProcess, ancestor: &File) -> io::Result<bool> {
@@ -9590,36 +9632,69 @@ fn launch_with_pty(
     }
     let parent_namespace = match &b.causal_parent {
         Some(parent) => {
-            let selected_parent = root_parent_grant(&prepared.directory, &b.handoff_id)?;
-            let consumed: Grant = exact_file(
-                &prepared.directory,
-                &format!("{}.consumed.json", parent.grant_id),
-            )?
-            .ok_or_else(|| io::Error::other("causal parent consumed K absent"))?;
-            let attach: Attach = exact_file(
-                &prepared.directory,
-                &format!("{}.attach.json", parent.grant_id),
-            )?
-            .ok_or_else(|| io::Error::other("causal parent attach absent"))?;
-            let pinned = PinnedProcess::open(parent.init_pid)?;
-            if consumed != selected_parent
-                || consumed.id != parent.grant_id
-                || consumed.binding.causal_parent.is_some()
-                || consumed.binding.root_id != b.root_id
-                || consumed.binding.handoff_id != b.handoff_id
-                || attach.grant_id != parent.grant_id
-                || attach.work_id != parent.work_id
-                || attach.pid1 != parent.init_pid
-                || attach.pid1_starttime != parent.init_starttime
-                || (attach.pidns_dev, attach.pidns_ino) != (parent.pidns_dev, parent.pidns_ino)
-                || pinned.starttime_ticks != parent.init_starttime
-                || (pinned.pidns_dev, pinned.pidns_ino) != (parent.pidns_dev, parent.pidns_ino)
-                || !pinned.is_namespace_init()?
-                || !in_namespace_lineage(actor, pinned.namespace())?
+            let state_root = prepared
+                .directory
+                .parent()
+                .and_then(Path::parent)
+                .ok_or_else(|| io::Error::other("fresh Bash State root absent"))?;
+            let lane = oulipoly_state::mailbox::FreshV30Lane::open_at(state_root)
+                .map_err(io::Error::other)?;
+            if lane
+                .normal_provider_k_recorded(&b.handoff_id)
+                .map_err(io::Error::other)?
             {
-                return Err(io::Error::other("fresh Bash K causal parent changed"));
+                let (release, root_actor) = lane
+                    .released_handoff_for_root(&b.root_id)
+                    .map_err(io::Error::other)?;
+                let session = lane
+                    .read_session(&release.d_key)
+                    .map_err(io::Error::other)?
+                    .ok_or_else(|| io::Error::other("normal Bash root D absent"))?;
+                let (admission_id, init) =
+                    oulipoly_kernel_broker::normal_physical::parent_for_bash(
+                        &lane,
+                        &release,
+                        &root_actor,
+                        &session,
+                        state_root,
+                    )?;
+                let exact = parent_from_normal(admission_id, init, actor, root)?;
+                if exact.stamp != *parent || release.handoff_id != b.handoff_id {
+                    return Err(io::Error::other("normal Bash K causal parent changed"));
+                }
+                exact.init.namespace().try_clone()?
+            } else {
+                let selected_parent = root_parent_grant(&prepared.directory, &b.handoff_id)?;
+                let consumed: Grant = exact_file(
+                    &prepared.directory,
+                    &format!("{}.consumed.json", parent.grant_id),
+                )?
+                .ok_or_else(|| io::Error::other("causal parent consumed K absent"))?;
+                let attach: Attach = exact_file(
+                    &prepared.directory,
+                    &format!("{}.attach.json", parent.grant_id),
+                )?
+                .ok_or_else(|| io::Error::other("causal parent attach absent"))?;
+                let pinned = PinnedProcess::open(parent.init_pid)?;
+                if consumed != selected_parent
+                    || consumed.id != parent.grant_id
+                    || consumed.binding.causal_parent.is_some()
+                    || consumed.binding.root_id != b.root_id
+                    || consumed.binding.handoff_id != b.handoff_id
+                    || attach.grant_id != parent.grant_id
+                    || attach.work_id != parent.work_id
+                    || attach.pid1 != parent.init_pid
+                    || attach.pid1_starttime != parent.init_starttime
+                    || (attach.pidns_dev, attach.pidns_ino) != (parent.pidns_dev, parent.pidns_ino)
+                    || pinned.starttime_ticks != parent.init_starttime
+                    || (pinned.pidns_dev, pinned.pidns_ino) != (parent.pidns_dev, parent.pidns_ino)
+                    || !pinned.is_namespace_init()?
+                    || !in_namespace_lineage(actor, pinned.namespace())?
+                {
+                    return Err(io::Error::other("fresh Bash K causal parent changed"));
+                }
+                pinned.namespace().try_clone()?
             }
-            pinned.namespace().try_clone()?
         }
         None => {
             if !actor.direct_child_of(root)? || !actor.in_namespace(root.namespace())? {

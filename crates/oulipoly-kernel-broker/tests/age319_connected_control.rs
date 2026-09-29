@@ -1,5 +1,6 @@
 #![cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
 
+use base64::Engine as _;
 use oulipoly_kernel_broker::RootRecord;
 use oulipoly_kernel_broker::first_install_activation::{FirstInstallActivation, PairPaths};
 use oulipoly_kernel_broker::installed_pair::InstalledPair;
@@ -47,6 +48,11 @@ fn root_mapped_connected_l_runs_normal_model_and_closes_owner() {
 }
 
 #[test]
+fn root_mapped_connected_l_runs_real_bash_sync_child_and_closes_owner() {
+    run_connected_case_with_bash(true, ProofFault::None, true);
+}
+
+#[test]
 fn root_mapped_connected_l_refuses_missing_q_after_certificate() {
     run_connected_case(true, ProofFault::MissingQ);
 }
@@ -72,36 +78,47 @@ enum ProofFault {
 }
 
 fn run_connected_case(normal: bool, fault: ProofFault) {
+    run_connected_case_with_bash(normal, fault, false);
+}
+
+fn run_connected_case_with_bash(normal: bool, fault: ProofFault, real_bash: bool) {
     let Ok(runner_bin) = std::env::var("AGE319_CONNECTED_RUNNER_BIN") else {
         return;
     };
+    let bash_bin = real_bash.then(|| {
+        std::env::var("AGE319_CONNECTED_BASH_BIN")
+            .expect("real Bash case requires AGE319_CONNECTED_BASH_BIN")
+    });
     if std::env::var_os("AGE319_CONNECTED_CHILD_TEST").is_none() {
-        let test_name = match (normal, fault) {
-            (false, ProofFault::None) => {
+        let test_name = match (normal, fault, real_bash) {
+            (true, ProofFault::None, true) => {
+                "root_mapped_connected_l_runs_real_bash_sync_child_and_closes_owner"
+            }
+            (false, ProofFault::None, false) => {
                 "root_mapped_connected_l_reaches_ordinary_help_with_exact_one_use_custody"
             }
-            (false, ProofFault::Diagnostics) => {
+            (false, ProofFault::Diagnostics, false) => {
                 "root_mapped_connected_diagnostics_help_closes_without_effect"
             }
-            (false, ProofFault::Restart) => {
+            (false, ProofFault::Restart, false) => {
                 "root_mapped_connected_help_revalidates_offline_close_after_restart"
             }
-            (false, ProofFault::OfflineTamper) => {
+            (false, ProofFault::OfflineTamper, false) => {
                 "root_mapped_connected_help_refuses_tampered_no_effect_certificate"
             }
-            (true, ProofFault::None) => {
+            (true, ProofFault::None, false) => {
                 "root_mapped_connected_l_runs_normal_model_and_closes_owner"
             }
-            (true, ProofFault::MissingQ) => {
+            (true, ProofFault::MissingQ, false) => {
                 "root_mapped_connected_l_refuses_missing_q_after_certificate"
             }
-            (true, ProofFault::ChangedQ) => {
+            (true, ProofFault::ChangedQ, false) => {
                 "root_mapped_connected_l_refuses_changed_q_after_certificate"
             }
-            (true, ProofFault::Restart) => {
+            (true, ProofFault::Restart, false) => {
                 "root_mapped_connected_l_revalidates_certificate_after_broker_restart"
             }
-            (true, ProofFault::OfflineTamper | ProofFault::Diagnostics) | (false, _) => {
+            _ => {
                 unreachable!()
             }
         };
@@ -111,6 +128,11 @@ fn run_connected_case(normal: bool, fault: ProofFault) {
             .args(["--exact", test_name, "--nocapture"])
             .env("AGE319_CONNECTED_CHILD_TEST", "1")
             .env("AGE319_CONNECTED_RUNNER_BIN", runner_bin)
+            .envs(
+                bash_bin
+                    .as_ref()
+                    .map(|path| ("AGE319_CONNECTED_BASH_BIN", path)),
+            )
             .status()
             .unwrap();
         assert!(status.success(), "root-mapped connected fixture failed");
@@ -127,7 +149,11 @@ fn run_connected_case(normal: bool, fault: ProofFault) {
         let provider = temp.path().join("provider.sh");
         fs::write(
             &provider,
-            b"#!/bin/sh\nprintf 'one\\n' >> \"$AGE319_EFFECT_FILE\"\nprintf 'normal-provider-out:'\ncat\nprintf 'normal-provider-err\\n' >&2\n",
+            if real_bash {
+                b"#!/bin/sh\nexport OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1=\"$AGE319_BASH_CONTROL_SOCKET\"\n\"$AGE319_BASH_IMAGE\" run --delivery sync -- /bin/sh -c 'printf \"one\\n\" >> \"$AGE319_EFFECT_FILE\"; printf \"bash-child-out\\n\"; printf \"bash-child-err\\n\" >&2'\n".as_slice()
+            } else {
+                b"#!/bin/sh\nprintf 'one\\n' >> \"$AGE319_EFFECT_FILE\"\nprintf 'normal-provider-out:'\ncat\nprintf 'normal-provider-err\\n' >&2\n".as_slice()
+            },
         )
         .unwrap();
         fs::set_permissions(&provider, fs::Permissions::from_mode(0o755)).unwrap();
@@ -135,7 +161,7 @@ fn run_connected_case(normal: bool, fault: ProofFault) {
             config.join("providers.toml"),
             format!(
                 "[local]\ncommand = {}\nquota_account_id = 'physical-local'\n",
-                serde_json::to_string(provider.to_str().unwrap()).unwrap()
+                serde_json::to_string(provider.to_str().unwrap()).unwrap(),
             ),
         )
         .unwrap();
@@ -154,7 +180,20 @@ fn run_connected_case(normal: bool, fault: ProofFault) {
     fs::copy(&runner_bin, &runner).unwrap();
     fs::copy(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"), &broker_image).unwrap();
     fs::copy(env!("CARGO_BIN_EXE_oulipoly-installed-launcher"), &launcher).unwrap();
-    fs::copy(&broker_image, &bash).unwrap();
+    fs::copy(
+        bash_bin.as_ref().map_or(broker_image.as_path(), Path::new),
+        &bash,
+    )
+    .unwrap();
+    if real_bash {
+        assert_eq!(
+            digest(&bash),
+            digest(Path::new(bash_bin.as_deref().unwrap()))
+        );
+        assert_ne!(digest(&bash), digest(&broker_image));
+        assert_ne!(digest(&bash), digest(&runner));
+        assert_ne!(digest(&bash), digest(&launcher));
+    }
     let manifest = installed.join("install-v1.json");
     let pair = InstalledPair {
         schema: 2,
@@ -169,7 +208,7 @@ fn run_connected_case(normal: bool, fault: ProofFault) {
     fs::set_permissions(&manifest, fs::Permissions::from_mode(0o600)).unwrap();
     let state = temp.path().join("state");
     let source = EmptyV30BootstrapIdentity::bootstrap_at(&state).unwrap();
-    FirstInstallActivation::activate_at(
+    let activation = FirstInstallActivation::activate_at(
         &state,
         PairPaths {
             manifest: &manifest,
@@ -181,6 +220,7 @@ fn run_connected_case(normal: bool, fault: ProofFault) {
         true,
     )
     .unwrap();
+    assert_eq!(activation.bash.sha256, pair.bash_sha256.as_deref().unwrap());
     let socket = temp.path().join("control.sock");
     let broker_log = temp.path().join("broker.err");
     let mut broker = Command::new(&broker_image)
@@ -278,6 +318,8 @@ fn run_connected_case(normal: bool, fault: ProofFault) {
         .envs(normal.then_some(("OULIPOLY_CONFIG_HOME", &config_home)))
         .envs(normal.then_some(("OULIPOLY_DATA_DIR", &data_dir)))
         .envs(normal.then_some(("AGE319_EFFECT_FILE", &effect)))
+        .envs(real_bash.then_some(("AGE319_BASH_IMAGE", &bash)))
+        .envs(real_bash.then_some(("AGE319_BASH_CONTROL_SOCKET", &socket)))
         .env("AGE319_PRIVATE_CONNECTED_J_REPLAY_V1", "1")
         .env("AGE319_CONNECTED_PAUSE_DIR", &pause)
         .envs(
@@ -297,7 +339,10 @@ fn run_connected_case(normal: bool, fault: ProofFault) {
     while !pause.join("ready").exists() {
         assert!(
             Instant::now() < deadline,
-            "control Runner did not accept connected grant"
+            "control Runner did not accept connected grant: caller={} broker={} launcher={:?}",
+            fs::read_to_string(&caller_err).unwrap_or_default(),
+            fs::read_to_string(&broker_log).unwrap_or_default(),
+            launcher_child.try_wait().unwrap()
         );
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -433,8 +478,42 @@ fn run_connected_case(normal: bool, fault: ProofFault) {
         }
         assert!(
             Instant::now() < deadline,
-            "actual control wait was not retained: broker={}",
-            fs::read_to_string(&broker_log).unwrap_or_default()
+            "actual control wait was not retained: caller={} stdout={} broker={} bash_files={:?} normal_files={:?}",
+            fs::read_to_string(&caller_err).unwrap_or_default(),
+            fs::read_to_string(&caller_out).unwrap_or_default(),
+            fs::read_to_string(&broker_log).unwrap_or_default(),
+            fs::read_dir(state.join("v30/fresh-provider"))
+                .ok()
+                .map(|dir| dir
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.file_name())
+                    .collect::<Vec<_>>()),
+            fs::read_dir(state.join("v30/normal-provider"))
+                .ok()
+                .map(|dir| dir
+                    .filter_map(Result::ok)
+                    .map(|entry| {
+                        let path = entry.path();
+                        (
+                            path.clone(),
+                            fs::read_dir(&path).ok().map(|files| {
+                                files
+                                    .filter_map(Result::ok)
+                                    .map(|file| {
+                                        (
+                                            file.file_name(),
+                                            fs::read_to_string(file.path())
+                                                .unwrap_or_default()
+                                                .chars()
+                                                .take(300)
+                                                .collect::<String>(),
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                            }),
+                        )
+                    })
+                    .collect::<Vec<_>>()),
         );
         std::thread::sleep(Duration::from_millis(20));
     };
@@ -454,9 +533,22 @@ fn run_connected_case(normal: bool, fault: ProofFault) {
     assert_eq!(
         control_exit["code"],
         0,
-        "caller={} broker={} handoff={handoff}",
+        "caller={} broker={} handoff={handoff} bash_files={:?}",
         fs::read_to_string(&caller_err).unwrap_or_default(),
-        fs::read_to_string(&broker_log).unwrap_or_default()
+        fs::read_to_string(&broker_log).unwrap_or_default(),
+        fs::read_dir(state.join("v30/fresh-provider"))
+            .ok()
+            .map(|dir| dir
+                .filter_map(Result::ok)
+                .map(|entry| (
+                    entry.file_name(),
+                    fs::read_to_string(entry.path())
+                        .unwrap_or_default()
+                        .chars()
+                        .take(300)
+                        .collect::<String>()
+                ))
+                .collect::<Vec<_>>()),
     );
     assert!(control_exit["signal"].is_null());
     let fresh_sidecar = state.join("v30/sidecar/pid-identity.db");
@@ -487,7 +579,9 @@ fn run_connected_case(normal: bool, fault: ProofFault) {
     }
     let output = loop {
         let output = fs::read_to_string(&caller_out).unwrap_or_default();
-        if output.contains(if normal {
+        if output.contains(if real_bash {
+            "\"dispatch_state\":\"sync-child-result\""
+        } else if normal {
             "normal-provider-out:"
         } else {
             "Usage:"
@@ -503,7 +597,9 @@ fn run_connected_case(normal: bool, fault: ProofFault) {
         std::thread::sleep(Duration::from_millis(20));
     };
     assert!(
-        output.contains(if normal {
+        output.contains(if real_bash {
+            "\"schema_version\":31"
+        } else if normal {
             "normal-provider-out:hello fixture"
         } else if fault == ProofFault::Diagnostics {
             "diagnostics"
@@ -538,11 +634,15 @@ fn run_connected_case(normal: bool, fault: ProofFault) {
             "normal close warning: {broker_errors}"
         );
         assert_eq!(fs::read_to_string(&effect).unwrap(), "one\n");
-        assert!(
-            fs::read_to_string(&caller_err)
-                .unwrap()
-                .contains("normal-provider-err")
-        );
+        if real_bash {
+            assert_real_bash_sync_child(&state, &fresh_db, &root_id, &handoff, &output);
+        } else {
+            assert!(
+                fs::read_to_string(&caller_err)
+                    .unwrap()
+                    .contains("normal-provider-err")
+            );
+        }
         assert_eq!(drained["pid1_echild_receipt"], true);
         assert_eq!(drained["pid1_terminal_proof"], true);
         assert_eq!(drained["pid1_exact_live"], false);
@@ -585,11 +685,19 @@ fn run_connected_case(normal: bool, fault: ProofFault) {
         assert_eq!(parent["admission_id"], admission_id);
         assert_eq!(
             fs::read(physical.join("stdout")).unwrap(),
-            b"normal-provider-out:hello fixture"
+            if real_bash {
+                output.as_bytes()
+            } else {
+                b"normal-provider-out:hello fixture"
+            },
         );
         assert_eq!(
             fs::read(physical.join("stderr")).unwrap(),
-            b"normal-provider-err\n"
+            if real_bash {
+                b"".as_slice()
+            } else {
+                b"normal-provider-err\n"
+            },
         );
         assert!(physical.join("caller-settled.json").exists());
         assert_eq!(fs::read_dir(state.join("entries")).unwrap().count(), 1);
@@ -818,4 +926,154 @@ fn run_connected_case(normal: bool, fault: ProofFault) {
     );
     broker.kill().unwrap();
     broker.wait().unwrap();
+}
+
+fn assert_real_bash_sync_child(
+    state: &Path,
+    fresh_db: &Path,
+    root_id: &str,
+    handoff: &serde_json::Value,
+    output: &str,
+) {
+    let report: serde_json::Value = serde_json::from_str(output).unwrap();
+    assert_eq!(report["schema_version"], 31);
+    assert_eq!(report["dispatch_state"], "sync-child-result");
+    assert_eq!(report["publication"]["phase"], "unknown");
+    assert_eq!(report["publication"]["outcome"], "exited");
+    assert_eq!(report["publication"]["exit_code"], 0);
+    let child = &report["publication"]["child"];
+    let event = &report["publication"]["event"];
+    let request_id = child["request_id"].as_str().unwrap();
+    let grant_id = event["physical_grant_id"].as_str().unwrap();
+    assert_eq!(child["root_id"], root_id);
+    assert_eq!(child["root_handoff_id"], handoff["handoff_id"]);
+    assert_eq!(child["parent_invocation_uuid"], handoff["invocation_uuid"]);
+    assert_eq!(
+        child["listener_policy"].as_str().unwrap_or("response_only"),
+        "response_only"
+    );
+    assert_eq!(event["request_id"], request_id);
+    assert_eq!(event["source_id"], child["handle"]);
+    assert_eq!(event["attempt_id"], child["invocation_uuid"]);
+    assert_eq!(event["parent_work_grant_id"], child["parent_work_grant_id"]);
+    assert_eq!(event["parent_work_id"], child["parent_work_id"]);
+    assert_eq!(event["tree_drained"], true);
+    assert_eq!(event["output_closed"], true);
+    assert_eq!(event["wait_status"], 0);
+    let db =
+        rusqlite::Connection::open_with_flags(fresh_db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    for (table, column, expected) in [
+        ("fresh_bash_child", "receipt_json", child),
+        ("fresh_bash_selected_event", "receipt_json", event),
+        (
+            "fresh_bash_sync_publication",
+            "receipt_json",
+            &report["publication"],
+        ),
+    ] {
+        let rows: i64 = db
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 1, "{table} must hold exactly one C/W/response record");
+        let stored: String = db
+            .query_row(
+                &format!("SELECT {column} FROM {table} WHERE request_id=?1"),
+                [request_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut stored: serde_json::Value = serde_json::from_str(&stored).unwrap();
+        if table == "fresh_bash_child" {
+            assert_eq!(stored["session"]["session_id"], "");
+            stored["session"] = child["session"].clone();
+        }
+        assert_eq!(stored, *expected);
+    }
+    let physical = state.join("v30/fresh-provider");
+    let child_consumptions = fs::read_dir(&physical)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".consumed.json")
+        })
+        .count();
+    assert_eq!(child_consumptions, 1, "exactly one Bash child K");
+    let consumed: serde_json::Value = serde_json::from_slice(
+        &fs::read(physical.join(format!("{grant_id}.consumed.json"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(consumed["id"], grant_id);
+    assert_eq!(consumed["binding"]["grant_key"], request_id);
+    let parent_grant = child["parent_work_grant_id"].as_str().unwrap();
+    let parent_k: String = db
+        .query_row(
+            "SELECT k_json FROM fresh_normal_provider_k WHERE handoff_id=?1",
+            [handoff["handoff_id"].as_str().unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let parent_k: serde_json::Value = serde_json::from_str(&parent_k).unwrap();
+    assert_eq!(parent_k["admission_id"], parent_grant);
+    assert_eq!(child["parent_work_id"], parent_grant);
+    let parent: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            state
+                .join("v30/normal-provider")
+                .join(parent_grant)
+                .join("bash-parent.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(parent["admission_id"], parent_k["admission_id"]);
+    assert_eq!(parent["plan_sha256"], parent_k["plan_sha256"]);
+    assert_eq!(parent["handoff_id"], handoff["handoff_id"]);
+    assert_eq!(parent["root_id"], root_id);
+    assert!(parent["pid1_host_pid"].as_i64().unwrap() > 0);
+    assert!(parent["pid1_starttime_ticks"].as_u64().unwrap() > 0);
+    let selection: serde_json::Value = serde_json::from_slice(
+        &fs::read(physical.join(format!("{request_id}.child-work-selection.json"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(selection["role"], "bash-child-ordinary-tree-v1");
+    assert_eq!(selection["child_request_id"], request_id);
+    assert_eq!(selection["child_d_key"], child["d_key"]);
+    assert_eq!(
+        selection["binding"]["causal_parent"]["grant_id"],
+        parent_grant
+    );
+    assert_eq!(
+        selection["binding"]["causal_parent"]["work_id"],
+        child["parent_work_id"]
+    );
+    let source_event: serde_json::Value = serde_json::from_slice(
+        &fs::read(physical.join(format!("{grant_id}.source-event.json"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(source_event, *event);
+    assert!(physical.join(format!("{grant_id}.drain.json")).exists());
+    for (stream, expected) in [
+        ("stdout", b"bash-child-out\n".as_slice()),
+        ("stderr", b"bash-child-err\n".as_slice()),
+    ] {
+        let bytes = fs::read(physical.join(format!("{grant_id}.{stream}"))).unwrap();
+        assert_eq!(bytes, expected);
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(report[format!("{stream}_base64")].as_str().unwrap())
+                .unwrap(),
+            expected
+        );
+        assert_eq!(event[format!("{stream}_len")], expected.len());
+        assert_eq!(
+            event[format!("{stream}_sha256")],
+            format!("{:x}", Sha256::digest(expected))
+        );
+    }
 }
