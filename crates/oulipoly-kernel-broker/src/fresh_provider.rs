@@ -9630,6 +9630,7 @@ fn launch_with_pty(
     {
         return Err(io::Error::other("fresh provider K root or actor changed"));
     }
+    let mut normal_parent = None;
     let parent_namespace = match &b.causal_parent {
         Some(parent) => {
             let state_root = prepared
@@ -9662,7 +9663,13 @@ fn launch_with_pty(
                 if exact.stamp != *parent || release.handoff_id != b.handoff_id {
                     return Err(io::Error::other("normal Bash K causal parent changed"));
                 }
-                exact.init.namespace().try_clone()?
+                let namespace = exact.init.namespace().try_clone()?;
+                normal_parent = Some((
+                    state_root.to_path_buf(),
+                    exact.stamp.grant_id.clone(),
+                    exact.init,
+                ));
+                namespace
             } else {
                 let selected_parent = root_parent_grant(&prepared.directory, &b.handoff_id)?;
                 let consumed: Grant = exact_file(
@@ -9765,11 +9772,23 @@ fn launch_with_pty(
     {
         require_selected_plan_indexed(&prepared.directory, b, &prepared.plan, index)?;
     }
+    let normal_child_reservation = normal_parent
+        .as_ref()
+        .map(|(state_root, admission_id, init)| {
+            oulipoly_kernel_broker::normal_physical::reserve_bash_child(
+                state_root,
+                admission_id,
+                init,
+                &prepared.grant.id,
+            )
+        })
+        .transpose()?;
     durable_new(
         &prepared.directory,
         &format!("{}.consumed.json", prepared.grant.id),
         &prepared.grant,
     )?;
+    drop(normal_child_reservation);
     if let Some((generation, intent, request, revision)) = v3_quota {
         generation
             .record_quota_k(&intent.binding, request, &intent.id, Some(revision))
