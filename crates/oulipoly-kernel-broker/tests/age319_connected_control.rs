@@ -170,15 +170,8 @@ fn run_connected_case_with_bash(
             if async_bash {
                 br#"#!/bin/sh
 export OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1="$AGE319_BASH_CONTROL_SOCKET"
-response=$("$AGE319_BASH_IMAGE" run --delivery async -- /bin/sh -c 'printf "one\n" >> "$AGE319_EFFECT_FILE"; printf "async-child-out\n"; printf "async-child-err\n" >&2') || exit
+response=$("$AGE319_BASH_IMAGE" run --delivery async -- /bin/sh -c 'while [ ! -f "$AGE319_CHILD_RELEASE_FILE" ]; do sleep 0.02; done; printf "one\n" >> "$AGE319_EFFECT_FILE"; printf "async-child-out\n"; printf "async-child-err\n" >&2') || exit
 printf '%s\n' "$response"
-grant=$(printf '%s' "$response" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["physical_grant_id"])') || exit
-attempt=0
-while [ ! -f "$AGE319_BASH_SOURCE_DIR/$grant.source-event.json" ]; do
-    attempt=$((attempt+1))
-    [ "$attempt" -lt 1500 ] || exit 1
-    sleep 0.02
-done
 "#.as_slice()
             } else if real_bash {
                 b"#!/bin/sh\nexport OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1=\"$AGE319_BASH_CONTROL_SOCKET\"\n\"$AGE319_BASH_IMAGE\" run --delivery sync -- /bin/sh -c 'printf \"one\\n\" >> \"$AGE319_EFFECT_FILE\"; printf \"bash-child-out\\n\"; printf \"bash-child-err\\n\" >&2'\n".as_slice()
@@ -351,7 +344,10 @@ done
         .envs(normal.then_some(("AGE319_EFFECT_FILE", &effect)))
         .envs(real_bash.then_some(("AGE319_BASH_IMAGE", &bash)))
         .envs(real_bash.then_some(("AGE319_BASH_CONTROL_SOCKET", &socket)))
-        .envs(async_bash.then_some(("AGE319_BASH_SOURCE_DIR", state.join("v30/fresh-provider"))))
+        .envs(async_bash.then_some((
+            "AGE319_CHILD_RELEASE_FILE",
+            temp.path().join("child-release"),
+        )))
         .envs(async_bash.then_some(("AGE319_CONNECTED_ASYNC_RECIPIENT_DIR_V1", &recipient)))
         .env("AGE319_PRIVATE_CONNECTED_J_REPLAY_V1", "1")
         .env("AGE319_CONNECTED_PAUSE_DIR", &pause)
@@ -498,6 +494,32 @@ done
             fs::read_to_string(&broker_log).unwrap_or_default()
         );
         std::thread::sleep(Duration::from_millis(20));
+    }
+    if async_bash {
+        let normal_store = state.join("v30/normal-provider");
+        let physical = loop {
+            if let Ok(mut entries) = fs::read_dir(&normal_store)
+                && let Some(Ok(entry)) = entries.next()
+            {
+                break entry.path();
+            }
+            assert!(Instant::now() < deadline, "normal physical grant absent");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        while !physical.join("provider-exit.json").exists() {
+            assert!(
+                Instant::now() < deadline,
+                "normal provider did not exit before async child release: caller={} broker={}",
+                fs::read_to_string(&caller_err).unwrap_or_default(),
+                fs::read_to_string(&broker_log).unwrap_or_default(),
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !physical.join("q.json").exists(),
+            "normal Q preceded live child"
+        );
+        fs::write(temp.path().join("child-release"), b"release").unwrap();
     }
     let exit_path = state.join("installed-control-exits").join(format!(
         "{}.json",

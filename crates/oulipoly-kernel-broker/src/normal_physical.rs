@@ -2,7 +2,9 @@
 //! State K precedes the detached supervisor. Only that supervisor can produce
 //! a Q; missing or damaged evidence is unknown and never permits a retry.
 
-use crate::identity::{PinnedProcess, host_proc_file, install_detached_host_proc};
+use crate::identity::{
+    PinnedProcess, host_proc_file, install_detached_host_proc, observed_incarnation_gone,
+};
 use crate::normal_model_selection;
 use crate::normal_plan_custody;
 use oulipoly_runtime::executor::cli::fresh_remote::FreshProviderPlan;
@@ -23,6 +25,7 @@ use std::process::{Command, Stdio};
 
 const MAX_RECIPE: u64 = 64 * 1024 * 1024;
 const HASH_BUFFER: usize = 64 * 1024;
+const CHILD_DRAIN_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -83,6 +86,144 @@ struct BashParent {
     pid1_starttime_ticks: u64,
     pidns_dev: u64,
     pidns_ino: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BashChildReservation {
+    admission_id: String,
+    grant_id: String,
+}
+
+#[derive(Deserialize)]
+struct ChildAttach {
+    grant_id: String,
+    work_id: String,
+    pid1: i32,
+    pid1_starttime: u64,
+    pidns_dev: u64,
+    pidns_ino: u64,
+}
+
+#[derive(Deserialize)]
+struct ChildDrain {
+    grant_id: String,
+    work_id: String,
+    zero_remaining: bool,
+}
+
+#[derive(Deserialize)]
+struct ChildWait {
+    grant_id: String,
+    work_id: String,
+    reaped: bool,
+    wait_status: i32,
+}
+
+fn lock_directory(directory: &File) -> io::Result<()> {
+    if unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Serialize a child's durable pre-K reservation with the normal PID1's
+/// final drain decision. The returned directory lock is held through K.
+pub fn reserve_bash_child(
+    state_root: &Path,
+    admission_id: &str,
+    init: &PinnedProcess,
+    grant_id: &str,
+) -> io::Result<File> {
+    let directory = id_path(&store_root(state_root)?, admission_id)?;
+    let lock = File::open(&directory)?;
+    lock_directory(&lock)?;
+    let parent: BashParent = read_optional(&directory, "bash-parent.json")?
+        .ok_or_else(|| io::Error::other("normal Bash parent attach absent"))?;
+    if parent.admission_id != admission_id
+        || parent.pid1_host_pid != init.host_pid
+        || parent.pid1_starttime_ticks != init.starttime_ticks
+        || (parent.pidns_dev, parent.pidns_ino) != (init.pidns_dev, init.pidns_ino)
+        || init.exited()?
+        || directory.join("q.json").exists()
+    {
+        return Err(io::Error::other(
+            "normal Bash parent already drained or changed",
+        ));
+    }
+    init.verify()?;
+    let grant_id = uuid::Uuid::parse_str(grant_id).map_err(io::Error::other)?;
+    if grant_id.is_nil() {
+        return Err(io::Error::other("normal Bash child grant ID invalid"));
+    }
+    let grant_id = grant_id.to_string();
+    write_new(
+        &directory,
+        &format!("bash-child-{grant_id}.json"),
+        &BashChildReservation {
+            admission_id: admission_id.to_owned(),
+            grant_id,
+        },
+    )?;
+    Ok(lock)
+}
+
+fn bash_children_drained(directory: &Path, admission_id: &str, boot_id: &str) -> io::Result<bool> {
+    let physical = directory
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| io::Error::other("normal child physical store absent"))?
+        .join("fresh-provider");
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(grant_id) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("bash-child-"))
+            .and_then(|name| name.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        id_path(&physical, grant_id)?;
+        let reservation: BashChildReservation = read_optional(directory, &name.to_string_lossy())?
+            .ok_or_else(|| io::Error::other("normal child reservation disappeared"))?;
+        if reservation.admission_id != admission_id || reservation.grant_id != grant_id {
+            return Err(io::Error::other("normal child reservation changed"));
+        }
+        // The Broker holds the same lock from reservation through durable K.
+        // A crash before K leaves an inert reservation, never a launched child.
+        if !physical.join(format!("{grant_id}.consumed.json")).exists() {
+            continue;
+        }
+        let attach: Option<ChildAttach> =
+            read_optional(&physical, &format!("{grant_id}.attach.json"))?;
+        let drain: Option<ChildDrain> =
+            read_optional(&physical, &format!("{grant_id}.drain.json"))?;
+        let wait: Option<ChildWait> =
+            read_optional(&physical, &format!("{grant_id}.pid1-wait.json"))?;
+        let (Some(attach), Some(drain), Some(wait)) = (attach, drain, wait) else {
+            return Ok(false);
+        };
+        if attach.grant_id != grant_id
+            || drain.grant_id != grant_id
+            || wait.grant_id != grant_id
+            || drain.work_id != attach.work_id
+            || wait.work_id != attach.work_id
+            || !drain.zero_remaining
+            || !wait.reaped
+            || !libc::WIFEXITED(wait.wait_status)
+            || libc::WEXITSTATUS(wait.wait_status) != 0
+            || !observed_incarnation_gone(
+                attach.pid1,
+                boot_id,
+                attach.pid1_starttime,
+                (attach.pidns_dev, attach.pidns_ino),
+            )?
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn own_host_pid_and_starttime() -> io::Result<(i32, u64)> {
@@ -842,6 +983,32 @@ fn pid1_run(
     }
     let provider_wait_status =
         provider_wait.ok_or_else(|| io::Error::other("normal provider wait absent"))?;
+    // This interim observation is useful to fixture and diagnostics; failure
+    // to publish it must not terminate PID1 with an attached child still live.
+    let _ = write_new(
+        directory,
+        "provider-exit.json",
+        &serde_json::json!({
+            "admission_id": recipe.k.admission_id,
+            "provider_wait_status": provider_wait_status,
+        }),
+    );
+    // A Broker-spawned Bash child shares this PID namespace but is not this
+    // PID1's process child. ECHILD alone cannot certify its lifetime. The
+    // Broker records an exact child grant while holding this directory lock
+    // through K; PID1 takes the same lock before deciding that Q may close.
+    let lock = loop {
+        if let Ok(lock) = File::open(directory) {
+            if lock_directory(&lock).is_ok() {
+                match bash_children_drained(directory, &recipe.k.admission_id, &root.boot_id) {
+                    Ok(true) => break lock,
+                    Ok(false) | Err(_) => {}
+                }
+            }
+            drop(lock);
+        }
+        std::thread::sleep(CHILD_DRAIN_POLL);
+    };
     let q = PhysicalQ {
         admission_id: recipe.k.admission_id.clone(),
         plan_sha256: recipe.k.plan_sha256.clone(),
@@ -850,7 +1017,9 @@ fn pid1_run(
         stdout: output_evidence(&mut stdout)?,
         stderr: output_evidence(&mut stderr)?,
     };
-    write_new(directory, "q.json", &q)
+    let result = write_new(directory, "q.json", &q);
+    drop(lock);
+    result
 }
 
 /// Runs only as a fresh process spawned by the broker after State K commits.
