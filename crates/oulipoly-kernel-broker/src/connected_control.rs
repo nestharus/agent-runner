@@ -11,7 +11,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 
 pub const FD_ENV: &str = "OULIPOLY_KERNEL_CONNECTED_CONTROL_FD_V1";
 
@@ -30,6 +30,7 @@ pub struct ControlGrant {
     pub process: ProcessStamp,
     channel: UnixStream,
     child: Child,
+    e_accepted: bool,
 }
 
 impl ControlGrant {
@@ -189,7 +190,16 @@ impl ControlGrant {
             process,
             channel: broker,
             child,
+            e_accepted: false,
         })
+    }
+
+    pub fn mark_e_accepted(&mut self) {
+        self.e_accepted = true;
+    }
+
+    pub fn e_accepted(&self) -> bool {
+        self.e_accepted
     }
 
     /// E is the sole consumer. A read from the connected channel must carry
@@ -239,8 +249,10 @@ impl ControlGrant {
         crate::identity::host_proc_uid(self.process.host_pid)
     }
 
-    pub fn reap_if_done(&mut self) -> bool {
-        !matches!(self.child.try_wait(), Ok(None))
+    /// Return the kernel wait result for this exact direct child. The caller
+    /// must retain the grant until that result has been recorded durably.
+    pub fn reap_if_done(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.child.try_wait()
     }
 }
 
