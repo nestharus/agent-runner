@@ -79,7 +79,7 @@ pub use fresh_lane::{
     FreshRootTerminalReadback, FreshRootWorkIntent, FreshSuccessorAdmission,
     FreshSuccessorDelivery, FreshSuccessorDeliveryReadback, FreshSuccessorOffer,
     FreshSuccessorReceiverReceipt, FreshSuccessorTerminalAck, FreshV30Lane, FreshV30LaneIdentity,
-    FreshV30Session, normal_root_arguments,
+    FreshV30Session, NormalProviderSelection, normal_root_arguments,
 };
 pub use native_publication::NativePublication;
 #[path = "mailbox/schema.rs"]

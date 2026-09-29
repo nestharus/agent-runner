@@ -54,6 +54,10 @@ pub struct FreshRootTerminalReadback {
     pub native_receipt_state: String,
     pub listener_policy: Option<String>,
     pub child_request_id: Option<String>,
+    /// Exact selected W remains readable while the parent provider Q is
+    /// pending and no root terminal execution has been committed yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_child_event: Option<FreshBashSourceEvent>,
     pub unresolved_child_request_ids: Vec<String>,
     pub mailbox_seq: Option<i64>,
     pub delivery_request_id: Option<String>,
@@ -583,6 +587,7 @@ impl FreshV30Lane {
             native_receipt_state: "not_observed".into(),
             listener_policy: None,
             child_request_id: None,
+            selected_child_event: None,
             unresolved_child_request_ids: Vec::new(),
             mailbox_seq: None,
             delivery_request_id: None,
@@ -626,6 +631,7 @@ impl FreshV30Lane {
             .as_ref()
             .map(|id| self.selected_private_bash_event(id))
             .transpose();
+        result.selected_child_event = actual_child.as_ref().ok().cloned().flatten();
         if let Some(json) = encoded {
             let stored: FreshRootTerminalExecution =
                 serde_json::from_str(&json).map_err(|e| e.to_string())?;

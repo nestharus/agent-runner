@@ -499,6 +499,9 @@ fn disposable_root_featureless_l_help_lost_reply_and_duplicate() {
 export OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1="$AGE319_BASH_CONTROL_SOCKET"
 response=$("$AGE319_BASH_IMAGE" run --delivery async -- /bin/sh -c 'while [ ! -f "$AGE319_CHILD_RELEASE_FILE" ]; do sleep 0.02; done; printf "async\n" >> "$AGE319_EFFECT_FILE"; printf "async-child-out\n"; printf "async-child-err\n" >&2') || exit
 printf '%s\n' "$response"
+if [ -n "$AGE319_PROVIDER_HOLD_FILE" ]; then
+  while [ ! -f "$AGE319_PROVIDER_HOLD_FILE" ]; do sleep 0.02; done
+fi
 "#,
     )
     .unwrap();
@@ -506,9 +509,7 @@ printf '%s\n' "$response"
     let async_out = temp.path().join("async.out");
     let async_err = temp.path().join("async.err");
     let child_release = temp.path().join("async-child-release");
-    if successor_case {
-        fs::write(temp.path().join("successor-mode"), b"1").unwrap();
-    }
+    let provider_release = temp.path().join("async-provider-release");
     let mut async_command = Command::new(&launcher);
     async_command
         .args(["--model", "fixture-model", "hello async"])
@@ -521,6 +522,15 @@ printf '%s\n' "$response"
         .env("AGE319_BASH_IMAGE", &bash)
         .env("AGE319_BASH_CONTROL_SOCKET", &socket)
         .env("AGE319_CHILD_RELEASE_FILE", &child_release)
+        .env(
+            "AGE319_PROVIDER_HOLD_FILE",
+            if successor_case {
+                ""
+            } else {
+                provider_release.to_str().unwrap()
+            },
+        )
+        .env("AGE319_TEST_FEATURELESS_DROP_START_REPLY_V1", "1")
         .env("AGE319_TEST_FEATURELESS_DROP_F_REPLY_V1", "1")
         .env("AGE319_TEST_FEATURELESS_DROP_ACK_REPLY_V1", "1")
         .env("AGE319_TEST_FEATURELESS_REPLAY_ACK_V1", "1")
@@ -560,15 +570,20 @@ printf '%s\n' "$response"
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-    let physical = state.join("v30/normal-provider").join(async_parent);
-    while !physical.join("provider-exit.json").exists() {
-        assert!(
-            Instant::now() < deadline,
-            "provider did not exit before child W: {} / {}",
-            fs::read_to_string(&async_err).unwrap(),
-            fs::read_to_string(&broker_log).unwrap()
-        );
-        std::thread::sleep(Duration::from_millis(20));
+    let physical = state.join("v30/normal-provider").join(&async_parent);
+    if successor_case {
+        while !physical.join("provider-exit.json").exists() {
+            assert!(
+                Instant::now() < deadline,
+                "provider did not exit before child W: {} / {}",
+                fs::read_to_string(&async_err).unwrap(),
+                fs::read_to_string(&broker_log).unwrap()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    } else {
+        assert!(physical.join("provider-start.json").exists());
+        assert!(!physical.join("provider-exit.json").exists());
     }
     assert!(
         !physical.join("q.json").exists(),
@@ -621,6 +636,44 @@ printf '%s\n' "$response"
         std::thread::sleep(Duration::from_millis(20));
     };
     assert!(selected.tree_drained && selected.output_closed);
+    let selection = selected.normal_provider_selection.as_ref().unwrap();
+    assert_eq!(selection.admission_id, async_parent);
+    assert_eq!(
+        selection.mode,
+        if successor_case { "sleeping" } else { "busy" }
+    );
+    if successor_case {
+        let wait: serde_json::Value =
+            serde_json::from_slice(&fs::read(physical.join("provider-exit.json")).unwrap())
+                .unwrap();
+        assert_eq!(wait["admission_id"], selection.admission_id);
+        assert_eq!(
+            wait["provider_wait_status"],
+            selection.provider_wait_status.unwrap()
+        );
+    } else {
+        let provider = selection.provider.as_ref().unwrap();
+        let start: serde_json::Value =
+            serde_json::from_slice(&fs::read(physical.join("provider-start.json")).unwrap())
+                .unwrap();
+        assert_eq!(start["host_pid"], provider.host_pid);
+        assert_eq!(start["starttime_ticks"], provider.starttime_ticks);
+        assert_eq!(start["local_pid"], selection.provider_local_pid.unwrap());
+        let live = PinnedProcess::open(provider.host_pid).unwrap();
+        assert_eq!(live.starttime_ticks, provider.starttime_ticks);
+        assert!(
+            !live.exited().unwrap(),
+            "busy W provider exited before selection"
+        );
+        let (root, actor) = lane.released_handoff_for_root(&async_root).unwrap();
+        let session = lane.read_session(&root.d_key).unwrap().unwrap();
+        let pending = lane
+            .read_private_root_terminal(&root, &actor, &session)
+            .unwrap();
+        assert_eq!(pending.selected_child_event, Some(selected.clone()));
+        assert!(pending.execution.is_none(), "parent Q preceded busy W");
+        fs::write(&provider_release, b"release").unwrap();
+    }
     let async_status = loop {
         if let Some(status) = async_launch.try_wait().unwrap() {
             break status;
@@ -699,7 +752,7 @@ printf '%s\n' "$response"
             .unwrap_or_else(|| {
                 panic!(
                     "original did not choose selected W: terminal={async_terminal:?} marker={} original_stderr={} broker={}",
-                    temp.path().join("successor-mode").exists(),
+                    selection.mode,
                     fs::read_to_string(&async_err).unwrap(),
                     fs::read_to_string(&broker_log).unwrap()
                 )
