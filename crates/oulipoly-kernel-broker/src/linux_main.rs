@@ -6296,9 +6296,9 @@ fn serve() -> io::Result<()> {
                     return Err(io::Error::other("fresh-only pair/source binding changed"));
                 }
                 require_fresh_cli_shape(&spec, &descriptors)?;
-                // The disposable path has Bash history readback, but the real
-                // non-root caller/root Broker boundary and fixed host paths
-                // still need connected proof before host admission opens.
+                // The normal K/Q terminal reader now recognizes the State K,
+                // but connected async/later caller close has not completed
+                // the disposable four-image proof. Keep host admission closed.
                 if !fixture {
                     return Err(io::Error::other("production installed CLI admission remains closed"));
                 }
