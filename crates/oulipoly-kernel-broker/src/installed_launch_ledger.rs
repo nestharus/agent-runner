@@ -92,6 +92,25 @@ impl InstalledLaunchLedger {
     /// activated pair. Fixture tests may use a private directory under their
     /// own UID; production serves only as host root.
     pub fn open(state: &Path, pair_generation: &str, source_generation: &str) -> io::Result<Self> {
+        Self::open_inner(state, pair_generation, source_generation, true)
+    }
+
+    /// A fresh reader must never heal absent ledger storage while deciding
+    /// whether historical roots can be ignored for scope classification.
+    pub fn open_existing(
+        state: &Path,
+        pair_generation: &str,
+        source_generation: &str,
+    ) -> io::Result<Self> {
+        Self::open_inner(state, pair_generation, source_generation, false)
+    }
+
+    fn open_inner(
+        state: &Path,
+        pair_generation: &str,
+        source_generation: &str,
+        create_missing: bool,
+    ) -> io::Result<Self> {
         if !canonical_uuid(pair_generation) || !canonical_uuid(source_generation) {
             return Err(io::Error::other("invalid installed launch generation"));
         }
@@ -99,7 +118,7 @@ impl InstalledLaunchLedger {
         let exit_directory = state.join("installed-control-exits");
         let terminal_directory = state.join("installed-normal-terminals");
         for path in [&directory, &exit_directory, &terminal_directory] {
-            if !path.exists() {
+            if create_missing && !path.exists() {
                 fs::DirBuilder::new().mode(0o700).create(path)?;
                 File::open(state)?.sync_all()?;
             }
@@ -524,6 +543,21 @@ mod tests {
             environment: vec![],
             stdio_present: [false; 3],
         }
+    }
+
+    #[test]
+    fn readback_refuses_missing_storage_without_recreating_it() {
+        let state = tempfile::tempdir().unwrap();
+        let pair = uuid::Uuid::new_v4().to_string();
+        let source = uuid::Uuid::new_v4().to_string();
+        assert!(InstalledLaunchLedger::open_existing(state.path(), &pair, &source).is_err());
+        assert!(!state.path().join("installed-launches").exists());
+        InstalledLaunchLedger::open(state.path(), &pair, &source).unwrap();
+        InstalledLaunchLedger::open_existing(state.path(), &pair, &source).unwrap();
+        let terminals = state.path().join("installed-normal-terminals");
+        fs::remove_dir(&terminals).unwrap();
+        assert!(InstalledLaunchLedger::open_existing(state.path(), &pair, &source).is_err());
+        assert!(!terminals.exists());
     }
 
     #[test]

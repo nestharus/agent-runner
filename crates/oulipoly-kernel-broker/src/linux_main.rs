@@ -1266,7 +1266,8 @@ fn verify_delegated_root_h_source(
         .ok_or_else(|| io::Error::other("delegated root H Bash image absent"))?;
     let bash_image = File::open(bash_path)?;
     let lane = FreshV30Lane::open_at(state_root).map_err(io::Error::other)?;
-    let (root, root_actor, parent) = fresh_bash_parent(state_root, &lane, peer, Some(&bash_image))?;
+    let (root, root_actor, parent) =
+        fresh_bash_parent(state_root, &lane, peer, Some(&bash_image), None)?;
     if root.old_release.prepared.root_id != root_id {
         return Err(io::Error::other("delegated root H work scope changed"));
     }
@@ -4269,6 +4270,29 @@ fn require_prior_entries_closed(
     sources: &SourcePhysicalRegistry,
     sidecar: Option<&BrokerSidecar>,
 ) -> io::Result<()> {
+    require_prior_entries_closed_inner(
+        state_root, installed, roots, entries, works, grants, sources, sidecar, None,
+    )
+}
+
+/// The fresh Bash reader may coexist with one live, unfenced root. All other
+/// entries are checked from their retained authorities before their debt is
+/// ignored for scope classification. This path performs no durable writes.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "close joins independent authorities"
+)]
+fn require_prior_entries_closed_inner(
+    state_root: &Path,
+    installed: Option<&InstalledLaunchLedger>,
+    roots: &mut RootRegistry,
+    entries: &mut EntryRegistry,
+    works: &mut WorkRegistry,
+    grants: &GrantRegistry,
+    sources: &SourcePhysicalRegistry,
+    sidecar: Option<&BrokerSidecar>,
+    active_root_id: Option<&str>,
+) -> io::Result<()> {
     if entries.records().is_empty() {
         if roots.live_roots().next().is_some()
             || !roots.debt_records().is_empty()
@@ -4314,6 +4338,9 @@ fn require_prior_entries_closed(
     let mut closed_cursors: Vec<oulipoly_state::mailbox::BrokerStateCloseCursor> = Vec::new();
     let mut offline_closes = Vec::new();
     for entry in entries.records() {
+        if Some(entry.root_id.as_str()) == active_root_id {
+            continue;
+        }
         let root = roots
             .record(&entry.root_id)
             .ok_or_else(|| io::Error::other("prior entry has no exact root"))?;
@@ -4393,13 +4420,26 @@ fn require_prior_entries_closed(
             .owner_close_proof
             .as_ref()
             .ok_or_else(|| io::Error::other("prior entry owner not exactly closed"))?;
+        let physical = root_drain::physical_close_proof(&inventory)?;
+        let certificate = installed
+            .map(|installed| installed.terminal_for_root(&entry.root_id))
+            .transpose()?
+            .flatten();
+        if let Some(certificate) = &certificate {
+            if certificate.physical != physical || certificate.owner != *proof {
+                return Err(io::Error::other("prior caller certificate changed"));
+            }
+        } else if installed.is_some() {
+            return Err(io::Error::other(
+                "prior installed caller certificate absent",
+            ));
+        }
         if offline {
-            let certificate = installed
-                .ok_or_else(|| io::Error::other("prior installed offline ledger absent"))?
-                .terminal_for_root(&entry.root_id)?
+            let certificate = certificate
+                .as_ref()
                 .ok_or_else(|| io::Error::other("prior offline caller certificate absent"))?;
             if certificate.physical.offline.is_none()
-                || certificate.physical != root_drain::physical_close_proof(&inventory)?
+                || certificate.physical != physical
                 || &certificate.owner != proof
             {
                 return Err(io::Error::other("prior offline caller certificate changed"));
@@ -4432,19 +4472,34 @@ fn require_prior_entries_closed(
     }) {
         return Err(io::Error::other("prior entry close cursor order changed"));
     }
-    let current = sidecar
-        .ok_or_else(|| io::Error::other("prior entry sidecar absent"))?
-        .read_current_close_cursor()
-        .map_err(io::Error::other)?;
-    if closed_cursors.last() != Some(&current) {
-        return Err(io::Error::other("unclosed State continuity generation"));
+    if !closed_cursors.is_empty() {
+        let current = sidecar
+            .ok_or_else(|| io::Error::other("prior entry sidecar absent"))?
+            .read_current_close_cursor()
+            .map_err(io::Error::other)?;
+        if closed_cursors.last() != Some(&current) {
+            return Err(io::Error::other("unclosed State continuity generation"));
+        }
     }
     for entry in entries.records() {
+        if Some(entry.root_id.as_str()) == active_root_id {
+            continue;
+        }
         roots.admit_closed_historical(&entry.root_id)?;
         works.admit_closed_historical(&entry.root_id);
     }
     for (root_id, certificate_sha256) in offline_closes {
-        entries.settle_offline_close(&root_id, &certificate_sha256)?;
+        if active_root_id.is_some() {
+            if entries
+                .record(&root_id)
+                .and_then(|entry| entry.offline_close_sha256.as_deref())
+                != Some(certificate_sha256.as_str())
+            {
+                return Err(io::Error::other("prior offline close marker changed"));
+            }
+        } else {
+            entries.settle_offline_close(&root_id, &certificate_sha256)?;
+        }
     }
     Ok(())
 }
@@ -5829,6 +5884,12 @@ fn serve() -> io::Result<()> {
         let fresh_state_root = PathBuf::from(&state);
         let fresh_runner_image = runner_image.try_clone()?;
         let fresh_bash_image = pinned_bash_image(installed_pair.as_ref())?;
+        let fresh_installed_identity = fresh_activation.as_ref().map(|activation| {
+            (
+                activation.pair_generation.clone(),
+                activation.source.source_generation.clone(),
+            )
+        });
         let fresh_handoff_tx = handoff_tx.clone();
         let fresh_terminal_tx = terminal_tx.clone();
         let fresh_drain_tx = drain_tx.clone();
@@ -5846,6 +5907,7 @@ fn serve() -> io::Result<()> {
                     &fresh_socket,
                     fresh_runner_image,
                     fresh_bash_image,
+                    fresh_installed_identity,
                     Some(fresh_handoff_tx),
                     Some(fresh_terminal_tx),
                     Some(fresh_drain_tx),
@@ -6194,11 +6256,9 @@ fn serve() -> io::Result<()> {
                     return Err(io::Error::other("fresh-only pair/source binding changed"));
                 }
                 require_fresh_cli_shape(&spec, &descriptors)?;
-                // The disposable connected path is proven for help and a
-                // normal provider, but the featureless Bash parent probe can
-                // still see a previously closed root as debt. Keep host-root
-                // installed admission closed until that cross-lane proof and
-                // real non-root caller tests pass.
+                // The disposable path has Bash history readback, but the real
+                // non-root caller/root Broker boundary and fixed host paths
+                // still need connected proof before host admission opens.
                 if !fixture {
                     return Err(io::Error::other("production installed CLI admission remains closed"));
                 }
@@ -7310,6 +7370,16 @@ fn serve_fresh_v30() -> io::Result<()> {
         Path::new(&socket),
         File::open(&runner)?,
         bash_image,
+        installed_pair
+            .as_ref()
+            .map(|pair| {
+                oulipoly_state::mailbox::EmptyV30BootstrapIdentity::readback_at(Path::new(
+                    &state_root,
+                ))
+                .map(|source| (pair.generation.clone(), source.source_generation))
+                .map_err(io::Error::other)
+            })
+            .transpose()?,
         None,
         None,
         None,
@@ -7322,6 +7392,7 @@ fn fresh_bash_parent(
     lane: &FreshV30Lane,
     peer: &PeerIdentity,
     bash_image: Option<&File>,
+    installed_identity: Option<(&str, &str)>,
 ) -> io::Result<(
     FreshReleasedHandoff,
     FreshRecipientIdentity,
@@ -7331,13 +7402,51 @@ fn fresh_bash_parent(
     if !peer.process.same_executable_as(image)? {
         return Err(io::Error::other("Bash child image changed"));
     }
-    let roots = RootRegistry::open(state_root)?;
-    let works = WorkRegistry::open(state_root.join("works"), &roots)?;
+    let mut roots = RootRegistry::open(state_root)?;
+    let mut works = WorkRegistry::open(state_root.join("works"), &roots)?;
+    if let Some((pair_generation, source_generation)) = installed_identity {
+        // Exactly one unfenced root may be active. Historical roots can only
+        // cease to count as debt after the full retained close joins below.
+        let active: Vec<_> = roots
+            .live_roots()
+            .filter(|root| !roots.admission_fenced(&root.record.root_id))
+            .collect();
+        let [active] = active.as_slice() else {
+            return Err(io::Error::other("fresh Bash active root ambiguous"));
+        };
+        active.init.verify()?;
+        let active_id = active.record.root_id.clone();
+        let mut entries = EntryRegistry::open(state_root.join("entries"))?;
+        if entries.record(&active_id).is_none() {
+            return Err(io::Error::other("fresh Bash active entry absent"));
+        }
+        let grants = GrantRegistry::open(state_root.join("grants"))?;
+        let sources = SourcePhysicalRegistry::open(state_root.join("source-physical"))?;
+        let sidecar =
+            BrokerSidecar::open_existing(&state_root.join("sidecar/pid-identity.db"), state_root)
+                .map_err(io::Error::other)?;
+        let installed =
+            InstalledLaunchLedger::open_existing(state_root, pair_generation, source_generation)?;
+        require_prior_entries_closed_inner(
+            state_root,
+            Some(&installed),
+            &mut roots,
+            &mut entries,
+            &mut works,
+            &grants,
+            &sources,
+            Some(&sidecar),
+            Some(&active_id),
+        )?;
+    }
     let root_id = match classify_scope(peer, &host_proc_file("self/ns/pid")?, &roots, &works) {
         Scope::Root(id) | Scope::Work { root_id: id, .. } => id,
         Scope::Outside => return Err(io::Error::other("Bash child is outside a released root")),
         Scope::Uncertain => return Err(io::Error::other("Bash child scope uncertain")),
     };
+    if roots.admission_fenced(&root_id) {
+        return Err(io::Error::other("Bash child root admission fenced"));
+    }
     let (root, actor) = lane
         .released_handoff_for_root(&root_id)
         .map_err(io::Error::other)?;
@@ -7475,6 +7584,7 @@ fn serve_fresh_v30_at(
     socket: &Path,
     runner_image: File,
     bash_image: Option<File>,
+    installed_identity: Option<(String, String)>,
     handoff_tx: Option<SyncSender<FreshHandoffBridgeRequest>>,
     terminal_tx: Option<SyncSender<FreshTerminalBridgeRequest>>,
     drain_tx: Option<SyncSender<FreshDrainBridgeRequest>>,
@@ -7854,8 +7964,15 @@ fn serve_fresh_v30_at(
                     ))
                 }
                 0x90 => {
-                    let (root, _, parent) =
-                        fresh_bash_parent(state_root, &lane, &peer, bash_image.as_ref())?;
+                    let (root, _, parent) = fresh_bash_parent(
+                        state_root,
+                        &lane,
+                        &peer,
+                        bash_image.as_ref(),
+                        installed_identity
+                            .as_ref()
+                            .map(|(pair, source)| (pair.as_str(), source.as_str())),
+                    )?;
                     let session = lane
                         .read_session(&root.d_key)
                         .map_err(io::Error::other)?
@@ -7906,8 +8023,15 @@ fn serve_fresh_v30_at(
                             _ => return Err(io::Error::other("Bash child request absent")),
                         };
                     diagnostic_key_hash = format!("{:x}", Sha256::digest(request_id.as_bytes()));
-                    let (root, root_actor, parent_work) =
-                        fresh_bash_parent(state_root, &lane, &peer, bash_image.as_ref())?;
+                    let (root, root_actor, parent_work) = fresh_bash_parent(
+                        state_root,
+                        &lane,
+                        &peer,
+                        bash_image.as_ref(),
+                        installed_identity
+                            .as_ref()
+                            .map(|(pair, source)| (pair.as_str(), source.as_str())),
+                    )?;
                     let directory = state_root.join("v30/fresh-provider");
                     let _admission_guard =
                         if matches!(operation, b'C' | b'X' | b'E' | b'%' | b'8' | b'^') {
