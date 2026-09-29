@@ -2351,9 +2351,8 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
                         invocation,
                     );
                 }
-                #[cfg(not(feature = "age319-private-broker-fixture"))]
                 let _ = model_invocation;
-                return Err("normal provider route held: native K/Q, result and physical custody are absent".into());
+                return Err("private normal provider route has no selected effect".into());
             }
             if !private_help {
                 begin_root_effect(receipt, session)?;
@@ -2387,7 +2386,9 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
                 #[cfg(not(feature = "age319-private-broker-fixture"))]
                 return run_normal_model(&receipt, &session, &invocation);
                 #[cfg(feature = "age319-private-broker-fixture")]
-                let _ = invocation;
+                if std::env::var_os("AGE319_PRIVATE_CONNECTED_NORMAL_MODEL_V1").is_some() {
+                    return run_normal_model(&receipt, &session, &invocation);
+                }
             }
             return Err("normal root intent has no caller result route".into());
         }
@@ -2399,7 +2400,6 @@ fn child_v30_entry(grant: &str, gate: UnixStream) -> Result<ExitCode, String> {
     Ok(result)
 }
 
-#[cfg(not(feature = "age319-private-broker-fixture"))]
 fn run_normal_model(
     receipt: &oulipoly_state::mailbox::FreshReleasedHandoff,
     _session: &oulipoly_state::mailbox::FreshV30Session,
@@ -2570,8 +2570,10 @@ fn prepare_normal_work(
         }
         _ => None,
     };
-    #[cfg(not(feature = "age319-private-broker-fixture"))]
-    if let Some(invocation) = model_invocation.as_ref() {
+    if let Some(invocation) = model_invocation.as_ref()
+        && (cfg!(not(feature = "age319-private-broker-fixture"))
+            || std::env::var_os("AGE319_PRIVATE_CONNECTED_NORMAL_MODEL_V1").is_some())
+    {
         let config_dir = oulipoly_state::paths::config_dir()?;
         let source = File::open(&config_dir)
             .map_err(|e| format!("normal model config source unavailable: {e}"))?;
