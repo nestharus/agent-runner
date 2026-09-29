@@ -81,6 +81,10 @@ fn ordinary_entrypoint(run: impl FnOnce() -> ExitCode) -> ExitCode {
 }
 
 fn production_entrypoint() -> ExitCode {
+    #[cfg(target_os = "linux")]
+    if let Some(result) = kernel_entry::installed_successor_entry() {
+        return result;
+    }
     #[cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
     if let Some(result) = kernel_entry::private_consumed_h_source_decision_entry() {
         return result;
