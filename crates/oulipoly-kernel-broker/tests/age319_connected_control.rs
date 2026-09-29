@@ -23,23 +23,58 @@ fn digest(path: &Path) -> String {
 
 #[test]
 fn root_mapped_connected_l_reaches_ordinary_help_with_exact_one_use_custody() {
-    run_connected_case(false);
+    run_connected_case(false, ProofFault::None);
 }
 
 #[test]
 fn root_mapped_connected_l_runs_normal_model_and_closes_owner() {
-    run_connected_case(true);
+    run_connected_case(true, ProofFault::None);
 }
 
-fn run_connected_case(normal: bool) {
+#[test]
+fn root_mapped_connected_l_refuses_missing_q_after_certificate() {
+    run_connected_case(true, ProofFault::MissingQ);
+}
+
+#[test]
+fn root_mapped_connected_l_refuses_changed_q_after_certificate() {
+    run_connected_case(true, ProofFault::ChangedQ);
+}
+
+#[test]
+fn root_mapped_connected_l_revalidates_certificate_after_broker_restart() {
+    run_connected_case(true, ProofFault::Restart);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProofFault {
+    None,
+    MissingQ,
+    ChangedQ,
+    Restart,
+}
+
+fn run_connected_case(normal: bool, fault: ProofFault) {
     let Ok(runner_bin) = std::env::var("AGE319_CONNECTED_RUNNER_BIN") else {
         return;
     };
     if std::env::var_os("AGE319_CONNECTED_CHILD_TEST").is_none() {
-        let test_name = if normal {
-            "root_mapped_connected_l_runs_normal_model_and_closes_owner"
-        } else {
-            "root_mapped_connected_l_reaches_ordinary_help_with_exact_one_use_custody"
+        let test_name = match (normal, fault) {
+            (false, _) => {
+                "root_mapped_connected_l_reaches_ordinary_help_with_exact_one_use_custody"
+            }
+            (true, ProofFault::None) => {
+                "root_mapped_connected_l_runs_normal_model_and_closes_owner"
+            }
+            (true, ProofFault::MissingQ) => {
+                "root_mapped_connected_l_refuses_missing_q_after_certificate"
+            }
+            (true, ProofFault::ChangedQ) => {
+                "root_mapped_connected_l_refuses_changed_q_after_certificate"
+            }
+            (true, ProofFault::Restart) => {
+                "root_mapped_connected_l_revalidates_certificate_after_broker_restart"
+            }
         };
         let status = Command::new("unshare")
             .args(["-Urpfm", "--mount-proc"])
@@ -190,6 +225,8 @@ fn run_connected_case(normal: bool) {
     assert_eq!(fs::read_dir(state.join("entries")).unwrap().count(), 0);
     let pause = temp.path().join("connected-pause");
     fs::create_dir(&pause).unwrap();
+    let certificate_pause = temp.path().join("certificate-pause");
+    fs::create_dir(&certificate_pause).unwrap();
     let caller_out = temp.path().join("caller.out");
     let caller_err = temp.path().join("caller.err");
     let mut launch = Command::new(&launcher);
@@ -197,7 +234,7 @@ fn run_connected_case(normal: bool) {
     if normal {
         launch.args(["fixture-model", "hello fixture"]);
     }
-    let launcher_status = launch
+    let mut launcher_child = launch
         .env_clear()
         .env("HOME", temp.path())
         .env("PATH", "/usr/bin:/bin")
@@ -210,6 +247,10 @@ fn run_connected_case(normal: bool) {
         .envs(normal.then_some(("AGE319_EFFECT_FILE", &effect)))
         .env("AGE319_PRIVATE_CONNECTED_J_REPLAY_V1", "1")
         .env("AGE319_CONNECTED_PAUSE_DIR", &pause)
+        .envs(
+            (fault != ProofFault::None)
+                .then_some(("AGE319_CONNECTED_CERTIFICATE_PAUSE_DIR", &certificate_pause)),
+        )
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
         .env(
             "OULIPOLY_KERNEL_BROKER_FIXTURE_GENERATION_V1",
@@ -217,9 +258,8 @@ fn run_connected_case(normal: bool) {
         )
         .stdout(Stdio::from(File::create(&caller_out).unwrap()))
         .stderr(Stdio::from(File::create(&caller_err).unwrap()))
-        .status()
+        .spawn()
         .unwrap();
-    assert_eq!(launcher_status.code(), Some(70)); // L remains pending/unknown.
     let deadline = Instant::now() + Duration::from_secs(10);
     while !pause.join("ready").exists() {
         assert!(
@@ -542,6 +582,139 @@ fn run_connected_case(normal: bool) {
     let session = lane.read_session(&released.d_key).unwrap().unwrap();
     lane.require_released_invocation(&released, &actor, &session)
         .unwrap();
+    let terminal_path = state.join("installed-normal-terminals").join(format!(
+        "{}.json",
+        launch_record["request_id"].as_str().unwrap()
+    ));
+    if fault != ProofFault::None {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !certificate_pause.join("ready").exists() {
+            assert!(
+                Instant::now() < deadline,
+                "launcher did not observe certificate: broker={}",
+                fs::read_to_string(&broker_log).unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let terminal: serde_json::Value =
+            serde_json::from_slice(&fs::read(&terminal_path).unwrap()).unwrap();
+        match fault {
+            ProofFault::MissingQ => {
+                let admission = terminal["physical"]["normal"]["physical"]["q"]["admission_id"]
+                    .as_str()
+                    .unwrap();
+                fs::remove_file(
+                    state
+                        .join("v30/normal-provider")
+                        .join(admission)
+                        .join("q.json"),
+                )
+                .unwrap();
+            }
+            ProofFault::ChangedQ => {
+                let admission = terminal["physical"]["normal"]["physical"]["q"]["admission_id"]
+                    .as_str()
+                    .unwrap();
+                let q_path = state
+                    .join("v30/normal-provider")
+                    .join(admission)
+                    .join("q.json");
+                let mut q: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&q_path).unwrap()).unwrap();
+                q["provider_wait_status"] = serde_json::json!(1);
+                fs::write(q_path, serde_json::to_vec(&q).unwrap()).unwrap();
+            }
+            ProofFault::Restart => {
+                broker.kill().unwrap();
+                broker.wait().unwrap();
+                broker = Command::new(&broker_image)
+                    .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", &state)
+                    .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                    .env("OULIPOLY_KERNEL_BROKER_FIXTURE_RUNNER_V1", &runner)
+                    .env("OULIPOLY_KERNEL_BROKER_FIXTURE_PAIR_V1", &manifest)
+                    .env("OULIPOLY_KERNEL_BROKER_FIXTURE_BROKER_V1", &broker_image)
+                    .env("OULIPOLY_KERNEL_BROKER_FIXTURE_LAUNCHER_V1", &launcher)
+                    .env("OULIPOLY_KERNEL_BROKER_FIXTURE_BASH_V1", &bash)
+                    .env("OULIPOLY_AGE319_PRIVATE_CONNECTED_CONTROL_V1", "1")
+                    .env_remove("OULIPOLY_DATA_DIR")
+                    .stderr(Stdio::from(
+                        File::options().append(true).open(&broker_log).unwrap(),
+                    ))
+                    .spawn()
+                    .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while observe_entry_gate_at(&socket).ok() != Some(EntryRoute::FreshOnlyOpen) {
+                    assert!(
+                        broker.try_wait().unwrap().is_none(),
+                        "restarted Broker exited: {}",
+                        fs::read_to_string(&broker_log).unwrap_or_default()
+                    );
+                    assert!(
+                        Instant::now() < deadline,
+                        "restarted Broker did not activate"
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+            ProofFault::None => unreachable!(),
+        }
+        fs::write(certificate_pause.join("release"), b"release").unwrap();
+    }
+    let caller_deadline = Instant::now() + Duration::from_secs(10);
+    let launcher_status = loop {
+        if let Some(status) = launcher_child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < caller_deadline,
+            "installed caller did not complete: caller={} broker={}",
+            fs::read_to_string(&caller_err).unwrap_or_default(),
+            fs::read_to_string(&broker_log).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    if normal && matches!(fault, ProofFault::None | ProofFault::Restart) {
+        assert_eq!(
+            launcher_status.code(),
+            Some(0),
+            "caller={} broker={}",
+            fs::read_to_string(&caller_err).unwrap_or_default(),
+            fs::read_to_string(&broker_log).unwrap_or_default()
+        );
+        let terminal: serde_json::Value =
+            serde_json::from_slice(&fs::read(&terminal_path).unwrap()).unwrap();
+        assert_eq!(terminal["request"], launch_record);
+        assert_eq!(terminal["control_exit"], control_exit);
+        assert_eq!(terminal["exit_code"], 0);
+        assert_eq!(terminal["physical"]["root_id"], root_id);
+        assert_eq!(terminal["physical"]["pid1_echild_receipt"], true);
+        assert_eq!(terminal["physical"]["pid1_parent_wait_proof"], true);
+        assert_eq!(
+            terminal["physical"]["normal"]["physical"]["q"]["tree_drained"],
+            true
+        );
+        assert_eq!(
+            terminal["physical"]["normal"]["publication"]["state"],
+            "settled"
+        );
+        assert_eq!(terminal["owner"]["root_id"], root_id);
+    } else if fault == ProofFault::None {
+        assert_eq!(launcher_status.code(), Some(70));
+        assert!(!terminal_path.exists());
+        let diagnostic = fs::read_to_string(&caller_err).unwrap();
+        assert!(
+            diagnostic.contains("Broker reported unknown terminal evidence"),
+            "{diagnostic}"
+        );
+    } else {
+        assert_eq!(launcher_status.code(), Some(70));
+        let diagnostic = fs::read_to_string(&caller_err).unwrap();
+        assert!(
+            diagnostic.contains("Broker reported unknown terminal evidence"),
+            "{diagnostic}"
+        );
+        assert_eq!(fs::read_to_string(&effect).unwrap(), "one\n");
+    }
     assert!(!temp.path().join("state.db").exists());
     assert!(!temp.path().join("pid-identity.db").exists());
     assert!(
