@@ -194,6 +194,18 @@ fn private_main(mut stdio: [std::os::fd::RawFd; 3]) -> i32 {
             .collect();
         let response =
             protocol::submit_installed_launch_at(Path::new(&socket), &captured.spec, &descriptors)?;
+        if std::env::var_os("OULIPOLY_AGE319_PRIVATE_DUPLICATE_L_V1").is_some() {
+            let duplicate = protocol::submit_installed_launch_at(
+                Path::new(&socket),
+                &captured.spec,
+                &descriptors,
+            )?;
+            if duplicate != response {
+                return Err(std::io::Error::other(
+                    "exact duplicate L changed its pending reply",
+                ));
+            }
+        }
         let expected = format!(" drained {}\n", captured.spec.request_id);
         if let Some(exit) = response
             .strip_suffix(&expected)

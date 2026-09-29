@@ -488,6 +488,107 @@ const REQUIRED_ENV: &str = "OULIPOLY_KERNEL_HOST_ENTRY_REQUIRED_V1";
 const CHILD_FD_ENV: &str = "OULIPOLY_KERNEL_CHILD_JOIN_FD_V1";
 const INSTALLED_RUNNER: &str = "/usr/local/libexec/oulipoly/oulipoly-agent-runner";
 
+struct ConnectedRootGrant {
+    root_id: String,
+    _channel: UnixStream,
+}
+
+static CONNECTED_ROOT_GRANT: std::sync::OnceLock<ConnectedRootGrant> = std::sync::OnceLock::new();
+
+fn socket_peer(fd: i32) -> Result<libc::ucred, String> {
+    let mut credentials = std::mem::MaybeUninit::<libc::ucred>::uninit();
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    if unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            credentials.as_mut_ptr().cast(),
+            &mut length,
+        )
+    } != 0
+        || length as usize != std::mem::size_of::<libc::ucred>()
+    {
+        return Err("connected control peer unavailable".into());
+    }
+    Ok(unsafe { credentials.assume_init() })
+}
+
+fn verify_connected_root_grant(
+    pair: &InstalledPair,
+    observed: &protocol::InstalledPairObservation,
+) -> Result<(), String> {
+    use std::io::{Read, Write};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let number = std::env::var(oulipoly_kernel_broker::connected_control::FD_ENV)
+        .map_err(|_| "connected control descriptor absent")?;
+    let fd: i32 = number
+        .parse()
+        .map_err(|_| "invalid connected control descriptor")?;
+    if fd <= 2 || unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+        return Err("connected control descriptor unavailable".into());
+    }
+    let mut channel = unsafe { UnixStream::from_raw_fd(fd) };
+    let peer = socket_peer(fd)?;
+    let live = UnixStream::connect(broker_socket()).map_err(|e| e.to_string())?;
+    let live_peer = socket_peer(live.as_raw_fd())?;
+    drop(live);
+    if peer.uid != 0 || peer.pid <= 0 || peer.pid != live_peer.pid || peer.uid != live_peer.uid {
+        return Err("connected control is not held by the live Broker".into());
+    }
+    channel
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .map_err(|e| e.to_string())?;
+    let mut line = Vec::new();
+    loop {
+        if line.len() >= 512 {
+            return Err("connected control frame too large".into());
+        }
+        let mut byte = [0];
+        channel.read_exact(&mut byte).map_err(|e| e.to_string())?;
+        if byte == [b'\n'] {
+            break;
+        }
+        line.push(byte[0]);
+    }
+    let grant: oulipoly_kernel_broker::connected_control::GrantMessage =
+        serde_json::from_slice(&line).map_err(|e| e.to_string())?;
+    let canonical = |id: &str| {
+        uuid::Uuid::parse_str(id)
+            .ok()
+            .is_some_and(|uuid| uuid.to_string() == id)
+    };
+    if grant.protocol != "installed-connected-control-v1"
+        || grant.pair_generation != pair.generation
+        || observed.source_generation.as_deref() != Some(grant.source_generation.as_str())
+        || !canonical(&grant.request_id)
+        || !canonical(&grant.root_id)
+    {
+        return Err("connected control pair/source/request/root changed".into());
+    }
+    channel.write_all(b"R").map_err(|e| e.to_string())?;
+    #[cfg(feature = "age319-private-broker-fixture")]
+    if private_userns_broker_socket().is_some()
+        && let Some(directory) = std::env::var_os("AGE319_CONNECTED_PAUSE_DIR")
+    {
+        let directory = std::path::PathBuf::from(directory);
+        std::fs::write(directory.join("ready"), b"ready").map_err(|e| e.to_string())?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !directory.join("release").exists() {
+            if std::time::Instant::now() >= deadline {
+                return Err("private connected control pause expired".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    CONNECTED_ROOT_GRANT
+        .set(ConnectedRootGrant {
+            root_id: grant.root_id,
+            _channel: channel,
+        })
+        .map_err(|_| "connected control grant already installed".to_owned())
+}
+
 /// The fixed installed image and the explicit kernel entry path must consult
 /// broker-owned ingress state before worker, helper, CLI, GUI, or State work.
 /// A missing broker is an admission refusal for those supported paths.
@@ -509,11 +610,39 @@ pub(crate) fn verify_installed_entry_route() -> Result<(), String> {
         let observation = protocol::observe_installed_pair_at(&broker_socket())
             .map_err(|error| format!("installed pair broker unavailable: {error}"))?;
         require_pair_route(&pair, &observation)?;
-        return require_pair_launch_mode(
+        require_pair_launch_mode(
             pair.schema,
             std::env::var_os(REQUIRED_ENV).is_some(),
             std::env::var_os(CHILD_FD_ENV).is_some(),
-        );
+        )?;
+        if pair.schema == 2 && std::env::var_os(REQUIRED_ENV).is_some() {
+            verify_connected_root_grant(&pair, &observation)?;
+        }
+        return Ok(());
+    }
+    #[cfg(feature = "age319-private-broker-fixture")]
+    if let (Some(socket), Some(manifest)) = (
+        private_userns_broker_socket(),
+        std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_PAIR_V1"),
+    ) {
+        let pair = InstalledPair::load(std::path::Path::new(&manifest), false)
+            .map_err(|e| e.to_string())?;
+        if pair.schema == 2 {
+            pair.verify_image(&image, &pair.runner_sha256, false)
+                .map_err(|e| e.to_string())?;
+            let observation =
+                protocol::observe_installed_pair_at(&socket).map_err(|e| e.to_string())?;
+            require_pair_route(&pair, &observation)?;
+            require_pair_launch_mode(
+                pair.schema,
+                std::env::var_os(REQUIRED_ENV).is_some(),
+                std::env::var_os(CHILD_FD_ENV).is_some(),
+            )?;
+            if std::env::var_os(REQUIRED_ENV).is_some() {
+                verify_connected_root_grant(&pair, &observation)?;
+            }
+            return Ok(());
+        }
     }
     let route = protocol::observe_entry_gate_at(&broker_socket())
         .map_err(|error| format!("installed broker entry gate unavailable: {error}"))?;
@@ -553,10 +682,10 @@ fn require_pair_route(
 
 fn require_pair_launch_mode(schema: u8, host_entry: bool, child_entry: bool) -> Result<(), String> {
     if schema == 2 {
-        if !host_entry && child_entry {
+        if host_entry ^ child_entry {
             Ok(())
         } else {
-            Err("fresh-only installed Runner requires a broker-owned child gate".into())
+            Err("fresh-only installed Runner requires one broker-owned entry gate".into())
         }
     } else {
         require_paired_launch_mode(host_entry, child_entry)
@@ -6834,6 +6963,9 @@ fn private_held_prepared_entry() -> Result<(), String> {
 }
 
 fn v30_host_entry() -> Result<ExitCode, String> {
+    let grant = CONNECTED_ROOT_GRANT
+        .get()
+        .ok_or("v30 connected control grant absent")?;
     let broker = broker_socket();
     let StateRoute::BrokerOwned {
         source_generation,
@@ -6849,6 +6981,9 @@ fn v30_host_entry() -> Result<ExitCode, String> {
         .and_then(|s| s.strip_suffix('\n'))
         .ok_or("v30 E did not reserve a root")?
         .to_owned();
+    if root != grant.root_id {
+        return Err("v30 E changed the connected root ID".into());
+    }
     let supervisor = uuid::Uuid::new_v4().to_string();
     let (mut entry, mut guardian) = UnixStream::pair().map_err(|e| e.to_string())?;
     let pid = unsafe { libc::fork() };
@@ -6857,6 +6992,9 @@ fn v30_host_entry() -> Result<ExitCode, String> {
     }
     if pid == 0 {
         drop(entry);
+        // The connected E grant belongs only to the original host control
+        // process. Its forked guardian uses the entry registry custody path.
+        unsafe { libc::close(grant._channel.as_raw_fd()) };
         let result = (|| {
             // The guardian and its driver are control processes. Keep their
             // diagnostics off the model caller's binary stderr channel; the
@@ -7580,7 +7718,9 @@ mod tests {
         old.source_generation = Some(source.clone());
         assert!(require_pair_route(&fresh_pair, &old).is_ok());
         assert!(require_pair_launch_mode(2, false, false).is_err());
-        assert!(require_pair_launch_mode(2, true, false).is_err());
+        // The host shape is admitted only after the connected grant verifier
+        // runs in verify_installed_entry_route.
+        assert!(require_pair_launch_mode(2, true, false).is_ok());
         assert!(require_pair_launch_mode(2, true, true).is_err());
         assert!(require_pair_launch_mode(2, false, true).is_ok());
         assert!(require_pair_grant_kind(2, false).is_err());

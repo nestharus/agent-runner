@@ -1,5 +1,5 @@
-//! Versioned, inert installed-entry handoff. The host broker must own any
-//! eventual execution; this module only captures and validates the request.
+//! Versioned installed-entry handoff. Broker owns execution; this module
+//! captures and validates the launcher's request and descriptors.
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::File;

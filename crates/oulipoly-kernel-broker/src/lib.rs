@@ -1,10 +1,11 @@
 //! Host PID namespace classifier, durable registries, and fail-closed host
-//! entry staging. The service is uninstalled; child and work handoff remain
-//! unavailable pending paired integration.
+//! entry staging. The installed service remains opt-in; connected control E
+//! does not by itself establish terminal or physical-drain completion.
 #![cfg(target_os = "linux")]
 
 pub mod accepted_grant;
 pub mod codex_raw_verifier;
+pub mod connected_control;
 pub mod cutover_gate;
 pub mod entry_registry;
 pub mod first_install_activation;
