@@ -3154,6 +3154,15 @@ fn connected_async_bash_recipient(
         .map_err(|e| e.to_string())?;
     let grant_id = grant["grant_id"].as_str().ok_or("F grant absent")?;
     let token = grant["delivery_token"].as_str().ok_or("F token absent")?;
+    protocol::persist_original_receiver_receipt(&delivery, &delivery_request_id)
+        .map_err(|e| format!("connected async original receipt: {e}"))?;
+    protocol::fresh_recipient_request_at(
+        socket,
+        &FreshRecipientRequest::CertifyOriginalReceipt {
+            grant_id: grant_id.into(),
+        },
+    )
+    .map_err(|e| format!("connected async original certification: {e}"))?;
     let ack = protocol::fresh_recipient_request_at(
         socket,
         &FreshRecipientRequest::Acknowledge {
@@ -6445,6 +6454,15 @@ fn private_bash_recipient_probe(
         {
             return Err("wrong fresh F token acknowledged accepted W".into());
         }
+        protocol::persist_original_receiver_receipt(&delivered, &delivery_request_id)
+            .map_err(|e| format!("private Bash original receipt: {e}"))?;
+        protocol::fresh_recipient_request_at(
+            socket,
+            &FreshRecipientRequest::CertifyOriginalReceipt {
+                grant_id: grant["grant_id"].as_str().ok_or("F grant absent")?.into(),
+            },
+        )
+        .map_err(|e| format!("private Bash original certification: {e}"))?;
         let ack = protocol::fresh_recipient_request_at(
             socket,
             &FreshRecipientRequest::Acknowledge {

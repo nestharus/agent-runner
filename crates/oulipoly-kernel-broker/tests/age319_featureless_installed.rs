@@ -5,7 +5,7 @@ use oulipoly_kernel_broker::first_install_activation::{FirstInstallActivation, P
 use oulipoly_kernel_broker::installed_launch_ledger::InstalledLaunchLedger;
 use oulipoly_kernel_broker::installed_pair::InstalledPair;
 use oulipoly_kernel_broker::protocol::{self, EntryRoute, Operation};
-use oulipoly_state::mailbox::{EmptyV30BootstrapIdentity, FreshBashSourceEvent};
+use oulipoly_state::mailbox::{EmptyV30BootstrapIdentity, FreshBashSourceEvent, FreshV30Lane};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::os::unix::fs::PermissionsExt;
@@ -562,9 +562,19 @@ while [ ! -f "$AGE319_PROVIDER_RELEASE_FILE" ]; do sleep 0.02; done
         }
         assert!(
             Instant::now() < deadline,
-            "async launcher timed out: {} / {}",
+            "async launcher timed out: stderr={} stdout={} broker={} state={}",
             fs::read_to_string(&async_err).unwrap(),
-            fs::read_to_string(&broker_log).unwrap()
+            fs::read_to_string(&async_out).unwrap(),
+            fs::read_to_string(&broker_log).unwrap(),
+            {
+                let lane = FreshV30Lane::open_at(&state).unwrap();
+                let (root, actor) = lane.released_handoff_for_root(&selected.root_id).unwrap();
+                let session = lane.read_session(&root.d_key).unwrap().unwrap();
+                format!(
+                    "{:?}",
+                    lane.read_private_root_terminal(&root, &actor, &session)
+                )
+            }
         );
         std::thread::sleep(Duration::from_millis(25));
     };
@@ -588,27 +598,30 @@ while [ ! -f "$AGE319_PROVIDER_RELEASE_FILE" ]; do sleep 0.02; done
         async_terminal.physical.work_retired,
         async_terminal.physical.work_records
     );
-    let receipt_dir = temp.path().join("data/async-recipient-receipts");
-    let receipts: Vec<_> = fs::read_dir(&receipt_dir)
-        .unwrap()
-        .map(Result::unwrap)
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .ends_with(".receipt.json")
-        })
-        .collect();
-    let [receipt_file] = receipts.as_slice() else {
-        panic!("expected one independent async receiver receipt");
-    };
+    let receipt_identity = async_terminal
+        .original_receipt
+        .as_ref()
+        .expect("installed terminal omitted original receipt identity");
+    assert_eq!(
+        async_terminal.physical.original_receipt.as_ref(),
+        Some(receipt_identity)
+    );
+    let owner_physical: serde_json::Value =
+        serde_json::from_str(&async_terminal.owner.physical_proof_json).unwrap();
+    assert_eq!(
+        owner_physical["original_receipt"],
+        serde_json::to_value(receipt_identity).unwrap()
+    );
+    let receipt_path = Path::new(&receipt_identity.receipt_path);
+    assert!(receipt_path.starts_with(temp.path().join("state-original-receipts")));
+    assert_eq!(digest(receipt_path), receipt_identity.receipt_sha256);
     let receipt: serde_json::Value =
-        serde_json::from_slice(&fs::read(receipt_file.path()).unwrap()).unwrap();
+        serde_json::from_slice(&fs::read(receipt_path).unwrap()).unwrap();
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(receipt["payload_base64"].as_str().unwrap())
         .unwrap();
     assert_eq!(
-        receipt["observed_sha256"],
+        receipt["grant"]["payload_sha256"],
         format!("{:x}", Sha256::digest(&bytes))
     );
     let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -669,6 +682,69 @@ while [ ! -f "$AGE319_PROVIDER_RELEASE_FILE" ]; do sleep 0.02; done
         ledger.read_terminal(&async_id).unwrap().unwrap(),
         async_terminal
     );
+    let stored_receipt = fs::read(receipt_path).unwrap();
+    fs::set_permissions(receipt_path, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(receipt_path, b"tampered original receiver receipt").unwrap();
+    assert!(ledger.read_terminal(&async_id).is_err());
+    let lane = FreshV30Lane::open_at(&state).unwrap();
+    let (released, actor) = lane
+        .released_handoff_for_root(&async_terminal.physical.root_id)
+        .unwrap();
+    let session = lane.read_session(&released.d_key).unwrap().unwrap();
+    let changed = lane
+        .read_private_root_terminal(&released, &actor, &session)
+        .unwrap();
+    assert_ne!(changed.notification_state, "acked");
+    assert!(
+        oulipoly_kernel_broker::root_drain::exact_original_receipt_for_root(
+            &lane,
+            &async_terminal.physical.root_id
+        )
+        .is_err()
+    );
+    let tamper_err = temp.path().join("tamper-entry.err");
+    let mut tamper_entry = Command::new(&launcher)
+        .args(["--model", "fixture-model", "tampered prior receipt"])
+        .env_clear()
+        .env("HOME", temp.path())
+        .env("PATH", "/usr/bin:/bin")
+        .env("OULIPOLY_CONFIG_HOME", &config_home)
+        .env("OULIPOLY_DATA_DIR", temp.path().join("data"))
+        .env("AGE319_EFFECT_FILE", &effect)
+        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_PAIR_V1", &manifest)
+        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_LAUNCHER_V1", &launcher)
+        .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+        .env(
+            "OULIPOLY_AGE319_PRIVATE_REQUEST_ID_V1",
+            uuid::Uuid::new_v4().to_string(),
+        )
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(File::create(&tamper_err).unwrap()))
+        .spawn()
+        .unwrap();
+    let tamper_deadline = Instant::now() + Duration::from_secs(15);
+    let tamper_status = loop {
+        if let Some(status) = tamper_entry.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= tamper_deadline {
+            tamper_entry.kill().unwrap();
+            panic!("tampered prior receipt did not refuse entry");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert!(
+        !tamper_status.success(),
+        "tampered receipt admitted a new root"
+    );
+    assert_eq!(fs::read_to_string(&effect).unwrap(), "one\nbash\nasync\n");
+    assert_eq!(fs::read_dir(state.join("entries")).unwrap().count(), 4);
+    fs::write(receipt_path, &stored_receipt).unwrap();
+    fs::set_permissions(receipt_path, fs::Permissions::from_mode(0o400)).unwrap();
+    let restored = lane
+        .read_private_root_terminal(&released, &actor, &session)
+        .unwrap();
+    assert_eq!(restored.original_receipt.as_ref(), Some(receipt_identity));
 
     // A later E must revalidate the fully closed async root as history.
     fs::write(

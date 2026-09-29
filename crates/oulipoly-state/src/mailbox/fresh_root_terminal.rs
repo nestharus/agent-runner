@@ -62,6 +62,8 @@ pub struct FreshRootTerminalReadback {
     pub delivery_payload_byte_len: Option<i64>,
     pub ack_basis: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_receipt: Option<FreshOriginalReceiptIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub successor_ack: Option<FreshSuccessorTerminalAck>,
     pub publication_state: String,
     pub publication_sha256: Option<String>,
@@ -588,6 +590,7 @@ impl FreshV30Lane {
             delivery_payload_sha256: None,
             delivery_payload_byte_len: None,
             ack_basis: None,
+            original_receipt: None,
             successor_ack: None,
             publication_state: "not_started".into(),
             publication_sha256: None,
@@ -978,6 +981,8 @@ impl FreshV30Lane {
                     "SELECT e.basis,e.delivery_token_sha256,g.delivery_token
                      FROM fresh_recipient_ack_evidence e
                      JOIN fresh_recipient_grant g ON g.grant_id=e.grant_id
+                     LEFT JOIN fresh_original_receipt c ON c.grant_id=e.grant_id
+                     LEFT JOIN fresh_original_grant_uid u ON u.grant_id=e.grant_id
                      JOIN mailbox m ON m.session_id=e.session_id AND m.seq=e.seq
                      JOIN fresh_recipient_row_source r ON r.session_id=e.session_id AND r.seq=e.seq
                      WHERE e.grant_id=?1 AND e.session_id=?2 AND e.seq=?3
@@ -995,7 +1000,16 @@ impl FreshV30Lane {
                        AND r.source_id=e.source_id AND r.attempt_id=e.attempt_id
                        AND r.payload_sha256=e.payload_sha256 AND r.payload_byte_len=e.payload_byte_len
                        AND ((e.basis='manual_ack' AND e.delegation_id IS NULL
-                             AND m.delivered_by_invocation_uuid=e.grant_id)
+                             AND m.delivered_by_invocation_uuid=e.grant_id
+                             AND c.delivery_request_id=e.delivery_request_id
+                             AND c.session_id=e.session_id AND c.seq=e.seq
+                             AND c.source_id=e.source_id AND c.attempt_id=e.attempt_id
+                             AND c.recipient_identity=e.recipient_identity
+                             AND c.recipient_identity=u.recipient_identity
+                             AND c.recipient_uid=u.recipient_uid
+                             AND c.payload_sha256=e.payload_sha256
+                             AND c.payload_byte_len=e.payload_byte_len
+                             AND c.delivery_token_sha256=e.delivery_token_sha256)
                          OR (e.basis='delegated_manual_ack' AND e.delegation_id IS NOT NULL
                              AND m.delivered_by_invocation_uuid=e.delegation_id
                              AND EXISTS (SELECT 1 FROM fresh_recipient_ack_delegation_item i
@@ -1068,6 +1082,26 @@ impl FreshV30Lane {
                 };
                 if sha256_hex(token.as_bytes()) != token_sha {
                     return Err("terminal fresh ACK token conflict".into());
+                }
+                if basis == "manual_ack" {
+                    let uid: Option<u32> = self.sidecar.mailbox().conn.query_row(
+                        "SELECT recipient_uid FROM fresh_original_grant_uid WHERE grant_id=?1",
+                        [&grant_id], |r| r.get(0),
+                    ).optional().map_err(|e| e.to_string())?;
+                    let receipt = uid.ok_or_else(|| "terminal original F UID absent".to_string())
+                        .and_then(|uid| self.read_original_receipt(&grant_id,actor,uid)
+                            .and_then(|r| r.ok_or("terminal original receipt absent".into())));
+                    match receipt {
+                        Ok(receipt) => {
+                            result.artifacts.push(format!("original-receipt:{}",receipt.receipt_sha256));
+                            result.original_receipt = Some(receipt);
+                        }
+                        Err(error) => {
+                            result.notification_state = "f_unknown".into();
+                            result.record_unknown(format!("original_receipt:{error}"));
+                            return Ok(());
+                        }
+                    }
                 }
                 result.ack_basis = Some(basis);
                 "acked"

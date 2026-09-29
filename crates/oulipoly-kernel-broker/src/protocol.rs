@@ -1949,6 +1949,12 @@ pub enum FreshRecipientRequest {
     Recover {
         delivery_request_id: String,
     },
+    CertifyOriginalReceipt {
+        grant_id: String,
+    },
+    ReadOriginalReceipt {
+        grant_id: String,
+    },
     /// Private, authority-neutral pre-send record. A typed Tail read must
     /// precede this call; no PTY write or ACK is implied.
     PrepareNativeF {
@@ -2076,6 +2082,145 @@ pub fn fresh_recipient_request_without_reply_at(
 /// Persist an independent receiver receipt from the actual Broker F bytes.
 /// The reply is the only payload input; this never consults a State lookup.
 /// An existing exact receipt is usable after a lost certification reply.
+pub fn persist_original_receiver_receipt(
+    reply: &serde_json::Value,
+    delivery_request_id: &str,
+) -> io::Result<Vec<u8>> {
+    use oulipoly_state::mailbox::{
+        FreshDeliveryReadback, FreshOriginalReceiverReceipt, FreshRecipientIdentity,
+    };
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    let kind = reply["kind"]
+        .as_str()
+        .ok_or_else(|| io::Error::other("original F kind absent"))?;
+    if kind != "delivery" && kind != "recovered_delivery" {
+        return Err(io::Error::other("reply is not original F bytes"));
+    }
+    let mut grant_json = reply["grant"].clone();
+    let token = grant_json["delivery_token"]
+        .as_str()
+        .ok_or_else(|| io::Error::other("original F token absent"))?
+        .to_string();
+    grant_json
+        .as_object_mut()
+        .ok_or_else(|| io::Error::other("original F grant invalid"))?
+        .remove("delivery_token");
+    let mut grant: FreshDeliveryReadback =
+        serde_json::from_value(grant_json).map_err(io::Error::other)?;
+    if !matches!(grant.phase.as_str(), "unknown" | "submitted") {
+        return Err(io::Error::other("original F phase invalid"));
+    }
+    // Submission state may advance between a lost F reply and recovery.
+    grant.phase = "unknown".into();
+    let recipient: FreshRecipientIdentity =
+        serde_json::from_value(reply["recipient_identity"].clone()).map_err(io::Error::other)?;
+    let uid = unsafe { libc::geteuid() };
+    if reply["recipient_uid"].as_u64() != Some(uid as u64) {
+        return Err(io::Error::other("original F UID differs from receiver"));
+    }
+    let payload = base64::engine::general_purpose::STANDARD
+        .decode(
+            reply["payload_base64"]
+                .as_str()
+                .ok_or_else(|| io::Error::other("original F payload absent"))?,
+        )
+        .map_err(io::Error::other)?;
+    if i64::try_from(payload.len()).ok() != Some(grant.payload_byte_len)
+        || format!("{:x}", Sha256::digest(&payload)) != grant.payload_sha256
+    {
+        return Err(io::Error::other("original F reply bytes differ from grant"));
+    }
+    let path = std::path::Path::new(
+        reply["receipt_path"]
+            .as_str()
+            .ok_or_else(|| io::Error::other("original receipt path absent"))?,
+    );
+    let uid_name = uid.to_string();
+    if !path.is_absolute()
+        || path.file_name().and_then(|n| n.to_str())
+            != Some(format!("{}.json", grant.grant_id).as_str())
+        || path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            != Some(uid_name.as_str())
+        || !path
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with("-original-receipts"))
+    {
+        return Err(io::Error::other("original receipt path invalid"));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("original receipt parent absent"))?;
+    let root = parent
+        .parent()
+        .ok_or_else(|| io::Error::other("original receipt root absent"))?;
+    let parent_meta = std::fs::symlink_metadata(parent)?;
+    let root_meta = std::fs::symlink_metadata(root)?;
+    if !root_meta.is_dir()
+        || root_meta.file_type().is_symlink()
+        || root_meta.uid() != 0
+        || root_meta.mode() & 0o777 != 0o711
+        || !parent_meta.is_dir()
+        || parent_meta.file_type().is_symlink()
+        || parent_meta.uid() != uid
+        || parent_meta.mode() & 0o777 != 0o700
+    {
+        return Err(io::Error::other("original receipt directory untrusted"));
+    }
+    let receipt = FreshOriginalReceiverReceipt {
+        delivery_request_id: delivery_request_id.into(),
+        grant,
+        recipient_identity: recipient,
+        recipient_uid: uid,
+        payload_base64: reply["payload_base64"].as_str().unwrap().into(),
+        delivery_token_sha256: format!("{:x}", Sha256::digest(token.as_bytes())),
+    };
+    let bytes = serde_json::to_vec(&receipt).map_err(io::Error::other)?;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o400)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(mut file) => {
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(path)?;
+            let meta = file.metadata()?;
+            if !meta.is_file()
+                || meta.uid() != uid
+                || meta.nlink() != 1
+                || meta.mode() & 0o777 != 0o400
+                || meta.len() != bytes.len() as u64
+            {
+                return Err(io::Error::other("existing original receipt untrusted"));
+            }
+            let mut stored = Vec::new();
+            file.read_to_end(&mut stored)?;
+            if stored != bytes {
+                return Err(io::Error::other("existing original receipt differs"));
+            }
+            file.sync_all()?;
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        Err(error) => return Err(error),
+    }
+    Ok(payload)
+}
+
+/// Persist an independent receiver receipt from the actual successor F bytes.
 pub fn persist_successor_receiver_receipt(
     reply: &serde_json::Value,
     recipient: &oulipoly_state::mailbox::FreshRecipientIdentity,

@@ -2,7 +2,7 @@
 
 use base64::Engine as _;
 use oulipoly_kernel_broker::identity::PinnedProcess;
-use oulipoly_kernel_broker::protocol::{FreshRecipientRequest, fresh_recipient_request_at};
+use oulipoly_kernel_broker::protocol::{self, FreshRecipientRequest, fresh_recipient_request_at};
 use oulipoly_runtime::executor::cli::pty_broker::PtyControlGenerationIdentity;
 use oulipoly_state::StateDb;
 use oulipoly_state::mailbox::{
@@ -14,8 +14,9 @@ use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command};
 use std::sync::{
@@ -27,19 +28,39 @@ use std::time::{Duration, Instant};
 #[test]
 fn private_fresh_recipient_delivery_ack_collision_and_restart() {
     if std::env::var_os("AGE319_FRESH_RECIPIENT_CHILD").is_none() {
+        let images = tempfile::tempdir().unwrap();
+        fs::set_permissions(images.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let test_image = images.path().join("original-recipient-test");
+        let broker_image = images.path().join("broker");
+        fs::copy(std::env::current_exe().unwrap(), &test_image).unwrap();
+        fs::copy(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"), &broker_image).unwrap();
+        fs::set_permissions(&test_image, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&broker_image, fs::Permissions::from_mode(0o755)).unwrap();
         let status = Command::new("unshare")
-            .args(["-Urpfm", "--mount-proc"])
-            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--map-auto",
+                "--setuid",
+                "0",
+                "--setgid",
+                "0",
+                "-pfm",
+                "--mount-proc",
+            ])
+            .arg(&test_image)
             .arg("--exact")
             .arg("private_fresh_recipient_delivery_ack_collision_and_restart")
             .arg("--nocapture")
             .env("AGE319_FRESH_RECIPIENT_CHILD", "1")
+            .env("AGE319_FRESH_BROKER_IMAGE", &broker_image)
             .status()
             .unwrap();
         assert!(status.success(), "private recipient fixture failed");
         return;
     }
-    let private = tempfile::tempdir().unwrap();
+    let private = tempfile::Builder::new()
+        .prefix("age319-original-")
+        .tempdir_in("/dev/shm")
+        .unwrap();
     let old_root = private.path().join("old");
     let broker_root = private.path().join("broker");
     fs::create_dir(&old_root).unwrap();
@@ -575,6 +596,17 @@ fn private_fresh_recipient_delivery_ack_collision_and_restart() {
         )
         .is_err()
     );
+    assert!(
+        fresh_recipient_request_at(
+            &socket,
+            &FreshRecipientRequest::Acknowledge {
+                grant_id: first_id.clone(),
+                delivery_token: first_token.clone(),
+            }
+        )
+        .is_err(),
+        "original ACK accepted no receiver receipt"
+    );
     let wrong = Command::new(&runner)
         .arg("--exact")
         .arg("wrong_recipient_child")
@@ -818,15 +850,108 @@ fn private_fresh_recipient_delivery_ack_collision_and_restart() {
         assert_eq!(delivered, index == 1 || index == 3);
     }
     for grant in [&first_recovery["grant"], &next[1]] {
+        let grant_id = grant["grant_id"].as_str().unwrap();
+        let request_id: String = fresh
+            .query_row(
+                "SELECT delivery_request_id FROM fresh_recipient_grant WHERE grant_id=?1",
+                [grant_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let delivery = fresh_recipient_request_at(
+            &socket,
+            &FreshRecipientRequest::Recover {
+                delivery_request_id: request_id.clone(),
+            },
+        )
+        .unwrap();
+        let bytes = protocol::persist_original_receiver_receipt(&delivery, &request_id).unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&bytes)),
+            grant["payload_sha256"].as_str().unwrap()
+        );
+        let path = Path::new(delivery["receipt_path"].as_str().unwrap());
+        let original_bytes = fs::read(path).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(path, b"changed original F bytes").unwrap();
+        assert!(
+            fresh_recipient_request_at(
+                &socket,
+                &FreshRecipientRequest::CertifyOriginalReceipt {
+                    grant_id: grant_id.into(),
+                }
+            )
+            .is_err(),
+            "changed physical receipt was certified"
+        );
+        fs::write(path, &original_bytes).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o400)).unwrap();
+        let certify = FreshRecipientRequest::CertifyOriginalReceipt {
+            grant_id: grant_id.into(),
+        };
+        drop_reply(&socket, &certify);
+        let certified = fresh_recipient_request_at(
+            &socket,
+            &FreshRecipientRequest::ReadOriginalReceipt {
+                grant_id: grant_id.into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            certified["receipt"]["receipt_path"],
+            delivery["receipt_path"]
+        );
+        let ack_request = FreshRecipientRequest::Acknowledge {
+            grant_id: grant_id.into(),
+            delivery_token: grant["delivery_token"].as_str().unwrap().into(),
+        };
+        drop_reply(&socket, &ack_request);
         let ack = fresh_recipient_request_at(
             &socket,
-            &FreshRecipientRequest::Acknowledge {
-                grant_id: grant["grant_id"].as_str().unwrap().into(),
-                delivery_token: grant["delivery_token"].as_str().unwrap().into(),
+            &FreshRecipientRequest::Read {
+                delivery_request_id: request_id.clone(),
             },
         )
         .unwrap();
         assert_eq!(ack["grant"]["phase"].as_str(), Some("acked"));
+        assert_eq!(ack["receipt"], certified["receipt"]);
+        assert!(fresh_recipient_request_at(&socket, &ack_request).is_err());
+        let held = path.with_extension("held");
+        fs::rename(path, &held).unwrap();
+        assert!(
+            fresh_recipient_request_at(
+                &socket,
+                &FreshRecipientRequest::Read {
+                    delivery_request_id: request_id.clone(),
+                }
+            )
+            .is_err(),
+            "missing ACK receipt remained settled"
+        );
+        fs::write(path, &original_bytes).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(
+            fresh_recipient_request_at(
+                &socket,
+                &FreshRecipientRequest::ReadOriginalReceipt {
+                    grant_id: grant_id.into(),
+                }
+            )
+            .is_err(),
+            "replacement inode retained certification"
+        );
+        fs::remove_file(path).unwrap();
+        fs::rename(&held, path).unwrap();
+        assert_eq!(
+            fresh_recipient_request_at(
+                &socket,
+                &FreshRecipientRequest::ReadOriginalReceipt {
+                    grant_id: grant_id.into(),
+                }
+            )
+            .unwrap()["receipt"],
+            certified["receipt"]
+        );
     }
     let evidence = fresh
         .prepare(
@@ -853,6 +978,22 @@ fn private_fresh_recipient_delivery_ack_collision_and_restart() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(evidence.len(), 4);
+    assert_eq!(
+        fresh
+            .query_row("SELECT count(*) FROM fresh_original_ack_receipt", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    assert!(
+        fresh
+            .execute(
+                "UPDATE fresh_original_ack_receipt SET receipt_sha256='changed' WHERE grant_id=?1",
+                [&first_id],
+            )
+            .is_err(),
+        "original ACK receipt identity was mutable"
+    );
     for (
         index,
         (basis, token_sha, token, row_session, seq, row_source, row_attempt, row_sha, row_len),
@@ -1151,8 +1292,153 @@ fn private_fresh_recipient_delivery_ack_collision_and_restart() {
         .is_err()
     );
     drop(lane);
+    fs::set_permissions(private.path(), fs::Permissions::from_mode(0o711)).unwrap();
+    let socket_c = std::ffi::CString::new(socket.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::chown(socket_c.as_ptr(), 0, 1001) }, 0);
+    let go = private.path().join("uid-1001-go");
+    let uid_request = uuid::Uuid::new_v4().to_string();
+    let uid_allocation = uuid::Uuid::new_v4().to_string();
+    let mut lane = FreshV30Lane::open_at(&broker_root).unwrap();
+    let uid_session = lane.allocate_session(&uid_allocation).unwrap();
+    let mut uid_child = Command::new(&runner)
+        .arg("--exact")
+        .arg("uid_1001_original_recipient_child")
+        .env("AGE319_ORIGINAL_UID_CHILD", "1")
+        .env("AGE319_FRESH_SOCKET", &socket)
+        .env("AGE319_ORIGINAL_UID_GO", &go)
+        .env("AGE319_ORIGINAL_UID_ROOT", &broker_root)
+        .env("AGE319_ORIGINAL_UID_ALLOCATION", &uid_allocation)
+        .env("AGE319_ORIGINAL_UID_REQUEST", &uid_request)
+        .uid(1001)
+        .gid(1001)
+        .spawn()
+        .unwrap();
+    let uid_actor = identity(uid_child.id() as i32);
+    fresh
+        .execute(
+            "INSERT INTO fresh_recipient_binding VALUES(?1,?2,?3,?4,?5)",
+            params![
+                uid_session.session_id,
+                serde_json::to_string(&uid_actor).unwrap(),
+                root_id,
+                owner_generation,
+                lane_id.source_generation
+            ],
+        )
+        .unwrap();
+    attach_state_recipient(
+        &state,
+        &uid_session.session_id,
+        &lane_id.lane_id,
+        &lane_id.source_generation,
+        &root_id,
+        &owner_generation,
+        &uid_actor,
+    );
+    let (uid_seq, uid_sha, uid_len) = insert_fresh_payload(
+        &fresh,
+        &sidecar_path,
+        &uid_session.session_id,
+        "uid-original",
+        b"UID 1001 exact F bytes",
+    );
+    fresh
+        .execute(
+            "INSERT INTO fresh_recipient_row_source VALUES(?1,?2,?3,?4,?5,?6)",
+            params![
+                uid_session.session_id,
+                uid_seq,
+                source_id,
+                attempt_id,
+                uid_sha,
+                uid_len
+            ],
+        )
+        .unwrap();
+    fs::write(&go, b"go").unwrap();
+    assert!(
+        uid_child.wait().unwrap().success(),
+        "mapped UID original receiver failed"
+    );
+    drop(lane);
     broker.kill().unwrap();
     broker.wait().unwrap();
+}
+
+#[test]
+fn uid_1001_original_recipient_child() {
+    if std::env::var_os("AGE319_ORIGINAL_UID_CHILD").is_none() {
+        return;
+    }
+    assert_eq!(unsafe { libc::geteuid() }, 1001);
+    let root = std::env::var("AGE319_ORIGINAL_UID_ROOT").unwrap();
+    assert!(
+        fs::metadata(Path::new(&root).join("v30/state.db")).is_err(),
+        "mapped original Runner traversed root-only State"
+    );
+    let go = std::env::var("AGE319_ORIGINAL_UID_GO").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !Path::new(&go).exists() {
+        assert!(Instant::now() < deadline, "mapped original binding absent");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let socket = std::env::var("AGE319_FRESH_SOCKET").unwrap();
+    let request_id = std::env::var("AGE319_ORIGINAL_UID_REQUEST").unwrap();
+    let delivery = fresh_recipient_request_at(
+        Path::new(&socket),
+        &FreshRecipientRequest::Submit {
+            allocation_request_id: std::env::var("AGE319_ORIGINAL_UID_ALLOCATION").unwrap(),
+            delivery_request_id: request_id.clone(),
+        },
+    )
+    .unwrap();
+    let grant_id = delivery["grant"]["grant_id"].as_str().unwrap();
+    let token = delivery["grant"]["delivery_token"].as_str().unwrap();
+    assert_eq!(delivery["recipient_uid"], 1001);
+    assert!(
+        fresh_recipient_request_at(
+            Path::new(&socket),
+            &FreshRecipientRequest::Acknowledge {
+                grant_id: grant_id.into(),
+                delivery_token: token.into(),
+            }
+        )
+        .is_err(),
+        "mapped original ACK accepted no receipt"
+    );
+    let payload = protocol::persist_original_receiver_receipt(&delivery, &request_id).unwrap();
+    assert_eq!(payload, b"UID 1001 exact F bytes");
+    let path = Path::new(delivery["receipt_path"].as_str().unwrap());
+    assert_eq!(fs::symlink_metadata(path).unwrap().uid(), 1001);
+    assert_eq!(
+        fs::symlink_metadata(path.parent().unwrap()).unwrap().uid(),
+        1001
+    );
+    let cert = fresh_recipient_request_at(
+        Path::new(&socket),
+        &FreshRecipientRequest::CertifyOriginalReceipt {
+            grant_id: grant_id.into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(cert["receipt"]["receipt_path"], delivery["receipt_path"]);
+    let ack = fresh_recipient_request_at(
+        Path::new(&socket),
+        &FreshRecipientRequest::Acknowledge {
+            grant_id: grant_id.into(),
+            delivery_token: token.into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(ack["grant"]["phase"], "acked");
+    let read = fresh_recipient_request_at(
+        Path::new(&socket),
+        &FreshRecipientRequest::Read {
+            delivery_request_id: request_id,
+        },
+    )
+    .unwrap();
+    assert_eq!(read["receipt"], cert["receipt"]);
 }
 
 struct ControlFixtureServer {
@@ -1423,7 +1709,10 @@ fn insert_fresh_payload(
 }
 
 fn start_broker(root: &Path, socket: &Path, runner: &Path) -> Child {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_oulipoly-kernel-broker"))
+    let broker_image = std::env::var_os("AGE319_FRESH_BROKER_IMAGE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_oulipoly-kernel-broker").into());
+    let mut child = Command::new(broker_image)
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_STATE_V1", root)
         .env(
             "OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1",

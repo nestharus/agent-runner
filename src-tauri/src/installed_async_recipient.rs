@@ -8,7 +8,7 @@ use oulipoly_state::mailbox::FreshRootTerminalReadback;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read as _, Write as _};
+use std::io::Read as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -20,15 +20,6 @@ struct Intent {
     root_id: String,
     session_id: String,
     delivery_request_id: String,
-}
-
-#[derive(Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct Receipt {
-    intent: Intent,
-    grant: serde_json::Value,
-    payload_base64: String,
-    observed_sha256: String,
 }
 
 pub(crate) fn settle_pending_original(
@@ -94,19 +85,37 @@ pub(crate) fn settle_pending_original(
         .map_err(|e| e.to_string())?;
     let sha = format!("{:x}", Sha256::digest(&payload));
     validate_payload(&terminal, grant, &payload, &sha)?;
-    let receipt = Receipt {
-        intent: intent.clone(),
-        grant: grant.clone(),
-        payload_base64: encoded.into(),
-        observed_sha256: sha,
-    };
     let grant_id = grant["grant_id"]
         .as_str()
         .ok_or("async F grant ID absent")?;
-    persist_exact(
-        &directory.join(format!("{grant_id}.receipt.json")),
-        &receipt,
-    )?;
+    if protocol::persist_original_receiver_receipt(&reply, &intent.delivery_request_id)
+        .map_err(|e| format!("async original receipt write unknown: {e}"))?
+        != payload
+    {
+        return Err("async original receipt differs from actual F bytes".into());
+    }
+    let certified = protocol::fresh_recipient_request_at(
+        socket,
+        &FreshRecipientRequest::CertifyOriginalReceipt {
+            grant_id: grant_id.into(),
+        },
+    )
+    .or_else(|_| {
+        protocol::fresh_recipient_request_at(
+            socket,
+            &FreshRecipientRequest::ReadOriginalReceipt {
+                grant_id: grant_id.into(),
+            },
+        )
+    })
+    .map_err(|e| format!("async original receipt certification unknown: {e}"))?;
+    let receipt_identity = certified["receipt"].clone();
+    if receipt_identity["grant_id"] != grant_id
+        || receipt_identity["receipt_path"] != reply["receipt_path"]
+        || receipt_identity["receipt_sha256"].as_str().is_none()
+    {
+        return Err("async original receipt certification changed F".into());
+    }
     let token = grant["delivery_token"]
         .as_str()
         .ok_or("async F token absent")?;
@@ -127,6 +136,7 @@ pub(crate) fn settle_pending_original(
     if read["kind"] != "readback"
         || read["grant"]["grant_id"] != grant_id
         || read["grant"]["phase"] != "acked"
+        || read["receipt"] != receipt_identity
         || ack
             .as_ref()
             .is_ok_and(|reply| reply["grant"] != read["grant"])
@@ -143,6 +153,8 @@ pub(crate) fn settle_pending_original(
     if terminal.notification_state != "acked"
         || terminal.ack_basis.as_deref() != Some("manual_ack")
         || terminal.delivery_grant_id.as_deref() != Some(grant_id)
+        || serde_json::to_value(&terminal.original_receipt).map_err(|e| e.to_string())?
+            != serde_json::json!(receipt_identity)
     {
         return Err("async original terminal did not join exact ACK".into());
     }
@@ -293,34 +305,6 @@ fn load_or_create_intent(
                 return Err("async original persisted request changed D binding".into());
             }
             Ok(existing)
-        }
-        Err(error) => Err(error.to_string()),
-    }
-}
-
-fn persist_exact(path: &Path, receipt: &Receipt) -> Result<(), String> {
-    let bytes = serde_json::to_vec(receipt).map_err(|e| e.to_string())?;
-    match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o400)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-    {
-        Ok(mut file) => {
-            file.write_all(&bytes).map_err(|e| e.to_string())?;
-            file.sync_all().map_err(|e| e.to_string())?;
-            File::open(path.parent().unwrap())
-                .and_then(|dir| dir.sync_all())
-                .map_err(|e| e.to_string())?;
-            Ok(())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let existing: Receipt = read_exact(path)?;
-            if existing != *receipt {
-                return Err("async original persisted F bytes changed".into());
-            }
-            Ok(())
         }
         Err(error) => Err(error.to_string()),
     }

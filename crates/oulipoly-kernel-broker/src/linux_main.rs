@@ -4374,6 +4374,7 @@ fn require_prior_entries_closed_inner(
             .map_err(io::Error::other)?
         {
             root_drain::exact_successor_ack_for_root(&lane, &entry.root_id)?;
+            root_drain::exact_original_receipt_for_root(&lane, &entry.root_id)?;
             let stored = entry
                 .terminal_settlement
                 .as_ref()
@@ -4562,7 +4563,7 @@ fn installed_normal_status(
     ) {
         return Ok(unknown());
     }
-    let proof = (|| -> io::Result<(root_drain::RootPhysicalCloseProof, oulipoly_state::mailbox::BrokerClosedOwner, Option<oulipoly_state::mailbox::FreshSuccessorTerminalAck>)> {
+    let proof = (|| -> io::Result<(root_drain::RootPhysicalCloseProof, oulipoly_state::mailbox::BrokerClosedOwner, Option<oulipoly_state::mailbox::FreshSuccessorTerminalAck>, Option<oulipoly_state::mailbox::FreshOriginalReceiptIdentity>)> {
         let root = roots.record(root_id).ok_or_else(|| io::Error::other("installed root absent"))?;
         let entry = entries.record(root_id).ok_or_else(|| io::Error::other("installed E absent"))?;
         if entry.entry != control.control || entry.owner_uid != request.owner_uid {
@@ -4586,6 +4587,7 @@ fn installed_normal_status(
             return Err(io::Error::other("installed normal K absent"));
         }
         let successor_ack = root_drain::exact_successor_ack_for_root(&lane, root_id)?;
+        let original_receipt = root_drain::exact_original_receipt_for_root(&lane, root_id)?;
         let inventory = root_drain::readback(root, roots, entries, works, grants, sources, Some(sidecar))?;
         let normal = inventory.normal.as_ref().ok_or_else(|| io::Error::other("installed normal Q absent"))?;
         let settlement = entry.terminal_settlement.as_ref()
@@ -4606,17 +4608,20 @@ fn installed_normal_status(
         if physical.successor_ack != successor_ack {
             return Err(io::Error::other("installed successor ACK and owner proof differ"));
         }
+        if physical.original_receipt != original_receipt {
+            return Err(io::Error::other("installed original receipt and owner proof differ"));
+        }
         let owner = inventory.owner_close_proof
             .ok_or_else(|| io::Error::other("installed owner close absent"))?;
         if owner.owner_generation != handoff.old_release.prepared.owner_generation
             || owner.source_generation != request.source_generation {
             return Err(io::Error::other("installed closed owner identity changed"));
         }
-        Ok((physical, owner, successor_ack))
+        Ok((physical, owner, successor_ack, original_receipt))
     })();
     let stored = ledger.read_terminal(request_id);
     match (proof, stored) {
-        (Ok((physical, owner, successor_ack)), Ok(stored)) => {
+        (Ok((physical, owner, successor_ack, original_receipt)), Ok(stored)) => {
             let certificate = NormalTerminalCertificate {
                 protocol: String::new(),
                 request,
@@ -4629,6 +4634,7 @@ fn installed_normal_status(
                 physical,
                 owner,
                 successor_ack,
+                original_receipt,
             };
             let current = if let Some(stored) = stored {
                 stored
@@ -4641,6 +4647,7 @@ fn installed_normal_status(
                 || current.physical != certificate.physical
                 || current.owner != certificate.owner
                 || current.successor_ack != certificate.successor_ack
+                || current.original_receipt != certificate.original_receipt
             {
                 return Ok(unknown());
             }
@@ -4783,6 +4790,7 @@ fn installed_offline_status(
                 physical,
                 owner,
                 successor_ack: None,
+                original_receipt: None,
             };
             let current = if let Some(stored) = stored {
                 stored
@@ -4795,6 +4803,7 @@ fn installed_offline_status(
                 || current.physical != certificate.physical
                 || current.owner != certificate.owner
                 || current.successor_ack != certificate.successor_ack
+                || current.original_receipt != certificate.original_receipt
             {
                 return Ok(unknown());
             }
@@ -4882,6 +4891,12 @@ fn commit_exact_owner_close(
     } else {
         None
     };
+    let original_receipt = if state_root.join("v30/state.db").exists() {
+        let lane = FreshV30Lane::open_at(state_root).map_err(io::Error::other)?;
+        root_drain::exact_original_receipt_for_root(&lane, &expected.root_id)?
+    } else {
+        None
+    };
     let intent = registry
         .read_close_intent(expected)?
         .ok_or_else(|| io::Error::other("owner close intent absent"))?;
@@ -4918,6 +4933,9 @@ fn commit_exact_owner_close(
         if physical.successor_ack != successor_ack {
             return Err(io::Error::other("owner close successor ACK changed"));
         }
+        if physical.original_receipt != original_receipt {
+            return Err(io::Error::other("owner close original receipt changed"));
+        }
         let candidate = oulipoly_state::mailbox::BrokerClosedOwner {
             source_generation: intent.source_generation.clone(),
             root_id: expected.root_id.clone(),
@@ -4943,6 +4961,12 @@ fn commit_exact_owner_close(
                         != successor_ack
                     {
                         return Err("owner close successor ACK changed under writers".into());
+                    }
+                    if root_drain::exact_original_receipt_for_root(&lane, &expected.root_id)
+                        .map_err(|error| error.to_string())?
+                        != original_receipt
+                    {
+                        return Err("owner close original receipt changed under writers".into());
                     }
                 }
                 let observer = BrokerSidecar::open_existing(&sidecar_path, state_root)?;
@@ -5064,6 +5088,9 @@ fn advance_one_normal_owner(
         }
         let expected_owner = &released.old_release.prepared.owner_generation;
         if root_drain::exact_successor_ack_for_root(&lane, &root.root_id).is_err() {
+            continue;
+        }
+        if root_drain::exact_original_receipt_for_root(&lane, &root.root_id).is_err() {
             continue;
         }
         if let Some(proof) = &inventory.owner_close_proof {
@@ -7250,10 +7277,14 @@ fn serve() -> io::Result<()> {
 fn fresh_payload_reply(
     kind: &str,
     submission: FreshDeliverySubmission,
+    receipt_path: &Path,
+    recipient: &FreshRecipientIdentity,
+    uid: u32,
 ) -> io::Result<serde_json::Value> {
     let mut grant = serde_json::to_value(submission.readback)?;
     grant["delivery_token"] = serde_json::Value::String(submission.delivery_token);
     Ok(serde_json::json!({ "kind": kind, "grant": grant,
+        "receipt_path":receipt_path,"recipient_identity":recipient,"recipient_uid":uid,
         "payload_base64": base64::engine::general_purpose::STANDARD.encode(submission.payload) }))
 }
 
@@ -10461,10 +10492,20 @@ fn serve_fresh_v30_at(
                                     &delivery_request_id,
                                     &session,
                                     &recipient,
+                                    peer.uid,
                                 )
                                 .map_err(io::Error::other)?;
+                            let receipt_path = lane
+                                .original_receipt_path(&submitted.readback.grant_id, peer.uid)
+                                .map_err(io::Error::other)?;
                             submitted_grant = Some(submitted.readback.grant_id.clone());
-                            fresh_payload_reply("delivery", submitted)?
+                            fresh_payload_reply(
+                                "delivery",
+                                submitted,
+                                &receipt_path,
+                                &recipient,
+                                peer.uid,
+                            )?
                         }
                         FreshRecipientRequest::Read {
                             delivery_request_id,
@@ -10475,7 +10516,31 @@ fn serve_fresh_v30_at(
                                     &recipient,
                                 )
                                 .map_err(io::Error::other)?;
-                            serde_json::json!({ "kind": "readback", "grant": grant })
+                            let receipt = if let Some(grant) = &grant {
+                                if grant.phase == "acked"
+                                    && lane
+                                        .original_manual_ack_exists_for_grant(&grant.grant_id)
+                                        .map_err(io::Error::other)?
+                                {
+                                    Some(
+                                        lane.read_original_receipt(
+                                            &grant.grant_id,
+                                            &recipient,
+                                            peer.uid,
+                                        )
+                                        .map_err(io::Error::other)?
+                                        .ok_or_else(
+                                            || io::Error::other("ACK original receipt absent"),
+                                        )?,
+                                    )
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+                            serde_json::json!({ "kind": "readback", "grant": grant,
+                                "receipt":receipt })
                         }
                         FreshRecipientRequest::Recover {
                             delivery_request_id,
@@ -10486,7 +10551,28 @@ fn serve_fresh_v30_at(
                                     &recipient,
                                 )
                                 .map_err(io::Error::other)?;
-                            fresh_payload_reply("recovered_delivery", recovered)?
+                            let receipt_path = lane
+                                .original_receipt_path(&recovered.readback.grant_id, peer.uid)
+                                .map_err(io::Error::other)?;
+                            fresh_payload_reply(
+                                "recovered_delivery",
+                                recovered,
+                                &receipt_path,
+                                &recipient,
+                                peer.uid,
+                            )?
+                        }
+                        FreshRecipientRequest::CertifyOriginalReceipt { grant_id } => {
+                            let receipt = lane
+                                .certify_original_receipt(&grant_id, &recipient, peer.uid)
+                                .map_err(io::Error::other)?;
+                            serde_json::json!({"kind":"original_receipt","receipt":receipt})
+                        }
+                        FreshRecipientRequest::ReadOriginalReceipt { grant_id } => {
+                            let receipt = lane
+                                .read_original_receipt(&grant_id, &recipient, peer.uid)
+                                .map_err(io::Error::other)?;
+                            serde_json::json!({"kind":"original_receipt_readback","receipt":receipt})
                         }
                         FreshRecipientRequest::PrepareNativeF { preparation } => {
                             if instance.is_closed() {
@@ -10689,9 +10775,14 @@ fn serve_fresh_v30_at(
                                     &grant_id,
                                     &delivery_token,
                                     &recipient,
+                                    peer.uid,
                                 )
                                 .map_err(io::Error::other)?;
-                            serde_json::json!({ "kind": "ack", "grant": grant })
+                            let receipt = lane
+                                .read_original_receipt(&grant_id, &recipient, peer.uid)
+                                .map_err(io::Error::other)?
+                                .ok_or_else(|| io::Error::other("ACK original receipt absent"))?;
+                            serde_json::json!({ "kind": "ack", "grant": grant, "receipt":receipt })
                         }
                         FreshRecipientRequest::Delegate {
                             grant_ids,

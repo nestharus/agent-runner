@@ -71,13 +71,14 @@ pub use fresh_lane::{
     FreshNativeFObservedTurn, FreshNativeFPreparation, FreshNativeFPrepareRequest,
     FreshNativeFReceipt, FreshNativeFSubmission, FreshNativeFTransport, FreshNormalExecutablePlan,
     FreshNormalModelSelection, FreshNormalModelSource, FreshNormalProviderAdmission,
-    FreshNormalProviderK, FreshNormalWorkPreparation, FreshPhysicalTerminal,
-    FreshRecipientIdentity, FreshReleasedHandoff, FreshRootCallerResult, FreshRootEffect,
-    FreshRootEffectState, FreshRootHConsumption, FreshRootHDelegation, FreshRootHSelectedK,
-    FreshRootTerminalExecution, FreshRootTerminalReadback, FreshRootWorkIntent,
-    FreshSuccessorAdmission, FreshSuccessorDelivery, FreshSuccessorDeliveryReadback,
-    FreshSuccessorOffer, FreshSuccessorReceiverReceipt, FreshSuccessorTerminalAck, FreshV30Lane,
-    FreshV30LaneIdentity, FreshV30Session, normal_root_arguments,
+    FreshNormalProviderK, FreshNormalWorkPreparation, FreshOriginalReceiptIdentity,
+    FreshOriginalReceiverReceipt, FreshPhysicalTerminal, FreshRecipientIdentity,
+    FreshReleasedHandoff, FreshRootCallerResult, FreshRootEffect, FreshRootEffectState,
+    FreshRootHConsumption, FreshRootHDelegation, FreshRootHSelectedK, FreshRootTerminalExecution,
+    FreshRootTerminalReadback, FreshRootWorkIntent, FreshSuccessorAdmission,
+    FreshSuccessorDelivery, FreshSuccessorDeliveryReadback, FreshSuccessorOffer,
+    FreshSuccessorReceiverReceipt, FreshSuccessorTerminalAck, FreshV30Lane, FreshV30LaneIdentity,
+    FreshV30Session, normal_root_arguments,
 };
 pub use native_publication::NativePublication;
 #[path = "mailbox/schema.rs"]

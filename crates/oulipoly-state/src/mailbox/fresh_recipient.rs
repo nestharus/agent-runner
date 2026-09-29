@@ -189,6 +189,7 @@ impl FreshV30Lane {
         delivery_request_id: &str,
         session: &FreshV30Session,
         recipient: &FreshRecipientIdentity,
+        uid: u32,
     ) -> Result<FreshDeliverySubmission, String> {
         validate_request_id(delivery_request_id)?;
         if self
@@ -255,6 +256,7 @@ impl FreshV30Lane {
         let identity_json = Self::recipient_identity_json(recipient)?;
         let grant_id = Uuid::new_v4().to_string();
         let delivery_token = Uuid::new_v4().to_string();
+        self.ensure_original_receipt_directory(uid)?;
         let now = Utc::now().to_rfc3339();
         let tx = self
             .sidecar
@@ -303,6 +305,13 @@ impl FreshV30Lane {
             .map_err(|e| format!("fresh delivery grant refused: {e}"))?;
         if changed != 1 {
             return Err("fresh recipient row changed before grant".into());
+        }
+        if tx.execute(
+            "INSERT INTO fresh_original_grant_uid(grant_id,recipient_identity,recipient_uid)
+             VALUES(?1,?2,?3)",
+            params![grant_id,identity_json,uid],
+        ).map_err(|e| e.to_string())? != 1 {
+            return Err("fresh original F UID binding absent".into());
         }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(FreshDeliverySubmission {
@@ -455,12 +464,15 @@ impl FreshV30Lane {
         grant_id: &str,
         token: &str,
         recipient: &FreshRecipientIdentity,
+        uid: u32,
     ) -> Result<FreshDeliveryReadback, String> {
         validate_request_id(grant_id)?;
         validate_request_id(token)?;
         let identity_json = Self::recipient_identity_json(recipient)?;
         let grant = self.read_recipient_delivery(grant_id, recipient)?
             .ok_or("fresh delivery grant or recipient absent")?;
+        let receipt = self.read_original_receipt(grant_id,recipient,uid)?
+            .ok_or("original receiver receipt not certified")?;
         let payload = self.lookup_payload(&grant.lane_id, &grant.session_id, grant.seq)?;
         if grant.lane_id != self.identity.lane_id
             || i64::try_from(payload.len()).ok() != Some(grant.payload_byte_len)
@@ -515,6 +527,8 @@ impl FreshV30Lane {
                     g.source_id,g.attempt_id,g.recipient_identity,g.payload_sha256,
                     g.payload_byte_len,'manual_ack',NULL,?5
              FROM fresh_recipient_grant g
+             JOIN fresh_original_receipt c ON c.grant_id=g.grant_id
+             JOIN fresh_original_grant_uid u ON u.grant_id=g.grant_id
              JOIN mailbox m ON m.session_id=g.session_id AND m.seq=g.seq
              JOIN fresh_recipient_row_source r ON r.session_id=g.session_id AND r.seq=g.seq
              WHERE g.grant_id=?1 AND g.delivery_token=?2 AND g.recipient_identity=?3
@@ -522,10 +536,45 @@ impl FreshV30Lane {
                AND m.delivered_at=?5 AND m.delivered_by_invocation_uuid=?1
                AND m.payload_sha256=g.payload_sha256 AND m.payload_byte_len=g.payload_byte_len
                AND r.source_id=g.source_id AND r.attempt_id=g.attempt_id
-               AND r.payload_sha256=g.payload_sha256 AND r.payload_byte_len=g.payload_byte_len",
-            params![grant_id,token,identity_json,token_sha,now],
+               AND r.payload_sha256=g.payload_sha256 AND r.payload_byte_len=g.payload_byte_len
+               AND c.delivery_request_id=g.delivery_request_id
+               AND c.session_id=g.session_id AND c.seq=g.seq
+               AND c.source_id=g.source_id AND c.attempt_id=g.attempt_id
+               AND c.recipient_identity=g.recipient_identity
+               AND c.recipient_identity=u.recipient_identity
+               AND c.recipient_uid=u.recipient_uid AND c.recipient_uid=?6
+               AND c.payload_sha256=g.payload_sha256 AND c.payload_byte_len=g.payload_byte_len
+               AND c.delivery_token_sha256=?4 AND c.receipt_sha256=?7
+               AND c.receipt_device=?8 AND c.receipt_inode=?9",
+            params![grant_id,token,identity_json,token_sha,now,uid,
+                receipt.receipt_sha256,receipt.receipt_device,receipt.receipt_inode],
         ).map_err(|e| e.to_string())?;
         if evidence != 1 { return Err("fresh ACK lacks exact row/source/grant/token".into()); }
+        let locked = tx.execute(
+            "INSERT INTO fresh_original_ack_receipt
+             (grant_id,delivery_request_id,recipient_uid,receipt_sha256,
+              receipt_device,receipt_inode,acknowledged_at)
+             SELECT c.grant_id,c.delivery_request_id,c.recipient_uid,c.receipt_sha256,
+                    c.receipt_device,c.receipt_inode,e.acknowledged_at
+             FROM fresh_original_receipt c JOIN fresh_recipient_ack_evidence e
+               ON e.grant_id=c.grant_id
+             WHERE c.grant_id=?1 AND e.basis='manual_ack'
+               AND e.delivery_request_id=c.delivery_request_id
+               AND e.session_id=c.session_id AND e.seq=c.seq
+               AND e.source_id=c.source_id AND e.attempt_id=c.attempt_id
+               AND e.recipient_identity=c.recipient_identity
+               AND e.payload_sha256=c.payload_sha256
+               AND e.payload_byte_len=c.payload_byte_len
+               AND e.delivery_token_sha256=?2 AND c.delivery_token_sha256=?2
+               AND c.receipt_sha256=?3 AND c.receipt_device=?4
+               AND c.receipt_inode=?5 AND c.recipient_uid=?6
+               AND e.acknowledged_at=?7",
+            params![grant_id,token_sha,receipt.receipt_sha256,receipt.receipt_device,
+                receipt.receipt_inode,uid,now],
+        ).map_err(|e| e.to_string())?;
+        if locked != 1 {
+            return Err("fresh ACK did not lock certified receiver identity".into());
+        }
         tx.commit().map_err(|e| e.to_string())?;
         self.read_recipient_delivery(grant_id, recipient)?
             .ok_or("ACK readback absent".into())

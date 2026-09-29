@@ -12,6 +12,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Component;
 
 include!("fresh_recipient.rs");
+include!("fresh_original_receipt.rs");
 include!("fresh_successor.rs");
 include!("fresh_native_f.rs");
 include!("fresh_headless_native_f.rs");
@@ -51,6 +52,8 @@ const FRESH_NORMAL_PROVIDER_K_SCHEMA: &str =
     include_str!("migrations/0050_fresh_normal_provider_k.sql");
 const FRESH_RECIPIENT_SCHEMA: &str = include_str!("migrations/0030_fresh_recipient.sql");
 const FRESH_RECIPIENT_ACK_SCHEMA: &str = include_str!("migrations/0039_fresh_recipient_ack.sql");
+const FRESH_ORIGINAL_RECEIPT_SCHEMA: &str =
+    include_str!("migrations/0053_fresh_original_receipt.sql");
 const FRESH_NATIVE_F_PREPARATION_SCHEMA: &str =
     include_str!("migrations/0041_fresh_native_f_preparation.sql");
 const FRESH_NATIVE_F_SUBMISSION_SCHEMA: &str =
@@ -861,7 +864,7 @@ impl FreshV30Lane {
             .mailbox()
             .conn
             .execute_batch(&format!(
-                "{FRESH_SCHEMA}\n{FRESH_RECIPIENT_SCHEMA}\n{FRESH_RECIPIENT_ACK_SCHEMA}\n{FRESH_NATIVE_F_PREPARATION_SCHEMA}\n{FRESH_NATIVE_F_SUBMISSION_SCHEMA}\n{FRESH_SUCCESSOR_SIDECAR_SCHEMA}\n{FRESH_SUCCESSOR_DELIVERY_SCHEMA}"
+                "{FRESH_SCHEMA}\n{FRESH_RECIPIENT_SCHEMA}\n{FRESH_RECIPIENT_ACK_SCHEMA}\n{FRESH_ORIGINAL_RECEIPT_SCHEMA}\n{FRESH_NATIVE_F_PREPARATION_SCHEMA}\n{FRESH_NATIVE_F_SUBMISSION_SCHEMA}\n{FRESH_SUCCESSOR_SIDECAR_SCHEMA}\n{FRESH_SUCCESSOR_DELIVERY_SCHEMA}"
             ))
             .map_err(|e| e.to_string())?;
         sidecar
@@ -1139,6 +1142,61 @@ impl FreshV30Lane {
                 "fresh_recipient_ack_evidence_no_delete",
             ],
         )?;
+        let original_receipt_objects: i64 = sidecar
+            .mailbox()
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name IN
+             ('fresh_original_grant_uid','fresh_original_grant_uid_no_update',
+              'fresh_original_grant_uid_no_delete','fresh_original_receipt',
+              'fresh_original_receipt_no_update','fresh_original_receipt_no_delete',
+              'fresh_original_ack_receipt','fresh_original_ack_receipt_no_update',
+              'fresh_original_ack_receipt_no_delete')",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        match original_receipt_objects {
+            0 => sidecar
+                .mailbox()
+                .conn
+                .execute_batch(&format!(
+                    "BEGIN IMMEDIATE;\n{FRESH_ORIGINAL_RECEIPT_SCHEMA}\nCOMMIT;"
+                ))
+                .map_err(|e| e.to_string())?,
+            9 => {}
+            _ => return Err("fresh original receipt schema incomplete".into()),
+        }
+        for (table, triggers) in [
+            (
+                "fresh_original_grant_uid",
+                &[
+                    "fresh_original_grant_uid_no_update",
+                    "fresh_original_grant_uid_no_delete",
+                ][..],
+            ),
+            (
+                "fresh_original_receipt",
+                &[
+                    "fresh_original_receipt_no_update",
+                    "fresh_original_receipt_no_delete",
+                ][..],
+            ),
+            (
+                "fresh_original_ack_receipt",
+                &[
+                    "fresh_original_ack_receipt_no_update",
+                    "fresh_original_ack_receipt_no_delete",
+                ][..],
+            ),
+        ] {
+            verify_fresh_sql_objects(
+                &sidecar.mailbox().conn,
+                FRESH_ORIGINAL_RECEIPT_SCHEMA,
+                table,
+                triggers,
+            )?;
+        }
         let preparation_schema_count: i64 = sidecar
             .mailbox()
             .conn

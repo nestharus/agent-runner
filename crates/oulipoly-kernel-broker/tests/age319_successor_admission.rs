@@ -744,7 +744,7 @@ fn run_successor_fixture(fack: bool) {
         "partial State admission cannot masquerade as complete readback"
     );
     assert!(
-        lane.submit_recipient_delivery(&uuid::Uuid::new_v4().to_string(), &session, &original)
+        lane.submit_recipient_delivery(&uuid::Uuid::new_v4().to_string(), &session, &original, 0)
             .is_err(),
         "State-only admission must fence original F"
     );
@@ -774,12 +774,12 @@ fn run_successor_fixture(fack: bool) {
         admission
     );
     assert!(
-        lane.submit_recipient_delivery(&uuid::Uuid::new_v4().to_string(), &session, &original)
+        lane.submit_recipient_delivery(&uuid::Uuid::new_v4().to_string(), &session, &original, 0)
             .is_err(),
         "original F must be fenced by State admission"
     );
     assert!(
-        lane.submit_recipient_delivery(&uuid::Uuid::new_v4().to_string(), &session, &successor)
+        lane.submit_recipient_delivery(&uuid::Uuid::new_v4().to_string(), &session, &successor, 0)
             .is_err(),
         "successor F awaits explicit F/ACK join"
     );
