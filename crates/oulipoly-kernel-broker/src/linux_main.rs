@@ -7314,13 +7314,22 @@ fn fresh_bash_parent(
         .read_session(&root.d_key)
         .map_err(io::Error::other)?
         .ok_or_else(|| io::Error::other("released root D absent"))?;
-    let parent = fresh_provider::parent_for_bash(
-        &state_root.join("v30/fresh-provider"),
-        &root,
-        &root_session.session_id,
-        &peer.process,
-        &root_init,
-    )?;
+    let parent = if lane
+        .normal_provider_k_recorded(&root.handoff_id)
+        .map_err(io::Error::other)?
+    {
+        let (admission_id, init) =
+            normal_physical::parent_for_bash(lane, &root, &actor, &root_session, state_root)?;
+        fresh_provider::parent_from_normal(admission_id, init, &peer.process, &root_init)?
+    } else {
+        fresh_provider::parent_for_bash(
+            &state_root.join("v30/fresh-provider"),
+            &root,
+            &root_session.session_id,
+            &peer.process,
+            &root_init,
+        )?
+    };
     peer.process.verify()?;
     Ok((root, actor, parent))
 }

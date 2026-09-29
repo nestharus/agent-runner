@@ -225,7 +225,7 @@ impl FreshV30Lane {
             .ok_or("fresh Bash D absent")?;
         self.require_session(&session)?;
         child.session = session.clone();
-        let (root, _) = self.released_handoff_for_root(&child.root_id)?;
+        let (root, root_actor) = self.released_handoff_for_root(&child.root_id)?;
         let digest = bash_source_registration_digest(&child)?;
         let registration: (String,String,String,String,String) = self.state_connection(OpenFlags::SQLITE_OPEN_READ_ONLY)?
             .query_row(
@@ -331,15 +331,70 @@ impl FreshV30Lane {
             &directory,
             &format!("{}.pid1-wait.json", event.physical_grant_id),
         )?;
-        let (parent_grant, interactive_parent) = physical_parent_for_bash(&directory, &child)?;
-        let parent_consumed = physical_json(
-            &directory,
-            &format!("{}.consumed.json", child.parent_work_grant_id),
-        )?;
-        let parent_attach = physical_json(
-            &directory,
-            &format!("{}.attach.json", child.parent_work_grant_id),
-        )?;
+        let root_session = self.read_session(&root.d_key)?.ok_or("root D absent at W")?;
+        let normal_k = if self.normal_provider_k_recorded(&root.handoff_id)? {
+            Some(self.read_normal_provider_k(&root, &root_actor, &root_session)?
+                .ok_or("normal causal parent K disappeared at W")?)
+        } else {
+            None
+        };
+        let (parent_grant, interactive_parent, parent_consumed, parent_attach) =
+            if let Some(k) = normal_k {
+                if physical_entry_exists(&directory, &format!("{}.fresh-grant.json", root.handoff_id))?
+                    || physical_entry_exists(&directory, &format!("{}.interactive-k.json", root.handoff_id))?
+                {
+                    return Err("ambiguous causal parent K".into());
+                }
+                let normal_directory = directory.parent().ok_or("normal parent lane absent")?
+                    .join("normal-provider").join(&k.admission_id);
+                let parent = physical_json(&normal_directory, "bash-parent.json")?;
+                if parent["handoff_id"] != root.handoff_id
+                    || parent["admission_id"] != k.admission_id
+                    || parent["plan_sha256"] != k.plan_sha256
+                    || parent["root_id"] != root.old_release.prepared.root_id
+                    || parent["pid1_host_pid"].as_i64().is_none_or(|pid| pid <= 0)
+                    || parent["pid1_starttime_ticks"].as_u64().is_none_or(|ticks| ticks == 0)
+                    || parent["pidns_ino"].as_u64().is_none_or(|ino| ino == 0)
+                {
+                    return Err("normal causal parent K or PID1 changed at W".into());
+                }
+                let binding = &root.old_release.prepared.joined_child;
+                // Normal K is the immutable State consumption. Normalize its
+                // readback with PID1's retained receipt for the common child
+                // K/Q checks below; there is no second fresh-provider root K.
+                let grant = serde_json::json!({
+                    "id": k.admission_id,
+                    "binding": {
+                        "root_id": root.old_release.prepared.root_id,
+                        "handoff_id": root.handoff_id,
+                        "invocation_uuid": root.invocation_uuid,
+                        "session_id": root_session.session_id,
+                        "actor_pid": binding.host_pid,
+                        "actor_starttime": binding.starttime_ticks,
+                        "actor_boot_id": binding.boot_id,
+                    }
+                });
+                let attach = serde_json::json!({
+                    "grant_id": k.admission_id,
+                    "work_id": k.admission_id,
+                    "pid1": parent["pid1_host_pid"],
+                    "pid1_starttime": parent["pid1_starttime_ticks"],
+                    "pidns_dev": parent["pidns_dev"],
+                    "pidns_ino": parent["pidns_ino"],
+                });
+                (grant.clone(), false, grant, attach)
+            } else {
+                let (grant, interactive) = physical_parent_for_bash(&directory, &child)?;
+                let consumed = physical_json(
+                    &directory,
+                    &format!("{}.consumed.json", child.parent_work_grant_id),
+                )?;
+                let attach = physical_json(
+                    &directory,
+                    &format!("{}.attach.json", child.parent_work_grant_id),
+                )?;
+                (grant, interactive, consumed, attach)
+            };
         if interactive_parent {
             let identity = physical_json(
                 &directory,
@@ -409,6 +464,10 @@ impl FreshV30Lane {
             || b["root_pidns_ino"] != root.old_release.prepared.root_init.pidns_ino
             || b["causal_parent"]["grant_id"] != child.parent_work_grant_id
             || b["causal_parent"]["work_id"] != child.parent_work_id
+            || b["causal_parent"]["init_pid"] != parent_attach["pid1"]
+            || b["causal_parent"]["init_starttime"] != parent_attach["pid1_starttime"]
+            || b["causal_parent"]["pidns_dev"] != parent_attach["pidns_dev"]
+            || b["causal_parent"]["pidns_ino"] != parent_attach["pidns_ino"]
             || attach["version"] != 1
             || attach["grant_id"] != *q
             || attach["work_id"] != *w

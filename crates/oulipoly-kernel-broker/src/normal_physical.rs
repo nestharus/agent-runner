@@ -2,7 +2,7 @@
 //! State K precedes the detached supervisor. Only that supervisor can produce
 //! a Q; missing or damaged evidence is unknown and never permits a retry.
 
-use crate::identity::{PinnedProcess, install_detached_host_proc};
+use crate::identity::{PinnedProcess, host_proc_file, install_detached_host_proc};
 use crate::normal_model_selection;
 use crate::normal_plan_custody;
 use oulipoly_runtime::executor::cli::fresh_remote::FreshProviderPlan;
@@ -28,6 +28,7 @@ const HASH_BUFFER: usize = 64 * 1024;
 #[serde(deny_unknown_fields)]
 struct SupervisorRecipe {
     k: FreshNormalProviderK,
+    root_id: String,
     plan: FreshNormalExecutablePlan,
     root: FreshRecipientIdentity,
     actor: FreshRecipientIdentity,
@@ -69,6 +70,69 @@ struct ParentWait {
     admission_id: String,
     pid1_parent_namespace_pid: i32,
     pid1_wait_status: i32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BashParent {
+    handoff_id: String,
+    admission_id: String,
+    plan_sha256: String,
+    root_id: String,
+    pid1_host_pid: i32,
+    pid1_starttime_ticks: u64,
+    pidns_dev: u64,
+    pidns_ino: u64,
+}
+
+fn own_host_pid_and_starttime() -> io::Result<(i32, u64)> {
+    let mut stat = String::new();
+    host_proc_file("self/stat")?.read_to_string(&mut stat)?;
+    let (pid, remaining) = stat
+        .split_once(" (")
+        .ok_or_else(|| io::Error::other("normal provider PID1 host stat invalid"))?;
+    let fields = remaining
+        .rsplit_once(") ")
+        .ok_or_else(|| io::Error::other("normal provider PID1 host stat invalid"))?
+        .1;
+    let host_pid = pid.parse().map_err(io::Error::other)?;
+    let starttime = fields
+        .split_ascii_whitespace()
+        .nth(19)
+        .ok_or_else(|| io::Error::other("normal provider PID1 host starttime absent"))?
+        .parse()
+        .map_err(io::Error::other)?;
+    Ok((host_pid, starttime))
+}
+
+pub fn parent_for_bash(
+    lane: &FreshV30Lane,
+    release: &FreshReleasedHandoff,
+    actor: &FreshRecipientIdentity,
+    session: &FreshV30Session,
+    state_root: &Path,
+) -> io::Result<(String, PinnedProcess)> {
+    let k = lane
+        .read_normal_provider_k(release, actor, session)
+        .map_err(io::Error::other)?
+        .ok_or_else(|| io::Error::other("normal Bash parent K absent"))?;
+    let directory = id_path(&store_root(state_root)?, &k.admission_id)?;
+    let parent: BashParent = read_optional(&directory, "bash-parent.json")?
+        .ok_or_else(|| io::Error::other("normal Bash parent attach absent"))?;
+    if parent.handoff_id != release.handoff_id
+        || parent.admission_id != k.admission_id
+        || parent.plan_sha256 != k.plan_sha256
+        || parent.root_id != release.old_release.prepared.root_id
+    {
+        return Err(io::Error::other("normal Bash parent K binding changed"));
+    }
+    let init = PinnedProcess::open(parent.pid1_host_pid)?;
+    if init.starttime_ticks != parent.pid1_starttime_ticks
+        || (init.pidns_dev, init.pidns_ino) != (parent.pidns_dev, parent.pidns_ino)
+    {
+        return Err(io::Error::other("normal Bash parent PID1 changed"));
+    }
+    Ok((k.admission_id, init))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -315,6 +379,7 @@ pub fn launch(
     };
     let recipe = SupervisorRecipe {
         k: proposed_k,
+        root_id: receipt.old_release.prepared.root_id.clone(),
         plan: plan.clone(),
         root: stamp(&root),
         actor: actor_identity.clone(),
@@ -640,6 +705,26 @@ fn pid1_run(
     if unsafe { libc::getpid() } != 1 {
         return Err(io::Error::other("normal provider worker is not PID1"));
     }
+    let (pid1_host_pid, pid1_starttime_ticks) = own_host_pid_and_starttime()?;
+    let namespace = host_proc_file("self/ns/pid")?;
+    let namespace_meta = namespace.metadata()?;
+    // The serving Broker verifies this PID1's namespace parent against the
+    // exact released root on every challenged Bash request. PID1 itself has
+    // no host-namespace ioctl authority after entering the child namespace.
+    write_new(
+        directory,
+        "bash-parent.json",
+        &BashParent {
+            handoff_id: recipe.k.handoff_id.clone(),
+            admission_id: recipe.k.admission_id.clone(),
+            plan_sha256: recipe.k.plan_sha256.clone(),
+            root_id: recipe.root_id.clone(),
+            pid1_host_pid,
+            pid1_starttime_ticks,
+            pidns_dev: namespace_meta.dev(),
+            pidns_ino: namespace_meta.ino(),
+        },
+    )?;
     let mut stdout = OpenOptions::new()
         .create_new(true)
         .read(true)
