@@ -724,6 +724,22 @@ fn run_successor_fixture(fack: bool) {
     .unwrap();
     assert!(lane.admit_successor(&request, &original).is_err());
     assert!(
+        lane.read_successor_terminal_ack(
+            &request,
+            &original,
+            &session,
+            seq,
+            &source,
+            &attempt,
+            &root,
+            &owner,
+            &sha,
+            payload.len() as i64,
+        )
+        .is_err(),
+        "State-only admission settled terminal"
+    );
+    assert!(
         lane.read_successor_admission(&request, &original).is_err(),
         "partial State admission cannot masquerade as complete readback"
     );
@@ -735,6 +751,23 @@ fn run_successor_fixture(fack: bool) {
     side.execute_batch("DROP TRIGGER fixture_fail_successor_sidecar")
         .unwrap();
     let admission = lane.admit_successor(&request, &original).unwrap();
+    assert!(
+        lane.read_successor_terminal_ack(
+            &request,
+            &original,
+            &session,
+            seq,
+            &source,
+            &attempt,
+            &root,
+            &owner,
+            &sha,
+            payload.len() as i64,
+        )
+        .unwrap()
+        .is_none(),
+        "admission settled terminal before F/ACK"
+    );
     assert_eq!(admission.offer.generation, offer["generation"]);
     assert_eq!(
         lane.admit_successor(&request, &original).unwrap(),
@@ -783,6 +816,25 @@ fn run_successor_fixture(fack: bool) {
         }
         let f: serde_json::Value =
             serde_json::from_slice(&fs::read(peer_dir.join("f.json")).unwrap()).unwrap();
+        assert!(
+            FreshV30Lane::open_at(&broker_root)
+                .unwrap()
+                .read_successor_terminal_ack(
+                    &request,
+                    &original,
+                    &session,
+                    seq,
+                    &source,
+                    &attempt,
+                    &root,
+                    &owner,
+                    &sha,
+                    payload.len() as i64,
+                )
+                .unwrap()
+                .is_none(),
+            "F submission settled terminal without ACK"
+        );
         let delivery_request_id = f["delivery_request_id"].as_str().unwrap();
         let token = f["delivery_token"].as_str().unwrap();
         assert!(
@@ -907,6 +959,85 @@ fn run_successor_fixture(fack: bool) {
         assert_eq!(attempts, 1);
         assert_eq!(receipt_sha, ack_sha);
         assert_eq!(receipt_sha, fack["receipt_sha256"]);
+        let terminal_ack = FreshV30Lane::open_at(&broker_root)
+            .unwrap()
+            .read_successor_terminal_ack(
+                &request,
+                &original,
+                &session,
+                seq,
+                &source,
+                &attempt,
+                &root,
+                &owner,
+                &sha,
+                payload.len() as i64,
+            )
+            .unwrap()
+            .expect("cross-store successor terminal ACK absent");
+        assert_eq!(terminal_ack.generation, offer["generation"]);
+        assert_eq!(terminal_ack.grant_id, f["delivery"]["grant"]["grant_id"]);
+        assert_eq!(terminal_ack.receipt_sha256, receipt_sha);
+        assert_eq!(terminal_ack.recipient_uid, 1001);
+        let terminal_lane = FreshV30Lane::open_at(&broker_root).unwrap();
+        let trigger_sql: String = side
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger'
+             AND name='fresh_successor_ack_no_update'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        side.execute_batch("DROP TRIGGER fresh_successor_ack_no_update")
+            .unwrap();
+        side.execute(
+            "UPDATE fresh_successor_ack_evidence SET source_id='tampered-source'
+             WHERE grant_id=?1",
+            [terminal_ack.grant_id.as_str()],
+        )
+        .unwrap();
+        assert!(
+            terminal_lane
+                .read_successor_terminal_ack(
+                    &request,
+                    &original,
+                    &session,
+                    seq,
+                    &source,
+                    &attempt,
+                    &root,
+                    &owner,
+                    &sha,
+                    payload.len() as i64,
+                )
+                .is_err(),
+            "mismatched immutable ACK settled terminal"
+        );
+        side.execute(
+            "UPDATE fresh_successor_ack_evidence SET source_id=?2 WHERE grant_id=?1",
+            params![terminal_ack.grant_id, source],
+        )
+        .unwrap();
+        side.execute_batch(&trigger_sql).unwrap();
+        drop(terminal_lane);
+        assert!(
+            FreshV30Lane::open_at(&broker_root)
+                .unwrap()
+                .read_successor_terminal_ack(
+                    &request,
+                    &original,
+                    &session,
+                    seq,
+                    "wrong-source",
+                    &attempt,
+                    &root,
+                    &owner,
+                    &sha,
+                    payload.len() as i64,
+                )
+                .is_err(),
+            "mismatched source joined terminal ACK"
+        );
         assert_eq!(
             fs::symlink_metadata(&receipt_path)
                 .unwrap()
@@ -940,6 +1071,44 @@ fn run_successor_fixture(fack: bool) {
         let restart: serde_json::Value =
             serde_json::from_slice(&fs::read(peer_dir.join("restart-ack.json")).unwrap()).unwrap();
         assert_eq!(restart["ack"], fack["ack"]);
+        assert_eq!(
+            FreshV30Lane::open_at(&broker_root)
+                .unwrap()
+                .read_successor_terminal_ack(
+                    &request,
+                    &original,
+                    &session,
+                    seq,
+                    &source,
+                    &attempt,
+                    &root,
+                    &owner,
+                    &sha,
+                    payload.len() as i64,
+                )
+                .unwrap(),
+            Some(terminal_ack)
+        );
+        fs::set_permissions(&receipt_path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            FreshV30Lane::open_at(&broker_root)
+                .unwrap()
+                .read_successor_terminal_ack(
+                    &request,
+                    &original,
+                    &session,
+                    seq,
+                    &source,
+                    &attempt,
+                    &root,
+                    &owner,
+                    &sha,
+                    payload.len() as i64,
+                )
+                .is_err(),
+            "changed receiver receipt retained terminal ACK"
+        );
+        fs::set_permissions(&receipt_path, fs::Permissions::from_mode(0o400)).unwrap();
         assert!(peer.wait().unwrap().success());
         broker.kill().unwrap();
         broker.wait().unwrap();

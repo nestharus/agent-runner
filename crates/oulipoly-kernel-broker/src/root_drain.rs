@@ -10,7 +10,8 @@ use crate::source_physical::SourcePhysicalRegistry;
 use crate::work_registry::{LiveWork, WorkRecord, WorkRegistry};
 use oulipoly_state::mailbox::{
     BrokerClosedOwner, BrokerOwnerCloseInventory, BrokerSidecar, BrokerSourceEffectObligations,
-    FreshRootEffect, FreshRootEffectState, FreshRootWorkIntent, FreshV30Lane, PreparedProcessStamp,
+    FreshRootEffect, FreshRootEffectState, FreshRootWorkIntent, FreshSuccessorTerminalAck,
+    FreshV30Lane, PreparedProcessStamp,
 };
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -38,9 +39,41 @@ pub struct RootPhysicalCloseProof {
     pub source_physical_retired: usize,
     pub source_effect: BrokerSourceEffectObligations,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub successor_ack: Option<FreshSuccessorTerminalAck>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub normal: Option<NormalRootEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offline: Option<OfflineRootEvidence>,
+}
+
+pub fn exact_successor_ack_for_root(
+    lane: &FreshV30Lane,
+    root_id: &str,
+) -> io::Result<Option<FreshSuccessorTerminalAck>> {
+    if !lane
+        .successor_admission_exists_for_root(root_id)
+        .map_err(io::Error::other)?
+    {
+        return Ok(None);
+    }
+    let (released, actor) = lane
+        .released_handoff_for_root(root_id)
+        .map_err(io::Error::other)?;
+    let session = lane
+        .read_session(&released.d_key)
+        .map_err(io::Error::other)?
+        .ok_or_else(|| io::Error::other("successor original D session absent"))?;
+    let terminal = lane
+        .read_private_root_terminal(&released, &actor, &session)
+        .map_err(io::Error::other)?;
+    if terminal.notification_origin != "admitted_successor"
+        || terminal.notification_state != "acked"
+        || terminal.ack_basis.as_deref() != Some("successor_receiver_receipt_ack")
+        || terminal.successor_ack.is_none()
+    {
+        return Err(io::Error::other("successor terminal ACK remains unknown"));
+    }
+    Ok(terminal.successor_ack)
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -121,6 +154,7 @@ pub fn physical_close_proof(inventory: &RootDrainInventory) -> io::Result<RootPh
                 || inventory.source_physical_records != 0))
         || inventory.normal_uncertain
         || inventory.offline_uncertain
+        || inventory.successor_ack_unknown
         || inventory.normal.as_ref().is_some_and(|normal| {
             normal.physical.state != "drained"
                 || normal.physical.q.is_none()
@@ -143,6 +177,7 @@ pub fn physical_close_proof(inventory: &RootDrainInventory) -> io::Result<RootPh
         source_physical_records: inventory.source_physical_records,
         source_physical_retired: inventory.source_physical_retired,
         source_effect: source_effect.clone(),
+        successor_ack: inventory.successor_ack.clone(),
         normal: inventory.normal.clone(),
         offline: inventory.offline.clone(),
     })
@@ -196,6 +231,9 @@ pub struct RootDrainInventory {
     /// exact owner/incarnation could not be read, including an absent sidecar.
     pub source_effect: Option<BrokerSourceEffectObligations>,
     pub source_effect_readback_uncertain: bool,
+    pub successor_ack_unknown: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub successor_ack: Option<FreshSuccessorTerminalAck>,
     pub normal: Option<NormalRootEvidence>,
     pub normal_uncertain: bool,
     /// The released U intent selects the no-effect route even before its
@@ -332,6 +370,11 @@ pub fn readback(
         .filter(|work| work.root_id == expected.root_id)
         .collect();
     let lane = FreshV30Lane::open_at(works.broker_root()?).ok();
+    let successor_ack_read = lane.as_ref().map_or(Ok(None), |lane| {
+        exact_successor_ack_for_root(lane, &expected.root_id)
+    });
+    let successor_ack_unknown = successor_ack_read.is_err();
+    let successor_ack = successor_ack_read.ok().flatten();
     let terminal_dir = works.broker_root()?.join("terminals");
     let mut work_retired = 0;
     let mut work_outstanding = 0;
@@ -697,6 +740,8 @@ pub fn readback(
         source_physical_outstanding,
         source_effect,
         source_effect_readback_uncertain,
+        successor_ack_unknown,
+        successor_ack,
         normal,
         normal_uncertain,
         offline_intent,
@@ -808,6 +853,7 @@ pub fn ready_for_owner_close_preflight(
         || inventory.source_physical_retired != inventory.source_physical_records
         || inventory.source_physical_outstanding != 0
         || inventory.source_effect_readback_uncertain
+        || inventory.successor_ack_unknown
         || inventory.normal_uncertain
         || inventory.offline_uncertain
         || inventory.uncertain_registry_or_incarnation
@@ -944,6 +990,8 @@ mod tests {
             source_physical_outstanding: 0,
             source_effect: Some(effect.clone()),
             source_effect_readback_uncertain: false,
+            successor_ack_unknown: false,
+            successor_ack: None,
             normal: None,
             normal_uncertain: false,
             offline_intent: false,
@@ -991,6 +1039,10 @@ mod tests {
         assert!(ready_for_owner_close_preflight(&settled, "root", "stale").is_err());
 
         let mut changed = settled.clone();
+        changed.successor_ack_unknown = true;
+        assert!(ready_for_owner_close_preflight(&changed, "root", "owner").is_err());
+        assert!(physical_close_proof(&changed).is_err());
+        changed = settled.clone();
         changed.pid1_parent_wait_proof = false;
         assert!(ready_for_owner_close_preflight(&changed, "root", "owner").is_err());
         changed = settled.clone();

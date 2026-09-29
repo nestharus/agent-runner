@@ -34,6 +34,29 @@ pub struct FreshSuccessorDeliveryReadback {
     pub receipt_sha256: Option<String>,
 }
 
+/// Exact settled delivery evidence for the original D-bound root. The UID is
+/// the one authenticated at successor F; the receipt digest names the file
+/// independently certified from that receiving process's bytes.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreshSuccessorTerminalAck {
+    pub offer_request_id: String,
+    pub generation: String,
+    pub delivery_request_id: String,
+    pub grant_id: String,
+    pub session_id: String,
+    pub seq: i64,
+    pub source_id: String,
+    pub attempt_id: String,
+    pub root_id: String,
+    pub owner_generation: String,
+    pub successor_identity: FreshRecipientIdentity,
+    pub recipient_uid: u32,
+    pub payload_sha256: String,
+    pub payload_byte_len: i64,
+    pub receipt_sha256: String,
+}
+
 pub struct FreshSuccessorDelivery {
     pub readback: FreshSuccessorDeliveryReadback,
     pub delivery_token: String,
@@ -62,6 +85,85 @@ pub struct FreshSuccessorReceiverReceipt {
 }
 
 impl FreshV30Lane {
+    pub fn successor_admission_exists_for_root(&self, root_id: &str) -> Result<bool, String> {
+        let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let committed: bool = state.query_row(
+            "SELECT EXISTS(SELECT 1 FROM fresh_lane_successor_admission WHERE root_id=?1)",
+            [root_id], |r| r.get(0),
+        ).map_err(|e| e.to_string())?;
+        let broker: bool = self.sidecar.mailbox().conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM fresh_successor_admission WHERE root_id=?1)",
+            [root_id], |r| r.get(0),
+        ).map_err(|e| e.to_string())?;
+        Ok(committed || broker)
+    }
+
+    pub fn read_successor_terminal_ack(
+        &self,
+        offer_request_id: &str,
+        original: &FreshRecipientIdentity,
+        session: &FreshV30Session,
+        seq: i64,
+        source_id: &str,
+        attempt_id: &str,
+        root_id: &str,
+        owner_generation: &str,
+        payload_sha256: &str,
+        payload_byte_len: i64,
+    ) -> Result<Option<FreshSuccessorTerminalAck>, String> {
+        let admission = self.read_successor_admission(offer_request_id, original)?
+            .ok_or("successor cross-store admission absent")?;
+        let offer = &admission.offer;
+        if offer.original_identity != *original
+            || offer.session_id != session.session_id
+            || offer.seq != seq
+            || offer.source_id != source_id
+            || offer.attempt_id != attempt_id
+            || offer.lane_id != self.identity.lane_id
+            || offer.source_generation != self.identity.source_generation
+            || offer.root_id != root_id
+            || offer.owner_generation != owner_generation
+            || offer.payload_sha256 != payload_sha256
+            || offer.payload_byte_len != payload_byte_len
+        {
+            return Err("successor terminal admission differs from original D/J/row".into());
+        }
+        let original_grant: bool = self.sidecar.mailbox().conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM fresh_recipient_grant WHERE session_id=?1 AND seq=?2)",
+            params![session.session_id, seq], |r| r.get(0),
+        ).map_err(|e| e.to_string())?;
+        if original_grant {
+            return Err("successor terminal conflicts with original F grant".into());
+        }
+        let grant: Option<(String, i64)> = self.sidecar.mailbox().conn.query_row(
+            "SELECT delivery_request_id,recipient_uid FROM fresh_successor_grant
+             WHERE generation=?1 AND offer_request_id=?2 AND session_id=?3 AND seq=?4",
+            params![offer.generation,offer.offer_request_id,session.session_id,seq],
+            |r| Ok((r.get(0)?,r.get(1)?)),
+        ).optional().map_err(|e| e.to_string())?;
+        let Some((delivery_request_id, uid)) = grant else { return Ok(None); };
+        let uid = u32::try_from(uid).map_err(|_| "successor F UID invalid")?;
+        let read = self.read_successor_delivery(
+            &delivery_request_id, &offer.successor_identity, uid)?
+            .ok_or("successor F exact readback absent")?;
+        if read.grant.phase != "acked" { return Ok(None); }
+        let ack = self.read_successor_ack(
+            &delivery_request_id, &offer.successor_identity, uid)?
+            .ok_or("successor immutable ACK absent")?;
+        let receipt_sha256 = ack.receipt_sha256
+            .ok_or("successor certified receiver receipt absent")?;
+        Ok(Some(FreshSuccessorTerminalAck {
+            offer_request_id:offer.offer_request_id.clone(),
+            generation:offer.generation.clone(),delivery_request_id,
+            grant_id:ack.grant.grant_id,session_id:offer.session_id.clone(),
+            seq,source_id:offer.source_id.clone(),attempt_id:offer.attempt_id.clone(),
+            root_id:offer.root_id.clone(),owner_generation:offer.owner_generation.clone(),
+            successor_identity:offer.successor_identity.clone(),recipient_uid:uid,
+            payload_sha256:offer.payload_sha256.clone(),
+            payload_byte_len:offer.payload_byte_len,receipt_sha256,
+        }))
+    }
+
     pub fn admitted_successor(
         &self,
         offer_request_id: &str,

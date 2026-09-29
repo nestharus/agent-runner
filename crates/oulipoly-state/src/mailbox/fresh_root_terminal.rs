@@ -61,6 +61,8 @@ pub struct FreshRootTerminalReadback {
     pub delivery_payload_sha256: Option<String>,
     pub delivery_payload_byte_len: Option<i64>,
     pub ack_basis: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub successor_ack: Option<FreshSuccessorTerminalAck>,
     pub publication_state: String,
     pub publication_sha256: Option<String>,
     pub unknown_stage: Option<String>,
@@ -586,6 +588,7 @@ impl FreshV30Lane {
             delivery_payload_sha256: None,
             delivery_payload_byte_len: None,
             ack_basis: None,
+            successor_ack: None,
             publication_state: "not_started".into(),
             publication_sha256: None,
             unknown_stage: None,
@@ -896,6 +899,43 @@ impl FreshV30Lane {
         result
             .artifacts
             .push(format!("fresh-mailbox:{}:{seq}", session.session_id));
+        let state_successor: Option<String> = state.query_row(
+            "SELECT offer_request_id FROM fresh_lane_successor_admission
+             WHERE session_id=?1 AND seq=?2",
+            params![session.session_id,seq], |r| r.get(0),
+        ).optional().map_err(|e| e.to_string())?;
+        let sidecar_successor: bool = self.sidecar.mailbox().conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM fresh_successor_admission
+             WHERE session_id=?1 AND seq=?2)",
+            params![session.session_id,seq], |r| r.get(0),
+        ).map_err(|e| e.to_string())?;
+        if let Some(offer_request_id) = state_successor {
+            result.notification_origin = "admitted_successor".into();
+            result.notification_state = "pending_f".into();
+            match self.read_successor_terminal_ack(
+                &offer_request_id,actor,session,seq,&source,&attempt,
+                &result.root_id,&result.owner_generation,&sha,len,
+            ) {
+                Ok(Some(ack)) => {
+                    result.delivery_request_id = Some(ack.delivery_request_id.clone());
+                    result.delivery_grant_id = Some(ack.grant_id.clone());
+                    result.ack_basis = Some("successor_receiver_receipt_ack".into());
+                    result.artifacts.push(format!("successor-admission:{}",ack.generation));
+                    result.artifacts.push(format!("successor-f-grant:{}",ack.grant_id));
+                    result.artifacts.push(format!("successor-receipt:{}",ack.receipt_sha256));
+                    result.successor_ack = Some(ack);
+                    result.notification_state = "acked".into();
+                }
+                Ok(None) => {}
+                Err(error) => result.record_unknown(format!("successor_ack:{error}")),
+            }
+            return Ok(());
+        }
+        if sidecar_successor {
+            result.notification_state = "pending_f".into();
+            result.record_unknown("successor_state_admission_absent".into());
+            return Ok(());
+        }
         let grant: Option<(String,String,String,String)> = self.sidecar.mailbox().conn.query_row(
             "SELECT grant_id,delivery_request_id,phase,recipient_identity FROM fresh_recipient_grant
              WHERE session_id=?1 AND seq=?2 AND source_id=?3 AND attempt_id=?4
