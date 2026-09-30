@@ -71,6 +71,90 @@ distinct image and must not be pointed at the Runner launcher. Existing
 system paths on this host and remain untouched. No production alias or
 workload admission is claimed by the service readback.
 
+## Preserved reinstall over the served AGE-319 first host
+
+`reinstall_preserved_v30.py` is a **single-campaign** operator. It is for the one
+host where this first install already served the old pair. It is not a
+general upgrade path.
+
+Keeping the old State in place is not possible. Its activation record pins
+every old image by SHA-256, device and inode, so the Broker refuses to start
+with it once the images change. Activation also refuses any root that has
+already served. So `preserve` moves the old install aside instead:
+
+1. It checks the old install is exactly as expected:
+   - the images and unit match the old package byte for byte;
+   - the State bootstrap/activation source is `--source-generation`, bound to
+     the old pair and to this `state.db` file's device/inode;
+   - no stage from an interrupted install, bootstrap or activation is present;
+   - everything is on the same filesystem.
+2. It takes a census of actors. An actor is any process that is running one
+   of the installed images, is in the unit cgroup, or holds a path under
+   State, `/run/oulipoly-kernel-broker` or the preservation root. The only
+   actor allowed is the running service `MainPID`, which must equal
+   `--broker-pid` and run the installed Broker image. Any other actor, or any
+   process that can't be read, refuses before anything changes. Nothing is
+   signalled by name or by PID.
+3. It writes `pre-stop-v1.json` to the root-only
+   `/var/lib/oulipoly-age319-preserved-<old generation>` directory, then stops
+   only the unit.
+4. It confirms the Broker has drained. The unit must be inactive with no
+   `MainPID`, the old Broker incarnation must be gone, and the census must
+   find no actors and no unreadable processes. `KillMode=process` makes the
+   stop alone no proof of this.
+5. It records the exact quiescent tree of State, images and unit in
+   `baseline-v1.json`.
+6. It renames State, then images, then unit into that directory with
+   `RENAME_NOREPLACE`. It rechecks identity and drain before each rename and
+   compares the result with the baseline afterwards.
+
+Nothing is deleted, rewritten, replayed or reset. A refusal keeps every change
+already made, including the stop; stderr lists them. A rerun continues from the
+records and refuses anything that changed. `status` is read-only. `restore`
+renames the preserved install back only while the original paths are still
+free, and leaves the service stopped. Initial `status` succeeds only with
+`readiness: "ready"` and `verdict: "ready"`. After preservation, it compares all
+three old objects with the quiescent baseline at their preserved paths, even
+when the new install also occupies the original paths. It succeeds with
+`verdict: "preserved"` and `preservation_verdict: "preserved old State, images
+and unit match baseline"` only when all three remain preserved and match.
+Refused readiness, incomplete preservation, or a baseline mismatch exits
+nonzero. Locations, comparison paths and per-item matches remain in the JSON
+for diagnosing a refusal; a partial move is not a success verdict.
+
+After `preserve`, the unchanged first-install procedure installs the new pair.
+It bootstraps a **new empty** State. The old served State stays preserved and
+is never offered to activation.
+
+The root invocation for this host follows. Run it from a checkout containing
+this file.
+
+```bash
+OLD=/home/nes/.local/share/age319-first-install-v30-20260929-04aab777/first-install-v30-main-04aab777-release.tar.gz
+NEW=/home/nes/.local/share/age319-fixed-path-release-20260929-ba6f537a/first-install-v30-release.tar.gz
+EXPECT="--old-generation 2ca23e6d-fe12-5b8e-9656-970801e22377 --new-generation 4e0edeee-816a-5ff7-aa29-930a974adcd7 --source-generation 5ba95834-a10b-441f-a5fe-0f6f348f7029 --broker-pid 768990"
+sha256sum "$OLD" "$NEW"   # 045613d2...79af9e0 and 8367b3ea...98fc37d9
+sudo python3 packaging/linux/reinstall_preserved_v30.py status "$OLD" "$NEW" $EXPECT    # readiness must be "ready"
+sudo python3 packaging/linux/reinstall_preserved_v30.py preserve "$OLD" "$NEW" $EXPECT
+sudo python3 packaging/linux/install_first_host_v30.py install "$NEW"
+sudo python3 packaging/linux/install_first_host_v30.py check "$NEW"
+sudo python3 packaging/linux/install_first_host_v30.py activate "$NEW"
+sudo python3 packaging/linux/install_first_host_v30.py start "$NEW"
+sudo python3 packaging/linux/install_first_host_v30.py readback "$NEW"  # pair_generation 4e0edeee-...
+sudo python3 packaging/linux/reinstall_preserved_v30.py status "$OLD" "$NEW" $EXPECT    # verdict "preserved"; all three matches_baseline true
+```
+
+Before `status`, both SHA-256 values must match the recorded package hashes:
+`045613d20b1a603070c2c081b0c73966e0a4ec8361b9a2179663b392a79af9e0` (old) and
+`8367b3ea0f58c075915d23bad2f149e5c2076e169e265ea33957e26698fc37d9` (new).
+The final reinstall `status` establishes preservation against the captured
+baseline; the preceding installer `readback` establishes the new live pair.
+
+Stop at the first nonzero exit and keep its output. Do not use `install` or
+`activate` to repair a partial `preserve`. The fixture tests simulate the
+service manager and only list the test's own child processes. They prove
+operator control flow, not the host service, the host census or the UID split.
+
 The featureless Broker also has an explicit offline storage command:
 `oulipoly-kernel-broker --bootstrap-empty-v30-state`. As root, it publishes
 `/var/lib/oulipoly-kernel-broker` only from an absent path. The publication
