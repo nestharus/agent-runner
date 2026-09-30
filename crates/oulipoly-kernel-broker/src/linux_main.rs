@@ -51,6 +51,9 @@ use base64::Engine as _;
 #[cfg(feature = "age319-private-broker-fixture")]
 use oulipoly_kernel_broker::accepted_grant::DelegatedRootHGrant;
 use oulipoly_kernel_broker::accepted_grant::{Acceptance, GrantRegistry};
+use oulipoly_kernel_broker::admission_accounting::{
+    Disposition, EntryFacts, RootState, account_entries, closed_history,
+};
 use oulipoly_kernel_broker::connected_control::ControlGrant;
 use oulipoly_kernel_broker::cutover_gate::EntryGate;
 use oulipoly_kernel_broker::entry_registry::{
@@ -59,6 +62,7 @@ use oulipoly_kernel_broker::entry_registry::{
 use oulipoly_kernel_broker::first_install_activation::{FirstInstallActivation, PairPaths};
 use oulipoly_kernel_broker::identity::{
     PeerIdentity, PinnedProcess, host_proc_file, host_proc_uid, install_detached_host_proc,
+    observed_incarnation_gone,
 };
 use oulipoly_kernel_broker::installed_launch::{self, InstalledLaunchSpec};
 use oulipoly_kernel_broker::installed_launch_ledger::{
@@ -4256,14 +4260,21 @@ fn settle_entry_from_terminal(
         .map_err(|_| io::Error::other("terminal entry settlement response uncertain"))?
 }
 
-/// Every older entry must have either its settled Q publication or its exact
-/// installed offline caller certificate, plus the physical/State owner close.
-/// This runs on the old writer loop under the shared fresh admission mutex.
+/// Concurrent-scoped admission accounting replaces the earlier single-flight
+/// "every prior entry closed" policy. Every root, work, grant and source must
+/// belong to a known entry. An unfinished entry is an accounted in-flight
+/// sibling only while its exact owner lives (reserved or active) or the
+/// Broker's own fenced close holds it. Every closed entry must still have its
+/// settled Q publication or exact installed offline caller certificate plus
+/// the physical/State owner close. That join runs once per exact entry record
+/// in this Broker incarnation; later admissions reuse it instead of repeating
+/// the retained joins for all history. A `read_only` caller (the fresh Bash
+/// reader) performs no durable writes.
 #[expect(
     clippy::too_many_arguments,
-    reason = "entry reuse joins all retained authorities"
+    reason = "entry accounting joins all retained authorities"
 )]
-fn require_prior_entries_closed(
+fn require_accounted_entries(
     state_root: &Path,
     installed: Option<&InstalledLaunchLedger>,
     roots: &mut RootRegistry,
@@ -4272,198 +4283,111 @@ fn require_prior_entries_closed(
     grants: &GrantRegistry,
     sources: &SourcePhysicalRegistry,
     sidecar: Option<&BrokerSidecar>,
+    read_only: bool,
 ) -> io::Result<()> {
-    require_prior_entries_closed_inner(
-        state_root, installed, roots, entries, works, grants, sources, sidecar, None,
-    )
-}
-
-/// The fresh Bash reader may coexist with one live, unfenced root. All other
-/// entries are checked from their retained authorities before their debt is
-/// ignored for scope classification. This path performs no durable writes.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "close joins independent authorities"
-)]
-fn require_prior_entries_closed_inner(
-    state_root: &Path,
-    installed: Option<&InstalledLaunchLedger>,
-    roots: &mut RootRegistry,
-    entries: &mut EntryRegistry,
-    works: &mut WorkRegistry,
-    grants: &GrantRegistry,
-    sources: &SourcePhysicalRegistry,
-    sidecar: Option<&BrokerSidecar>,
-    active_root_id: Option<&str>,
-) -> io::Result<()> {
-    if entries.records().is_empty() {
-        if roots.live_roots().next().is_some()
-            || !roots.debt_records().is_empty()
-            || works.live_works().next().is_some()
-            || !works.debt_records().is_empty()
-            || !grants.records().is_empty()
-            || !grants.native_records().is_empty()
-            || !sources.records().is_empty()
-        {
-            return Err(io::Error::other("root or work exists without an entry"));
-        }
-        return Ok(());
-    }
-    let known: HashSet<&str> = entries
-        .records()
-        .iter()
-        .map(|entry| entry.root_id.as_str())
-        .collect();
-    if roots.live_roots().count() + roots.debt_records().len() != known.len()
-        || works
-            .live_works()
-            .any(|work| !known.contains(work.record.root_id.as_str()))
-        || works
-            .debt_records()
-            .iter()
-            .any(|work| !known.contains(work.root_id.as_str()))
-        || grants
+    let mut closed_cursors = Vec::new();
+    let dispositions = {
+        let history = closed_history(state_root)?;
+        let facts: Vec<EntryFacts<'_>> = entries
             .records()
             .iter()
-            .any(|grant| !known.contains(grant.root_id.as_str()))
-        || grants
-            .native_records()
-            .iter()
-            .any(|grant| !known.contains(grant.root_id.as_str()))
-        || sources
-            .records()
-            .iter()
-            .any(|source| !known.contains(source.grant.root_id.as_str()))
-    {
-        return Err(io::Error::other("unaccounted prior root or work debt"));
-    }
-    let lane = FreshV30Lane::open_at(state_root).map_err(io::Error::other)?;
-    let mut closed_cursors: Vec<oulipoly_state::mailbox::BrokerStateCloseCursor> = Vec::new();
-    let mut offline_closes = Vec::new();
-    for entry in entries.records() {
-        if Some(entry.root_id.as_str()) == active_root_id {
-            continue;
-        }
-        let root = roots
-            .record(&entry.root_id)
-            .ok_or_else(|| io::Error::other("prior entry has no exact root"))?;
-        let (handoff, actor) = lane
-            .released_handoff_for_root(&entry.root_id)
-            .map_err(io::Error::other)?;
-        let session = lane
-            .read_session(&handoff.d_key)
-            .map_err(io::Error::other)?
-            .ok_or_else(|| io::Error::other("prior entry session absent"))?;
-        let offline = matches!(
-            &handoff.root_work_intent,
-            oulipoly_state::mailbox::FreshRootWorkIntent::CliHelp(_)
-                | oulipoly_state::mailbox::FreshRootWorkIntent::CliDiagnostics(_)
-        );
-        if offline {
-            let effect = lane
-                .read_root_effect(&handoff, &actor, &session)
-                .map_err(io::Error::other)?
-                .ok_or_else(|| io::Error::other("prior offline State result absent"))?;
-            if !matches!(
-                effect.state,
-                oulipoly_state::mailbox::FreshRootEffectState::ReturnedSuccess
-                    | oulipoly_state::mailbox::FreshRootEffectState::ReturnedFailure
-            ) || entry.terminal_settlement.is_some()
-            {
-                return Err(io::Error::other("prior offline result changed"));
-            }
-        } else if lane
-            .normal_provider_k_present(&handoff, &actor, &session)
-            .map_err(io::Error::other)?
-        {
-            root_drain::exact_successor_ack_for_root(&lane, &entry.root_id)?;
-            root_drain::exact_original_receipt_for_root(&lane, &entry.root_id)?;
-            let stored = entry
-                .terminal_settlement
-                .as_ref()
-                .ok_or_else(|| io::Error::other("prior entry caller result unsettled"))?;
-            let publication = normal_physical::observe_publication(
-                &lane, &handoff, &actor, &session, state_root,
-            )?;
-            if publication.state != "settled"
-                || stored.d_key != handoff.d_key
-                || stored.handoff_id != handoff.handoff_id
-                || stored.invocation_uuid != handoff.invocation_uuid
-                || stored.session_id != session.session_id
-                || stored.actor
-                    != (ProcessStamp {
-                        host_pid: actor.host_pid,
-                        boot_id: actor.boot_id.clone(),
-                        starttime_ticks: actor.starttime_ticks,
-                        pidns_dev: actor.pidns_dev,
-                        pidns_ino: actor.pidns_ino,
-                    })
-                || stored.parent_grant_id != publication.admission_id
-                || Some(stored.publication_sha256.as_str())
-                    != publication.publication_sha256.as_deref()
-            {
-                return Err(io::Error::other(
-                    "prior normal publication identity changed",
-                ));
-            }
-        } else {
-            let stored = entry
-                .terminal_settlement
-                .as_ref()
-                .ok_or_else(|| io::Error::other("prior entry caller result unsettled"))?;
-            let terminal = lane
-                .read_private_root_terminal(&handoff, &actor, &session)
-                .map_err(io::Error::other)?;
-            if &exact_entry_terminal_settlement(&terminal)? != stored {
-                return Err(io::Error::other("prior entry publication identity changed"));
-            }
-        }
-        let inventory =
-            root_drain::readback(root, roots, entries, works, grants, sources, sidecar)?;
-        let proof = inventory
-            .owner_close_proof
-            .as_ref()
-            .ok_or_else(|| io::Error::other("prior entry owner not exactly closed"))?;
-        let physical = root_drain::physical_close_proof(&inventory)?;
-        let certificate = installed
-            .map(|installed| installed.terminal_for_root(&entry.root_id))
+            .map(|entry| {
+                let cached = history.exact(entry);
+                if let Some(closed) = cached {
+                    closed_cursors.push(closed.cursor.clone());
+                }
+                let settled =
+                    entry.terminal_settlement.is_some() || entry.offline_close_sha256.is_some();
+                EntryFacts {
+                    root_id: &entry.root_id,
+                    settled,
+                    owner_live: cached.is_none() && !settled && EntryRegistry::owner_live(entry),
+                    root: if cached.is_some() {
+                        RootState::Absent
+                    } else {
+                        admission_root_state(roots, &entry.root_id)
+                    },
+                    closed_cached: cached.is_some(),
+                }
+            })
+            .collect();
+        account_entries(
+            &facts,
+            roots
+                .live_roots()
+                .map(|root| root.record.root_id.as_str())
+                .chain(
+                    roots
+                        .debt_records()
+                        .iter()
+                        .map(|root| root.root_id.as_str()),
+                )
+                .chain(works.live_works().map(|work| work.record.root_id.as_str()))
+                .chain(
+                    works
+                        .debt_records()
+                        .iter()
+                        .map(|work| work.root_id.as_str()),
+                )
+                .chain(grants.records().iter().map(|grant| grant.root_id.as_str()))
+                .chain(
+                    grants
+                        .native_records()
+                        .iter()
+                        .map(|grant| grant.root_id.as_str()),
+                )
+                .chain(
+                    sources
+                        .records()
+                        .iter()
+                        .map(|source| source.grant.root_id.as_str()),
+                ),
+        )?
+    };
+    let candidates = dispositions.contains(&Disposition::CloseCandidate);
+    // Read before any join: a concurrent owner close on the old writer loop
+    // may add a later validated cursor, never replace this one.
+    let current = if closed_cursors.is_empty() && !candidates {
+        None
+    } else {
+        sidecar
+            .map(|sidecar| {
+                sidecar
+                    .read_current_close_cursor()
+                    .map_err(io::Error::other)
+            })
             .transpose()?
-            .flatten();
-        if let Some(certificate) = &certificate {
-            if certificate.physical != physical || certificate.owner != *proof {
-                return Err(io::Error::other("prior caller certificate changed"));
+    };
+    let lane = candidates
+        .then(|| FreshV30Lane::open_at(state_root).map_err(io::Error::other))
+        .transpose()?;
+    let mut closed_roots = Vec::new();
+    let mut joined = Vec::new();
+    for (entry, disposition) in entries.records().iter().zip(&dispositions) {
+        match disposition {
+            Disposition::InFlight => {}
+            Disposition::Closed => closed_roots.push(entry.root_id.clone()),
+            Disposition::CloseCandidate => {
+                let Some(close) = join_closed_entry(
+                    state_root,
+                    lane.as_ref().expect("close candidate opened the lane"),
+                    installed,
+                    entry,
+                    roots,
+                    entries,
+                    works,
+                    grants,
+                    sources,
+                    sidecar,
+                )?
+                else {
+                    continue;
+                };
+                closed_cursors.push(close.cursor.clone());
+                closed_roots.push(entry.root_id.clone());
+                joined.push((entry.root_id.clone(), close));
             }
-        } else if installed.is_some() {
-            return Err(io::Error::other(
-                "prior installed caller certificate absent",
-            ));
         }
-        if offline {
-            let certificate = certificate
-                .as_ref()
-                .ok_or_else(|| io::Error::other("prior offline caller certificate absent"))?;
-            if certificate.physical.offline.is_none()
-                || certificate.physical != physical
-                || &certificate.owner != proof
-            {
-                return Err(io::Error::other("prior offline caller certificate changed"));
-            }
-            offline_closes.push((
-                entry.root_id.clone(),
-                format!("{:x}", Sha256::digest(serde_json::to_vec(&certificate)?)),
-            ));
-        }
-        if (inventory.entry_unsettled && !offline)
-            || (offline && inventory.offline.is_none())
-            || inventory.state_sidecar_outstanding_unknown
-            || proof.root_id != entry.root_id
-            || proof.owner_generation != handoff.old_release.prepared.owner_generation
-        {
-            return Err(io::Error::other(
-                "prior entry close or caller result changed",
-            ));
-        }
-        closed_cursors.push(proof.state_cursor.clone());
     }
     // Directory enumeration after restart has no generation order. Compare
     // the immutable ordinals themselves and reject aliasing or a source swap.
@@ -4477,35 +4401,233 @@ fn require_prior_entries_closed_inner(
         return Err(io::Error::other("prior entry close cursor order changed"));
     }
     if !closed_cursors.is_empty() {
-        let current = sidecar
-            .ok_or_else(|| io::Error::other("prior entry sidecar absent"))?
-            .read_current_close_cursor()
-            .map_err(io::Error::other)?;
-        if closed_cursors.last() != Some(&current) {
+        let current = current.ok_or_else(|| io::Error::other("prior entry sidecar absent"))?;
+        // The serial writer loop sees no close between its read and joins.
+        // The fresh reader may see a later close only as a validated cursor.
+        let accounted = if read_only {
+            closed_cursors.contains(&current)
+        } else {
+            closed_cursors.last() == Some(&current)
+        };
+        if !accounted {
             return Err(io::Error::other("unclosed State continuity generation"));
         }
     }
-    for entry in entries.records() {
-        if Some(entry.root_id.as_str()) == active_root_id {
-            continue;
-        }
-        roots.admit_closed_historical(&entry.root_id)?;
-        works.admit_closed_historical(&entry.root_id);
+    for root_id in &closed_roots {
+        roots.admit_closed_historical(root_id)?;
+        works.admit_closed_historical(root_id);
     }
-    for (root_id, certificate_sha256) in offline_closes {
-        if active_root_id.is_some() {
-            if entries
+    let mut history = Vec::new();
+    for (root_id, close) in joined {
+        if let Some(certificate_sha256) = &close.offline_certificate_sha256 {
+            match entries
                 .record(&root_id)
                 .and_then(|entry| entry.offline_close_sha256.as_deref())
-                != Some(certificate_sha256.as_str())
             {
-                return Err(io::Error::other("prior offline close marker changed"));
+                Some(marker) if marker == certificate_sha256 => {}
+                Some(_) => return Err(io::Error::other("prior offline close marker changed")),
+                // The old writer loop marks it; until then it is not history.
+                None if read_only => continue,
+                None => entries.settle_offline_close(&root_id, certificate_sha256)?,
             }
-        } else {
-            entries.settle_offline_close(&root_id, &certificate_sha256)?;
+        }
+        if close.certified {
+            let record = entries
+                .record(&root_id)
+                .cloned()
+                .ok_or_else(|| io::Error::other("closed entry absent"))?;
+            history.push((record, close.cursor));
         }
     }
+    let mut cache = closed_history(state_root)?;
+    for (record, cursor) in history {
+        cache.insert(record, cursor);
+    }
     Ok(())
+}
+
+fn admission_root_state(roots: &RootRegistry, root_id: &str) -> RootState {
+    match roots
+        .live_roots()
+        .find(|root| root.record.root_id == root_id)
+    {
+        Some(root) if root.init.verify().is_ok() => RootState::Live,
+        None if !roots
+            .debt_records()
+            .iter()
+            .any(|root| root.root_id == root_id) =>
+        {
+            RootState::Absent
+        }
+        _ => RootState::Exited {
+            fenced: roots.admission_fenced(root_id),
+        },
+    }
+}
+
+struct ClosedEntryJoin {
+    cursor: oulipoly_state::mailbox::BrokerStateCloseCursor,
+    offline_certificate_sha256: Option<String>,
+    /// The caller certificate exists. Without it the owner close is proven
+    /// but the root's own launcher has not yet acknowledged its result.
+    certified: bool,
+}
+
+/// Join one fenced, exited root to its retained authorities. `None` means the
+/// Broker-owned owner close is still in flight.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "close joins independent authorities"
+)]
+fn join_closed_entry(
+    state_root: &Path,
+    lane: &FreshV30Lane,
+    installed: Option<&InstalledLaunchLedger>,
+    entry: &oulipoly_kernel_broker::entry_registry::EntryRecord,
+    roots: &RootRegistry,
+    entries: &EntryRegistry,
+    works: &WorkRegistry,
+    grants: &GrantRegistry,
+    sources: &SourcePhysicalRegistry,
+    sidecar: Option<&BrokerSidecar>,
+) -> io::Result<Option<ClosedEntryJoin>> {
+    let root = roots
+        .record(&entry.root_id)
+        .ok_or_else(|| io::Error::other("prior entry has no exact root"))?;
+    let inventory = root_drain::readback(root, roots, entries, works, grants, sources, sidecar)?;
+    let Some(proof) = inventory.owner_close_proof.as_ref() else {
+        return Ok(None);
+    };
+    let (handoff, actor) = lane
+        .released_handoff_for_root(&entry.root_id)
+        .map_err(io::Error::other)?;
+    let session = lane
+        .read_session(&handoff.d_key)
+        .map_err(io::Error::other)?
+        .ok_or_else(|| io::Error::other("prior entry session absent"))?;
+    let offline = matches!(
+        &handoff.root_work_intent,
+        oulipoly_state::mailbox::FreshRootWorkIntent::CliHelp(_)
+            | oulipoly_state::mailbox::FreshRootWorkIntent::CliDiagnostics(_)
+    );
+    if offline {
+        let effect = lane
+            .read_root_effect(&handoff, &actor, &session)
+            .map_err(io::Error::other)?
+            .ok_or_else(|| io::Error::other("prior offline State result absent"))?;
+        if !matches!(
+            effect.state,
+            oulipoly_state::mailbox::FreshRootEffectState::ReturnedSuccess
+                | oulipoly_state::mailbox::FreshRootEffectState::ReturnedFailure
+        ) || entry.terminal_settlement.is_some()
+        {
+            return Err(io::Error::other("prior offline result changed"));
+        }
+    } else if lane
+        .normal_provider_k_present(&handoff, &actor, &session)
+        .map_err(io::Error::other)?
+    {
+        root_drain::exact_successor_ack_for_root(lane, &entry.root_id)?;
+        root_drain::exact_original_receipt_for_root(lane, &entry.root_id)?;
+        let stored = entry
+            .terminal_settlement
+            .as_ref()
+            .ok_or_else(|| io::Error::other("prior entry caller result unsettled"))?;
+        let publication =
+            normal_physical::observe_publication(lane, &handoff, &actor, &session, state_root)?;
+        if publication.state != "settled"
+            || stored.d_key != handoff.d_key
+            || stored.handoff_id != handoff.handoff_id
+            || stored.invocation_uuid != handoff.invocation_uuid
+            || stored.session_id != session.session_id
+            || stored.actor
+                != (ProcessStamp {
+                    host_pid: actor.host_pid,
+                    boot_id: actor.boot_id.clone(),
+                    starttime_ticks: actor.starttime_ticks,
+                    pidns_dev: actor.pidns_dev,
+                    pidns_ino: actor.pidns_ino,
+                })
+            || stored.parent_grant_id != publication.admission_id
+            || Some(stored.publication_sha256.as_str()) != publication.publication_sha256.as_deref()
+        {
+            return Err(io::Error::other(
+                "prior normal publication identity changed",
+            ));
+        }
+    } else {
+        let stored = entry
+            .terminal_settlement
+            .as_ref()
+            .ok_or_else(|| io::Error::other("prior entry caller result unsettled"))?;
+        let terminal = lane
+            .read_private_root_terminal(&handoff, &actor, &session)
+            .map_err(io::Error::other)?;
+        if &exact_entry_terminal_settlement(&terminal)? != stored {
+            return Err(io::Error::other("prior entry publication identity changed"));
+        }
+    }
+    let physical = root_drain::physical_close_proof(&inventory)?;
+    let certificate = installed
+        .map(|installed| installed.terminal_for_root(&entry.root_id))
+        .transpose()?
+        .flatten();
+    if let Some(certificate) = &certificate {
+        if certificate.physical != physical || certificate.owner != *proof {
+            return Err(io::Error::other("prior caller certificate changed"));
+        }
+    } else if let Some(installed) = installed {
+        // The owner close is exact, but the caller certificate is published
+        // only when the root's own launcher reads its result. That ACK is
+        // still accounted while the exact launcher lives.
+        let launcher_live = installed
+            .request_for_root(&entry.root_id)?
+            .is_some_and(|request| {
+                observed_incarnation_gone(
+                    request.launcher.host_pid,
+                    &request.launcher.boot_id,
+                    request.launcher.starttime_ticks,
+                    (request.launcher.pidns_dev, request.launcher.pidns_ino),
+                )
+                .is_ok_and(|gone| !gone)
+            });
+        if !launcher_live {
+            return Err(io::Error::other(
+                "prior installed caller certificate absent",
+            ));
+        }
+    }
+    let mut offline_certificate_sha256 = None;
+    if offline && (certificate.is_some() || installed.is_none()) {
+        let certificate = certificate
+            .as_ref()
+            .ok_or_else(|| io::Error::other("prior offline caller certificate absent"))?;
+        if certificate.physical.offline.is_none()
+            || certificate.physical != physical
+            || &certificate.owner != proof
+        {
+            return Err(io::Error::other("prior offline caller certificate changed"));
+        }
+        offline_certificate_sha256 = Some(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&certificate)?)
+        ));
+    }
+    if (inventory.entry_unsettled && !offline)
+        || (offline && inventory.offline.is_none())
+        || inventory.state_sidecar_outstanding_unknown
+        || proof.root_id != entry.root_id
+        || proof.owner_generation != handoff.old_release.prepared.owner_generation
+    {
+        return Err(io::Error::other(
+            "prior entry close or caller result changed",
+        ));
+    }
+    Ok(Some(ClosedEntryJoin {
+        cursor: proof.state_cursor.clone(),
+        offline_certificate_sha256,
+        certified: certificate.is_some() || installed.is_none(),
+    }))
 }
 
 /// Rebuild the exact normal caller result on every status read, including
@@ -7157,29 +7279,19 @@ fn serve() -> io::Result<()> {
                 let _entry_guard = admission_fences.lock().map_err(|_| {
                     io::Error::other("root admission fence poisoned")
                 })?;
-                // A guardian reads I after its own E. That active entry is
-                // intentionally unsettled. E itself gates every reservation.
-                if entries
-                    .records()
-                    .iter()
-                    .all(|entry| {
-                        entry.terminal_settlement.is_some()
-                            || installed_launches.as_ref().is_some_and(|ledger| {
-                                ledger.terminal_for_root(&entry.root_id).ok().flatten().is_some()
-                            })
-                    })
-                {
-                    require_prior_entries_closed(
-                        Path::new(&state),
-                        installed_launches.as_ref(),
-                        &mut registry,
-                        &mut entries,
-                        &mut works,
-                        &grants,
-                        &source_physical,
-                        broker_sidecar.as_ref(),
-                    )?;
-                }
+                // A guardian reads I after its own E. That active entry, like
+                // any concurrent sibling, is an accounted in-flight entry.
+                require_accounted_entries(
+                    Path::new(&state),
+                    installed_launches.as_ref(),
+                    &mut registry,
+                    &mut entries,
+                    &mut works,
+                    &grants,
+                    &source_physical,
+                    broker_sidecar.as_ref(),
+                    false,
+                )?;
                 if !root_launch_admitted(
                     &peer,
                     &classify_scope(&peer, &host_namespace, &registry, &works),
@@ -7199,9 +7311,10 @@ fn serve() -> io::Result<()> {
                     None => "state-route legacy\n".into(),
                 })
             } else {
-                // E and exact owner close share this fence. A previous
-                // unknown caller write, live root, pending debt or changed
-                // continuity cursor must refuse before a second reservation.
+                // E and exact owner close share this fence. An orphan or
+                // unaccounted root/work/grant/source, an unfinished entry
+                // without its exact owner, or a changed closed join or
+                // continuity cursor must refuse before another reservation.
                 let _entry_guard = if matches!(operation, b'E' | b'e') {
                     Some(admission_fences.lock().map_err(|_| {
                         io::Error::other("root admission fence poisoned")
@@ -7210,7 +7323,7 @@ fn serve() -> io::Result<()> {
                     None
                 };
                 if _entry_guard.is_some() {
-                    require_prior_entries_closed(
+                    require_accounted_entries(
                         Path::new(&state),
                         installed_launches.as_ref(),
                         &mut registry,
@@ -7219,6 +7332,7 @@ fn serve() -> io::Result<()> {
                         &grants,
                         &source_physical,
                         broker_sidecar.as_ref(),
+                        false,
                     )?;
                 }
                 if matches!(operation, b'E' | b'e')
@@ -7448,22 +7562,12 @@ fn fresh_bash_parent(
     }
     let mut roots = RootRegistry::open(state_root)?;
     let mut works = WorkRegistry::open(state_root.join("works"), &roots)?;
+    let mut entries = None;
     if let Some((pair_generation, source_generation)) = installed_identity {
-        // Exactly one unfenced root may be active. Historical roots can only
-        // cease to count as debt after the full retained close joins below.
-        let active: Vec<_> = roots
-            .live_roots()
-            .filter(|root| !roots.admission_fenced(&root.record.root_id))
-            .collect();
-        let [active] = active.as_slice() else {
-            return Err(io::Error::other("fresh Bash active root ambiguous"));
-        };
-        active.init.verify()?;
-        let active_id = active.record.root_id.clone();
-        let mut entries = EntryRegistry::open(state_root.join("entries"))?;
-        if entries.record(&active_id).is_none() {
-            return Err(io::Error::other("fresh Bash active entry absent"));
-        }
+        // Concurrent sibling roots are accounted in-flight entries. Closed
+        // roots cease to count as debt only after their retained close join,
+        // which this process performs once per exact entry record.
+        let mut opened = EntryRegistry::open(state_root.join("entries"))?;
         let grants = GrantRegistry::open(state_root.join("grants"))?;
         let sources = SourcePhysicalRegistry::open(state_root.join("source-physical"))?;
         let sidecar =
@@ -7471,23 +7575,31 @@ fn fresh_bash_parent(
                 .map_err(io::Error::other)?;
         let installed =
             InstalledLaunchLedger::open_existing(state_root, pair_generation, source_generation)?;
-        require_prior_entries_closed_inner(
+        require_accounted_entries(
             state_root,
             Some(&installed),
             &mut roots,
-            &mut entries,
+            &mut opened,
             &mut works,
             &grants,
             &sources,
             Some(&sidecar),
-            Some(&active_id),
+            true,
         )?;
+        entries = Some(opened);
     }
     let root_id = match classify_scope(peer, &host_proc_file("self/ns/pid")?, &roots, &works) {
         Scope::Root(id) | Scope::Work { root_id: id, .. } => id,
         Scope::Outside => return Err(io::Error::other("Bash child is outside a released root")),
         Scope::Uncertain => return Err(io::Error::other("Bash child scope uncertain")),
     };
+    // The caller's own root, not the only root, must be an exact live entry.
+    if entries
+        .as_ref()
+        .is_some_and(|entries| entries.record(&root_id).is_none())
+    {
+        return Err(io::Error::other("fresh Bash active entry absent"));
+    }
     if roots.admission_fenced(&root_id) {
         return Err(io::Error::other("Bash child root admission fenced"));
     }

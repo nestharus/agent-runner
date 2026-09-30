@@ -4,6 +4,7 @@
 #![cfg(target_os = "linux")]
 
 pub mod accepted_grant;
+pub mod admission_accounting;
 pub mod codex_raw_verifier;
 pub mod connected_control;
 pub mod cutover_gate;
