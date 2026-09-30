@@ -1837,6 +1837,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                     std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
                 )
                 .unwrap();
@@ -2003,6 +2004,7 @@ mod tests {
                 &state_for_server,
                 &socket_for_server,
                 image,
+                None,
                 None,
                 None,
                 None,

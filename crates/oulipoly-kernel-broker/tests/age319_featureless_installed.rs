@@ -10,6 +10,7 @@ use oulipoly_kernel_broker::successor_launch::{self, Ledger as SuccessorLaunchLe
 use oulipoly_state::mailbox::{EmptyV30BootstrapIdentity, FreshBashSourceEvent, FreshV30Lane};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -65,12 +66,11 @@ fn disposable_root_featureless_l_help_lost_reply_and_duplicate() {
     let prior_sync_case =
         !successor_case && std::env::var_os("AGE319_FEATURELESS_ONLY_BUSY").is_none();
 
-    // State's trust check includes every ancestor. /tmp and this worktree's
-    // shared parent are writable, so use a short-lived root-owned home child.
-    let home = std::env::var_os("HOME").expect("disposable test needs a trusted home directory");
+    // TMPDIR keeps every disposable artifact under the owned writer. State
+    // still checks this directory and all its ancestors in the namespace.
     let temp = tempfile::Builder::new()
         .prefix("age319-featureless-")
-        .tempdir_in(home)
+        .tempdir()
         .unwrap();
     let installed = temp.path().join("installed");
     fs::create_dir(&installed).unwrap();
@@ -115,7 +115,14 @@ fn disposable_root_featureless_l_help_lost_reply_and_duplicate() {
         activation.source.source_generation,
         source.source_generation
     );
-    let socket = temp.path().join("control.sock");
+    // A procfd path names this same test-owned directory without exceeding
+    // Unix socket pathname limits in a deeply nested writer checkout.
+    let socket_directory = File::open(temp.path()).unwrap();
+    let socket = std::path::PathBuf::from(format!(
+        "/proc/{}/fd/{}/control.sock",
+        std::process::id(),
+        socket_directory.as_raw_fd(),
+    ));
     let broker_log = temp.path().join("broker.err");
     let mut broker = Command::new(&broker_image)
         .env_clear()

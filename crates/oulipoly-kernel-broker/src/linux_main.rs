@@ -34,6 +34,8 @@ mod native_work;
 mod private_installed_exec;
 #[path = "released_handoff.rs"]
 mod released_handoff;
+#[path = "recipient_effect_gate.rs"]
+mod recipient_effect_gate;
 #[path = "root_join.rs"]
 mod root_join;
 #[path = "source_decision_journal.rs"]
@@ -7621,6 +7623,223 @@ fn ordinary_bash_completion_worker(
     }
 }
 
+/// Reuses the released-child authority already owned by U/D. A session or
+/// grant is only a lookup key; it cannot authorize a recipient on its own.
+fn bind_original_d(
+    lane: &FreshV30Lane,
+    d_key: &str,
+    actor: &FreshRecipientIdentity,
+) -> Result<
+    (
+        FreshReleasedHandoff,
+        oulipoly_state::mailbox::FreshV30Session,
+    ),
+    String,
+> {
+    let root = lane.released_handoff_for_child(d_key, actor)?;
+    let session = lane
+        .read_session(d_key)?
+        .ok_or("recipient D session absent")?;
+    if session.request_id != root.d_key {
+        return Err("recipient session differs from released D".into());
+    }
+    lane.require_released_invocation(&root, actor, &session)?;
+    Ok((root, session))
+}
+
+fn bind_original_grant(
+    lane: &FreshV30Lane,
+    grant: &oulipoly_state::mailbox::FreshDeliveryReadback,
+    actor: &FreshRecipientIdentity,
+) -> Result<(), String> {
+    let (released, original) = lane.released_handoff_for_root(&grant.root_id)?;
+    if original != *actor {
+        return Err("recipient grant is outside pinned original actor".into());
+    }
+    let (root, session) = bind_original_d(lane, &released.d_key, actor)?;
+    if grant.session_id != session.session_id
+        || grant.root_id != root.old_release.prepared.root_id
+        || grant.owner_generation != root.old_release.prepared.owner_generation
+        || grant.lane_id != session.lane_id
+        || grant.source_generation != session.source_generation
+        || lane.recipient_binding(&session, actor)?
+            != (grant.root_id.clone(), grant.owner_generation.clone())
+    {
+        return Err("recipient grant differs from released D/session/owner".into());
+    }
+    let terminal = lane.read_private_root_terminal(&root, actor, &session)?;
+    let event = terminal
+        .selected_child_event
+        .as_ref()
+        .ok_or("recipient original grant selected W absent")?;
+    if terminal.listener_policy.as_deref() != Some("notify")
+        || terminal.mailbox_seq != Some(grant.seq)
+        || event.source_id != grant.source_id
+        || event.attempt_id != grant.attempt_id
+    {
+        return Err("recipient original grant differs from selected W".into());
+    }
+    // Readback must not confer authority on a copied old grant/mailbox row.
+    let payload = lane.lookup_payload(&grant.lane_id, &grant.session_id, grant.seq)?;
+    if i64::try_from(payload.len()).ok() != Some(grant.payload_byte_len)
+        || format!("{:x}", Sha256::digest(&payload)) != grant.payload_sha256
+    {
+        return Err("recipient grant differs from retained source bytes".into());
+    }
+    Ok(())
+}
+
+fn bind_successor_request(
+    lane: &FreshV30Lane,
+    offer: &str,
+    actor: &FreshRecipientIdentity,
+    uid: u32,
+    ledger: Option<&SuccessorLaunchLedger>,
+    original_read: bool,
+) -> Result<(), String> {
+    let decision = lane
+        .read_bash_wake_successor_decision_for_offer(offer)?
+        .ok_or("recipient successor selected W decision absent")?;
+    let w = &decision.obligation;
+    let (released, original) = lane.released_handoff_for_root(&w.root_id)?;
+    let (_, session) = bind_original_d(lane, &released.d_key, &original)?;
+    if w.original_identity != original || w.session_id != session.session_id {
+        return Err("recipient successor differs from released D/session".into());
+    }
+    if original_read && *actor == original {
+        return Ok(());
+    }
+    let candidate = ledger
+        .ok_or("recipient successor installed ledger absent")?
+        .read_candidate(offer)
+        .map_err(|e| e.to_string())?
+        .ok_or("recipient successor installed candidate absent")?;
+    let process = &candidate.process;
+    if process.host_pid != actor.host_pid
+        || process.boot_id != actor.boot_id
+        || process.starttime_ticks != actor.starttime_ticks
+        || process.pidns_dev != actor.pidns_dev
+        || process.pidns_ino != actor.pidns_ino
+        || candidate.owner_uid != uid
+    {
+        return Err("recipient successor differs from pinned installed candidate".into());
+    }
+    Ok(())
+}
+
+/// `true` means the scoped normal path established its existing authority.
+/// `false` leaves off-path experimental operations host-closed. Every scoped
+/// operation runs this binding in the fixture as well as on the host.
+fn bind_normal_recipient_request(
+    lane: &FreshV30Lane,
+    request: &FreshRecipientRequest,
+    actor: &FreshRecipientIdentity,
+    uid: u32,
+    ledger: Option<&SuccessorLaunchLedger>,
+) -> Result<bool, String> {
+    use FreshRecipientRequest::*;
+    match request {
+        ReadRootTerminal { d_key }
+        | SettleRootTerminal { d_key }
+        | RepairRootTerminal { d_key }
+        | FenceRootTerminal { d_key }
+        | BeginRootPublication { d_key, .. }
+        | BeginRootCallerResult { d_key, .. }
+        | SettleRootCallerResult { d_key, .. }
+        | DecideBashWakeSuccessor { d_key, .. }
+        | ReadBashWakeSuccessorDecision { d_key, .. }
+        | StartInstalledSuccessor { d_key, .. }
+        | ReadInstalledSuccessorStart { d_key, .. }
+        | ReadInstalledSuccessorOffer { d_key, .. }
+        | AdmitSuccessor { d_key, .. } => {
+            bind_original_d(lane, d_key, actor)?;
+        }
+        Submit {
+            allocation_request_id,
+            ..
+        } => {
+            let (root, session) = bind_original_d(lane, allocation_request_id, actor)?;
+            lane.recipient_binding(&session, actor)?;
+            let terminal = lane.read_private_root_terminal(&root, actor, &session)?;
+            if terminal.listener_policy.as_deref() != Some("notify")
+                || terminal.notification_state != "pending_f"
+                || terminal.selected_child_event.is_none()
+                || terminal.mailbox_seq.is_none()
+            {
+                return Err("recipient original F requires selected pending W".into());
+            }
+        }
+        Read {
+            delivery_request_id,
+        }
+        | Recover {
+            delivery_request_id,
+        } => {
+            let grant = lane
+                .read_recipient_delivery_by_request(delivery_request_id, actor)?
+                .ok_or("recipient original delivery absent")?;
+            bind_original_grant(lane, &grant, actor)?;
+        }
+        CertifyOriginalReceipt { grant_id }
+        | ReadOriginalReceipt { grant_id }
+        | Acknowledge { grant_id, .. } => {
+            let grant = lane
+                .read_recipient_delivery(grant_id, actor)?
+                .ok_or("recipient original grant absent")?;
+            bind_original_grant(lane, &grant, actor)?;
+        }
+        OfferSuccessor {
+            allocation_request_id,
+            offer_request_id,
+            ..
+        } => {
+            bind_successor_request(lane, offer_request_id, actor, uid, ledger, false)?;
+            let decision = lane
+                .read_bash_wake_successor_decision_for_offer(offer_request_id)?
+                .ok_or("recipient successor decision absent")?;
+            let (root, _) = lane.released_handoff_for_root(&decision.obligation.root_id)?;
+            if root.d_key != *allocation_request_id {
+                return Err("recipient successor allocation differs from released D".into());
+            }
+        }
+        ReadSuccessorOffer { offer_request_id }
+        | SubmitSuccessor {
+            offer_request_id, ..
+        } => {
+            bind_successor_request(lane, offer_request_id, actor, uid, ledger, false)?;
+        }
+        ReadSuccessorAdmission { offer_request_id } => {
+            bind_successor_request(lane, offer_request_id, actor, uid, ledger, true)?;
+        }
+        ReadSuccessorDelivery {
+            delivery_request_id,
+        }
+        | RecoverSuccessorDelivery {
+            delivery_request_id,
+        }
+        | CertifySuccessorReceipt {
+            delivery_request_id,
+        }
+        | ReadSuccessorReceipt {
+            delivery_request_id,
+        }
+        | AcknowledgeSuccessor {
+            delivery_request_id,
+            ..
+        }
+        | ReadSuccessorAck {
+            delivery_request_id,
+        } => {
+            let delivery = lane
+                .read_successor_delivery(delivery_request_id, actor, uid)?
+                .ok_or("recipient successor delivery absent")?;
+            bind_successor_request(lane, &delivery.offer_request_id, actor, uid, ledger, false)?;
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
 fn serve_fresh_v30_at(
     state_root: &Path,
     socket: &Path,
@@ -10150,16 +10369,21 @@ fn serve_fresh_v30_at(
                     Ok(result)
                 }
                 b'F' => {
-                    // No production delivery can be authorized by a private
-                    // prefix D/session or by a copied old mailbox row.
-                    if !private_fixture() {
-                        return Err(io::Error::other(
-                            "fresh recipient effect closed until released-child handoff, real invocation, registration, W, result and ACK",
-                        ));
-                    }
                     let RequestPayload::FreshRecipientRequest { request } = payload else {
                         return Err(io::Error::other("fresh recipient request absent"));
                     };
+                    // Fixture identity never substitutes for the ordinary
+                    // recipient's released D/J/registration or retained row.
+                    recipient_effect_gate::require_route(private_fixture(), || {
+                        bind_normal_recipient_request(
+                            &lane,
+                            &request,
+                            &recipient,
+                            peer.uid,
+                            successor_ledger.as_ref(),
+                        )
+                    })
+                    .map_err(io::Error::other)?;
                     let reply = match request {
                         FreshRecipientRequest::DecideBashWakeSuccessor {
                             d_key,
@@ -11518,6 +11742,10 @@ pub fn run() {
         std::process::exit(1);
     }
 }
+
+#[cfg(all(test, feature = "age319-private-broker-fixture"))]
+#[path = "recipient_effect_tests.rs"]
+mod recipient_effect_tests;
 
 #[cfg(test)]
 mod tests {
