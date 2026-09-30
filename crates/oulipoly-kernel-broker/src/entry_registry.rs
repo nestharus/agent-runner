@@ -170,9 +170,11 @@ impl EntryRegistry {
     }
 
     /// The v30 Broker calls this only under its admission fence after
-    /// `require_prior_entries_closed` has joined every historical root to its
-    /// physical close and, for help, its offline caller certificate. Offline
-    /// entries intentionally have no normal terminal settlement in this row.
+    /// `require_accounted_entries` has joined every closed root to its
+    /// physical close and, for help, its offline caller certificate, and has
+    /// accounted every unfinished sibling to an exact live owner or the
+    /// Broker-owned close. Offline entries intentionally have no normal
+    /// terminal settlement in this row.
     pub fn reserve_exact_after_prior_close(
         &mut self,
         uid: u32,
@@ -595,25 +597,29 @@ impl EntryRegistry {
                 .records
                 .iter()
                 .filter(|r| r.terminal_settlement.is_none() && r.offline_close_sha256.is_none())
-                .any(|r| {
-                    boot_id().ok().as_deref() != Some(r.entry.boot_id.as_str())
-                        || PinnedProcess::open(r.entry.host_pid)
-                            .and_then(|p| r.entry.matches(&p))
-                            .ok()
-                            != Some(true)
-                        || r.prepared_guardian.as_ref().is_some_and(|stamp| {
-                            PinnedProcess::open(stamp.host_pid)
-                                .and_then(|p| stamp.matches(&p))
-                                .ok()
-                                != Some(true)
-                        })
-                        || r.prepared_driver.as_ref().is_some_and(|stamp| {
-                            PinnedProcess::open(stamp.host_pid)
-                                .and_then(|p| stamp.matches(&p))
-                                .ok()
-                                != Some(true)
-                        })
-                })
+                .any(|r| !Self::owner_live(r))
+    }
+
+    /// An unsettled entry is an accounted in-flight sibling only while its
+    /// exact reserving process and any prepared guardian or driver still live.
+    pub fn owner_live(r: &EntryRecord) -> bool {
+        boot_id().ok().as_deref() == Some(r.entry.boot_id.as_str())
+            && PinnedProcess::open(r.entry.host_pid)
+                .and_then(|p| r.entry.matches(&p))
+                .ok()
+                == Some(true)
+            && r.prepared_guardian.as_ref().is_none_or(|stamp| {
+                PinnedProcess::open(stamp.host_pid)
+                    .and_then(|p| stamp.matches(&p))
+                    .ok()
+                    == Some(true)
+            })
+            && r.prepared_driver.as_ref().is_none_or(|stamp| {
+                PinnedProcess::open(stamp.host_pid)
+                    .and_then(|p| stamp.matches(&p))
+                    .ok()
+                    == Some(true)
+            })
     }
 
     pub fn has_unsettled_join(&self) -> bool {
@@ -631,6 +637,54 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn concurrent_reservations_are_accounted_by_their_own_live_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut registry = EntryRegistry::open(temp.path()).unwrap();
+        let first = PinnedProcess::open(std::process::id() as i32).unwrap();
+        let mut sibling_process = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let sibling = PinnedProcess::open(sibling_process.id() as i32).unwrap();
+        let a = uuid::Uuid::new_v4().to_string();
+        let b = uuid::Uuid::new_v4().to_string();
+        registry
+            .reserve_exact_after_prior_close(1000, &first, &a)
+            .unwrap();
+        // A second unsettled entry with its own live owner is not debt.
+        registry
+            .reserve_exact_after_prior_close(1000, &sibling, &b)
+            .unwrap();
+        assert!(!registry.has_debt());
+        assert!(registry.records().iter().all(EntryRegistry::owner_live));
+        // Own IDs stay one-use: neither the root ID nor the owner may be reused.
+        let mut third_process = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let third = PinnedProcess::open(third_process.id() as i32).unwrap();
+        assert!(
+            registry
+                .reserve_exact_after_prior_close(1000, &third, &b)
+                .is_err()
+        );
+        assert!(
+            registry
+                .reserve_exact_after_prior_close(1000, &sibling, &uuid::Uuid::new_v4().to_string())
+                .is_err()
+        );
+        third_process.kill().unwrap();
+        third_process.wait().unwrap();
+        // The sibling's owner vanishing without settlement is debt again.
+        sibling_process.kill().unwrap();
+        sibling_process.wait().unwrap();
+        assert!(registry.has_debt());
+        let reopened = EntryRegistry::open(temp.path()).unwrap();
+        assert!(!EntryRegistry::owner_live(reopened.record(&b).unwrap()));
+        assert!(EntryRegistry::owner_live(reopened.record(&a).unwrap()));
+    }
 
     #[test]
     fn exact_direct_child_binds_once_and_survives_registry_reopen() {

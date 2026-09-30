@@ -378,15 +378,21 @@ impl RootRegistry {
         Ok(())
     }
 
+    /// A fenced root whose exact PID1 has a durable terminal proof is in the
+    /// Broker-owned close progression: its namespace is gone and its close is
+    /// accounted per root, so it does not stop concurrent sibling roots. Any
+    /// other exited root remains global debt.
     pub fn has_debt(&self) -> bool {
         self.poisoned
+            || self.debt.iter().any(|r| self.unaccounted_exit(r))
             || self
-                .debt
+                .live
                 .iter()
-                .any(|r| !self.closed_historical.contains(&r.root_id))
-            || self.live.iter().any(|r| {
-                !self.closed_historical.contains(&r.record.root_id) && r.init.verify().is_err()
-            })
+                .any(|r| r.init.verify().is_err() && self.unaccounted_exit(&r.record))
+    }
+
+    fn unaccounted_exit(&self, root: &RootRecord) -> bool {
+        !self.closed_historical.contains(&root.root_id) && !self.terminal_verified(root)
     }
 
     /// This changes only in-memory debt classification. Durable root records
@@ -406,18 +412,9 @@ impl RootRegistry {
     }
 
     /// Read-only physical Q for one terminal root may use its exact PID1
-    /// receipt. Global admission debt remains until the separate root close.
-    pub fn has_unrelated_debt(&self, expected: &RootRecord) -> bool {
-        self.poisoned
-            || self.debt.iter().any(|root| {
-                !self.closed_historical.contains(&root.root_id)
-                    && (root != expected || !self.terminal_verified(root))
-            })
-            || self.live.iter().any(|root| {
-                !self.closed_historical.contains(&root.record.root_id)
-                    && root.init.verify().is_err()
-                    && (root.record != *expected || !self.terminal_verified(&root.record))
-            })
+    /// receipt. This is the same accounting as `has_debt`.
+    pub fn has_unrelated_debt(&self, _expected: &RootRecord) -> bool {
+        self.has_debt()
     }
 
     pub fn pid1_terminal_proof(&self, expected: &RootRecord) -> io::Result<bool> {
@@ -604,12 +601,7 @@ impl RootRegistry {
     /// older callers; roots launched with a stable parent use its durable
     /// wait after exit. A missing wait never becomes a successful exit.
     pub fn observe_init_exit(&self, expected: &RootRecord) -> io::Result<ChildExit> {
-        if self.poisoned
-            || self
-                .debt
-                .iter()
-                .any(|root| !self.closed_historical.contains(&root.root_id))
-        {
+        if self.poisoned || self.debt.iter().any(|root| self.unaccounted_exit(root)) {
             return Err(io::Error::other("uncertain root registry"));
         }
         let root = self
@@ -662,8 +654,9 @@ impl RootRegistry {
         Ok(())
     }
 
-    /// No automatic retirement. A failed or vanished root remains recorded and
-    /// blocks new outside launches until a future settlement protocol handles it.
+    /// No automatic retirement. A failed or vanished root remains recorded; it
+    /// blocks new outside launches unless it is closed history or a fenced
+    /// root with its exact PID1 terminal proof.
     pub fn debt_records(&self) -> &[RootRecord] {
         &self.debt
     }

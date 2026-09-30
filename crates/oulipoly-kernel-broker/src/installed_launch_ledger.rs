@@ -254,6 +254,17 @@ impl InstalledLaunchLedger {
         Ok(None)
     }
 
+    /// The immutable L request that chose this root, if any.
+    pub fn request_for_root(&self, root_id: &str) -> io::Result<Option<RequestRecord>> {
+        for entry in fs::read_dir(&self.directory)? {
+            let request = self.read_path(&entry?.path())?;
+            if request.root_id.as_deref() == Some(root_id) {
+                return Ok(Some(request));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn read_terminal(&self, request_id: &str) -> io::Result<Option<NormalTerminalCertificate>> {
         let request = self.read(request_id)?;
         let path = self.terminal_directory.join(format!("{request_id}.json"));
