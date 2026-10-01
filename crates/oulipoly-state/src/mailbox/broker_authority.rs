@@ -221,6 +221,9 @@ pub struct BrokerSourceEffectGrant {
     pub revision: i64,
 }
 
+/// Pending-delivery sessions one recipient selection examines.
+const RECIPIENT_SESSION_SCAN: usize = 32;
+
 /// A pending recipient selected on the retained broker connection. This is
 /// metadata for planning only: the row can change, and neither the session ID
 /// nor the payload digest is a recipient authentication or work grant.
@@ -231,6 +234,21 @@ pub struct BrokerRecipientSelection {
     pub owner_generation: String,
     pub authority_ordinal: i64,
     pub candidate: Option<BrokerRecipientCandidate>,
+    /// Paused sessions passed over although they held a pending row.
+    #[serde(default)]
+    pub skipped_paused_pending: u32,
+    /// The bounded session scan may have stopped before every pending
+    /// session. With no candidate, absence is then not established.
+    #[serde(default)]
+    pub session_scan_bounded: bool,
+}
+
+impl BrokerRecipientSelection {
+    /// No recipient is pending at the projected head: no candidate, no
+    /// pending row passed over and no session left unscanned.
+    pub fn established_none_pending(&self) -> bool {
+        self.candidate.is_none() && self.skipped_paused_pending == 0 && !self.session_scan_bounded
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -2062,12 +2080,11 @@ impl BrokerSidecar {
         let sessions = self
             .mailbox
             .wake_sessions()
-            .pending_delivery_session_ids(32)?;
+            .pending_delivery_session_ids(RECIPIENT_SESSION_SCAN)?;
+        let session_scan_bounded = sessions.len() >= RECIPIENT_SESSION_SCAN;
+        let mut skipped_paused_pending = 0u32;
         let mut candidate = None;
         for session_id in sessions {
-            if self.mailbox.notifications_paused(&session_id)? {
-                continue;
-            }
             let Some(row) = self
                 .mailbox
                 .list_pending_for_delivery_after(&session_id, None, 0, 1)?
@@ -2076,6 +2093,10 @@ impl BrokerSidecar {
             else {
                 continue;
             };
+            if self.mailbox.notifications_paused(&session_id)? {
+                skipped_paused_pending += 1;
+                continue;
+            }
             // Verification uses the retained root-owned payload repository.
             // The response carries only its exact digest and length.
             self.mailbox.payloads().verify_mailbox_row_payload(&row)?;
@@ -2107,6 +2128,8 @@ impl BrokerSidecar {
             owner_generation: owner.owner_generation.clone(),
             authority_ordinal: head.map_or(0, |head| head.authority_ordinal),
             candidate,
+            skipped_paused_pending,
+            session_scan_bounded,
         })
     }
 
@@ -6264,6 +6287,28 @@ mod tests {
                 .seq,
             mail.seq
         );
+        // A pending row in a paused session is passed over, but counted:
+        // the selection does not establish that nothing is pending.
+        broker
+            .mailbox
+            .set_notifications_paused("recipient", true)
+            .unwrap();
+        let paused = broker
+            .read_bounded_recipient_selection(&generation, &root_id, &owner)
+            .unwrap();
+        assert!(paused.candidate.is_none());
+        assert_eq!(paused.skipped_paused_pending, 1);
+        assert!(!paused.session_scan_bounded);
+        assert!(!paused.established_none_pending());
+        broker
+            .mailbox
+            .set_notifications_paused("recipient", false)
+            .unwrap();
+        let resumed = broker
+            .read_bounded_recipient_selection(&generation, &root_id, &owner)
+            .unwrap();
+        assert_eq!(resumed.candidate.as_ref().unwrap().seq, mail.seq);
+        assert!(!resumed.established_none_pending());
         let retained_path = broker
             .read_exact_mailbox_row(&generation, "recipient", mail.seq)
             .unwrap()
@@ -6281,6 +6326,18 @@ mod tests {
                 .unwrap_err()
                 .contains("integrity mismatch")
         );
+        // Every row delivered: nothing pending, nothing skipped, absence
+        // established.
+        broker
+            .mailbox
+            .acknowledge_range("recipient", mail.seq, i64::MAX, "fixture")
+            .unwrap();
+        let none = broker
+            .read_bounded_recipient_selection(&generation, &root_id, &owner)
+            .unwrap();
+        assert!(none.candidate.is_none(), "{none:?}");
+        assert_eq!(none.skipped_paused_pending, 0);
+        assert!(none.established_none_pending());
     }
 
     #[cfg(unix)]

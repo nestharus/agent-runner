@@ -399,8 +399,29 @@ fn run_v30_repair_boundary(
             // before any claim, transport submission, or delivery result.
             return Err("v30 recipient effect closed: no broker-authenticated live recipient or exact wake successor, durable one-use work grant, or pinned provider K/physical child tree".into());
         }
-        return Err("v30 no pending broker recipient; wake effect refused".into());
+        return no_pending_disposition(&selected);
     }
+}
+
+pub(crate) const V30_NOTHING_PENDING: &str =
+    "v30 repair boundary: no pending broker recipient; nothing to repair";
+
+/// Nothing to repair is this boundary's ordinary outcome, not a failure:
+/// the projection reached the bound head with no source and the Broker
+/// established that no recipient is pending. A pending row the selection
+/// passed over (a paused session, or sessions beyond its bounded scan)
+/// does not establish absence and stays a failure.
+fn no_pending_disposition(
+    selected: &oulipoly_state::mailbox::BrokerRecipientSelection,
+) -> Result<(), String> {
+    if selected.established_none_pending() {
+        eprintln!("{V30_NOTHING_PENDING}");
+        return Ok(());
+    }
+    Err(format!(
+        "v30 pending broker recipient not established absent: {} paused session(s) with pending rows, scan bounded: {}",
+        selected.skipped_paused_pending, selected.session_scan_bounded
+    ))
 }
 
 fn run_owned(path: &Path, owner: &CompletionDomainOwner) -> Result<(), String> {
@@ -559,5 +580,44 @@ fn run_owned(path: &Path, owner: &CompletionDomainOwner) -> Result<(), String> {
             }
         }
         std::thread::sleep(DRIVER_POLL_INTERVAL);
+    }
+}
+
+#[cfg(test)]
+mod no_pending_disposition_tests {
+    use super::no_pending_disposition;
+    use oulipoly_state::mailbox::{BrokerRecipientCandidate, BrokerRecipientSelection};
+
+    fn selection(paused: u32, bounded: bool) -> BrokerRecipientSelection {
+        BrokerRecipientSelection {
+            source_generation: "generation".into(),
+            root_id: "root".into(),
+            owner_generation: "owner".into(),
+            authority_ordinal: 0,
+            candidate: None,
+            skipped_paused_pending: paused,
+            session_scan_bounded: bounded,
+        }
+    }
+
+    #[test]
+    fn only_established_absence_is_a_successful_no_op() {
+        assert_eq!(no_pending_disposition(&selection(0, false)), Ok(()));
+        // A pending row the Broker passed over, or sessions it never
+        // scanned, stays a failure: absence is not established.
+        for (paused, bounded) in [(1, false), (0, true), (2, true)] {
+            let error = no_pending_disposition(&selection(paused, bounded)).unwrap_err();
+            assert!(error.contains("not established absent"), "{error}");
+        }
+        let mut pending = selection(0, false);
+        pending.candidate = Some(BrokerRecipientCandidate {
+            session_id: "session".into(),
+            seq: 1,
+            kind: "input".into(),
+            handle: "handle".into(),
+            payload_sha256: "sha".into(),
+            payload_byte_len: 1,
+        });
+        assert!(!pending.established_none_pending());
     }
 }

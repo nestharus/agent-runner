@@ -15002,7 +15002,7 @@ fn inner() {
                         "v30 recipient effect closed: no broker-authenticated live recipient or exact wake successor, durable one-use work grant, or pinned provider K/physical child tree",
                     )
                 } else if mode == "normal_empty" {
-                    Some("v30 no pending broker recipient; wake effect refused")
+                    Some("v30 repair boundary: no pending broker recipient; nothing to repair")
                 } else if real_source && mode != "normal_bash_source_lost_reply" {
                     Some("v30 source physically launched; v2 acceptance remains closed")
                 } else if real_source {

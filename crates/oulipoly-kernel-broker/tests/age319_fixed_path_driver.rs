@@ -323,7 +323,8 @@ fn disposable_fixed_path_driver_admission_and_public_refusal() {
     assert!(
         stderr.lines().any(|line| matches!(
             line,
-            "error dead peer" | "v30 no pending broker recipient; wake effect refused"
+            "error dead peer"
+                | "v30 repair boundary: no pending broker recipient; nothing to repair"
         )),
         "driver dispatch result was not observed: {stderr}"
     );
