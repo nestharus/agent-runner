@@ -19,6 +19,7 @@ pub mod native_receipt;
 pub mod normal_model_selection;
 pub mod normal_physical;
 pub mod normal_plan_custody;
+pub mod phase_record;
 pub mod protocol;
 pub mod registry;
 pub mod root_drain;

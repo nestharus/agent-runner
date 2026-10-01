@@ -73,6 +73,7 @@ use oulipoly_kernel_broker::native_receipt::{
     BoundNativeAuthority, verify as verify_native_receipt,
 };
 use oulipoly_kernel_broker::normal_physical;
+use oulipoly_kernel_broker::phase_record;
 use oulipoly_kernel_broker::protocol::{
     AcceptedWorkSpec, DelegatedRootHProof, ExactSourceDecisionRequest,
     ExactSourceDecisionVerification, ExactSourceIssuerKind, FreshChildRequest,
@@ -317,6 +318,14 @@ fn read_native_f_auto_ack_with_source(
 ) -> Result<Option<oulipoly_state::mailbox::FreshNativeFAutoAck>, String> {
     verify_native_f_committed_receipt(lane, request, recipient)?;
     lane.read_native_f_auto_ack(request, recipient)
+}
+
+/// Acquires the shared root admission fences, recording the wait against the
+/// request on this thread. The lock and its poisoning are unchanged.
+fn lock_fences(
+    fences: &Mutex<HashSet<String>>,
+) -> std::sync::LockResult<std::sync::MutexGuard<'_, HashSet<String>>> {
+    phase_record::timed(phase_record::Sub::Fence, || fences.lock())
 }
 
 fn private_fixture() -> bool {
@@ -798,6 +807,7 @@ fn recv_request(
     // live through classification and dispatch.
     let challenge = *uuid::Uuid::new_v4().as_bytes();
     stream.write_all(&challenge)?;
+    phase_record::mark_challenge();
     let mut request = [0u8; REQUEST_RECEIVE_BUFFER_BYTES];
     let mut iov = libc::iovec {
         iov_base: request.as_mut_ptr().cast(),
@@ -850,6 +860,7 @@ fn recv_request(
         }
         cmsg = unsafe { libc::CMSG_NXTHDR(&msg, cmsg) };
     }
+    phase_record::mark_received(read as usize, descriptors.len());
     let valid_length = match request[0] {
         b'G' | b'g' => read == 65,
         b'P' | b'p' => read == 37,
@@ -4182,24 +4193,26 @@ fn fence_root_from_terminal(
     let prepared = &root.old_release.prepared;
     let init = &prepared.root_init;
     let (reply, answer) = mpsc::sync_channel(1);
-    bridge
-        .send(FreshDrainBridgeRequest {
-            root: RootRecord {
-                version: 1,
-                boot_id: init.boot_id.clone(),
-                root_id: prepared.root_id.clone(),
-                owner_uid: prepared.owner_uid,
-                init_host_pid: init.host_pid,
-                init_starttime_ticks: init.starttime_ticks,
-                pidns_dev: init.pidns_dev,
-                pidns_ino: init.pidns_ino,
-            },
-            reply,
-        })
-        .map_err(|_| io::Error::other("root drain authority unavailable"))?;
-    answer
-        .recv_timeout(RELEASED_HANDOFF_REPLY_TIMEOUT)
-        .map_err(|_| io::Error::other("root drain fence response uncertain"))?
+    phase_record::timed(phase_record::Sub::Bridge, || {
+        bridge
+            .send(FreshDrainBridgeRequest {
+                root: RootRecord {
+                    version: 1,
+                    boot_id: init.boot_id.clone(),
+                    root_id: prepared.root_id.clone(),
+                    owner_uid: prepared.owner_uid,
+                    init_host_pid: init.host_pid,
+                    init_starttime_ticks: init.starttime_ticks,
+                    pidns_dev: init.pidns_dev,
+                    pidns_ino: init.pidns_ino,
+                },
+                reply,
+            })
+            .map_err(|_| io::Error::other("root drain authority unavailable"))?;
+        answer
+            .recv_timeout(RELEASED_HANDOFF_REPLY_TIMEOUT)
+            .map_err(|_| io::Error::other("root drain fence response uncertain"))?
+    })
 }
 
 fn exact_entry_terminal_settlement(
@@ -4248,16 +4261,18 @@ fn settle_entry_from_terminal(
 ) -> io::Result<()> {
     let settlement = exact_entry_terminal_settlement(read)?;
     let (reply, answer) = mpsc::sync_channel(1);
-    bridge
-        .send(FreshTerminalBridgeRequest {
-            root_id: read.root_id.clone(),
-            settlement,
-            reply,
-        })
-        .map_err(|_| io::Error::other("terminal entry authority unavailable"))?;
-    answer
-        .recv_timeout(RELEASED_HANDOFF_REPLY_TIMEOUT)
-        .map_err(|_| io::Error::other("terminal entry settlement response uncertain"))?
+    phase_record::timed(phase_record::Sub::Bridge, || {
+        bridge
+            .send(FreshTerminalBridgeRequest {
+                root_id: read.root_id.clone(),
+                settlement,
+                reply,
+            })
+            .map_err(|_| io::Error::other("terminal entry authority unavailable"))?;
+        answer
+            .recv_timeout(RELEASED_HANDOFF_REPLY_TIMEOUT)
+            .map_err(|_| io::Error::other("terminal entry settlement response uncertain"))?
+    })
 }
 
 /// Concurrent-scoped admission accounting replaces the earlier single-flight
@@ -5255,8 +5270,7 @@ fn advance_one_normal_owner(
             if ready.is_err() {
                 continue;
             }
-            let mut fences = admission_fences
-                .lock()
+            let mut fences = lock_fences(admission_fences)
                 .map_err(|_| io::Error::other("root admission fence poisoned"))?;
             let persisted = registry.fence_admission(&root);
             // Match the host-root fence operation: a partial write also stops
@@ -5274,8 +5288,7 @@ fn advance_one_normal_owner(
         if !inventory.owner_close_preflight {
             continue;
         }
-        let _guard = admission_fences
-            .lock()
+        let _guard = lock_fences(admission_fences)
             .map_err(|_| io::Error::other("root admission fence poisoned"))?;
         if inventory.owner_close_intent.is_none() {
             issue_exact_owner_close_intent(
@@ -6097,7 +6110,19 @@ fn serve() -> io::Result<()> {
     }
     let mut completed_auto_normal = HashSet::<String>::new();
     let mut last_auto_normal = Instant::now() - NORMAL_CLOSE_POLL_INTERVAL;
+    if let Err(error) = phase_record::init(Path::new(&state)) {
+        eprintln!("phase records unavailable: {error}");
+    }
+    let control_images = phase_record::ImageRoles::new(
+        Some(&runner_image),
+        pinned_bash_image(installed_pair.as_ref())
+            .ok()
+            .flatten()
+            .as_ref(),
+    );
+    let mut window = phase_record::MainWindow::new();
     loop {
+        let iteration_start = phase_record::mono_ns();
         control_grants.retain(|_, grant| match grant.reap_if_done() {
             Ok(None) => true,
             Ok(Some(status)) => installed_launches.as_ref().is_none_or(|ledger| {
@@ -6130,11 +6155,13 @@ fn serve() -> io::Result<()> {
                 true
             }
         });
+        let bridges_start = phase_record::mono_ns();
+        window.reap_ns += bridges_start.saturating_sub(iteration_start);
         if let Ok(request) = drain_rx.try_recv() {
+            window.bridge_n += 1;
             let result = (|| {
                 registry.exact_record(&request.root)?;
-                let mut fences = admission_fences
-                    .lock()
+                let mut fences = lock_fences(&admission_fences)
                     .map_err(|_| io::Error::other("root admission fence poisoned"))?;
                 let persisted = registry.fence_admission(&request.root);
                 fences.insert(request.root.root_id.clone());
@@ -6153,10 +6180,12 @@ fn serve() -> io::Result<()> {
             let _ = request.reply.send(result);
         }
         if let Ok(request) = terminal_rx.try_recv() {
+            window.bridge_n += 1;
             let result = entries.settle_join(&request.root_id, request.settlement);
             let _ = request.reply.send(result);
         }
         if let Ok(request) = handoff_rx.try_recv() {
+            window.bridge_n += 1;
             released_child_handoff(
                 request,
                 &host_namespace,
@@ -6170,8 +6199,11 @@ fn serve() -> io::Result<()> {
                 &broker_incarnation,
             );
         }
+        let advance_start = phase_record::mono_ns();
+        window.bridge_ns += advance_start.saturating_sub(bridges_start);
         if last_auto_normal.elapsed() >= NORMAL_CLOSE_POLL_INTERVAL {
             last_auto_normal = Instant::now();
+            window.advance_n += 1;
             if let Err(error) = advance_one_normal_owner(
                 Path::new(&state),
                 &mut registry,
@@ -6186,6 +6218,8 @@ fn serve() -> io::Result<()> {
                 eprintln!("normal owner close progression blocked: {error}");
             }
         }
+        let accept_start = phase_record::mono_ns();
+        window.advance_ns += accept_start.saturating_sub(advance_start);
         let mut stream = match listener.accept() {
             Ok((stream, _)) => stream,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -6250,15 +6284,31 @@ fn serve() -> io::Result<()> {
                         let _ = registry.reap_terminal_pid1(&root.record);
                     }
                 }
+                let sleep_start = phase_record::mono_ns();
+                window.idle_duty_ns += sleep_start.saturating_sub(accept_start);
                 std::thread::sleep(BROKER_ACCEPT_POLL_INTERVAL);
+                window.idle_sleep_ns += phase_record::mono_ns().saturating_sub(sleep_start);
+                window.idle_n += 1;
+                window.iteration_done();
                 continue;
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
         };
+        let mut control_record = phase_record::Request::accepted("control");
+        phase_record::begin_request();
         stream.set_read_timeout(Some(BROKER_INGRESS_IO_TIMEOUT))?;
         stream.set_write_timeout(Some(BROKER_INGRESS_IO_TIMEOUT))?;
         let result = peer_from_request(&mut stream).and_then(|(operation, payload, peer)| {
+            control_record.read_done();
+            control_record.opcode = Some(operation);
+            control_record.peer(
+                peer.process.host_pid,
+                peer.process.starttime_ticks,
+                peer.uid,
+                control_images.role(peer.process.host_pid),
+            );
+            control_record.handler_start = phase_record::mono_ns();
             // Request parsing is bounded. Root launch/recovery readiness is
             // governed by exact gates and process death, not a 5s cutoff.
             stream.set_read_timeout(None)?;
@@ -6278,7 +6328,7 @@ fn serve() -> io::Result<()> {
                 };
                 registry.exact_record(&request.expected)?;
                 if operation == 0x82 || operation == 0x83 {
-                    let _guard = admission_fences.lock()
+                    let _guard = lock_fences(&admission_fences)
                         .map_err(|_| io::Error::other("root admission fence poisoned"))?;
                     let proof = commit_exact_owner_close(
                         Path::new(&state), &request.expected, &request.owner_generation,
@@ -6289,7 +6339,7 @@ fn serve() -> io::Result<()> {
                 }
                 let intent = if operation == 0x80 {
                     // Fresh admissions holding this mutex finish first.
-                    let _guard = admission_fences.lock()
+                    let _guard = lock_fences(&admission_fences)
                         .map_err(|_| io::Error::other("root admission fence poisoned"))?;
                     issue_exact_owner_close_intent(
                         &request.expected, &request.owner_generation, &mut registry, &entries,
@@ -6312,7 +6362,7 @@ fn serve() -> io::Result<()> {
                 };
                 registry.exact_record(&expected)?;
                 if operation == b'@' {
-                    let mut fences = admission_fences.lock()
+                    let mut fences = lock_fences(&admission_fences)
                         .map_err(|_| io::Error::other("root admission fence poisoned"))?;
                     let persisted = registry.fence_admission(&expected);
                     // A partial fence write must also stop the fresh lane in
@@ -7286,7 +7336,7 @@ fn serve() -> io::Result<()> {
                 {
                     return Err(io::Error::other("broker State route admission refused"));
                 }
-                let _entry_guard = admission_fences.lock().map_err(|_| {
+                let _entry_guard = lock_fences(&admission_fences).map_err(|_| {
                     io::Error::other("root admission fence poisoned")
                 })?;
                 // A guardian reads I after its own E. That active entry, like
@@ -7326,7 +7376,7 @@ fn serve() -> io::Result<()> {
                 // without its exact owner, or a changed closed join or
                 // continuity cursor must refuse before another reservation.
                 let _entry_guard = if matches!(operation, b'E' | b'e') {
-                    Some(admission_fences.lock().map_err(|_| {
+                    Some(lock_fences(&admission_fences).map_err(|_| {
                         io::Error::other("root admission fence poisoned")
                     })?)
                 } else {
@@ -7397,10 +7447,19 @@ fn serve() -> io::Result<()> {
                 )
             }
         });
+        control_record.handler_end = phase_record::mono_ns();
+        control_record.sub = phase_record::take_sub();
+        if control_record.opcode.is_none() {
+            control_record.read_done();
+        }
+        control_record.ok = result.is_ok();
         let response = result.unwrap_or_else(|error| format!("error {error}\n"));
+        control_record.reply_bytes = response.len() as u64;
         if !response.is_empty() {
             let _ = stream.write_all(response.as_bytes());
         }
+        control_record.reply_written = phase_record::mono_ns();
+        control_record.emit();
         for record in &source_physical.records()[tracked_source_records..] {
             pending_source_evidence.insert(record.grant.grant_id.clone(), record.grant.clone());
         }
@@ -7408,6 +7467,9 @@ fn serve() -> io::Result<()> {
         if let Some(sidecar) = broker_sidecar.as_mut() {
             capture_terminal_sources(sidecar, &source_physical, &mut pending_source_evidence);
         }
+        window.control_ns += phase_record::mono_ns().saturating_sub(accept_start);
+        window.control_n += 1;
+        window.iteration_done();
     }
 }
 
@@ -7441,18 +7503,20 @@ fn bridge_released_handoff(
         pidns_ino: peer.process.pidns_ino,
     };
     let (reply, answer) = mpsc::sync_channel(RELEASED_HANDOFF_REPLY_CAPACITY);
-    bridge
-        .send(FreshHandoffBridgeRequest {
-            spec,
-            peer,
-            lane: lane.clone(),
-            read_only,
-            reply,
-        })
-        .map_err(|_| io::Error::other("old release authority unavailable"))?;
-    let receipt = answer
-        .recv_timeout(RELEASED_HANDOFF_REPLY_TIMEOUT)
-        .map_err(|_| io::Error::other("old release authority response uncertain"))??;
+    let receipt = phase_record::timed(phase_record::Sub::Bridge, || {
+        bridge
+            .send(FreshHandoffBridgeRequest {
+                spec,
+                peer,
+                lane: lane.clone(),
+                read_only,
+                reply,
+            })
+            .map_err(|_| io::Error::other("old release authority unavailable"))?;
+        answer
+            .recv_timeout(RELEASED_HANDOFF_REPLY_TIMEOUT)
+            .map_err(|_| io::Error::other("old release authority response uncertain"))?
+    })?;
     let current = PinnedProcess::open(expected.host_pid)?;
     current.verify()?;
     let image = runner_image.metadata()?;
@@ -7566,6 +7630,22 @@ fn fresh_bash_parent(
     FreshRecipientIdentity,
     fresh_provider::ParentWork,
 )> {
+    phase_record::timed(phase_record::Sub::Parent, || {
+        derive_fresh_bash_parent(state_root, lane, peer, bash_image, installed_identity)
+    })
+}
+
+fn derive_fresh_bash_parent(
+    state_root: &Path,
+    lane: &FreshV30Lane,
+    peer: &PeerIdentity,
+    bash_image: Option<&File>,
+    installed_identity: Option<(&str, &str)>,
+) -> io::Result<(
+    FreshReleasedHandoff,
+    FreshRecipientIdentity,
+    fresh_provider::ParentWork,
+)> {
     let image = bash_image.ok_or_else(|| io::Error::other("installed Bash image absent"))?;
     if !peer.process.same_executable_as(image)? {
         return Err(io::Error::other("Bash child image changed"));
@@ -7585,17 +7665,20 @@ fn fresh_bash_parent(
                 .map_err(io::Error::other)?;
         let installed =
             InstalledLaunchLedger::open_existing(state_root, pair_generation, source_generation)?;
-        require_accounted_entries(
-            state_root,
-            Some(&installed),
-            &mut roots,
-            &mut opened,
-            &mut works,
-            &grants,
-            &sources,
-            Some(&sidecar),
-            true,
-        )?;
+        phase_record::add_accounted_entries(opened.records().len());
+        phase_record::timed(phase_record::Sub::Accounting, || {
+            require_accounted_entries(
+                state_root,
+                Some(&installed),
+                &mut roots,
+                &mut opened,
+                &mut works,
+                &grants,
+                &sources,
+                Some(&sidecar),
+                true,
+            )
+        })?;
         entries = Some(opened);
     }
     let root_id = match classify_scope(peer, &host_proc_file("self/ns/pid")?, &roots, &works) {
@@ -8131,8 +8214,14 @@ fn serve_fresh_v30_at(
     // An old candidate record is readback only. Only this Broker incarnation
     // owns an inherited gate and may authorize a first offer.
     let mut live_successors = BTreeMap::<String, LiveCandidate>::new();
+    if let Err(error) = phase_record::init(state_root) {
+        eprintln!("phase records unavailable: {error}");
+    }
+    let images = phase_record::ImageRoles::new(Some(&runner_image), bash_image.as_ref());
     for incoming in listener.incoming() {
         let Ok(mut stream) = incoming else { continue };
+        let mut record = phase_record::Request::accepted("v30");
+        phase_record::begin_request();
         stream.set_read_timeout(Some(FRESH_V30_READ_TIMEOUT))?;
         stream.set_write_timeout(Some(FRESH_V30_WRITE_TIMEOUT))?;
         let mut submitted_grant = None;
@@ -8160,6 +8249,15 @@ fn serve_fresh_v30_at(
         let mut diagnostic_key_hash = String::from("unavailable");
         let answer = (|| -> io::Result<String> {
             let (operation, payload, peer) = peer_from_request(&mut stream)?;
+            record.read_done();
+            record.opcode = Some(operation);
+            record.peer(
+                peer.process.host_pid,
+                peer.process.starttime_ticks,
+                peer.uid,
+                images.role(peer.process.host_pid),
+            );
+            record.handler_start = phase_record::mono_ns();
             diagnostic_opcode = operation;
             diagnostic_stage = "peer_authority";
             peer.process.verify()?;
@@ -8309,8 +8407,7 @@ fn serve_fresh_v30_at(
                             lane.require_released_handoff(&receipt.d_key, &receipt, &recipient)
                                 .map_err(io::Error::other)?;
                         } else {
-                            let _guard = admission_fences
-                                .lock()
+                            let _guard = lock_fences(&admission_fences)
                                 .map_err(|_| io::Error::other("root admission fence poisoned"))?;
                             if _guard.contains(&receipt.old_release.prepared.root_id) {
                                 return Err(io::Error::other("exact root admission fenced"));
@@ -8425,8 +8522,7 @@ fn serve_fresh_v30_at(
                     let directory = state_root.join("v30/fresh-provider");
                     let _admission_guard =
                         if matches!(operation, b'C' | b'X' | b'E' | b'%' | b'8' | b'^') {
-                            let guard = admission_fences
-                                .lock()
+                            let guard = lock_fences(&admission_fences)
                                 .map_err(|_| io::Error::other("root admission fence poisoned"))?;
                             if guard.contains(&root.old_release.prepared.root_id) {
                                 return Err(io::Error::other("exact root admission fenced"));
@@ -8454,29 +8550,33 @@ fn serve_fresh_v30_at(
                     };
                     let child = if matches!(operation, b'C' | b'X') && !instance.is_closed() {
                         diagnostic_stage = "bash_child_admission";
-                        lane.admit_bash_child(
-                            &request_id,
-                            &root,
-                            &root_actor,
-                            &recipient,
-                            parent_work.grant_id(),
-                            parent_work.work_id(),
-                            listener_policy
-                                .ok_or_else(|| io::Error::other("fresh Bash C policy absent"))?,
-                        )
+                        let policy = listener_policy
+                            .ok_or_else(|| io::Error::other("fresh Bash C policy absent"))?;
+                        phase_record::timed(phase_record::Sub::State, || {
+                            lane.admit_bash_child(
+                                &request_id,
+                                &root,
+                                &root_actor,
+                                &recipient,
+                                parent_work.grant_id(),
+                                parent_work.work_id(),
+                                policy,
+                            )
+                        })
                         .map_err(io::Error::other)?
                     } else {
                         diagnostic_stage = "bash_child_exact_readback";
-                        let mut child = lane
-                            .read_bash_child(&request_id)
-                            .map_err(io::Error::other)?
-                            .ok_or_else(|| io::Error::other("Bash child absent"))?;
-                        child.session = lane
-                            .read_session(&child.d_key)
-                            .map_err(io::Error::other)?
-                            .ok_or_else(|| io::Error::other("Bash child D incomplete"))?;
-                        lane.require_bash_child(&child, &root, &root_actor, &recipient)
-                            .map_err(io::Error::other)?;
+                        let child = phase_record::timed(phase_record::Sub::State, || {
+                            let mut child = lane
+                                .read_bash_child(&request_id)?
+                                .ok_or("Bash child absent")?;
+                            child.session = lane
+                                .read_session(&child.d_key)?
+                                .ok_or("Bash child D incomplete")?;
+                            lane.require_bash_child(&child, &root, &root_actor, &recipient)?;
+                            Ok::<_, String>(child)
+                        })
+                        .map_err(io::Error::other)?;
                         if child.parent_work_grant_id != parent_work.grant_id()
                             || child.parent_work_id != parent_work.work_id()
                         {
@@ -8523,20 +8623,24 @@ fn serve_fresh_v30_at(
                         ));
                     }
                     if matches!(operation, b'C' | b'X' | b'c') {
-                        lane.register_private_bash_source(&child)
-                            .map_err(io::Error::other)?;
-                        if matches!(operation, b'C' | b'X') {
-                            lane.register_private_bash_listener(
-                                &child,
-                                listener_policy.ok_or_else(|| {
-                                    io::Error::other("fresh Bash C policy absent")
-                                })?,
-                            )
-                            .map_err(io::Error::other)?;
-                        } else {
-                            lane.require_private_bash_listener(&child, None)
+                        phase_record::timed(phase_record::Sub::State, || {
+                            lane.register_private_bash_source(&child)
                                 .map_err(io::Error::other)?;
-                        }
+                            if matches!(operation, b'C' | b'X') {
+                                lane.register_private_bash_listener(
+                                    &child,
+                                    listener_policy.ok_or_else(|| {
+                                        io::Error::other("fresh Bash C policy absent")
+                                    })?,
+                                )
+                                .map(drop)
+                                .map_err(io::Error::other)
+                            } else {
+                                lane.require_private_bash_listener(&child, None)
+                                    .map(drop)
+                                    .map_err(io::Error::other)
+                            }
+                        })?;
                     }
                     match operation {
                         b'v' | b'u' => {
@@ -8922,8 +9026,7 @@ fn serve_fresh_v30_at(
                     // the same D key may finish its State-first admission.
                     let _admission_guard = if operation == b'D' && !instance.is_closed() {
                         if let Some(receipt) = released.as_ref() {
-                            let guard = admission_fences
-                                .lock()
+                            let guard = lock_fences(&admission_fences)
                                 .map_err(|_| io::Error::other("root admission fence poisoned"))?;
                             if guard.contains(&receipt.old_release.prepared.root_id) {
                                 return Err(io::Error::other("exact root admission fenced"));
@@ -9017,8 +9120,7 @@ fn serve_fresh_v30_at(
                                     "fresh root effect entry gate closed",
                                 ));
                             }
-                            let guard = admission_fences
-                                .lock()
+                            let guard = lock_fences(&admission_fences)
                                 .map_err(|_| io::Error::other("root admission fence poisoned"))?;
                             if guard.contains(&receipt.old_release.prepared.root_id) {
                                 return Err(io::Error::other("exact root admission fenced"));
@@ -9093,8 +9195,7 @@ fn serve_fresh_v30_at(
                         if instance.is_closed() {
                             return Err(io::Error::other("normal work preparation gate closed"));
                         }
-                        let guard = admission_fences
-                            .lock()
+                        let guard = lock_fences(&admission_fences)
                             .map_err(|_| io::Error::other("root admission fence poisoned"))?;
                         if guard.contains(&receipt.old_release.prepared.root_id) {
                             return Err(io::Error::other("exact root admission fenced"));
@@ -9162,8 +9263,7 @@ fn serve_fresh_v30_at(
                     lane.require_released_invocation(&receipt, &recipient, &session)
                         .map_err(io::Error::other)?;
                     let selection = if operation == 0x84 {
-                        let guard = admission_fences
-                            .lock()
+                        let guard = lock_fences(&admission_fences)
                             .map_err(|_| io::Error::other("root admission fence poisoned"))?;
                         if guard.contains(&receipt.old_release.prepared.root_id) {
                             return Err(io::Error::other("exact root admission fenced"));
@@ -9310,16 +9410,22 @@ fn serve_fresh_v30_at(
                             io::Error::other("normal entry settlement bridge absent")
                         })?;
                         let (reply, answer) = mpsc::sync_channel(1);
-                        bridge
-                            .send(FreshTerminalBridgeRequest {
-                                root_id: receipt.old_release.prepared.root_id.clone(),
-                                settlement,
-                                reply,
-                            })
-                            .map_err(|_| io::Error::other("normal entry settlement unavailable"))?;
-                        answer
-                            .recv_timeout(RELEASED_HANDOFF_REPLY_TIMEOUT)
-                            .map_err(|_| io::Error::other("normal entry settlement uncertain"))??;
+                        phase_record::timed(phase_record::Sub::Bridge, || {
+                            bridge
+                                .send(FreshTerminalBridgeRequest {
+                                    root_id: receipt.old_release.prepared.root_id.clone(),
+                                    settlement,
+                                    reply,
+                                })
+                                .map_err(|_| {
+                                    io::Error::other("normal entry settlement unavailable")
+                                })?;
+                            answer
+                                .recv_timeout(RELEASED_HANDOFF_REPLY_TIMEOUT)
+                                .map_err(|_| {
+                                    io::Error::other("normal entry settlement uncertain")
+                                })?
+                        })?;
                     }
                     Ok(format!(
                         "fresh-normal-publication {}\n",
@@ -9404,8 +9510,7 @@ fn serve_fresh_v30_at(
                         };
                     }
                     let plan = if operation == 0x86 {
-                        let guard = admission_fences
-                            .lock()
+                        let guard = lock_fences(&admission_fences)
                             .map_err(|_| io::Error::other("root admission fence poisoned"))?;
                         if guard.contains(&receipt.old_release.prepared.root_id) {
                             return Err(io::Error::other("exact root admission fenced"));
@@ -9462,8 +9567,7 @@ fn serve_fresh_v30_at(
                     live.verify()?;
                     if matches!(operation, 0x88 | 0x89 | 0x8a | 0x8b) {
                         let _admission_guard = if matches!(operation, 0x88 | 0x8a) {
-                            let guard = admission_fences
-                                .lock()
+                            let guard = lock_fences(&admission_fences)
                                 .map_err(|_| io::Error::other("root admission fence poisoned"))?;
                             if guard.contains(&receipt.old_release.prepared.root_id) {
                                 return Err(io::Error::other("exact root admission fenced"));
@@ -9669,8 +9773,7 @@ fn serve_fresh_v30_at(
                             | b'~'
                             | b'?'
                     ) {
-                        let guard = admission_fences
-                            .lock()
+                        let guard = lock_fences(&admission_fences)
                             .map_err(|_| io::Error::other("root admission fence poisoned"))?;
                         if guard.contains(&receipt.old_release.prepared.root_id) {
                             return Err(io::Error::other("exact root admission fenced"));
@@ -10531,8 +10634,7 @@ fn serve_fresh_v30_at(
                                     "wake decision differs from pinned D",
                                 ));
                             }
-                            let _guard = admission_fences
-                                .lock()
+                            let _guard = lock_fences(&admission_fences)
                                 .map_err(|_| io::Error::other("root admission fence poisoned"))?;
                             if _guard.contains(&obligation.root_id) {
                                 return Err(io::Error::other("exact root admission fenced"));
@@ -10621,8 +10723,7 @@ fn serve_fresh_v30_at(
                                     "successor start requires one pending W without F/ACK",
                                 ));
                             }
-                            let _fence = admission_fences
-                                .lock()
+                            let _fence = lock_fences(&admission_fences)
                                 .map_err(|_| io::Error::other("root admission fence poisoned"))?;
                             if _fence.contains(&decision.obligation.root_id) {
                                 return Err(io::Error::other("successor start root fenced"));
@@ -10926,8 +11027,7 @@ fn serve_fresh_v30_at(
                             } else {
                                 None
                             };
-                            let _guard = admission_fences
-                                .lock()
+                            let _guard = lock_fences(&admission_fences)
                                 .map_err(|_| io::Error::other("root admission fence poisoned"))?;
                             if _guard.contains(&offered.root_id) {
                                 return Err(io::Error::other("exact root admission fenced"));
@@ -10963,8 +11063,7 @@ fn serve_fresh_v30_at(
                             let admission = lane
                                 .admitted_successor(&offer_request_id, &recipient)
                                 .map_err(io::Error::other)?;
-                            let _guard = admission_fences
-                                .lock()
+                            let _guard = lock_fences(&admission_fences)
                                 .map_err(|_| io::Error::other("root admission fence poisoned"))?;
                             if _guard.contains(&admission.offer.root_id) {
                                 return Err(io::Error::other("exact root admission fenced"));
@@ -11200,8 +11299,7 @@ fn serve_fresh_v30_at(
                                 .ok_or_else(|| {
                                     io::Error::other("fresh Bash notification child absent")
                                 })?;
-                            let _guard = admission_fences
-                                .lock()
+                            let _guard = lock_fences(&admission_fences)
                                 .map_err(|_| io::Error::other("root admission fence poisoned"))?;
                             if _guard.contains(&child.root_id) {
                                 return Err(io::Error::other("exact root admission fenced"));
@@ -11228,8 +11326,7 @@ fn serve_fresh_v30_at(
                             let (root_id, _) = lane
                                 .recipient_binding(&session, &recipient)
                                 .map_err(io::Error::other)?;
-                            let _guard = admission_fences
-                                .lock()
+                            let _guard = lock_fences(&admission_fences)
                                 .map_err(|_| io::Error::other("root admission fence poisoned"))?;
                             if _guard.contains(&root_id) {
                                 return Err(io::Error::other("exact root admission fenced"));
@@ -11332,8 +11429,7 @@ fn serve_fresh_v30_at(
                                 )
                                 .map_err(io::Error::other)?
                                 .ok_or_else(|| io::Error::other("native F delivery absent"))?;
-                            let _guard = admission_fences
-                                .lock()
+                            let _guard = lock_fences(&admission_fences)
                                 .map_err(|_| io::Error::other("root admission fence poisoned"))?;
                             if _guard.contains(&delivery.root_id) {
                                 return Err(io::Error::other("exact root admission fenced"));
@@ -11393,8 +11489,7 @@ fn serve_fresh_v30_at(
                                 .read_native_f_preparation(&preparation_request_id, &recipient)
                                 .map_err(io::Error::other)?
                                 .ok_or_else(|| io::Error::other("native F preparation absent"))?;
-                            let _guard = admission_fences
-                                .lock()
+                            let _guard = lock_fences(&admission_fences)
                                 .map_err(|_| io::Error::other("root admission fence poisoned"))?;
                             if _guard.contains(&prepared.root_id) {
                                 return Err(io::Error::other("exact root admission fenced"));
@@ -11579,157 +11674,51 @@ fn serve_fresh_v30_at(
                 )),
             }
         })();
-        #[cfg(feature = "age319-private-broker-fixture")]
-        if drop_provider_k_reply
-            || drop_native_bash_reply
-            || drop_native_turn_reply
-            || drop_native_f_turn_reply
-            || drop_provider_q_reply
-            || drop_account_effect_reply
-            || drop_route_reply
-            || drop_interactive_k_reply
-            || drop_root_h_reply
-        {
-            if let Some(gate) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1") {
-                let marker = if drop_native_f_turn_reply {
-                    "native-f-turn-reply-dropped"
-                } else if drop_native_turn_reply {
-                    "native-turn-reply-dropped"
-                } else if drop_native_bash_reply {
-                    "native-bash-reply-dropped"
-                } else if drop_root_h_reply {
-                    "root-h-reply-dropped"
-                } else if drop_route_reply {
-                    "route-reply-dropped"
-                } else if drop_provider_k_reply {
-                    "provider-k-reply-dropped"
-                } else if drop_interactive_k_reply {
-                    "interactive-k-reply-dropped"
-                } else if drop_provider_q_reply {
-                    "provider-q-reply-dropped"
-                } else {
-                    "account-effect-reply-dropped"
-                };
-                fs::write(Path::new(&gate).join(marker), b"yes")?;
-            }
-            continue;
+        record.handler_end = phase_record::mono_ns();
+        record.sub = phase_record::take_sub();
+        if record.opcode.is_none() {
+            record.read_done();
         }
         #[cfg(feature = "age319-private-broker-fixture")]
-        if answer.is_ok() && private_fixture() {
-            let phase = match diagnostic_opcode {
-                b'X' => Some("c"),
-                b'^' => Some("k"),
-                b'%' => Some("w"),
-                b'v' => Some("sync-begin"),
-                _ => None,
-            };
-            if let (Some(phase), Some(gate)) = (
-                phase,
-                std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1"),
-            ) {
-                let gate = Path::new(&gate);
-                let armed = gate.join(format!("featureless-bash-drop-{phase}"));
-                if armed.exists() {
-                    fs::remove_file(&armed)?;
-                    fs::write(
-                        gate.join(format!("featureless-bash-dropped-{phase}")),
-                        b"yes",
-                    )?;
-                    continue;
-                }
-            }
-        }
-        let response = answer.unwrap_or_else(|error| {
-            eprintln!(
-                "oulipoly broker request error: opcode={} stage={} key_sha256={} kind={:?} os_error={:?}",
-                diagnostic_opcode as char,
-                diagnostic_stage,
-                {
-                    #[cfg(feature = "age319-private-broker-fixture")]
-                    { diagnostic_key_hash.as_str() }
-                    #[cfg(not(feature = "age319-private-broker-fixture"))]
-                    { "unavailable" }
-                },
-                error.kind(),
-                error.raw_os_error()
-            );
-            let wire: String = error
-                .to_string()
-                .chars()
-                .filter(|ch| !ch.is_control())
-                .take(240)
-                .collect();
-            format!("error {wire}\n")
-        });
-        #[cfg(feature = "age319-private-broker-fixture")]
-        if diagnostic_opcode == b'v'
-            && provider_output_files.is_some()
-            && std::env::var_os("AGE319_PRIVATE_SYNC_PARTIAL_SOCKET_REPLY_V1").is_some()
-        {
-            let _ = stream.write_all(&response.as_bytes()[..response.len().min(16)]);
-            continue;
-        }
-        if let Some(files) = provider_output_files {
-            let fds: Vec<_> = files.iter().map(AsRawFd::as_raw_fd).collect();
-            let mut iov = libc::iovec {
-                iov_base: response.as_ptr().cast_mut().cast(),
-                iov_len: response.len(),
-            };
-            let mut control = [0u8; 64];
-            let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-            msg.msg_iov = &mut iov;
-            msg.msg_iovlen = 1;
-            msg.msg_control = control.as_mut_ptr().cast();
-            msg.msg_controllen =
-                unsafe { libc::CMSG_SPACE(std::mem::size_of_val(fds.as_slice()) as _) } as usize;
-            unsafe {
-                let header = libc::CMSG_FIRSTHDR(&msg);
-                (*header).cmsg_level = libc::SOL_SOCKET;
-                (*header).cmsg_type = libc::SCM_RIGHTS;
-                (*header).cmsg_len =
-                    libc::CMSG_LEN(std::mem::size_of_val(fds.as_slice()) as _) as usize;
-                std::ptr::copy_nonoverlapping(
-                    fds.as_ptr(),
-                    libc::CMSG_DATA(header).cast(),
-                    fds.len(),
-                );
-                let sent = libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL);
-                if sent != response.len() as isize {
-                    eprintln!(
-                        "oulipoly broker descriptor reply incomplete: opcode={} sent={sent}",
-                        diagnostic_opcode as char
-                    );
-                }
-            }
-            continue;
-        }
-        let write = stream.write_all(response.as_bytes());
-        if matches!(
-            diagnostic_opcode,
-            b'C' | b'c' | b'E' | b'O' | b'%' | b'&' | b'!'
-        ) {
-            eprintln!(
-                "oulipoly broker reply: opcode={} bytes={} newline={} prefix={} write={}",
-                diagnostic_opcode as char,
-                response.len(),
-                response.ends_with('\n'),
-                if response.starts_with("error ") {
-                    "error"
-                } else {
-                    "success"
-                },
-                if write.is_ok() { "ok" } else { "error" }
-            );
-            if let Err(error) = &write {
-                eprintln!(
-                    "oulipoly broker reply write error: opcode={} kind={:?} os_error={:?}",
-                    diagnostic_opcode as char,
-                    error.kind(),
-                    error.raw_os_error()
-                );
-            }
-        }
-        if write.is_ok() {
+        let drop_marker = if drop_native_f_turn_reply {
+            Some("native-f-turn-reply-dropped")
+        } else if drop_native_turn_reply {
+            Some("native-turn-reply-dropped")
+        } else if drop_native_bash_reply {
+            Some("native-bash-reply-dropped")
+        } else if drop_root_h_reply {
+            Some("root-h-reply-dropped")
+        } else if drop_route_reply {
+            Some("route-reply-dropped")
+        } else if drop_provider_k_reply {
+            Some("provider-k-reply-dropped")
+        } else if drop_interactive_k_reply {
+            Some("interactive-k-reply-dropped")
+        } else if drop_provider_q_reply {
+            Some("provider-q-reply-dropped")
+        } else if drop_account_effect_reply {
+            Some("account-effect-reply-dropped")
+        } else {
+            None
+        };
+        #[cfg(not(feature = "age319-private-broker-fixture"))]
+        let drop_marker = {
+            let _ = drop_route_reply;
+            None
+        };
+        let wrote = finish_fresh_v30_reply(
+            &mut stream,
+            answer,
+            FreshReplyDiagnostic {
+                opcode: diagnostic_opcode,
+                stage: diagnostic_stage,
+                key_hash: &diagnostic_key_hash,
+            },
+            provider_output_files,
+            drop_marker,
+            &mut record,
+        )?;
+        if wrote {
             if let Some(grant_id) = submitted_grant {
                 let _ = lane.mark_recipient_submitted(&grant_id);
             }
@@ -11739,6 +11728,159 @@ fn serve_fresh_v30_at(
         }
     }
     Ok(())
+}
+
+struct FreshReplyDiagnostic<'a> {
+    opcode: u8,
+    stage: &'static str,
+    #[cfg_attr(
+        not(feature = "age319-private-broker-fixture"),
+        allow(dead_code, reason = "key hashes are journaled by private builds only")
+    )]
+    key_hash: &'a str,
+}
+
+/// Writes one v30 reply, after any private reply drop, and records it.
+/// Returns whether an ordinary reply write succeeded; only then may the
+/// caller mark a submitted grant.
+fn finish_fresh_v30_reply(
+    stream: &mut UnixStream,
+    answer: io::Result<String>,
+    diagnostic: FreshReplyDiagnostic<'_>,
+    provider_output_files: Option<Vec<File>>,
+    drop_marker: Option<&'static str>,
+    record: &mut phase_record::Request,
+) -> io::Result<bool> {
+    let diagnostic_opcode = diagnostic.opcode;
+    let diagnostic_stage = diagnostic.stage;
+    record.ok = answer.is_ok();
+    if let Some(marker) = drop_marker {
+        if let Some(gate) = std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1") {
+            fs::write(Path::new(&gate).join(marker), b"yes")?;
+        }
+        record.emit();
+        return Ok(false);
+    }
+    #[cfg(feature = "age319-private-broker-fixture")]
+    if answer.is_ok() && private_fixture() {
+        let phase = match diagnostic_opcode {
+            b'X' => Some("c"),
+            b'^' => Some("k"),
+            b'%' => Some("w"),
+            b'v' => Some("sync-begin"),
+            _ => None,
+        };
+        if let (Some(phase), Some(gate)) = (
+            phase,
+            std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1"),
+        ) {
+            let gate = Path::new(&gate);
+            let armed = gate.join(format!("featureless-bash-drop-{phase}"));
+            if armed.exists() {
+                fs::remove_file(&armed)?;
+                fs::write(
+                    gate.join(format!("featureless-bash-dropped-{phase}")),
+                    b"yes",
+                )?;
+                record.emit();
+                return Ok(false);
+            }
+        }
+    }
+    let response = answer.unwrap_or_else(|error| {
+        eprintln!(
+            "oulipoly broker request error: opcode={} stage={} key_sha256={} kind={:?} os_error={:?}",
+            diagnostic_opcode as char,
+            diagnostic_stage,
+            {
+                #[cfg(feature = "age319-private-broker-fixture")]
+                { diagnostic.key_hash }
+                #[cfg(not(feature = "age319-private-broker-fixture"))]
+                { "unavailable" }
+            },
+            error.kind(),
+            error.raw_os_error()
+        );
+        let wire: String = error
+            .to_string()
+            .chars()
+            .filter(|ch| !ch.is_control())
+            .take(240)
+            .collect();
+        format!("error {wire}\n")
+    });
+    record.reply_bytes = response.len() as u64;
+    #[cfg(feature = "age319-private-broker-fixture")]
+    if diagnostic_opcode == b'v'
+        && provider_output_files.is_some()
+        && std::env::var_os("AGE319_PRIVATE_SYNC_PARTIAL_SOCKET_REPLY_V1").is_some()
+    {
+        let _ = stream.write_all(&response.as_bytes()[..response.len().min(16)]);
+        record.reply_written = phase_record::mono_ns();
+        record.emit();
+        return Ok(false);
+    }
+    if let Some(files) = provider_output_files {
+        let fds: Vec<_> = files.iter().map(AsRawFd::as_raw_fd).collect();
+        let mut iov = libc::iovec {
+            iov_base: response.as_ptr().cast_mut().cast(),
+            iov_len: response.len(),
+        };
+        let mut control = [0u8; 64];
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr().cast();
+        msg.msg_controllen =
+            unsafe { libc::CMSG_SPACE(std::mem::size_of_val(fds.as_slice()) as _) } as usize;
+        unsafe {
+            let header = libc::CMSG_FIRSTHDR(&msg);
+            (*header).cmsg_level = libc::SOL_SOCKET;
+            (*header).cmsg_type = libc::SCM_RIGHTS;
+            (*header).cmsg_len =
+                libc::CMSG_LEN(std::mem::size_of_val(fds.as_slice()) as _) as usize;
+            std::ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(header).cast(), fds.len());
+            let sent = libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL);
+            if sent != response.len() as isize {
+                eprintln!(
+                    "oulipoly broker descriptor reply incomplete: opcode={} sent={sent}",
+                    diagnostic_opcode as char
+                );
+            }
+        }
+        record.reply_written = phase_record::mono_ns();
+        record.emit();
+        return Ok(false);
+    }
+    let write = stream.write_all(response.as_bytes());
+    record.reply_written = phase_record::mono_ns();
+    if matches!(
+        diagnostic_opcode,
+        b'C' | b'c' | b'E' | b'O' | b'%' | b'&' | b'!'
+    ) {
+        eprintln!(
+            "oulipoly broker reply: opcode={} bytes={} newline={} prefix={} write={}",
+            diagnostic_opcode as char,
+            response.len(),
+            response.ends_with('\n'),
+            if response.starts_with("error ") {
+                "error"
+            } else {
+                "success"
+            },
+            if write.is_ok() { "ok" } else { "error" }
+        );
+        if let Err(error) = &write {
+            eprintln!(
+                "oulipoly broker reply write error: opcode={} kind={:?} os_error={:?}",
+                diagnostic_opcode as char,
+                error.kind(),
+                error.raw_os_error()
+            );
+        }
+    }
+    record.emit();
+    Ok(write.is_ok())
 }
 
 pub fn run() {

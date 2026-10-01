@@ -218,6 +218,18 @@ impl RootRegistry {
                 }
                 continue;
             }
+            // Phase timing records are diagnostics only, never root records.
+            if name == crate::phase_record::DIRECTORY {
+                let meta = fs::symlink_metadata(entry.path())?;
+                if !meta.is_dir()
+                    || meta.file_type().is_symlink()
+                    || meta.uid() != 0
+                    || meta.mode() & 0o777 != 0o700
+                {
+                    return Err(io::Error::other("unsafe phase record directory"));
+                }
+                continue;
+            }
             // EntryGate::open validated these exact files and holds the
             // singleton lock before this registry scan. Unknown files still
             // stop recovery rather than being mistaken for root records.

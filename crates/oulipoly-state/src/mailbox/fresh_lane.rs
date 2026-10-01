@@ -2838,7 +2838,10 @@ impl FreshV30Lane {
         if state.path() != self.state_path {
             return Err("fresh State path changed".into());
         }
-        Connection::open_with_flags(&self.state_path, flags).map_err(|e| e.to_string())
+        let connection =
+            Connection::open_with_flags(&self.state_path, flags).map_err(|e| e.to_string())?;
+        crate::sqlite_wait::install(&connection).map_err(|e| e.to_string())?;
+        Ok(connection)
     }
 
     fn read_state_admission_on(
