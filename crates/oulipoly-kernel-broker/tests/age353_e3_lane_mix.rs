@@ -200,6 +200,16 @@ fn age353_e3_concurrent_bash_calls_beside_looping_clients() {
         br#"#!/bin/sh
 export OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1="$AGE319_BASH_CONTROL_SOCKET"
 printf ready > "$E3_READY_FILE"
+# Used-like history roots end in a failure, a crash, an unsettled Bash child
+# or an abandoned caller instead of the timed call.
+case "${E3_MODE:-}" in
+fail) exit 3 ;;
+crash) kill -9 $$ ;;
+unsettled)
+  "$AGE319_BASH_IMAGE" run --delivery async -- /bin/sh -c 'while [ ! -f "$E3_NEVER_FILE" ]; do sleep 0.2; done' > /dev/null 2>&1
+  exit 0 ;;
+abandon) while :; do sleep 1; done ;;
+esac
 while [ ! -f "$E3_GO_FILE" ]; do sleep 0.02; done
 sleep "$E3_STAGGER"
 start=$(date +%s%N)
@@ -437,6 +447,108 @@ while [ ! -f "$E3_PROVIDER_RELEASE_FILE" ]; do sleep 0.02; done
         assert_eq!(dispatch["dispatch_state"], "broker-k-consumed");
     }
     assert_eq!(fs::read_to_string(&effect).unwrap().lines().count(), roots);
+
+    // Main's no-pending baseline: an isolated period with no test traffic
+    // and every launched root settled, then (optionally) one bounded attempt
+    // at used-like history through the same product paths, followed by a
+    // second isolated period. Neither phase asserts a Main outcome.
+    let baseline_s: f64 = std::env::var("AGE353_E3_MAIN_BASELINE_S")
+        .map(|value| value.parse().unwrap())
+        .unwrap_or(0.0);
+    let mut periods = Vec::new();
+    let mut used_like = serde_json::Value::Null;
+    if baseline_s > 0.0 {
+        let isolated = |name: &str| {
+            let from = phase_record::mono_ns();
+            std::thread::sleep(Duration::from_secs_f64(baseline_s));
+            (name.to_owned(), from, phase_record::mono_ns())
+        };
+        periods.push(isolated("settled"));
+        if std::env::var_os("AGE353_E3_USED_LIKE").is_some() {
+            let modes = ["fail", "crash", "unsettled", "abandon"];
+            let mut extra = Vec::new();
+            let constructed_from = phase_record::mono_ns();
+            for (index, mode) in modes.iter().enumerate() {
+                let tag = format!("used-{index}-{mode}");
+                let ready = temp.path().join(format!("{tag}-ready"));
+                let child = Command::new(&launcher)
+                    .args(["--model", "fixture-model", "hello e3 used"])
+                    .current_dir(temp.path())
+                    .env_clear()
+                    .env("HOME", temp.path())
+                    .env("PATH", "/usr/bin:/bin")
+                    .env("OULIPOLY_CONFIG_HOME", &config_home)
+                    .env("OULIPOLY_DATA_DIR", temp.path().join(format!("data-{tag}")))
+                    .env("AGE319_BASH_IMAGE", &bash)
+                    .env("AGE319_BASH_CONTROL_SOCKET", &socket)
+                    .env("E3_MODE", mode)
+                    .env("E3_READY_FILE", &ready)
+                    .env("E3_NEVER_FILE", temp.path().join("never"))
+                    .env("OULIPOLY_KERNEL_BROKER_FIXTURE_PAIR_V1", &manifest)
+                    .env("OULIPOLY_KERNEL_BROKER_FIXTURE_LAUNCHER_V1", &launcher)
+                    .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)
+                    .env(
+                        "OULIPOLY_AGE319_PRIVATE_REQUEST_ID_V1",
+                        uuid::Uuid::new_v4().to_string(),
+                    )
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::from(
+                        File::create(temp.path().join(format!("{tag}.err"))).unwrap(),
+                    ))
+                    .spawn()
+                    .unwrap();
+                extra.push((*mode, child, ready));
+            }
+            // Bounded: each launch either reaches its provider or exits.
+            let bound = Instant::now() + Duration::from_secs(120);
+            let mut outcomes = Vec::new();
+            for (mode, child, ready) in extra.iter_mut() {
+                while !ready.exists()
+                    && child.try_wait().unwrap().is_none()
+                    && Instant::now() < bound
+                {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                let reached_provider = ready.exists();
+                if *mode == "abandon" && reached_provider {
+                    // The caller disappears while its provider holds.
+                    let _ = child.kill();
+                }
+                let status = loop {
+                    if let Some(status) = child.try_wait().unwrap() {
+                        break Some(status);
+                    }
+                    if Instant::now() >= bound {
+                        break None;
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                };
+                outcomes.push(serde_json::json!({
+                    "mode": mode,
+                    "reached_provider": reached_provider,
+                    "launcher_exit": status.and_then(|status| status.code()),
+                    "launcher_signal": status.and_then(|status| {
+                        std::os::unix::process::ExitStatusExt::signal(&status)
+                    }),
+                    "launcher_still_running_at_bound": status.is_none(),
+                }));
+            }
+            let constructed_to = phase_record::mono_ns();
+            // Let any immediate settlement run before the second period.
+            std::thread::sleep(Duration::from_secs(3));
+            periods.push(isolated("used-like"));
+            used_like = serde_json::json!({
+                "constructed_from": constructed_from,
+                "constructed_to": constructed_to,
+                "roots": outcomes,
+            });
+            // Launchers still running are this fixture's own; end them.
+            for (_, child, _) in extra.iter_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
     broker.kill().unwrap();
     broker.wait().unwrap();
     // A Broker built before phase records still runs the same mix.
@@ -449,8 +561,14 @@ while [ ! -f "$E3_PROVIDER_RELEASE_FILE" ]; do sleep 0.02; done
         return;
     }
 
-    let records = phase_record::read_all(&state).unwrap();
-    let summary = summarize(&records, &calls, traffic_counts.load(Ordering::Relaxed));
+    let (records, skipped) = phase_record::read_all_counted(&state).unwrap();
+    let mut summary = summarize(&records, &calls, traffic_counts.load(Ordering::Relaxed));
+    summary["totals"]["skipped_record_lines"] = skipped.into();
+    summary["main_periods"] = periods
+        .iter()
+        .map(|(name, from, to)| main_period(&records, name, *from, *to))
+        .collect();
+    summary["used_like"] = used_like;
     fs::create_dir_all(&output).unwrap();
     let label = std::env::var("AGE353_E3_LABEL").unwrap_or_else(|_| "run".into());
     fs::write(
@@ -490,6 +608,79 @@ fn num(value: &serde_json::Value, key: &str) -> u64 {
 
 fn seconds(ns: u64) -> f64 {
     ns as f64 / 1e9
+}
+
+/// One sub-phase split into this thread's CPU, its measured shared waits and
+/// the off-CPU remainder they do not name (I/O, commit/fsync, run-queue,
+/// unmeasured SQLite busy on sidecar and direct State connections, other
+/// locks). The remainder is signed: a measured wait may include some spin.
+fn split(request: &serde_json::Value, phase: &str) -> serde_json::Value {
+    let whole = num(request, phase) as i64;
+    let cpu = num(request, &format!("{phase}_cpu")) as i64;
+    let busy = num(request, &format!("{phase}_busy")) as i64;
+    let hist = num(request, &format!("{phase}_hist")) as i64;
+    serde_json::json!({
+        "whole_s": whole as f64 / 1e9,
+        "own_cpu_s": cpu as f64 / 1e9,
+        "history_mutex_wait_s": hist as f64 / 1e9,
+        "sqlite_busy_measured_s": busy as f64 / 1e9,
+        "off_cpu_unattributed_s": (whole - cpu - busy - hist) as f64 / 1e9,
+    })
+}
+
+/// Main windows wholly inside one isolated period, and any request recorded
+/// in it. Windows are emitted after full iterations, so edges are excluded.
+fn main_period(records: &[serde_json::Value], name: &str, from: u64, to: u64) -> serde_json::Value {
+    let windows: Vec<_> = records
+        .iter()
+        .filter(|record| {
+            record["k"] == "main" && num(record, "from") >= from && num(record, "to") <= to
+        })
+        .collect();
+    let requests = records
+        .iter()
+        .filter(|record| {
+            record["k"] == "req" && num(record, "acc") >= from && num(record, "acc") <= to
+        })
+        .count();
+    let sum = |key: &str| windows.iter().map(|window| num(window, key)).sum::<u64>();
+    let covered = windows
+        .iter()
+        .map(|window| num(window, "to") - num(window, "from"))
+        .sum::<u64>();
+    let busy = sum("reap") + sum("bridge") + sum("advance") + sum("control") + sum("idle_duty");
+    serde_json::json!({
+        "period": name,
+        "span_s": seconds(to - from),
+        "windows": windows.len(),
+        "covered_s": seconds(covered),
+        "requests_recorded": requests,
+        "windows_without_control_or_bridge": windows
+            .iter()
+            .filter(|window| num(window, "control_n") == 0 && num(window, "bridge_n") == 0)
+            .count(),
+        "iterations": sum("it"),
+        "busy_s": seconds(busy),
+        "busy_share": busy as f64 / covered.max(1) as f64,
+        "advance_s": seconds(sum("advance")),
+        "advance_cpu_s": seconds(sum("advance_cpu")),
+        "advance_n": sum("advance_n"),
+        "idle_duty_s": seconds(sum("idle_duty")),
+        "idle_duty_cpu_s": seconds(sum("idle_duty_cpu")),
+        "idle_sleep_s": seconds(sum("idle_sleep")),
+        "fence_write_wait_s": seconds(sum("fence_w")),
+        "history_wait_s": seconds(sum("hist_w")),
+        "control_n": sum("control_n"),
+        "bridge_n": sum("bridge_n"),
+        "pending_entries_summed": sum("adv_pending"),
+        "pending_entries_max": windows
+            .iter()
+            .map(|window| num(window, "adv_pending_max"))
+            .max()
+            .unwrap_or(0),
+        "advance_readbacks": sum("adv_readback"),
+        "advance_effect_passes": sum("adv_acted"),
+    })
 }
 
 /// Joins each provider-timed Bash call with its four recorded connections
@@ -600,6 +791,13 @@ fn summarize(
                 "bridge_wait_s": seconds(num(request, "bridge")),
                 "state_s": seconds(num(request, "state")),
                 "sqlite_busy_s": seconds(num(request, "sqlite_busy")),
+                "history_wait_s": seconds(num(request, "hist")),
+                "handler_cpu_s": seconds(num(request, "cpu")),
+                "handler_off_cpu_s": seconds(handler.saturating_sub(num(request, "cpu"))),
+                "voluntary_switches": request["vcsw"],
+                "involuntary_switches": request["ivcsw"],
+                "parent_split": split(request, "parent"),
+                "state_split": split(request, "state"),
             }));
             previous_end = num(request, "rw");
         }
@@ -658,13 +856,27 @@ fn summarize(
         "control",
         "idle_duty",
         "idle_sleep",
+        "advance_cpu",
+        "idle_duty_cpu",
+        "fence_w",
+        "hist_w",
     ] {
         main.insert(
             key,
             seconds(windows.iter().map(|window| num(window, key)).sum()),
         );
     }
-    for key in ["it", "bridge_n", "advance_n", "control_n", "idle_n"] {
+    for key in [
+        "it",
+        "bridge_n",
+        "advance_n",
+        "control_n",
+        "idle_n",
+        "fence_wn",
+        "adv_pending",
+        "adv_readback",
+        "adv_acted",
+    ] {
         main.insert(
             key,
             windows.iter().map(|window| num(window, key)).sum::<u64>() as f64,

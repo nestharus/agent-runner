@@ -50,6 +50,24 @@ pub fn wall_ns() -> u64 {
     clock(libc::CLOCK_REALTIME)
 }
 
+/// CPU time this thread has run, in nanoseconds. Wall time minus this is
+/// time the thread spent off CPU: blocked (locks, I/O, commit/fsync, sleeps)
+/// or runnable but waiting for a CPU.
+pub fn thread_cpu_ns() -> u64 {
+    clock(libc::CLOCK_THREAD_CPUTIME_ID)
+}
+
+/// Voluntary and involuntary context switches of this thread so far. A
+/// count, not a time: many involuntary switches mean the thread was
+/// preempted while runnable; voluntary ones mean it blocked.
+fn thread_switches() -> (u64, u64) {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut usage) } != 0 {
+        return (0, 0);
+    }
+    (usage.ru_nvcsw as u64, usage.ru_nivcsw as u64)
+}
+
 /// Opens this incarnation's record file once. Failure leaves recording off
 /// and is returned for the caller to report; it never blocks serving.
 pub fn init(state_root: &Path) -> io::Result<PathBuf> {
@@ -136,6 +154,8 @@ pub enum Sub {
     Bridge,
     /// Durable State calls on the Bash path (commit and its waits).
     State,
+    /// Waiting to acquire the shared per-State-root closed-history mutex.
+    History,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -150,10 +170,27 @@ pub struct SubPhases {
     pub bridge_n: u32,
     pub state_ns: u64,
     pub sqlite_busy_ns: u64,
+    pub hist_ns: u64,
+    pub hist_n: u32,
+    /// Split of `parent` and `state`: this thread's CPU time inside them,
+    /// and the measured shared-serialization waits inside them. The rest of
+    /// each is off-CPU time not attributed to a named wait.
+    pub parent_cpu_ns: u64,
+    pub parent_busy_ns: u64,
+    pub parent_hist_ns: u64,
+    pub state_cpu_ns: u64,
+    pub state_busy_ns: u64,
+    pub state_hist_ns: u64,
+    /// The whole request on this thread: CPU time and context switches.
+    pub cpu_ns: u64,
+    pub vcsw: u64,
+    pub ivcsw: u64,
 }
 
 thread_local! {
     static SUBS: RefCell<SubPhases> = RefCell::new(SubPhases::default());
+    /// CPU time and context switches when this thread's request began.
+    static BEGUN: Cell<(u64, u64, u64)> = const { Cell::new((0, 0, 0)) };
     static CHALLENGE: Cell<u64> = const { Cell::new(0) };
     static RECEIVED: Cell<(u64, u64, u32)> = const { Cell::new((0, 0, 0)) };
 }
@@ -176,8 +213,16 @@ pub fn add(kind: Sub, ns: u64) {
                 subs.bridge_n += 1;
             }
             Sub::State => subs.state_ns += ns,
+            Sub::History => {
+                subs.hist_ns += ns;
+                subs.hist_n += 1;
+            }
         }
     });
+}
+
+fn hist_so_far() -> u64 {
+    SUBS.with(|subs| subs.borrow().hist_ns)
 }
 
 pub fn add_accounted_entries(count: usize) {
@@ -185,9 +230,40 @@ pub fn add_accounted_entries(count: usize) {
 }
 
 pub fn timed<T>(kind: Sub, work: impl FnOnce() -> T) -> T {
+    // Parent and State also split their time into own CPU and the measured
+    // shared waits inside them.
+    // The CPU reads sit inside the wall interval. A measured wait can still
+    // include a little CPU (a lock's spin), so the unattributed remainder is
+    // approximate to that extent.
+    let split = matches!(kind, Sub::Parent | Sub::State);
     let start = mono_ns();
+    let before = split.then(|| {
+        (
+            thread_cpu_ns(),
+            oulipoly_state::sqlite_wait::thread_wait_ns(),
+            hist_so_far(),
+        )
+    });
     let result = work();
+    let cpu_end = split.then(thread_cpu_ns);
     add(kind, mono_ns().saturating_sub(start));
+    if let (Some((cpu, busy, hist)), Some(cpu_end)) = (before, cpu_end) {
+        let cpu = cpu_end.saturating_sub(cpu);
+        let busy = oulipoly_state::sqlite_wait::thread_wait_ns().saturating_sub(busy);
+        let hist = hist_so_far().saturating_sub(hist);
+        SUBS.with(|subs| {
+            let mut subs = subs.borrow_mut();
+            if matches!(kind, Sub::Parent) {
+                subs.parent_cpu_ns += cpu;
+                subs.parent_busy_ns += busy;
+                subs.parent_hist_ns += hist;
+            } else {
+                subs.state_cpu_ns += cpu;
+                subs.state_busy_ns += busy;
+                subs.state_hist_ns += hist;
+            }
+        });
+    }
     result
 }
 
@@ -195,18 +271,35 @@ pub fn timed<T>(kind: Sub, work: impl FnOnce() -> T) -> T {
 pub fn begin_request() {
     SUBS.with(|subs| *subs.borrow_mut() = SubPhases::default());
     let _ = oulipoly_state::sqlite_wait::take_thread_wait_ns();
+    let (voluntary, involuntary) = thread_switches();
+    BEGUN.with(|begun| begun.set((thread_cpu_ns(), voluntary, involuntary)));
 }
 
 pub fn take_sub() -> SubPhases {
     let mut subs = SUBS.with(|subs| std::mem::take(&mut *subs.borrow_mut()));
     subs.sqlite_busy_ns = oulipoly_state::sqlite_wait::take_thread_wait_ns();
+    let (cpu, voluntary, involuntary) = BEGUN.with(|begun| begun.replace((0, 0, 0)));
+    if cpu > 0 {
+        let (now_voluntary, now_involuntary) = thread_switches();
+        subs.cpu_ns = thread_cpu_ns().saturating_sub(cpu);
+        subs.vcsw = now_voluntary.saturating_sub(voluntary);
+        subs.ivcsw = now_involuntary.saturating_sub(involuntary);
+    }
     subs
 }
 
+/// Takes the waits accumulated on this thread outside a request (Main's
+/// bridge and advance work), leaving no request state behind.
+pub fn take_untracked_waits() -> (u64, u32, u64) {
+    let subs = SUBS.with(|subs| std::mem::take(&mut *subs.borrow_mut()));
+    let _ = oulipoly_state::sqlite_wait::take_thread_wait_ns();
+    (subs.fence_ns, subs.fence_n, subs.hist_ns)
+}
+
 /// Records which thread held the root admission fences, and for how long,
-/// when a hold could delay another request (20 ms or more).
-pub fn fence_held(acquired: u64) {
-    let released = mono_ns();
+/// when a hold could delay another request (20 ms or more). Called after the
+/// guard is released, with the release time.
+pub fn fence_held(acquired: u64, released: u64) {
     if released.saturating_sub(acquired) < 20_000_000 || RECORDER.get().is_none() {
         return;
     }
@@ -331,7 +424,7 @@ impl Request {
         }
         let s = &self.sub;
         emit(format!(
-            "{{\"k\":\"req\",\"lane\":\"{}\",\"seq\":{},\"op\":{},\"acc\":{},\"chl\":{},\"rcv\":{},\"rb\":{},\"fds\":{},\"pid\":{},\"st\":{},\"uid\":{},\"img\":\"{}\",\"rt\":{},\"hs\":{},\"he\":{},\"rw\":{},\"wb\":{},\"ok\":{},\"parent\":{},\"parent_n\":{},\"acct\":{},\"acct_entries\":{},\"fence\":{},\"fence_n\":{},\"bridge\":{},\"bridge_n\":{},\"state\":{},\"sqlite_busy\":{}}}",
+            "{{\"k\":\"req\",\"lane\":\"{}\",\"seq\":{},\"op\":{},\"acc\":{},\"chl\":{},\"rcv\":{},\"rb\":{},\"fds\":{},\"pid\":{},\"st\":{},\"uid\":{},\"img\":\"{}\",\"rt\":{},\"hs\":{},\"he\":{},\"rw\":{},\"wb\":{},\"ok\":{},\"parent\":{},\"parent_n\":{},\"acct\":{},\"acct_entries\":{},\"fence\":{},\"fence_n\":{},\"bridge\":{},\"bridge_n\":{},\"state\":{},\"sqlite_busy\":{},\"hist\":{},\"hist_n\":{},\"parent_cpu\":{},\"parent_busy\":{},\"parent_hist\":{},\"state_cpu\":{},\"state_busy\":{},\"state_hist\":{},\"cpu\":{},\"vcsw\":{},\"ivcsw\":{}}}",
             self.lane,
             self.seq,
             self.opcode.map_or(-1, i32::from),
@@ -360,12 +453,24 @@ impl Request {
             s.bridge_n,
             s.state_ns,
             s.sqlite_busy_ns,
+            s.hist_ns,
+            s.hist_n,
+            s.parent_cpu_ns,
+            s.parent_busy_ns,
+            s.parent_hist_ns,
+            s.state_cpu_ns,
+            s.state_busy_ns,
+            s.state_hist_ns,
+            s.cpu_ns,
+            s.vcsw,
+            s.ivcsw,
         ));
     }
 }
 
 /// Main-loop time shares over a short window. Every iteration's time lands
 /// in exactly one bucket, so the buckets sum to the window's covered time.
+/// The remaining fields are nested inside those buckets, not added to them.
 #[derive(Default)]
 pub struct MainWindow {
     start: u64,
@@ -380,6 +485,49 @@ pub struct MainWindow {
     pub idle_duty_ns: u64,
     pub idle_sleep_ns: u64,
     pub idle_n: u64,
+    /// Main's own CPU time inside `advance` and `idle_duty`.
+    pub advance_cpu_ns: u64,
+    pub idle_duty_cpu_ns: u64,
+    /// Main's wait for the exclusive side of the admission fences and for
+    /// the closed-history mutex outside control requests (inside `bridge`,
+    /// `advance` and `idle_duty`).
+    pub fence_wait_ns: u64,
+    pub fence_wait_n: u64,
+    pub hist_wait_ns: u64,
+    /// Pending logical duties seen by the owner-close advance: entries it
+    /// still had to examine (summed over passes, and the largest pass), how
+    /// many reached the drain readback, and passes that made an effect.
+    pub adv_pending: u64,
+    pub adv_pending_max: u64,
+    pub adv_readback: u64,
+    pub adv_acted: u64,
+}
+
+/// What one owner-close advance pass found. Counts only; it never steers
+/// the pass.
+#[derive(Default, Clone, Copy)]
+pub struct AdvanceScan {
+    pub pending: u64,
+    pub readback: u64,
+    pub acted: bool,
+}
+
+impl MainWindow {
+    /// Folds one advance pass into the window.
+    pub fn advance_scanned(&mut self, scan: AdvanceScan) {
+        self.adv_pending += scan.pending;
+        self.adv_pending_max = self.adv_pending_max.max(scan.pending);
+        self.adv_readback += scan.readback;
+        self.adv_acted += u64::from(scan.acted);
+    }
+
+    /// Folds Main's untracked fence and history waits since the last call.
+    pub fn untracked_waits(&mut self) {
+        let (fence, fence_n, hist) = take_untracked_waits();
+        self.fence_wait_ns += fence;
+        self.fence_wait_n += u64::from(fence_n);
+        self.hist_wait_ns += hist;
+    }
 }
 
 const MAIN_WINDOW_NS: u64 = 500_000_000;
@@ -401,7 +549,7 @@ impl MainWindow {
         }
         if RECORDER.get().is_some() {
             emit(format!(
-                "{{\"k\":\"main\",\"from\":{},\"to\":{now},\"wall_ns\":{},\"it\":{},\"reap\":{},\"bridge\":{},\"bridge_n\":{},\"advance\":{},\"advance_n\":{},\"control\":{},\"control_n\":{},\"idle_duty\":{},\"idle_sleep\":{},\"idle_n\":{}}}",
+                "{{\"k\":\"main\",\"from\":{},\"to\":{now},\"wall_ns\":{},\"it\":{},\"reap\":{},\"bridge\":{},\"bridge_n\":{},\"advance\":{},\"advance_n\":{},\"control\":{},\"control_n\":{},\"idle_duty\":{},\"idle_sleep\":{},\"idle_n\":{},\"advance_cpu\":{},\"idle_duty_cpu\":{},\"fence_w\":{},\"fence_wn\":{},\"hist_w\":{},\"adv_pending\":{},\"adv_pending_max\":{},\"adv_readback\":{},\"adv_acted\":{}}}",
                 self.start,
                 wall_ns(),
                 self.iterations,
@@ -415,6 +563,15 @@ impl MainWindow {
                 self.idle_duty_ns,
                 self.idle_sleep_ns,
                 self.idle_n,
+                self.advance_cpu_ns,
+                self.idle_duty_cpu_ns,
+                self.fence_wait_ns,
+                self.fence_wait_n,
+                self.hist_wait_ns,
+                self.adv_pending,
+                self.adv_pending_max,
+                self.adv_readback,
+                self.adv_acted,
             ));
         }
         *self = Self {
@@ -426,6 +583,12 @@ impl MainWindow {
 
 /// Reads every record file under a State root without the Broker.
 pub fn read_all(state_root: &Path) -> io::Result<Vec<serde_json::Value>> {
+    read_all_counted(state_root).map(|(records, _)| records)
+}
+
+/// As [`read_all`], also counting lines that did not parse (a torn tail or
+/// a damaged record), which `read_all` skips.
+pub fn read_all_counted(state_root: &Path) -> io::Result<(Vec<serde_json::Value>, u64)> {
     let mut paths: Vec<_> = fs::read_dir(state_root.join(DIRECTORY))?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
@@ -433,14 +596,16 @@ pub fn read_all(state_root: &Path) -> io::Result<Vec<serde_json::Value>> {
         .collect();
     paths.sort();
     let mut records = Vec::new();
+    let mut skipped = 0;
     for path in paths {
         for line in fs::read_to_string(path)?.lines() {
-            if let Ok(value) = serde_json::from_str(line) {
-                records.push(value);
+            match serde_json::from_str(line) {
+                Ok(value) => records.push(value),
+                Err(_) => skipped += 1,
             }
         }
     }
-    Ok(records)
+    Ok((records, skipped))
 }
 
 #[cfg(test)]
@@ -538,5 +703,87 @@ mod tests {
         let main = records.iter().find(|r| r["k"] == "main").unwrap();
         assert_eq!(main["control_n"], 1);
         assert!(main["wall_ns"].as_u64().unwrap() > 0);
+    }
+
+    /// Parent time splits into this thread's CPU, the contended closed-history
+    /// wait inside it, and an unattributed remainder; none exceeds the whole.
+    #[test]
+    fn parent_time_splits_own_cpu_from_the_shared_history_wait() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().to_path_buf();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let holder = {
+            let state = state.clone();
+            std::thread::spawn(move || {
+                let _history = crate::admission_accounting::closed_history(&state).unwrap();
+                held_tx.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(60));
+            })
+        };
+        held_rx.recv().unwrap();
+        begin_request();
+        timed(Sub::Parent, || {
+            // Own compute, then the shared mutex another thread holds.
+            let spin = thread_cpu_ns();
+            while thread_cpu_ns() - spin < 20_000_000 {
+                std::hint::black_box(spin);
+            }
+            drop(crate::admission_accounting::closed_history(&state).unwrap());
+        });
+        let subs = take_sub();
+        holder.join().unwrap();
+        assert_eq!(subs.parent_n, 1);
+        assert_eq!(subs.hist_n, 1);
+        assert!(subs.parent_cpu_ns >= 20_000_000, "{}", subs.parent_cpu_ns);
+        assert!(subs.parent_hist_ns >= 20_000_000, "{}", subs.parent_hist_ns);
+        assert_eq!(subs.parent_hist_ns, subs.hist_ns);
+        // Within the spin a lock acquisition may also count as CPU.
+        assert!(
+            subs.parent_cpu_ns + subs.parent_hist_ns <= subs.parent_ns + 2_000_000,
+            "{} + {} > {}",
+            subs.parent_cpu_ns,
+            subs.parent_hist_ns,
+            subs.parent_ns
+        );
+        assert!(subs.cpu_ns >= subs.parent_cpu_ns);
+        assert_eq!(
+            subs.state_cpu_ns + subs.state_busy_ns + subs.state_hist_ns,
+            0
+        );
+        // An uncontended acquisition records no wait.
+        begin_request();
+        drop(crate::admission_accounting::closed_history(&state).unwrap());
+        assert_eq!(take_sub().hist_n, 0);
+    }
+
+    #[test]
+    fn advance_scans_and_untracked_waits_fold_into_the_main_window() {
+        let mut window = MainWindow::new();
+        window.advance_scanned(AdvanceScan {
+            pending: 3,
+            readback: 2,
+            acted: false,
+        });
+        window.advance_scanned(AdvanceScan {
+            pending: 1,
+            readback: 1,
+            acted: true,
+        });
+        add(Sub::Fence, 7);
+        add(Sub::History, 5);
+        window.untracked_waits();
+        assert_eq!(
+            (
+                window.adv_pending,
+                window.adv_pending_max,
+                window.adv_readback
+            ),
+            (4, 3, 3)
+        );
+        assert_eq!(window.adv_acted, 1);
+        assert_eq!((window.fence_wait_ns, window.fence_wait_n), (7, 1));
+        assert_eq!(window.hist_wait_ns, 5);
+        window.untracked_waits();
+        assert_eq!(window.fence_wait_ns, 7, "waits are taken once");
     }
 }

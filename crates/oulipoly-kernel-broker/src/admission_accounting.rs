@@ -195,9 +195,16 @@ pub fn closed_history(state_root: &Path) -> io::Result<MutexGuard<'static, Close
             .entry(state_root.to_path_buf())
             .or_insert_with(|| Box::leak(Box::default()))
     };
-    cache
-        .lock()
-        .map_err(|_| io::Error::other("closed history poisoned"))
+    // An uncontended lock records nothing; a contended one records its wait
+    // against the request on this thread.
+    let locked = match cache.try_lock() {
+        Ok(guard) => Ok(guard),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            crate::phase_record::timed(crate::phase_record::Sub::History, || cache.lock())
+        }
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => Err(poisoned),
+    };
+    locked.map_err(|_| io::Error::other("closed history poisoned"))
 }
 
 #[cfg(test)]

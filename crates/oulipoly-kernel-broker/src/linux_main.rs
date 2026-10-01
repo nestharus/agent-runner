@@ -335,6 +335,10 @@ struct AdmissionFences {
     /// A Bash effect that panicked while holding its root poisons the whole
     /// set, as a panicking holder of the former mutex did.
     bash_poisoned: std::sync::atomic::AtomicBool,
+    /// Same-root waiters currently parked, so tests can order a panic after
+    /// a waiter is already waiting.
+    #[cfg(test)]
+    bash_waiting: std::sync::atomic::AtomicUsize,
 }
 
 impl AdmissionFences {
@@ -344,6 +348,8 @@ impl AdmissionFences {
             bash_roots: Mutex::new(HashSet::new()),
             bash_root_released: std::sync::Condvar::new(),
             bash_poisoned: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            bash_waiting: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -361,12 +367,26 @@ impl AdmissionFences {
             }
             let mut held = self.bash_roots.lock().map_err(|_| poisoned())?;
             while held.contains(root_id) {
-                held = self.bash_root_released.wait(held).map_err(|_| poisoned())?;
+                #[cfg(test)]
+                self.bash_waiting
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let woke = self.bash_root_released.wait(held);
+                #[cfg(test)]
+                self.bash_waiting
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                held = woke.map_err(|_| poisoned())?;
+            }
+            // Rechecked under the root set: a holder that panicked while this
+            // caller waited, or since the check above, poisoned the whole set
+            // before releasing its root, exactly as the former mutex refused
+            // every later and already-waiting holder.
+            if self.poisoned() {
+                return Err(poisoned());
             }
             held.insert(root_id.to_owned());
             Ok(BashRootFence {
                 fences: self,
-                fenced,
+                fenced: Some(fenced),
                 root_id: root_id.to_owned(),
                 acquired: phase_record::mono_ns(),
             })
@@ -376,14 +396,17 @@ impl AdmissionFences {
 
 struct BashRootFence<'a> {
     fences: &'a AdmissionFences,
-    fenced: std::sync::RwLockReadGuard<'a, HashSet<String>>,
+    /// Present until drop; released before the hold is recorded.
+    fenced: Option<std::sync::RwLockReadGuard<'a, HashSet<String>>>,
     root_id: String,
     acquired: u64,
 }
 
 impl BashRootFence<'_> {
     fn contains(&self, root_id: &str) -> bool {
-        self.fenced.contains(root_id)
+        self.fenced
+            .as_ref()
+            .is_some_and(|fenced| fenced.contains(root_id))
     }
 }
 
@@ -398,32 +421,39 @@ impl Drop for BashRootFence<'_> {
             held.remove(&self.root_id);
         }
         self.fences.bash_root_released.notify_all();
-        phase_record::fence_held(self.acquired);
+        let released = phase_record::mono_ns();
+        drop(self.fenced.take());
+        // The record is written after the guard is gone, so a slow append
+        // never extends a hold.
+        phase_record::fence_held(self.acquired, released);
     }
 }
 
 /// The exclusive side of the root admission fences.
 struct FenceGuard<'a> {
-    fenced: std::sync::RwLockWriteGuard<'a, HashSet<String>>,
+    /// Present until drop; released before the hold is recorded.
+    fenced: Option<std::sync::RwLockWriteGuard<'a, HashSet<String>>>,
     acquired: u64,
 }
 
 impl std::ops::Deref for FenceGuard<'_> {
     type Target = HashSet<String>;
     fn deref(&self) -> &Self::Target {
-        &self.fenced
+        self.fenced.as_ref().expect("fence guard held until drop")
     }
 }
 
 impl std::ops::DerefMut for FenceGuard<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.fenced
+        self.fenced.as_mut().expect("fence guard held until drop")
     }
 }
 
 impl Drop for FenceGuard<'_> {
     fn drop(&mut self) {
-        phase_record::fence_held(self.acquired);
+        let released = phase_record::mono_ns();
+        drop(self.fenced.take());
+        phase_record::fence_held(self.acquired, released);
     }
 }
 
@@ -436,7 +466,7 @@ fn lock_fences(fences: &AdmissionFences) -> Result<FenceGuard<'_>, ()> {
             return Err(());
         }
         Ok(FenceGuard {
-            fenced,
+            fenced: Some(fenced),
             acquired: phase_record::mono_ns(),
         })
     })
@@ -5294,6 +5324,7 @@ fn advance_one_normal_owner(
     sidecar: &mut Option<BrokerSidecar>,
     admission_fences: &AdmissionFences,
     completed: &mut HashSet<String>,
+    scan: &mut phase_record::AdvanceScan,
 ) -> io::Result<()> {
     if entries.records().is_empty() || sidecar.is_none() || !state_root.join("v30").exists() {
         return Ok(());
@@ -5303,6 +5334,7 @@ fn advance_one_normal_owner(
         if completed.contains(&entry.root_id) {
             continue;
         }
+        scan.pending += 1;
         // An entry may be prepared before its root record is published. It
         // carries no normal K or close authority until that exact root exists.
         let Some(root) = registry.record(&entry.root_id).cloned() else {
@@ -5338,6 +5370,7 @@ fn advance_one_normal_owner(
         {
             continue;
         }
+        scan.readback += 1;
         let inventory = root_drain::readback(
             &root,
             registry,
@@ -5366,6 +5399,7 @@ fn advance_one_normal_owner(
                 return Err(io::Error::other("normal closed owner generation changed"));
             }
             completed.insert(entry.root_id.clone());
+            scan.acted = true;
             continue;
         }
         if inventory
@@ -5384,6 +5418,7 @@ fn advance_one_normal_owner(
             if ready.is_err() {
                 continue;
             }
+            scan.acted = true;
             let mut fences = lock_fences(admission_fences)
                 .map_err(|_| io::Error::other("root admission fence poisoned"))?;
             let persisted = registry.fence_admission(&root);
@@ -5395,6 +5430,7 @@ fn advance_one_normal_owner(
         }
         if !inventory.pid1_echild_receipt {
             if root_drain::ready_for_pid1_request(&inventory).is_ok() {
+                scan.acted = true;
                 root_pid1::publish_request(&registry.pid1_directory(), &root)?;
             }
             continue;
@@ -5402,6 +5438,7 @@ fn advance_one_normal_owner(
         if !inventory.owner_close_preflight {
             continue;
         }
+        scan.acted = true;
         let _guard = lock_fences(admission_fences)
             .map_err(|_| io::Error::other("root admission fence poisoned"))?;
         if inventory.owner_close_intent.is_none() {
@@ -6313,11 +6350,14 @@ fn serve() -> io::Result<()> {
                 &broker_incarnation,
             );
         }
+        window.untracked_waits();
         let advance_start = phase_record::mono_ns();
         window.bridge_ns += advance_start.saturating_sub(bridges_start);
         if last_auto_normal.elapsed() >= NORMAL_CLOSE_POLL_INTERVAL {
             last_auto_normal = Instant::now();
             window.advance_n += 1;
+            let advance_cpu = phase_record::thread_cpu_ns();
+            let mut scan = phase_record::AdvanceScan::default();
             if let Err(error) = advance_one_normal_owner(
                 Path::new(&state),
                 &mut registry,
@@ -6328,15 +6368,20 @@ fn serve() -> io::Result<()> {
                 &mut broker_sidecar,
                 &admission_fences,
                 &mut completed_auto_normal,
+                &mut scan,
             ) {
                 eprintln!("normal owner close progression blocked: {error}");
             }
+            window.advance_cpu_ns += phase_record::thread_cpu_ns().saturating_sub(advance_cpu);
+            window.advance_scanned(scan);
+            window.untracked_waits();
         }
         let accept_start = phase_record::mono_ns();
         window.advance_ns += accept_start.saturating_sub(advance_start);
         let mut stream = match listener.accept() {
             Ok((stream, _)) => stream,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                let idle_cpu = phase_record::thread_cpu_ns();
                 if let Some(sidecar) = broker_sidecar.as_mut() {
                     capture_terminal_sources(
                         sidecar,
@@ -6398,6 +6443,8 @@ fn serve() -> io::Result<()> {
                         let _ = registry.reap_terminal_pid1(&root.record);
                     }
                 }
+                window.idle_duty_cpu_ns += phase_record::thread_cpu_ns().saturating_sub(idle_cpu);
+                window.untracked_waits();
                 let sleep_start = phase_record::mono_ns();
                 window.idle_duty_ns += sleep_start.saturating_sub(accept_start);
                 std::thread::sleep(BROKER_ACCEPT_POLL_INTERVAL);
@@ -12484,6 +12531,95 @@ mod admission_fence_tests {
         assert!(panicked.join().is_err());
         assert!(fences.bash_root(B).is_err());
         assert!(lock_fences(&fences).is_err());
+    }
+
+    /// Holds `root` on its own thread until `go`, then panics inside the
+    /// effect, as a guarded effect failing midway would.
+    fn panicking_holder(
+        fences: &Arc<AdmissionFences>,
+        root: &'static str,
+    ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let fences = Arc::clone(fences);
+        let holder = std::thread::spawn(move || {
+            let _held = fences.bash_root(root).unwrap();
+            held_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+            panic!("effect failed mid-admission");
+        });
+        held_rx.recv().unwrap();
+        (go_tx, holder)
+    }
+
+    fn until_waiting(fences: &AdmissionFences, waiters: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while fences.bash_waiting.load(Ordering::SeqCst) != waiters {
+            assert!(std::time::Instant::now() < deadline, "waiter never parked");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn a_same_root_effect_already_waiting_is_refused_after_the_holder_panics() {
+        let fences = Arc::new(AdmissionFences::new(HashSet::new()));
+        let (go, holder) = panicking_holder(&fences, A);
+        let waiter = {
+            let fences = Arc::clone(&fences);
+            std::thread::spawn(move || fences.bash_root(A).map(|_| ()).is_ok())
+        };
+        // The waiter is parked on A before the holder fails.
+        until_waiting(&fences, 1);
+        go.send(()).unwrap();
+        assert!(holder.join().is_err());
+        assert!(
+            !waiter.join().unwrap(),
+            "waiting effect entered after panic"
+        );
+        assert!(fences.bash_root(A).is_err());
+        assert!(fences.bash_root(B).is_err());
+        assert!(lock_fences(&fences).is_err());
+    }
+
+    #[test]
+    fn an_effect_already_waiting_on_another_root_is_refused_after_a_panic() {
+        let fences = Arc::new(AdmissionFences::new(HashSet::new()));
+        let (go, holder) = panicking_holder(&fences, A);
+        // Root B's effect was already in flight; a second B effect waits.
+        let in_flight = fences.bash_root(B).unwrap();
+        let waiter = {
+            let fences = Arc::clone(&fences);
+            std::thread::spawn(move || fences.bash_root(B).map(|_| ()).is_ok())
+        };
+        until_waiting(&fences, 1);
+        go.send(()).unwrap();
+        assert!(holder.join().is_err());
+        // The in-flight cross-root effect is unchanged; its release lets the
+        // waiter recheck, and it is refused.
+        assert!(!in_flight.contains(B));
+        drop(in_flight);
+        assert!(
+            !waiter.join().unwrap(),
+            "waiting effect entered after panic"
+        );
+        assert!(lock_fences(&fences).is_err());
+    }
+
+    #[test]
+    fn an_exclusive_holder_waiting_on_a_bash_effect_is_refused_after_it_panics() {
+        let fences = Arc::new(AdmissionFences::new(HashSet::new()));
+        let (go, holder) = panicking_holder(&fences, A);
+        let exclusive = {
+            let fences = Arc::clone(&fences);
+            std::thread::spawn(move || lock_fences(&fences).is_ok())
+        };
+        // The writer cannot pass the panicking reader; whenever it arrives,
+        // the read guard is released only after the poison is set.
+        std::thread::sleep(Duration::from_millis(50));
+        go.send(()).unwrap();
+        assert!(holder.join().is_err());
+        assert!(!exclusive.join().unwrap(), "exclusive entered after panic");
+        assert!(fences.bash_root(A).is_err());
     }
 }
 

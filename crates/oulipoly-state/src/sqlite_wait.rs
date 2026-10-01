@@ -50,6 +50,11 @@ pub fn take_thread_wait_ns() -> u64 {
     WAIT_NS.with(|wait| wait.replace(0))
 }
 
+/// Returns the lock wait measured on this thread so far, without clearing it.
+pub fn thread_wait_ns() -> u64 {
+    WAIT_NS.with(Cell::get)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
