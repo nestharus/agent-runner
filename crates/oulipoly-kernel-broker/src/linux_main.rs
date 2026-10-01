@@ -11450,36 +11450,51 @@ fn fresh_v30_worker(
                             let root = lane
                                 .released_handoff_for_child(&d_key, &recipient)
                                 .map_err(io::Error::other)?;
-                            let (offered_d, offer) = lane
-                                .read_successor_offer_for_root(&offer_request_id, &recipient)
-                                .map_err(io::Error::other)?;
-                            let ledger = successor_ledger
-                                .as_ref()
-                                .ok_or_else(|| io::Error::other("successor ledger absent"))?;
-                            let start = ledger
-                                .read_start(&offer_request_id)?
-                                .ok_or_else(|| io::Error::other("successor start absent"))?;
-                            let candidate = ledger
-                                .read_candidate(&offer_request_id)?
-                                .ok_or_else(|| io::Error::other("successor candidate absent"))?;
-                            if offered_d != d_key
-                                || start.d_key != d_key
-                                || offer.root_id != root.old_release.prepared.root_id
-                                || start.decision.obligation.root_id != offer.root_id
-                                || start.decision.obligation.original_identity != recipient
-                                || start.owner_uid != peer.uid
-                                || candidate.process.host_pid != offer.successor_identity.host_pid
-                                || candidate.process.boot_id != offer.successor_identity.boot_id
-                                || candidate.process.starttime_ticks
-                                    != offer.successor_identity.starttime_ticks
-                                || candidate.process.pidns_dev != offer.successor_identity.pidns_dev
-                                || candidate.process.pidns_ino != offer.successor_identity.pidns_ino
+                            // Not offered yet is an ordinary poll answer, not a
+                            // refusal; an existing offer must match exactly.
+                            match lane
+                                .find_successor_offer_for_root(&offer_request_id, &recipient)
+                                .map_err(io::Error::other)?
                             {
-                                return Err(io::Error::other(
-                                    "installed successor offer/start/root changed",
-                                ));
+                                None => {
+                                    serde_json::json!({"kind":"installed_successor_offer_readback", "offer":null})
+                                }
+                                Some((offered_d, offer)) => {
+                                    let ledger = successor_ledger.as_ref().ok_or_else(|| {
+                                        io::Error::other("successor ledger absent")
+                                    })?;
+                                    let start =
+                                        ledger.read_start(&offer_request_id)?.ok_or_else(|| {
+                                            io::Error::other("successor start absent")
+                                        })?;
+                                    let candidate =
+                                        ledger.read_candidate(&offer_request_id)?.ok_or_else(
+                                            || io::Error::other("successor candidate absent"),
+                                        )?;
+                                    if offered_d != d_key
+                                        || start.d_key != d_key
+                                        || offer.root_id != root.old_release.prepared.root_id
+                                        || start.decision.obligation.root_id != offer.root_id
+                                        || start.decision.obligation.original_identity != recipient
+                                        || start.owner_uid != peer.uid
+                                        || candidate.process.host_pid
+                                            != offer.successor_identity.host_pid
+                                        || candidate.process.boot_id
+                                            != offer.successor_identity.boot_id
+                                        || candidate.process.starttime_ticks
+                                            != offer.successor_identity.starttime_ticks
+                                        || candidate.process.pidns_dev
+                                            != offer.successor_identity.pidns_dev
+                                        || candidate.process.pidns_ino
+                                            != offer.successor_identity.pidns_ino
+                                    {
+                                        return Err(io::Error::other(
+                                            "installed successor offer/start/root changed",
+                                        ));
+                                    }
+                                    serde_json::json!({"kind":"installed_successor_offer_readback", "offer":offer})
+                                }
                             }
-                            serde_json::json!({"kind":"installed_successor_offer_readback", "offer":offer})
                         }
                         FreshRecipientRequest::AdmitSuccessor {
                             d_key,

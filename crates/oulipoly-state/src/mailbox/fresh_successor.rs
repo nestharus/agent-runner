@@ -809,8 +809,19 @@ impl FreshV30Lane {
         request_id: &str,
         original: &FreshRecipientIdentity,
     ) -> Result<(String, FreshSuccessorOffer), String> {
+        self.find_successor_offer_for_root(request_id, original)?
+            .ok_or_else(|| "successor offer absent for original root".into())
+    }
+
+    /// `None` only when this original has no offer row under this ID yet;
+    /// a row that exists must read back exactly or this fails.
+    pub fn find_successor_offer_for_root(
+        &self,
+        request_id: &str,
+        original: &FreshRecipientIdentity,
+    ) -> Result<Option<(String, FreshSuccessorOffer)>, String> {
         validate_request_id(request_id)?;
-        let successor_json: String = self
+        let Some(successor_json): Option<String> = self
             .sidecar
             .mailbox()
             .conn
@@ -822,14 +833,16 @@ impl FreshV30Lane {
             )
             .optional()
             .map_err(|e| e.to_string())?
-            .ok_or("successor offer absent for original root")?;
+        else {
+            return Ok(None);
+        };
         let successor: FreshRecipientIdentity =
             serde_json::from_str(&successor_json).map_err(|e| e.to_string())?;
         let offer = self
             .read_successor_offer(request_id, &successor)?
             .ok_or("successor offer readback absent")?;
         let session = self.read_session_for_successor(&offer)?;
-        Ok((session.request_id, offer))
+        Ok(Some((session.request_id, offer)))
     }
 
     fn require_pending_successor_row(
