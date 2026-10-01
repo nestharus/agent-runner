@@ -2122,19 +2122,12 @@ impl BrokerSidecar {
         if state.completion_repair_has_suffix(head.as_ref())? {
             return Err("broker recipient selection requires complete State projection".into());
         }
-        let sessions = self.root_pending_recipient_sessions(root_id)?;
-        let session_scan_bounded = sessions.len() >= RECIPIENT_SESSION_SCAN;
+        let rows = self.root_pending_recipient_rows(root_id)?;
+        let session_scan_bounded = rows.len() >= RECIPIENT_SESSION_SCAN;
         let mut skipped_paused_pending = 0u32;
         let mut candidate = None;
-        for session_id in sessions {
-            let Some(row) = self
-                .mailbox
-                .list_pending_for_delivery_after(&session_id, None, 0, 1)?
-                .into_iter()
-                .next()
-            else {
-                continue;
-            };
+        for row in rows {
+            let session_id = row.session_id.clone();
             if self.mailbox.notifications_paused(&session_id)? {
                 skipped_paused_pending += 1;
                 continue;
@@ -2147,7 +2140,7 @@ impl BrokerSidecar {
             else {
                 return Err("broker pending recipient has no retained payload identity".into());
             };
-            if payload_byte_len < 0 || row.session_id != session_id {
+            if payload_byte_len < 0 {
                 return Err("broker pending recipient identity changed".into());
             }
             candidate = Some(BrokerRecipientCandidate {
@@ -2177,28 +2170,32 @@ impl BrokerSidecar {
         })
     }
 
-    /// Sessions holding a pending row materialized for one of this root's
-    /// reserved completion sources, oldest first.
-    fn root_pending_recipient_sessions(&self, root_id: &str) -> Result<Vec<String>, String> {
+    /// The oldest own pending row per session, oldest first. Carry the row
+    /// through the root-filtered query: an earlier foreign or chainless row
+    /// in the same session must not become this root's candidate or error.
+    fn root_pending_recipient_rows(&self, root_id: &str) -> Result<Vec<MailboxRow>, String> {
         let mut statement = self
             .mailbox
             .conn
             .prepare_cached(&format!(
-                "SELECT m.session_id FROM broker_source_effect_grant g
+                "SELECT {MAILBOX_ROW_COLUMNS} FROM mailbox WHERE seq IN (
+                 SELECT MIN(m.seq) FROM broker_source_effect_grant g
                  JOIN completion_continuation_source s ON s.registration_id=g.registration_id
                  JOIN completion_event_listener l ON l.event_id=s.event_id
                  JOIN mailbox m ON m.seq=l.mailbox_seq
                  WHERE g.root_id=?1 AND m.delivered_at IS NULL
                    AND {DELIVERABLE_MAILBOX_ERROR_PREDICATE}
-                 GROUP BY m.session_id ORDER BY MIN(m.seq) LIMIT ?2"
+                 GROUP BY m.session_id ORDER BY MIN(m.seq) LIMIT ?2)
+                 ORDER BY seq"
             ))
             .map_err(|e| e.to_string())?;
         statement
-            .query_map(params![root_id, RECIPIENT_SESSION_SCAN as i64], |r| {
-                r.get(0)
-            })
+            .query_map(
+                params![root_id, RECIPIENT_SESSION_SCAN as i64],
+                map_mailbox_row,
+            )
             .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<String>, _>>()
+            .collect::<Result<Vec<MailboxRow>, _>>()
             .map_err(|e| e.to_string())
     }
 
@@ -6508,6 +6505,116 @@ mod tests {
             .unwrap();
         assert!(bounded.session_scan_bounded);
         assert_eq!(bounded.absence(), RecipientAbsence::Pending);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recipient_selection_in_mixed_session_uses_only_own_attributed_row() {
+        let (_root, source, broker_root, foreign, own) = payload_cutover_fixture();
+        assert!(foreign.seq < own.seq);
+        assert_eq!(foreign.session_id, own.session_id);
+        let uid = unsafe { libc::geteuid() };
+        let stage = stage_with_owner(&source, uid, &broker_root, uid).unwrap();
+        let generation = publish_with_owner(&source, uid, &stage, &broker_root, uid).unwrap();
+        let target = broker_root.join("sidecar/pid-identity.db");
+        let state_path = source.with_file_name("state.db");
+        drop(StateDb::open(&state_path).unwrap());
+        write_state_source_binding(&broker_root.join("sidecar"), &state_path, uid, uid).unwrap();
+        let mut broker = open_with_owner(&target, uid, &broker_root).unwrap();
+        let owner = CompletionDomainOwner {
+            protocol: PROTOCOL.into(),
+            domain_id: broker.domain_id().unwrap(),
+            supervisor_authority_id: uuid::Uuid::new_v4().to_string(),
+            owner_generation: uuid::Uuid::new_v4().to_string(),
+            guardian_identity: SourceProcessIdentity {
+                pid: 1,
+                boot_id: uuid::Uuid::new_v4().to_string(),
+                starttime_ticks: 1,
+            },
+            driver_identity: SourceProcessIdentity {
+                pid: 2,
+                boot_id: uuid::Uuid::new_v4().to_string(),
+                starttime_ticks: 2,
+            },
+            endpoint: "fixture".into(),
+        };
+        let root_id = uuid::Uuid::new_v4().to_string();
+        let other_root = uuid::Uuid::new_v4().to_string();
+        attribute_to_root(&broker.mailbox, foreign.seq, "recipient", &other_root);
+        attribute_to_root(&broker.mailbox, own.seq, "recipient", &root_id);
+        // A bad earlier foreign payload must not supply this root's integrity
+        // diagnostic. The later own row still keeps it pending, never absent.
+        broker
+            .mailbox
+            .conn
+            .execute(
+                "UPDATE mailbox SET payload_sha256=?1 WHERE seq=?2",
+                params!["0".repeat(64), foreign.seq],
+            )
+            .unwrap();
+        let selected = broker
+            .read_bounded_recipient_selection(&generation, &root_id, &owner)
+            .unwrap();
+        assert_eq!(selected.absence(), RecipientAbsence::Pending);
+        let candidate = selected.candidate.unwrap();
+        assert_eq!(candidate.seq, own.seq);
+        assert_eq!(
+            candidate.payload_sha256,
+            own.payload_sha256.clone().unwrap()
+        );
+        assert_eq!(selected.unattributed_pending, 0);
+
+        // Remove only the foreign attribution in this private fixture. The
+        // earlier row is now chainless, with the same global-unknown meaning.
+        broker
+            .mailbox
+            .conn
+            .execute(
+                "DELETE FROM broker_source_effect_grant WHERE root_id=?1",
+                [&other_root],
+            )
+            .unwrap();
+        let chainless = broker
+            .read_bounded_recipient_selection(&generation, &root_id, &owner)
+            .unwrap();
+        assert_eq!(chainless.absence(), RecipientAbsence::Pending);
+        assert_eq!(chainless.candidate.unwrap().seq, own.seq);
+        assert_eq!(chainless.unattributed_pending, 1);
+        let empty = broker
+            .read_bounded_recipient_selection(&generation, &other_root, &owner)
+            .unwrap();
+        assert_eq!(empty.absence(), RecipientAbsence::NotEstablished);
+
+        broker
+            .mailbox
+            .set_notifications_paused("recipient", true)
+            .unwrap();
+        let held = broker
+            .read_bounded_recipient_selection(&generation, &root_id, &owner)
+            .unwrap();
+        assert_eq!(held.absence(), RecipientAbsence::Pending);
+        assert_eq!(held.skipped_paused_pending, 1);
+        broker
+            .mailbox
+            .set_notifications_paused("recipient", false)
+            .unwrap();
+        let retained_path = broker
+            .read_exact_mailbox_row(&generation, "recipient", own.seq)
+            .unwrap()
+            .unwrap()
+            .row
+            .payload_file_path
+            .unwrap();
+        let corrupted = vec![b'x'; fs::metadata(&retained_path).unwrap().len() as usize];
+        fs::set_permissions(&retained_path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&retained_path, corrupted).unwrap();
+        fs::set_permissions(&retained_path, fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(
+            broker
+                .read_bounded_recipient_selection(&generation, &root_id, &owner)
+                .unwrap_err()
+                .contains("integrity mismatch")
+        );
     }
 
     /// A pending row as the mailbox stores one, without retained payload.
