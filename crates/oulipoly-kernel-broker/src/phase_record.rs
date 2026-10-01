@@ -203,6 +203,20 @@ pub fn take_sub() -> SubPhases {
     subs
 }
 
+/// Records which thread held the root admission fences, and for how long,
+/// when a hold could delay another request (20 ms or more).
+pub fn fence_held(acquired: u64) {
+    let released = mono_ns();
+    if released.saturating_sub(acquired) < 20_000_000 || RECORDER.get().is_none() {
+        return;
+    }
+    let thread = std::thread::current();
+    emit(format!(
+        "{{\"k\":\"fence\",\"thread\":\"{}\",\"from\":{acquired},\"to\":{released}}}",
+        thread.name().unwrap_or("unnamed")
+    ));
+}
+
 /// Set by the shared request reader at the challenge write and request read.
 pub fn mark_challenge() {
     CHALLENGE.with(|cell| cell.set(mono_ns()));
@@ -432,6 +446,35 @@ pub fn read_all(state_root: &Path) -> io::Result<Vec<serde_json::Value>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Prints the per-request recording cost on this host: one image-role
+    /// lookup plus one record write. Run explicitly with `--ignored`.
+    #[test]
+    #[ignore = "measurement; run explicitly"]
+    fn recording_cost_per_request() {
+        let root = tempfile::tempdir().unwrap();
+        // A separate process-global recorder may exist; write to a file of
+        // the same shape directly to time the same single append.
+        let file = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(root.path().join("cost.jsonl"))
+            .unwrap();
+        let roles = ImageRoles::new(None, None);
+        let pid = std::process::id() as i32;
+        let rounds = 20_000u64;
+        let started = mono_ns();
+        for request in 0..rounds {
+            let role = roles.role(pid);
+            let line = format!(
+                "{{\"k\":\"req\",\"seq\":{request},\"img\":\"{role}\",\"acc\":{}}}\n",
+                mono_ns()
+            );
+            (&file).write_all(line.as_bytes()).unwrap();
+        }
+        let per = (mono_ns() - started) / rounds;
+        println!("AGE353_RECORDING_COST_NS_PER_REQUEST {per}");
+    }
 
     // The recorder is process-global, so one test owns its initialization.
     #[test]

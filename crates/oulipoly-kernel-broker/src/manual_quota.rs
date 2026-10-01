@@ -1838,7 +1838,9 @@ mod tests {
                     None,
                     None,
                     None,
-                    std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+                    std::sync::Arc::new(super::super::AdmissionFences::new(
+                        std::collections::HashSet::new(),
+                    )),
                 )
                 .unwrap();
             });
@@ -2009,7 +2011,9 @@ mod tests {
                 None,
                 None,
                 None,
-                std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+                std::sync::Arc::new(super::super::AdmissionFences::new(
+                    std::collections::HashSet::new(),
+                )),
             )
             .unwrap();
         });

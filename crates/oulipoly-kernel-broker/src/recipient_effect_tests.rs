@@ -135,7 +135,7 @@ fn socket_case(fixture: bool) {
             None,
             None,
             None,
-            Arc::new(Mutex::new(HashSet::new())),
+            Arc::new(super::AdmissionFences::new(HashSet::new())),
         )
         .unwrap();
     });

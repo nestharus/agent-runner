@@ -320,12 +320,126 @@ fn read_native_f_auto_ack_with_source(
     lane.read_native_f_auto_ack(request, recipient)
 }
 
-/// Acquires the shared root admission fences, recording the wait against the
-/// request on this thread. The lock and its poisoning are unchanged.
-fn lock_fences(
-    fences: &Mutex<HashSet<String>>,
-) -> std::sync::LockResult<std::sync::MutexGuard<'_, HashSet<String>>> {
-    phase_record::timed(phase_record::Sub::Fence, || fences.lock())
+/// Root admission fences shared by the old loop and the fresh lane.
+///
+/// Every holder that is not a Bash child effect takes the whole set
+/// exclusively, exactly as the former single mutex did: it excludes all other
+/// holders, including every Bash child effect. A Bash child effect shares the
+/// set only with Bash child effects of other roots and still excludes its own
+/// root's. A root fenced under the exclusive side therefore has no Bash
+/// effect in flight and admits none afterwards.
+struct AdmissionFences {
+    fenced: std::sync::RwLock<HashSet<String>>,
+    bash_roots: Mutex<HashSet<String>>,
+    bash_root_released: std::sync::Condvar,
+    /// A Bash effect that panicked while holding its root poisons the whole
+    /// set, as a panicking holder of the former mutex did.
+    bash_poisoned: std::sync::atomic::AtomicBool,
+}
+
+impl AdmissionFences {
+    fn new(fenced: HashSet<String>) -> Self {
+        Self {
+            fenced: std::sync::RwLock::new(fenced),
+            bash_roots: Mutex::new(HashSet::new()),
+            bash_root_released: std::sync::Condvar::new(),
+            bash_poisoned: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn poisoned(&self) -> bool {
+        self.bash_poisoned.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Holds `root_id` for one Bash child effect. Waits recorded as fence.
+    fn bash_root(&self, root_id: &str) -> io::Result<BashRootFence<'_>> {
+        phase_record::timed(phase_record::Sub::Fence, || {
+            let poisoned = || io::Error::other("root admission fence poisoned");
+            let fenced = self.fenced.read().map_err(|_| poisoned())?;
+            if self.poisoned() {
+                return Err(poisoned());
+            }
+            let mut held = self.bash_roots.lock().map_err(|_| poisoned())?;
+            while held.contains(root_id) {
+                held = self.bash_root_released.wait(held).map_err(|_| poisoned())?;
+            }
+            held.insert(root_id.to_owned());
+            Ok(BashRootFence {
+                fences: self,
+                fenced,
+                root_id: root_id.to_owned(),
+                acquired: phase_record::mono_ns(),
+            })
+        })
+    }
+}
+
+struct BashRootFence<'a> {
+    fences: &'a AdmissionFences,
+    fenced: std::sync::RwLockReadGuard<'a, HashSet<String>>,
+    root_id: String,
+    acquired: u64,
+}
+
+impl BashRootFence<'_> {
+    fn contains(&self, root_id: &str) -> bool {
+        self.fenced.contains(root_id)
+    }
+}
+
+impl Drop for BashRootFence<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.fences
+                .bash_poisoned
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        if let Ok(mut held) = self.fences.bash_roots.lock() {
+            held.remove(&self.root_id);
+        }
+        self.fences.bash_root_released.notify_all();
+        phase_record::fence_held(self.acquired);
+    }
+}
+
+/// The exclusive side of the root admission fences.
+struct FenceGuard<'a> {
+    fenced: std::sync::RwLockWriteGuard<'a, HashSet<String>>,
+    acquired: u64,
+}
+
+impl std::ops::Deref for FenceGuard<'_> {
+    type Target = HashSet<String>;
+    fn deref(&self) -> &Self::Target {
+        &self.fenced
+    }
+}
+
+impl std::ops::DerefMut for FenceGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.fenced
+    }
+}
+
+impl Drop for FenceGuard<'_> {
+    fn drop(&mut self) {
+        phase_record::fence_held(self.acquired);
+    }
+}
+
+/// Acquires the root admission fences exclusively, recording the wait against
+/// the request on this thread. Poisoning still refuses the caller.
+fn lock_fences(fences: &AdmissionFences) -> Result<FenceGuard<'_>, ()> {
+    phase_record::timed(phase_record::Sub::Fence, || {
+        let fenced = fences.fenced.write().map_err(|_| ())?;
+        if fences.poisoned() {
+            return Err(());
+        }
+        Ok(FenceGuard {
+            fenced,
+            acquired: phase_record::mono_ns(),
+        })
+    })
 }
 
 fn private_fixture() -> bool {
@@ -5178,7 +5292,7 @@ fn advance_one_normal_owner(
     grants: &GrantRegistry,
     sources: &SourcePhysicalRegistry,
     sidecar: &mut Option<BrokerSidecar>,
-    admission_fences: &Mutex<HashSet<String>>,
+    admission_fences: &AdmissionFences,
     completed: &mut HashSet<String>,
 ) -> io::Result<()> {
     if entries.records().is_empty() || sidecar.is_none() || !state_root.join("v30").exists() {
@@ -5973,7 +6087,7 @@ fn serve() -> io::Result<()> {
         .transpose()?;
     let host_namespace = host_proc_file("self/ns/pid")?;
     let mut registry = RootRegistry::open(&state)?;
-    let admission_fences = Arc::new(Mutex::new(
+    let admission_fences = Arc::new(AdmissionFences::new(
         registry
             .fenced_root_ids()
             .map(str::to_owned)
@@ -7591,7 +7705,7 @@ fn serve_fresh_v30() -> io::Result<()> {
     };
     let bash_image = pinned_bash_image(installed_pair.as_ref())?;
     let roots = RootRegistry::open(&state_root)?;
-    let admission_fences = Arc::new(Mutex::new(
+    let admission_fences = Arc::new(AdmissionFences::new(
         roots
             .fenced_root_ids()
             .map(str::to_owned)
@@ -8054,7 +8168,7 @@ fn serve_fresh_v30_at(
     handoff_tx: Option<SyncSender<FreshHandoffBridgeRequest>>,
     terminal_tx: Option<SyncSender<FreshTerminalBridgeRequest>>,
     drain_tx: Option<SyncSender<FreshDrainBridgeRequest>>,
-    admission_fences: Arc<Mutex<HashSet<String>>>,
+    admission_fences: Arc<AdmissionFences>,
 ) -> io::Result<()> {
     // A missing or incomplete publication cannot bind the new endpoint.
     let mut lane = FreshV30Lane::open_at(state_root).map_err(io::Error::other)?;
@@ -8073,10 +8187,12 @@ fn serve_fresh_v30_at(
     // The lease spans all broker requests, including route, grant, provider K,
     // quota/auth/manual intent and K, and their readback paths. Offline index
     // rebuild takes the exclusive side before reading any retained evidence.
-    let _admission = fresh_index::broker_admission_lease(&state_root.join("v30/fresh-provider"))
-        .map_err(io::Error::other)?;
+    let _admission = Arc::new(
+        fresh_index::broker_admission_lease(&state_root.join("v30/fresh-provider"))
+            .map_err(io::Error::other)?,
+    );
     #[cfg(feature = "age319-private-broker-fixture")]
-    let admission = &_admission;
+    let admission = &*_admission;
     #[cfg(feature = "age319-private-broker-fixture")]
     let provider_readback_v3 = {
         let root = state_root.join("v30/fresh-provider");
@@ -8198,6 +8314,257 @@ fn serve_fresh_v30_at(
             })?;
         sender
     };
+    let successor_ledger = installed_identity
+        .as_ref()
+        .map(|(pair, source)| SuccessorLaunchLedger::open(state_root, pair, source))
+        .transpose()?;
+    // An old candidate record is readback only. Only this Broker incarnation
+    // owns an inherited gate and may authorize a first offer.
+    let live_successors = BTreeMap::<String, LiveCandidate>::new();
+    if let Err(error) = phase_record::init(state_root) {
+        eprintln!("phase records unavailable: {error}");
+    }
+    let images = phase_record::ImageRoles::new(Some(&runner_image), bash_image.as_ref());
+    let instance = Arc::new(instance);
+    // Bash call-path requests get their own workers only when no private
+    // index or v3 provider generation is bound to this lane.
+    #[cfg(feature = "age319-private-broker-fixture")]
+    let bash_pool = route_index.is_none()
+        && provider_readback_v3.is_none()
+        && !route_writer_v3
+        && !provider_writer_v3;
+    #[cfg(not(feature = "age319-private-broker-fixture"))]
+    let bash_pool = route_index.is_none();
+    let (general_tx, general_rx) = mpsc::channel::<FreshV30Job>();
+    let bash_tx = if bash_pool {
+        let (sender, receiver) = mpsc::channel::<FreshV30Job>();
+        let receiver = Arc::new(Mutex::new(receiver));
+        for index in 0..FRESH_BASH_WORKERS {
+            let receiver = Arc::clone(&receiver);
+            let state_root = state_root.to_path_buf();
+            let runner_image = runner_image.try_clone()?;
+            let bash_image = bash_image.as_ref().map(File::try_clone).transpose()?;
+            let installed_identity = installed_identity.clone();
+            let (handoff_tx, terminal_tx, drain_tx) =
+                (handoff_tx.clone(), terminal_tx.clone(), drain_tx.clone());
+            let admission_fences = Arc::clone(&admission_fences);
+            let instance = Arc::clone(&instance);
+            let ordinary_completion_tx = ordinary_completion_tx.clone();
+            let admission_lease = Arc::clone(&_admission);
+            std::thread::Builder::new()
+                .name(format!("fresh-v30-bash-{index}"))
+                .spawn(move || {
+                    let lane = match FreshV30Lane::open_at(&state_root) {
+                        Ok(lane) => lane,
+                        Err(error) => {
+                            eprintln!("fresh Bash worker unavailable: {error}");
+                            return;
+                        }
+                    };
+                    let jobs = std::iter::from_fn(|| receiver.lock().ok()?.recv().ok());
+                    let worker = FreshV30Worker {
+                        label: "v30-bash",
+                        state_root: &state_root,
+                        lane,
+                        runner_image,
+                        bash_image,
+                        installed_identity,
+                        handoff_tx,
+                        terminal_tx,
+                        drain_tx,
+                        admission_fences,
+                        instance,
+                        route_index: None,
+                        successor_ledger: None,
+                        live_successors: BTreeMap::new(),
+                        ordinary_completion_tx,
+                        admission_lease,
+                        #[cfg(feature = "age319-private-broker-fixture")]
+                        provider_readback_v3: None,
+                        #[cfg(feature = "age319-private-broker-fixture")]
+                        route_writer_v3: false,
+                        #[cfg(feature = "age319-private-broker-fixture")]
+                        provider_writer_v3: false,
+                    };
+                    if let Err(error) = fresh_v30_worker(worker, jobs) {
+                        eprintln!("fresh Bash worker closed: {error}");
+                    }
+                })?;
+        }
+        Some(sender)
+    } else {
+        None
+    };
+    std::thread::Builder::new()
+        .name("fresh-v30-accept".into())
+        .spawn(move || accept_fresh_v30(listener, images, general_tx, bash_tx))?;
+    fresh_v30_worker(
+        FreshV30Worker {
+            label: "v30",
+            state_root,
+            lane,
+            runner_image,
+            bash_image,
+            installed_identity,
+            handoff_tx,
+            terminal_tx,
+            drain_tx,
+            admission_fences,
+            instance,
+            route_index,
+            successor_ledger,
+            live_successors,
+            ordinary_completion_tx,
+            admission_lease: _admission,
+            #[cfg(feature = "age319-private-broker-fixture")]
+            provider_readback_v3,
+            #[cfg(feature = "age319-private-broker-fixture")]
+            route_writer_v3,
+            #[cfg(feature = "age319-private-broker-fixture")]
+            provider_writer_v3,
+        },
+        general_rx,
+    )
+}
+
+/// Bash call-path workers. Four serve 2+2 concurrently; more callers queue
+/// only behind other Bash requests, never behind unrelated v30 clients.
+const FRESH_BASH_WORKERS: usize = 4;
+
+/// One accepted v30 connection whose peer is pinned, challenged and read.
+struct FreshV30Job {
+    stream: UnixStream,
+    request: io::Result<(u8, RequestPayload, PeerIdentity)>,
+    record: phase_record::Request,
+}
+
+/// Exactly the requests the serial lane served from its 0x90 and Bash-child
+/// arms without the Runner image gate. Every other request, including a
+/// malformed variant of these opcodes, stays on the general worker.
+fn fresh_bash_route(operation: u8, payload: &RequestPayload) -> bool {
+    match operation {
+        0x90 => matches!(payload, RequestPayload::None),
+        b'8' | b'9' => matches!(payload, RequestPayload::FreshBashChildRequest { .. }),
+        b'C' | b'X' | b'c' | b'E' | b'O' | b'%' | b'!' | b'^' | b'v' | b'u' | b'<' => matches!(
+            payload,
+            RequestPayload::FreshBashChildRequest { .. }
+                | RequestPayload::FreshBashPrivateResult { .. }
+        ),
+        _ => false,
+    }
+}
+
+/// Accepts, pins and challenges every v30 peer and reads its request, then
+/// hands the connection to the Bash or general worker. The challenge is no
+/// longer withheld while an unrelated handler runs.
+fn accept_fresh_v30(
+    listener: UnixListener,
+    images: phase_record::ImageRoles,
+    general: mpsc::Sender<FreshV30Job>,
+    bash: Option<mpsc::Sender<FreshV30Job>>,
+) {
+    for incoming in listener.incoming() {
+        let Ok(mut stream) = incoming else { continue };
+        let mut record = phase_record::Request::accepted("v30");
+        if stream
+            .set_read_timeout(Some(FRESH_V30_READ_TIMEOUT))
+            .and_then(|()| stream.set_write_timeout(Some(FRESH_V30_WRITE_TIMEOUT)))
+            .is_err()
+        {
+            continue;
+        }
+        let request = peer_from_request(&mut stream);
+        record.read_done();
+        if let Ok((operation, _, peer)) = &request {
+            record.opcode = Some(*operation);
+            record.peer(
+                peer.process.host_pid,
+                peer.process.starttime_ticks,
+                peer.uid,
+                images.role(peer.process.host_pid),
+            );
+        }
+        let to_bash = request
+            .as_ref()
+            .is_ok_and(|(operation, payload, _)| fresh_bash_route(*operation, payload));
+        record.routed = phase_record::mono_ns();
+        let job = FreshV30Job {
+            stream,
+            request,
+            record,
+        };
+        let job = match bash.as_ref().filter(|_| to_bash) {
+            // A closed Bash pool falls back to the serial general worker.
+            Some(bash) => match bash.send(job) {
+                Ok(()) => continue,
+                Err(mpsc::SendError(job)) => job,
+            },
+            None => job,
+        };
+        if general.send(job).is_err() {
+            return;
+        }
+    }
+}
+
+struct FreshV30Worker<'a> {
+    label: &'static str,
+    state_root: &'a Path,
+    lane: FreshV30Lane,
+    runner_image: File,
+    bash_image: Option<File>,
+    installed_identity: Option<(String, String)>,
+    handoff_tx: Option<SyncSender<FreshHandoffBridgeRequest>>,
+    terminal_tx: Option<SyncSender<FreshTerminalBridgeRequest>>,
+    drain_tx: Option<SyncSender<FreshDrainBridgeRequest>>,
+    admission_fences: Arc<AdmissionFences>,
+    instance: Arc<EntryGate>,
+    route_index: Option<fresh_index::Index>,
+    successor_ledger: Option<SuccessorLaunchLedger>,
+    live_successors: BTreeMap<String, LiveCandidate>,
+    ordinary_completion_tx: mpsc::Sender<String>,
+    admission_lease: Arc<fresh_index::AdmissionLease>,
+    #[cfg(feature = "age319-private-broker-fixture")]
+    provider_readback_v3: Option<fresh_index::KeyedGeneration>,
+    #[cfg(feature = "age319-private-broker-fixture")]
+    route_writer_v3: bool,
+    #[cfg(feature = "age319-private-broker-fixture")]
+    provider_writer_v3: bool,
+}
+
+/// Serves requests one at a time with this worker's own lane. The general
+/// worker owns every in-memory candidate and private map; a Bash worker
+/// receives only `fresh_bash_route` requests, which use none of them.
+fn fresh_v30_worker(
+    worker: FreshV30Worker<'_>,
+    jobs: impl IntoIterator<Item = FreshV30Job>,
+) -> io::Result<()> {
+    let FreshV30Worker {
+        label,
+        state_root,
+        mut lane,
+        runner_image,
+        bash_image,
+        installed_identity,
+        handoff_tx,
+        terminal_tx,
+        drain_tx,
+        admission_fences,
+        instance,
+        route_index,
+        successor_ledger,
+        mut live_successors,
+        ordinary_completion_tx,
+        admission_lease,
+        #[cfg(feature = "age319-private-broker-fixture")]
+        provider_readback_v3,
+        #[cfg(feature = "age319-private-broker-fixture")]
+        route_writer_v3,
+        #[cfg(feature = "age319-private-broker-fixture")]
+        provider_writer_v3,
+    } = worker;
+    // Every worker holds the broker admission lease while it can serve.
+    let _admission_lease = admission_lease;
     #[cfg(feature = "age319-private-broker-fixture")]
     let mut native_codex_controls: HashMap<String, fresh_provider::NativeCodexControl> =
         HashMap::new();
@@ -8207,23 +8574,15 @@ fn serve_fresh_v30_at(
     let mut native_turn_execs: HashMap<String, fresh_provider::NativeTurnExec> = HashMap::new();
     #[cfg(feature = "age319-private-broker-fixture")]
     let mut native_f_execs: HashMap<String, fresh_provider::NativeFExec> = HashMap::new();
-    let successor_ledger = installed_identity
-        .as_ref()
-        .map(|(pair, source)| SuccessorLaunchLedger::open(state_root, pair, source))
-        .transpose()?;
-    // An old candidate record is readback only. Only this Broker incarnation
-    // owns an inherited gate and may authorize a first offer.
-    let mut live_successors = BTreeMap::<String, LiveCandidate>::new();
-    if let Err(error) = phase_record::init(state_root) {
-        eprintln!("phase records unavailable: {error}");
-    }
-    let images = phase_record::ImageRoles::new(Some(&runner_image), bash_image.as_ref());
-    for incoming in listener.incoming() {
-        let Ok(mut stream) = incoming else { continue };
-        let mut record = phase_record::Request::accepted("v30");
+    for job in jobs {
+        let FreshV30Job {
+            mut stream,
+            request,
+            mut record,
+        } = job;
+        record.lane = label;
         phase_record::begin_request();
-        stream.set_read_timeout(Some(FRESH_V30_READ_TIMEOUT))?;
-        stream.set_write_timeout(Some(FRESH_V30_WRITE_TIMEOUT))?;
+        record.handler_start = phase_record::mono_ns();
         let mut submitted_grant = None;
         let mut submitted_successor_grant = None;
         #[cfg(feature = "age319-private-broker-fixture")]
@@ -8248,16 +8607,7 @@ fn serve_fresh_v30_at(
         let mut diagnostic_stage = "request_decode";
         let mut diagnostic_key_hash = String::from("unavailable");
         let answer = (|| -> io::Result<String> {
-            let (operation, payload, peer) = peer_from_request(&mut stream)?;
-            record.read_done();
-            record.opcode = Some(operation);
-            record.peer(
-                peer.process.host_pid,
-                peer.process.starttime_ticks,
-                peer.uid,
-                images.role(peer.process.host_pid),
-            );
-            record.handler_start = phase_record::mono_ns();
+            let (operation, payload, peer) = request?;
             diagnostic_opcode = operation;
             diagnostic_stage = "peer_authority";
             peer.process.verify()?;
@@ -8520,10 +8870,12 @@ fn serve_fresh_v30_at(
                             .map(|(pair, source)| (pair.as_str(), source.as_str())),
                     )?;
                     let directory = state_root.join("v30/fresh-provider");
+                    // Bash effects of one root stay serialized with each other and
+                    // with every fence holder; other roots' Bash effects overlap.
                     let _admission_guard =
                         if matches!(operation, b'C' | b'X' | b'E' | b'%' | b'8' | b'^') {
-                            let guard = lock_fences(&admission_fences)
-                                .map_err(|_| io::Error::other("root admission fence poisoned"))?;
+                            let guard =
+                                admission_fences.bash_root(&root.old_release.prepared.root_id)?;
                             if guard.contains(&root.old_release.prepared.root_id) {
                                 return Err(io::Error::other("exact root admission fenced"));
                             }
@@ -11676,9 +12028,6 @@ fn serve_fresh_v30_at(
         })();
         record.handler_end = phase_record::mono_ns();
         record.sub = phase_record::take_sub();
-        if record.opcode.is_none() {
-            record.read_done();
-        }
         #[cfg(feature = "age319-private-broker-fixture")]
         let drop_marker = if drop_native_f_turn_reply {
             Some("native-f-turn-reply-dropped")
@@ -12010,6 +12359,133 @@ pub fn run() {
 #[cfg(all(test, feature = "age319-private-broker-fixture"))]
 #[path = "recipient_effect_tests.rs"]
 mod recipient_effect_tests;
+
+#[cfg(test)]
+mod admission_fence_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    const A: &str = "11111111-1111-4111-8111-111111111111";
+    const B: &str = "22222222-2222-4222-8222-222222222222";
+
+    fn child(request_id: &str) -> RequestPayload {
+        RequestPayload::FreshBashChildRequest {
+            request_id: request_id.into(),
+            listener_policy: None,
+            ordinary_command: None,
+            ordinary_k_digest: None,
+        }
+    }
+
+    #[test]
+    fn only_the_serial_bash_arms_route_to_bash_workers() {
+        assert!(fresh_bash_route(0x90, &RequestPayload::None));
+        assert!(!fresh_bash_route(0x90, &child(A)));
+        for operation in [
+            b'C', b'X', b'c', b'E', b'O', b'%', b'!', b'^', b'v', b'u', b'<', b'8', b'9',
+        ] {
+            assert!(fresh_bash_route(operation, &child(A)), "{operation}");
+            assert!(!fresh_bash_route(operation, &RequestPayload::None));
+            assert!(!fresh_bash_route(
+                operation,
+                &RequestPayload::FreshSessionRequest {
+                    request_id: A.into()
+                }
+            ));
+        }
+        // The serial lane served these opcodes elsewhere or not at all.
+        for operation in [b'D', b'd', b'I', b'i', b'U', b'F', 0x8b, 0x8c, b'@'] {
+            assert!(!fresh_bash_route(operation, &child(A)), "{operation}");
+            assert!(!fresh_bash_route(operation, &RequestPayload::None));
+        }
+    }
+
+    #[test]
+    fn bash_effects_overlap_across_roots_but_not_within_one() {
+        let fences = Arc::new(AdmissionFences::new(HashSet::new()));
+        let a = fences.bash_root(A).unwrap();
+        // Another root's Bash effect proceeds while A is held.
+        let b = fences.bash_root(B).unwrap();
+        assert!(!a.contains(A) && !b.contains(B));
+        drop(b);
+        let entered = Arc::new(AtomicUsize::new(0));
+        let second = {
+            let (fences, entered) = (Arc::clone(&fences), Arc::clone(&entered));
+            std::thread::spawn(move || {
+                let _held = fences.bash_root(A).unwrap();
+                entered.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(entered.load(Ordering::SeqCst), 0, "same root overlapped");
+        drop(a);
+        second.join().unwrap();
+        assert_eq!(entered.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn exclusive_fence_waits_for_every_bash_effect_and_blocks_new_ones() {
+        let fences = Arc::new(AdmissionFences::new(HashSet::new()));
+        let a = fences.bash_root(A).unwrap();
+        let b = fences.bash_root(B).unwrap();
+        let fenced = Arc::new(AtomicUsize::new(0));
+        let fencer = {
+            let (fences, fenced) = (Arc::clone(&fences), Arc::clone(&fenced));
+            std::thread::spawn(move || {
+                let mut guard = lock_fences(&fences).unwrap();
+                fenced.store(1, Ordering::SeqCst);
+                guard.insert(A.into());
+                std::thread::sleep(Duration::from_millis(100));
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(fenced.load(Ordering::SeqCst), 0, "fence passed an effect");
+        drop(a);
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(fenced.load(Ordering::SeqCst), 0, "fence passed root B");
+        drop(b);
+        fencer.join().unwrap();
+        // After the fence, root A's next Bash effect sees it.
+        let after = fences.bash_root(A).unwrap();
+        assert!(after.contains(A));
+        assert!(!after.contains(B));
+    }
+
+    #[test]
+    fn exclusive_holder_excludes_bash_effects_of_every_root() {
+        let fences = Arc::new(AdmissionFences::new(HashSet::new()));
+        let guard = lock_fences(&fences).unwrap();
+        let entered = Arc::new(AtomicUsize::new(0));
+        let effect = {
+            let (fences, entered) = (Arc::clone(&fences), Arc::clone(&entered));
+            std::thread::spawn(move || {
+                let _held = fences.bash_root(B).unwrap();
+                entered.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(entered.load(Ordering::SeqCst), 0);
+        drop(guard);
+        effect.join().unwrap();
+        assert_eq!(entered.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_panicking_bash_effect_poisons_both_sides() {
+        let fences = Arc::new(AdmissionFences::new(HashSet::new()));
+        let panicked = {
+            let fences = Arc::clone(&fences);
+            std::thread::spawn(move || {
+                let _held = fences.bash_root(A).unwrap();
+                panic!("effect failed mid-admission");
+            })
+        };
+        assert!(panicked.join().is_err());
+        assert!(fences.bash_root(B).is_err());
+        assert!(lock_fences(&fences).is_err());
+    }
+}
 
 #[cfg(test)]
 mod tests {

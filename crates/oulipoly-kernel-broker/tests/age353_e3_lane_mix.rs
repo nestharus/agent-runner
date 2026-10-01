@@ -81,6 +81,13 @@ fn age353_e3_concurrent_bash_calls_beside_looping_clients() {
     let roots: usize = std::env::var("AGE353_E3_ROOTS")
         .map(|value| value.parse().unwrap())
         .unwrap_or(ROOTS);
+    // Seconds after the common start at which each root's call begins. The
+    // default is P3's observed spacing (s2, b2, b1, s1); a burst is heavier.
+    let staggers: Vec<f64> = std::env::var("AGE353_E3_STAGGERS")
+        .unwrap_or_else(|_| "0,1.07,1.79,3.41".into())
+        .split(',')
+        .map(|value| value.parse().unwrap())
+        .collect();
 
     // State refuses storage below a group/world-writable ancestor. An owned
     // directory may be bound over /mnt in this private mount namespace so
@@ -246,7 +253,10 @@ while [ ! -f "$E3_PROVIDER_RELEASE_FILE" ]; do sleep 0.02; done
             .env("AGE319_BASH_CONTROL_SOCKET", &socket)
             .env("E3_READY_FILE", &ready)
             .env("E3_GO_FILE", &go)
-            .env("E3_STAGGER", format!("{:.2}", index as f64 * 0.15))
+            .env(
+                "E3_STAGGER",
+                format!("{:.2}", staggers[index % staggers.len()]),
+            )
             .env("E3_CALL_FILE", &call)
             .env("E3_BASH_ERR_FILE", call.with_extension("err"))
             .env("E3_CHILD_RELEASE_FILE", &child_release)
@@ -286,11 +296,20 @@ while [ ! -f "$E3_PROVIDER_RELEASE_FILE" ]; do sleep 0.02; done
                 )
             },
         );
-        assert!(
-            ready.exists(),
-            "launcher exited early: {}",
-            fs::read_to_string(&*err).unwrap_or_default()
-        );
+        if !ready.exists() {
+            // Keep the records of a refused launch for diagnosis.
+            if let Ok(records) = phase_record::read_all(&state) {
+                fs::create_dir_all(&output).unwrap();
+                let label = std::env::var("AGE353_E3_LABEL").unwrap_or_else(|_| "run".into());
+                let raw: String = records.iter().map(|record| format!("{record}\n")).collect();
+                fs::write(output.join(format!("{label}-refused-records.jsonl")), raw).unwrap();
+            }
+            panic!(
+                "launcher exited early: {} / broker: {}",
+                fs::read_to_string(&*err).unwrap_or_default(),
+                log()
+            );
+        }
     }
     // Every original Runner is now in its 50 ms Q loop. Let the loops and
     // the extra traffic settle before the calls start.
@@ -420,6 +439,15 @@ while [ ! -f "$E3_PROVIDER_RELEASE_FILE" ]; do sleep 0.02; done
     assert_eq!(fs::read_to_string(&effect).unwrap().lines().count(), roots);
     broker.kill().unwrap();
     broker.wait().unwrap();
+    // A Broker built before phase records still runs the same mix.
+    if std::env::var_os("AGE353_E3_WITHOUT_RECORDS").is_some() {
+        let wholes: Vec<f64> = calls
+            .iter()
+            .map(|(start, end, _)| (end - start) as f64 / 1e9)
+            .collect();
+        println!("AGE353_E3_CALL_WHOLE_S {wholes:?}");
+        return;
+    }
 
     let records = phase_record::read_all(&state).unwrap();
     let summary = summarize(&records, &calls, traffic_counts.load(Ordering::Relaxed));
