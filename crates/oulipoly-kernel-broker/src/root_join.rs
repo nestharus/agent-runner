@@ -8,6 +8,7 @@ use oulipoly_kernel_broker::entry_registry::EntryRegistry;
 use oulipoly_kernel_broker::entry_registry::ProcessStamp;
 use oulipoly_kernel_broker::identity::own_pid1_record_matches;
 use oulipoly_kernel_broker::identity::{PeerIdentity, PinnedProcess};
+use oulipoly_kernel_broker::phase_record::stage;
 use oulipoly_kernel_broker::protocol::JoinSpec;
 use oulipoly_kernel_broker::registry::{RootRecord, RootRegistry};
 use oulipoly_kernel_broker::{json_artifact, root_pid1};
@@ -516,7 +517,9 @@ pub(super) fn hold(
     entries: &mut EntryRegistry,
     _held_v30: bool,
 ) -> io::Result<HeldRootJoin> {
+    stage("hold:validate");
     validate(&spec, &descriptors)?;
+    stage("hold:receipt");
     let mut receipt_peer = libc::ucred {
         pid: 0,
         uid: 0,
@@ -540,12 +543,15 @@ pub(super) fn hold(
             "completion receipt is not the original entry socket",
         ));
     }
-    if (peer.uid < 1000 && !super::private_fixture())
-        || !peer.process.same_executable_as(image)?
-        || roots.has_debt()
-    {
+    stage("hold:trust");
+    if (peer.uid < 1000 && !super::private_fixture()) || !peer.process.same_executable_as(image)? {
         return Err(io::Error::other("untrusted root join entry"));
     }
+    stage("hold:debt");
+    if roots.has_debt() {
+        return Err(io::Error::other("untrusted root join entry"));
+    }
+    stage("hold:consume");
     // This fsynced transition precedes any namespace fork. It is never reset
     // on timeout, connection loss or broker restart.
     entries.consume_join(
@@ -556,6 +562,7 @@ pub(super) fn hold(
         peer.uid,
         &peer.process,
     )?;
+    stage("hold:prepare");
     let (mut broker_control, init_control) = UnixStream::pair()?;
     let (broker_gate, init_gate) = UnixStream::pair()?;
     let one: libc::c_int = 1;
@@ -593,6 +600,7 @@ pub(super) fn hold(
     let supervisor = context.spec.supervisor_id.clone();
     let guardian_pid = context.spec.guardian_pid;
     let (reservation, parent_permit, child_permit) = super::namespace_helper_reaper::prepare()?;
+    stage("hold:fork");
     let pointer = Box::into_raw(context);
     let parent_pid = unsafe { libc::fork() };
     if parent_pid < 0 {
@@ -667,7 +675,9 @@ pub(super) fn hold(
         drop(Box::from_raw(pointer));
     }
     drop(child_permit);
+    stage("hold:activate");
     super::namespace_helper_reaper::activate(reservation, parent_pid, parent_permit)?;
+    stage("hold:pid1-notice");
     let mut record_length = [0u8; 2];
     parent_notice.read_exact(&mut record_length)?;
     let length = usize::from(u16::from_be_bytes(record_length));
@@ -680,6 +690,7 @@ pub(super) fn hold(
     if record.root_id != root_id || record.owner_uid != peer.uid {
         return Err(io::Error::other("root PID1 parent record changed"));
     }
+    stage("hold:pid1-verify");
     let init = PinnedProcess::open(record.init_host_pid)?;
     if !init.is_namespace_init()?
         || init.in_namespace(peer.process.namespace())?
@@ -689,7 +700,9 @@ pub(super) fn hold(
     {
         return Err(io::Error::other("root PID namespace did not form"));
     }
+    stage("hold:root-insert");
     roots.insert(record.clone())?;
+    stage("hold:child");
     broker_control.write_all(b"P")?;
     let bytes = serde_json::to_vec(&record)?;
     broker_control.write_all(&(bytes.len() as u16).to_be_bytes())?;
@@ -711,6 +724,7 @@ pub(super) fn hold(
     }
     // Persist the exact child incarnation before the executable can cross the
     // gate. A failed write leaves consumed-join debt, never a loose UUID grant.
+    stage("hold:bind-child");
     entries.bind_joined_child(&root_id, peer.uid, &peer.process, &child)?;
     #[cfg(feature = "age319-private-broker-fixture")]
     if !_held_v30
@@ -726,6 +740,7 @@ pub(super) fn hold(
             std::thread::sleep(PRIVATE_ROOT_GATE_POLL);
         }
     }
+    stage("hold:guardian");
     let guardian = PinnedProcess::open(guardian_pid)?;
     if entries
         .record(&root_id)

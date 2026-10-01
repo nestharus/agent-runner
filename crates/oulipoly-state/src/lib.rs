@@ -58,6 +58,7 @@ pub mod schema;
 pub mod schema_probe;
 mod snapshot_helper;
 pub mod sqlite_observability;
+pub mod sqlite_wait;
 
 pub type StateDbError = String;
 
