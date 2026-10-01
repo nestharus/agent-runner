@@ -425,6 +425,11 @@ pub const ACCESS_INVENTORY: &[InventoryEntry] = &[
         class: SqliteAccessClass::LiveAuthority,
     },
     InventoryEntry {
+        id: "index.completion_continuation_owner_running_authority",
+        kind: InventoryKind::Index,
+        class: SqliteAccessClass::LiveAuthority,
+    },
+    InventoryEntry {
         id: "index.completion_continuation_attempt_unresolved",
         kind: InventoryKind::Index,
         class: SqliteAccessClass::LiveAuthority,

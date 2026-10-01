@@ -100,9 +100,14 @@ impl CompletionAuthorityFence<'_> {
         Ok(())
     }
 
+    /// `exact_owner` is the released root's (root, owner generation,
+    /// supervisor) triple for a broker exact projection. Concurrent roots
+    /// share one domain, so the source belongs to that exact owner, never
+    /// to whichever running row the domain happens to return first.
     pub(crate) fn materialize_continuation_binding(
         &self,
         binding: &AdmittedSourceBinding,
+        exact_owner: Option<(&str, &str, &str)>,
     ) -> Result<(), String> {
         self.preflight_continuation_binding(binding, true)?;
         let source = binding.registration()?;
@@ -123,16 +128,44 @@ impl CompletionAuthorityFence<'_> {
                 Err("immutable completion binding conflict".into())
             };
         }
-        let supervisor_authority_id: String = self
-            .tx
-            .query_row(
-                "SELECT supervisor_authority_id
-                 FROM completion_continuation_owner
-                 WHERE domain_id=?1 AND phase='running'",
-                [&source.domain_id],
-                |row| row.get(0),
-            )
-            .map_err(|e| e.to_string())?;
+        let supervisor_authority_id: String =
+            if let Some((root_id, generation, supervisor)) = exact_owner {
+                self.tx
+                    .query_row(
+                        "SELECT supervisor_authority_id
+                     FROM completion_continuation_owner
+                     WHERE domain_id=?1 AND phase='running' AND kernel_root_id=?2
+                     AND generation=?3 AND supervisor_authority_id=?4",
+                        params![source.domain_id, root_id, generation, supervisor],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|e| e.to_string())?
+                    .ok_or("completion source exact owner is not running")?
+            } else {
+                let mut statement = self
+                    .tx
+                    .prepare(
+                        "SELECT supervisor_authority_id
+                     FROM completion_continuation_owner
+                     WHERE domain_id=?1 AND phase='running' LIMIT 2",
+                    )
+                    .map_err(|e| e.to_string())?;
+                let running = statement
+                    .query_map([&source.domain_id], |row| row.get::<_, String>(0))
+                    .map_err(|e| e.to_string())?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| e.to_string())?;
+                match running.as_slice() {
+                    [only] => only.clone(),
+                    [] => return Err("completion source owner is not running".into()),
+                    _ => {
+                        return Err(
+                            "completion source owner is ambiguous across concurrent roots".into(),
+                        );
+                    }
+                }
+            };
         self.tx.execute("INSERT INTO completion_continuation_source(registration_id,domain_id,source_id,event_id,registration_digest,binding,supervisor_authority_id,attempt_association_history) VALUES(?1,?2,?3,?4,?5,?6,?7,'known')", params![source.registration_id,source.domain_id,source.source_id,source.handle,binding.registration_digest(),bytes,supervisor_authority_id]).map_err(|e| e.to_string())?;
         Ok(())
     }

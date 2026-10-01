@@ -82,7 +82,8 @@ coordination. Diagnostics must select the explicitly named
 | `index.idx_completion_event_listener_session_live` | live authority | Exact-session listener activation contains only explicit retirement obligations. |
 | `index.idx_completion_event_listener_retirement_pending` | live authority | Explicit pending-retirement listener projection; response-only/no-notification rows, acknowledged rows, and explicitly terminal mailbox-error rows are absent. |
 | `index.idx_runtime_generation_live_session` | live authority | Explicit non-exited runtime projection by session. |
-| `index.completion_continuation_owner_running` | live authority | Current completion owner. |
+| `index.completion_continuation_owner_running` | live authority | Current completion owner (ordinary sidecars and broker sidecars before v39). |
+| `index.completion_continuation_owner_running_authority` | live authority | Broker v39: one running completion owner per supervisor authority, so concurrent released roots keep their own owners. |
 | `index.completion_continuation_attempt_unresolved` | live authority | Current/inherited unresolved supervisor attempts. |
 | `index.completion_continuation_attempt_native_runtime` | bounded cross-boundary | Exact native runtime/invocation identity probe for cancellation, drain, and supervisor retirement without attempt-history scans. |
 | `index.completion_continuation_source_unaccepted` | live authority | Current/inherited registered sources. |

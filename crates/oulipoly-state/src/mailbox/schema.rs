@@ -318,7 +318,7 @@ fn classify_completion_summary(summary: CompletionProtocolSummary) -> Option<&'s
 // v30 was assigned to the broker-owned sidecar. Keep that ordinal reserved so
 // an ordinary opener can never mistake an old broker cutover for an upgrade.
 pub(super) const CURRENT_VERSION: i64 = 31;
-pub(super) const BROKER_OWNED_VERSION: i64 = 38;
+pub(super) const BROKER_OWNED_VERSION: i64 = 39;
 const MAX_SUPPORTED_VERSION: i64 = CURRENT_VERSION;
 const SCHEMA_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -754,7 +754,10 @@ pub(super) fn validate_broker_owned(conn: &Connection) -> Result<String, String>
     if version == 30 {
         return Err("persisted broker-owned v30 sidecar requires separate disposition; in-place migration is unsupported".into());
     }
-    if !matches!(version, 32 | 33 | 34 | 35 | 36 | 37 | BROKER_OWNED_VERSION) {
+    if !matches!(
+        version,
+        32 | 33 | 34 | 35 | 36 | 37 | 38 | BROKER_OWNED_VERSION
+    ) {
         return Err(format!(
             "broker sidecar requires schema version {BROKER_OWNED_VERSION}"
         ));
@@ -771,6 +774,8 @@ pub(super) fn validate_broker_owned(conn: &Connection) -> Result<String, String>
         super::completion_continuation::validate_broker_v36_schema_on(&tx)?;
     } else if version == 37 {
         super::completion_continuation::validate_broker_v37_schema_on(&tx)?;
+    } else if version == 38 {
+        super::completion_continuation::validate_broker_v38_schema_on(&tx)?;
     } else {
         super::completion_continuation::validate_broker_schema_on(&tx)?;
     }
@@ -989,7 +994,7 @@ pub(super) fn validate_broker_owned(conn: &Connection) -> Result<String, String>
             }
         }
     }
-    if version == BROKER_OWNED_VERSION {
+    if version >= 38 {
         for (name, expected) in [
             ("broker_owner_close", BROKER_OWNER_CLOSE_SCHEMA),
             ("broker_owner_close_immutable", BROKER_OWNER_CLOSE_IMMUTABLE),
@@ -1402,6 +1407,16 @@ BEGIN SELECT RAISE(ABORT,'broker owner close is immutable'); END";
 pub(super) const BROKER_OWNER_CLOSE_RETAIN: &str = "CREATE TRIGGER broker_owner_close_retain
 BEFORE DELETE ON broker_owner_close
 BEGIN SELECT RAISE(ABORT,'broker owner close must be retained'); END";
+
+/// v39: each released root keeps its own running completion owner. The v18
+/// domain-wide election index made any sibling release displace every other
+/// still-active root. Uniqueness now belongs to the supervisor authority,
+/// which is already bound to exactly one guardian incarnation and root.
+pub(super) const BROKER_LEGACY_OWNER_RUNNING_INDEX_DROP: &str =
+    "DROP INDEX completion_continuation_owner_running";
+pub(super) const BROKER_PER_ROOT_OWNER_RUNNING_INDEX: &str =
+    "CREATE UNIQUE INDEX completion_continuation_owner_running_authority
+ON completion_continuation_owner(supervisor_authority_id) WHERE phase='running'";
 
 pub(super) const BROKER_OWNER_RELEASE_EXACT: &str = "CREATE TRIGGER broker_owner_release_exact
 BEFORE INSERT ON broker_owner_release

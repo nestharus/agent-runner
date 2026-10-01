@@ -4892,7 +4892,10 @@ fn open_with_owner(path: &Path, owner: u32, anchor: &Path) -> Result<BrokerSidec
         .map_err(|error| format!("Failed to open broker sidecar: {error}"))?;
     authority.validate_opened_target()?;
     configure_writable_sidecar_connection(&conn)?;
-    if matches!(schema::sidecar_version(&conn)?, 32 | 33 | 34 | 35 | 36 | 37) {
+    if matches!(
+        schema::sidecar_version(&conn)?,
+        32 | 33 | 34 | 35 | 36 | 37 | 38
+    ) {
         schema::validate_broker_owned(&conn)?;
         // Serialize both additive upgrades on the retained connection. The
         // historical four-column provenance table remains inert at v34.
@@ -4962,6 +4965,18 @@ fn open_with_owner(path: &Path, owner: u32, anchor: &Path) -> Result<BrokerSidec
                 schema::BROKER_OWNER_CLOSE_SCHEMA,
                 schema::BROKER_OWNER_CLOSE_IMMUTABLE,
                 schema::BROKER_OWNER_CLOSE_RETAIN,
+            ] {
+                tx.execute_batch(definition).map_err(|e| e.to_string())?;
+            }
+            tx.pragma_update(None, "user_version", 38)
+                .map_err(|e| e.to_string())?;
+        }
+        if schema::sidecar_version(&tx)? == 38 {
+            // Existing rows already satisfy the narrower predicate: the old
+            // index admitted at most one running owner in the whole domain.
+            for definition in [
+                schema::BROKER_LEGACY_OWNER_RUNNING_INDEX_DROP,
+                schema::BROKER_PER_ROOT_OWNER_RUNNING_INDEX,
             ] {
                 tx.execute_batch(definition).map_err(|e| e.to_string())?;
             }
@@ -5066,6 +5081,8 @@ pub(super) fn activate_with_owner(
         schema::BROKER_OWNER_RELEASE_RETAIN,
         schema::BROKER_OWNER_RELEASE_EXACT,
         schema::BROKER_PREPARED_OWNER_NO_RUNNING,
+        schema::BROKER_LEGACY_OWNER_RUNNING_INDEX_DROP,
+        schema::BROKER_PER_ROOT_OWNER_RUNNING_INDEX,
     ] {
         tx.execute_batch(definition)
             .map_err(|error| format!("Failed to create broker prepared owner: {error}"))?;
@@ -6495,6 +6512,419 @@ mod tests {
         assert!(open_with_owner(&path, uid, root.path()).is_err());
     }
 
+    /// AGE-353: four overlapping released roots in one Broker domain (the
+    /// installed 2 busy + 2 sleeping shape). Each keeps its own running owner,
+    /// supervisor authority and debt; a sibling's release, a closed sibling
+    /// and a later root never retire them. Copied single-owner rows keep the
+    /// replace-and-adopt election.
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_released_roots_keep_their_own_owner_authority_and_debt() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("sidecar");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join("pid-identity.db");
+        let mut db = MailboxDb::open(&path).unwrap();
+        let domain = db.completion_continuation_domain().unwrap().unwrap();
+        let live = crate::pid_identity::read_current_process_identity().unwrap();
+        let identity = SourceProcessIdentity {
+            pid: live.os_pid,
+            boot_id: live.os_boot_id.clone(),
+            starttime_ticks: live.os_pid_starttime_ticks,
+        };
+        let copied = super::super::CompletionDomainOwner {
+            protocol: PROTOCOL.into(),
+            domain_id: domain.clone(),
+            supervisor_authority_id: uuid::Uuid::new_v4().to_string(),
+            owner_generation: uuid::Uuid::new_v4().to_string(),
+            guardian_identity: identity.clone(),
+            driver_identity: identity,
+            endpoint: "/copied/single-owner".into(),
+        };
+        db.publish_completion_owner_with_kernel_root(
+            &copied,
+            Some(&uuid::Uuid::new_v4().to_string()),
+        )
+        .unwrap();
+        let insert_attempt = |conn: &Connection, owner_generation: &str, authority: &str| {
+            let attempt_id = uuid::Uuid::new_v4().to_string();
+            conn.execute(
+                "INSERT INTO completion_continuation_attempt(attempt_id,domain_id,
+                 owner_generation,operation,request_sha256,phase,result_path,
+                 supervisor_authority_id)
+                 VALUES(?1,?2,?3,'transport',?4,'accepted','/fixture/result',?5)",
+                params![
+                    attempt_id,
+                    domain,
+                    owner_generation,
+                    "a".repeat(64),
+                    authority
+                ],
+            )
+            .unwrap();
+            attempt_id
+        };
+        let copied_debt = insert_attempt(
+            &db.conn,
+            &copied.owner_generation,
+            &copied.supervisor_authority_id,
+        );
+        drop(db);
+        for artifact in [path.clone(), mailbox_authority_path(&path)] {
+            fs::set_permissions(artifact, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let uid = unsafe { libc::geteuid() };
+        let source_generation = activate_with_owner(&path, uid, root.path()).unwrap();
+        let mut broker = open_with_owner(&path, uid, root.path()).unwrap();
+        assert_eq!(
+            schema::sidecar_version(&broker.mailbox.conn).unwrap(),
+            schema::BROKER_OWNED_VERSION
+        );
+        schema::validate_broker_owned(&broker.mailbox.conn).unwrap();
+
+        let boot_id = uuid::Uuid::new_v4().to_string();
+        let prepared_root = |index: i32| {
+            let stamp = |actor: i32, pidns_ino| PreparedProcessStamp {
+                host_pid: 1000 + index * 10 + actor,
+                boot_id: boot_id.clone(),
+                starttime_ticks: (5000 + index * 10 + actor) as u64,
+                pidns_dev: 1,
+                pidns_ino,
+            };
+            let host_ns = 1;
+            let root_ns = 100 + index as u64;
+            PreparedBrokerOwner {
+                source_generation: source_generation.clone(),
+                root_id: uuid::Uuid::new_v4().to_string(),
+                owner_uid: uid,
+                domain_id: domain.clone(),
+                supervisor_authority_id: uuid::Uuid::new_v4().to_string(),
+                owner_generation: uuid::Uuid::new_v4().to_string(),
+                endpoint: format!("/fixture/root-{index}/owner.sock"),
+                entry: stamp(1, host_ns),
+                guardian: stamp(2, host_ns),
+                driver: stamp(3, host_ns),
+                root_init: stamp(4, root_ns),
+                joined_child: stamp(5, root_ns),
+            }
+        };
+        let owner_phase = |broker: &BrokerSidecar, generation: &str| -> String {
+            broker
+                .mailbox
+                .conn
+                .query_row(
+                    "SELECT phase FROM completion_continuation_owner WHERE generation=?1",
+                    [generation],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let authority_phase = |broker: &BrokerSidecar, authority: &str| -> String {
+            broker
+                .mailbox
+                .conn
+                .query_row(
+                    "SELECT phase FROM completion_supervisor_authority WHERE authority_id=?1",
+                    [authority],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let attempt_phase = |broker: &BrokerSidecar, attempt: &str| -> String {
+            broker
+                .mailbox
+                .conn
+                .query_row(
+                    "SELECT phase FROM completion_continuation_attempt WHERE attempt_id=?1",
+                    [attempt],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let inherits = |broker: &BrokerSidecar, heir: &str, predecessor: &str| -> bool {
+            broker
+                .mailbox
+                .conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM completion_supervisor_inheritance
+                     WHERE authority_id=?1 AND predecessor_authority_id=?2)",
+                    [heir, predecessor],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let require_qualified = |broker: &BrokerSidecar, prepared: &PreparedBrokerOwner| {
+            let release = broker
+                .read_released_owner_for_root(&prepared.root_id)
+                .unwrap();
+            assert_eq!(release.prepared, *prepared);
+            broker
+                .read_exact_continuation(
+                    &source_generation,
+                    &prepared.root_id,
+                    &prepared.domain_id,
+                    &prepared.supervisor_authority_id,
+                    &prepared.owner_generation,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(owner_phase(broker, &prepared.owner_generation), "running");
+            assert_eq!(
+                authority_phase(broker, &prepared.supervisor_authority_id),
+                "active"
+            );
+        };
+
+        // Every root reaches J/prepared before any release: real overlap.
+        let roots: Vec<_> = (0..4).map(prepared_root).collect();
+        for prepared in &roots {
+            assert_eq!(broker.prepare_exact_owner(prepared).unwrap(), *prepared);
+        }
+        let mut sibling_debt = Vec::new();
+        for (index, prepared) in roots.iter().enumerate() {
+            broker.commit_exact_prepared_release(prepared).unwrap();
+            sibling_debt.push(insert_attempt(
+                &broker.mailbox.conn,
+                &prepared.owner_generation,
+                &prepared.supervisor_authority_id,
+            ));
+            for earlier in &roots[..=index] {
+                require_qualified(&broker, earlier);
+            }
+            for debt in &sibling_debt {
+                assert_eq!(attempt_phase(&broker, debt), "accepted");
+            }
+        }
+        // The copied single-owner row was replaced and adopted exactly once.
+        assert_eq!(owner_phase(&broker, &copied.owner_generation), "lost");
+        assert_eq!(
+            authority_phase(&broker, &copied.supervisor_authority_id),
+            "retired"
+        );
+        assert_eq!(attempt_phase(&broker, &copied_debt), "unknown_custody");
+        assert!(inherits(
+            &broker,
+            &roots[0].supervisor_authority_id,
+            &copied.supervisor_authority_id
+        ));
+        for later in &roots[1..] {
+            assert!(!inherits(
+                &broker,
+                &later.supervisor_authority_id,
+                &copied.supervisor_authority_id
+            ));
+        }
+        for heir in &roots {
+            for sibling in &roots {
+                assert!(!inherits(
+                    &broker,
+                    &heir.supervisor_authority_id,
+                    &sibling.supervisor_authority_id
+                ));
+            }
+        }
+        // Each root's close duties are its own debt, never a sibling's.
+        for (index, prepared) in roots.iter().enumerate() {
+            let duties = owner_close_duties_on(
+                &broker.mailbox.conn,
+                &prepared.supervisor_authority_id,
+                &source_generation,
+                &prepared.root_id,
+                &prepared.owner_generation,
+            )
+            .unwrap();
+            assert_eq!(duties.unresolved_attempts, if index == 0 { 2 } else { 1 });
+        }
+
+        // A root cannot qualify through a sibling's owner or authority.
+        let (b1, s1) = (&roots[0], &roots[1]);
+        for (supervisor, generation) in [
+            (&b1.supervisor_authority_id, &s1.owner_generation),
+            (&s1.supervisor_authority_id, &b1.owner_generation),
+            (&b1.supervisor_authority_id, &b1.owner_generation),
+        ] {
+            assert!(
+                broker
+                    .read_exact_continuation(
+                        &source_generation,
+                        &s1.root_id,
+                        &domain,
+                        supervisor,
+                        generation,
+                        None,
+                    )
+                    .is_err()
+            );
+        }
+        let mut thief = broker
+            .read_released_owner_for_root(&b1.root_id)
+            .unwrap()
+            .owner;
+        thief.owner_generation = uuid::Uuid::new_v4().to_string();
+        thief.guardian_identity.starttime_ticks += 1;
+        assert!(
+            broker
+                .mailbox
+                .publish_completion_owner_with_kernel_root(&thief, Some(&s1.root_id))
+                .unwrap_err()
+                .contains("cannot move")
+        );
+        for prepared in &roots {
+            require_qualified(&broker, prepared);
+        }
+
+        // Emulate b1's committed owner close (the sidecar transitions of
+        // close_exact_root_owner, without its bound State proof), then admit
+        // a fifth root. Neither touches the three still-active siblings.
+        let close = |broker: &BrokerSidecar, prepared: &PreparedBrokerOwner| {
+            for debt in &sibling_debt {
+                broker
+                    .mailbox
+                    .conn
+                    .execute(
+                        "UPDATE completion_continuation_attempt
+                         SET phase='drained',revision=revision+1,integrated=1,drain_receipt='fixture'
+                         WHERE attempt_id=?1 AND supervisor_authority_id=?2",
+                        params![debt, prepared.supervisor_authority_id],
+                    )
+                    .unwrap();
+            }
+            assert_eq!(
+                broker
+                    .mailbox
+                    .conn
+                    .execute(
+                        "UPDATE completion_continuation_owner SET phase='closing'
+                         WHERE generation=?1 AND kernel_root_id=?2
+                         AND supervisor_authority_id=?3 AND phase='running'",
+                        params![
+                            prepared.owner_generation,
+                            prepared.root_id,
+                            prepared.supervisor_authority_id
+                        ],
+                    )
+                    .unwrap(),
+                1
+            );
+            broker
+                .mailbox
+                .conn
+                .execute(
+                    "UPDATE completion_supervisor_authority SET phase='retired'
+                     WHERE authority_id=?1",
+                    [&prepared.supervisor_authority_id],
+                )
+                .unwrap();
+        };
+        close(&broker, b1);
+        let fifth = prepared_root(4);
+        broker.prepare_exact_owner(&fifth).unwrap();
+        broker.commit_exact_prepared_release(&fifth).unwrap();
+        assert_eq!(owner_phase(&broker, &b1.owner_generation), "closing");
+        for prepared in roots[1..].iter().chain([&fifth]) {
+            require_qualified(&broker, prepared);
+            assert!(!inherits(
+                &broker,
+                &fifth.supervisor_authority_id,
+                &prepared.supervisor_authority_id
+            ));
+        }
+        for debt in &sibling_debt[1..] {
+            assert_eq!(attempt_phase(&broker, debt), "accepted");
+        }
+
+        // Every root can close its own owner; Main-only settlement then has
+        // no running owner left in the domain.
+        for prepared in roots[1..].iter().chain([&fifth]) {
+            close(&broker, prepared);
+        }
+        assert_eq!(
+            broker
+                .mailbox
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM completion_continuation_owner
+                     WHERE domain_id=?1 AND phase='running'",
+                    [&domain],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        drop(broker);
+        schema::validate_broker_owned(&Connection::open(&path).unwrap()).unwrap();
+    }
+
+    /// An installed v38 sidecar upgrades in place: its single running owner
+    /// survives, and only then may a sibling root run beside it.
+    #[cfg(unix)]
+    #[test]
+    fn retained_v38_upgrade_moves_running_uniqueness_to_the_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("sidecar");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join("pid-identity.db");
+        drop(MailboxDb::open(&path).unwrap());
+        for artifact in [path.clone(), mailbox_authority_path(&path)] {
+            fs::set_permissions(artifact, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let uid = unsafe { libc::geteuid() };
+        let generation = activate_with_owner(&path, uid, root.path()).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "PRAGMA wal_autocheckpoint=0;
+             DROP INDEX completion_continuation_owner_running_authority;
+             CREATE UNIQUE INDEX completion_continuation_owner_running ON completion_continuation_owner(domain_id) WHERE phase='running';
+             CREATE TABLE retained_v38_wal(value TEXT NOT NULL);
+             INSERT INTO retained_v38_wal VALUES('committed');
+             PRAGMA user_version=38;",
+        )
+        .unwrap();
+        // The v38 shape is the exact former broker lineage, not a guess.
+        schema::validate_broker_owned(&conn).unwrap();
+        drop(conn);
+        let upgraded = open_with_owner(&path, uid, root.path()).unwrap();
+        assert_eq!(upgraded.source_generation(), generation);
+        assert_eq!(
+            schema::sidecar_version(&upgraded.mailbox.conn).unwrap(),
+            schema::BROKER_OWNED_VERSION
+        );
+        assert_eq!(
+            upgraded
+                .mailbox
+                .conn
+                .query_row("SELECT value FROM retained_v38_wal", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "committed"
+        );
+        let indexes: Vec<String> = upgraded
+            .mailbox
+            .conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='index'
+                 AND tbl_name='completion_continuation_owner' AND name LIKE '%running%'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(indexes, ["completion_continuation_owner_running_authority"]);
+        schema::validate_broker_owned(&upgraded.mailbox.conn).unwrap();
+        // A v39 sidecar still refuses a hand-restored domain-wide index.
+        upgraded
+            .mailbox
+            .conn
+            .execute_batch(
+                "CREATE UNIQUE INDEX completion_continuation_owner_running ON completion_continuation_owner(domain_id) WHERE phase='running'",
+            )
+            .unwrap();
+        assert!(schema::validate_broker_owned(&upgraded.mailbox.conn).is_err());
+    }
+
     #[cfg(unix)]
     #[test]
     fn quiesced_v29_copy_activates_once_and_direct_writers_refuse_v30() {
@@ -6619,6 +7049,8 @@ mod tests {
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(
             "PRAGMA wal_autocheckpoint=0;
+             DROP INDEX completion_continuation_owner_running_authority;
+             CREATE UNIQUE INDEX completion_continuation_owner_running ON completion_continuation_owner(domain_id) WHERE phase='running';
              DROP TRIGGER broker_owner_close_immutable;
              DROP TRIGGER broker_owner_close_retain;
              DROP TABLE broker_owner_close;
@@ -6678,6 +7110,8 @@ mod tests {
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(
             "PRAGMA wal_autocheckpoint=0;
+             DROP INDEX completion_continuation_owner_running_authority;
+             CREATE UNIQUE INDEX completion_continuation_owner_running ON completion_continuation_owner(domain_id) WHERE phase='running';
              DROP TRIGGER broker_owner_close_immutable;
              DROP TRIGGER broker_owner_close_retain;
              DROP TABLE broker_owner_close;
@@ -6754,6 +7188,8 @@ mod tests {
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(
             "PRAGMA wal_autocheckpoint=0;
+             DROP INDEX completion_continuation_owner_running_authority;
+             CREATE UNIQUE INDEX completion_continuation_owner_running ON completion_continuation_owner(domain_id) WHERE phase='running';
              DROP TRIGGER broker_owner_close_immutable;
              DROP TRIGGER broker_owner_close_retain;
              DROP TABLE broker_owner_close;
@@ -6806,6 +7242,8 @@ mod tests {
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(
             "PRAGMA wal_autocheckpoint=0;
+             DROP INDEX completion_continuation_owner_running_authority;
+             CREATE UNIQUE INDEX completion_continuation_owner_running ON completion_continuation_owner(domain_id) WHERE phase='running';
              DROP TRIGGER broker_owner_close_immutable;
              DROP TRIGGER broker_owner_close_retain;
              DROP TABLE broker_owner_close;
@@ -6852,6 +7290,8 @@ mod tests {
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(
             "PRAGMA wal_autocheckpoint=0;
+             DROP INDEX completion_continuation_owner_running_authority;
+             CREATE UNIQUE INDEX completion_continuation_owner_running ON completion_continuation_owner(domain_id) WHERE phase='running';
              DROP TRIGGER broker_owner_close_immutable;
              DROP TRIGGER broker_owner_close_retain;
              DROP TABLE broker_owner_close;
@@ -6895,6 +7335,8 @@ mod tests {
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(
             "PRAGMA wal_autocheckpoint=0;
+             DROP INDEX completion_continuation_owner_running_authority;
+             CREATE UNIQUE INDEX completion_continuation_owner_running ON completion_continuation_owner(domain_id) WHERE phase='running';
              DROP TRIGGER broker_owner_close_immutable;
              DROP TRIGGER broker_owner_close_retain;
              DROP TABLE broker_owner_close;

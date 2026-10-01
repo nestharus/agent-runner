@@ -7949,6 +7949,53 @@ fn private_held_prepared_entry() -> Result<(), String> {
     }
 }
 
+/// A `--model` guardian's stdio is sunk, so its own refusal would otherwise
+/// be lost. Retain only that one diagnostic line, per root, beneath the
+/// caller's data directory. Fail-open: retention never changes the exit.
+fn retain_v30_guardian_gap(root_id: &str, error: &str) {
+    if let Ok(data_dir) = oulipoly_state::paths::data_dir() {
+        retain_v30_guardian_gap_in(&data_dir, root_id, error);
+    }
+}
+
+fn retain_v30_guardian_gap_in(data_dir: &std::path::Path, root_id: &str, error: &str) {
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+    const LIMIT: usize = 4096;
+    if uuid::Uuid::parse_str(root_id)
+        .map(|id| id.to_string())
+        .as_deref()
+        != Ok(root_id)
+    {
+        return;
+    }
+    let directory = data_dir.join("kernel-v30-guardian-gaps");
+    match std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&directory)
+    {
+        Ok(()) => {}
+        Err(_) => return,
+    }
+    let mut end = error.len().min(LIMIT);
+    while !error.is_char_boundary(end) {
+        end -= 1;
+    }
+    let line = format!(
+        "OULIPOLY_KERNEL_V30_GUARDIAN_GAP={}\n",
+        error[..end].replace(['\n', '\r'], " ")
+    );
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(directory.join(format!("{root_id}.gap")))
+    {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
 fn v30_host_entry() -> Result<ExitCode, String> {
     let grant = CONNECTED_ROOT_GRANT
         .get()
@@ -7982,12 +8029,16 @@ fn v30_host_entry() -> Result<ExitCode, String> {
         // The connected E grant belongs only to the original host control
         // process. Its forked guardian uses the entry registry custody path.
         unsafe { libc::close(grant._channel.as_raw_fd()) };
+        let gap_root = root.clone();
+        #[cfg_attr(feature = "age319-private-broker-fixture", allow(unused_mut))]
+        let mut stdio_sunk = false;
         let result = (|| {
             // The guardian and its driver are control processes. Keep their
             // diagnostics off the model caller's binary stderr channel; the
             // joined actor retains the original descriptors for publication.
             #[cfg(not(feature = "age319-private-broker-fixture"))]
             if std::env::args().nth(1).as_deref() == Some("--model") {
+                stdio_sunk = true;
                 let sink = std::fs::OpenOptions::new()
                     .write(true)
                     .open("/dev/null")
@@ -8044,6 +8095,9 @@ fn v30_host_entry() -> Result<ExitCode, String> {
         })();
         if let Err(error) = &result {
             eprintln!("OULIPOLY_KERNEL_V30_GUARDIAN_GAP={error}");
+            if stdio_sunk {
+                retain_v30_guardian_gap(&gap_root, error);
+            }
         }
         unsafe { libc::_exit(if result.is_ok() { 0 } else { 70 }) }
     }
@@ -8515,6 +8569,46 @@ fn join_child(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn v30_guardian_gap_is_one_retained_line_per_exact_root() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let data = tempfile::tempdir().unwrap();
+        let root = uuid::Uuid::new_v4().to_string();
+        super::retain_v30_guardian_gap_in(
+            data.path(),
+            &root,
+            &format!("broker exact running owner absent\n{}", "x".repeat(8192)),
+        );
+        let path = data
+            .path()
+            .join("kernel-v30-guardian-gaps")
+            .join(format!("{root}.gap"));
+        let retained = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            retained.starts_with(
+                "OULIPOLY_KERNEL_V30_GUARDIAN_GAP=broker exact running owner absent x"
+            )
+        );
+        assert_eq!(retained.lines().count(), 1);
+        assert!(retained.len() < 4200);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // The first refusal is retained; a later write never replaces it.
+        super::retain_v30_guardian_gap_in(data.path(), &root, "later");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), retained);
+        // A non-canonical root never names a file.
+        super::retain_v30_guardian_gap_in(data.path(), "../escape", "refused");
+        super::retain_v30_guardian_gap_in(data.path(), &root.to_uppercase(), "refused");
+        assert_eq!(
+            std::fs::read_dir(data.path().join("kernel-v30-guardian-gaps"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
     use super::*;
     use std::cell::RefCell;
 

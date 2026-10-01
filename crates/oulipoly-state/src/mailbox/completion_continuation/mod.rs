@@ -432,15 +432,40 @@ WHERE supervisor_authority_id IN (SELECT authority_id FROM supervisor_scope) AND
                 return Err("kernel root ID cannot move to another guardian or authority".into());
             }
         }
+        // Only this authority's own running row can continue or conflict.
+        // Under the v18 single-owner index this is the same row as before.
         let current_root: Option<(String, String)> = tx
             .query_row(
                 "SELECT supervisor_authority_id,guardian_identity
-                 FROM completion_continuation_owner WHERE phase='running'",
-                [],
+                 FROM completion_continuation_owner
+                 WHERE phase='running' AND supervisor_authority_id=?1",
+                [&owner.supervisor_authority_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(|e| e.to_string())?;
+        // A broker-released root is a sibling, not a predecessor: its exact
+        // owner, supervisor authority and inherited debt stay its own. Only
+        // v39 broker sidecars admit several running owners in one domain;
+        // every other publication keeps the single-owner election.
+        let per_root = kernel_root_id.is_some()
+            && super::schema::sidecar_version(tx)? == super::schema::BROKER_OWNED_VERSION;
+        let sibling_scope = format!(
+            "WITH RECURSIVE sibling_scope(authority_id) AS ({} UNION
+SELECT inheritance.predecessor_authority_id
+FROM completion_supervisor_inheritance inheritance JOIN sibling_scope scope
+ON inheritance.authority_id=scope.authority_id)",
+            if per_root {
+                "SELECT sibling.supervisor_authority_id
+FROM completion_continuation_owner sibling JOIN broker_completion_owner released
+ON released.owner_generation=sibling.generation AND released.root_id=sibling.kernel_root_id
+WHERE sibling.domain_id=?2 AND sibling.phase='running'
+AND sibling.supervisor_authority_id!=?1"
+            } else {
+                "SELECT authority_id FROM completion_supervisor_authority
+WHERE 0 AND authority_id!=?1 AND domain_id=?2"
+            }
+        );
         if current_root.as_ref().is_some_and(|(authority, guardian)| {
             authority == &owner.supervisor_authority_id && guardian != &encoded_guardian
         }) {
@@ -486,7 +511,8 @@ WHERE supervisor_authority_id IN (SELECT authority_id FROM supervisor_scope) AND
         // never become part of its recovery scope.
         if !continues_root {
             tx.execute(
-                "WITH unresolved(authority_id) AS (
+                &format!(
+                    "{sibling_scope}, unresolved(authority_id) AS (
                 SELECT supervisor_authority_id
                 FROM completion_continuation_attempt
                 WHERE domain_id=?2 AND phase NOT IN ('drained','never_started')
@@ -496,7 +522,9 @@ WHERE supervisor_authority_id IN (SELECT authority_id FROM supervisor_scope) AND
                 WHERE domain_id=?2 AND phase='registered')
              INSERT OR IGNORE INTO completion_supervisor_inheritance(
                 authority_id,predecessor_authority_id,inherited_by_generation)
-             SELECT ?1,authority_id,?3 FROM unresolved WHERE authority_id!=?1",
+             SELECT ?1,authority_id,?3 FROM unresolved WHERE authority_id!=?1
+             AND authority_id NOT IN (SELECT authority_id FROM sibling_scope)"
+                ),
                 params![
                     owner.supervisor_authority_id,
                     owner.domain_id,
@@ -506,15 +534,22 @@ WHERE supervisor_authority_id IN (SELECT authority_id FROM supervisor_scope) AND
             .map_err(|e| e.to_string())?;
         }
         tx.execute(
-            "UPDATE completion_continuation_owner SET phase='lost' WHERE domain_id=?1 AND phase='running'",
-            [&owner.domain_id],
+            &format!(
+                "{sibling_scope} UPDATE completion_continuation_owner SET phase='lost'
+             WHERE domain_id=?2 AND phase='running'
+             AND supervisor_authority_id NOT IN (SELECT authority_id FROM sibling_scope)"
+            ),
+            params![owner.supervisor_authority_id, owner.domain_id],
         )
         .map_err(|e| e.to_string())?;
         if !continues_root {
             tx.execute(
-                "UPDATE completion_supervisor_authority SET phase='retired'
-             WHERE domain_id=?1 AND authority_id!=?2 AND phase='active'",
-                params![owner.domain_id, owner.supervisor_authority_id],
+                &format!(
+                    "{sibling_scope} UPDATE completion_supervisor_authority SET phase='retired'
+             WHERE domain_id=?2 AND authority_id!=?1 AND phase='active'
+             AND authority_id NOT IN (SELECT authority_id FROM sibling_scope)"
+                ),
+                params![owner.supervisor_authority_id, owner.domain_id],
             )
             .map_err(|e| e.to_string())?;
         }
@@ -594,6 +629,7 @@ pub(in crate::mailbox) fn domain_on(conn: &Connection) -> Result<Option<String>,
         34 => validate_broker_v34_schema_on(conn)?,
         35 => validate_broker_v35_schema_on(conn)?,
         37 => validate_broker_v37_schema_on(conn)?,
+        38 => validate_broker_v38_schema_on(conn)?,
         version if version == super::schema::BROKER_OWNED_VERSION => {
             validate_broker_schema_on(conn)?
         }
@@ -633,7 +669,11 @@ pub(super) fn validate_schema_on(conn: &Connection) -> Result<(), String> {
 }
 
 pub(super) fn validate_broker_schema_on(conn: &Connection) -> Result<(), String> {
-    validate_schema_version_on(conn, super::schema::BROKER_OWNED_VERSION, true)
+    validate_schema_lineage_on(conn, super::schema::BROKER_OWNED_VERSION, true, true)
+}
+
+pub(super) fn validate_broker_v38_schema_on(conn: &Connection) -> Result<(), String> {
+    validate_schema_version_on(conn, 38, true)
 }
 
 pub(super) fn validate_broker_v36_schema_on(conn: &Connection) -> Result<(), String> {
@@ -671,10 +711,21 @@ fn validate_schema_version_on(
     required_version: i64,
     include_uncertain: bool,
 ) -> Result<(), String> {
+    validate_schema_lineage_on(conn, required_version, include_uncertain, false)
+}
+
+fn validate_schema_lineage_on(
+    conn: &Connection,
+    required_version: i64,
+    include_uncertain: bool,
+    per_root_owners: bool,
+) -> Result<(), String> {
     type Definition = (String, String, String);
     static EXPECTED_V29: std::sync::OnceLock<Result<Vec<Definition>, String>> =
         std::sync::OnceLock::new();
     static EXPECTED_CURRENT: std::sync::OnceLock<Result<Vec<Definition>, String>> =
+        std::sync::OnceLock::new();
+    static EXPECTED_PER_ROOT: std::sync::OnceLock<Result<Vec<Definition>, String>> =
         std::sync::OnceLock::new();
     fn definitions(conn: &Connection, include_uncertain: bool) -> Result<Vec<Definition>, String> {
         let mut statement = conn
@@ -784,7 +835,10 @@ fn validate_schema_version_on(
             .collect::<Result<Vec<_>, _>>()
             .map(|rows| rows.into_iter().flatten().collect())
     }
-    fn expected_definitions(include_uncertain: bool) -> Result<Vec<Definition>, String> {
+    fn expected_definitions(
+        include_uncertain: bool,
+        per_root_owners: bool,
+    ) -> Result<Vec<Definition>, String> {
         let expected = Connection::open_in_memory().map_err(|e| e.to_string())?;
         expected
                 .execute_batch("CREATE TABLE session_wake_claim(session_id TEXT,claim_token TEXT); CREATE TABLE completion_event_listener(event_id TEXT,listener_id TEXT,acknowledged_at TEXT,acknowledgement_reason TEXT,mailbox_seq INTEGER,PRIMARY KEY(event_id,listener_id));")
@@ -856,12 +910,24 @@ fn validate_schema_version_on(
                 .execute_batch(include_str!("../migrations/0031_uncertain_activation.sql"))
                 .map_err(|e| e.to_string())?;
         }
+        if per_root_owners {
+            for definition in [
+                super::schema::BROKER_LEGACY_OWNER_RUNNING_INDEX_DROP,
+                super::schema::BROKER_PER_ROOT_OWNER_RUNNING_INDEX,
+            ] {
+                expected
+                    .execute_batch(definition)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
         definitions(&expected, include_uncertain)
     }
-    let expected = if include_uncertain {
-        EXPECTED_CURRENT.get_or_init(|| expected_definitions(true))
+    let expected = if per_root_owners {
+        EXPECTED_PER_ROOT.get_or_init(|| expected_definitions(true, true))
+    } else if include_uncertain {
+        EXPECTED_CURRENT.get_or_init(|| expected_definitions(true, false))
     } else {
-        EXPECTED_V29.get_or_init(|| expected_definitions(false))
+        EXPECTED_V29.get_or_init(|| expected_definitions(false, false))
     }
     .as_ref()
     .map_err(Clone::clone)?;

@@ -1490,7 +1490,16 @@ impl CompletionAuthorityFence<'_> {
     ) -> Result<CompletionEventRegistrationResult, String> {
         let inserted = register_completion_event_on(&self.tx, &input, &now_rfc3339())?;
         if let Some(binding) = binding {
-            self.materialize_continuation_binding(binding)?;
+            self.materialize_continuation_binding(
+                binding,
+                exact.map(|exact| {
+                    (
+                        exact.root_id.as_str(),
+                        exact.owner_generation.as_str(),
+                        exact.supervisor_id.as_str(),
+                    )
+                }),
+            )?;
             let event = completion_event_by_id_on(&self.tx, input.event_id)?
                 .ok_or("registered source disappeared")?;
             completion_continuation::reconcile_notification_on(
