@@ -5324,17 +5324,38 @@ fn advance_one_normal_owner(
     sidecar: &mut Option<BrokerSidecar>,
     admission_fences: &AdmissionFences,
     completed: &mut HashSet<String>,
+    cursor: &mut usize,
     scan: &mut phase_record::AdvanceScan,
 ) -> io::Result<()> {
     if entries.records().is_empty() || sidecar.is_none() || !state_root.join("v30").exists() {
         return Ok(());
     }
-    let lane = FreshV30Lane::open_at(state_root).map_err(io::Error::other)?;
-    for entry in entries.records() {
+    // Count retained candidates without walking them. Completion is only
+    // inserted after an exact close proof, and entries are never removed.
+    scan.pending = entries.records().len().saturating_sub(completed.len()) as u64;
+    let index = *cursor % entries.records().len();
+    *cursor = index.wrapping_add(1);
+    for entry in &entries.records()[index..=index] {
         if completed.contains(&entry.root_id) {
             continue;
         }
-        scan.pending += 1;
+        // Both normal and offline close require the original to have exited.
+        // This is a deferral only: disappearance cannot authorize settlement.
+        // Recheck all State/physical authorities below when it can progress.
+        let Some(actor) = entry.joined_child.as_ref() else {
+            continue;
+        };
+        if !observed_incarnation_gone(
+            actor.host_pid,
+            &actor.boot_id,
+            actor.starttime_ticks,
+            (actor.pidns_dev, actor.pidns_ino),
+        )
+        .unwrap_or(false)
+        {
+            continue;
+        }
+        let lane = FreshV30Lane::open_at(state_root).map_err(io::Error::other)?;
         // An entry may be prepared before its root record is published. It
         // carries no normal K or close authority until that exact root exists.
         let Some(root) = registry.record(&entry.root_id).cloned() else {
@@ -5348,6 +5369,15 @@ fn advance_one_normal_owner(
             oulipoly_state::mailbox::FreshRootWorkIntent::CliHelp(_)
                 | oulipoly_state::mailbox::FreshRootWorkIntent::CliDiagnostics(_)
         );
+        // The normal fence already requires caller settlement. Do not rebuild
+        // the full inventory while that necessary condition is absent. An
+        // explicit fence and the offline route retain their existing checks.
+        if !offline
+            && entry.terminal_settlement.is_none()
+            && !registry.admission_fenced(&root.root_id)
+        {
+            continue;
+        }
         // U can be visible while D is still publishing. The normal route
         // cannot advance from an empty K; offline has its own State return.
         if !offline
@@ -6260,6 +6290,7 @@ fn serve() -> io::Result<()> {
             })?;
     }
     let mut completed_auto_normal = HashSet::<String>::new();
+    let mut auto_normal_cursor = 0;
     let mut last_auto_normal = Instant::now() - NORMAL_CLOSE_POLL_INTERVAL;
     if let Err(error) = phase_record::init(Path::new(&state)) {
         eprintln!("phase records unavailable: {error}");
@@ -6368,6 +6399,7 @@ fn serve() -> io::Result<()> {
                 &mut broker_sidecar,
                 &admission_fences,
                 &mut completed_auto_normal,
+                &mut auto_normal_cursor,
                 &mut scan,
             ) {
                 eprintln!("normal owner close progression blocked: {error}");
@@ -12410,6 +12442,10 @@ pub fn run() {
 #[cfg(all(test, feature = "age319-private-broker-fixture"))]
 #[path = "recipient_effect_tests.rs"]
 mod recipient_effect_tests;
+
+#[cfg(test)]
+#[path = "owner_close_scan_tests.rs"]
+mod owner_close_scan_tests;
 
 #[cfg(test)]
 mod admission_fence_tests {
