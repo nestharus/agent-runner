@@ -1863,6 +1863,19 @@ impl BrokerSidecar {
         Ok(state)
     }
 
+    /// The file predicates [`Self::bound_state`] evaluates before it opens
+    /// State: bound identity, then the read-only open's own path, read-bit
+    /// and WAL/SHM checks. Returns the path that open would use. Opens no
+    /// file, so a caller holding a connection to it loses no SQLite lock.
+    pub(super) fn bound_state_open_path(&self) -> Result<std::path::PathBuf, String> {
+        let source = self
+            .state_source
+            .as_ref()
+            .ok_or("broker StateDb source binding absent")?;
+        verify_bound_state_source(source)?;
+        StateDb::broker_repair_open_path(&source.path)
+    }
+
     /// Uses the broker's persisted source authority, never a caller path.
     /// This only checks file metadata and does not open or read State, so the
     /// decision verifier can call it while a State writer holds its lock.

@@ -701,7 +701,34 @@ struct CachedStateConnection {
     /// The SQLite schema cookie read inside the snapshot that validated this
     /// connection. Every schema change increments it.
     schema_version: i64,
+    /// Digest of the stored schema rows validated in that snapshot. A
+    /// `writable_schema` edit can change them without the cookie.
+    schema_digest: [u8; 32],
+    /// `PRAGMA data_version` when the digest was last confirmed: unchanged
+    /// means no other connection committed since.
+    data_version: i64,
+    /// The State file's size, mtime and ctime at validation. A write that
+    /// bypasses SQLite (which a held page cache would not see) changes them.
+    file_stamp: StateFileStamp,
     connection: Connection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StateFileStamp {
+    size: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl StateFileStamp {
+    fn read(path: &Path) -> Result<Self, String> {
+        let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+        Ok(Self {
+            size: meta.size(),
+            mtime: (meta.mtime(), meta.mtime_nsec()),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
+        })
+    }
 }
 
 /// Lane operations nest (a binding read calls further readbacks while its
@@ -764,26 +791,84 @@ impl Drop for StateConnection {
 }
 
 /// The checks of the bound State open (readable schema, current version,
-/// admission binding) made on this connection, with the schema cookie of
-/// the same read snapshot.
-fn validated_state_schema(connection: &Connection) -> Result<i64, String> {
+/// admission binding) made on this connection, with the schema cookie,
+/// stored-schema digest and data version of the same read snapshot.
+fn validated_state_schema(connection: &Connection) -> Result<(i64, [u8; 32], i64), String> {
     connection
         .execute_batch("BEGIN")
         .map_err(|e| e.to_string())?;
-    let checked = (|| -> Result<i64, String> {
+    let checked = (|| -> Result<(i64, [u8; 32], i64), String> {
         connection
             .query_row("SELECT count(*) FROM sqlite_schema", [], |_| Ok(()))
             .map_err(|e| e.to_string())?;
         let cookie = current_state_schema(connection)?;
         crate::completion_continuation::validate_admission_schema(connection)?;
-        Ok(cookie)
+        let data_version = state_data_version(connection)?;
+        Ok((cookie, stored_schema_digest(connection)?, data_version))
     })();
     let ended = connection
         .execute_batch("COMMIT")
         .map_err(|e| e.to_string());
-    let cookie = checked?;
+    let validated = checked?;
     ended?;
-    Ok(cookie)
+    Ok(validated)
+}
+
+fn state_data_version(connection: &Connection) -> Result<i64, String> {
+    connection
+        .query_row("PRAGMA data_version", [], |row| row.get(0))
+        .map_err(|e| e.to_string())
+}
+
+/// Digest of every stored schema row, as a new connection would parse it.
+fn stored_schema_digest(connection: &Connection) -> Result<[u8; 32], String> {
+    use sha2::Digest as _;
+    let mut digest = sha2::Sha256::new();
+    let mut statement = connection
+        .prepare_cached("SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema ORDER BY rowid")
+        .map_err(|e| e.to_string())?;
+    let mut rows = statement.query([]).map_err(|e| e.to_string())?;
+    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        for column in 0..5 {
+            match row.get_ref(column).map_err(|e| e.to_string())? {
+                rusqlite::types::ValueRef::Null => digest.update([0]),
+                rusqlite::types::ValueRef::Integer(value) => {
+                    digest.update([1]);
+                    digest.update(value.to_le_bytes());
+                }
+                rusqlite::types::ValueRef::Text(bytes) | rusqlite::types::ValueRef::Blob(bytes) => {
+                    digest.update([2]);
+                    digest.update((bytes.len() as u64).to_le_bytes());
+                    digest.update(bytes);
+                }
+                rusqlite::types::ValueRef::Real(value) => {
+                    digest.update([3]);
+                    digest.update(value.to_le_bytes());
+                }
+            }
+        }
+    }
+    Ok(digest.finalize().into())
+}
+
+/// Whether this process may still open the State files the way a new
+/// connection would, judged with its effective IDs and capabilities. Uses
+/// `faccessat`, never an open: closing any descriptor of the State file
+/// would drop this process's SQLite POSIX locks on it.
+fn state_files_accessible(path: &Path, write: bool) -> bool {
+    fn accessible(path: &Path, mode: libc::c_int) -> bool {
+        let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
+            return false;
+        };
+        unsafe { libc::faccessat(libc::AT_FDCWD, path.as_ptr(), mode, libc::AT_EACCESS) == 0 }
+    }
+    let write_mode = if write { libc::W_OK } else { 0 };
+    let [wal, shm] = StateDb::sqlite_sidecar_paths(path);
+    // A held WAL connection keeps both sidecars; a missing one means they
+    // were replaced underneath it, and only a new connection sees that.
+    accessible(path, libc::R_OK | write_mode)
+        && accessible(&wal, libc::R_OK | write_mode)
+        && accessible(&shm, libc::R_OK | libc::W_OK)
 }
 
 /// The current schema cookie, refusing any State whose version is not this
@@ -2950,8 +3035,11 @@ impl FreshV30Lane {
 
     /// A State connection on the bound file. Each statement still reads the
     /// current committed State; only the connection and its parsed schema
-    /// are reused, on this thread, while the bound file identity and the
-    /// validated schema stay exactly the same (see [`StateConnection`]).
+    /// are reused, on this thread. A reuse refuses exactly what a new
+    /// connection's full validation would refuse: it re-runs every check
+    /// that validation makes and a held connection could skip (see
+    /// [`Self::cached_state_still_valid`]). A check that fails or cannot run
+    /// retires the connection and the full validation decides.
     fn state_connection(&self, flags: OpenFlags) -> Result<StateConnection, String> {
         let write = flags.contains(OpenFlags::SQLITE_OPEN_READ_WRITE);
         let identity = self.sidecar.bound_state_file_identity()?;
@@ -2962,14 +3050,14 @@ impl FreshV30Lane {
                 .position(|slot| slot.path == self.state_path && slot.write == write)?;
             Some(slots.swap_remove(index))
         });
-        if let Some(cached) = reused
+        if let Some(mut cached) = reused
             && (cached.device, cached.inode) == (identity.device, identity.inode)
-            && current_state_schema(&cached.connection).ok() == Some(cached.schema_version)
+            && self.cached_state_still_valid(&mut cached) == Ok(true)
         {
             return Ok(StateConnection(Some(cached)));
         }
-        // First use on this thread, or the file or schema changed: the full
-        // bound State validation, then a new connection validated itself.
+        // First use on this thread, or a check failed: the full bound State
+        // validation, then a new connection validated itself.
         let state = self.sidecar.bound_state()?;
         if state.path() != self.state_path {
             return Err("fresh State path changed".into());
@@ -2978,7 +3066,8 @@ impl FreshV30Lane {
         let connection =
             Connection::open_with_flags(&self.state_path, flags).map_err(|e| e.to_string())?;
         crate::sqlite_wait::install(&connection).map_err(|e| e.to_string())?;
-        let schema_version = validated_state_schema(&connection)?;
+        let (schema_version, schema_digest, data_version) = validated_state_schema(&connection)?;
+        let file_stamp = StateFileStamp::read(&self.state_path)?;
         #[cfg(test)]
         VALIDATED_STATE_OPENS.with(|opens| opens.set(opens.get() + 1));
         let after = self.sidecar.bound_state_file_identity()?;
@@ -2991,8 +3080,37 @@ impl FreshV30Lane {
             inode: identity.inode,
             write,
             schema_version,
+            schema_digest,
+            data_version,
+            file_stamp,
             connection,
         })))
+    }
+
+    /// The checks a new connection's validation makes that a held one would
+    /// otherwise skip. The bound identity is checked by the caller.
+    /// - the read-only open's file predicates: State present and readable,
+    ///   existing WAL/SHM readable, and the path resolving to itself;
+    /// - the operating system still letting this process open the files;
+    /// - no write that bypassed SQLite since validation;
+    /// - the current version and schema cookie;
+    /// - after another connection's commit, the same stored schema rows.
+    fn cached_state_still_valid(&self, cached: &mut CachedStateConnection) -> Result<bool, String> {
+        if self.sidecar.bound_state_open_path()? != self.state_path
+            || !state_files_accessible(&self.state_path, cached.write)
+            || StateFileStamp::read(&self.state_path)? != cached.file_stamp
+            || current_state_schema(&cached.connection)? != cached.schema_version
+        {
+            return Ok(false);
+        }
+        let data_version = state_data_version(&cached.connection)?;
+        if data_version != cached.data_version {
+            if stored_schema_digest(&cached.connection)? != cached.schema_digest {
+                return Ok(false);
+            }
+            cached.data_version = data_version;
+        }
+        Ok(true)
     }
 
     fn read_state_admission_on(
@@ -3815,5 +3933,281 @@ mod state_connection_cache_tests {
         std::fs::copy(&state_path, &copy).unwrap();
         std::fs::rename(&copy, &state_path).unwrap();
         assert!(lane.state_connection(read_only).is_err());
+    }
+
+    const WARM_TEST: &str = "mailbox::fresh_lane::state_connection_cache_tests::\
+                             warm_reuse_refuses_exactly_what_a_new_connection_refuses";
+
+    /// One acquisition's outcome: `Ok` or the refusal text.
+    fn acquire(lane: &FreshV30Lane, write: bool) -> Result<(), String> {
+        let flags = if write {
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+        } else {
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+        };
+        let connection = lane.state_connection(flags)?;
+        connection
+            .query_row("SELECT count(*) FROM sqlite_schema", [], |_| Ok(()))
+            .map_err(|e| e.to_string())
+    }
+
+    /// A new thread's acquisition: no cached connection at all.
+    fn acquire_cold(lane: &FreshV30Lane, write: bool) -> Result<(), String> {
+        CACHED_STATE.with(|slots| slots.borrow_mut().clear());
+        acquire(lane, write)
+    }
+
+    /// Warm both classes, change one open-time predicate, and require the
+    /// warm acquisition to give exactly the cold acquisition's answer. When
+    /// both accept, the warm one must still have been decided by a full
+    /// validation, not by the held connection. `refused` is the cold answer
+    /// where this fixture determines it.
+    fn same_as_cold(
+        lane: &FreshV30Lane,
+        name: &str,
+        change: &mut dyn FnMut(),
+        restore: &mut dyn FnMut(),
+        refused: Option<bool>,
+    ) {
+        for write in [false, true] {
+            acquire_cold(lane, write).unwrap();
+            let validated = opens();
+            acquire(lane, write).unwrap();
+            assert_eq!(opens(), validated, "{name}: unchanged State is reused");
+            change();
+            let warm = acquire(lane, write);
+            let revalidated = opens() > validated;
+            let cold = acquire_cold(lane, write);
+            restore();
+            assert_eq!(warm, cold, "{name} (write {write}): warm differs from cold");
+            assert!(
+                warm.is_err() || revalidated,
+                "{name} (write {write}): accepted on the held connection"
+            );
+            if let Some(refused) = refused {
+                assert_eq!(warm.is_err(), refused, "{name} (write {write}): {warm:?}");
+            }
+            acquire_cold(lane, write).unwrap();
+        }
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// Raise or drop this thread's effective DAC override, as an unprivileged
+    /// Broker would run. Capabilities are per thread; the permitted set keeps
+    /// them, so they can be raised again.
+    fn dac_override(on: bool) {
+        #[repr(C)]
+        struct Header {
+            version: u32,
+            pid: i32,
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Data {
+            effective: u32,
+            permitted: u32,
+            inheritable: u32,
+        }
+        let mut header = Header {
+            version: 0x2008_0522,
+            pid: 0,
+        };
+        let mut data = [Data {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        }; 2];
+        assert_eq!(
+            unsafe { libc::syscall(libc::SYS_capget, &mut header, data.as_mut_ptr()) },
+            0
+        );
+        // CAP_DAC_OVERRIDE and CAP_DAC_READ_SEARCH.
+        let bits = (1 << 1) | (1 << 2);
+        if on {
+            data[0].effective |= bits;
+        } else {
+            data[0].effective &= !bits;
+        }
+        assert_eq!(
+            unsafe { libc::syscall(libc::SYS_capset, &mut header, data.as_ptr()) },
+            0
+        );
+    }
+
+    /// Overwrite bytes of the State file from another process: an open and
+    /// close here would drop this process's SQLite locks on it.
+    fn write_bytes(path: &Path, offset: usize, bytes: &[u8]) {
+        let mut child = std::process::Command::new("dd")
+            .arg(format!("of={}", path.display()))
+            .args(["bs=1", "conv=notrunc", "status=none"])
+            .arg(format!("seek={offset}"))
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write as _;
+        child.stdin.take().unwrap().write_all(bytes).unwrap();
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn warm_reuse_refuses_exactly_what_a_new_connection_refuses() {
+        if unsafe { libc::geteuid() } != 0 {
+            let status = std::process::Command::new("unshare")
+                .arg("-Urm")
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", WARM_TEST, "--nocapture"])
+                .status()
+                .expect("root-mapped user namespace required");
+            assert!(status.success(), "root-mapped warm refusal test failed");
+            return;
+        }
+        let private = tempfile::tempdir().unwrap();
+        set_mode(private.path(), 0o700);
+        let bound = std::process::Command::new("mount")
+            .arg("--bind")
+            .arg(private.path())
+            .arg("/mnt")
+            .status()
+            .unwrap();
+        assert!(bound.success(), "private bind over /mnt failed");
+        let root = Path::new("/mnt").join("broker-state");
+        EmptyV30BootstrapIdentity::bootstrap_at(&root).unwrap();
+        let lane = FreshV30Lane::open_at(&root).unwrap();
+        let lane_dir = root.join(LANE_DIRECTORY);
+        let state_path = lane_dir.join("state.db");
+        let [wal, shm] = StateDb::sqlite_sidecar_paths(&state_path);
+        // Another connection keeps State open, as other Broker threads and
+        // processes do; otherwise retiring the last connection checkpoints
+        // and removes the WAL, and the question changes.
+        let writer = Connection::open(&state_path).unwrap();
+        writer
+            .query_row("SELECT count(*) FROM sqlite_schema", [], |_| Ok(()))
+            .unwrap();
+        acquire_cold(&lane, false).unwrap();
+        assert!(wal.exists() && shm.exists(), "State is held in WAL mode");
+        let db_mode = std::fs::metadata(&state_path).unwrap().mode() & 0o7777;
+        let wal_mode = std::fs::metadata(&wal).unwrap().mode() & 0o7777;
+        let shm_mode = std::fs::metadata(&shm).unwrap().mode() & 0o7777;
+
+        // The read-only open's own read-bit predicates, even for root.
+        for (name, path, mode) in [
+            ("State read bits", &state_path, db_mode),
+            ("WAL read bits", &wal, wal_mode),
+            ("SHM read bits", &shm, shm_mode),
+        ] {
+            same_as_cold(
+                &lane,
+                name,
+                &mut || set_mode(path, 0o200),
+                &mut || set_mode(path, mode),
+                Some(true),
+            );
+        }
+        // A mode change that keeps read bits is not a refusal either way.
+        same_as_cold(
+            &lane,
+            "State still readable",
+            &mut || set_mode(&state_path, 0o640),
+            &mut || set_mode(&state_path, db_mode),
+            Some(false),
+        );
+
+        // The bound path no longer resolving to itself (an ancestor became a
+        // symlink to the same directory, so the file identity is unchanged).
+        let moved = root.join("v30-moved");
+        same_as_cold(
+            &lane,
+            "State path resolution",
+            &mut || {
+                std::fs::rename(&lane_dir, &moved).unwrap();
+                std::os::unix::fs::symlink(&moved, &lane_dir).unwrap();
+            },
+            &mut || {
+                std::fs::remove_file(&lane_dir).unwrap();
+                std::fs::rename(&moved, &lane_dir).unwrap();
+            },
+            Some(true),
+        );
+
+        // The operating system's own open permission, for a Broker without
+        // DAC override: State, WAL and SHM keep read bits but not for their
+        // owner, and an ancestor loses search permission. While another
+        // connection holds State, SQLite may reuse this process's parked
+        // descriptor for a new connection, so the cold answer to the first
+        // three is SQLite's, not the fixture's; the warm one must match it.
+        for (name, path, mode, changed, refused) in [
+            ("State owner access", &state_path, db_mode, 0o044, None),
+            ("WAL owner access", &wal, wal_mode, 0o044, None),
+            ("SHM owner access", &shm, shm_mode, 0o044, None),
+            ("ancestor search", &lane_dir, 0o700, 0o600, Some(true)),
+        ] {
+            let current = std::fs::metadata(path).unwrap().mode() & 0o7777;
+            assert_eq!(current, mode);
+            dac_override(false);
+            same_as_cold(
+                &lane,
+                name,
+                &mut || set_mode(path, changed),
+                &mut || set_mode(path, mode),
+                refused,
+            );
+            dac_override(true);
+        }
+
+        // Stored schema rows edited without a cookie change: a new
+        // connection parses the edit and refuses the admission binding.
+        let cookie = || -> i64 {
+            writer
+                .query_row("PRAGMA schema_version", [], |row| row.get(0))
+                .unwrap()
+        };
+        let before = cookie();
+        let edit = |from: &str, to: &str| {
+            writer.execute_batch("PRAGMA writable_schema=ON").unwrap();
+            let changed = writer
+                .execute(
+                    "UPDATE sqlite_schema SET sql=replace(sql,?1,?2)
+                     WHERE name='invocation_completion_obligations'",
+                    [from, to],
+                )
+                .unwrap();
+            writer.execute_batch("PRAGMA writable_schema=OFF").unwrap();
+            assert_eq!(changed, 1);
+        };
+        same_as_cold(
+            &lane,
+            "stored schema without cookie change",
+            &mut || {
+                edit("completion_v2_binding BLOB", "completion_v2_binding TEXT");
+                assert_eq!(cookie(), before, "edit must keep the cookie");
+            },
+            &mut || edit("completion_v2_binding TEXT", "completion_v2_binding BLOB"),
+            Some(true),
+        );
+
+        // A write that bypasses SQLite: the file no longer reads as a
+        // database to a new connection, whatever a held page cache holds.
+        writer
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+            .unwrap();
+        let header = std::fs::read(&state_path).unwrap()[..16].to_vec();
+        same_as_cold(
+            &lane,
+            "State file written outside SQLite",
+            &mut || write_bytes(&state_path, 0, &[0; 16]),
+            &mut || write_bytes(&state_path, 0, &header),
+            Some(true),
+        );
+
+        // Unchanged State keeps reusing after all of the above.
+        acquire(&lane, false).unwrap();
+        let validated = opens();
+        for _ in 0..4 {
+            acquire(&lane, false).unwrap();
+        }
+        assert_eq!(opens(), validated);
     }
 }
