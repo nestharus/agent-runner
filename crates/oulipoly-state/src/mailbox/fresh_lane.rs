@@ -687,6 +687,121 @@ pub struct FreshV30Lane {
     state_path: PathBuf,
 }
 
+/// A State connection a lane operation borrows. On drop it returns to this
+/// thread's cache only when it holds no transaction; statements borrow it,
+/// so none can outlive it. The cache is process memory: a restarted Broker
+/// starts empty and validates its first connection in full.
+pub(super) struct StateConnection(Option<CachedStateConnection>);
+
+struct CachedStateConnection {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    write: bool,
+    /// The SQLite schema cookie read inside the snapshot that validated this
+    /// connection. Every schema change increments it.
+    schema_version: i64,
+    connection: Connection,
+}
+
+/// Lane operations nest (a binding read calls further readbacks while its
+/// own connection is borrowed); each nesting level keeps its own connection.
+const CACHED_STATE_DEPTH: usize = 8;
+
+#[cfg(test)]
+thread_local! {
+    static VALIDATED_STATE_OPENS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+thread_local! {
+    static CACHED_STATE: std::cell::RefCell<Vec<CachedStateConnection>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl std::ops::Deref for StateConnection {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        &self
+            .0
+            .as_ref()
+            .expect("State connection is present until drop")
+            .connection
+    }
+}
+
+impl std::ops::DerefMut for StateConnection {
+    fn deref_mut(&mut self) -> &mut Connection {
+        &mut self
+            .0
+            .as_mut()
+            .expect("State connection is present until drop")
+            .connection
+    }
+}
+
+impl Drop for StateConnection {
+    fn drop(&mut self) {
+        let Some(cached) = self.0.take() else {
+            return;
+        };
+        // An unfinished transaction is rolled back by closing, as before.
+        if !cached.connection.is_autocommit() {
+            return;
+        }
+        CACHED_STATE.with(|slots| {
+            let mut slots = slots.borrow_mut();
+            if slots
+                .iter()
+                .filter(|slot| slot.path == cached.path && slot.write == cached.write)
+                .count()
+                < CACHED_STATE_DEPTH
+            {
+                slots.push(cached);
+            }
+        });
+    }
+}
+
+/// The checks of the bound State open (readable schema, current version,
+/// admission binding) made on this connection, with the schema cookie of
+/// the same read snapshot.
+fn validated_state_schema(connection: &Connection) -> Result<i64, String> {
+    connection
+        .execute_batch("BEGIN")
+        .map_err(|e| e.to_string())?;
+    let checked = (|| -> Result<i64, String> {
+        connection
+            .query_row("SELECT count(*) FROM sqlite_schema", [], |_| Ok(()))
+            .map_err(|e| e.to_string())?;
+        let cookie = current_state_schema(connection)?;
+        crate::completion_continuation::validate_admission_schema(connection)?;
+        Ok(cookie)
+    })();
+    let ended = connection
+        .execute_batch("COMMIT")
+        .map_err(|e| e.to_string());
+    let cookie = checked?;
+    ended?;
+    Ok(cookie)
+}
+
+/// The current schema cookie, refusing any State whose version is not this
+/// build's. An unchanged cookie means the validated schema is unchanged.
+fn current_state_schema(connection: &Connection) -> Result<i64, String> {
+    let (version, cookie): (i64, i64) = connection
+        .query_row(
+            "SELECT user_version,schema_version FROM pragma_user_version,pragma_schema_version",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|e| e.to_string())?;
+    if version != i64::from(crate::schema::CURRENT_SCHEMA_VERSION) {
+        return Err("broker repair requires current StateDb schema".into());
+    }
+    Ok(cookie)
+}
+
 /// Broker-observed process facts for one consumed interactive K. The caller
 /// must have independently authenticated the released root, K, attach and
 /// selected plan; numeric PIDs are keys in `observer_domain` only.
@@ -2833,15 +2948,51 @@ impl FreshV30Lane {
         Ok(session)
     }
 
-    fn state_connection(&self, flags: OpenFlags) -> Result<Connection, String> {
+    /// A State connection on the bound file. Each statement still reads the
+    /// current committed State; only the connection and its parsed schema
+    /// are reused, on this thread, while the bound file identity and the
+    /// validated schema stay exactly the same (see [`StateConnection`]).
+    fn state_connection(&self, flags: OpenFlags) -> Result<StateConnection, String> {
+        let write = flags.contains(OpenFlags::SQLITE_OPEN_READ_WRITE);
+        let identity = self.sidecar.bound_state_file_identity()?;
+        let reused = CACHED_STATE.with(|slots| {
+            let mut slots = slots.borrow_mut();
+            let index = slots
+                .iter()
+                .position(|slot| slot.path == self.state_path && slot.write == write)?;
+            Some(slots.swap_remove(index))
+        });
+        if let Some(cached) = reused
+            && (cached.device, cached.inode) == (identity.device, identity.inode)
+            && current_state_schema(&cached.connection).ok() == Some(cached.schema_version)
+        {
+            return Ok(StateConnection(Some(cached)));
+        }
+        // First use on this thread, or the file or schema changed: the full
+        // bound State validation, then a new connection validated itself.
         let state = self.sidecar.bound_state()?;
         if state.path() != self.state_path {
             return Err("fresh State path changed".into());
         }
+        drop(state);
         let connection =
             Connection::open_with_flags(&self.state_path, flags).map_err(|e| e.to_string())?;
         crate::sqlite_wait::install(&connection).map_err(|e| e.to_string())?;
-        Ok(connection)
+        let schema_version = validated_state_schema(&connection)?;
+        #[cfg(test)]
+        VALIDATED_STATE_OPENS.with(|opens| opens.set(opens.get() + 1));
+        let after = self.sidecar.bound_state_file_identity()?;
+        if (after.device, after.inode) != (identity.device, identity.inode) {
+            return Err("fresh State path changed".into());
+        }
+        Ok(StateConnection(Some(CachedStateConnection {
+            path: self.state_path.clone(),
+            device: identity.device,
+            inode: identity.inode,
+            write,
+            schema_version,
+            connection,
+        })))
     }
 
     fn read_state_admission_on(
@@ -3528,4 +3679,141 @@ fn rename_noreplace(from: &Path, to: &Path) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// The lane's State connections are reused per thread only while the bound
+/// file and its validated schema are unchanged; every read still sees the
+/// current committed State. Runs as root in a private user namespace, on a
+/// real bootstrapped Broker State root.
+#[cfg(all(test, target_os = "linux"))]
+mod state_connection_cache_tests {
+    use super::*;
+
+    const TEST: &str = "mailbox::fresh_lane::state_connection_cache_tests::\
+                        reused_state_connections_read_current_state_and_revalidate";
+
+    /// Validated opens on this thread so far: unchanged means reused.
+    fn opens() -> u64 {
+        VALIDATED_STATE_OPENS.with(std::cell::Cell::get)
+    }
+
+    fn probe_count(lane: &FreshV30Lane) -> i64 {
+        lane.state_connection(OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap()
+            .query_row("SELECT count(*) FROM cache_probe", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn reused_state_connections_read_current_state_and_revalidate() {
+        if unsafe { libc::geteuid() } != 0 {
+            let status = std::process::Command::new("unshare")
+                .arg("-Urm")
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .status()
+                .expect("root-mapped user namespace required");
+            assert!(status.success(), "root-mapped cache test failed");
+            return;
+        }
+        // State refuses storage below a group/world-writable ancestor; an
+        // owned directory bound over /mnt in this mount namespace has none.
+        let private = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(private.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let bound = std::process::Command::new("mount")
+            .arg("--bind")
+            .arg(private.path())
+            .arg("/mnt")
+            .status()
+            .unwrap();
+        assert!(bound.success(), "private bind over /mnt failed");
+        let root = Path::new("/mnt").join("broker-state");
+        EmptyV30BootstrapIdentity::bootstrap_at(&root).unwrap();
+        let lane = FreshV30Lane::open_at(&root).unwrap();
+        let state_path = root.join(LANE_DIRECTORY).join("state.db");
+        let writer = Connection::open(&state_path).unwrap();
+        let read_only = OpenFlags::SQLITE_OPEN_READ_ONLY;
+
+        // First use validates a new connection; a later one reuses it.
+        drop(lane.state_connection(read_only).unwrap());
+        let validated = opens();
+        drop(lane.state_connection(read_only).unwrap());
+        assert_eq!(opens(), validated);
+
+        // A schema change retires the cached connection.
+        writer
+            .execute_batch("CREATE TABLE cache_probe(value INTEGER)")
+            .unwrap();
+        assert_eq!(probe_count(&lane), 0);
+        assert_eq!(opens(), validated + 1);
+
+        // A reused connection reads rows committed after it was cached.
+        writer
+            .execute("INSERT INTO cache_probe VALUES(1)", [])
+            .unwrap();
+        let reused = lane.state_connection(read_only).unwrap();
+        assert_eq!(opens(), validated + 1);
+        let count: i64 = reused
+            .query_row("SELECT count(*) FROM cache_probe", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+
+        // A nested acquisition gets its own connection.
+        let nested = lane.state_connection(read_only).unwrap();
+        assert_eq!(opens(), validated + 2);
+        drop(nested);
+        drop(reused);
+
+        // A connection left inside a read snapshot is closed, not reused:
+        // the next reader sees later commits.
+        let open = lane.state_connection(read_only).unwrap();
+        open.execute_batch("BEGIN").unwrap();
+        let _: i64 = open
+            .query_row("SELECT count(*) FROM cache_probe", [], |row| row.get(0))
+            .unwrap();
+        drop(open);
+        writer
+            .execute("INSERT INTO cache_probe VALUES(2)", [])
+            .unwrap();
+        // Both cached slots are taken at once; a snapshot left open in either
+        // would still count one row.
+        let (one, two) = (
+            lane.state_connection(read_only).unwrap(),
+            lane.state_connection(read_only).unwrap(),
+        );
+        for connection in [&one, &two] {
+            let count: i64 = connection
+                .query_row("SELECT count(*) FROM cache_probe", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 2);
+        }
+        drop((one, two));
+
+        // Writes through a reused read-write connection are seen by readers.
+        for value in [3, 4] {
+            lane.state_connection(OpenFlags::SQLITE_OPEN_READ_WRITE)
+                .unwrap()
+                .execute("INSERT INTO cache_probe VALUES(?1)", [value])
+                .unwrap();
+        }
+        assert_eq!(probe_count(&lane), 4);
+
+        // A State of another version is refused even with a cached connection.
+        let current = i64::from(crate::schema::CURRENT_SCHEMA_VERSION);
+        writer
+            .execute_batch(&format!("PRAGMA user_version={}", current + 1))
+            .unwrap();
+        assert!(lane.state_connection(read_only).is_err());
+        writer
+            .execute_batch(&format!("PRAGMA user_version={current}"))
+            .unwrap();
+        assert_eq!(probe_count(&lane), 4);
+
+        // A replaced State file is refused even with a cached connection.
+        drop(writer);
+        let copy = state_path.with_file_name("state.db.copy");
+        std::fs::copy(&state_path, &copy).unwrap();
+        std::fs::rename(&copy, &state_path).unwrap();
+        assert!(lane.state_connection(read_only).is_err());
+    }
 }
