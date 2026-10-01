@@ -221,7 +221,8 @@ pub struct BrokerSourceEffectGrant {
     pub revision: i64,
 }
 
-/// Pending-delivery sessions one recipient selection examines.
+/// This root's pending-delivery sessions one recipient selection examines,
+/// and the most unattributed pending rows it counts.
 const RECIPIENT_SESSION_SCAN: usize = 32;
 
 /// A pending recipient selected on the retained broker connection. This is
@@ -234,20 +235,46 @@ pub struct BrokerRecipientSelection {
     pub owner_generation: String,
     pub authority_ordinal: i64,
     pub candidate: Option<BrokerRecipientCandidate>,
-    /// Paused sessions passed over although they held a pending row.
+    /// This root's paused sessions passed over although they held a
+    /// pending row: pending work, held.
     #[serde(default)]
     pub skipped_paused_pending: u32,
     /// The bounded session scan may have stopped before every pending
     /// session. With no candidate, absence is then not established.
     #[serde(default)]
     pub session_scan_bounded: bool,
+    /// Pending rows attributable to no root (rows retained from before v30
+    /// carry no source-grant chain): they may be this root's, so absence is
+    /// not established. Other roots' rows are not counted.
+    #[serde(default)]
+    pub unattributed_pending: u32,
+}
+
+/// What a recipient selection establishes for its root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecipientAbsence {
+    /// Nothing of this root is pending, and nothing unattributed is.
+    Established,
+    /// This root has pending recipient work (selected or held paused).
+    Pending,
+    /// The scan could not attribute or reach every pending session.
+    NotEstablished,
 }
 
 impl BrokerRecipientSelection {
-    /// No recipient is pending at the projected head: no candidate, no
-    /// pending row passed over and no session left unscanned.
+    pub fn absence(&self) -> RecipientAbsence {
+        if self.candidate.is_some() || self.skipped_paused_pending > 0 {
+            RecipientAbsence::Pending
+        } else if self.unattributed_pending > 0 || self.session_scan_bounded {
+            RecipientAbsence::NotEstablished
+        } else {
+            RecipientAbsence::Established
+        }
+    }
+
+    /// No recipient of this root is pending at the projected head.
     pub fn established_none_pending(&self) -> bool {
-        self.candidate.is_none() && self.skipped_paused_pending == 0 && !self.session_scan_bounded
+        self.absence() == RecipientAbsence::Established
     }
 }
 
@@ -2075,9 +2102,14 @@ impl BrokerSidecar {
         })
     }
 
-    /// Read one pending recipient from at most 32 sessions. The broker must
-    /// first prove the exact live root, owner and driver. This does not claim
-    /// the session, read payload bytes onto the wire, or authorize delivery.
+    /// Read one pending recipient of this root. A pending row is this root's
+    /// when it was materialized for a completion source this root's driver
+    /// reserved: grant, source, event, listener and row, all retained in this
+    /// sidecar. Other roots' rows do not bear on this root. A pending row with
+    /// no such chain (one retained from before v30) may be anyone's and
+    /// leaves absence not established. The broker must first prove the exact
+    /// live root, owner and driver. This does not claim the session, read
+    /// payload bytes onto the wire, or authorize delivery.
     pub fn read_bounded_recipient_selection(
         &mut self,
         source_generation: &str,
@@ -2090,10 +2122,7 @@ impl BrokerSidecar {
         if state.completion_repair_has_suffix(head.as_ref())? {
             return Err("broker recipient selection requires complete State projection".into());
         }
-        let sessions = self
-            .mailbox
-            .wake_sessions()
-            .pending_delivery_session_ids(RECIPIENT_SESSION_SCAN)?;
+        let sessions = self.root_pending_recipient_sessions(root_id)?;
         let session_scan_bounded = sessions.len() >= RECIPIENT_SESSION_SCAN;
         let mut skipped_paused_pending = 0u32;
         let mut candidate = None;
@@ -2131,6 +2160,7 @@ impl BrokerSidecar {
             });
             break;
         }
+        let unattributed_pending = self.unattributed_pending_rows()?;
         if state.completion_repair_has_suffix(head.as_ref())? {
             return Err("broker State source changed during recipient selection".into());
         }
@@ -2143,7 +2173,52 @@ impl BrokerSidecar {
             candidate,
             skipped_paused_pending,
             session_scan_bounded,
+            unattributed_pending,
         })
+    }
+
+    /// Sessions holding a pending row materialized for one of this root's
+    /// reserved completion sources, oldest first.
+    fn root_pending_recipient_sessions(&self, root_id: &str) -> Result<Vec<String>, String> {
+        let mut statement = self
+            .mailbox
+            .conn
+            .prepare_cached(&format!(
+                "SELECT m.session_id FROM broker_source_effect_grant g
+                 JOIN completion_continuation_source s ON s.registration_id=g.registration_id
+                 JOIN completion_event_listener l ON l.event_id=s.event_id
+                 JOIN mailbox m ON m.seq=l.mailbox_seq
+                 WHERE g.root_id=?1 AND m.delivered_at IS NULL
+                   AND {DELIVERABLE_MAILBOX_ERROR_PREDICATE}
+                 GROUP BY m.session_id ORDER BY MIN(m.seq) LIMIT ?2"
+            ))
+            .map_err(|e| e.to_string())?;
+        statement
+            .query_map(params![root_id, RECIPIENT_SESSION_SCAN as i64], |r| {
+                r.get(0)
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<String>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    /// Pending rows with no source-grant chain to any root, up to the scan
+    /// bound.
+    fn unattributed_pending_rows(&self) -> Result<u32, String> {
+        self.mailbox
+            .conn
+            .prepare_cached(&format!(
+                "SELECT count(*) FROM (SELECT 1 FROM mailbox m
+                 WHERE m.delivered_at IS NULL AND {DELIVERABLE_MAILBOX_ERROR_PREDICATE}
+                   AND NOT EXISTS(SELECT 1 FROM completion_event_listener l
+                     JOIN completion_continuation_source s ON s.event_id=l.event_id
+                     JOIN broker_source_effect_grant g ON g.registration_id=s.registration_id
+                     WHERE l.mailbox_seq=m.seq)
+                 LIMIT ?1)"
+            ))
+            .map_err(|e| e.to_string())?
+            .query_row([RECIPIENT_SESSION_SCAN as i64], |r| r.get(0))
+            .map_err(|e| e.to_string())
     }
 
     /// Reserve only the broker's first still-pending State-projected source.
@@ -6261,6 +6336,17 @@ mod tests {
             endpoint: "fixture".into(),
         };
         let root_id = uuid::Uuid::new_v4().to_string();
+        // Retained from before v30, the completion and input rows are
+        // attributable to no root.
+        let legacy = broker
+            .read_bounded_recipient_selection(&generation, &root_id, &owner)
+            .unwrap();
+        assert!(legacy.candidate.is_none());
+        assert_eq!(legacy.unattributed_pending, 2);
+        assert_eq!(legacy.absence(), RecipientAbsence::NotEstablished);
+        // Materialized for a source this root's driver reserved, it is this
+        // root's.
+        attribute_to_root(&broker.mailbox, mail.seq, "recipient", &root_id);
         assert!(
             broker
                 .read_bounded_recipient_selection("wrong", &root_id, &owner)
@@ -6351,6 +6437,140 @@ mod tests {
         assert!(none.candidate.is_none(), "{none:?}");
         assert_eq!(none.skipped_paused_pending, 0);
         assert!(none.established_none_pending());
+
+        // Other roots' pending rows do not bear on this root, however many
+        // there are (more than the 32-session scan).
+        for index in 0..40 {
+            let session = format!("other-{index}");
+            let seq = pending(&broker.mailbox, &session);
+            attribute_to_root(
+                &broker.mailbox,
+                seq,
+                &session,
+                &uuid::Uuid::new_v4().to_string(),
+            );
+        }
+        let others = broker
+            .read_bounded_recipient_selection(&generation, &root_id, &owner)
+            .unwrap();
+        assert_eq!(
+            others.absence(),
+            RecipientAbsence::Established,
+            "{others:?}"
+        );
+        // This root's pending row held by a paused session is pending work,
+        // not absence, with the other roots present.
+        let held_seq = pending(&broker.mailbox, "recipient-two");
+        attribute_to_root(&broker.mailbox, held_seq, "recipient-two", &root_id);
+        broker
+            .mailbox
+            .set_notifications_paused("recipient-two", true)
+            .unwrap();
+        let held = broker
+            .read_bounded_recipient_selection(&generation, &root_id, &owner)
+            .unwrap();
+        assert_eq!(held.skipped_paused_pending, 1);
+        assert_eq!(held.absence(), RecipientAbsence::Pending);
+        // Unpaused, it is selected; its missing retained payload is a
+        // genuine failure, never an absence.
+        broker
+            .mailbox
+            .set_notifications_paused("recipient-two", false)
+            .unwrap();
+        assert!(
+            broker
+                .read_bounded_recipient_selection(&generation, &root_id, &owner)
+                .is_err()
+        );
+        broker
+            .mailbox
+            .acknowledge_range("recipient-two", 1, i64::MAX, "fixture")
+            .unwrap();
+        assert!(
+            broker
+                .read_bounded_recipient_selection(&generation, &root_id, &owner)
+                .unwrap()
+                .established_none_pending()
+        );
+        // More of this root's pending sessions than one scan examines, all
+        // held: absence is not reached by the scan.
+        for index in 0..RECIPIENT_SESSION_SCAN {
+            let session = format!("mine-{index}");
+            let seq = pending(&broker.mailbox, &session);
+            attribute_to_root(&broker.mailbox, seq, &session, &root_id);
+            broker
+                .mailbox
+                .set_notifications_paused(&session, true)
+                .unwrap();
+        }
+        let bounded = broker
+            .read_bounded_recipient_selection(&generation, &root_id, &owner)
+            .unwrap();
+        assert!(bounded.session_scan_bounded);
+        assert_eq!(bounded.absence(), RecipientAbsence::Pending);
+    }
+
+    /// A pending row as the mailbox stores one, without retained payload.
+    fn pending(mailbox: &MailboxDb, session: &str) -> i64 {
+        mailbox
+            .conn
+            .query_row(
+                "INSERT INTO mailbox(session_id,kind,handle,payload_json,enqueued_at,
+                 state_dir,meta_path,log_path,rc_path,rc)
+                 VALUES(?1,'agent_bash_complete',?1,'{}','2026-10-01T00:00:00Z',
+                 'state','meta','log','rc',0) RETURNING seq",
+                [session],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// Retain the chain that makes a pending row a root's: a source grant the
+    /// root's driver reserved, for a registration whose event's listener row
+    /// it is.
+    fn attribute_to_root(mailbox: &MailboxDb, seq: i64, session: &str, root_id: &str) {
+        let id = uuid::Uuid::new_v4().to_string();
+        let conn = &mailbox.conn;
+        let domain: String = conn
+            .query_row(
+                "SELECT domain_id FROM completion_continuation_domain",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO completion_supervisor_authority(authority_id,domain_id,phase,
+             created_by_generation) VALUES(?1,?2,'active','fixture')",
+            params![id, domain],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO completion_event(event_id,kind,state,delivery_mode,state_dir,
+             meta_path,log_path,rc_path,created_at)
+             VALUES(?1,'agent_bash_complete','pending','async','state','meta','log','rc','now')",
+            [&id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO completion_continuation_source(registration_id,domain_id,source_id,
+             event_id,registration_digest,binding,supervisor_authority_id,
+             attempt_association_history) VALUES(?1,?2,?1,?1,'digest',x'00',?1,'unknown')",
+            params![id, domain],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO completion_event_listener(event_id,listener_id,session_id,
+             owner_invocation_uuid,active,mailbox_seq,created_at)
+             VALUES(?1,?1,?2,'owner',1,?3,'now')",
+            params![id, session, seq],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO broker_source_effect_grant VALUES(?1,'generation',?2,'owner','{}',0,
+             ?1,'digest',x'00',0,'{}','consumed',2)",
+            params![id, root_id],
+        )
+        .unwrap();
     }
 
     #[cfg(unix)]

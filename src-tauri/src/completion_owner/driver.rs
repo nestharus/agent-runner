@@ -406,22 +406,48 @@ fn run_v30_repair_boundary(
 pub(crate) const V30_NOTHING_PENDING: &str =
     "v30 repair boundary: no pending broker recipient; nothing to repair";
 
-/// Nothing to repair is this boundary's ordinary outcome, not a failure:
-/// the projection reached the bound head with no source and the Broker
-/// established that no recipient is pending. A pending row the selection
-/// passed over (a paused session, or sessions beyond its bounded scan)
-/// does not establish absence and stays a failure.
+/// Prefix of the one driver outcome that is neither success nor failure:
+/// the Broker could not establish whether this root has a pending
+/// recipient. The driver exits [`V30_ABSENCE_NOT_ESTABLISHED_EXIT`].
+pub(crate) const V30_ABSENCE_NOT_ESTABLISHED: &str = "v30 recipient absence not established";
+
+/// Exit status for [`V30_ABSENCE_NOT_ESTABLISHED`]; every genuine failure
+/// or pending recipient exits 1, and established absence exits 0.
+pub(crate) const V30_ABSENCE_NOT_ESTABLISHED_EXIT: u8 = 3;
+
+/// The exit status for a driver error: "not established" is told apart
+/// from failure, and neither ever reads as success.
+pub(super) fn failure_exit(error: &str) -> std::process::ExitCode {
+    if error.starts_with(V30_ABSENCE_NOT_ESTABLISHED) {
+        std::process::ExitCode::from(V30_ABSENCE_NOT_ESTABLISHED_EXIT)
+    } else {
+        std::process::ExitCode::FAILURE
+    }
+}
+
+/// The boundary's three outcomes once no source or selected recipient
+/// remains. Established absence of this root's recipients is success.
+/// This root's pending row held by a paused session is pending work, a
+/// failure. A pending row attributable to no root, or this root's scan
+/// reaching its bound, leaves absence not established: its own outcome.
 fn no_pending_disposition(
     selected: &oulipoly_state::mailbox::BrokerRecipientSelection,
 ) -> Result<(), String> {
-    if selected.established_none_pending() {
-        eprintln!("{V30_NOTHING_PENDING}");
-        return Ok(());
+    use oulipoly_state::mailbox::RecipientAbsence;
+    match selected.absence() {
+        RecipientAbsence::Established => {
+            eprintln!("{V30_NOTHING_PENDING}");
+            Ok(())
+        }
+        RecipientAbsence::Pending => Err(format!(
+            "v30 pending broker recipient held: {} paused session(s) of this root with pending rows",
+            selected.skipped_paused_pending
+        )),
+        RecipientAbsence::NotEstablished => Err(format!(
+            "{V30_ABSENCE_NOT_ESTABLISHED}: {} pending row(s) attributable to no root, this root's scan bounded: {}",
+            selected.unattributed_pending, selected.session_scan_bounded
+        )),
     }
-    Err(format!(
-        "v30 pending broker recipient not established absent: {} paused session(s) with pending rows, scan bounded: {}",
-        selected.skipped_paused_pending, selected.session_scan_bounded
-    ))
 }
 
 fn run_owned(path: &Path, owner: &CompletionDomainOwner) -> Result<(), String> {
@@ -585,10 +611,11 @@ fn run_owned(path: &Path, owner: &CompletionDomainOwner) -> Result<(), String> {
 
 #[cfg(test)]
 mod no_pending_disposition_tests {
-    use super::no_pending_disposition;
+    use super::{V30_ABSENCE_NOT_ESTABLISHED, failure_exit, no_pending_disposition};
     use oulipoly_state::mailbox::{BrokerRecipientCandidate, BrokerRecipientSelection};
+    use std::process::ExitCode;
 
-    fn selection(paused: u32, bounded: bool) -> BrokerRecipientSelection {
+    fn selection(paused: u32, bounded: bool, unattributed: u32) -> BrokerRecipientSelection {
         BrokerRecipientSelection {
             source_generation: "generation".into(),
             root_id: "root".into(),
@@ -597,19 +624,33 @@ mod no_pending_disposition_tests {
             candidate: None,
             skipped_paused_pending: paused,
             session_scan_bounded: bounded,
+            unattributed_pending: unattributed,
         }
     }
 
     #[test]
-    fn only_established_absence_is_a_successful_no_op() {
-        assert_eq!(no_pending_disposition(&selection(0, false)), Ok(()));
-        // A pending row the Broker passed over, or sessions it never
-        // scanned, stays a failure: absence is not established.
-        for (paused, bounded) in [(1, false), (0, true), (2, true)] {
-            let error = no_pending_disposition(&selection(paused, bounded)).unwrap_err();
-            assert!(error.contains("not established absent"), "{error}");
+    fn three_driver_outcomes_are_told_apart() {
+        // Established absence is the only success.
+        assert_eq!(no_pending_disposition(&selection(0, false, 0)), Ok(()));
+        // This root's held pending row is pending work: failure, exit 1,
+        // even when absence elsewhere is also unknown.
+        for (bounded, unattributed) in [(false, 0), (true, 0), (false, 2)] {
+            let error = no_pending_disposition(&selection(1, bounded, unattributed)).unwrap_err();
+            assert!(error.contains("held"), "{error}");
+            assert_eq!(failure_exit(&error), ExitCode::FAILURE);
         }
-        let mut pending = selection(0, false);
+        // Unattributed or unreached sessions: not established, exit 3.
+        for (bounded, unattributed) in [(true, 0), (false, 1), (true, 3)] {
+            let error = no_pending_disposition(&selection(0, bounded, unattributed)).unwrap_err();
+            assert!(error.starts_with(V30_ABSENCE_NOT_ESTABLISHED), "{error}");
+            assert_eq!(failure_exit(&error), ExitCode::from(3));
+        }
+        // A genuine failure keeps exit 1.
+        assert_eq!(
+            failure_exit("v30 recipient effect closed: no broker-authenticated live recipient"),
+            ExitCode::FAILURE
+        );
+        let mut pending = selection(0, false, 0);
         pending.candidate = Some(BrokerRecipientCandidate {
             session_id: "session".into(),
             seq: 1,

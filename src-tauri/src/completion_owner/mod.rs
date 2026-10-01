@@ -417,6 +417,16 @@ pub(crate) fn verify_installed_driver_entry() -> Result<bool, String> {
 }
 
 #[cfg(target_os = "linux")]
+/// Exit status for a failed custodian entry. Only the v30 driver has an
+/// outcome that is neither success nor failure (absence not established).
+pub(crate) fn custodian_failure_exit(error: &str) -> std::process::ExitCode {
+    if std::env::args().nth(1).as_deref() == Some(driver::DRIVER_ARG) {
+        driver::failure_exit(error)
+    } else {
+        std::process::ExitCode::FAILURE
+    }
+}
+
 pub(crate) fn custodian_entry() -> Option<Result<(), String>> {
     match std::env::args().nth(1).as_deref() {
         Some(driver::DRIVER_ARG) => Some(driver::entry()),
