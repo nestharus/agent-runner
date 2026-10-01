@@ -663,6 +663,170 @@ fn verify_historical_close_cursor(
     Ok(())
 }
 
+/// One State continuity advance attributed to the exact released root whose
+/// source admission appended it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrokerContinuityAdvance {
+    pub authority_ordinal: i64,
+    pub root_id: String,
+    pub owner_generation: String,
+}
+
+/// Several roots share one State continuity head. Every advance after a
+/// historical `base` up to the synchronized `current` head must be an exact
+/// source admission of a prepared root in this source generation, identical
+/// in both stores. An unattributed (historical or non-exact) advance refuses:
+/// it cannot be told apart from the caller's own progress.
+fn continuity_advances_on(
+    state: &StateDb,
+    sidecar: &Connection,
+    source_generation: &str,
+    base: &BrokerStateCloseCursor,
+    current: &BrokerStateCloseCursor,
+) -> Result<Vec<BrokerContinuityAdvance>, String> {
+    if base.file != current.file
+        || base.sidecar_generation != current.sidecar_generation
+        || base.authority_ordinal > current.authority_ordinal
+    {
+        return Err("broker State continuity advance is not forward".into());
+    }
+    verify_historical_close_cursor(state, sidecar, base)?;
+    let mut statement = state
+        .raw_connection()
+        .prepare(
+            "SELECT c.authority_ordinal,c.admission_id,c.continuity_digest,
+                d.root_id,d.owner_generation,d.source_generation
+             FROM invocation_completion_continuity c
+             LEFT JOIN invocation_completion_exact_source_decisions d
+             ON d.admission_id=c.admission_id
+             WHERE c.authority_ordinal>?1 AND c.authority_ordinal<=?2
+             ORDER BY c.authority_ordinal",
+        )
+        .map_err(|error| error.to_string())?;
+    type Row = (
+        i64,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let rows = statement
+        .query_map(
+            params![base.authority_ordinal, current.authority_ordinal],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<Row>, _>>()
+        .map_err(|error| error.to_string())?;
+    let mut advances = Vec::with_capacity(rows.len());
+    let mut expected = base.authority_ordinal;
+    let mut last = None;
+    for (ordinal, admission_id, digest, root_id, owner_generation, decision_source) in rows {
+        expected += 1;
+        let projected = completion_continuity_by_admission_on(sidecar, &admission_id)?;
+        if ordinal != expected
+            || projected.as_ref().map(|row| {
+                (
+                    row.authority_ordinal,
+                    row.continuity_digest.as_str(),
+                    row.sidecar_generation.as_str(),
+                )
+            }) != Some((
+                ordinal,
+                digest.as_str(),
+                current.sidecar_generation.as_str(),
+            ))
+        {
+            return Err("broker State continuity advance changed".into());
+        }
+        let (Some(root_id), Some(owner_generation), Some(decision_source)) =
+            (root_id, owner_generation, decision_source)
+        else {
+            return Err("broker State continuity advance is unattributed".into());
+        };
+        let prepared: bool = sidecar
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM broker_prepared_owner
+                 WHERE owner_generation=?1 AND root_id=?2 AND source_generation=?3)",
+                params![owner_generation, root_id, source_generation],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if decision_source != source_generation || !prepared {
+            return Err("broker State continuity advance has no prepared root".into());
+        }
+        last = Some((admission_id, digest));
+        advances.push(BrokerContinuityAdvance {
+            authority_ordinal: ordinal,
+            root_id,
+            owner_generation,
+        });
+    }
+    let reaches_current = match &last {
+        Some((admission_id, digest)) => {
+            *admission_id == current.admission_id && *digest == current.continuity_digest
+        }
+        None => base == current,
+    };
+    if expected != current.authority_ordinal || !reaches_current {
+        return Err("broker State continuity advance changed".into());
+    }
+    Ok(advances)
+}
+
+/// A root's close may bind its intent cursor while siblings keep admitting.
+/// Only progress attributed to another prepared root may separate the two.
+fn require_sibling_advance_on(
+    state: &StateDb,
+    sidecar: &Connection,
+    source_generation: &str,
+    root_id: &str,
+    base: &BrokerStateCloseCursor,
+    current: &BrokerStateCloseCursor,
+) -> Result<(), String> {
+    if continuity_advances_on(state, sidecar, source_generation, base, current)?
+        .iter()
+        .any(|advance| advance.root_id == root_id)
+    {
+        return Err("broker owner close root has its own State continuity advance".into());
+    }
+    Ok(())
+}
+
+/// A close cursor must cover every State admission of its own root. A replayed
+/// or stale close proof that predates the root's own advance refuses.
+fn require_no_own_advance_after_on(
+    state: &StateDb,
+    root_id: &str,
+    cursor: &BrokerStateCloseCursor,
+) -> Result<(), String> {
+    let own_later: bool = state
+        .raw_connection()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM invocation_completion_continuity c
+             JOIN invocation_completion_exact_source_decisions d
+             ON d.admission_id=c.admission_id
+             WHERE c.authority_ordinal>?1 AND d.root_id=?2)",
+            params![cursor.authority_ordinal, root_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if own_later {
+        return Err("broker closed owner root advanced after its close cursor".into());
+    }
+    Ok(())
+}
+
 fn source_effect_obligations_on(
     conn: &Connection,
     source_generation: &str,
@@ -1415,13 +1579,12 @@ impl BrokerSidecar {
         let state_tx =
             Transaction::new_unchecked(state.raw_connection(), TransactionBehavior::Immediate)
                 .map_err(|error| format!("broker owner close State writer reservation: {error}"))?;
-        let state_cursor = state_close_cursor(&state, self.bound_state_file_identity()?)?;
-        if (proof.state_cursor.authority_ordinal == 0
-            && (state_cursor.is_some()
-                || proof.state_cursor.admission_id != EMPTY_CLOSE_ADMISSION
-                || proof.state_cursor.continuity_digest != EMPTY_CLOSE_DIGEST))
-            || (proof.state_cursor.authority_ordinal != 0
-                && state_cursor.as_ref() != Some(&proof.state_cursor))
+        // The head is compared under both writer reservations below; a
+        // sibling's admission may have advanced it since this root's intent.
+        if proof.state_cursor.authority_ordinal < 0
+            || (proof.state_cursor.authority_ordinal == 0
+                && (proof.state_cursor.admission_id != EMPTY_CLOSE_ADMISSION
+                    || proof.state_cursor.continuity_digest != EMPTY_CLOSE_DIGEST))
         {
             return Err("broker owner close State cursor changed".into());
         }
@@ -1446,10 +1609,24 @@ impl BrokerSidecar {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| format!("broker owner close sidecar writer reservation: {error}"))?;
         let head = completion_continuity_head_on(&sidecar_tx)?;
-        if current_close_cursor_on(&state, &sidecar_tx, state_file)? != proof.state_cursor
-            || state.completion_repair_has_suffix(head.as_ref())?
-        {
+        let current = current_close_cursor_on(&state, &sidecar_tx, state_file)?;
+        if state.completion_repair_has_suffix(head.as_ref())? {
             return Err("broker owner close State/sidecar continuity changed".into());
+        }
+        // The close keeps its intent cursor. Any later head must be progress
+        // of other prepared roots only, never this root's own admission.
+        if current != proof.state_cursor {
+            require_sibling_advance_on(
+                &state,
+                &sidecar_tx,
+                &proof.source_generation,
+                &proof.root_id,
+                &proof.state_cursor,
+                &current,
+            )
+            .map_err(|error| {
+                format!("broker owner close State/sidecar continuity changed: {error}")
+            })?;
         }
         let duties = owner_close_duties_on(
             &sidecar_tx,
@@ -1565,6 +1742,7 @@ impl BrokerSidecar {
         }
         let state = self.bound_state()?;
         verify_historical_close_cursor(&state, &self.mailbox.conn, &state_cursor)?;
+        require_no_own_advance_after_on(&state, root_id, &state_cursor)?;
         if self.mailbox.sidecar_generation()? != state_cursor.sidecar_generation
             || state.has_pending_native_channel_duty_for_domain(&domain)?
             || !state.cancelling_native_attempts()?.is_empty()
@@ -1590,9 +1768,53 @@ impl BrokerSidecar {
         }))
     }
 
+    /// Attribute every State continuity advance after the historical `base`
+    /// up to the synchronized `current` head to its exact prepared root.
+    /// Admission accounting accepts an advance past the latest closed cursor
+    /// only when each attributed root is still an accounted in-flight entry.
+    pub fn read_continuity_advances(
+        &self,
+        base: &BrokerStateCloseCursor,
+        current: &BrokerStateCloseCursor,
+    ) -> Result<Vec<BrokerContinuityAdvance>, String> {
+        self.check_mailbox_read(&self.source_generation)?;
+        let state = self.bound_state()?;
+        let file = self.bound_state_file_identity()?;
+        if base.file != file || current.file != file {
+            return Err("broker State continuity advance inode changed".into());
+        }
+        let advances = continuity_advances_on(
+            &state,
+            &self.mailbox.conn,
+            &self.source_generation,
+            base,
+            current,
+        )?;
+        self.check_mailbox_read(&self.source_generation)?;
+        Ok(advances)
+    }
+
+    /// Read-only preflight of the close writer's own check: from this root's
+    /// intent cursor to the current head, only other roots advanced State.
+    pub fn require_sibling_close_advance(
+        &self,
+        root_id: &str,
+        intent: &BrokerStateCloseCursor,
+        current: &BrokerStateCloseCursor,
+    ) -> Result<(), String> {
+        if self
+            .read_continuity_advances(intent, current)?
+            .iter()
+            .any(|advance| advance.root_id == root_id)
+        {
+            return Err("broker owner close root has its own State continuity advance".into());
+        }
+        Ok(())
+    }
+
     /// Admission must account for every State continuity advance. Older
-    /// closed owners retain their original cursors, but the newest closed
-    /// entry must still be the current, fully projected head in both stores.
+    /// closed owners retain their original cursors; an advance past the
+    /// newest closed cursor is attributed through `read_continuity_advances`.
     pub fn read_current_close_cursor(&self) -> Result<BrokerStateCloseCursor, String> {
         self.check_mailbox_read(&self.source_generation)?;
         let state = self.bound_state()?;
@@ -6852,6 +7074,319 @@ mod tests {
                 .unwrap(),
             0
         );
+        drop(broker);
+        schema::validate_broker_owned(&Connection::open(&path).unwrap()).unwrap();
+    }
+
+    /// Real `close_exact_root_owner` under overlapping roots that share one
+    /// State continuity head. A root closes at its intent cursor while other
+    /// prepared roots' exact admissions follow it; its own, unattributed or
+    /// unprepared progress after that cursor still refuses, as does a second
+    /// close. Distinct roots may close at one unchanged head.
+    #[cfg(unix)]
+    #[test]
+    fn overlapping_roots_close_through_sibling_progress_but_not_their_own() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("sidecar");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join("pid-identity.db");
+        let state_path = directory.join("state.db");
+        // Four real continuity admissions, projected into the same sidecar
+        // before it becomes broker-owned.
+        let mut state = StateDb::open(&state_path).unwrap();
+        for generation in 0..4 {
+            let invocation = uuid::Uuid::new_v4().to_string();
+            state
+                .start_invocation(&crate::InvocationStart {
+                    invocation_uuid: invocation.clone(),
+                    model_name: "overlap-close".into(),
+                    provider_name: "fixture".into(),
+                    provider_index: 0,
+                    parent_invocation_id: None,
+                })
+                .unwrap();
+            state
+                .register_completion_event_with_obligation(
+                    crate::InvocationMutationAuthority::Standalone,
+                    &format!("overlap-admission-{generation}"),
+                    CompletionEventRegistrationInput {
+                        event_id: &format!("overlap-event-{generation}"),
+                        delivery_mode: "async",
+                        owner_session_id: Some(&format!("overlap-session-{generation}")),
+                        owner_invocation_uuid: Some(&invocation),
+                        state_dir: "/tmp/age353-overlap-state",
+                        meta_path: "/tmp/age353-overlap-meta",
+                        log_path: "/tmp/age353-overlap-log",
+                        rc_path: "/tmp/age353-overlap-rc",
+                    },
+                )
+                .unwrap();
+        }
+        drop(state);
+        let domain = MailboxDb::open(&path)
+            .unwrap()
+            .completion_continuation_domain()
+            .unwrap()
+            .unwrap();
+        for artifact in [path.clone(), mailbox_authority_path(&path)] {
+            fs::set_permissions(artifact, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let uid = unsafe { libc::geteuid() };
+        let source_generation = activate_with_owner(&path, uid, root.path()).unwrap();
+        write_state_source_binding(&directory, &state_path, uid, uid).unwrap();
+        let mut broker = open_with_owner(&path, uid, root.path()).unwrap();
+        // Fixture settlement of the four registrations' global listener
+        // retirement (named Group A coupling, outside this relation).
+        broker
+            .mailbox
+            .conn
+            .execute(
+                "UPDATE completion_event_listener SET retirement_pending=0",
+                [],
+            )
+            .unwrap();
+        let file = broker.bound_state_file_identity().unwrap();
+        let cursor_at = |ordinal: i64| -> BrokerStateCloseCursor {
+            let state = StateDb::open(&state_path).unwrap();
+            state
+                .raw_connection()
+                .query_row(
+                    "SELECT authority_ordinal,admission_id,expected_sidecar_generation,
+                     continuity_digest FROM invocation_completion_continuity
+                     WHERE authority_ordinal=?1",
+                    [ordinal],
+                    |row| {
+                        Ok(BrokerStateCloseCursor {
+                            file,
+                            authority_ordinal: row.get(0)?,
+                            admission_id: row.get(1)?,
+                            sidecar_generation: row.get(2)?,
+                            continuity_digest: row.get(3)?,
+                        })
+                    },
+                )
+                .unwrap()
+        };
+        let empty = empty_close_cursor(file, broker.mailbox.sidecar_generation().unwrap());
+        let head = cursor_at(4);
+        assert_eq!(broker.read_current_close_cursor().unwrap(), head);
+
+        let boot_id = uuid::Uuid::new_v4().to_string();
+        let prepared_root = |index: i32| {
+            let stamp = |actor: i32, pidns_ino| PreparedProcessStamp {
+                host_pid: 2000 + index * 10 + actor,
+                boot_id: boot_id.clone(),
+                starttime_ticks: (7000 + index * 10 + actor) as u64,
+                pidns_dev: 1,
+                pidns_ino,
+            };
+            PreparedBrokerOwner {
+                source_generation: source_generation.clone(),
+                root_id: uuid::Uuid::new_v4().to_string(),
+                owner_uid: uid,
+                domain_id: domain.clone(),
+                supervisor_authority_id: uuid::Uuid::new_v4().to_string(),
+                owner_generation: uuid::Uuid::new_v4().to_string(),
+                endpoint: format!("/fixture/overlap-{index}/owner.sock"),
+                entry: stamp(1, 1),
+                guardian: stamp(2, 1),
+                driver: stamp(3, 1),
+                root_init: stamp(4, 200 + index as u64),
+                joined_child: stamp(5, 200 + index as u64),
+            }
+        };
+        // Attribute an existing continuity row to the exact source admission
+        // of one root, as the exact-source State admission records it.
+        let attribute = |ordinal: i64, owner: &PreparedBrokerOwner| {
+            let state = StateDb::open(&state_path).unwrap();
+            let admission: String = state
+                .raw_connection()
+                .query_row(
+                    "SELECT admission_id FROM invocation_completion_continuity
+                     WHERE authority_ordinal=?1",
+                    [ordinal],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            state
+                .raw_connection()
+                .execute(
+                    "INSERT INTO invocation_completion_exact_source_decisions(
+                     admission_id,request_id,decision_id,registration_id,registration_sha256,
+                     root_id,source_generation,owner_generation,supervisor_id,issuer_stamp_json,
+                     original_state_device,original_state_inode,broker_readback_json)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'{}',?10,?11,x'7b7d')",
+                    params![
+                        admission,
+                        uuid::Uuid::new_v4().to_string(),
+                        uuid::Uuid::new_v4().to_string(),
+                        uuid::Uuid::new_v4().to_string(),
+                        "b".repeat(64),
+                        owner.root_id,
+                        owner.source_generation,
+                        owner.owner_generation,
+                        owner.supervisor_authority_id,
+                        file.device as i64,
+                        file.inode as i64,
+                    ],
+                )
+                .unwrap();
+        };
+        let proof =
+            |owner: &PreparedBrokerOwner, cursor: &BrokerStateCloseCursor| BrokerClosedOwner {
+                source_generation: source_generation.clone(),
+                root_id: owner.root_id.clone(),
+                owner_generation: owner.owner_generation.clone(),
+                state_cursor: cursor.clone(),
+                root_record_json: "{}".into(),
+                physical_proof_json: r#"{"normal":{}}"#.into(),
+            };
+        let running = |broker: &BrokerSidecar, owner: &PreparedBrokerOwner| -> bool {
+            broker
+                .mailbox
+                .conn
+                .query_row(
+                    "SELECT phase='running' FROM completion_continuation_owner
+                     WHERE generation=?1",
+                    [&owner.owner_generation],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+
+        // Rows: 1 historical (unattributed), 2-3 sibling b, 4 sibling c.
+        let (a, b, c) = (prepared_root(0), prepared_root(1), prepared_root(2));
+        for owner in [&a, &b] {
+            broker.prepare_exact_owner(owner).unwrap();
+            broker.commit_exact_prepared_release(owner).unwrap();
+        }
+        attribute(2, &b);
+        attribute(3, &b);
+        attribute(4, &c);
+
+        // c's admission is not yet a prepared root: a's close refuses.
+        let refused = broker
+            .close_exact_root_owner(&proof(&a, &cursor_at(1)), || Ok(()))
+            .unwrap_err();
+        assert!(refused.contains("no prepared root"), "{refused}");
+        broker.prepare_exact_owner(&c).unwrap();
+        broker.commit_exact_prepared_release(&c).unwrap();
+
+        // An unattributed advance cannot be told apart from a's own progress.
+        let refused = broker
+            .close_exact_root_owner(&proof(&a, &empty), || Ok(()))
+            .unwrap_err();
+        assert!(refused.contains("unattributed"), "{refused}");
+        assert!(running(&broker, &a));
+
+        // B1: a's intent cursor is row 1; b and c admitted afterwards. The
+        // real close commits at that intent cursor.
+        let closed_a = broker
+            .close_exact_root_owner(&proof(&a, &cursor_at(1)), || Ok(()))
+            .unwrap();
+        assert_eq!(closed_a.state_cursor, cursor_at(1));
+        assert!(!running(&broker, &a));
+        assert_eq!(
+            broker
+                .read_closed_root_owner(&a.root_id, &a.owner_generation)
+                .unwrap()
+                .unwrap(),
+            closed_a
+        );
+        // A duplicate or replayed close of the same owner refuses.
+        assert!(
+            broker
+                .close_exact_root_owner(&proof(&a, &cursor_at(1)), || Ok(()))
+                .is_err()
+        );
+        assert!(
+            broker
+                .close_exact_root_owner(&proof(&a, &head), || Ok(()))
+                .is_err()
+        );
+
+        // c's own admission (row 4) follows an earlier intent cursor: refused.
+        let refused = broker
+            .close_exact_root_owner(&proof(&c, &cursor_at(3)), || Ok(()))
+            .unwrap_err();
+        assert!(
+            refused.contains("own State continuity advance"),
+            "{refused}"
+        );
+        assert!(
+            broker
+                .require_sibling_close_advance(&c.root_id, &cursor_at(3), &head)
+                .is_err()
+        );
+        // b's own rows precede an intent at row 3; only c advanced after it.
+        broker
+            .require_sibling_close_advance(&b.root_id, &cursor_at(3), &head)
+            .unwrap();
+        // A cursor that is not the immutable historical row refuses.
+        let mut forged = cursor_at(3);
+        forged.continuity_digest = "0".repeat(64);
+        assert!(
+            broker
+                .close_exact_root_owner(&proof(&b, &forged), || Ok(()))
+                .is_err()
+        );
+        assert!(running(&broker, &b));
+
+        // B2: b and c both close at the unchanged head, row 4.
+        let closed_c = broker
+            .close_exact_root_owner(&proof(&c, &head), || Ok(()))
+            .unwrap();
+        let closed_b = broker
+            .close_exact_root_owner(&proof(&b, &head), || Ok(()))
+            .unwrap();
+        assert_eq!(closed_b.state_cursor, closed_c.state_cursor);
+        for owner in [&a, &b, &c] {
+            assert!(!running(&broker, owner));
+            assert!(
+                broker
+                    .read_closed_root_owner(&owner.root_id, &owner.owner_generation)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+
+        // Accounting attribution (B3): from a's closed cursor to the head,
+        // every advance names its exact prepared root.
+        let advances = broker
+            .read_continuity_advances(&cursor_at(1), &head)
+            .unwrap();
+        assert_eq!(
+            advances
+                .iter()
+                .map(|advance| (advance.authority_ordinal, advance.root_id.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (2, b.root_id.as_str()),
+                (3, b.root_id.as_str()),
+                (4, c.root_id.as_str())
+            ]
+        );
+        assert!(
+            broker
+                .read_continuity_advances(&head, &head)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(broker.read_continuity_advances(&empty, &head).is_err());
+        assert!(
+            broker
+                .read_continuity_advances(&head, &cursor_at(1))
+                .is_err()
+        );
+
+        // A stale close cursor that predates the root's own admission is
+        // refused by the closed-owner readback predicate.
+        let state = StateDb::open(&state_path).unwrap();
+        assert!(require_no_own_advance_after_on(&state, &b.root_id, &cursor_at(1)).is_err());
+        require_no_own_advance_after_on(&state, &b.root_id, &cursor_at(3)).unwrap();
+        require_no_own_advance_after_on(&state, &a.root_id, &cursor_at(1)).unwrap();
+        drop(state);
         drop(broker);
         schema::validate_broker_owned(&Connection::open(&path).unwrap()).unwrap();
     }

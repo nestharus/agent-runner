@@ -52,7 +52,7 @@ use base64::Engine as _;
 use oulipoly_kernel_broker::accepted_grant::DelegatedRootHGrant;
 use oulipoly_kernel_broker::accepted_grant::{Acceptance, GrantRegistry};
 use oulipoly_kernel_broker::admission_accounting::{
-    Disposition, EntryFacts, RootState, account_entries, closed_history,
+    Disposition, EntryFacts, RootState, account_close_cursors, account_entries, closed_history,
 };
 use oulipoly_kernel_broker::connected_control::ControlGrant;
 use oulipoly_kernel_broker::cutover_gate::EntryGate;
@@ -4362,10 +4362,13 @@ fn require_accounted_entries(
         .then(|| FreshV30Lane::open_at(state_root).map_err(io::Error::other))
         .transpose()?;
     let mut closed_roots = Vec::new();
+    let mut in_flight = HashSet::new();
     let mut joined = Vec::new();
     for (entry, disposition) in entries.records().iter().zip(&dispositions) {
         match disposition {
-            Disposition::InFlight => {}
+            Disposition::InFlight => {
+                in_flight.insert(entry.root_id.clone());
+            }
             Disposition::Closed => closed_roots.push(entry.root_id.clone()),
             Disposition::CloseCandidate => {
                 let Some(close) = join_closed_entry(
@@ -4381,6 +4384,7 @@ fn require_accounted_entries(
                     sidecar,
                 )?
                 else {
+                    in_flight.insert(entry.root_id.clone());
                     continue;
                 };
                 closed_cursors.push(close.cursor.clone());
@@ -4389,30 +4393,23 @@ fn require_accounted_entries(
             }
         }
     }
-    // Directory enumeration after restart has no generation order. Compare
-    // the immutable ordinals themselves and reject aliasing or a source swap.
-    closed_cursors.sort_by_key(|cursor| cursor.authority_ordinal);
-    if closed_cursors.windows(2).any(|pair| {
-        (pair[0].authority_ordinal >= pair[1].authority_ordinal
-            && !(pair[0].authority_ordinal == 0 && pair[0] == pair[1]))
-            || pair[0].file != pair[1].file
-            || pair[0].sidecar_generation != pair[1].sidecar_generation
-    }) {
-        return Err(io::Error::other("prior entry close cursor order changed"));
-    }
-    if !closed_cursors.is_empty() {
-        let current = current.ok_or_else(|| io::Error::other("prior entry sidecar absent"))?;
-        // The serial writer loop sees no close between its read and joins.
-        // The fresh reader may see a later close only as a validated cursor.
-        let accounted = if read_only {
-            closed_cursors.contains(&current)
-        } else {
-            closed_cursors.last() == Some(&current)
-        };
-        if !accounted {
-            return Err(io::Error::other("unclosed State continuity generation"));
-        }
-    }
+    // Directory enumeration after restart has no generation order; the
+    // accounting compares the immutable ordinals themselves.
+    account_close_cursors(
+        closed_cursors,
+        current,
+        read_only,
+        &in_flight,
+        |base, current| {
+            Ok(sidecar
+                .ok_or_else(|| io::Error::other("prior entry sidecar absent"))?
+                .read_continuity_advances(base, current)
+                .map_err(io::Error::other)?
+                .into_iter()
+                .map(|advance| advance.root_id)
+                .collect())
+        },
+    )?;
     for root_id in &closed_roots {
         roots.admit_closed_historical(root_id)?;
         works.admit_closed_historical(root_id);
@@ -5053,10 +5050,23 @@ fn commit_exact_owner_close(
             .owner_close_inventory
             .as_ref()
             .ok_or_else(|| io::Error::other("owner close inventory absent"))?;
-        if owner.source_generation != intent.source_generation
-            || owner.state_cursor.as_ref() != Some(&intent.state_cursor)
-        {
+        let current = owner
+            .state_cursor
+            .as_ref()
+            .ok_or_else(|| io::Error::other("owner close intent cursor changed"))?;
+        if owner.source_generation != intent.source_generation {
             return Err(io::Error::other("owner close intent cursor changed"));
+        }
+        // Siblings keep admitting after this root's intent. The intent cursor
+        // stays the close cursor; only another root's progress may follow it.
+        if *current != intent.state_cursor {
+            sidecar
+                .as_ref()
+                .ok_or_else(|| io::Error::other("owner close retained sidecar absent"))?
+                .require_sibling_close_advance(&expected.root_id, &intent.state_cursor, current)
+                .map_err(|error| {
+                    io::Error::other(format!("owner close intent cursor changed: {error}"))
+                })?;
         }
         let physical = root_drain::physical_close_proof(&inventory)?;
         if physical.successor_ack != successor_ack {

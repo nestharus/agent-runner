@@ -71,6 +71,7 @@ fn main() -> ExitCode {
     #[cfg(target_os = "linux")]
     if let Err(error) = kernel_entry::verify_installed_entry_route() {
         eprintln!("OULIPOLY_KERNEL_ENTRY_GAP={error}");
+        kernel_entry::retain_v30_driver_gap(&error);
         return ExitCode::FAILURE;
     }
     ordinary_entrypoint(production_entrypoint)
@@ -126,6 +127,7 @@ fn production_entrypoint() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("{error}");
+                kernel_entry::retain_v30_driver_gap(&error);
                 ExitCode::FAILURE
             }
         };

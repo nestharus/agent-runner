@@ -89,6 +89,54 @@ pub fn account_entries<'a>(
         .collect()
 }
 
+/// Account the closed entries' State close cursors against the current head.
+/// Each entry contributes at most one cursor, so equal cursors are distinct
+/// roots closed at one unchanged head: the same immutable history row. Equal
+/// ordinals with different content are aliasing or a source swap. Concurrent
+/// roots share the head; progress past the newest covering close is accounted
+/// only when `advances` attributes every step to an `in_flight` entry. A
+/// closed, unknown or unattributed advance stays an unclosed generation.
+/// The serial writer loop sees no close between its read and joins; the
+/// read-only fresh reader may see a later close only as a validated cursor.
+pub fn account_close_cursors(
+    mut closed: Vec<BrokerStateCloseCursor>,
+    current: Option<BrokerStateCloseCursor>,
+    read_only: bool,
+    in_flight: &HashSet<String>,
+    advances: impl FnOnce(&BrokerStateCloseCursor, &BrokerStateCloseCursor) -> io::Result<Vec<String>>,
+) -> io::Result<()> {
+    closed.sort_by_key(|cursor| cursor.authority_ordinal);
+    if closed.windows(2).any(|pair| {
+        (pair[0].authority_ordinal == pair[1].authority_ordinal && pair[0] != pair[1])
+            || pair[0].file != pair[1].file
+            || pair[0].sidecar_generation != pair[1].sidecar_generation
+    }) {
+        return Err(io::Error::other("prior entry close cursor order changed"));
+    }
+    let Some(last) = closed.last() else {
+        return Ok(());
+    };
+    let current = current.ok_or_else(|| io::Error::other("prior entry sidecar absent"))?;
+    if !read_only && last.authority_ordinal > current.authority_ordinal {
+        return Err(io::Error::other("unclosed State continuity generation"));
+    }
+    let base = closed
+        .iter()
+        .rev()
+        .find(|cursor| cursor.authority_ordinal <= current.authority_ordinal)
+        .ok_or_else(|| io::Error::other("unclosed State continuity generation"))?;
+    if *base == current {
+        return Ok(());
+    }
+    let roots = advances(base, &current).map_err(|error| {
+        io::Error::other(format!("unclosed State continuity generation: {error}"))
+    })?;
+    if roots.iter().any(|root_id| !in_flight.contains(root_id)) {
+        return Err(io::Error::other("unclosed State continuity generation"));
+    }
+    Ok(())
+}
+
 /// One closed entry joined in this Broker incarnation.
 #[derive(Clone, Debug)]
 pub struct ClosedEntry<C = BrokerStateCloseCursor> {
@@ -325,6 +373,170 @@ mod tests {
                 .filter(|d| **d != Disposition::Closed)
                 .count(),
             2
+        );
+    }
+
+    fn cursor(ordinal: i64, tag: &str) -> BrokerStateCloseCursor {
+        BrokerStateCloseCursor {
+            file: BoundStateFileIdentity {
+                device: 1,
+                inode: 2,
+            },
+            authority_ordinal: ordinal,
+            admission_id: format!("admission-{ordinal}-{tag}"),
+            sidecar_generation: "g".into(),
+            continuity_digest: format!("{ordinal:064}"),
+        }
+    }
+
+    fn roots(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|id| (*id).to_owned()).collect()
+    }
+
+    fn unattributed(
+        _: &BrokerStateCloseCursor,
+        _: &BrokerStateCloseCursor,
+    ) -> io::Result<Vec<String>> {
+        panic!("no advance expected")
+    }
+
+    #[test]
+    fn distinct_roots_closed_at_one_unchanged_head_are_accounted() {
+        // B2: two roots closed one after another at the same nonzero head.
+        for read_only in [false, true] {
+            account_close_cursors(
+                vec![cursor(7, "a"), cursor(7, "a")],
+                Some(cursor(7, "a")),
+                read_only,
+                &roots(&[]),
+                unattributed,
+            )
+            .unwrap();
+        }
+        // Equal ordinals with different content are aliasing or a swap.
+        let mut swapped = cursor(7, "a");
+        swapped.continuity_digest = "f".repeat(64);
+        for pair in [
+            vec![cursor(7, "a"), cursor(7, "b")],
+            vec![cursor(7, "a"), swapped],
+        ] {
+            assert_eq!(
+                account_close_cursors(pair, Some(cursor(7, "a")), false, &roots(&[]), unattributed)
+                    .unwrap_err()
+                    .to_string(),
+                "prior entry close cursor order changed"
+            );
+        }
+        let mut moved = cursor(8, "a");
+        moved.sidecar_generation = "other".into();
+        assert!(
+            account_close_cursors(
+                vec![cursor(7, "a"), moved],
+                Some(cursor(8, "a")),
+                false,
+                &roots(&[]),
+                unattributed,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn sibling_progress_past_every_closed_cursor_is_accounted_only_for_in_flight_roots() {
+        // B3: A closed at 7; in-flight sibling B advanced the head to 9.
+        let advances = |base: &BrokerStateCloseCursor, current: &BrokerStateCloseCursor| {
+            assert_eq!((base.authority_ordinal, current.authority_ordinal), (7, 9));
+            Ok(vec![B.to_owned(), B.to_owned()])
+        };
+        for read_only in [false, true] {
+            account_close_cursors(
+                vec![cursor(7, "a")],
+                Some(cursor(9, "b")),
+                read_only,
+                &roots(&[B]),
+                advances,
+            )
+            .unwrap();
+        }
+        // The advance belongs to a closed or unknown root: still unclosed.
+        for in_flight in [roots(&[]), roots(&[C])] {
+            assert_eq!(
+                account_close_cursors(
+                    vec![cursor(7, "a")],
+                    Some(cursor(9, "b")),
+                    false,
+                    &in_flight,
+                    advances,
+                )
+                .unwrap_err()
+                .to_string(),
+                "unclosed State continuity generation"
+            );
+        }
+        // An unattributed advance (the attribution read refuses) stays unclosed.
+        let refused = account_close_cursors(
+            vec![cursor(7, "a")],
+            Some(cursor(9, "b")),
+            false,
+            &roots(&[B]),
+            |_, _| Err(io::Error::other("unattributed")),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(refused.starts_with("unclosed State continuity generation"));
+        // The base is the newest close not past the head.
+        let base_seen = std::cell::Cell::new(0);
+        account_close_cursors(
+            vec![cursor(3, "c"), cursor(7, "a"), cursor(5, "x")],
+            Some(cursor(9, "b")),
+            false,
+            &roots(&[B]),
+            |base, _| {
+                base_seen.set(base.authority_ordinal);
+                Ok(vec![B.to_owned()])
+            },
+        )
+        .unwrap();
+        assert_eq!(base_seen.get(), 7);
+    }
+
+    #[test]
+    fn later_closes_are_visible_only_to_the_read_only_reader() {
+        // The writer loop never sees a close after its head read.
+        assert!(
+            account_close_cursors(
+                vec![cursor(7, "a"), cursor(9, "b")],
+                Some(cursor(7, "a")),
+                false,
+                &roots(&[]),
+                unattributed,
+            )
+            .is_err()
+        );
+        account_close_cursors(
+            vec![cursor(7, "a"), cursor(9, "b")],
+            Some(cursor(7, "a")),
+            true,
+            &roots(&[]),
+            unattributed,
+        )
+        .unwrap();
+        // A head with the newest ordinal but other content is not that close.
+        assert!(
+            account_close_cursors(
+                vec![cursor(7, "a")],
+                Some(cursor(7, "z")),
+                false,
+                &roots(&[]),
+                |_, _| Err(io::Error::other("not forward")),
+            )
+            .is_err()
+        );
+        // No closed history: nothing to account against the head.
+        account_close_cursors(Vec::new(), None, false, &roots(&[]), unattributed).unwrap();
+        assert!(
+            account_close_cursors(vec![cursor(7, "a")], None, true, &roots(&[]), unattributed)
+                .is_err()
         );
     }
 

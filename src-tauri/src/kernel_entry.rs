@@ -7959,6 +7959,63 @@ fn retain_v30_guardian_gap(root_id: &str, error: &str) {
 }
 
 fn retain_v30_guardian_gap_in(data_dir: &std::path::Path, root_id: &str, error: &str) {
+    retain_v30_gap_in(
+        data_dir,
+        "kernel-v30-guardian-gaps",
+        "OULIPOLY_KERNEL_V30_GUARDIAN_GAP",
+        root_id,
+        error,
+    );
+}
+
+/// The v30 driver inherits its guardian's sunk stdio, so its refusal is lost
+/// the same way. Retain it only for the exact driver argv with a canonical
+/// root selector, and only while stderr really is the null device: private
+/// fixture and diagnostic callers keep their own visible channels unchanged.
+pub(crate) fn retain_v30_driver_gap(error: &str) {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() != 5
+        || args[1] != crate::completion_owner::V30_DRIVER_ARG
+        || !stderr_is_null_device()
+    {
+        return;
+    }
+    if let Ok(data_dir) = oulipoly_state::paths::data_dir() {
+        retain_v30_driver_gap_in(&data_dir, &args[4], error);
+    }
+}
+
+fn retain_v30_driver_gap_in(data_dir: &std::path::Path, root_id: &str, error: &str) {
+    retain_v30_gap_in(
+        data_dir,
+        "kernel-v30-driver-gaps",
+        "OULIPOLY_KERNEL_V30_DRIVER_GAP",
+        root_id,
+        error,
+    );
+}
+
+fn stderr_is_null_device() -> bool {
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+    let Ok(null) = std::fs::metadata("/dev/null") else {
+        return false;
+    };
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(libc::STDERR_FILENO, &mut stat) } != 0 {
+        return false;
+    }
+    null.file_type().is_char_device()
+        && stat.st_mode & libc::S_IFMT == libc::S_IFCHR
+        && stat.st_rdev == null.rdev()
+}
+
+fn retain_v30_gap_in(
+    data_dir: &std::path::Path,
+    kind: &str,
+    prefix: &str,
+    root_id: &str,
+    error: &str,
+) {
     use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
     const LIMIT: usize = 4096;
     if uuid::Uuid::parse_str(root_id)
@@ -7968,7 +8025,7 @@ fn retain_v30_guardian_gap_in(data_dir: &std::path::Path, root_id: &str, error: 
     {
         return;
     }
-    let directory = data_dir.join("kernel-v30-guardian-gaps");
+    let directory = data_dir.join(kind);
     match std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -7981,10 +8038,7 @@ fn retain_v30_guardian_gap_in(data_dir: &std::path::Path, root_id: &str, error: 
     while !error.is_char_boundary(end) {
         end -= 1;
     }
-    let line = format!(
-        "OULIPOLY_KERNEL_V30_GUARDIAN_GAP={}\n",
-        error[..end].replace(['\n', '\r'], " ")
-    );
+    let line = format!("{prefix}={}\n", error[..end].replace(['\n', '\r'], " "));
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -8607,6 +8661,43 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn v30_driver_gap_is_retained_apart_from_guardian_gaps() {
+        let data = tempfile::tempdir().unwrap();
+        let root = uuid::Uuid::new_v4().to_string();
+        super::retain_v30_driver_gap_in(data.path(), &root, "driver owner refused\nby broker");
+        super::retain_v30_guardian_gap_in(data.path(), &root, "guardian refused");
+        let driver = std::fs::read_to_string(
+            data.path()
+                .join("kernel-v30-driver-gaps")
+                .join(format!("{root}.gap")),
+        )
+        .unwrap();
+        assert_eq!(
+            driver,
+            "OULIPOLY_KERNEL_V30_DRIVER_GAP=driver owner refused by broker\n"
+        );
+        let guardian = std::fs::read_to_string(
+            data.path()
+                .join("kernel-v30-guardian-gaps")
+                .join(format!("{root}.gap")),
+        )
+        .unwrap();
+        assert_eq!(
+            guardian,
+            "OULIPOLY_KERNEL_V30_GUARDIAN_GAP=guardian refused\n"
+        );
+        super::retain_v30_driver_gap_in(data.path(), "v30-unused-legacy-path", "refused");
+        assert_eq!(
+            std::fs::read_dir(data.path().join("kernel-v30-driver-gaps"))
+                .unwrap()
+                .count(),
+            1
+        );
+        // A test process is not the driver argv: nothing is retained.
+        super::retain_v30_driver_gap("not the driver");
     }
 
     use super::*;

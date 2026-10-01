@@ -16,6 +16,8 @@ mod driver;
 #[cfg(all(target_os = "linux", feature = "age319-private-broker-fixture"))]
 pub(crate) const PRIVATE_DRIVER_ARG: &str = driver::DRIVER_ARG;
 #[cfg(target_os = "linux")]
+pub(crate) const V30_DRIVER_ARG: &str = driver::DRIVER_ARG;
+#[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
 mod original_work;
