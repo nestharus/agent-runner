@@ -568,6 +568,9 @@ fi
         .env("AGE319_TEST_FEATURELESS_DROP_F_REPLY_V1", "1")
         .env("AGE319_TEST_FEATURELESS_DROP_ACK_REPLY_V1", "1")
         .env("AGE319_TEST_FEATURELESS_REPLAY_ACK_V1", "1")
+        // The original sends a replayed start and wrong-offer start and
+        // approval; the Broker must refuse each before the handoff proceeds.
+        .env("AGE319_TEST_FEATURELESS_SUCCESSOR_NEGATIVES_V1", "1")
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_PAIR_V1", &manifest)
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_LAUNCHER_V1", &launcher)
         .env("OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1", &socket)

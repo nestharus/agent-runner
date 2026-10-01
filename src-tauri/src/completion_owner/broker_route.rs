@@ -79,16 +79,12 @@ impl V30OwnerRoute {
             return Err("broker recipient selection/repair readback conflict".into());
         }
         #[cfg(feature = "age319-private-broker-fixture")]
-        if let Some(expected) = std::env::var_os("AGE319_PRIVATE_EXPECT_RECIPIENT_SHA_V1") {
-            let selected = selection
-                .candidate
-                .as_ref()
-                .ok_or("private pending recipient selection absent")?;
-            if selected.session_id != "fixture-recipient"
-                || selected.handle != "fixture-completion"
-                || selected.payload_sha256 != expected.to_string_lossy()
-            {
-                return Err("private retained recipient identity changed".into());
+        if std::env::var_os("AGE319_PRIVATE_EXPECT_RECIPIENT_SHA_V1").is_some() {
+            // The retained fixture row predates v30 and is attached to no
+            // root: it is counted against this root's absence, never
+            // selected as this root's recipient.
+            if selection.candidate.is_some() || selection.unattributed_pending != 1 {
+                return Err("private retained recipient attribution changed".into());
             }
         }
         Ok(selection)

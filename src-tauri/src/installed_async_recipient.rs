@@ -112,6 +112,8 @@ pub(crate) fn settle_pending_original(
                 prior_offer,
                 disposable_fixture
                     && std::env::var_os("AGE319_TEST_FEATURELESS_DROP_START_REPLY_V1").is_some(),
+                disposable_fixture
+                    && std::env::var_os("AGE319_TEST_FEATURELESS_SUCCESSOR_NEGATIVES_V1").is_some(),
             );
         }
         "busy"
@@ -241,6 +243,7 @@ fn settle_pending_successor(
     terminal: &FreshRootTerminalReadback,
     prior_offer: Option<&str>,
     drop_start_reply: bool,
+    send_negatives: bool,
 ) -> Result<(), String> {
     let wake_request_id = terminal
         .child_request_id
@@ -336,28 +339,11 @@ fn settle_pending_successor(
     {
         return Err("installed candidate prior admission changed offer".into());
     }
-    if protocol::fresh_recipient_request_at(socket, &start_request).is_ok()
-        || protocol::fresh_recipient_request_at(
-            socket,
-            &FreshRecipientRequest::StartInstalledSuccessor {
-                d_key: d_key.into(),
-                offer_request_id: uuid::Uuid::new_v4().to_string(),
-            },
-        )
-        .is_ok()
-    {
-        return Err("installed successor start replay or wrong offer accepted".into());
-    }
-    if protocol::fresh_recipient_request_at(
-        socket,
-        &FreshRecipientRequest::AdmitSuccessor {
-            d_key: d_key.into(),
-            offer_request_id: uuid::Uuid::new_v4().to_string(),
-        },
-    )
-    .is_ok()
-    {
-        return Err("installed successor wrong approval accepted".into());
+    // The Broker refuses a replayed start and a wrong-offer start or approval
+    // whatever this client sends. That refusal is tested against the real
+    // Broker from a disposable fixture, not re-proved on every handoff.
+    if send_negatives {
+        require_successor_negatives_refused(socket, d_key, &start_request)?;
     }
     let deadline = Instant::now() + Duration::from_secs(60);
     let offer = loop {
@@ -423,6 +409,40 @@ fn settle_pending_successor(
         }
         std::thread::sleep(Duration::from_millis(30));
     }
+}
+
+/// Disposable fixture only: this exact original sends a replayed start, a
+/// start for a wrong offer and an approval of a wrong offer. Any acceptance
+/// is a failure of the handoff.
+fn require_successor_negatives_refused(
+    socket: &Path,
+    d_key: &str,
+    start_request: &FreshRecipientRequest,
+) -> Result<(), String> {
+    if protocol::fresh_recipient_request_at(socket, start_request).is_ok()
+        || protocol::fresh_recipient_request_at(
+            socket,
+            &FreshRecipientRequest::StartInstalledSuccessor {
+                d_key: d_key.into(),
+                offer_request_id: uuid::Uuid::new_v4().to_string(),
+            },
+        )
+        .is_ok()
+    {
+        return Err("installed successor start replay or wrong offer accepted".into());
+    }
+    if protocol::fresh_recipient_request_at(
+        socket,
+        &FreshRecipientRequest::AdmitSuccessor {
+            d_key: d_key.into(),
+            offer_request_id: uuid::Uuid::new_v4().to_string(),
+        },
+    )
+    .is_ok()
+    {
+        return Err("installed successor wrong approval accepted".into());
+    }
+    Ok(())
 }
 
 fn recover_delivery(

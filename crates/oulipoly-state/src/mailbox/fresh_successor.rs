@@ -809,8 +809,19 @@ impl FreshV30Lane {
         request_id: &str,
         original: &FreshRecipientIdentity,
     ) -> Result<(String, FreshSuccessorOffer), String> {
+        self.find_successor_offer_for_root(request_id, original)?
+            .ok_or_else(|| "successor offer absent for original root".into())
+    }
+
+    /// `None` only when this original has no offer row under this ID yet;
+    /// a row that exists must read back exactly or this fails.
+    pub fn find_successor_offer_for_root(
+        &self,
+        request_id: &str,
+        original: &FreshRecipientIdentity,
+    ) -> Result<Option<(String, FreshSuccessorOffer)>, String> {
         validate_request_id(request_id)?;
-        let successor_json: String = self
+        let Some(successor_json): Option<String> = self
             .sidecar
             .mailbox()
             .conn
@@ -822,14 +833,16 @@ impl FreshV30Lane {
             )
             .optional()
             .map_err(|e| e.to_string())?
-            .ok_or("successor offer absent for original root")?;
+        else {
+            return Ok(None);
+        };
         let successor: FreshRecipientIdentity =
             serde_json::from_str(&successor_json).map_err(|e| e.to_string())?;
         let offer = self
             .read_successor_offer(request_id, &successor)?
             .ok_or("successor offer readback absent")?;
         let session = self.read_session_for_successor(&offer)?;
-        Ok((session.request_id, offer))
+        Ok(Some((session.request_id, offer)))
     }
 
     fn require_pending_successor_row(
@@ -1179,5 +1192,113 @@ impl FreshV30Lane {
             }
             _ => Err("successor admission cross-store transition incomplete; original root retry required".into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod successor_offer_lookup_tests {
+    use super::*;
+
+    const TEST: &str = "mailbox::fresh_lane::successor_offer_lookup_tests::\
+                        matching_offer_rows_are_read_exactly_or_refused";
+
+    fn identity(host_pid: i32) -> FreshRecipientIdentity {
+        FreshRecipientIdentity {
+            host_pid,
+            boot_id: "boot".into(),
+            starttime_ticks: 7,
+            pidns_dev: 1,
+            pidns_ino: 2,
+        }
+    }
+
+    fn offer_row(lane: &FreshV30Lane, request_id: &str, original: &str, successor: &str) {
+        let conn = &lane.sidecar.mailbox().conn;
+        let seq: i64 = conn
+            .query_row("SELECT count(*)+1 FROM fresh_successor_offer", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute(
+            "INSERT INTO fresh_successor_offer VALUES(?1,?2,'session',?3,'source','attempt',
+             'lane','generation','root','owner',?4,?5,'sha',1,'now')",
+            params![
+                request_id,
+                Uuid::new_v4().to_string(),
+                seq,
+                original,
+                successor
+            ],
+        )
+        .unwrap();
+    }
+
+    /// What the Broker's installed offer poll reads: `None` only when no row
+    /// exists for this original under this ID; a matching row that does not
+    /// read back exactly is refused, never answered as "not offered yet".
+    #[test]
+    fn matching_offer_rows_are_read_exactly_or_refused() {
+        if unsafe { libc::geteuid() } != 0 {
+            let status = std::process::Command::new("unshare")
+                .arg("-Urm")
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .status()
+                .expect("root-mapped user namespace required");
+            assert!(status.success(), "root-mapped offer lookup test failed");
+            return;
+        }
+        let private = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(private.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let bound = std::process::Command::new("mount")
+            .arg("--bind")
+            .arg(private.path())
+            .arg("/mnt")
+            .status()
+            .unwrap();
+        assert!(bound.success(), "private bind over /mnt failed");
+        let root = Path::new("/mnt").join("broker-state");
+        EmptyV30BootstrapIdentity::bootstrap_at(&root).unwrap();
+        let lane = FreshV30Lane::open_at(&root).unwrap();
+        let original = identity(10);
+        let original_json = FreshV30Lane::recipient_identity_json(&original).unwrap();
+        let successor_json = FreshV30Lane::recipient_identity_json(&identity(11)).unwrap();
+
+        // Not offered yet.
+        let absent = Uuid::new_v4().to_string();
+        assert_eq!(
+            lane.find_successor_offer_for_root(&absent, &original),
+            Ok(None)
+        );
+
+        // A matching row whose successor identity is corrupt.
+        let corrupt = Uuid::new_v4().to_string();
+        offer_row(&lane, &corrupt, &original_json, "{not json");
+        assert!(
+            lane.find_successor_offer_for_root(&corrupt, &original)
+                .is_err()
+        );
+
+        // A matching row naming a session that does not exist.
+        let orphan = Uuid::new_v4().to_string();
+        offer_row(&lane, &orphan, &original_json, &successor_json);
+        let error = lane
+            .find_successor_offer_for_root(&orphan, &original)
+            .unwrap_err();
+        assert!(error.contains("successor fresh session absent"), "{error}");
+
+        // Accepted scope: a row under this ID filed for another original is
+        // outside this original's lookup and reads as not offered.
+        let foreign = Uuid::new_v4().to_string();
+        offer_row(
+            &lane,
+            &foreign,
+            &FreshV30Lane::recipient_identity_json(&identity(12)).unwrap(),
+            &successor_json,
+        );
+        assert_eq!(
+            lane.find_successor_offer_for_root(&foreign, &original),
+            Ok(None)
+        );
     }
 }

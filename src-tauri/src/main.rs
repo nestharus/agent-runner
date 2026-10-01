@@ -128,7 +128,7 @@ fn production_entrypoint() -> ExitCode {
             Err(error) => {
                 eprintln!("{error}");
                 kernel_entry::retain_v30_driver_gap(&error);
-                ExitCode::FAILURE
+                completion_owner::custodian_failure_exit(&error)
             }
         };
     }

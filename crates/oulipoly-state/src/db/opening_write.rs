@@ -186,11 +186,26 @@ impl From<String> for WritableOpenError {
 }
 
 impl StateDb {
+    /// The file checks the broker repair open makes before it opens State
+    /// (present, readable, existing WAL/SHM readable), and the resolved path
+    /// it opens. A held connection re-runs exactly these on each reuse.
+    pub(crate) fn broker_repair_open_path(path: &Path) -> Result<std::path::PathBuf, String> {
+        Self::validate_read_only_paths(path).map_err(|e| format!("{e:?}"))
+    }
+
+    /// The WAL and SHM sidecars SQLite keeps beside `path`.
+    pub(crate) fn sqlite_sidecar_paths(path: &Path) -> [std::path::PathBuf; 2] {
+        [
+            super::opening_read_only::wal_path(path),
+            super::opening_read_only::shm_path(path),
+        ]
+    }
+
     /// Broker v30 reads the live admitted suffix through the original State
     /// file. Avoid the historical snapshot (a full database copy) and avoid a
     /// writable open's migration/backfill path on every bounded repair page.
     pub(crate) fn open_broker_repair_read_only(path: &Path) -> Result<Self, String> {
-        let source = Self::validate_read_only_paths(path).map_err(|e| format!("{e:?}"))?;
+        let source = Self::broker_repair_open_path(path)?;
         let conn =
             sqlite::Connection::open_with_flags(&source, sqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
                 .map_err(|e| e.to_string())?;

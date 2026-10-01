@@ -14998,11 +14998,13 @@ fn inner() {
             } else {
                 let entry_error = fs::read_to_string(&err).unwrap_or_default();
                 let expected_stop = if recipient_mode {
+                    // The retained row is attached to no root, so this
+                    // root's recipient absence is not established.
                     Some(
-                        "v30 recipient effect closed: no broker-authenticated live recipient or exact wake successor, durable one-use work grant, or pinned provider K/physical child tree",
+                        "v30 recipient absence not established: 1 pending row(s) attributable to no root",
                     )
                 } else if mode == "normal_empty" {
-                    Some("v30 no pending broker recipient; wake effect refused")
+                    Some("v30 repair boundary: no pending broker recipient; nothing to repair")
                 } else if real_source && mode != "normal_bash_source_lost_reply" {
                     Some("v30 source physically launched; v2 acceptance remains closed")
                 } else if real_source {

@@ -88,10 +88,7 @@ impl FreshV30Lane {
         root: &str,
         owner: &str,
     ) -> Result<(), String> {
-        let state = self.sidecar.bound_state()?;
-        let connection =
-            Connection::open_with_flags(state.path(), OpenFlags::SQLITE_OPEN_READ_ONLY)
-                .map_err(|e| e.to_string())?;
+        let connection = self.state_connection(OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let attached: bool = connection
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM fresh_lane_recipient_attachment
@@ -152,10 +149,7 @@ impl FreshV30Lane {
             .map_err(|e| e.to_string())?;
         let (source_id, attempt_id, admission_id, digest) =
             source.ok_or("fresh row lacks exact admitted source/attempt provenance")?;
-        let state = self.sidecar.bound_state()?;
-        let connection =
-            Connection::open_with_flags(state.path(), OpenFlags::SQLITE_OPEN_READ_ONLY)
-                .map_err(|e| e.to_string())?;
+        let connection = self.state_connection(OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let accepted: bool = connection
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM fresh_lane_accepted_source

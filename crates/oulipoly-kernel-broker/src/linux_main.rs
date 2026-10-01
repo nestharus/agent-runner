@@ -5307,9 +5307,140 @@ fn commit_exact_owner_close(
     Ok(proof)
 }
 
-/// One durable transition per timed serving pass. The normal K/Q and caller receipt
-/// select the route; each later transition rereads the same exact root. No
-/// process is signaled: only the pinned PID1 reads its own request file.
+/// Retained roots awaiting owner-close progress, in revisit order. A visited
+/// root is requeued behind every root already waiting, and roots retained
+/// later join behind them, so a root waits at most for the roots queued
+/// ahead of it, however many arrive afterwards. Completed roots leave.
+#[derive(Default)]
+struct OwnerCloseQueue {
+    order: std::collections::VecDeque<String>,
+    queued: HashSet<String>,
+}
+
+impl OwnerCloseQueue {
+    fn admit_retained<'a>(
+        &mut self,
+        root_ids: impl IntoIterator<Item = &'a str>,
+        completed: &HashSet<String>,
+    ) {
+        for root_id in root_ids {
+            if !self.queued.contains(root_id) && !completed.contains(root_id) {
+                self.requeue(root_id.to_owned());
+            }
+        }
+    }
+
+    fn requeue(&mut self, root_id: String) {
+        if self.queued.insert(root_id.clone()) {
+            self.order.push_back(root_id);
+        }
+    }
+
+    fn next(&mut self) -> Option<String> {
+        let root_id = self.order.pop_front()?;
+        self.queued.remove(&root_id);
+        Some(root_id)
+    }
+
+    fn len(&self) -> usize {
+        self.order.len()
+    }
+}
+
+/// Wall time after which an owner-close pass yields Main to bridges and
+/// control; the roots not reached keep their place in the queue.
+const OWNER_CLOSE_PASS_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// One timed serving pass: each queued root, in revisit order, is examined
+/// once and makes at most one durable transition. The normal K/Q and caller
+/// receipt select the route; each later transition rereads the same exact
+/// root. No process is signaled: only the pinned PID1 reads its own request
+/// file.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "normal progression joins all retained authorities"
+)]
+fn advance_normal_owners(
+    state_root: &Path,
+    registry: &mut RootRegistry,
+    entries: &EntryRegistry,
+    works: &WorkRegistry,
+    grants: &GrantRegistry,
+    sources: &SourcePhysicalRegistry,
+    sidecar: &mut Option<BrokerSidecar>,
+    admission_fences: &AdmissionFences,
+    completed: &mut HashSet<String>,
+    queue: &mut OwnerCloseQueue,
+    scan: &mut phase_record::AdvanceScan,
+) -> io::Result<()> {
+    if entries.records().is_empty() || sidecar.is_none() || !state_root.join("v30").exists() {
+        return Ok(());
+    }
+    let pending = run_owner_close_pass(
+        queue,
+        entries.records().iter().map(|entry| entry.root_id.as_str()),
+        completed,
+        OWNER_CLOSE_PASS_BUDGET,
+        |root_id| {
+            let Some(entry) = entries.record(root_id) else {
+                return Ok(false);
+            };
+            advance_one_normal_owner(
+                state_root,
+                registry,
+                entries,
+                works,
+                grants,
+                sources,
+                sidecar,
+                admission_fences,
+                entry,
+                scan,
+            )
+        },
+    );
+    scan.pending = pending.0;
+    pending.1
+}
+
+/// Admits newly retained roots behind those already waiting, then visits
+/// queued roots in order, each at most once, until all were visited or the
+/// budget is spent (at least one is always visited). A completed root
+/// leaves; any other is requeued at the back. An error stops the pass.
+/// Returns the number pending at the start of the pass.
+fn run_owner_close_pass<'a>(
+    queue: &mut OwnerCloseQueue,
+    retained: impl IntoIterator<Item = &'a str>,
+    completed: &mut HashSet<String>,
+    budget: std::time::Duration,
+    mut visit: impl FnMut(&str) -> io::Result<bool>,
+) -> (u64, io::Result<()>) {
+    queue.admit_retained(retained, completed);
+    let pending = queue.len() as u64;
+    let deadline = Instant::now() + budget;
+    for _ in 0..queue.len() {
+        let Some(root_id) = queue.next() else {
+            break;
+        };
+        match visit(&root_id) {
+            Ok(true) => {
+                completed.insert(root_id);
+            }
+            Ok(false) => queue.requeue(root_id),
+            Err(error) => {
+                queue.requeue(root_id);
+                return (pending, Err(error));
+            }
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+    }
+    (pending, Ok(()))
+}
+
+/// One examination of one retained root; `true` once its exact close proof
+/// is durable.
 #[expect(
     clippy::too_many_arguments,
     reason = "normal progression joins all retained authorities"
@@ -5323,176 +5454,140 @@ fn advance_one_normal_owner(
     sources: &SourcePhysicalRegistry,
     sidecar: &mut Option<BrokerSidecar>,
     admission_fences: &AdmissionFences,
-    completed: &mut HashSet<String>,
-    cursor: &mut usize,
+    entry: &oulipoly_kernel_broker::entry_registry::EntryRecord,
     scan: &mut phase_record::AdvanceScan,
-) -> io::Result<()> {
-    if entries.records().is_empty() || sidecar.is_none() || !state_root.join("v30").exists() {
-        return Ok(());
+) -> io::Result<bool> {
+    // Both normal and offline close require the original to have exited.
+    // This is a deferral only: disappearance cannot authorize settlement.
+    // Recheck all State/physical authorities below when it can progress.
+    let Some(actor) = entry.joined_child.as_ref() else {
+        return Ok(false);
+    };
+    if !observed_incarnation_gone(
+        actor.host_pid,
+        &actor.boot_id,
+        actor.starttime_ticks,
+        (actor.pidns_dev, actor.pidns_ino),
+    )
+    .unwrap_or(false)
+    {
+        return Ok(false);
     }
-    // Count retained candidates without walking them. Completion is only
-    // inserted after an exact close proof, and entries are never removed.
-    scan.pending = entries.records().len().saturating_sub(completed.len()) as u64;
-    let index = *cursor % entries.records().len();
-    *cursor = index.wrapping_add(1);
-    for entry in &entries.records()[index..=index] {
-        if completed.contains(&entry.root_id) {
-            continue;
-        }
-        // Both normal and offline close require the original to have exited.
-        // This is a deferral only: disappearance cannot authorize settlement.
-        // Recheck all State/physical authorities below when it can progress.
-        let Some(actor) = entry.joined_child.as_ref() else {
-            continue;
-        };
-        if !observed_incarnation_gone(
-            actor.host_pid,
-            &actor.boot_id,
-            actor.starttime_ticks,
-            (actor.pidns_dev, actor.pidns_ino),
-        )
-        .unwrap_or(false)
-        {
-            continue;
-        }
-        let lane = FreshV30Lane::open_at(state_root).map_err(io::Error::other)?;
-        // An entry may be prepared before its root record is published. It
-        // carries no normal K or close authority until that exact root exists.
-        let Some(root) = registry.record(&entry.root_id).cloned() else {
-            continue;
-        };
-        let Ok((released, actor)) = lane.released_handoff_for_root(&root.root_id) else {
-            continue;
-        };
-        let offline = matches!(
-            &released.root_work_intent,
-            oulipoly_state::mailbox::FreshRootWorkIntent::CliHelp(_)
-                | oulipoly_state::mailbox::FreshRootWorkIntent::CliDiagnostics(_)
-        );
-        // The normal fence already requires caller settlement. Do not rebuild
-        // the full inventory while that necessary condition is absent. An
-        // explicit fence and the offline route retain their existing checks.
-        if !offline
-            && entry.terminal_settlement.is_none()
-            && !registry.admission_fenced(&root.root_id)
-        {
-            continue;
-        }
-        // U can be visible while D is still publishing. The normal route
-        // cannot advance from an empty K; offline has its own State return.
-        if !offline
-            && !lane
-                .normal_provider_k_recorded(&released.handoff_id)
-                .map_err(io::Error::other)?
-        {
-            continue;
-        }
-        let Some(session) = lane
-            .read_session(&released.d_key)
+    let lane = FreshV30Lane::open_at(state_root).map_err(io::Error::other)?;
+    // An entry may be prepared before its root record is published. It
+    // carries no normal K or close authority until that exact root exists.
+    let Some(root) = registry.record(&entry.root_id).cloned() else {
+        return Ok(false);
+    };
+    let Ok((released, actor)) = lane.released_handoff_for_root(&root.root_id) else {
+        return Ok(false);
+    };
+    let offline = matches!(
+        &released.root_work_intent,
+        oulipoly_state::mailbox::FreshRootWorkIntent::CliHelp(_)
+            | oulipoly_state::mailbox::FreshRootWorkIntent::CliDiagnostics(_)
+    );
+    // The normal fence already requires caller settlement. Do not rebuild
+    // the full inventory while that necessary condition is absent. An
+    // explicit fence and the offline route retain their existing checks.
+    if !offline && entry.terminal_settlement.is_none() && !registry.admission_fenced(&root.root_id)
+    {
+        return Ok(false);
+    }
+    // U can be visible while D is still publishing. The normal route
+    // cannot advance from an empty K; offline has its own State return.
+    if !offline
+        && !lane
+            .normal_provider_k_recorded(&released.handoff_id)
             .map_err(io::Error::other)?
-        else {
-            continue;
-        };
-        if !offline
-            && !lane
-                .normal_provider_k_present(&released, &actor, &session)
-                .map_err(io::Error::other)?
-        {
-            continue;
-        }
-        scan.readback += 1;
-        let inventory = root_drain::readback(
-            &root,
-            registry,
-            entries,
-            works,
-            grants,
-            sources,
-            sidecar.as_ref(),
-        )?;
-        if (offline && inventory.offline.is_none())
-            || (!offline && inventory.normal.is_none())
-            || inventory.normal_uncertain
-            || inventory.offline_uncertain
-        {
-            continue;
-        }
-        let expected_owner = &released.old_release.prepared.owner_generation;
-        if root_drain::exact_successor_ack_for_root(&lane, &root.root_id).is_err() {
-            continue;
-        }
-        if root_drain::exact_original_receipt_for_root(&lane, &root.root_id).is_err() {
-            continue;
-        }
-        if let Some(proof) = &inventory.owner_close_proof {
-            if &proof.owner_generation != expected_owner {
-                return Err(io::Error::other("normal closed owner generation changed"));
-            }
-            completed.insert(entry.root_id.clone());
-            scan.acted = true;
-            continue;
-        }
-        if inventory
-            .owner_close_inventory
-            .as_ref()
-            .is_none_or(|owner| &owner.owner_generation != expected_owner)
-        {
-            continue;
-        }
-        if !inventory.fenced {
-            let ready = if offline {
-                root_drain::ready_for_offline_admission_fence(&inventory)
-            } else {
-                root_drain::ready_for_normal_admission_fence(&inventory)
-            };
-            if ready.is_err() {
-                continue;
-            }
-            scan.acted = true;
-            let mut fences = lock_fences(admission_fences)
-                .map_err(|_| io::Error::other("root admission fence poisoned"))?;
-            let persisted = registry.fence_admission(&root);
-            // Match the host-root fence operation: a partial write also stops
-            // fresh admission in this incarnation.
-            fences.insert(root.root_id.clone());
-            persisted?;
-            return Ok(());
-        }
-        if !inventory.pid1_echild_receipt {
-            if root_drain::ready_for_pid1_request(&inventory).is_ok() {
-                scan.acted = true;
-                root_pid1::publish_request(&registry.pid1_directory(), &root)?;
-            }
-            continue;
-        }
-        if !inventory.owner_close_preflight {
-            continue;
+    {
+        return Ok(false);
+    }
+    let Some(session) = lane
+        .read_session(&released.d_key)
+        .map_err(io::Error::other)?
+    else {
+        return Ok(false);
+    };
+    if !offline
+        && !lane
+            .normal_provider_k_present(&released, &actor, &session)
+            .map_err(io::Error::other)?
+    {
+        return Ok(false);
+    }
+    scan.readback += 1;
+    let inventory = root_drain::readback(
+        &root,
+        registry,
+        entries,
+        works,
+        grants,
+        sources,
+        sidecar.as_ref(),
+    )?;
+    if (offline && inventory.offline.is_none())
+        || (!offline && inventory.normal.is_none())
+        || inventory.normal_uncertain
+        || inventory.offline_uncertain
+    {
+        return Ok(false);
+    }
+    let expected_owner = &released.old_release.prepared.owner_generation;
+    if root_drain::exact_successor_ack_for_root(&lane, &root.root_id).is_err() {
+        return Ok(false);
+    }
+    if root_drain::exact_original_receipt_for_root(&lane, &root.root_id).is_err() {
+        return Ok(false);
+    }
+    if let Some(proof) = &inventory.owner_close_proof {
+        if &proof.owner_generation != expected_owner {
+            return Err(io::Error::other("normal closed owner generation changed"));
         }
         scan.acted = true;
-        let _guard = lock_fences(admission_fences)
+        return Ok(true);
+    }
+    if inventory
+        .owner_close_inventory
+        .as_ref()
+        .is_none_or(|owner| &owner.owner_generation != expected_owner)
+    {
+        return Ok(false);
+    }
+    if !inventory.fenced {
+        let ready = if offline {
+            root_drain::ready_for_offline_admission_fence(&inventory)
+        } else {
+            root_drain::ready_for_normal_admission_fence(&inventory)
+        };
+        if ready.is_err() {
+            return Ok(false);
+        }
+        scan.acted = true;
+        let mut fences = lock_fences(admission_fences)
             .map_err(|_| io::Error::other("root admission fence poisoned"))?;
-        if inventory.owner_close_intent.is_none() {
-            issue_exact_owner_close_intent(
-                &root,
-                expected_owner,
-                registry,
-                entries,
-                works,
-                grants,
-                sources,
-                sidecar.as_ref(),
-            )?;
-            return Ok(());
+        let persisted = registry.fence_admission(&root);
+        // Match the host-root fence operation: a partial write also stops
+        // fresh admission in this incarnation.
+        fences.insert(root.root_id.clone());
+        persisted?;
+        return Ok(false);
+    }
+    if !inventory.pid1_echild_receipt {
+        if root_drain::ready_for_pid1_request(&inventory).is_ok() {
+            scan.acted = true;
+            root_pid1::publish_request(&registry.pid1_directory(), &root)?;
         }
-        #[cfg(feature = "age319-private-broker-fixture")]
-        if std::env::var("AGE319_TEST_AUTO_RESTART_PHASE_V1").as_deref() == Ok("intent")
-            && std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
-                .is_some_and(|dir| !Path::new(&dir).join("auto-intent-resume").exists())
-        {
-            return Ok(());
-        }
-        commit_exact_owner_close(
-            state_root,
+        return Ok(false);
+    }
+    if !inventory.owner_close_preflight {
+        return Ok(false);
+    }
+    scan.acted = true;
+    let _guard = lock_fences(admission_fences)
+        .map_err(|_| io::Error::other("root admission fence poisoned"))?;
+    if inventory.owner_close_intent.is_none() {
+        issue_exact_owner_close_intent(
             &root,
             expected_owner,
             registry,
@@ -5500,13 +5595,30 @@ fn advance_one_normal_owner(
             works,
             grants,
             sources,
-            sidecar,
-            true,
+            sidecar.as_ref(),
         )?;
-        completed.insert(root.root_id);
-        return Ok(());
+        return Ok(false);
     }
-    Ok(())
+    #[cfg(feature = "age319-private-broker-fixture")]
+    if std::env::var("AGE319_TEST_AUTO_RESTART_PHASE_V1").as_deref() == Ok("intent")
+        && std::env::var_os("OULIPOLY_KERNEL_BROKER_FIXTURE_GATE_DIR_V1")
+            .is_some_and(|dir| !Path::new(&dir).join("auto-intent-resume").exists())
+    {
+        return Ok(false);
+    }
+    commit_exact_owner_close(
+        state_root,
+        &root,
+        expected_owner,
+        registry,
+        entries,
+        works,
+        grants,
+        sources,
+        sidecar,
+        true,
+    )?;
+    Ok(true)
 }
 
 /// Revisit one retained original source per idle tick. Only the serving
@@ -6290,7 +6402,7 @@ fn serve() -> io::Result<()> {
             })?;
     }
     let mut completed_auto_normal = HashSet::<String>::new();
-    let mut auto_normal_cursor = 0;
+    let mut owner_close_queue = OwnerCloseQueue::default();
     let mut last_auto_normal = Instant::now() - NORMAL_CLOSE_POLL_INTERVAL;
     if let Err(error) = phase_record::init(Path::new(&state)) {
         eprintln!("phase records unavailable: {error}");
@@ -6389,7 +6501,7 @@ fn serve() -> io::Result<()> {
             window.advance_n += 1;
             let advance_cpu = phase_record::thread_cpu_ns();
             let mut scan = phase_record::AdvanceScan::default();
-            if let Err(error) = advance_one_normal_owner(
+            if let Err(error) = advance_normal_owners(
                 Path::new(&state),
                 &mut registry,
                 &entries,
@@ -6399,7 +6511,7 @@ fn serve() -> io::Result<()> {
                 &mut broker_sidecar,
                 &admission_fences,
                 &mut completed_auto_normal,
-                &mut auto_normal_cursor,
+                &mut owner_close_queue,
                 &mut scan,
             ) {
                 eprintln!("normal owner close progression blocked: {error}");
@@ -11338,36 +11450,51 @@ fn fresh_v30_worker(
                             let root = lane
                                 .released_handoff_for_child(&d_key, &recipient)
                                 .map_err(io::Error::other)?;
-                            let (offered_d, offer) = lane
-                                .read_successor_offer_for_root(&offer_request_id, &recipient)
-                                .map_err(io::Error::other)?;
-                            let ledger = successor_ledger
-                                .as_ref()
-                                .ok_or_else(|| io::Error::other("successor ledger absent"))?;
-                            let start = ledger
-                                .read_start(&offer_request_id)?
-                                .ok_or_else(|| io::Error::other("successor start absent"))?;
-                            let candidate = ledger
-                                .read_candidate(&offer_request_id)?
-                                .ok_or_else(|| io::Error::other("successor candidate absent"))?;
-                            if offered_d != d_key
-                                || start.d_key != d_key
-                                || offer.root_id != root.old_release.prepared.root_id
-                                || start.decision.obligation.root_id != offer.root_id
-                                || start.decision.obligation.original_identity != recipient
-                                || start.owner_uid != peer.uid
-                                || candidate.process.host_pid != offer.successor_identity.host_pid
-                                || candidate.process.boot_id != offer.successor_identity.boot_id
-                                || candidate.process.starttime_ticks
-                                    != offer.successor_identity.starttime_ticks
-                                || candidate.process.pidns_dev != offer.successor_identity.pidns_dev
-                                || candidate.process.pidns_ino != offer.successor_identity.pidns_ino
+                            // Not offered yet is an ordinary poll answer, not a
+                            // refusal; an existing offer must match exactly.
+                            match lane
+                                .find_successor_offer_for_root(&offer_request_id, &recipient)
+                                .map_err(io::Error::other)?
                             {
-                                return Err(io::Error::other(
-                                    "installed successor offer/start/root changed",
-                                ));
+                                None => {
+                                    serde_json::json!({"kind":"installed_successor_offer_readback", "offer":null})
+                                }
+                                Some((offered_d, offer)) => {
+                                    let ledger = successor_ledger.as_ref().ok_or_else(|| {
+                                        io::Error::other("successor ledger absent")
+                                    })?;
+                                    let start =
+                                        ledger.read_start(&offer_request_id)?.ok_or_else(|| {
+                                            io::Error::other("successor start absent")
+                                        })?;
+                                    let candidate =
+                                        ledger.read_candidate(&offer_request_id)?.ok_or_else(
+                                            || io::Error::other("successor candidate absent"),
+                                        )?;
+                                    if offered_d != d_key
+                                        || start.d_key != d_key
+                                        || offer.root_id != root.old_release.prepared.root_id
+                                        || start.decision.obligation.root_id != offer.root_id
+                                        || start.decision.obligation.original_identity != recipient
+                                        || start.owner_uid != peer.uid
+                                        || candidate.process.host_pid
+                                            != offer.successor_identity.host_pid
+                                        || candidate.process.boot_id
+                                            != offer.successor_identity.boot_id
+                                        || candidate.process.starttime_ticks
+                                            != offer.successor_identity.starttime_ticks
+                                        || candidate.process.pidns_dev
+                                            != offer.successor_identity.pidns_dev
+                                        || candidate.process.pidns_ino
+                                            != offer.successor_identity.pidns_ino
+                                    {
+                                        return Err(io::Error::other(
+                                            "installed successor offer/start/root changed",
+                                        ));
+                                    }
+                                    serde_json::json!({"kind":"installed_successor_offer_readback", "offer":offer})
+                                }
                             }
-                            serde_json::json!({"kind":"installed_successor_offer_readback", "offer":offer})
                         }
                         FreshRecipientRequest::AdmitSuccessor {
                             d_key,
