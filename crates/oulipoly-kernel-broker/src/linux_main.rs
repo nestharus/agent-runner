@@ -6755,6 +6755,7 @@ fn serve() -> io::Result<()> {
                     Ok("entry-gate-v1 legacy-open\n".into())
                 }
             } else if operation == b'J' || operation == b'j' {
+                phase_record::stage("j:admission");
                 if !root_launch_admitted(
                     &peer,
                     &classify_scope(&peer, &host_namespace, &registry, &works),
@@ -6765,10 +6766,12 @@ fn serve() -> io::Result<()> {
                 let RequestPayload::Join { spec, descriptors } = payload else {
                     return Err(io::Error::other("invalid root join payload"));
                 };
+                phase_record::stage("j:fenced");
                 if registry.admission_fenced(&spec.root_id) {
                     return Err(io::Error::other("exact root admission fenced"));
                 }
                 if operation == b'j' {
+                    phase_record::stage("j:duplicate");
                     if held_joins.contains_key(&spec.root_id) {
                         return Err(io::Error::other("root join gate already held"));
                     }
@@ -6781,6 +6784,7 @@ fn serve() -> io::Result<()> {
                         &mut entries,
                         true,
                     )?;
+                    phase_record::stage("j:actors");
                     let actors = held.actors()?;
                     let root_id = held.root_id().to_owned();
                     held_joins.insert(root_id.clone(), held);

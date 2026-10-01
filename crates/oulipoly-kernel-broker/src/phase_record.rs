@@ -185,12 +185,16 @@ pub struct SubPhases {
     pub cpu_ns: u64,
     pub vcsw: u64,
     pub ivcsw: u64,
+    /// Last stage label reached (see [`stage`]).
+    pub stage: &'static str,
 }
 
 thread_local! {
     static SUBS: RefCell<SubPhases> = RefCell::new(SubPhases::default());
     /// CPU time and context switches when this thread's request began.
     static BEGUN: Cell<(u64, u64, u64)> = const { Cell::new((0, 0, 0)) };
+    /// The last controlled stage label a request reached on this thread.
+    static STAGE: Cell<&'static str> = const { Cell::new("") };
     static CHALLENGE: Cell<u64> = const { Cell::new(0) };
     static RECEIVED: Cell<(u64, u64, u32)> = const { Cell::new((0, 0, 0)) };
 }
@@ -223,6 +227,13 @@ pub fn add(kind: Sub, ns: u64) {
 
 fn hist_so_far() -> u64 {
     SUBS.with(|subs| subs.borrow().hist_ns)
+}
+
+/// Marks the stage a request has reached. Labels are fixed strings in the
+/// code, never request content; a failed request's record keeps the last one,
+/// which locates the refusal without its error text.
+pub fn stage(label: &'static str) {
+    STAGE.with(|stage| stage.set(label));
 }
 
 pub fn add_accounted_entries(count: usize) {
@@ -271,6 +282,7 @@ pub fn timed<T>(kind: Sub, work: impl FnOnce() -> T) -> T {
 pub fn begin_request() {
     SUBS.with(|subs| *subs.borrow_mut() = SubPhases::default());
     let _ = oulipoly_state::sqlite_wait::take_thread_wait_ns();
+    STAGE.with(|stage| stage.set(""));
     let (voluntary, involuntary) = thread_switches();
     BEGUN.with(|begun| begun.set((thread_cpu_ns(), voluntary, involuntary)));
 }
@@ -278,6 +290,7 @@ pub fn begin_request() {
 pub fn take_sub() -> SubPhases {
     let mut subs = SUBS.with(|subs| std::mem::take(&mut *subs.borrow_mut()));
     subs.sqlite_busy_ns = oulipoly_state::sqlite_wait::take_thread_wait_ns();
+    subs.stage = STAGE.with(|stage| stage.replace(""));
     let (cpu, voluntary, involuntary) = BEGUN.with(|begun| begun.replace((0, 0, 0)));
     if cpu > 0 {
         let (now_voluntary, now_involuntary) = thread_switches();
@@ -424,7 +437,7 @@ impl Request {
         }
         let s = &self.sub;
         emit(format!(
-            "{{\"k\":\"req\",\"lane\":\"{}\",\"seq\":{},\"op\":{},\"acc\":{},\"chl\":{},\"rcv\":{},\"rb\":{},\"fds\":{},\"pid\":{},\"st\":{},\"uid\":{},\"img\":\"{}\",\"rt\":{},\"hs\":{},\"he\":{},\"rw\":{},\"wb\":{},\"ok\":{},\"parent\":{},\"parent_n\":{},\"acct\":{},\"acct_entries\":{},\"fence\":{},\"fence_n\":{},\"bridge\":{},\"bridge_n\":{},\"state\":{},\"sqlite_busy\":{},\"hist\":{},\"hist_n\":{},\"parent_cpu\":{},\"parent_busy\":{},\"parent_hist\":{},\"state_cpu\":{},\"state_busy\":{},\"state_hist\":{},\"cpu\":{},\"vcsw\":{},\"ivcsw\":{}}}",
+            "{{\"k\":\"req\",\"lane\":\"{}\",\"seq\":{},\"op\":{},\"acc\":{},\"chl\":{},\"rcv\":{},\"rb\":{},\"fds\":{},\"pid\":{},\"st\":{},\"uid\":{},\"img\":\"{}\",\"rt\":{},\"hs\":{},\"he\":{},\"rw\":{},\"wb\":{},\"ok\":{},\"parent\":{},\"parent_n\":{},\"acct\":{},\"acct_entries\":{},\"fence\":{},\"fence_n\":{},\"bridge\":{},\"bridge_n\":{},\"state\":{},\"sqlite_busy\":{},\"hist\":{},\"hist_n\":{},\"parent_cpu\":{},\"parent_busy\":{},\"parent_hist\":{},\"state_cpu\":{},\"state_busy\":{},\"state_hist\":{},\"cpu\":{},\"vcsw\":{},\"ivcsw\":{},\"stage\":\"{}\"}}",
             self.lane,
             self.seq,
             self.opcode.map_or(-1, i32::from),
@@ -464,6 +477,7 @@ impl Request {
             s.cpu_ns,
             s.vcsw,
             s.ivcsw,
+            s.stage,
         ));
     }
 }
@@ -656,6 +670,7 @@ mod tests {
                         record.opcode = Some(b'X');
                         record.peer(thread as i32, request, 1000, "other");
                         add(Sub::Fence, thread as u64 + 1);
+                        stage("test:stage");
                         timed(Sub::Bridge, || ());
                         record.handler_start = mono_ns();
                         record.handler_end = mono_ns();
@@ -694,6 +709,7 @@ mod tests {
                 request["pid"].as_u64().unwrap() + 1
             );
             assert_eq!(request["fence_n"], 1);
+            assert_eq!(request["stage"], "test:stage");
             assert_eq!(request["bridge_n"], 1);
             let keys: Vec<_> = request.as_object().unwrap().keys().cloned().collect();
             for forbidden in ["payload", "command", "argv", "env", "text"] {
