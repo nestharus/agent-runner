@@ -7995,6 +7995,131 @@ fn retain_v30_driver_gap_in(data_dir: &std::path::Path, root_id: &str, error: &s
     );
 }
 
+/// Directory, beneath the launch's data directory, of per-driver outcome
+/// records. Nothing waits on an installed v30 driver once its guardian has
+/// exited, so the driver records its own begin and end: a `begin` with no
+/// `end` is a driver that never returned (killed, crashed or still running),
+/// never a zero.
+pub(crate) const V30_DRIVER_OUTCOMES: &str = "kernel-v30-driver-outcomes";
+
+static V30_DRIVER_OUTCOME: std::sync::Mutex<Option<File>> = std::sync::Mutex::new(None);
+
+/// Records this process's begin when it is exactly an installed v30 driver
+/// (the driver argv with a canonical root, stderr the null device and the
+/// launch's data directory available). Fail-open: recording never changes
+/// what the driver does or returns.
+pub(crate) fn begin_v30_driver_outcome() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() != 5
+        || args[1] != crate::completion_owner::V30_DRIVER_ARG
+        || !stderr_is_null_device()
+    {
+        return;
+    }
+    if let Ok(data_dir) = oulipoly_state::paths::data_dir()
+        && let Some(file) = begin_v30_driver_outcome_in(&data_dir, &args[4])
+        && let Ok(mut slot) = V30_DRIVER_OUTCOME.lock()
+    {
+        *slot = Some(file);
+    }
+}
+
+/// Records how this driver returned: its result and the exit status it
+/// returns. Without a begin record nothing is written.
+pub(crate) fn end_v30_driver_outcome(result: Result<(), &str>, exit: u8) {
+    let file = V30_DRIVER_OUTCOME
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take());
+    if let Some(mut file) = file {
+        append_v30_driver_outcome(&mut file, &v30_driver_end(result, exit));
+    }
+}
+
+fn v30_driver_clock(id: libc::clockid_t) -> u64 {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe { libc::clock_gettime(id, &mut now) };
+    (now.tv_sec as u64) * 1_000_000_000 + now.tv_nsec as u64
+}
+
+fn begin_v30_driver_outcome_in(data_dir: &std::path::Path, root_id: &str) -> Option<File> {
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+    if uuid::Uuid::parse_str(root_id)
+        .map(|id| id.to_string())
+        .as_deref()
+        != Ok(root_id)
+    {
+        return None;
+    }
+    let directory = data_dir.join(V30_DRIVER_OUTCOMES);
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&directory)
+        .ok()?;
+    let pid = std::process::id();
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(directory.join(format!("{root_id}.{pid}.jsonl")))
+        .ok()?;
+    // Identity of this incarnation: PID, kernel start time and boot, and the
+    // guardian it was forked from.
+    let starttime = std::fs::read_to_string("/proc/self/stat")
+        .ok()
+        .and_then(|stat| {
+            stat.rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_whitespace().nth(19)?.parse::<u64>().ok())
+        });
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
+        .map(|boot| boot.trim().to_owned());
+    let begin = serde_json::json!({
+        "v": 1,
+        "event": "begin",
+        "root": root_id,
+        "pid": pid,
+        "starttime": starttime,
+        "boot_id": boot_id,
+        "ppid": unsafe { libc::getppid() },
+        "mono_ns": v30_driver_clock(libc::CLOCK_MONOTONIC),
+        "wall_ns": v30_driver_clock(libc::CLOCK_REALTIME),
+    });
+    append_v30_driver_outcome(&mut file, &begin);
+    Some(file)
+}
+
+fn v30_driver_end(result: Result<(), &str>, exit: u8) -> serde_json::Value {
+    const LIMIT: usize = 4096;
+    let error = result.err().map(|error| {
+        let mut end = error.len().min(LIMIT);
+        while !error.is_char_boundary(end) {
+            end -= 1;
+        }
+        error[..end].to_owned()
+    });
+    serde_json::json!({
+        "v": 1,
+        "event": "end",
+        "result": if error.is_none() { "ok" } else { "error" },
+        "exit": exit,
+        "error": error,
+        "mono_ns": v30_driver_clock(libc::CLOCK_MONOTONIC),
+        "wall_ns": v30_driver_clock(libc::CLOCK_REALTIME),
+    })
+}
+
+fn append_v30_driver_outcome(file: &mut File, record: &serde_json::Value) {
+    let mut line = record.to_string();
+    line.push('\n');
+    let _ = file.write_all(line.as_bytes());
+}
+
 fn stderr_is_null_device() -> bool {
     use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
     let Ok(null) = std::fs::metadata("/dev/null") else {
@@ -8698,6 +8823,85 @@ mod tests {
         );
         // A test process is not the driver argv: nothing is retained.
         super::retain_v30_driver_gap("not the driver");
+    }
+
+    /// A driver that returned leaves begin then end; one that never returned
+    /// leaves begin alone, which a reader must not read as a zero exit.
+    #[test]
+    fn v30_driver_outcome_records_begin_identity_and_its_return() {
+        let data = tempfile::tempdir().unwrap();
+        let root = uuid::Uuid::new_v4().to_string();
+        let mut file = super::begin_v30_driver_outcome_in(data.path(), &root).unwrap();
+        let path = data
+            .path()
+            .join(super::V30_DRIVER_OUTCOMES)
+            .join(format!("{root}.{}.jsonl", std::process::id()));
+        let begun = std::fs::read_to_string(&path).unwrap();
+        let begin: serde_json::Value = serde_json::from_str(begun.trim_end()).unwrap();
+        assert_eq!(begin["event"], "begin");
+        assert_eq!(begin["root"], root.as_str());
+        assert_eq!(begin["pid"], std::process::id());
+        assert_eq!(begin["ppid"], unsafe { libc::getppid() });
+        // The kernel start time is this incarnation's, read independently.
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+        let starttime: u64 = stat
+            .rsplit_once(')')
+            .unwrap()
+            .1
+            .split_whitespace()
+            .nth(19)
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(begin["starttime"], starttime);
+        assert!(
+            begin["boot_id"]
+                .as_str()
+                .is_some_and(|boot| boot.len() == 36)
+        );
+        super::append_v30_driver_outcome(
+            &mut file,
+            &super::v30_driver_end(
+                Err(&format!(
+                    "v30 recipient absence not established: 1\n{}",
+                    "x".repeat(8192)
+                )),
+                3,
+            ),
+        );
+        let lines: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1]["event"], "end");
+        assert_eq!(lines[1]["result"], "error");
+        assert_eq!(lines[1]["exit"], 3);
+        assert!(lines[1]["error"].as_str().unwrap().len() <= 4096);
+        assert!(lines[1]["mono_ns"].as_u64() >= begin["mono_ns"].as_u64());
+        let ok = super::v30_driver_end(Ok(()), 0);
+        assert_eq!(
+            (
+                ok["result"].clone(),
+                ok["exit"].clone(),
+                ok["error"].clone()
+            ),
+            ("ok".into(), 0.into(), serde_json::Value::Null)
+        );
+        // One record per driver incarnation: never overwritten or reused.
+        assert!(super::begin_v30_driver_outcome_in(data.path(), &root).is_none());
+        // A non-canonical root never names a file.
+        assert!(super::begin_v30_driver_outcome_in(data.path(), "../escape").is_none());
+        // A test process is not the driver argv: nothing begins or ends.
+        super::begin_v30_driver_outcome();
+        super::end_v30_driver_outcome(Ok(()), 0);
+        assert_eq!(
+            std::fs::read_dir(data.path().join(super::V30_DRIVER_OUTCOMES))
+                .unwrap()
+                .count(),
+            1
+        );
     }
 
     use super::*;

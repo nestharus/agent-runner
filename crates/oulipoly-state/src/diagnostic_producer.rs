@@ -148,7 +148,7 @@ pub(crate) fn ensure_default_process_event_sink(
         if producer.native_process.is_none() {
             return Err(EventSinkInstallError::Unavailable);
         }
-        let root = crate::paths::data_dir()
+        let root = crate::diagnostic_recorder::process_data_root()
             .map_err(|_| EventSinkInstallError::Unavailable)?
             .join("diagnostics/event-store-v1");
         let writer = ProcessEventWriter::start(EventWriterConfig::native(root, producer.clone()))

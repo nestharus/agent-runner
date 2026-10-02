@@ -418,10 +418,15 @@ pub(crate) const V30_ABSENCE_NOT_ESTABLISHED_EXIT: u8 = 3;
 /// The exit status for a driver error: "not established" is told apart
 /// from failure, and neither ever reads as success.
 pub(super) fn failure_exit(error: &str) -> std::process::ExitCode {
+    std::process::ExitCode::from(failure_exit_code(error))
+}
+
+/// [`failure_exit`] as its number, for the driver's own outcome record.
+pub(super) fn failure_exit_code(error: &str) -> u8 {
     if error.starts_with(V30_ABSENCE_NOT_ESTABLISHED) {
-        std::process::ExitCode::from(V30_ABSENCE_NOT_ESTABLISHED_EXIT)
+        V30_ABSENCE_NOT_ESTABLISHED_EXIT
     } else {
-        std::process::ExitCode::FAILURE
+        1
     }
 }
 

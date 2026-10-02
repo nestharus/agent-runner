@@ -214,3 +214,176 @@ fn completed_roots_leave_and_errors_keep_their_place() {
     assert_eq!(pending, 2);
     assert_eq!(visits, ["c", "b"]);
 }
+
+/// The emitted selection records rebuild each root's timeline: first
+/// admission, every visit (pass, position, outcome, last step), the passes a
+/// pending root waited unvisited, and a pass stopped by an error. Read from
+/// the actual record file, filtered to this test's roots; other tests in
+/// this binary may share the process-global recorder.
+#[test]
+fn owner_close_selection_records_rebuild_each_roots_timeline() {
+    let records_root = tempfile::tempdir().unwrap();
+    let path = phase_record::init(records_root.path()).unwrap();
+    let roots: Vec<String> = (0..3).map(|_| uuid::Uuid::new_v4().to_string()).collect();
+    let (a, b, c) = (roots[0].clone(), roots[1].clone(), roots[2].clone());
+    let mut queue = OwnerCloseQueue::default();
+    let mut completed = HashSet::new();
+    // Pass 1: zero budget, so only `a` is reached; `b` and `c` wait.
+    let (pending, result) = run_owner_close_pass(
+        &mut queue,
+        roots.iter().map(String::as_str),
+        &mut completed,
+        std::time::Duration::ZERO,
+        |_| {
+            phase_record::owner_close_step("pid1-echild");
+            Ok(false)
+        },
+    );
+    result.unwrap();
+    assert_eq!(pending, 3);
+    // Pass 2: `b` completes, `c` errors and stops the pass before `a`.
+    let (_, result) = run_owner_close_pass(
+        &mut queue,
+        roots.iter().map(String::as_str),
+        &mut completed,
+        std::time::Duration::from_secs(60),
+        |root| {
+            if root == b {
+                phase_record::owner_close_step("close-proof");
+                phase_record::owner_close_effects(true, true);
+                Ok(true)
+            } else {
+                phase_record::owner_close_step("readback");
+                Err(io::Error::other("readback unavailable"))
+            }
+        },
+    );
+    assert!(result.is_err());
+    // Pass 3: everything left is visited; `b` never again.
+    let (pending, result) = run_owner_close_pass(
+        &mut queue,
+        roots.iter().map(String::as_str),
+        &mut completed,
+        std::time::Duration::from_secs(60),
+        |_| Ok(false),
+    );
+    result.unwrap();
+    assert_eq!(pending, 2);
+
+    let ours = |record: &serde_json::Value| {
+        record["root"]
+            .as_str()
+            .is_some_and(|root| roots.iter().any(|ours| ours == root))
+    };
+    let records: Vec<serde_json::Value> = fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    // Passes are numbered process-wide; other tests may interleave theirs.
+    let first = records
+        .iter()
+        .find(|record| record["k"] == "oca" && ours(record))
+        .map(|record| record["pass"].as_u64().unwrap())
+        .unwrap();
+    let visits = |root: &str| -> Vec<serde_json::Value> {
+        records
+            .iter()
+            .filter(|record| record["k"] == "ocv" && record["root"] == root)
+            .cloned()
+            .collect()
+    };
+    // Each root is admitted once, in the first pass, in retained order.
+    let admitted: Vec<_> = records
+        .iter()
+        .filter(|record| record["k"] == "oca" && ours(record))
+        .collect();
+    assert_eq!(admitted.len(), 3);
+    for (record, root) in admitted.iter().zip(&roots) {
+        assert_eq!(record["root"], root.as_str());
+        assert_eq!(record["pass"], first);
+    }
+    // a: visited in passes 1 and 3, pending both times, its step retained.
+    let a_visits = visits(&a);
+    let b_visits = visits(&b);
+    let (second, third) = (
+        b_visits[0]["pass"].as_u64().unwrap(),
+        a_visits[1]["pass"].as_u64().unwrap(),
+    );
+    assert!(first < second && second < third);
+    assert_eq!(a_visits.len(), 2);
+    assert_eq!(a_visits[0]["pass"], first);
+    assert_eq!(a_visits[0]["out"], "pending");
+    assert_eq!(a_visits[0]["step"], "pid1-echild");
+    assert_eq!(a_visits[1]["step"], "", "a visit with no step says so");
+    // The revisit interval is the gap between visit starts.
+    let revisit = a_visits[1]["from"].as_u64().unwrap() - a_visits[0]["from"].as_u64().unwrap();
+    assert!(revisit > 0);
+    // b: waited unvisited in pass 1, then completed once with its effects.
+    assert_eq!(b_visits.len(), 1);
+    assert_eq!(
+        b_visits[0]["pos"], 0,
+        "b was queued first behind the requeued a"
+    );
+    assert_eq!(b_visits[0]["out"], "complete");
+    assert_eq!(
+        (b_visits[0]["rb"].clone(), b_visits[0]["acted"].clone()),
+        (true.into(), true.into())
+    );
+    // c: waited through pass 1, failed in pass 2 at its step, retried in 3.
+    let c_visits = visits(&c);
+    assert_eq!(
+        c_visits
+            .iter()
+            .map(|v| v["out"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["error", "pending"]
+    );
+    assert_eq!(c_visits[0]["step"], "readback");
+    assert_eq!(
+        (c_visits[0]["pass"].as_u64(), c_visits[1]["pass"].as_u64()),
+        (Some(second), Some(third))
+    );
+    assert_eq!(
+        (c_visits[0]["rb"].clone(), c_visits[0]["acted"].clone()),
+        (false.into(), false.into())
+    );
+    // Pass records: pending at start, roots reached, budget and error.
+    let pass = |number: u64| -> serde_json::Value {
+        records
+            .iter()
+            .find(|record| record["k"] == "ocp" && record["pass"] == number)
+            .cloned()
+            .unwrap()
+    };
+    let (p1, p2, p3) = (pass(first), pass(second), pass(third));
+    assert_eq!(
+        (p1["pending"].as_u64(), p1["visited"].as_u64()),
+        (Some(3), Some(1))
+    );
+    assert_eq!(
+        (p1["budget_spent"].clone(), p1["err"].clone()),
+        (true.into(), false.into())
+    );
+    assert_eq!(
+        (p2["visited"].as_u64(), p2["err"].clone()),
+        (Some(2), true.into())
+    );
+    assert_eq!(
+        (p3["pending"].as_u64(), p3["visited"].as_u64()),
+        (Some(2), Some(2))
+    );
+    assert_eq!(p3["budget_spent"], false);
+    if let Some(export) = std::env::var_os("AGE353_OBS_RECORDS_EXPORT") {
+        let lines: String = records
+            .iter()
+            .filter(|record| {
+                ours(record)
+                    || (record["k"] == "ocp"
+                        && [first, second, third].contains(&record["pass"].as_u64().unwrap()))
+            })
+            .map(|record| format!("{record}\n"))
+            .collect();
+        fs::write(export, lines).unwrap();
+    }
+}

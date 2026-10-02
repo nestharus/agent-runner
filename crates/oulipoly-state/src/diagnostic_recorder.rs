@@ -1671,8 +1671,27 @@ impl DiagnosticSpan {
     }
 }
 
+static PROCESS_DATA_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+/// Gives this process an explicit root for its own flight recorder and event
+/// store. A process started without an application data directory (the
+/// installed Broker under its unit) otherwise has no recorder: every attempt
+/// fails initialization. The first call wins; it changes no other path.
+pub fn set_process_data_root(root: PathBuf) -> bool {
+    PROCESS_DATA_ROOT.set(root).is_ok()
+}
+
+/// The explicit process root when one was set, otherwise the application
+/// data directory.
+pub(crate) fn process_data_root() -> Result<PathBuf, String> {
+    match PROCESS_DATA_ROOT.get() {
+        Some(root) => Ok(root.clone()),
+        None => crate::paths::data_dir(),
+    }
+}
+
 pub fn default_recorder_root() -> Result<PathBuf, String> {
-    crate::paths::data_dir().map(|root| root.join(RECORDER_DIRECTORY))
+    process_data_root().map(|root| root.join(RECORDER_DIRECTORY))
 }
 
 pub fn process_recorder() -> FlightRecorder {
@@ -3935,6 +3954,68 @@ fn saturating_millis(duration: Duration) -> u64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// A process with no application data directory (the installed Broker)
+    /// gets a recorder and event store only at the root it names; nothing
+    /// else is redirected. Runs in its own process: the root is global.
+    #[test]
+    fn explicit_process_root_initializes_the_recorder_without_a_data_dir() {
+        const CHILD: &str = "OULIPOLY_AGE353_EXPLICIT_RECORDER_ROOT_CHILD";
+        let root = std::env::var_os(CHILD);
+        let Some(root) = root else {
+            let root = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "diagnostic_recorder::tests::explicit_process_root_initializes_the_recorder_without_a_data_dir",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env(CHILD, root.path())
+                .env_remove("OULIPOLY_DATA_DIR")
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "isolated recorder-root fixture failed: {status}"
+            );
+            let flight = root
+                .path()
+                .join("broker-diagnostics-v1/diagnostics/flight-recorder-v1");
+            assert!(
+                std::fs::read_dir(&flight)
+                    .unwrap()
+                    .flatten()
+                    .any(|entry| { entry.file_name().to_string_lossy().ends_with(".jsonl") })
+            );
+            assert!(
+                root.path()
+                    .join("broker-diagnostics-v1/diagnostics/event-store-v1")
+                    .is_dir()
+            );
+            return;
+        };
+        // Unchanged default: no data directory, no recorder root.
+        assert!(default_recorder_root().is_err());
+        let explicit = PathBuf::from(root).join("broker-diagnostics-v1");
+        assert!(set_process_data_root(explicit.clone()));
+        assert!(
+            !set_process_data_root(PathBuf::from("/elsewhere")),
+            "first call wins"
+        );
+        assert_eq!(
+            default_recorder_root().unwrap(),
+            explicit.join(RECORDER_DIRECTORY)
+        );
+        // Other data paths are not redirected.
+        assert!(crate::paths::data_dir().is_err());
+        let recorder =
+            FlightRecorder::open(default_recorder_root().unwrap(), RecorderConfig::default())
+                .unwrap();
+        assert_eq!(
+            crate::diagnostic_producer::ensure_default_process_event_sink(&recorder.inner.process),
+            Ok(())
+        );
+    }
     use super::*;
     use std::process::{Command, Stdio};
     use std::sync::Arc;

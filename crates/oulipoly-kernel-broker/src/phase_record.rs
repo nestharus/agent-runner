@@ -595,6 +595,173 @@ impl MainWindow {
     }
 }
 
+thread_local! {
+    /// What the current owner-close visit on this thread reached: the last
+    /// step label, and whether the visit read back or acted.
+    static OWNER_CLOSE_VISIT: Cell<(&'static str, bool, bool)> = const { Cell::new(("", false, false)) };
+}
+
+/// Marks the last step an owner-close visit reached. A fixed label in the
+/// code, never root content; it locates where a pending root waited.
+pub fn owner_close_step(label: &'static str) {
+    OWNER_CLOSE_VISIT.with(|visit| {
+        let (_, readback, acted) = visit.get();
+        visit.set((label, readback, acted));
+    });
+}
+
+/// Notes what the current owner-close visit did beyond its step label.
+pub fn owner_close_effects(readback: bool, acted: bool) {
+    OWNER_CLOSE_VISIT.with(|visit| {
+        let (label, _, _) = visit.get();
+        visit.set((label, readback, acted));
+    });
+}
+
+fn take_owner_close_visit() -> (&'static str, bool, bool) {
+    OWNER_CLOSE_VISIT.with(|visit| visit.replace(("", false, false)))
+}
+
+/// One root's identifier as a JSON string. Root IDs are canonical UUIDs;
+/// anything else is still escaped, never written raw.
+fn root_json(root_id: &str) -> String {
+    serde_json::Value::from(root_id).to_string()
+}
+
+/// Per-root owner-close selection records. Each pass, the roots Main visits
+/// (in revisit order), and each root's first admission to the queue are
+/// recorded, so a reader can rebuild every root's selection timeline: when it
+/// became pending, each visit's time, outcome and step, the interval between
+/// its visits, and the passes in which it waited unvisited. They describe the
+/// pass; they never steer it.
+pub struct OwnerCloseTrace {
+    pass: u64,
+    pass_from: u64,
+    position: u64,
+    visit_from: u64,
+}
+
+impl OwnerCloseTrace {
+    /// Starts the next pass. Passes are numbered from 1 in this process.
+    pub fn pass() -> Self {
+        static PASSES: AtomicU64 = AtomicU64::new(0);
+        Self {
+            pass: PASSES.fetch_add(1, Ordering::Relaxed) + 1,
+            pass_from: mono_ns(),
+            position: 0,
+            visit_from: 0,
+        }
+    }
+
+    /// A root joined the queue for the first time in this incarnation.
+    pub fn admitted(&self, root_id: &str) {
+        if RECORDER.get().is_none() {
+            return;
+        }
+        emit(format!(
+            "{{\"k\":\"oca\",\"pass\":{},\"root\":{},\"at\":{}}}",
+            self.pass,
+            root_json(root_id),
+            mono_ns()
+        ));
+    }
+
+    /// Called just before Main examines a root.
+    pub fn visit_begins(&mut self) {
+        take_owner_close_visit();
+        self.visit_from = mono_ns();
+    }
+
+    /// Called once the examination returned: `Some(true)` completed,
+    /// `Some(false)` still pending, `None` an error that stopped the pass.
+    pub fn visit_ended(&mut self, root_id: &str, completed: Option<bool>) {
+        let to = mono_ns();
+        let (step, readback, acted) = take_owner_close_visit();
+        let position = self.position;
+        self.position += 1;
+        if RECORDER.get().is_none() {
+            return;
+        }
+        let outcome = match completed {
+            Some(true) => "complete",
+            Some(false) => "pending",
+            None => "error",
+        };
+        emit(format!(
+            "{{\"k\":\"ocv\",\"pass\":{},\"pos\":{position},\"root\":{},\"from\":{},\"to\":{to},\"out\":\"{outcome}\",\"step\":\"{step}\",\"rb\":{readback},\"acted\":{acted}}}",
+            self.pass,
+            root_json(root_id),
+            self.visit_from,
+        ));
+    }
+
+    /// Ends the pass: how many roots were pending at its start, whether its
+    /// budget ran out before every queued root was reached, and whether an
+    /// error stopped it.
+    pub fn pass_ended(&self, pending: u64, budget_spent: bool, error: bool) {
+        if RECORDER.get().is_none() {
+            return;
+        }
+        emit(format!(
+            "{{\"k\":\"ocp\",\"pass\":{},\"from\":{},\"to\":{},\"pending\":{pending},\"visited\":{},\"budget_spent\":{budget_spent},\"err\":{error}}}",
+            self.pass,
+            self.pass_from,
+            mono_ns(),
+            self.position,
+        ));
+    }
+}
+
+/// Exit status of an installed successor the Broker started, observed
+/// without reaping it, so the Broker's own later wait is unchanged.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SuccessorExit {
+    Exited(i32),
+    Signaled(i32),
+    /// The status could not be observed (the child was already reaped, or
+    /// the wait failed): unknown, never success.
+    Unobserved(&'static str),
+}
+
+/// Records that the Broker spawned a successor for one offer.
+pub fn successor_spawned(offer: &str, pid: i32, starttime: u64) {
+    if RECORDER.get().is_none() {
+        return;
+    }
+    emit(format!(
+        "{{\"k\":\"succ_spawn\",\"offer\":{},\"pid\":{pid},\"st\":{starttime},\"at\":{}}}",
+        root_json(offer),
+        mono_ns()
+    ));
+}
+
+/// Records how a spawned successor ended. A successor that fails at entry
+/// writes its reason to a null stderr; this record keeps the fact and its
+/// status. The reason text is not available here.
+/// `by` names the observer: `observer` waits without reaping from spawn;
+/// `reaper` is the Broker's own wait after ACK. Both may record one exit.
+pub fn successor_exited(
+    offer: &str,
+    pid: i32,
+    starttime: u64,
+    by: &'static str,
+    exit: &SuccessorExit,
+) {
+    if RECORDER.get().is_none() {
+        return;
+    }
+    let (how, code, signal, reason) = match exit {
+        SuccessorExit::Exited(code) => ("exited", *code, 0, ""),
+        SuccessorExit::Signaled(signal) => ("signaled", 0, *signal, ""),
+        SuccessorExit::Unobserved(reason) => ("unobserved", 0, 0, *reason),
+    };
+    emit(format!(
+        "{{\"k\":\"succ_exit\",\"offer\":{},\"pid\":{pid},\"st\":{starttime},\"by\":\"{by}\",\"at\":{},\"how\":\"{how}\",\"code\":{code},\"sig\":{signal},\"reason\":\"{reason}\"}}",
+        root_json(offer),
+        mono_ns()
+    ));
+}
+
 /// Reads every record file under a State root without the Broker.
 pub fn read_all(state_root: &Path) -> io::Result<Vec<serde_json::Value>> {
     read_all_counted(state_root).map(|(records, _)| records)

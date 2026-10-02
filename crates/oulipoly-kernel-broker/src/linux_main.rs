@@ -121,6 +121,8 @@ use std::time::Instant;
 
 const SOCKET: &str = "/run/oulipoly-kernel-broker/control.sock";
 const STATE: &str = "/var/lib/oulipoly-kernel-broker";
+/// Root, beneath State, of the Broker's own flight recorder and event store.
+const BROKER_DIAGNOSTICS: &str = "broker-diagnostics-v1";
 const FRESH_SOCKET: &str = "/run/oulipoly-kernel-broker/v30.sock";
 const RUNNER: &str = "/usr/local/libexec/oulipoly/oulipoly-agent-runner";
 
@@ -5322,9 +5324,11 @@ impl OwnerCloseQueue {
         &mut self,
         root_ids: impl IntoIterator<Item = &'a str>,
         completed: &HashSet<String>,
+        trace: &phase_record::OwnerCloseTrace,
     ) {
         for root_id in root_ids {
             if !self.queued.contains(root_id) && !completed.contains(root_id) {
+                trace.admitted(root_id);
                 self.requeue(root_id.to_owned());
             }
         }
@@ -5383,9 +5387,14 @@ fn advance_normal_owners(
         OWNER_CLOSE_PASS_BUDGET,
         |root_id| {
             let Some(entry) = entries.record(root_id) else {
+                phase_record::owner_close_step("entry-absent");
                 return Ok(false);
             };
-            advance_one_normal_owner(
+            // The pass-wide counts stay as before; the per-visit split is
+            // only recorded.
+            let (readback, acted) = (scan.readback, scan.acted);
+            scan.acted = false;
+            let result = advance_one_normal_owner(
                 state_root,
                 registry,
                 entries,
@@ -5396,7 +5405,10 @@ fn advance_normal_owners(
                 admission_fences,
                 entry,
                 scan,
-            )
+            );
+            phase_record::owner_close_effects(scan.readback > readback, scan.acted);
+            scan.acted |= acted;
+            result
         },
     );
     scan.pending = pending.0;
@@ -5415,20 +5427,27 @@ fn run_owner_close_pass<'a>(
     budget: std::time::Duration,
     mut visit: impl FnMut(&str) -> io::Result<bool>,
 ) -> (u64, io::Result<()>) {
-    queue.admit_retained(retained, completed);
+    let mut trace = phase_record::OwnerCloseTrace::pass();
+    queue.admit_retained(retained, completed, &trace);
     let pending = queue.len() as u64;
     let deadline = Instant::now() + budget;
+    let mut visited = 0;
     for _ in 0..queue.len() {
         let Some(root_id) = queue.next() else {
             break;
         };
-        match visit(&root_id) {
+        visited += 1;
+        trace.visit_begins();
+        let result = visit(&root_id);
+        trace.visit_ended(&root_id, result.as_ref().ok().copied());
+        match result {
             Ok(true) => {
                 completed.insert(root_id);
             }
             Ok(false) => queue.requeue(root_id),
             Err(error) => {
                 queue.requeue(root_id);
+                trace.pass_ended(pending, false, true);
                 return (pending, Err(error));
             }
         }
@@ -5436,6 +5455,7 @@ fn run_owner_close_pass<'a>(
             break;
         }
     }
+    trace.pass_ended(pending, visited < pending, false);
     (pending, Ok(()))
 }
 
@@ -5460,9 +5480,11 @@ fn advance_one_normal_owner(
     // Both normal and offline close require the original to have exited.
     // This is a deferral only: disappearance cannot authorize settlement.
     // Recheck all State/physical authorities below when it can progress.
+    phase_record::owner_close_step("original-joined");
     let Some(actor) = entry.joined_child.as_ref() else {
         return Ok(false);
     };
+    phase_record::owner_close_step("original-exited");
     if !observed_incarnation_gone(
         actor.host_pid,
         &actor.boot_id,
@@ -5473,12 +5495,15 @@ fn advance_one_normal_owner(
     {
         return Ok(false);
     }
+    phase_record::owner_close_step("lane-open");
     let lane = FreshV30Lane::open_at(state_root).map_err(io::Error::other)?;
     // An entry may be prepared before its root record is published. It
     // carries no normal K or close authority until that exact root exists.
+    phase_record::owner_close_step("root-record");
     let Some(root) = registry.record(&entry.root_id).cloned() else {
         return Ok(false);
     };
+    phase_record::owner_close_step("released-handoff");
     let Ok((released, actor)) = lane.released_handoff_for_root(&root.root_id) else {
         return Ok(false);
     };
@@ -5490,10 +5515,12 @@ fn advance_one_normal_owner(
     // The normal fence already requires caller settlement. Do not rebuild
     // the full inventory while that necessary condition is absent. An
     // explicit fence and the offline route retain their existing checks.
+    phase_record::owner_close_step("caller-settlement");
     if !offline && entry.terminal_settlement.is_none() && !registry.admission_fenced(&root.root_id)
     {
         return Ok(false);
     }
+    phase_record::owner_close_step("provider-k-recorded");
     // U can be visible while D is still publishing. The normal route
     // cannot advance from an empty K; offline has its own State return.
     if !offline
@@ -5503,12 +5530,14 @@ fn advance_one_normal_owner(
     {
         return Ok(false);
     }
+    phase_record::owner_close_step("session");
     let Some(session) = lane
         .read_session(&released.d_key)
         .map_err(io::Error::other)?
     else {
         return Ok(false);
     };
+    phase_record::owner_close_step("provider-k-present");
     if !offline
         && !lane
             .normal_provider_k_present(&released, &actor, &session)
@@ -5516,6 +5545,7 @@ fn advance_one_normal_owner(
     {
         return Ok(false);
     }
+    phase_record::owner_close_step("readback");
     scan.readback += 1;
     let inventory = root_drain::readback(
         &root,
@@ -5526,6 +5556,7 @@ fn advance_one_normal_owner(
         sources,
         sidecar.as_ref(),
     )?;
+    phase_record::owner_close_step("inventory-ready");
     if (offline && inventory.offline.is_none())
         || (!offline && inventory.normal.is_none())
         || inventory.normal_uncertain
@@ -5534,12 +5565,15 @@ fn advance_one_normal_owner(
         return Ok(false);
     }
     let expected_owner = &released.old_release.prepared.owner_generation;
+    phase_record::owner_close_step("successor-ack");
     if root_drain::exact_successor_ack_for_root(&lane, &root.root_id).is_err() {
         return Ok(false);
     }
+    phase_record::owner_close_step("original-receipt");
     if root_drain::exact_original_receipt_for_root(&lane, &root.root_id).is_err() {
         return Ok(false);
     }
+    phase_record::owner_close_step("close-proof");
     if let Some(proof) = &inventory.owner_close_proof {
         if &proof.owner_generation != expected_owner {
             return Err(io::Error::other("normal closed owner generation changed"));
@@ -5547,6 +5581,7 @@ fn advance_one_normal_owner(
         scan.acted = true;
         return Ok(true);
     }
+    phase_record::owner_close_step("owner-inventory");
     if inventory
         .owner_close_inventory
         .as_ref()
@@ -5554,6 +5589,7 @@ fn advance_one_normal_owner(
     {
         return Ok(false);
     }
+    phase_record::owner_close_step("admission-fence");
     if !inventory.fenced {
         let ready = if offline {
             root_drain::ready_for_offline_admission_fence(&inventory)
@@ -5563,6 +5599,7 @@ fn advance_one_normal_owner(
         if ready.is_err() {
             return Ok(false);
         }
+        phase_record::owner_close_step("admission-fenced");
         scan.acted = true;
         let mut fences = lock_fences(admission_fences)
             .map_err(|_| io::Error::other("root admission fence poisoned"))?;
@@ -5573,19 +5610,23 @@ fn advance_one_normal_owner(
         persisted?;
         return Ok(false);
     }
+    phase_record::owner_close_step("pid1-echild");
     if !inventory.pid1_echild_receipt {
         if root_drain::ready_for_pid1_request(&inventory).is_ok() {
+            phase_record::owner_close_step("pid1-requested");
             scan.acted = true;
             root_pid1::publish_request(&registry.pid1_directory(), &root)?;
         }
         return Ok(false);
     }
+    phase_record::owner_close_step("owner-close-preflight");
     if !inventory.owner_close_preflight {
         return Ok(false);
     }
     scan.acted = true;
     let _guard = lock_fences(admission_fences)
         .map_err(|_| io::Error::other("root admission fence poisoned"))?;
+    phase_record::owner_close_step("owner-close-intent");
     if inventory.owner_close_intent.is_none() {
         issue_exact_owner_close_intent(
             &root,
@@ -5606,6 +5647,7 @@ fn advance_one_normal_owner(
     {
         return Ok(false);
     }
+    phase_record::owner_close_step("owner-close-commit");
     commit_exact_owner_close(
         state_root,
         &root,
@@ -6043,6 +6085,16 @@ fn serve() -> io::Result<()> {
                 "incomplete first-install activation stage",
             ));
         }
+    }
+    if !fixture {
+        // The unit supplies no application data directory, so the Broker's
+        // own diagnostic recorder failed to initialize on every use. Give it
+        // a State-owned root and initialize it before startup repair and
+        // serving, so its one-time setup is never on a request path.
+        oulipoly_state::diagnostic_recorder::set_process_data_root(
+            Path::new(&state).join(BROKER_DIAGNOSTICS),
+        );
+        let _ = oulipoly_state::diagnostic_recorder::process_recorder();
     }
     let fresh_activation = if let Some(pair) = &installed_pair {
         if record_present {

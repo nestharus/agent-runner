@@ -3,6 +3,7 @@
 use crate::entry_registry::ProcessStamp;
 use crate::identity::{PeerIdentity, PinnedProcess};
 use crate::json_artifact;
+use crate::phase_record;
 use oulipoly_state::mailbox::FreshBashWakeSuccessorDecision;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -321,6 +322,11 @@ impl LiveCandidate {
             }
         };
         drop(pinned_image);
+        observe_exit(
+            &start.decision.offer_request_id,
+            record.process.host_pid,
+            record.process.starttime_ticks,
+        );
         Ok(Self {
             record,
             child,
@@ -386,11 +392,88 @@ impl LiveCandidate {
 
     pub fn reap_after_ack(self) {
         let mut child = self.child;
+        let offer = self.record.offer_request_id;
+        let (pid, starttime) = (
+            self.record.process.host_pid,
+            self.record.process.starttime_ticks,
+        );
         let _ = std::thread::Builder::new()
             .name("installed-successor-reaper".into())
             .spawn(move || {
-                let _ = child.wait();
+                let exit = match child.wait() {
+                    Ok(status) => exit_of(status),
+                    Err(_) => phase_record::SuccessorExit::Unobserved("reaper-wait-failed"),
+                };
+                phase_record::successor_exited(&offer, pid, starttime, "reaper", &exit);
             });
+    }
+}
+
+/// Blocks until the pidfd's child exits and returns how, leaving the child
+/// unreaped (`WNOWAIT`): its parent's own wait still receives the status.
+fn wait_exit_unreaped(pidfd: &std::os::fd::OwnedFd) -> phase_record::SuccessorExit {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let rc = loop {
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PIDFD,
+                pidfd.as_raw_fd() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if rc != 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        break rc;
+    };
+    if rc != 0 {
+        // ECHILD: the Broker's own reaper took the status first and records
+        // it itself.
+        return phase_record::SuccessorExit::Unobserved("reaped-before-observed");
+    }
+    let status = unsafe { info.si_status() };
+    match info.si_code {
+        libc::CLD_EXITED => phase_record::SuccessorExit::Exited(status),
+        libc::CLD_KILLED | libc::CLD_DUMPED => phase_record::SuccessorExit::Signaled(status),
+        _ => phase_record::SuccessorExit::Unobserved("status-unclassified"),
+    }
+}
+
+fn exit_of(status: std::process::ExitStatus) -> phase_record::SuccessorExit {
+    use std::os::unix::process::ExitStatusExt;
+    match (status.code(), status.signal()) {
+        (Some(code), _) => phase_record::SuccessorExit::Exited(code),
+        (None, Some(signal)) => phase_record::SuccessorExit::Signaled(signal),
+        (None, None) => phase_record::SuccessorExit::Unobserved("status-unclassified"),
+    }
+}
+
+/// Records the spawn, then waits on the exact child through a pidfd without
+/// reaping it, and records how it ended. A successor that fails at entry
+/// (before or after its offer) otherwise leaves no trace: its stderr is null
+/// and nothing reaps it before ACK. Its environment, descriptors and the
+/// Broker's own waits are unchanged; the status stays for the Broker's wait.
+fn observe_exit(offer: &str, pid: i32, starttime: u64) {
+    phase_record::successor_spawned(offer, pid, starttime);
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
+    if pidfd < 0 {
+        let exit = phase_record::SuccessorExit::Unobserved("pidfd-unavailable");
+        phase_record::successor_exited(offer, pid, starttime, "observer", &exit);
+        return;
+    }
+    let pidfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(pidfd) };
+    let observed = offer.to_owned();
+    let spawned = std::thread::Builder::new()
+        .name("installed-successor-observer".into())
+        .stack_size(64 * 1024)
+        .spawn(move || {
+            let exit = wait_exit_unreaped(&pidfd);
+            phase_record::successor_exited(&observed, pid, starttime, "observer", &exit);
+        });
+    if spawned.is_err() {
+        let exit = phase_record::SuccessorExit::Unobserved("observer-unavailable");
+        phase_record::successor_exited(offer, pid, starttime, "observer", &exit);
     }
 }
 
@@ -398,6 +481,49 @@ impl LiveCandidate {
 mod tests {
     use super::*;
     use oulipoly_state::mailbox::FreshRecipientIdentity;
+
+    fn pidfd_of(child: &Child) -> std::os::fd::OwnedFd {
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as i32, 0) } as i32;
+        assert!(fd >= 0, "{}", io::Error::last_os_error());
+        unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }
+    }
+
+    /// The observer reports a failed entry's status and a killed one's
+    /// signal, and the parent's own wait still receives the same status.
+    #[test]
+    fn unreaped_exit_observation_leaves_the_parent_wait_unchanged() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut failed = Command::new("/bin/sh")
+            .args(["-c", "exit 7"])
+            .spawn()
+            .unwrap();
+        let pidfd = pidfd_of(&failed);
+        assert_eq!(
+            wait_exit_unreaped(&pidfd),
+            phase_record::SuccessorExit::Exited(7)
+        );
+        // Still a zombie for its parent: observing it did not reap it.
+        assert_eq!(failed.wait().unwrap().code(), Some(7));
+        // Once the parent reaped it, the status is not invented.
+        assert_eq!(
+            wait_exit_unreaped(&pidfd),
+            phase_record::SuccessorExit::Unobserved("reaped-before-observed")
+        );
+
+        let mut killed = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let pidfd = pidfd_of(&killed);
+        let observer = std::thread::spawn(move || wait_exit_unreaped(&pidfd));
+        unsafe { libc::kill(killed.id() as i32, libc::SIGKILL) };
+        assert_eq!(
+            observer.join().unwrap(),
+            phase_record::SuccessorExit::Signaled(libc::SIGKILL)
+        );
+        assert_eq!(killed.wait().unwrap().signal(), Some(libc::SIGKILL));
+        assert!(matches!(
+            exit_of(killed.wait().unwrap()),
+            phase_record::SuccessorExit::Signaled(signal) if signal == libc::SIGKILL
+        ));
+    }
 
     #[test]
     fn spent_start_survives_restart_and_candidate_is_immutable() {
