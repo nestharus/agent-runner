@@ -1092,6 +1092,18 @@ mod tests {
 
     #[test]
     fn terminal_root_release_keeps_work_records_and_debt_classification() {
+        // The poll fault changes a resource limit only in this disposable
+        // process, never in the shared test harness.
+        const NAME: &str = "work_registry::tests::terminal_root_release_keeps_work_records_and_debt_classification";
+        if std::env::var_os("WORK_RELEASE_POLL_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env("WORK_RELEASE_POLL_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "disposable work-release control failed");
+            return;
+        }
         let (terminal, other) = ("terminal-root", "other-root");
         let exited = child(true);
         let running = child(false);
@@ -1118,7 +1130,31 @@ mod tests {
         let before = (works.has_debt(), descriptors());
         assert!(before.0, "exited works of unclosed roots are debt");
 
-        // Only the exited work of the named root drops its two handles.
+        let mut saved: libc::rlimit = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut saved) },
+            0
+        );
+        let unavailable = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: saved.rlim_max,
+        };
+        assert_eq!(
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &unavailable) },
+            0
+        );
+        // poll(nfds=1) is EINVAL with a zero soft limit. This is a real
+        // unavailable exit observation, not a simulated exit or EMFILE.
+        let failed_poll = works.live[0].init.exited();
+        works.release_terminal_root(terminal);
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &saved) }, 0);
+        assert_eq!(failed_poll.unwrap_err().raw_os_error(), Some(libc::EINVAL));
+        assert_eq!(works.live.len(), 3);
+        assert!(works.debt_records().is_empty());
+        assert_eq!(descriptors(), before.1, "failed observation keeps pins");
+
+        // A later opportunity for that same already-terminal root releases
+        // only its exact-exited work, despite the earlier failed observation.
         works.release_terminal_root(terminal);
         assert_eq!(descriptors(), before.1 - 2);
         assert_eq!(works.has_debt(), before.0);
@@ -1130,6 +1166,13 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![&records[1], &records[2]]
         );
+        works.release_terminal_root(terminal);
+        assert_eq!(descriptors(), before.1 - 2);
+        assert_eq!(works.debt_records(), &records[..1]);
         unsafe { libc::kill(running_pid, libc::SIGKILL) };
+        assert_eq!(
+            unsafe { libc::waitpid(running_pid, std::ptr::null_mut(), 0) },
+            running_pid
+        );
     }
 }

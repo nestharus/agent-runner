@@ -6585,6 +6585,8 @@ fn serve() -> io::Result<()> {
             // its kernel handles go. Its gate peer died with its namespace.
             for root in registry.release_terminal_roots() {
                 held_joins.remove(&root.root_id);
+                // Includes earlier released roots: an unavailable work exit
+                // observation retains pins until a later exact proof.
                 works.release_terminal_root(&root.root_id);
             }
             window.advance_cpu_ns += phase_record::thread_cpu_ns().saturating_sub(advance_cpu);
