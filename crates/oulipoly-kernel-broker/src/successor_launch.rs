@@ -296,7 +296,8 @@ pub struct LiveCandidate {
     pub record: CandidateRecord,
     child: Child,
     channel: UnixStream,
-    offered: bool,
+    gate_consumed: bool,
+    offer_may_be_published: bool,
 }
 
 impl LiveCandidate {
@@ -399,7 +400,8 @@ impl LiveCandidate {
             record,
             child,
             channel: broker,
-            offered: false,
+            gate_consumed: false,
+            offer_may_be_published: false,
         })
     }
 
@@ -418,7 +420,7 @@ impl LiveCandidate {
     }
 
     pub fn consume_offer(&mut self, peer: &PeerIdentity) -> io::Result<()> {
-        if self.offered
+        if self.gate_consumed
             || self.child.try_wait()?.is_some()
             || ProcessStamp::from(&peer.process) != self.record.process
             || peer.uid != self.record.owner_uid
@@ -436,12 +438,12 @@ impl LiveCandidate {
         if byte != [b'R'] {
             return Err(io::Error::other("successor gate proof invalid"));
         }
-        self.offered = true;
+        self.gate_consumed = true;
         Ok(())
     }
 
     pub fn verify_offered(&mut self, peer: &PeerIdentity) -> io::Result<()> {
-        if !self.offered
+        if !self.gate_consumed
             || self.child.try_wait()?.is_some()
             || ProcessStamp::from(&peer.process) != self.record.process
             || peer.uid != self.record.owner_uid
@@ -452,21 +454,38 @@ impl LiveCandidate {
     }
 
     pub fn verify_offered_stamp(&mut self, stamp: &ProcessStamp) -> io::Result<()> {
-        if !self.offered || self.child.try_wait()?.is_some() || &self.record.process != stamp {
+        if !self.gate_consumed || self.child.try_wait()?.is_some() || &self.record.process != stamp
+        {
             return Err(io::Error::other("successor live candidate absent"));
         }
         Ok(())
     }
 
-    /// A candidate whose exit is observed before the Broker accepted any
-    /// offer from it has nothing for a recipient to ACK. Its exact status is
+    /// Keep custody across publication and its readback: an error may arrive
+    /// after the durable commit. Only an affirmative absence readback lets
+    /// the pre-offer cleanup proceed. This does not reset the consumed gate.
+    pub fn publish_offer<T, E>(
+        &mut self,
+        publish: impl FnOnce() -> Result<T, E>,
+        definitely_absent: impl FnOnce() -> bool,
+    ) -> Result<T, E> {
+        self.offer_may_be_published = true;
+        let result = publish();
+        if result.is_err() && definitely_absent() {
+            self.offer_may_be_published = false;
+        }
+        result
+    }
+
+    /// A candidate whose exit is observed before durable offer publication
+    /// has nothing for a recipient to ACK. Its exact status is
     /// taken by the wait that reaps it (this handle's own child, so no PID
     /// number is reused) and recorded with what it reported on its gate.
     /// Its start and candidate records, and every obligation, stay as they
     /// are. Returns whether it was reaped; an offered or live candidate is
     /// left untouched.
     pub fn reap_if_exited_before_offer(&mut self) -> bool {
-        if self.offered {
+        if self.offer_may_be_published {
             return false;
         }
         let exit = match self.child.try_wait() {
@@ -647,7 +666,8 @@ mod tests {
                 record,
                 child,
                 channel,
-                offered,
+                gate_consumed: offered,
+                offer_may_be_published: offered,
             },
             offer,
         )
@@ -785,6 +805,110 @@ mod tests {
         assert!(rows_for(&path, &offer).is_empty());
         running.child.kill().unwrap();
         running.child.wait().unwrap();
+    }
+
+    /// Ordinary child/socket controls exercise the consumed gate and exact
+    /// wait. Publication closures model the lane's outcomes, including a
+    /// commit followed by an error; they do not exercise SQLite or cadence.
+    #[test]
+    fn publication_outcomes_preserve_gate_and_cleanup_boundary() {
+        let Some(path) = records("publication_outcomes_preserve_gate_and_cleanup_boundary") else {
+            return;
+        };
+        for outcome in [
+            "unreached",
+            "absent",
+            "published",
+            "post-commit-error",
+            "ambiguous",
+        ] {
+            let child = Command::new("/bin/sh")
+                .args(["-c", "read line; exit 7"])
+                .stdin(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let peer = PeerIdentity {
+                uid: unsafe { libc::geteuid() },
+                gid: unsafe { libc::getegid() },
+                process: PinnedProcess::open(child.id() as i32).unwrap(),
+            };
+            let pidfd = pidfd_of(&child);
+            let (broker, mut gate) = UnixStream::pair().unwrap();
+            let (mut live, offer) = candidate(child, broker, false);
+            live.record.process = ProcessStamp::from(&peer.process);
+            gate.write_all(b"R").unwrap();
+            live.consume_offer(&peer).unwrap();
+            assert!(live.gate_consumed);
+            assert!(!live.offer_may_be_published);
+
+            let committed = std::cell::Cell::new(false);
+            let readbacks = std::cell::Cell::new(0);
+            if outcome != "unreached" {
+                let result = live.publish_offer(
+                    || {
+                        if matches!(outcome, "published" | "post-commit-error") {
+                            committed.set(true);
+                        }
+                        if outcome == "published" {
+                            Ok(())
+                        } else {
+                            Err(io::Error::other("publication failed"))
+                        }
+                    },
+                    || {
+                        readbacks.set(readbacks.get() + 1);
+                        outcome != "ambiguous" && !committed.get()
+                    },
+                );
+                assert_eq!(result.is_ok(), outcome == "published");
+            }
+            assert_eq!(
+                readbacks.get(),
+                usize::from(!matches!(outcome, "unreached" | "published"))
+            );
+            // No second gate consumption/publication admission, including
+            // after an affirmative absence. A new marker remains unread.
+            gate.write_all(b"R").unwrap();
+            assert!(live.consume_offer(&peer).is_err(), "{outcome}");
+            let mut marker = [0u8; 1];
+            live.channel.read_exact(&mut marker).unwrap();
+            assert_eq!(marker, [b'R']);
+            gate.write_all(&failure_frame("offer", "fixture publication failure"))
+                .unwrap();
+            drop(gate);
+            drop(live.child.stdin.take());
+            assert_eq!(
+                wait_exit_unreaped(&pidfd),
+                phase_record::SuccessorExit::Exited(7)
+            );
+            let cleanup = matches!(outcome, "unreached" | "absent");
+            assert_eq!(live.reap_if_exited_before_offer(), cleanup, "{outcome}");
+            let rows = rows_for(&path, &offer);
+            if cleanup {
+                assert_eq!(
+                    wait_exit_unreaped(&pidfd),
+                    phase_record::SuccessorExit::Unobserved("reaped-before-observed")
+                );
+                assert_eq!(rows.len(), 1, "{outcome}: {rows:?}");
+                assert_eq!(rows[0]["k"], "succ_exit");
+                assert_eq!(rows[0]["by"], "pre-offer-reaper");
+                assert_eq!(rows[0]["how"], "exited");
+                assert_eq!(rows[0]["code"], 7);
+                assert_eq!(rows[0]["failure"], "offer:fixture publication failure");
+            } else {
+                assert_eq!(
+                    wait_exit_unreaped(&pidfd),
+                    phase_record::SuccessorExit::Exited(7)
+                );
+                assert!(rows.is_empty(), "{outcome}: {rows:?}");
+                // Retained custody includes the channel: no failure read.
+                let mut frame =
+                    vec![0; failure_frame("offer", "fixture publication failure").len()];
+                live.channel.read_exact(&mut frame).unwrap();
+                assert_eq!(frame, failure_frame("offer", "fixture publication failure"));
+                assert_eq!(live.child.wait().unwrap().code(), Some(7));
+            }
+        }
     }
 
     /// A failure frame is bounded and printable whatever the error text.
