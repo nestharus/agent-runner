@@ -1,7 +1,7 @@
 //! Durable, one-use host entry reservation. A reservation is not permission to
 //! launch a Runner: the guardian must bind it before any future child gate can
 //! be opened. Records remain debt until exact State terminal/publication settlement.
-use crate::identity::{PinnedProcess, observe_incarnation_live};
+use crate::identity::PinnedProcess;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -39,12 +39,23 @@ impl ProcessStamp {
     /// `Ok(false)` only when this exact incarnation is observed gone. A
     /// failed read is unavailable observation, never an exit.
     pub fn observe_live(&self) -> io::Result<bool> {
-        observe_incarnation_live(
+        self.observe_live_after_pin(|| {})
+    }
+
+    fn observe_live_after_pin(&self, after_pin: impl FnOnce()) -> io::Result<bool> {
+        let Some(process) = PinnedProcess::open_recorded(
             self.host_pid,
             &self.boot_id,
             self.starttime_ticks,
             (self.pidns_dev, self.pidns_ino),
-        )
+        )?
+        else {
+            return Ok(false);
+        };
+        after_pin();
+        // Keep the transient pin through the final exact-incarnation check.
+        // Reuse of the numeric PID between proc reads cannot revive this pin.
+        process.observe_live()
     }
 }
 
@@ -647,6 +658,32 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn owner_observation_finishes_on_the_pinned_incarnation() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let stamp = ProcessStamp::from(&PinnedProcess::open(child.id() as i32).unwrap());
+        assert_eq!(stamp.observe_live().unwrap(), true);
+        let mut wrong = stamp.clone();
+        wrong.starttime_ticks += 1;
+        assert_eq!(wrong.observe_live().unwrap(), false);
+
+        // Force exact exit after the recorded incarnation was pinned, before
+        // the final observation. This does not force numeric PID reuse.
+        assert_eq!(
+            stamp
+                .observe_live_after_pin(|| {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                })
+                .unwrap(),
+            false
+        );
+        assert_eq!(stamp.observe_live().unwrap(), false);
+    }
 
     #[test]
     fn concurrent_reservations_are_accounted_by_their_own_live_owner() {

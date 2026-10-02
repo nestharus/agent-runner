@@ -712,6 +712,8 @@ impl RootRegistry {
     /// record stays, pinless exactly as `reattach` leaves a dead PID1 after a
     /// Broker restart, so debt classification, records, fences, receipts and
     /// every obligation keyed by them are unchanged. Nothing is settled.
+    /// Return previously released, still-proven terminal roots too: the caller
+    /// must retry work-pin release if a prior exact-exit observation failed.
     pub fn release_terminal_roots(&mut self) -> Vec<RootRecord> {
         if self.poisoned {
             return Vec::new();
@@ -723,8 +725,12 @@ impl RootRegistry {
             });
         self.live = live;
         let records: Vec<_> = released.into_iter().map(|root| root.record).collect();
-        self.debt.extend(records.iter().cloned());
-        records
+        self.debt.extend(records);
+        self.debt
+            .iter()
+            .filter(|root| self.terminal_verified(root))
+            .cloned()
+            .collect()
     }
 
     /// No automatic retirement. A failed or vanished root remains recorded; it
@@ -1032,8 +1038,17 @@ mod tests {
         );
         assert!(roots.has_debt(), "the observed unfenced exit is debt");
 
-        let (faulted, reattached) =
-            without_descriptors(|| (classify(&roots), reattach(live.clone()).map(|_| ())));
+        let stamp = crate::entry_registry::ProcessStamp::from(&roots.live[0].init);
+        let (faulted, reattached, owner) = without_descriptors(|| {
+            (
+                classify(&roots),
+                reattach(live.clone()).map(|_| ()),
+                stamp.observe_live(),
+            )
+        });
+        let owner = owner.unwrap_err().to_string();
+        assert!(owner.starts_with(OBSERVATION_UNAVAILABLE), "{owner}");
+        assert!(owner.contains("os error 24"), "{owner}");
         let [unobserved, observed_exit] = faulted;
         let unobserved = unobserved.unwrap_err();
         assert!(
@@ -1052,6 +1067,7 @@ mod tests {
 
         // Nothing was recorded: the same classification, lists and files.
         assert_eq!(classify(&roots), before);
+        assert!(stamp.observe_live().unwrap());
         assert_eq!((roots.live.len(), roots.debt.len()), (2, 0));
         assert!(fs::read_dir(temp.path()).unwrap().next().is_none());
         drop(live_gate);
@@ -1156,7 +1172,11 @@ mod tests {
         );
         assert!(roots.pid1_terminal_proof(&done).unwrap());
         assert!(roots.pid1_echild_receipt(&done).unwrap());
-        assert!(roots.release_terminal_roots().is_empty());
+        assert!(without_descriptors(|| roots.release_terminal_roots()).is_empty());
+        // An unavailable later root proof neither returns release authority
+        // nor forgets the root; recovery supplies another work-release chance.
+        assert_eq!(roots.release_terminal_roots(), vec![done.clone()]);
+        assert_eq!(open_descriptors(), before.1 - 2);
 
         // Closed history still accounts the released record afterward.
         roots.admit_closed_historical(&done.root_id).unwrap();
