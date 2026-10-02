@@ -783,9 +783,11 @@ fn verify_installed_successor_gate(
     if fd <= 2 || unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
         return Err("successor inherited descriptor unavailable".into());
     }
-    let mut channel = unsafe { UnixStream::from_raw_fd(fd) };
+    // Kept open on failure, so the candidate can still report why on it.
+    let mut channel = std::mem::ManuallyDrop::new(unsafe { UnixStream::from_raw_fd(fd) });
     let peer = socket_peer(fd)?;
-    let live = UnixStream::connect(broker_socket()).map_err(|e| e.to_string())?;
+    let live = UnixStream::connect(broker_socket())
+        .map_err(|e| format!("successor live Broker connect: {e}"))?;
     let live_peer = socket_peer(live.as_raw_fd())?;
     if peer.uid != 0
         || peer.pid <= 0
@@ -804,7 +806,9 @@ fn verify_installed_successor_gate(
             return Err("successor gate frame too large".into());
         }
         let mut byte = [0];
-        channel.read_exact(&mut byte).map_err(|e| e.to_string())?;
+        channel
+            .read_exact(&mut byte)
+            .map_err(|e| format!("successor gate read: {e}"))?;
         if byte == [b'\n'] {
             break;
         }
@@ -840,7 +844,7 @@ fn verify_installed_successor_gate(
     INSTALLED_SUCCESSOR_GRANT
         .set(InstalledSuccessorGrant {
             message,
-            _channel: channel,
+            _channel: std::mem::ManuallyDrop::into_inner(channel),
         })
         .map_err(|_| "successor gate already installed".into())
 }
@@ -989,9 +993,40 @@ pub(crate) fn installed_successor_entry() -> Option<ExitCode> {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("OULIPOLY_SUCCESSOR_ENTRY_GAP={error}");
+            report_successor_failure("successor", &error);
             ExitCode::FAILURE
         }
     })
+}
+
+/// A successor candidate that fails reports its stage and bounded reason on
+/// the gate it inherited from the Broker, which records it if it reaps the
+/// candidate before any offer. Best effort and never blocking: the exit is
+/// unchanged. Only the gate whose peer is this process's parent is written,
+/// never another descriptor that reused the number.
+pub(crate) fn report_successor_failure(stage: &str, error: &str) {
+    use oulipoly_kernel_broker::successor_launch::{ENTRY_ARG, FD_ENV, failure_frame};
+    if std::env::args().nth(1).as_deref() != Some(ENTRY_ARG) {
+        return;
+    }
+    let Some(fd) = std::env::var(FD_ENV)
+        .ok()
+        .and_then(|number| number.parse::<i32>().ok())
+        .filter(|fd| *fd > 2 && unsafe { libc::fcntl(*fd, libc::F_GETFD) } >= 0)
+    else {
+        return;
+    };
+    if socket_peer(fd).is_ok_and(|peer| peer.pid == unsafe { libc::getppid() }) {
+        let frame = failure_frame(stage, error);
+        unsafe {
+            libc::send(
+                fd,
+                frame.as_ptr().cast(),
+                frame.len(),
+                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+            )
+        };
+    }
 }
 
 fn socket_peer(fd: i32) -> Result<libc::ucred, String> {

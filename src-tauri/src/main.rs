@@ -73,6 +73,7 @@ fn main() -> ExitCode {
     #[cfg(target_os = "linux")]
     if let Err(error) = kernel_entry::verify_installed_entry_route() {
         eprintln!("OULIPOLY_KERNEL_ENTRY_GAP={error}");
+        kernel_entry::report_successor_failure("entry", &error);
         kernel_entry::retain_v30_driver_gap(&error);
         kernel_entry::end_v30_driver_outcome(Err(&error), 1);
         return ExitCode::FAILURE;

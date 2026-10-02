@@ -4826,15 +4826,27 @@ fn installed_normal_status(
     let pending = ledger.status(request_id, generation, peer)?;
     let request = ledger.read(request_id)?;
     let unknown = || format!("unknown {request_id} {generation}\n");
+    // Each unknown answer leaves its branch as this request's stage label
+    // (fixed strings, never content). `status:unknown:proof-*` labels mark
+    // the proof step reached; a pending or exit answer replaces them.
     let control = match ledger.read_control_exit(request_id) {
         Ok(Some(control)) => control,
         Ok(None) if control_live => return Ok(pending),
-        Ok(None) | Err(_) => return Ok(unknown()),
+        Ok(None) => {
+            phase_record::stage("status:unknown:control-exit-absent");
+            return Ok(unknown());
+        }
+        Err(_) => {
+            phase_record::stage("status:unknown:control-exit-unreadable");
+            return Ok(unknown());
+        }
     };
     if !control.e_consumed || control.code.is_none() {
+        phase_record::stage("status:unknown:control-exit-incomplete");
         return Ok(unknown());
     }
     let Some(root_id) = request.root_id.as_deref() else {
+        phase_record::stage("status:unknown:root-unbound");
         return Ok(unknown());
     };
     let intent = FreshV30Lane::open_at(state_root)
@@ -4848,6 +4860,7 @@ fn installed_normal_status(
                 | oulipoly_state::mailbox::FreshRootWorkIntent::CliDiagnostics(_)
         )
     ) {
+        phase_record::stage("status:offline");
         return installed_offline_status(
             ledger, request_id, request, control, pending, state_root, roots, entries, works,
             grants, sources, sidecar,
@@ -4857,14 +4870,17 @@ fn installed_normal_status(
         intent,
         Some(oulipoly_state::mailbox::FreshRootWorkIntent::NormalCli(_))
     ) {
+        phase_record::stage("status:unknown:intent-not-normal");
         return Ok(unknown());
     }
     let proof = (|| -> io::Result<(root_drain::RootPhysicalCloseProof, oulipoly_state::mailbox::BrokerClosedOwner, Option<oulipoly_state::mailbox::FreshSuccessorTerminalAck>, Option<oulipoly_state::mailbox::FreshOriginalReceiptIdentity>)> {
+        phase_record::stage("status:unknown:proof-root-entry");
         let root = roots.record(root_id).ok_or_else(|| io::Error::other("installed root absent"))?;
         let entry = entries.record(root_id).ok_or_else(|| io::Error::other("installed E absent"))?;
         if entry.entry != control.control || entry.owner_uid != request.owner_uid {
             return Err(io::Error::other("installed E/control identity changed"));
         }
+        phase_record::stage("status:unknown:proof-release");
         let lane = FreshV30Lane::open_at(state_root).map_err(io::Error::other)?;
         let (handoff, actor) = lane.released_handoff_for_root(root_id).map_err(io::Error::other)?;
         if !matches!(handoff.root_work_intent, oulipoly_state::mailbox::FreshRootWorkIntent::NormalCli(_))
@@ -4876,15 +4892,19 @@ fn installed_normal_status(
         {
             return Err(io::Error::other("installed normal release/control identity changed"));
         }
+        phase_record::stage("status:unknown:proof-session-k");
         let session = lane.read_session(&handoff.d_key).map_err(io::Error::other)?
             .ok_or_else(|| io::Error::other("installed D absent"))?;
         lane.require_released_invocation(&handoff, &actor, &session).map_err(io::Error::other)?;
         if !lane.normal_provider_k_present(&handoff, &actor, &session).map_err(io::Error::other)? {
             return Err(io::Error::other("installed normal K absent"));
         }
+        phase_record::stage("status:unknown:proof-receipt-ack");
         let successor_ack = root_drain::exact_successor_ack_for_root(&lane, root_id)?;
         let original_receipt = root_drain::exact_original_receipt_for_root(&lane, root_id)?;
+        phase_record::stage("status:unknown:proof-inventory");
         let inventory = root_drain::readback(root, roots, entries, works, grants, sources, Some(sidecar))?;
+        phase_record::stage("status:unknown:proof-settlement");
         let normal = inventory.normal.as_ref().ok_or_else(|| io::Error::other("installed normal Q absent"))?;
         let settlement = entry.terminal_settlement.as_ref()
             .ok_or_else(|| io::Error::other("installed caller settlement absent"))?;
@@ -4900,6 +4920,7 @@ fn installed_normal_status(
         {
             return Err(io::Error::other("installed State/Q/publication identity changed"));
         }
+        phase_record::stage("status:unknown:proof-physical-close");
         let physical = root_drain::physical_close_proof(&inventory)?;
         if physical.successor_ack != successor_ack {
             return Err(io::Error::other("installed successor ACK and owner proof differ"));
@@ -4907,6 +4928,7 @@ fn installed_normal_status(
         if physical.original_receipt != original_receipt {
             return Err(io::Error::other("installed original receipt and owner proof differ"));
         }
+        phase_record::stage("status:unknown:proof-owner-close");
         let owner = inventory.owner_close_proof
             .ok_or_else(|| io::Error::other("installed owner close absent"))?;
         if owner.owner_generation != handoff.old_release.prepared.owner_generation
@@ -4918,6 +4940,7 @@ fn installed_normal_status(
     let stored = ledger.read_terminal(request_id);
     match (proof, stored) {
         (Ok((physical, owner, successor_ack, original_receipt)), Ok(stored)) => {
+            phase_record::stage("status:certificate");
             let certificate = NormalTerminalCertificate {
                 protocol: String::new(),
                 request,
@@ -4945,8 +4968,10 @@ fn installed_normal_status(
                 || current.successor_ack != certificate.successor_ack
                 || current.original_receipt != certificate.original_receipt
             {
+                phase_record::stage("status:unknown:terminal-differs");
                 return Ok(unknown());
             }
+            phase_record::stage("status:exit");
             Ok(format!("exit {} drained {request_id}\n", current.exit_code))
         }
         (Err(_), Ok(None)) => {
@@ -4977,9 +5002,21 @@ fn installed_normal_status(
                             || inventory.owner_close_preflight
                             || root_drain::physical_close_proof(&inventory).is_ok())
                 });
-            Ok(if progressing { pending } else { unknown() })
+            if progressing {
+                phase_record::stage("status:pending");
+                return Ok(pending);
+            }
+            // Not progressing: the label left is the proof step that failed.
+            Ok(unknown())
         }
-        _ => Ok(unknown()),
+        (_, Err(_)) => {
+            phase_record::stage("status:unknown:terminal-unreadable");
+            Ok(unknown())
+        }
+        (Err(_), Ok(Some(_))) => {
+            phase_record::stage("status:unknown:stored-terminal-unproven");
+            Ok(unknown())
+        }
     }
 }
 
@@ -5004,9 +5041,11 @@ fn installed_offline_status(
     let generation = request.pair_generation.clone();
     let unknown = || format!("unknown {request_id} {generation}\n");
     let Some(code) = control.code else {
+        phase_record::stage("status:unknown:offline-control-code-absent");
         return Ok(unknown());
     };
     if !control.e_consumed {
+        phase_record::stage("status:unknown:offline-control-unconsumed");
         return Ok(unknown());
     }
     let proof = (|| -> io::Result<_> {
@@ -5080,6 +5119,7 @@ fn installed_offline_status(
     let stored = ledger.read_terminal(request_id);
     match (proof, stored) {
         (Ok((physical, owner)), Ok(stored)) => {
+            phase_record::stage("status:offline-certificate");
             let certificate = NormalTerminalCertificate {
                 protocol: String::new(),
                 request,
@@ -5103,8 +5143,10 @@ fn installed_offline_status(
                 || current.successor_ack != certificate.successor_ack
                 || current.original_receipt != certificate.original_receipt
             {
+                phase_record::stage("status:unknown:offline-terminal-differs");
                 return Ok(unknown());
             }
+            phase_record::stage("status:offline-exit");
             Ok(format!("exit {code} drained {request_id}\n"))
         }
         (Err(_), Ok(None)) => {
@@ -5131,9 +5173,21 @@ fn installed_offline_status(
                             || inventory.owner_close_preflight
                             || root_drain::physical_close_proof(&inventory).is_ok())
                 });
+            phase_record::stage(if progressing {
+                "status:offline-pending"
+            } else {
+                "status:unknown:offline-proof"
+            });
             Ok(if progressing { pending } else { unknown() })
         }
-        _ => Ok(unknown()),
+        (_, Err(_)) => {
+            phase_record::stage("status:unknown:offline-terminal-unreadable");
+            Ok(unknown())
+        }
+        (Err(_), Ok(Some(_))) => {
+            phase_record::stage("status:unknown:offline-stored-terminal-unproven");
+            Ok(unknown())
+        }
     }
 }
 
@@ -8843,6 +8897,12 @@ fn fresh_v30_worker(
     #[cfg(feature = "age319-private-broker-fixture")]
     let mut native_f_execs: HashMap<String, fresh_provider::NativeFExec> = HashMap::new();
     for job in jobs {
+        // A candidate seen exited before any offer was accepted from it is
+        // reaped here and recorded; only its live handle leaves this map.
+        // Offered candidates keep theirs until ACK. The fixture build never
+        // marks an offer, so it cannot tell "before offer" and reaps nothing.
+        #[cfg(not(feature = "age319-private-broker-fixture"))]
+        live_successors.retain(|_, live| !live.reap_if_exited_before_offer());
         let FreshV30Job {
             mut stream,
             request,
