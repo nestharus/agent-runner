@@ -8897,10 +8897,10 @@ fn fresh_v30_worker(
     #[cfg(feature = "age319-private-broker-fixture")]
     let mut native_f_execs: HashMap<String, fresh_provider::NativeFExec> = HashMap::new();
     for job in jobs {
-        // A candidate seen exited before any offer was accepted from it is
+        // A candidate seen exited without a durably published offer is
         // reaped here and recorded; only its live handle leaves this map.
-        // Offered candidates keep theirs until ACK. The fixture build never
-        // marks an offer, so it cannot tell "before offer" and reaps nothing.
+        // Published or ambiguous offers keep custody until ACK. The fixture
+        // build does not track publication, so this cleanup is compiled out.
         #[cfg(not(feature = "age319-private-broker-fixture"))]
         live_successors.retain(|_, live| !live.reap_if_exited_before_offer());
         let FreshV30Job {
@@ -11533,15 +11533,28 @@ fn fresh_v30_worker(
                                     ));
                                 }
                             }
-                            let offer = lane
-                                .offer_successor(
+                            let publish = || {
+                                lane.offer_successor(
                                     &offer_request_id,
                                     &session,
                                     seq,
                                     &source_id,
                                     &recipient,
                                 )
-                                .map_err(io::Error::other)?;
+                            };
+                            #[cfg(not(feature = "age319-private-broker-fixture"))]
+                            let offer = live_successors
+                                .get_mut(&offer_request_id)
+                                .ok_or_else(|| io::Error::other("successor live gate absent"))?
+                                .publish_offer(publish, || {
+                                    matches!(
+                                        lane.read_successor_offer(&offer_request_id, &recipient),
+                                        Ok(None)
+                                    )
+                                });
+                            #[cfg(feature = "age319-private-broker-fixture")]
+                            let offer = publish();
+                            let offer = offer.map_err(io::Error::other)?;
                             #[cfg(not(feature = "age319-private-broker-fixture"))]
                             {
                                 let decision = lane
