@@ -8,6 +8,7 @@
 //! incarnation and then carried by an exact record fingerprint, so admission
 //! cost does not repeat the retained State/physical joins for every old root.
 use crate::entry_registry::EntryRecord;
+use crate::identity::OBSERVATION_UNAVAILABLE;
 use oulipoly_state::mailbox::BrokerStateCloseCursor;
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -24,6 +25,8 @@ pub enum RootState {
     /// The root PID1 is gone. Only a durable admission fence places it in the
     /// Broker-owned close progression.
     Exited { fenced: bool },
+    /// The Broker could not observe the root PID1: neither live nor exited.
+    Unobserved,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -32,8 +35,9 @@ pub struct EntryFacts<'a> {
     /// Caller result settled or offline close marked.
     pub settled: bool,
     /// For an unsettled entry: its exact reserving process (and any prepared
-    /// guardian or driver) is still live on this boot.
-    pub owner_live: bool,
+    /// guardian or driver) is still live on this boot. `None` when the Broker
+    /// could not observe it: neither live nor gone.
+    pub owner_live: Option<bool>,
     pub root: RootState,
     /// The exact record already passed the full close join in this incarnation.
     pub closed_cached: bool,
@@ -53,7 +57,9 @@ pub enum Disposition {
 
 /// Classify every entry and refuse orphan or unaccounted debt. `artifact_roots`
 /// yields the root ID of every live or debt root, live or debt work, grant,
-/// native grant and physical source.
+/// native grant and physical source. An entry whose classification depends on
+/// an unavailable observation is never admitted and never debt: absent any
+/// observed debt, the refusal names it as unavailable observation.
 pub fn account_entries<'a>(
     entries: &[EntryFacts<'_>],
     artifact_roots: impl IntoIterator<Item = &'a str>,
@@ -69,24 +75,41 @@ pub fn account_entries<'a>(
     if known.len() != entries.len() || artifacts.any(|root_id| !known.contains(root_id)) {
         return Err(io::Error::other("unaccounted prior root or work debt"));
     }
-    entries
+    let mut unobserved = None;
+    let dispositions = entries
         .iter()
         .map(|entry| {
             if entry.closed_cached {
-                return Ok(Disposition::Closed);
+                return Ok(Some(Disposition::Closed));
             }
-            match entry.root {
-                RootState::Absent if entry.settled => {
+            match (entry.root, entry.owner_live) {
+                (RootState::Unobserved, _) => Ok(None),
+                (RootState::Absent, _) if entry.settled => {
                     Err(io::Error::other("prior entry has no exact root"))
                 }
-                RootState::Absent | RootState::Live if entry.settled || entry.owner_live => {
-                    Ok(Disposition::InFlight)
+                (RootState::Absent | RootState::Live, Some(true)) => {
+                    Ok(Some(Disposition::InFlight))
                 }
-                RootState::Exited { fenced: true } => Ok(Disposition::CloseCandidate),
+                (RootState::Absent | RootState::Live, _) if entry.settled => {
+                    Ok(Some(Disposition::InFlight))
+                }
+                (RootState::Absent | RootState::Live, None) => Ok(None),
+                (RootState::Exited { fenced: true }, _) => Ok(Some(Disposition::CloseCandidate)),
                 _ => Err(io::Error::other("unaccounted prior root or work debt")),
             }
+            .inspect(|disposition| {
+                if disposition.is_none() {
+                    unobserved.get_or_insert(entry.root_id);
+                }
+            })
         })
-        .collect()
+        .collect::<io::Result<Vec<_>>>()?;
+    if let Some(root_id) = unobserved {
+        return Err(io::Error::other(format!(
+            "{OBSERVATION_UNAVAILABLE}: prior entry {root_id}"
+        )));
+    }
+    Ok(dispositions.into_iter().flatten().collect())
 }
 
 /// Account the closed entries' State close cursors against the current head.
@@ -221,7 +244,7 @@ mod tests {
         EntryFacts {
             root_id,
             settled,
-            owner_live,
+            owner_live: Some(owner_live),
             root,
             closed_cached: false,
         }
@@ -323,6 +346,52 @@ mod tests {
             )];
             assert_eq!(
                 message(account_entries(&entries, [A])),
+                "unaccounted prior root or work debt"
+            );
+        }
+    }
+
+    #[test]
+    fn unobserved_root_or_owner_is_neither_admitted_nor_debt() {
+        let unavailable = |result: io::Result<Vec<Disposition>>| {
+            let message = message(result);
+            assert!(message.starts_with(OBSERVATION_UNAVAILABLE), "{message}");
+            message
+        };
+        let mut unknown_owner = facts(A, RootState::Live, false, false);
+        unknown_owner.owner_live = None;
+        for entry in [
+            facts(A, RootState::Unobserved, false, true),
+            facts(A, RootState::Unobserved, true, false),
+            unknown_owner,
+            EntryFacts {
+                root: RootState::Absent,
+                ..unknown_owner
+            },
+        ] {
+            assert!(unavailable(account_entries(&[entry], [A])).ends_with(A));
+        }
+        // An observed fenced exit or a settled entry does not need the owner.
+        let fenced = EntryFacts {
+            root: RootState::Exited { fenced: true },
+            ..unknown_owner
+        };
+        let settled = EntryFacts {
+            root_id: B,
+            settled: true,
+            ..unknown_owner
+        };
+        assert_eq!(
+            account_entries(&[fenced, settled], [A, B]).unwrap(),
+            [Disposition::CloseCandidate, Disposition::InFlight]
+        );
+        // Observed debt still refuses as debt beside an unobserved sibling.
+        for debt in [
+            facts(B, RootState::Exited { fenced: false }, true, true),
+            facts(B, RootState::Live, false, false),
+        ] {
+            assert_eq!(
+                message(account_entries(&[unknown_owner, debt], [A, B])),
                 "unaccounted prior root or work debt"
             );
         }

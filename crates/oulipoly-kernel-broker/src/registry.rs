@@ -1,4 +1,5 @@
-use crate::identity::{ChildExit, PinnedProcess, boot_id};
+use crate::admission_accounting::RootState;
+use crate::identity::{ChildExit, PinnedProcess, observation_unavailable};
 use crate::json_artifact;
 use crate::root_pid1;
 use oulipoly_state::mailbox::BrokerStateCloseCursor;
@@ -54,22 +55,27 @@ pub struct RootRegistry {
     poisoned: bool,
 }
 
-fn reattach(record: RootRecord) -> Result<LiveRoot, RootRecord> {
-    if record.version != 1 || boot_id().ok().as_deref() != Some(record.boot_id.as_str()) {
-        return Err(record);
+/// `Ok(Err(record))` when the recorded PID1 is observed gone or is not that
+/// exact namespace init. A failure to observe it is an error, not an exit.
+fn reattach(record: RootRecord) -> io::Result<Result<LiveRoot, RootRecord>> {
+    if record.version != 1 {
+        return Ok(Err(record));
     }
-    let Ok(init) = PinnedProcess::open(record.init_host_pid) else {
-        return Err(record);
+    let Some(init) = PinnedProcess::open_recorded(
+        record.init_host_pid,
+        &record.boot_id,
+        record.init_starttime_ticks,
+        (record.pidns_dev, record.pidns_ino),
+    )?
+    else {
+        return Ok(Err(record));
     };
-    if init.boot_id != record.boot_id
-        || init.starttime_ticks != record.init_starttime_ticks
-        || init.pidns_dev != record.pidns_dev
-        || init.pidns_ino != record.pidns_ino
-        || !matches!(init.is_namespace_init(), Ok(true))
-    {
-        return Err(record);
+    match init.is_namespace_init() {
+        Ok(true) => Ok(Ok(LiveRoot { record, init })),
+        Ok(false) => Ok(Err(record)),
+        Err(_) if !init.observe_live()? => Ok(Err(record)),
+        Err(error) => Err(observation_unavailable(error)),
     }
-    Ok(LiveRoot { record, init })
 }
 
 impl RootRegistry {
@@ -269,7 +275,7 @@ impl RootRegistry {
             {
                 return Err(io::Error::other("registry filename/ID mismatch"));
             }
-            match reattach(record) {
+            match reattach(record)? {
                 Ok(root) => registry.live.push(root),
                 Err(record) => registry.debt.push(record),
             }
@@ -539,6 +545,24 @@ impl RootRegistry {
         Ok(())
     }
 
+    /// Admission classification of one entry's root. A live-list root is
+    /// `Exited` only when its pidfd reports the exit; a failure to observe it
+    /// is unavailable observation and records nothing.
+    pub fn admission_state(&self, root_id: &str) -> io::Result<RootState> {
+        let exited = || RootState::Exited {
+            fenced: self.admission_fenced(root_id),
+        };
+        match self.live.iter().find(|root| root.record.root_id == root_id) {
+            Some(root) => Ok(if root.init.observe_live()? {
+                RootState::Live
+            } else {
+                exited()
+            }),
+            None if self.debt.iter().any(|root| root.root_id == root_id) => Ok(exited()),
+            None => Ok(RootState::Absent),
+        }
+    }
+
     pub fn admission_fenced(&self, root_id: &str) -> bool {
         self.poisoned
             || self
@@ -660,7 +684,7 @@ impl RootRegistry {
             return Err(io::Error::other("uncertain root debt"));
         }
         let root =
-            reattach(record.clone()).map_err(|_| io::Error::other("init identity changed"))?;
+            reattach(record.clone())?.map_err(|_| io::Error::other("init identity changed"))?;
         if self.live.iter().any(|r| {
             r.record.root_id == record.root_id
                 || (r.record.pidns_dev, r.record.pidns_ino) == (record.pidns_dev, record.pidns_ino)
@@ -723,7 +747,7 @@ fn is_fresh_staging_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::ChildExit;
+    use crate::identity::{ChildExit, OBSERVATION_UNAVAILABLE};
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
     use std::time::{Duration, Instant};
@@ -915,6 +939,122 @@ mod tests {
     fn reap(pid: i32) {
         let mut status = 0;
         assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+    }
+
+    /// Run `observe` with no descriptor available to this process. Only a
+    /// re-executed disposable test process calls this.
+    fn without_descriptors<T>(observe: impl FnOnce() -> T) -> T {
+        // Fill the descriptor table below a small soft limit, as an
+        // exhausted Broker would have it; existing descriptors keep working.
+        let mut saved = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut saved) },
+            0
+        );
+        let small = libc::rlimit {
+            rlim_cur: 64,
+            rlim_max: saved.rlim_max,
+        };
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &small) }, 0);
+        let mut filled = Vec::new();
+        loop {
+            let fd = unsafe { libc::dup(2) };
+            if fd < 0 {
+                assert_eq!(
+                    io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EMFILE)
+                );
+                break;
+            }
+            filled.push(fd);
+        }
+        let probe = fs::File::open("/proc/self/stat").map(drop);
+        let result = observe();
+        for fd in filled {
+            unsafe { libc::close(fd) };
+        }
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &saved) }, 0);
+        assert_eq!(probe.unwrap_err().raw_os_error(), Some(libc::EMFILE));
+        result
+    }
+
+    /// EMFILE while observing a live root is unavailable observation: neither
+    /// an exit nor debt, and nothing changes. A pinned root's exit is still
+    /// observed through its pidfd. The fault runs in a re-executed process.
+    #[test]
+    fn failed_observation_is_unavailable_not_exit_and_records_nothing() {
+        const NAME: &str =
+            "registry::tests::failed_observation_is_unavailable_not_exit_and_records_nothing";
+        if std::env::var_os("AGE380_OBSERVATION_TEST_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env("AGE380_OBSERVATION_TEST_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "disposable observation control failed");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let (live_init, live_gate) = gated_child();
+        let (exited_init, mut exited_gate) = gated_child();
+        let live = record(&uuid::Uuid::new_v4().to_string(), &live_init);
+        let exited = record(&uuid::Uuid::new_v4().to_string(), &exited_init);
+        exited_gate.write_all(&[1]).unwrap();
+        reap(exited_init.host_pid);
+        let roots = RootRegistry {
+            directory: temp.path().into(),
+            live: [(&live, live_init), (&exited, exited_init)]
+                .into_iter()
+                .map(|(record, init)| LiveRoot {
+                    record: record.clone(),
+                    init,
+                })
+                .collect(),
+            debt: Vec::new(),
+            closed_historical: Default::default(),
+            admission_fences: Vec::new(),
+            poisoned: false,
+        };
+        let classify = |roots: &RootRegistry| {
+            [&live, &exited].map(|root| {
+                roots
+                    .admission_state(&root.root_id)
+                    .map_err(|error| error.to_string())
+            })
+        };
+        let before = classify(&roots);
+        assert_eq!(
+            before,
+            [Ok(RootState::Live), Ok(RootState::Exited { fenced: false })]
+        );
+        assert!(roots.has_debt(), "the observed unfenced exit is debt");
+
+        let (faulted, reattached) =
+            without_descriptors(|| (classify(&roots), reattach(live.clone()).map(|_| ())));
+        let [unobserved, observed_exit] = faulted;
+        let unobserved = unobserved.unwrap_err();
+        assert!(
+            unobserved.starts_with(OBSERVATION_UNAVAILABLE),
+            "{unobserved}"
+        );
+        assert!(unobserved.contains("os error 24"), "{unobserved}");
+        assert_eq!(observed_exit, Ok(RootState::Exited { fenced: false }));
+        // A restart that cannot observe a recorded root does not file it as
+        // a dead PID1.
+        let reattached = reattached.unwrap_err().to_string();
+        assert!(
+            reattached.starts_with(OBSERVATION_UNAVAILABLE),
+            "{reattached}"
+        );
+
+        // Nothing was recorded: the same classification, lists and files.
+        assert_eq!(classify(&roots), before);
+        assert_eq!((roots.live.len(), roots.debt.len()), (2, 0));
+        assert!(fs::read_dir(temp.path()).unwrap().next().is_none());
+        drop(live_gate);
     }
 
     /// PID1 receipts are root-only files, so this runs as mapped root in a

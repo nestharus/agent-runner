@@ -61,8 +61,8 @@ use oulipoly_kernel_broker::entry_registry::{
 };
 use oulipoly_kernel_broker::first_install_activation::{FirstInstallActivation, PairPaths};
 use oulipoly_kernel_broker::identity::{
-    PeerIdentity, PinnedProcess, host_proc_file, host_proc_uid, install_detached_host_proc,
-    observed_incarnation_gone,
+    OBSERVATION_UNAVAILABLE, PeerIdentity, PinnedProcess, host_proc_file, host_proc_uid,
+    install_detached_host_proc, observed_incarnation_gone,
 };
 use oulipoly_kernel_broker::installed_launch::{self, InstalledLaunchSpec};
 use oulipoly_kernel_broker::installed_launch_ledger::{
@@ -4447,6 +4447,9 @@ fn require_accounted_entries(
     read_only: bool,
 ) -> io::Result<()> {
     let mut closed_cursors = Vec::new();
+    // A failed observation (EMFILE included) is neither live nor exited. It
+    // makes its entry unobserved, never debt; the refusal carries its cause.
+    let mut unavailable: Vec<(&str, io::Error)> = Vec::new();
     let dispositions = {
         let history = closed_history(state_root)?;
         let facts: Vec<EntryFacts<'_>> = entries
@@ -4459,15 +4462,27 @@ fn require_accounted_entries(
                 }
                 let settled =
                     entry.terminal_settlement.is_some() || entry.offline_close_sha256.is_some();
+                let root = if cached.is_some() {
+                    RootState::Absent
+                } else {
+                    roots
+                        .admission_state(&entry.root_id)
+                        .unwrap_or_else(|error| {
+                            unavailable.push((&entry.root_id, error));
+                            RootState::Unobserved
+                        })
+                };
                 EntryFacts {
                     root_id: &entry.root_id,
                     settled,
-                    owner_live: cached.is_none() && !settled && EntryRegistry::owner_live(entry),
-                    root: if cached.is_some() {
-                        RootState::Absent
+                    owner_live: if cached.is_none() && !settled {
+                        EntryRegistry::owner_live(entry)
+                            .map_err(|error| unavailable.push((&entry.root_id, error)))
+                            .ok()
                     } else {
-                        admission_root_state(roots, &entry.root_id)
+                        Some(false)
                     },
+                    root,
                     closed_cached: cached.is_some(),
                 }
             })
@@ -4503,7 +4518,24 @@ fn require_accounted_entries(
                         .iter()
                         .map(|source| source.grant.root_id.as_str()),
                 ),
-        )?
+        )
+        .map_err(|error| {
+            let message = error.to_string();
+            match unavailable.iter().find(|(root_id, _)| {
+                message == format!("{OBSERVATION_UNAVAILABLE}: prior entry {root_id}")
+            }) {
+                Some((_, cause)) => io::Error::new(
+                    cause.kind(),
+                    format!(
+                        "{message}: {}",
+                        cause
+                            .to_string()
+                            .trim_start_matches(&format!("{OBSERVATION_UNAVAILABLE}: "))
+                    ),
+                ),
+                None => error,
+            }
+        })?
     };
     let candidates = dispositions.contains(&Disposition::CloseCandidate);
     // Read before any join: a concurrent owner close on the old writer loop
@@ -4602,25 +4634,6 @@ fn require_accounted_entries(
         cache.insert(record, cursor);
     }
     Ok(())
-}
-
-fn admission_root_state(roots: &RootRegistry, root_id: &str) -> RootState {
-    match roots
-        .live_roots()
-        .find(|root| root.record.root_id == root_id)
-    {
-        Some(root) if root.init.verify().is_ok() => RootState::Live,
-        None if !roots
-            .debt_records()
-            .iter()
-            .any(|root| root.root_id == root_id) =>
-        {
-            RootState::Absent
-        }
-        _ => RootState::Exited {
-            fenced: roots.admission_fenced(root_id),
-        },
-    }
 }
 
 struct ClosedEntryJoin {
@@ -12648,6 +12661,138 @@ mod admission_fence_tests {
             ordinary_command: None,
             ordinary_k_digest: None,
         }
+    }
+
+    /// EMFILE while observing an entry owner refuses admission as unavailable
+    /// observation, not as debt, and leaves classification unchanged. A dead
+    /// owner is still refused as debt. The fault runs in a re-executed process
+    /// as mapped root in a disposable user namespace (root-only registries).
+    #[test]
+    fn exhausted_descriptors_refuse_as_unavailable_observation_not_debt() {
+        use std::os::unix::fs::DirBuilderExt;
+        const NAME: &str = "linux_main::admission_fence_tests::exhausted_descriptors_refuse_as_unavailable_observation_not_debt";
+        if std::env::var_os("AGE380_OBSERVATION_TEST_CHILD").is_none() {
+            let status = std::process::Command::new("unshare")
+                .arg("-Ur")
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env("AGE380_OBSERVATION_TEST_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "disposable observation control failed");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let (state, other) = (temp.path().join("state"), temp.path().join("other"));
+        for directory in [
+            state.join("entries"),
+            state.join("works"),
+            other.join("grants"),
+            other.join("sources"),
+        ] {
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(directory)
+                .unwrap();
+        }
+        let mut roots = RootRegistry::open(&state).unwrap();
+        let mut works = WorkRegistry::open(state.join("works"), &roots).unwrap();
+        let mut entries = EntryRegistry::open(state.join("entries")).unwrap();
+        let grants = GrantRegistry::open(other.join("grants")).unwrap();
+        let sources = SourcePhysicalRegistry::open(other.join("sources")).unwrap();
+        let mut owner = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let root_id = entries
+            .reserve(
+                unsafe { libc::getuid() },
+                &PinnedProcess::open(owner.id() as i32).unwrap(),
+            )
+            .unwrap();
+        let durable = || {
+            let mut files: Vec<_> = fs::read_dir(state.join("entries"))
+                .unwrap()
+                .map(|file| {
+                    let path = file.unwrap().path();
+                    (fs::read(&path).unwrap(), path)
+                })
+                .collect();
+            files.sort();
+            files
+        };
+        let account =
+            |roots: &mut RootRegistry, entries: &mut EntryRegistry, works: &mut WorkRegistry| {
+                require_accounted_entries(
+                    &state, None, roots, entries, works, &grants, &sources, None, false,
+                )
+                .map_err(|error| error.to_string())
+            };
+        account(&mut roots, &mut entries, &mut works).unwrap();
+        let before = durable();
+
+        let refused =
+            without_descriptors(|| account(&mut roots, &mut entries, &mut works).unwrap_err());
+        assert!(
+            refused.starts_with(&format!("{OBSERVATION_UNAVAILABLE}: prior entry {root_id}")),
+            "{refused}"
+        );
+        assert!(refused.contains("os error 24"), "{refused}");
+        assert!(!refused.contains("debt"), "{refused}");
+        assert_eq!(durable(), before);
+        // The same in-flight sibling once observation is available again.
+        account(&mut roots, &mut entries, &mut works).unwrap();
+
+        owner.kill().unwrap();
+        owner.wait().unwrap();
+        assert_eq!(
+            account(&mut roots, &mut entries, &mut works).unwrap_err(),
+            "unaccounted prior root or work debt"
+        );
+        // Without descriptors even the dead owner cannot be observed.
+        let refused =
+            without_descriptors(|| account(&mut roots, &mut entries, &mut works).unwrap_err());
+        assert!(refused.starts_with(OBSERVATION_UNAVAILABLE), "{refused}");
+        assert_eq!(durable(), before);
+    }
+
+    fn without_descriptors<T>(observe: impl FnOnce() -> T) -> T {
+        // Fill the descriptor table below a small soft limit, as an
+        // exhausted Broker would have it; existing descriptors keep working.
+        let mut saved = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut saved) },
+            0
+        );
+        let small = libc::rlimit {
+            rlim_cur: 64,
+            rlim_max: saved.rlim_max,
+        };
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &small) }, 0);
+        let mut filled = Vec::new();
+        loop {
+            let fd = unsafe { libc::dup(2) };
+            if fd < 0 {
+                assert_eq!(
+                    io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EMFILE)
+                );
+                break;
+            }
+            filled.push(fd);
+        }
+        let probe = File::open("/proc/self/stat").map(drop);
+        let result = observe();
+        for fd in filled {
+            unsafe { libc::close(fd) };
+        }
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &saved) }, 0);
+        assert_eq!(probe.unwrap_err().raw_os_error(), Some(libc::EMFILE));
+        result
     }
 
     #[test]

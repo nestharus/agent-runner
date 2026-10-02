@@ -1,7 +1,7 @@
 //! Durable, one-use host entry reservation. A reservation is not permission to
 //! launch a Runner: the guardian must bind it before any future child gate can
 //! be opened. Records remain debt until exact State terminal/publication settlement.
-use crate::identity::{PinnedProcess, boot_id};
+use crate::identity::{PinnedProcess, observe_incarnation_live};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -34,6 +34,17 @@ impl ProcessStamp {
     fn matches(&self, process: &PinnedProcess) -> io::Result<bool> {
         process.verify()?;
         Ok(self == &Self::from(process))
+    }
+
+    /// `Ok(false)` only when this exact incarnation is observed gone. A
+    /// failed read is unavailable observation, never an exit.
+    pub fn observe_live(&self) -> io::Result<bool> {
+        observe_incarnation_live(
+            self.host_pid,
+            &self.boot_id,
+            self.starttime_ticks,
+            (self.pidns_dev, self.pidns_ino),
+        )
     }
 }
 
@@ -597,29 +608,28 @@ impl EntryRegistry {
                 .records
                 .iter()
                 .filter(|r| r.terminal_settlement.is_none() && r.offline_close_sha256.is_none())
-                .any(|r| !Self::owner_live(r))
+                .any(|r| !matches!(Self::owner_live(r), Ok(true)))
     }
 
     /// An unsettled entry is an accounted in-flight sibling only while its
     /// exact reserving process and any prepared guardian or driver still live.
-    pub fn owner_live(r: &EntryRecord) -> bool {
-        boot_id().ok().as_deref() == Some(r.entry.boot_id.as_str())
-            && PinnedProcess::open(r.entry.host_pid)
-                .and_then(|p| r.entry.matches(&p))
-                .ok()
-                == Some(true)
-            && r.prepared_guardian.as_ref().is_none_or(|stamp| {
-                PinnedProcess::open(stamp.host_pid)
-                    .and_then(|p| stamp.matches(&p))
-                    .ok()
-                    == Some(true)
-            })
-            && r.prepared_driver.as_ref().is_none_or(|stamp| {
-                PinnedProcess::open(stamp.host_pid)
-                    .and_then(|p| stamp.matches(&p))
-                    .ok()
-                    == Some(true)
-            })
+    /// `Ok(false)` only when one of them is observed gone; otherwise a failed
+    /// read is unavailable observation, neither live nor gone.
+    pub fn owner_live(r: &EntryRecord) -> io::Result<bool> {
+        let mut unavailable = None;
+        for stamp in std::iter::once(&r.entry)
+            .chain(&r.prepared_guardian)
+            .chain(&r.prepared_driver)
+        {
+            match stamp.observe_live() {
+                Ok(true) => {}
+                Ok(false) => return Ok(false),
+                Err(error) => {
+                    unavailable.get_or_insert(error);
+                }
+            }
+        }
+        unavailable.map_or(Ok(true), Err)
     }
 
     pub fn has_unsettled_join(&self) -> bool {
@@ -658,7 +668,12 @@ mod tests {
             .reserve_exact_after_prior_close(1000, &sibling, &b)
             .unwrap();
         assert!(!registry.has_debt());
-        assert!(registry.records().iter().all(EntryRegistry::owner_live));
+        assert!(
+            registry
+                .records()
+                .iter()
+                .all(|r| EntryRegistry::owner_live(r).unwrap())
+        );
         // Own IDs stay one-use: neither the root ID nor the owner may be reused.
         let mut third_process = std::process::Command::new("sleep")
             .arg("30")
@@ -682,8 +697,8 @@ mod tests {
         sibling_process.wait().unwrap();
         assert!(registry.has_debt());
         let reopened = EntryRegistry::open(temp.path()).unwrap();
-        assert!(!EntryRegistry::owner_live(reopened.record(&b).unwrap()));
-        assert!(EntryRegistry::owner_live(reopened.record(&a).unwrap()));
+        assert!(!EntryRegistry::owner_live(reopened.record(&b).unwrap()).unwrap());
+        assert!(EntryRegistry::owner_live(reopened.record(&a).unwrap()).unwrap());
     }
 
     #[test]
