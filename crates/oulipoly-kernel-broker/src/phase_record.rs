@@ -718,9 +718,22 @@ impl OwnerCloseTrace {
 pub enum SuccessorExit {
     Exited(i32),
     Signaled(i32),
-    /// The status could not be observed (the child was already reaped, or
-    /// the wait failed): unknown, never success.
+    /// The status could not be observed (the child was already reaped):
+    /// unknown, never success.
     Unobserved(&'static str),
+    /// The wait itself failed with this errno: unknown, never success.
+    WaitFailed(&'static str, i32),
+}
+
+fn successor_exit_fields(exit: &SuccessorExit) -> (&'static str, i32, i32, String) {
+    match exit {
+        SuccessorExit::Exited(code) => ("exited", *code, 0, String::new()),
+        SuccessorExit::Signaled(signal) => ("signaled", 0, *signal, String::new()),
+        SuccessorExit::Unobserved(reason) => ("unobserved", 0, 0, (*reason).into()),
+        SuccessorExit::WaitFailed(reason, errno) => {
+            ("unobserved", 0, 0, format!("{reason}-errno-{errno}"))
+        }
+    }
 }
 
 /// Records that the Broker spawned a successor for one offer.
@@ -750,15 +763,34 @@ pub fn successor_exited(
     if RECORDER.get().is_none() {
         return;
     }
-    let (how, code, signal, reason) = match exit {
-        SuccessorExit::Exited(code) => ("exited", *code, 0, ""),
-        SuccessorExit::Signaled(signal) => ("signaled", 0, *signal, ""),
-        SuccessorExit::Unobserved(reason) => ("unobserved", 0, 0, *reason),
-    };
+    let (how, code, signal, reason) = successor_exit_fields(exit);
     emit(format!(
         "{{\"k\":\"succ_exit\",\"offer\":{},\"pid\":{pid},\"st\":{starttime},\"by\":\"{by}\",\"at\":{},\"how\":\"{how}\",\"code\":{code},\"sig\":{signal},\"reason\":\"{reason}\"}}",
         root_json(offer),
         mono_ns()
+    ));
+}
+
+/// Records a successor the Broker reaped because it exited before any offer
+/// was accepted from it, with what it reported on its gate (`failure`: its
+/// stage and bounded reason, or that it left none). One row per such
+/// failure; offered and successful successors never write one.
+pub fn successor_failed_before_offer(
+    offer: &str,
+    pid: i32,
+    starttime: u64,
+    exit: &SuccessorExit,
+    failure: &str,
+) {
+    if RECORDER.get().is_none() {
+        return;
+    }
+    let (how, code, signal, reason) = successor_exit_fields(exit);
+    emit(format!(
+        "{{\"k\":\"succ_exit\",\"offer\":{},\"pid\":{pid},\"st\":{starttime},\"by\":\"pre-offer-reaper\",\"at\":{},\"how\":\"{how}\",\"code\":{code},\"sig\":{signal},\"reason\":\"{reason}\",\"failure\":{}}}",
+        root_json(offer),
+        mono_ns(),
+        serde_json::Value::from(failure),
     ));
 }
 
