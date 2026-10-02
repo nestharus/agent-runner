@@ -69,9 +69,12 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     #[cfg(target_os = "linux")]
+    kernel_entry::begin_v30_driver_outcome();
+    #[cfg(target_os = "linux")]
     if let Err(error) = kernel_entry::verify_installed_entry_route() {
         eprintln!("OULIPOLY_KERNEL_ENTRY_GAP={error}");
         kernel_entry::retain_v30_driver_gap(&error);
+        kernel_entry::end_v30_driver_outcome(Err(&error), 1);
         return ExitCode::FAILURE;
     }
     ordinary_entrypoint(production_entrypoint)
@@ -124,10 +127,17 @@ fn production_entrypoint() -> ExitCode {
     #[cfg(target_os = "linux")]
     if let Some(result) = completion_owner::custodian_entry() {
         return match result {
-            Ok(()) => ExitCode::SUCCESS,
+            Ok(()) => {
+                kernel_entry::end_v30_driver_outcome(Ok(()), 0);
+                ExitCode::SUCCESS
+            }
             Err(error) => {
                 eprintln!("{error}");
                 kernel_entry::retain_v30_driver_gap(&error);
+                kernel_entry::end_v30_driver_outcome(
+                    Err(&error),
+                    completion_owner::custodian_failure_code(&error),
+                );
                 completion_owner::custodian_failure_exit(&error)
             }
         };

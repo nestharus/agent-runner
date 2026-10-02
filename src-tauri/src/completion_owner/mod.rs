@@ -428,6 +428,16 @@ pub(crate) fn custodian_failure_exit(error: &str) -> std::process::ExitCode {
 }
 
 #[cfg(target_os = "linux")]
+/// The number [`custodian_failure_exit`] returns.
+pub(crate) fn custodian_failure_code(error: &str) -> u8 {
+    if std::env::args().nth(1).as_deref() == Some(driver::DRIVER_ARG) {
+        driver::failure_exit_code(error)
+    } else {
+        1
+    }
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn custodian_entry() -> Option<Result<(), String>> {
     match std::env::args().nth(1).as_deref() {
         Some(driver::DRIVER_ARG) => Some(driver::entry()),

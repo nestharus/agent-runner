@@ -657,9 +657,179 @@ fn age353_natural_two_busy_two_sleeping_through_owner_close() {
     for status in measured_drivers.0.values() {
         assert_eq!(*status, Some(0), "driver wait status");
     }
+    observability_records(&launches, &measured_drivers, &records, &state, &output);
     if std::env::var_os("AGE353_SERVING_REQUIRE").is_some() {
         for root in summary["roots"].as_array().unwrap() {
             assert!(root["whole_call_s"].as_f64().unwrap() <= 5.0, "{root}");
+        }
+    }
+}
+
+/// The observability records of this real 2+2, checked against what this
+/// process observed independently: each driver's own outcome record against
+/// the wait status this namespace PID1 reaped; each retained root's
+/// owner-close selection timeline through its completing visit; each
+/// successor's spawn and exit. Written beside the summary for collection.
+fn observability_records(
+    launches: &[Launch],
+    drivers: &Drivers,
+    records: &[serde_json::Value],
+    state: &Path,
+    output: &Path,
+) {
+    let mut outcomes = Vec::new();
+    for launch in launches {
+        let directory = launch.dir.join("data/kernel-v30-driver-outcomes");
+        let files: Vec<PathBuf> = fs::read_dir(&directory)
+            .unwrap_or_else(|error| panic!("{}: no driver outcome: {error}", launch.label))
+            .flatten()
+            .map(|entry| entry.path())
+            .collect();
+        assert_eq!(files.len(), 1, "{}: one driver per root", launch.label);
+        let lines: Vec<serde_json::Value> = fs::read_to_string(&files[0])
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2, "{}: {lines:?}", launch.label);
+        let (begin, end) = (&lines[0], &lines[1]);
+        assert_eq!(
+            (begin["event"].as_str(), end["event"].as_str()),
+            (Some("begin"), Some("end"))
+        );
+        let pid = begin["pid"].as_i64().unwrap() as i32;
+        let raw = drivers
+            .0
+            .get(&pid)
+            .copied()
+            .flatten()
+            .unwrap_or_else(|| panic!("{}: driver {pid} was not reaped here", launch.label));
+        // The record's exit is the status its adoptive parent reaped.
+        assert!(libc::WIFEXITED(raw), "{}: {raw}", launch.label);
+        assert_eq!(
+            end["exit"].as_i64(),
+            Some(i64::from(libc::WEXITSTATUS(raw)))
+        );
+        assert_eq!(
+            end["result"],
+            if libc::WEXITSTATUS(raw) == 0 {
+                "ok"
+            } else {
+                "error"
+            }
+        );
+        assert!(
+            files[0]
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(begin["root"].as_str().unwrap())
+        );
+        outcomes.push(serde_json::json!({"label": launch.label, "begin": begin, "end": end, "wait_status": raw}));
+    }
+    let entries: Vec<String> = fs::read_dir(state.join("entries"))
+        .unwrap()
+        .flatten()
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .strip_suffix(".json")
+                .map(str::to_owned)
+        })
+        .collect();
+    let mut timelines = serde_json::Map::new();
+    for root in &entries {
+        let admitted: Vec<_> = records
+            .iter()
+            .filter(|record| record["k"] == "oca" && record["root"] == root.as_str())
+            .collect();
+        assert_eq!(admitted.len(), 1, "{root} admitted once");
+        let visits: Vec<_> = records
+            .iter()
+            .filter(|record| record["k"] == "ocv" && record["root"] == root.as_str())
+            .collect();
+        let last = visits
+            .last()
+            .unwrap_or_else(|| panic!("{root} never selected"));
+        assert_eq!(last["out"], "complete", "{root}: {visits:?}");
+        assert_eq!(
+            visits
+                .iter()
+                .filter(|visit| visit["out"] == "complete")
+                .count(),
+            1,
+            "a completed root is never selected again"
+        );
+        let gaps: Vec<u64> = visits
+            .windows(2)
+            .map(|pair| num(pair[1], "from") - num(pair[0], "from"))
+            .collect();
+        let steps: Vec<&str> = visits
+            .iter()
+            .filter_map(|visit| visit["step"].as_str())
+            .collect();
+        timelines.insert(
+            root.clone(),
+            serde_json::json!({
+                "admitted_at": admitted[0]["at"],
+                "visits": visits.len(),
+                "max_revisit_ns": gaps.iter().max(),
+                "completed_at": last["to"],
+                "completing_step": last["step"],
+                "steps": steps,
+            }),
+        );
+    }
+    let sleeping = launches.iter().filter(|launch| !launch.busy).count();
+    let spawned: Vec<_> = records
+        .iter()
+        .filter(|record| record["k"] == "succ_spawn")
+        .collect();
+    assert_eq!(spawned.len(), sleeping, "one successor per sleeping root");
+    for spawn in &spawned {
+        let exits: Vec<_> = records
+            .iter()
+            .filter(|record| {
+                record["k"] == "succ_exit"
+                    && record["offer"] == spawn["offer"]
+                    && record["pid"] == spawn["pid"]
+            })
+            .collect();
+        assert!(
+            exits
+                .iter()
+                .any(|exit| exit["how"] == "exited" && exit["code"] == 0),
+            "{spawn}: {exits:?}"
+        );
+        assert!(
+            exits
+                .iter()
+                .all(|exit| exit["how"] != "signaled"
+                    && !(exit["how"] == "exited" && exit["code"] != 0)),
+            "{exits:?}"
+        );
+    }
+    let label = env_or("AGE353_SERVING_LABEL", "run");
+    fs::write(
+        output.join(format!("{label}-observability.json")),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "driver_outcomes": outcomes,
+            "owner_close_timelines": timelines,
+            "successors": spawned.len(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    for launch in launches {
+        let target = output.join(format!("{label}-{}-driver-outcomes", launch.label));
+        let _ = fs::create_dir_all(&target);
+        for entry in fs::read_dir(launch.dir.join("data/kernel-v30-driver-outcomes"))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let _ = fs::copy(entry.path(), target.join(entry.file_name()));
         }
     }
 }
