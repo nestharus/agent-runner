@@ -84,7 +84,9 @@ use oulipoly_kernel_broker::protocol::{
     SourceTicketUse, SourceWitnessProbe, StateGenerationSpec, StateReadSpec, StateWriteAction,
     StateWriteSpec,
 };
-use oulipoly_kernel_broker::registry::{OwnerCloseIntent, RootRecord, RootRegistry};
+use oulipoly_kernel_broker::registry::{
+    BROKER_DIAGNOSTICS, OwnerCloseIntent, RootRecord, RootRegistry,
+};
 use oulipoly_kernel_broker::source_acceptance::{
     accept_v2_completion_source, capture_and_stage_v2_evidence, commit_v2_evidence,
     decide_v2_source_retention_release, deliver_v2_source_retention_release,
@@ -121,8 +123,6 @@ use std::time::Instant;
 
 const SOCKET: &str = "/run/oulipoly-kernel-broker/control.sock";
 const STATE: &str = "/var/lib/oulipoly-kernel-broker";
-/// Root, beneath State, of the Broker's own flight recorder and event store.
-const BROKER_DIAGNOSTICS: &str = "broker-diagnostics-v1";
 const FRESH_SOCKET: &str = "/run/oulipoly-kernel-broker/v30.sock";
 const RUNNER: &str = "/usr/local/libexec/oulipoly/oulipoly-agent-runner";
 

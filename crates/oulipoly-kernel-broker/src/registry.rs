@@ -9,6 +9,9 @@ use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+/// State-owned root of the Broker's flight recorder and event store.
+pub const BROKER_DIAGNOSTICS: &str = "broker-diagnostics-v1";
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RootRecord {
@@ -227,6 +230,19 @@ impl RootRegistry {
                     || meta.mode() & 0o777 != 0o700
                 {
                     return Err(io::Error::other("unsafe phase record directory"));
+                }
+                continue;
+            }
+            // Installed serve() initializes the recorder before this scan.
+            // Its fixed storage also survives subsequent Broker starts; it
+            // contains diagnostics, never root records.
+            if name == BROKER_DIAGNOSTICS {
+                let meta = fs::symlink_metadata(entry.path())?;
+                if !meta.file_type().is_dir()
+                    || meta.uid() != unsafe { libc::geteuid() }
+                    || meta.mode() & 0o777 != 0o700
+                {
+                    return Err(io::Error::other("unsafe broker diagnostics directory"));
                 }
                 continue;
             }
@@ -690,6 +706,61 @@ mod tests {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn broker_diagnostics_directory_survives_registry_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let diagnostics = temp.path().join(BROKER_DIAGNOSTICS);
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&diagnostics)
+            .unwrap();
+        // These are namespace fixtures, not a recorder or serve() check.
+        fs::create_dir_all(diagnostics.join("diagnostics/flight-recorder-v1")).unwrap();
+        fs::create_dir_all(diagnostics.join("diagnostics/event-store-v1")).unwrap();
+        for _ in 0..2 {
+            let registry = RootRegistry::open(temp.path()).unwrap();
+            assert!(!registry.has_debt());
+            assert!(registry.live.is_empty());
+        }
+    }
+
+    #[test]
+    fn broker_diagnostics_does_not_admit_unknown_siblings() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(temp.path().join(BROKER_DIAGNOSTICS))
+            .unwrap();
+        RootRegistry::open(temp.path()).unwrap();
+        fs::create_dir(temp.path().join("broker-diagnostics-v2")).unwrap();
+        assert_eq!(
+            RootRegistry::open(temp.path()).unwrap_err().to_string(),
+            "unrecognized registry entry"
+        );
+    }
+
+    #[test]
+    fn broker_diagnostics_rejects_file_symlink_and_public_directory() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        for kind in ["file", "symlink", "public_directory"] {
+            let temp = tempfile::tempdir().unwrap();
+            let diagnostics = temp.path().join(BROKER_DIAGNOSTICS);
+            match kind {
+                "file" => fs::write(&diagnostics, b"").unwrap(),
+                "symlink" => symlink(temp.path(), &diagnostics).unwrap(),
+                _ => {
+                    fs::create_dir(&diagnostics).unwrap();
+                    fs::set_permissions(&diagnostics, fs::Permissions::from_mode(0o755)).unwrap();
+                }
+            }
+            assert_eq!(
+                RootRegistry::open(temp.path()).unwrap_err().to_string(),
+                "unsafe broker diagnostics directory"
+            );
+        }
+    }
 
     fn gated_child() -> (PinnedProcess, UnixStream) {
         let (parent, mut child_gate) = UnixStream::pair().unwrap();
