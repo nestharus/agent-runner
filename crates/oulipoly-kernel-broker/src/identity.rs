@@ -171,6 +171,35 @@ pub fn observed_incarnation_gone(
     Ok(namespace_identity(&namespace)? != recorded_namespace)
 }
 
+/// Prefix of every refusal caused by the Broker failing to observe a process
+/// (EMFILE included). It is neither an observed exit nor debt.
+pub const OBSERVATION_UNAVAILABLE: &str = "broker observation unavailable";
+
+pub fn observation_unavailable(error: io::Error) -> io::Error {
+    if error.to_string().starts_with(OBSERVATION_UNAVAILABLE) {
+        return error;
+    }
+    io::Error::new(error.kind(), format!("{OBSERVATION_UNAVAILABLE}: {error}"))
+}
+
+/// Liveness of a recorded incarnation: `Ok(false)` only when it is observed
+/// gone. A failed read is unavailable observation, never an exit.
+pub fn observe_incarnation_live(
+    host_pid: i32,
+    recorded_boot: &str,
+    recorded_starttime: u64,
+    recorded_namespace: (u64, u64),
+) -> io::Result<bool> {
+    observed_incarnation_gone(
+        host_pid,
+        recorded_boot,
+        recorded_starttime,
+        recorded_namespace,
+    )
+    .map(|gone| !gone)
+    .map_err(observation_unavailable)
+}
+
 /// Root PID1 terminal proof requires disappearance of its exact proc
 /// incarnation. A still-present zombie is exited but not yet absent.
 pub fn observed_incarnation_absent(
@@ -295,6 +324,50 @@ impl PinnedProcess {
         };
         process.verify()?;
         Ok(process)
+    }
+
+    /// Pin a recorded incarnation. `Ok(None)` only when that exact
+    /// incarnation is observed gone or the PID now names another; a failure
+    /// to open or read is unavailable observation.
+    pub fn open_recorded(
+        host_pid: i32,
+        recorded_boot: &str,
+        recorded_starttime: u64,
+        recorded_namespace: (u64, u64),
+    ) -> io::Result<Option<Self>> {
+        match Self::open(host_pid) {
+            Ok(process) => Ok((process.boot_id == recorded_boot
+                && process.starttime_ticks == recorded_starttime
+                && (process.pidns_dev, process.pidns_ino) == recorded_namespace)
+                .then_some(process)),
+            Err(error) => {
+                if observe_incarnation_live(
+                    host_pid,
+                    recorded_boot,
+                    recorded_starttime,
+                    recorded_namespace,
+                )? {
+                    Err(observation_unavailable(error))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+    }
+
+    /// Exact liveness of this pinned incarnation. `Ok(false)` only when its
+    /// pidfd reports the exit, which needs no new descriptor. Any other
+    /// `verify` failure (EMFILE included) is unavailable observation.
+    pub fn observe_live(&self) -> io::Result<bool> {
+        let exited = || self.exited().map_err(observation_unavailable);
+        if exited()? {
+            return Ok(false);
+        }
+        match self.verify() {
+            Ok(()) => Ok(true),
+            Err(_) if exited()? => Ok(false),
+            Err(error) => Err(observation_unavailable(error)),
+        }
     }
 
     pub fn verify(&self) -> io::Result<()> {
