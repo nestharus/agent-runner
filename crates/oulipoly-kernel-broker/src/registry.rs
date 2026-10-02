@@ -682,6 +682,27 @@ impl RootRegistry {
         Ok(())
     }
 
+    /// Stop holding the PID1 pin of each root whose terminal state is proven:
+    /// the pinned pidfd reports the exact exit, and the exact fence, PID1's
+    /// own ECHILD receipt and absence of its incarnation are verified. Each
+    /// record stays, pinless exactly as `reattach` leaves a dead PID1 after a
+    /// Broker restart, so debt classification, records, fences, receipts and
+    /// every obligation keyed by them are unchanged. Nothing is settled.
+    pub fn release_terminal_roots(&mut self) -> Vec<RootRecord> {
+        if self.poisoned {
+            return Vec::new();
+        }
+        let (released, live): (Vec<_>, Vec<_>) = std::mem::take(&mut self.live)
+            .into_iter()
+            .partition(|root| {
+                matches!(root.init.exited(), Ok(true)) && self.terminal_verified(&root.record)
+            });
+        self.live = live;
+        let records: Vec<_> = released.into_iter().map(|root| root.record).collect();
+        self.debt.extend(records.iter().cloned());
+        records
+    }
+
     /// No automatic retirement. A failed or vanished root remains recorded; it
     /// blocks new outside launches unless it is closed history or a fenced
     /// root with its exact PID1 terminal proof.
@@ -885,6 +906,123 @@ mod tests {
         assert!(RootRegistry::open(temp.path()).is_err());
         drop(first_gate);
         drop(second_gate);
+    }
+
+    fn open_descriptors() -> usize {
+        fs::read_dir("/proc/self/fd").unwrap().count()
+    }
+
+    fn reap(pid: i32) {
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+    }
+
+    /// PID1 receipts are root-only files, so this runs as mapped root in a
+    /// disposable user, PID and mount namespace with a private /tmp.
+    #[test]
+    fn terminal_release_drops_pin_but_keeps_record_and_debt_classification() {
+        if std::env::var_os("AGE380_RELEASE_TEST_CHILD").is_none() {
+            let private_tmp = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new("unshare")
+                .args(["-Urpfm", "--mount-proc", "/bin/sh", "-c",
+                    "mount --bind \"$1\" /tmp && exec \"$2\" --exact registry::tests::terminal_release_drops_pin_but_keeps_record_and_debt_classification --nocapture",
+                    "release-control"])
+                .arg(private_tmp.path())
+                .arg(std::env::current_exe().unwrap())
+                .env_remove("TMPDIR")
+                .env("AGE380_RELEASE_TEST_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "disposable release control failed");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["root-drains", "root-pid1"] {
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(temp.path().join(name))
+                .unwrap();
+        }
+        let (done_init, mut done_gate) = gated_child();
+        let (crashed_init, crashed_gate) = gated_child();
+        let (live_init, live_gate) = gated_child();
+        let done = record(&uuid::Uuid::new_v4().to_string(), &done_init);
+        let crashed = record(&uuid::Uuid::new_v4().to_string(), &crashed_init);
+        let live = record(&uuid::Uuid::new_v4().to_string(), &live_init);
+        let mut roots = RootRegistry {
+            directory: temp.path().into(),
+            live: [
+                (&done, done_init),
+                (&crashed, crashed_init),
+                (&live, live_init),
+            ]
+            .into_iter()
+            .map(|(record, init)| LiveRoot {
+                record: record.clone(),
+                init,
+            })
+            .collect(),
+            debt: Vec::new(),
+            closed_historical: std::collections::HashSet::new(),
+            admission_fences: Vec::new(),
+            poisoned: false,
+        };
+        roots.fence_admission(&done).unwrap();
+        roots.fence_admission(&crashed).unwrap();
+        root_pid1::publish_request(&roots.pid1_directory(), &done).unwrap();
+        root_pid1::publish_terminal(&roots.pid1_directory(), &done).unwrap();
+
+        // A receipt while the exact PID1 still lives is not terminal.
+        assert!(roots.release_terminal_roots().is_empty());
+        assert!(!roots.has_debt());
+
+        done_gate.write_all(b"go").unwrap();
+        reap(done.init_host_pid);
+        assert_eq!(
+            unsafe { libc::kill(crashed.init_host_pid, libc::SIGKILL) },
+            0
+        );
+        reap(crashed.init_host_pid);
+        assert!(roots.pid1_terminal_proof(&done).unwrap());
+
+        let classify = |roots: &RootRegistry| {
+            (
+                roots.has_debt(),
+                [&done, &crashed, &live].map(|root| {
+                    (
+                        roots.exact_record(root).is_ok(),
+                        roots.admission_fenced(&root.root_id),
+                        roots.unaccounted_exit(root),
+                        roots.pid1_exact_live(root).unwrap(),
+                    )
+                }),
+            )
+        };
+        let before = (classify(&roots), open_descriptors());
+        assert!(before.0.0, "the crashed root without a receipt is debt");
+
+        // Only the proven root releases its pidfd and namespace handle. The
+        // crashed root has no terminal proof and keeps its pin.
+        assert_eq!(roots.release_terminal_roots(), vec![done.clone()]);
+        assert_eq!(open_descriptors(), before.1 - 2);
+        assert_eq!(classify(&roots), before.0);
+        assert_eq!(roots.debt_records(), &[done.clone()]);
+        assert_eq!(
+            roots
+                .live_roots()
+                .map(|root| &root.record)
+                .collect::<Vec<_>>(),
+            vec![&crashed, &live]
+        );
+        assert!(roots.pid1_terminal_proof(&done).unwrap());
+        assert!(roots.pid1_echild_receipt(&done).unwrap());
+        assert!(roots.release_terminal_roots().is_empty());
+
+        // Closed history still accounts the released record afterward.
+        roots.admit_closed_historical(&done.root_id).unwrap();
+        assert!(!roots.unaccounted_exit(&done));
+        drop(crashed_gate);
+        drop(live_gate);
     }
 
     #[test]

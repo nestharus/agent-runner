@@ -6568,6 +6568,12 @@ fn serve() -> io::Result<()> {
             ) {
                 eprintln!("normal owner close progression blocked: {error}");
             }
+            // A proven terminal root keeps its records and obligations; only
+            // its kernel handles go. Its gate peer died with its namespace.
+            for root in registry.release_terminal_roots() {
+                held_joins.remove(&root.root_id);
+                works.release_terminal_root(&root.root_id);
+            }
             window.advance_cpu_ns += phase_record::thread_cpu_ns().saturating_sub(advance_cpu);
             window.advance_scanned(scan);
             window.untracked_waits();

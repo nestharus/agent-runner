@@ -793,6 +793,20 @@ impl WorkRegistry {
         &self.debt
     }
 
+    /// After the caller proves the root terminal, stop holding the PID1 pins of
+    /// its works whose pidfd reports the exact exit. Each record stays, as a
+    /// restart leaves it; `has_debt`, Q and retirement read records alone.
+    pub fn release_terminal_root(&mut self, root_id: &str) {
+        let (released, live): (Vec<_>, Vec<_>) = std::mem::take(&mut self.live)
+            .into_iter()
+            .partition(|work| {
+                work.record.root_id == root_id && matches!(work.init.exited(), Ok(true))
+            });
+        self.live = live;
+        self.debt
+            .extend(released.into_iter().map(|work| work.record));
+    }
+
     pub fn live_works(&self) -> impl Iterator<Item = &LiveWork> {
         self.live.iter()
     }
@@ -1036,4 +1050,86 @@ fn classify_scope_inner(
         namespace = unsafe { File::from_raw_fd(fd) };
     }
     Scope::Uncertain
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn work(root_id: &str, init: &PinnedProcess) -> WorkRecord {
+        WorkRecord {
+            version: 1,
+            boot_id: init.boot_id.clone(),
+            work_incarnation: uuid::Uuid::new_v4().to_string(),
+            root_id: root_id.into(),
+            root_init_host_pid: 1,
+            root_init_starttime_ticks: 1,
+            root_pidns_dev: init.pidns_dev,
+            root_pidns_ino: init.pidns_ino,
+            work_id: uuid::Uuid::new_v4().to_string(),
+            accepted_grant_id: None,
+            parent_work_incarnation: None,
+            init_host_pid: init.host_pid,
+            init_starttime_ticks: init.starttime_ticks,
+            pidns_dev: init.pidns_dev,
+            pidns_ino: init.pidns_ino,
+        }
+    }
+
+    fn child(exit_now: bool) -> PinnedProcess {
+        let mut process = std::process::Command::new("sleep")
+            .arg(if exit_now { "0.2" } else { "30" })
+            .spawn()
+            .unwrap();
+        let pinned = PinnedProcess::open(process.id() as i32).unwrap();
+        if exit_now {
+            process.wait().unwrap();
+        } else {
+            std::mem::forget(process);
+        }
+        pinned
+    }
+
+    #[test]
+    fn terminal_root_release_keeps_work_records_and_debt_classification() {
+        let (terminal, other) = ("terminal-root", "other-root");
+        let exited = child(true);
+        let running = child(false);
+        let other_exited = child(true);
+        let running_pid = running.host_pid;
+        let records = [
+            work(terminal, &exited),
+            work(terminal, &running),
+            work(other, &other_exited),
+        ];
+        let mut works = WorkRegistry {
+            directory: PathBuf::new(),
+            live: records
+                .iter()
+                .cloned()
+                .zip([exited, running, other_exited])
+                .map(|(record, init)| LiveWork { record, init })
+                .collect(),
+            debt: Vec::new(),
+            closed_historical: HashSet::new(),
+            poisoned: false,
+        };
+        let descriptors = || fs::read_dir("/proc/self/fd").unwrap().count();
+        let before = (works.has_debt(), descriptors());
+        assert!(before.0, "exited works of unclosed roots are debt");
+
+        // Only the exited work of the named root drops its two handles.
+        works.release_terminal_root(terminal);
+        assert_eq!(descriptors(), before.1 - 2);
+        assert_eq!(works.has_debt(), before.0);
+        assert_eq!(works.debt_records(), &records[..1]);
+        assert_eq!(
+            works
+                .live_works()
+                .map(|work| &work.record)
+                .collect::<Vec<_>>(),
+            vec![&records[1], &records[2]]
+        );
+        unsafe { libc::kill(running_pid, libc::SIGKILL) };
+    }
 }
