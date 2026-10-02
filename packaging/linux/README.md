@@ -1,5 +1,79 @@
 # AGE-319 paired Linux first host install
 
+## Broker descriptor capacity
+
+The packaged unit sets `LimitNOFILE=65536:1048576`: soft **65,536**, hard
+**1,048,576**. AGE-380's failed flat 40 run used an unchosen soft default of
+1,024. This capacity choice addresses that ceiling; completed-root descriptor
+release and truthful observation-error classification are separate corrections.
+
+Sizing follows the installed source path. `installed_launcher.rs` submits `L`
+even when invoked inside a parent producer. In `linux_main.rs`, `L` reserves a
+new root through `InstalledLaunchLedger::reserve_request` and spawns a
+`ControlGrant` in the Broker's host namespace. That control enters the ordinary
+`E`/`j` path. Each producer using this entry therefore creates its own root,
+including a child producer launched by a parent; it does not reuse the parent's
+root. `HeldRootJoin` retains a gate and four `PinnedProcess` objects;
+`RootRegistry` retains a fifth pin. Each pin owns a pidfd and a namespace file:
+**11 FDs per root**. The connected-control channel adds one; the namespace
+helper reaper holds one pidfd while its helper lives. This gives a **13-FD
+root/control/helper subtotal** per producer, before variable work and I/O.
+
+Bash `C`/`K` work is a distinct nested-work path. `fresh_provider.rs` preserves
+the causal parent namespace, and `work_launch.rs` inserts a `LiveWork` under
+the existing root. Its retained PID1 pin costs two FDs, with another helper
+pidfd while live. Its launch control/gate and worker pins are local to the
+launch. `SourcePhysicalRegistry` retains process stamps rather than pins.
+Normal provider K also launches its supervisor/PID1 below the root and stores
+physical records; it does not create another `HeldRootJoin`. These costs must
+not be counted as another 11-FD root merely because work is nested.
+
+The capacity budget allows **32 FDs per producer**, plus **4,096** for shared
+files, SQLite connections, concurrent requests, and launch/observation
+temporaries. The extra 19 per producer above the 13-FD subtotal allows nested
+work, sleeping-successor channels/pins, and per-producer I/O. These are chosen
+allowances, not measured peaks or proven upper bounds on arbitrary workloads.
+
+| Separate-mode geometry | Producers | Root/control/helper subtotal (13 each) | Budget (32 each + 4,096) | Spare under 65,536 |
+|---|---:|---:|---:|---:|
+| 10 parents + 100 children | 110 | 1,430 | 7,616 | 57,920 |
+| 20 parents + 400 children | 420 | 5,460 | 17,536 | 48,000 |
+| 32 parents + 1,024 children | 1,056 | 13,728 | 37,888 | 27,648 |
+
+At the largest cohort, spare capacity is about **73% of the budget**. This is
+source sizing for one cohort in each mode, not acceptance of any rung. Existing
+lifetime root retention still accumulates across completed cohorts; increasing
+capacity cannot make rolling churn finite. Variable SQLite retention and peak
+transients remain for source attribution and later runtime measurement.
+
+**Resource environment:** Linux inherits resource limits across fork/clone and
+exec. The Broker's control Runner, root helper/PID1, Runner child, provider and
+Bash descendants inherit the new soft limit and the hard limit; the production
+launch paths do not reset NOFILE. This deliberately raises their soft ceiling
+too. It reserves no descriptors and adds no workload quota, sandbox, timeout,
+or admission limit. Workloads retain ordinary host resource behavior and can
+adjust their soft limit up to the hard ceiling. A launcher already running in
+the caller's shell retains that shell's limits; its Broker-spawned control
+inherits the service's limits. No caller-limit restoration is added here.
+
+After installation, read the configured service limits without a census:
+
+```bash
+systemctl show oulipoly-kernel-broker.service -p LimitNOFILESoft -p LimitNOFILE
+```
+
+Also read the running Main's effective kernel limits (unit overrides or
+process changes can differ from the packaged source):
+
+```bash
+broker_main_pid=$(systemctl show oulipoly-kernel-broker.service -p MainPID --value)
+awk '$1 == "Max" && $2 == "open" && $3 == "files" { print }' "/proc/$broker_main_pid/limits"
+```
+
+Expected soft/hard values are 65,536 / 1,048,576. This readback and the failed
+flat-40 rerun belong to verification after all three AGE-380 corrections;
+neither is established by the source choice or packaging tests.
+
 ## Fresh-only first-install image package
 
 `first_install_v30.py` builds an inert archive from **four explicit images**:

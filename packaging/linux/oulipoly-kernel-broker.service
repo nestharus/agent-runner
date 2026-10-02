@@ -19,6 +19,9 @@ Restart=on-failure
 KillMode=process
 Delegate=yes
 NoNewPrivileges=no
+# AGE-380: sized for 1056 producers with headroom; descendants inherit this.
+# See README.md, Broker descriptor capacity, for sizing and effective readback.
+LimitNOFILE=65536:1048576
 
 [Install]
 WantedBy=multi-user.target
