@@ -119,15 +119,18 @@ fn settle_pending_child_set(
         match terminal.notification_state.as_str() {
             "response_only" | "acked" if complete => return Ok(()),
             "response_only" | "acked" | "child_set_pending" => {}
-            // State aggregates no selected members as N/A. Only the admitted,
-            // unresolved set before terminal freeze is a pending N/A.
+            // State aggregates no selected members as N/A. Before freeze it
+            // also reports execution_evidence_incomplete: that still refuses
+            // closure, but this admitted, unresolved notification set can wait.
             "not_applicable"
                 if terminal.notification_origin == "child_set"
                     && terminal.execution.is_none()
+                    && terminal.execution_state == "unknown"
+                    && terminal.terminal_state == "execution_unknown"
                     && terminal.children.is_empty()
                     && terminal.unresolved_child_request_ids.len() >= 2
                     && terminal.late_child_request_ids.is_empty()
-                    && terminal.refusal.is_none() => {}
+                    && terminal.refusal.as_deref() == Some("execution_evidence_incomplete") => {}
             other => return Err(format!("async original child set state unknown: {other}")),
         }
         let mut progressed = false;
@@ -846,10 +849,100 @@ mod intent_tests {
     }
 
     fn unselected_set() -> FreshRootTerminalReadback {
+        unselected_set_with_ids(vec!["a".into(), "b".into()])
+    }
+
+    fn unselected_set_with_ids(ids: Vec<String>) -> FreshRootTerminalReadback {
         let mut readback = terminal();
         readback.notification_state = "not_applicable".into();
-        readback.unresolved_child_request_ids = vec!["a".into(), "b".into()];
+        // read_private_root_terminal records each unresolved C first, then
+        // terminal_commit_absent when parent Q is complete but freeze awaits W.
+        readback.unknown_stages = ids
+            .iter()
+            .map(|id| format!("child_c_unresolved:{id}"))
+            .collect();
         readback
+            .unknown_stages
+            .push("terminal_commit_absent".into());
+        readback.unknown_stage = readback.unknown_stages.last().cloned();
+        readback.refusal = Some("execution_evidence_incomplete".into());
+        readback.artifacts = vec!["released-d:d".into(), "invocation-j:j".into()];
+        readback
+            .artifacts
+            .extend(ids.iter().map(|id| format!("unresolved-child-c:{id}")));
+        readback.unresolved_child_request_ids = ids;
+        readback
+    }
+
+    #[test]
+    fn pending_dto_tracks_state_producer_and_still_refuses_closure() {
+        // Source/DTO relationship control, not a native State/Broker run. Keep
+        // the scripted positive input tied to the actual producer's branches;
+        // a changed producer needs this fixture and its meaning reconsidered.
+        let state = include_str!("../../crates/oulipoly-state/src/mailbox/fresh_root_terminal.rs");
+        assert!(state.contains("if children.is_empty() {\n        \"not_applicable\""));
+        let producer = state
+            .split("pub fn read_private_root_terminal(")
+            .nth(1)
+            .unwrap()
+            .split("fn validate_frozen_child_set(")
+            .next()
+            .unwrap();
+        for source in [
+            "execution: None,",
+            "execution_state: \"unknown\".into(),",
+            "None => (set.selected.clone(), set.unresolved.clone(), Vec::new()),",
+            ".map_or(set.admitted() >= 2, |stored| !stored.children.is_empty());",
+            "format!(\"child_c_unresolved:{id}\")",
+            "result.unresolved_child_request_ids = unresolved;",
+            "_ => \"terminal_commit_absent\".into(),",
+            "(Err(e), _) => format!(\"parent_k_q:{e}\"),",
+            "result.notification_origin = \"child_set\".into();",
+            "result.notification_state = child_set_notification_state(&result.children).into();",
+            "result.terminal_state = if result.execution_state == \"unknown\" {\n            result.refusal = Some(\"execution_evidence_incomplete\".into());\n            \"execution_unknown\"",
+        ] {
+            assert!(
+                producer.contains(source),
+                "State producer changed: {source}"
+            );
+        }
+        let pending = unselected_set();
+        // Broker serializes this DTO; protocol deserializes it unchanged.
+        let decoded: FreshRootTerminalReadback =
+            serde_json::from_slice(&serde_json::to_vec(&pending).unwrap()).unwrap();
+        assert_eq!(decoded, pending);
+        assert_eq!(decoded.notification_state, "not_applicable");
+        assert_eq!(decoded.notification_origin, "child_set");
+        assert_eq!(
+            decoded.unknown_stages,
+            [
+                "child_c_unresolved:a",
+                "child_c_unresolved:b",
+                "terminal_commit_absent"
+            ]
+        );
+        assert_eq!(
+            decoded.unknown_stage.as_deref(),
+            Some("terminal_commit_absent")
+        );
+        assert_eq!(
+            decoded.refusal.as_deref(),
+            Some("execution_evidence_incomplete")
+        );
+        assert_eq!(
+            decoded.closure_refusal(),
+            Some("execution_evidence_incomplete")
+        );
+        let (result, settled, waits, _) = run_set(
+            vec![Ok(decoded.clone()), Ok(decoded)],
+            Duration::from_secs(120),
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            "async original child set did not become deliverable"
+        );
+        assert!(settled.is_empty());
+        assert_eq!(waits, 1);
     }
 
     // This drives the product loop, not a parallel classifier. Reads and time
@@ -886,9 +979,14 @@ mod intent_tests {
         // without pretending to run the installed ten-root workload.
         for count in [2, 10] {
             let ids: Vec<String> = (0..count).map(|i| format!("child-{i}")).collect();
-            let mut pending = unselected_set();
-            pending.unresolved_child_request_ids = ids.clone();
-            let mut reads = vec![Ok(pending.clone()), Ok(pending)];
+            let pending = unselected_set_with_ids(ids.clone());
+            // The other producer branch records incomplete parent Q while
+            // the original remains live. It likewise cannot certify closure.
+            let mut parent_pending = pending.clone();
+            let stage = "parent_k_q:parent physical Q incomplete or changed".to_owned();
+            *parent_pending.unknown_stages.last_mut().unwrap() = stage.clone();
+            parent_pending.unknown_stage = Some(stage);
+            let mut reads = vec![Ok(parent_pending), Ok(pending)];
             let mut selected = terminal();
             selected.children = ids.iter().map(|id| member(id)).collect();
             for index in 0..count {
@@ -945,6 +1043,21 @@ mod intent_tests {
         invalid.push(Ok(readback));
         let mut readback = unselected_set();
         readback.refusal = Some("original_gone".into());
+        invalid.push(Ok(readback));
+        for refusal in [
+            None,
+            Some("unresolved_child_admission"),
+            Some("child_admission_after_freeze"),
+        ] {
+            let mut readback = unselected_set();
+            readback.refusal = refusal.map(str::to_owned);
+            invalid.push(Ok(readback));
+        }
+        let mut readback = unselected_set();
+        readback.execution_state = "success".into();
+        invalid.push(Ok(readback));
+        let mut readback = unselected_set();
+        readback.terminal_state = "execution_completed".into();
         invalid.push(Ok(readback));
         let mut readback = unselected_set();
         readback.execution = Some(
