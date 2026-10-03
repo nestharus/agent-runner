@@ -3016,6 +3016,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "oulipoly-acp"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "oulipoly-agent-messenger"
 version = "0.1.0"
 dependencies = [
