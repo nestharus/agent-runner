@@ -31,9 +31,64 @@ pub struct FreshRootTerminalExecution {
     pub owner_generation: String,
     pub actor: FreshRecipientIdentity,
     pub parent: FreshPhysicalTerminal,
+    /// The one-member form, kept byte-identical for zero- and one-child roots
+    /// and for historical records.
     pub child_request_id: Option<String>,
     pub child_event: Option<FreshBashSourceEvent>,
     pub outcome: String,
+    /// The frozen member set of a root that admitted two or more children.
+    /// When present, the scalar child fields above are absent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<FreshRootTerminalChild>,
+}
+
+/// One admitted child, accounted for once with its own exact W.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreshRootTerminalChild {
+    pub request_id: String,
+    pub event: FreshBashSourceEvent,
+}
+
+impl FreshRootTerminalExecution {
+    /// Every child request the immutable record accounts for.
+    pub fn child_request_ids(&self) -> Vec<String> {
+        if self.children.is_empty() {
+            self.child_request_id.iter().cloned().collect()
+        } else {
+            self.children.iter().map(|child| child.request_id.clone()).collect()
+        }
+    }
+
+    fn child_events(&self) -> Vec<&FreshBashSourceEvent> {
+        if self.children.is_empty() {
+            self.child_event.iter().collect()
+        } else {
+            self.children.iter().map(|child| &child.event).collect()
+        }
+    }
+}
+
+/// Per-member notification readback for a root whose terminal accounts for a
+/// child set. Each member has its own recipient row, delivery and ACK.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreshRootTerminalChildReadback {
+    pub request_id: String,
+    pub selected_event: Option<FreshBashSourceEvent>,
+    pub listener_policy: Option<String>,
+    pub notification_state: String,
+    pub notification_origin: String,
+    pub mailbox_seq: Option<i64>,
+    pub delivery_request_id: Option<String>,
+    pub delivery_grant_id: Option<String>,
+    pub delivery_payload_sha256: Option<String>,
+    pub delivery_payload_byte_len: Option<i64>,
+    pub ack_basis: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_receipt: Option<FreshOriginalReceiptIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub successor_ack: Option<FreshSuccessorTerminalAck>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,6 +130,31 @@ pub struct FreshRootTerminalReadback {
     pub unknown_stages: Vec<String>,
     pub refusal: Option<String>,
     pub artifacts: Vec<String>,
+    /// Present only for a root with two or more admitted children. The scalar
+    /// child and notification fields then describe no single child.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<FreshRootTerminalChildReadback>,
+    /// Admissions that surfaced after the terminal froze its set. They stay
+    /// in `unresolved_child_request_ids` and are never discharged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub late_child_request_ids: Vec<String>,
+}
+
+/// Admitted children under one root: those with an accepted W, and those
+/// still without one. Both lists are ordered by request ID.
+struct RootChildSet {
+    selected: Vec<String>,
+    unresolved: Vec<String>,
+}
+
+impl RootChildSet {
+    fn admitted(&self) -> usize {
+        self.selected.len() + self.unresolved.len()
+    }
+
+    fn contains(&self, request_id: &str) -> bool {
+        self.selected.iter().chain(&self.unresolved).any(|id| id == request_id)
+    }
 }
 
 /// Byte identity offered by the original root before its caller-visible write.
@@ -117,12 +197,12 @@ impl FreshRootTerminalReadback {
 
 fn physical_root_outcome(
     parent: &FreshPhysicalTerminal,
-    child: Option<&FreshBashSourceEvent>,
+    children: &[&FreshBashSourceEvent],
 ) -> &'static str {
     if !parent.cancelled
         && libc::WIFEXITED(parent.wait_status)
         && libc::WEXITSTATUS(parent.wait_status) == 0
-        && child.is_none_or(|event| {
+        && children.iter().all(|event| {
             !event.cancelled
                 && libc::WIFEXITED(event.wait_status)
                 && libc::WEXITSTATUS(event.wait_status) == 0
@@ -131,6 +211,24 @@ fn physical_root_outcome(
         "success"
     } else {
         "failure"
+    }
+}
+
+/// A set is settled only when every member is: response-only members need no
+/// F, and every notify member needs its own ACK. Anything else stays pending.
+fn child_set_notification_state(children: &[FreshRootTerminalChildReadback]) -> &'static str {
+    let quiet = |state: &str| matches!(state, "not_applicable" | "response_only");
+    if children.is_empty() {
+        "not_applicable"
+    } else if children.iter().all(|child| quiet(&child.notification_state)) {
+        "response_only"
+    } else if children
+        .iter()
+        .all(|child| quiet(&child.notification_state) || child.notification_state == "acked")
+    {
+        "acked"
+    } else {
+        "child_set_pending"
     }
 }
 
@@ -514,7 +612,7 @@ impl FreshV30Lane {
         Ok((sha.into(), len))
     }
 
-    fn root_child_requests(&self, root_id: &str) -> Result<(Option<String>, Vec<String>), String> {
+    fn root_child_set(&self, root_id: &str) -> Result<RootChildSet, String> {
         let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let mut rows = state
             .prepare(
@@ -530,16 +628,29 @@ impl FreshV30Lane {
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
-        let selected: Vec<_> = ids.iter().filter(|(_, has_w)| *has_w).collect();
-        if selected.len() > 1 {
-            return Err("multiple accepted child W rows under root".into());
+        let (selected, unresolved): (Vec<_>, Vec<_>) =
+            ids.into_iter().partition(|(_, has_w)| *has_w);
+        Ok(RootChildSet {
+            selected: selected.into_iter().map(|(id, _)| id).collect(),
+            unresolved: unresolved.into_iter().map(|(id, _)| id).collect(),
+        })
+    }
+
+    /// A member's exact W. A W naming another request or another root is a
+    /// real anomaly, not an unresolved member.
+    fn root_member_event(
+        &self,
+        root_id: &str,
+        request_id: &str,
+    ) -> Result<Result<FreshBashSourceEvent, String>, String> {
+        let event = match self.selected_private_bash_event(request_id) {
+            Ok(event) => event,
+            Err(error) => return Ok(Err(error)),
+        };
+        if event.request_id != request_id || event.root_id != root_id {
+            return Err("child W identity or root conflict".into());
         }
-        let selected_id = selected.first().map(|(id, _)| id.clone());
-        let unresolved = ids
-            .into_iter()
-            .filter_map(|(id, _)| (Some(&id) != selected_id.as_ref()).then_some(id))
-            .collect();
-        Ok((selected_id, unresolved))
+        Ok(Ok(event))
     }
 
     /// Offline CLI close has no parent K/Q. A child C or selected W under
@@ -551,9 +662,7 @@ impl FreshV30Lane {
         session: &FreshV30Session,
     ) -> Result<bool, String> {
         self.require_released_invocation(root, actor, session)?;
-        let (selected, unresolved) =
-            self.root_child_requests(&root.old_release.prepared.root_id)?;
-        Ok(selected.is_none() && unresolved.is_empty())
+        Ok(self.root_child_set(&root.old_release.prepared.root_id)?.admitted() == 0)
     }
 
     /// Record complete physical work only. A missing parent Q or child W is
@@ -569,19 +678,32 @@ impl FreshV30Lane {
             Ok(parent) => parent,
             Err(_) => return self.read_private_root_terminal(root, actor, session),
         };
-        let (child_request_id, unresolved) =
-            self.root_child_requests(&root.old_release.prepared.root_id)?;
-        if child_request_id.is_none() && !unresolved.is_empty() {
+        // The set freezes here, after the parent's physical Q proves its tree
+        // drained. Every admitted C must already have its own W; an admission
+        // that surfaces later is retained by readback as an anomaly.
+        let root_id = &root.old_release.prepared.root_id;
+        let set = self.root_child_set(root_id)?;
+        if !set.unresolved.is_empty() {
             return self.read_private_root_terminal(root, actor, session);
         }
-        let child_event = match &child_request_id {
-            Some(id) => match self.selected_private_bash_event(id) {
-                Ok(event) => Some(event),
+        let mut members = Vec::with_capacity(set.selected.len());
+        for id in &set.selected {
+            match self.root_member_event(root_id, id)? {
+                Ok(event) => members.push(FreshRootTerminalChild {
+                    request_id: id.clone(),
+                    event,
+                }),
                 Err(_) => return self.read_private_root_terminal(root, actor, session),
-            },
-            None => None,
+            }
+        }
+        let events: Vec<_> = members.iter().map(|member| &member.event).collect();
+        let outcome = physical_root_outcome(&parent, &events);
+        let (child_request_id, child_event, children) = if members.len() == 1 {
+            let member = members.pop().unwrap();
+            (Some(member.request_id), Some(member.event), Vec::new())
+        } else {
+            (None, None, members)
         };
-        let outcome = physical_root_outcome(&parent, child_event.as_ref());
         let execution = FreshRootTerminalExecution {
             handoff_id: root.handoff_id.clone(),
             d_key: root.d_key.clone(),
@@ -594,6 +716,7 @@ impl FreshV30Lane {
             child_request_id,
             child_event,
             outcome: outcome.into(),
+            children,
         };
         let encoded = serde_json::to_string(&execution).map_err(|e| e.to_string())?;
         let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_WRITE)?;
@@ -620,15 +743,14 @@ impl FreshV30Lane {
         session: &FreshV30Session,
     ) -> Result<FreshRootTerminalReadback, String> {
         self.require_released_invocation(root, actor, session)?;
-        let (selected, unresolved) =
-            self.root_child_requests(&root.old_release.prepared.root_id)?;
-        for id in selected.iter().chain(unresolved.iter()) {
+        let root_id = &root.old_release.prepared.root_id;
+        let set = self.root_child_set(root_id)?;
+        for id in set.selected.iter().chain(set.unresolved.iter()) {
             self.repair_captured_private_bash_source(id)?;
         }
-        if let Some(id) = self
-            .root_child_requests(&root.old_release.prepared.root_id)?
-            .0
-        {
+        // Each member's listener is settled on its own; repair never treats
+        // one member's evidence as another's.
+        for id in self.root_child_set(root_id)?.selected {
             let child = self.require_complete_bash_child(&id)?;
             if self.require_private_bash_listener(&child, None)? == FreshBashListenerPolicy::Notify
             {
@@ -681,6 +803,8 @@ impl FreshV30Lane {
                 format!("released-d:{}", root.d_key),
                 format!("invocation-j:{}", root.invocation_uuid),
             ],
+            children: Vec::new(),
+            late_child_request_ids: Vec::new(),
         };
         let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let encoded: Option<String> = state
@@ -692,24 +816,60 @@ impl FreshV30Lane {
             .optional()
             .map_err(|e| e.to_string())?;
         let actual_parent = self.physical_root_terminal(root, actor, session);
-        let (child_id, unresolved) = self.root_child_requests(&result.root_id)?;
-        result.child_request_id = child_id.clone();
+        let set = self.root_child_set(&result.root_id)?;
+        let stored: Option<FreshRootTerminalExecution> = encoded
+            .map(|json| serde_json::from_str(&json).map_err(|e| e.to_string()))
+            .transpose()?;
+        // Members are the frozen set once the terminal is committed, otherwise
+        // every admitted C that already has its W.
+        let (members, unresolved, late) = match &stored {
+            Some(stored) => {
+                Self::validate_frozen_child_set(stored)?;
+                let frozen = stored.child_request_ids();
+                if frozen.iter().any(|id| !set.selected.contains(id)) {
+                    return Err("root terminal immutable evidence conflict".into());
+                }
+                let late: Vec<String> = set
+                    .selected
+                    .iter()
+                    .chain(&set.unresolved)
+                    .filter(|id| !frozen.contains(id))
+                    .cloned()
+                    .collect();
+                (frozen, late.clone(), late)
+            }
+            None => (set.selected.clone(), set.unresolved.clone(), Vec::new()),
+        };
+        debug_assert!(members.iter().all(|id| set.contains(id)));
+        let set_form = stored
+            .as_ref()
+            .map_or(set.admitted() >= 2, |stored| !stored.children.is_empty());
         for id in &unresolved {
             result.artifacts.push(format!("unresolved-child-c:{id}"));
-            result.record_unknown(format!("child_c_unresolved:{id}"));
+            result.record_unknown(if late.contains(id) {
+                format!("child_c_after_freeze:{id}")
+            } else {
+                format!("child_c_unresolved:{id}")
+            });
         }
         result.unresolved_child_request_ids = unresolved;
-        if let Some(id) = &child_id {
+        result.late_child_request_ids = late;
+        for id in &members {
             result.artifacts.push(format!("child-c:{id}"));
         }
-        let actual_child = child_id
-            .as_ref()
-            .map(|id| self.selected_private_bash_event(id))
-            .transpose();
-        result.selected_child_event = actual_child.as_ref().ok().cloned().flatten();
-        if let Some(json) = encoded {
-            let stored: FreshRootTerminalExecution =
-                serde_json::from_str(&json).map_err(|e| e.to_string())?;
+        let mut actual_children = Vec::with_capacity(members.len());
+        for id in &members {
+            actual_children.push(self.root_member_event(&result.root_id, id)?);
+        }
+        let actual_child: Result<Vec<FreshBashSourceEvent>, String> =
+            actual_children.iter().cloned().collect();
+        if !set_form {
+            result.child_request_id = members.first().cloned();
+            result.selected_child_event = actual_children
+                .first()
+                .and_then(|event| event.as_ref().ok().cloned());
+        }
+        if let Some(stored) = stored {
             if stored.handoff_id != root.handoff_id
                 || stored.d_key != root.d_key
                 || stored.invocation_uuid != root.invocation_uuid
@@ -717,7 +877,6 @@ impl FreshV30Lane {
                 || stored.root_id != result.root_id
                 || stored.owner_generation != result.owner_generation
                 || stored.actor != *actor
-                || stored.child_request_id != child_id
             {
                 return Err("root terminal immutable evidence conflict".into());
             }
@@ -735,7 +894,8 @@ impl FreshV30Lane {
                 "parent-stderr:{}:{}:{}",
                 stored.parent.grant_id, stored.parent.stderr_sha256, stored.parent.stderr_len
             ));
-            if let Some(event) = &stored.child_event {
+            let stored_events = stored.child_events();
+            for event in &stored_events {
                 result
                     .artifacts
                     .push(format!("child-k:{}", event.physical_grant_id));
@@ -754,10 +914,14 @@ impl FreshV30Lane {
             match (&actual_parent, &actual_child) {
                 (Err(e), _) => result.record_unknown(format!("parent_k_q:{e}")),
                 (_, Err(e)) => result.record_unknown(format!("child_c_k_q_w:{e}")),
-                (Ok(parent), Ok(child)) => {
+                (Ok(parent), Ok(children)) => {
                     if stored.parent != *parent
-                        || stored.child_event != *child
-                        || stored.outcome != physical_root_outcome(parent, child.as_ref())
+                        || stored_events.len() != children.len()
+                        || stored_events
+                            .iter()
+                            .zip(children)
+                            .any(|(stored, actual)| *stored != actual)
+                        || stored.outcome != physical_root_outcome(parent, &stored_events)
                     {
                         return Err("root terminal immutable physical evidence conflict".into());
                     }
@@ -772,11 +936,24 @@ impl FreshV30Lane {
                 _ => "terminal_commit_absent".into(),
             });
         }
-        if let Some(id) = child_id {
-            let child = self.require_complete_bash_child(&id)?;
+        if set_form {
+            result.notification_origin = "child_set".into();
+            for (id, event) in members.iter().zip(&actual_children) {
+                let member = self.read_member_notification(&state, id, actor, session, &result)?;
+                for stage in &member.1 {
+                    result.record_unknown(format!("child:{id}:{stage}"));
+                }
+                result.artifacts.extend(member.2);
+                let mut member = member.0;
+                member.selected_event = event.as_ref().ok().cloned();
+                result.children.push(member);
+            }
+            result.notification_state = child_set_notification_state(&result.children).into();
+        } else if let Some(id) = members.first() {
+            let child = self.require_complete_bash_child(id)?;
             let policy = self.require_private_bash_listener(&child, None)?;
             result.listener_policy = Some(policy.as_str().into());
-            self.read_terminal_notification(&state, &id, actor, session, &mut result)?;
+            self.read_terminal_notification(&state, id, actor, session, &mut result)?;
         }
         let publication: Option<(String, i64, String)> = state.query_row(
             "SELECT artifact_sha256,artifact_byte_len,phase FROM fresh_root_publication WHERE handoff_id=?1",
@@ -841,7 +1018,88 @@ impl FreshV30Lane {
             "execution_completed_notification_pending"
         }
         .into();
+        if !result.late_child_request_ids.is_empty() {
+            result.refusal = Some("child_admission_after_freeze".into());
+        }
         Ok(result)
+    }
+
+    /// A committed set names each member once, in request order, with its own
+    /// W. The one-member form never carries a set.
+    fn validate_frozen_child_set(stored: &FreshRootTerminalExecution) -> Result<(), String> {
+        let valid = if stored.children.is_empty() {
+            stored.child_request_id.is_some() == stored.child_event.is_some()
+                && stored.child_event.as_ref().is_none_or(|event| {
+                    Some(&event.request_id) == stored.child_request_id.as_ref()
+                })
+        } else {
+            stored.child_request_id.is_none()
+                && stored.child_event.is_none()
+                && stored.children.len() >= 2
+                && stored
+                    .children
+                    .iter()
+                    .all(|child| child.event.request_id == child.request_id)
+                && stored
+                    .children
+                    .windows(2)
+                    .all(|pair| pair[0].request_id < pair[1].request_id)
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err("root terminal child set record invalid".into())
+        }
+    }
+
+    /// Reads one member's notification through the same exact reader as the
+    /// one-child form, isolated from every other member's evidence.
+    fn read_member_notification(
+        &self,
+        state: &Connection,
+        request_id: &str,
+        actor: &FreshRecipientIdentity,
+        session: &FreshV30Session,
+        base: &FreshRootTerminalReadback,
+    ) -> Result<(FreshRootTerminalChildReadback, Vec<String>, Vec<String>), String> {
+        let child = self.require_complete_bash_child(request_id)?;
+        let policy = self.require_private_bash_listener(&child, None)?;
+        let mut scratch = base.clone();
+        scratch.children.clear();
+        scratch.listener_policy = Some(policy.as_str().into());
+        scratch.notification_state = "not_applicable".into();
+        scratch.notification_origin = "none".into();
+        scratch.mailbox_seq = None;
+        scratch.delivery_request_id = None;
+        scratch.delivery_grant_id = None;
+        scratch.delivery_payload_sha256 = None;
+        scratch.delivery_payload_byte_len = None;
+        scratch.ack_basis = None;
+        scratch.original_receipt = None;
+        scratch.successor_ack = None;
+        scratch.unknown_stage = None;
+        scratch.unknown_stages = Vec::new();
+        scratch.artifacts = Vec::new();
+        self.read_terminal_notification(state, request_id, actor, session, &mut scratch)?;
+        Ok((
+            FreshRootTerminalChildReadback {
+                request_id: request_id.into(),
+                selected_event: None,
+                listener_policy: scratch.listener_policy,
+                notification_state: scratch.notification_state,
+                notification_origin: scratch.notification_origin,
+                mailbox_seq: scratch.mailbox_seq,
+                delivery_request_id: scratch.delivery_request_id,
+                delivery_grant_id: scratch.delivery_grant_id,
+                delivery_payload_sha256: scratch.delivery_payload_sha256,
+                delivery_payload_byte_len: scratch.delivery_payload_byte_len,
+                ack_basis: scratch.ack_basis,
+                original_receipt: scratch.original_receipt,
+                successor_ack: scratch.successor_ack,
+            },
+            scratch.unknown_stages,
+            scratch.artifacts,
+        ))
     }
 
     fn read_terminal_notification(
@@ -1265,5 +1523,190 @@ impl FreshV30Lane {
             return Err("root caller settlement readback changed".into());
         }
         Ok(settled)
+    }
+}
+
+#[cfg(test)]
+mod root_terminal_child_set_tests {
+    use super::*;
+
+    fn identity() -> FreshRecipientIdentity {
+        FreshRecipientIdentity {
+            host_pid: 10,
+            boot_id: "boot".into(),
+            starttime_ticks: 20,
+            pidns_dev: 30,
+            pidns_ino: 40,
+        }
+    }
+
+    fn event(request_id: &str, wait_status: i32) -> FreshBashSourceEvent {
+        FreshBashSourceEvent {
+            request_id: request_id.into(),
+            source_id: format!("source-{request_id}"),
+            attempt_id: format!("attempt-{request_id}"),
+            state_admission_id: "admission".into(),
+            registration_digest: "digest".into(),
+            lane_id: "lane".into(),
+            source_generation: "generation".into(),
+            session_id: "session".into(),
+            root_id: "root".into(),
+            owner_generation: "owner".into(),
+            parent_work_grant_id: "parent-grant".into(),
+            parent_work_id: "parent-work".into(),
+            physical_grant_id: format!("grant-{request_id}"),
+            physical_work_id: format!("work-{request_id}"),
+            completion_policy: "notify".into(),
+            selected_kind: "physical".into(),
+            wait_status,
+            cancelled: false,
+            cancel_grant_id: None,
+            tree_drained: true,
+            output_closed: true,
+            stdout_sha256: "out".into(),
+            stdout_len: 1,
+            stderr_sha256: "err".into(),
+            stderr_len: 1,
+            normal_provider_selection: None,
+        }
+    }
+
+    fn parent() -> FreshPhysicalTerminal {
+        FreshPhysicalTerminal {
+            grant_id: "parent-grant".into(),
+            work_id: "parent-work".into(),
+            plan_sha256: "plan".into(),
+            wait_status: 0,
+            outcome: "exit_success".into(),
+            cancelled: false,
+            stdout_sha256: "out".into(),
+            stdout_len: 0,
+            stderr_sha256: "err".into(),
+            stderr_len: 0,
+        }
+    }
+
+    fn execution(
+        child_request_id: Option<&str>,
+        children: &[&str],
+    ) -> FreshRootTerminalExecution {
+        FreshRootTerminalExecution {
+            handoff_id: "handoff".into(),
+            d_key: "d".into(),
+            invocation_uuid: "j".into(),
+            session_id: "session".into(),
+            root_id: "root".into(),
+            owner_generation: "owner".into(),
+            actor: identity(),
+            parent: parent(),
+            child_request_id: child_request_id.map(Into::into),
+            child_event: child_request_id.map(|id| event(id, 0)),
+            outcome: "success".into(),
+            children: children
+                .iter()
+                .map(|id| FreshRootTerminalChild {
+                    request_id: (*id).into(),
+                    event: event(id, 0),
+                })
+                .collect(),
+        }
+    }
+
+    fn member(state: &str) -> FreshRootTerminalChildReadback {
+        FreshRootTerminalChildReadback {
+            request_id: "member".into(),
+            selected_event: None,
+            listener_policy: None,
+            notification_state: state.into(),
+            notification_origin: "none".into(),
+            mailbox_seq: None,
+            delivery_request_id: None,
+            delivery_grant_id: None,
+            delivery_payload_sha256: None,
+            delivery_payload_byte_len: None,
+            ack_basis: None,
+            original_receipt: None,
+            successor_ack: None,
+        }
+    }
+
+    /// Zero- and one-child records written before child sets existed read
+    /// back unchanged and serialize to the same bytes, so stored digests hold.
+    #[test]
+    fn historical_zero_and_one_child_records_keep_their_bytes() {
+        for record in [execution(None, &[]), execution(Some("a"), &[])] {
+            let historical = serde_json::to_string(&record).unwrap();
+            assert!(!historical.contains("\"children\""));
+            let read: FreshRootTerminalExecution = serde_json::from_str(&historical).unwrap();
+            assert_eq!(serde_json::to_string(&read).unwrap(), historical);
+            assert!(FreshV30Lane::validate_frozen_child_set(&read).is_ok());
+            assert_eq!(
+                read.child_request_ids(),
+                record.child_request_id.iter().cloned().collect::<Vec<_>>()
+            );
+        }
+        let set = execution(None, &["a", "b"]);
+        let encoded = serde_json::to_string(&set).unwrap();
+        let read: FreshRootTerminalExecution = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(read.child_request_ids(), vec!["a".to_owned(), "b".to_owned()]);
+    }
+
+    /// Each member is named once, in request order, with its own W. A
+    /// duplicate, a W naming another request, a one-member set, or a set
+    /// mixed with the scalar form is refused.
+    #[test]
+    fn frozen_set_refuses_duplicate_foreign_or_mixed_members() {
+        assert!(FreshV30Lane::validate_frozen_child_set(&execution(None, &["a", "b", "c"])).is_ok());
+        for invalid in [
+            execution(None, &["a", "a"]),
+            execution(None, &["b", "a"]),
+            execution(None, &["a"]),
+            execution(Some("a"), &["b", "c"]),
+        ] {
+            assert!(FreshV30Lane::validate_frozen_child_set(&invalid).is_err());
+        }
+        let mut foreign = execution(None, &["a", "b"]);
+        foreign.children[1].event.request_id = "a".into();
+        assert!(FreshV30Lane::validate_frozen_child_set(&foreign).is_err());
+        let mut half = execution(Some("a"), &[]);
+        half.child_event = None;
+        assert!(FreshV30Lane::validate_frozen_child_set(&half).is_err());
+        let mut renamed = execution(Some("a"), &[]);
+        renamed.child_event = Some(event("b", 0));
+        assert!(FreshV30Lane::validate_frozen_child_set(&renamed).is_err());
+    }
+
+    /// The set settles only when every member has: a receipt without ACK,
+    /// an unknown F, a pending F or a missing W keeps the whole set pending.
+    #[test]
+    fn child_set_notification_requires_every_member_settled() {
+        let set = |states: &[&str]| {
+            child_set_notification_state(&states.iter().map(|s| member(s)).collect::<Vec<_>>())
+        };
+        assert_eq!(set(&[]), "not_applicable");
+        assert_eq!(set(&["response_only", "response_only"]), "response_only");
+        assert_eq!(set(&["response_only", "acked"]), "acked");
+        assert_eq!(set(&["acked", "acked", "acked"]), "acked");
+        for pending in [
+            "f_submitted_native_pending",
+            "f_unknown",
+            "pending_f",
+            "awaiting_w",
+            "repair_required",
+        ] {
+            assert_eq!(set(&["acked", pending]), "child_set_pending", "{pending}");
+            assert_eq!(set(&[pending, "response_only"]), "child_set_pending", "{pending}");
+        }
+    }
+
+    /// The root succeeds only if its parent and every member exited cleanly.
+    #[test]
+    fn root_outcome_accounts_for_every_member() {
+        let ok = event("a", 0);
+        let failed = event("b", 1 << 8);
+        assert_eq!(physical_root_outcome(&parent(), &[]), "success");
+        assert_eq!(physical_root_outcome(&parent(), &[&ok, &ok]), "success");
+        assert_eq!(physical_root_outcome(&parent(), &[&ok, &failed]), "failure");
+        assert_eq!(physical_root_outcome(&parent(), &[&failed, &ok]), "failure");
     }
 }
