@@ -52,6 +52,18 @@ fn root_mapped_connected_l_runs_real_bash_sync_child_and_closes_owner() {
     run_connected_case_with_bash(true, ProofFault::None, true, false);
 }
 
+/// One fresh root owns two admitted sync Bash children. Each child keeps its
+/// own C/W/response record, and the root terminal accounts for both.
+#[test]
+fn root_mapped_connected_l_runs_two_real_bash_sync_children_and_closes_owner() {
+    run_connected_case_with_sync_children(2);
+}
+
+#[test]
+fn root_mapped_connected_l_runs_three_real_bash_sync_children_and_closes_owner() {
+    run_connected_case_with_sync_children(3);
+}
+
 #[test]
 fn root_mapped_connected_l_delivers_real_bash_async_to_recipient_and_acks() {
     run_connected_case_with_bash(true, ProofFault::None, true, true);
@@ -59,17 +71,24 @@ fn root_mapped_connected_l_delivers_real_bash_async_to_recipient_and_acks() {
 
 #[test]
 fn root_mapped_connected_l_delivers_real_bash_async_to_admitted_successor_and_acks() {
-    run_connected_case_with_bash_mode(true, ProofFault::None, true, true, true);
+    run_connected_case_with_bash_mode(true, ProofFault::None, true, true, true, 1);
 }
 
 #[test]
 fn root_mapped_connected_l_successor_ack_revalidates_after_broker_restart() {
-    run_connected_case_with_bash_mode(true, ProofFault::Restart, true, true, true);
+    run_connected_case_with_bash_mode(true, ProofFault::Restart, true, true, true, 1);
 }
 
 #[test]
 fn root_mapped_connected_l_successor_changed_receipt_refuses_certificate() {
-    run_connected_case_with_bash_mode(true, ProofFault::SuccessorReceiptTamper, true, true, true);
+    run_connected_case_with_bash_mode(
+        true,
+        ProofFault::SuccessorReceiptTamper,
+        true,
+        true,
+        true,
+        1,
+    );
 }
 
 #[test]
@@ -108,7 +127,11 @@ fn run_connected_case_with_bash(
     real_bash: bool,
     async_bash: bool,
 ) {
-    run_connected_case_with_bash_mode(normal, fault, real_bash, async_bash, false);
+    run_connected_case_with_bash_mode(normal, fault, real_bash, async_bash, false, 1);
+}
+
+fn run_connected_case_with_sync_children(children: usize) {
+    run_connected_case_with_bash_mode(true, ProofFault::None, true, false, false, children);
 }
 
 fn run_connected_case_with_bash_mode(
@@ -117,8 +140,10 @@ fn run_connected_case_with_bash_mode(
     real_bash: bool,
     async_bash: bool,
     successor_admission: bool,
+    sync_children: usize,
 ) {
     assert!(!async_bash || real_bash);
+    assert!(sync_children == 1 || (real_bash && !async_bash && !successor_admission));
     let Ok(runner_bin) = std::env::var("AGE319_CONNECTED_RUNNER_BIN") else {
         return;
     };
@@ -127,7 +152,11 @@ fn run_connected_case_with_bash_mode(
             .expect("real Bash case requires AGE319_CONNECTED_BASH_BIN")
     });
     if std::env::var_os("AGE319_CONNECTED_CHILD_TEST").is_none() {
-        let test_name = if successor_admission {
+        let test_name = if sync_children == 2 {
+            "root_mapped_connected_l_runs_two_real_bash_sync_children_and_closes_owner"
+        } else if sync_children == 3 {
+            "root_mapped_connected_l_runs_three_real_bash_sync_children_and_closes_owner"
+        } else if successor_admission {
             match fault {
                 ProofFault::None => {
                     "root_mapped_connected_l_delivers_real_bash_async_to_admitted_successor_and_acks"
@@ -214,6 +243,12 @@ export OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1="$AGE319_BASH_CONTROL_SOCKET"
 response=$("$AGE319_BASH_IMAGE" run --delivery async -- /bin/sh -c 'while [ ! -f "$AGE319_CHILD_RELEASE_FILE" ]; do sleep 0.02; done; printf "one\n" >> "$AGE319_EFFECT_FILE"; printf "async-child-out\n"; printf "async-child-err\n" >&2') || exit
 printf '%s\n' "$response"
 "#.as_slice()
+            } else if real_bash && sync_children > 1 {
+                format!(
+                    "#!/bin/sh\nexport OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1=\"$AGE319_BASH_CONTROL_SOCKET\"\nfor _ in $(seq {sync_children}); do\n\"$AGE319_BASH_IMAGE\" run --delivery sync -- /bin/sh -c 'printf \"one\\n\" >> \"$AGE319_EFFECT_FILE\"; printf \"bash-child-out\\n\"; printf \"bash-child-err\\n\" >&2' || exit\nprintf '\\n'\ndone\n"
+                )
+                .into_bytes()
+                .leak() as &[u8]
             } else if real_bash {
                 b"#!/bin/sh\nexport OULIPOLY_KERNEL_BROKER_FIXTURE_SOCKET_V1=\"$AGE319_BASH_CONTROL_SOCKET\"\n\"$AGE319_BASH_IMAGE\" run --delivery sync -- /bin/sh -c 'printf \"one\\n\" >> \"$AGE319_EFFECT_FILE\"; printf \"bash-child-out\\n\"; printf \"bash-child-err\\n\" >&2'\n".as_slice()
             } else {
@@ -950,13 +985,28 @@ printf '%s\n' "$response"
             !broker_errors.contains("normal owner close progression blocked"),
             "normal close warning: {broker_errors}"
         );
-        assert_eq!(fs::read_to_string(&effect).unwrap(), "one\n");
+        assert_eq!(
+            fs::read_to_string(&effect).unwrap(),
+            "one\n".repeat(sync_children)
+        );
         if async_bash && !successor_admission {
             assert_real_bash_async_child(
                 &state, &fresh_db, &root_id, &handoff, &output, &recipient,
             );
         } else if real_bash && !async_bash {
-            assert_real_bash_sync_child(&state, &fresh_db, &root_id, &handoff, &output);
+            let output = if sync_children > 1 {
+                fs::read_to_string(&caller_out).unwrap()
+            } else {
+                output.clone()
+            };
+            assert_real_bash_sync_children(
+                &state,
+                &fresh_db,
+                &root_id,
+                &handoff,
+                &output,
+                sync_children,
+            );
         } else if !real_bash {
             assert!(
                 fs::read_to_string(&caller_err)
@@ -1311,13 +1361,171 @@ printf '%s\n' "$response"
     broker.wait().unwrap();
 }
 
+/// Every admitted sync child keeps its own C, W, response record, K, drain
+/// and output. The committed root terminal accounts for exactly that set.
+fn assert_real_bash_sync_children(
+    state: &Path,
+    fresh_db: &Path,
+    root_id: &str,
+    handoff: &serde_json::Value,
+    output: &str,
+    children: usize,
+) {
+    let reports: Vec<&str> = if children == 1 {
+        vec![output]
+    } else {
+        output
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect()
+    };
+    assert_eq!(
+        reports.len(),
+        children,
+        "one sync report per child: {output}"
+    );
+    let mut request_ids = std::collections::BTreeSet::new();
+    let mut grant_ids = std::collections::BTreeSet::new();
+    for report in reports {
+        let (request_id, grant_id) =
+            assert_real_bash_sync_child(state, fresh_db, root_id, handoff, report, children);
+        assert!(request_ids.insert(request_id), "duplicate child request");
+        assert!(grant_ids.insert(grant_id), "duplicate child K");
+    }
+    let db =
+        rusqlite::Connection::open_with_flags(fresh_db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let execution: String = db
+        .query_row(
+            "SELECT execution_json FROM fresh_root_terminal WHERE handoff_id=?1",
+            [handoff["handoff_id"].as_str().unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let execution: serde_json::Value = serde_json::from_str(&execution).unwrap();
+    assert_eq!(execution["outcome"], "success");
+    let accounted: std::collections::BTreeSet<String> = if children == 1 {
+        assert!(
+            execution.get("children").is_none(),
+            "one-child record shape changed"
+        );
+        [execution["child_request_id"].as_str().unwrap().to_owned()].into()
+    } else {
+        assert!(execution["child_request_id"].is_null());
+        assert!(execution["child_event"].is_null());
+        let members = execution["children"].as_array().unwrap();
+        assert_eq!(members.len(), children);
+        members
+            .iter()
+            .map(|member| {
+                assert_eq!(member["event"]["request_id"], member["request_id"]);
+                assert_eq!(member["event"]["root_id"], root_id);
+                member["request_id"].as_str().unwrap().to_owned()
+            })
+            .collect()
+    };
+    assert_eq!(accounted, request_ids, "root terminal child set differs");
+    if children > 1 {
+        assert_child_set_readback_and_late_admission(state, root_id, &request_ids, &execution);
+    }
+}
+
+/// Reads the closed root through the actual State API, then admits one more
+/// child after the set froze. The late member is retained as unresolved
+/// custody and never discharged; the committed set does not change.
+fn assert_child_set_readback_and_late_admission(
+    state: &Path,
+    root_id: &str,
+    request_ids: &std::collections::BTreeSet<String>,
+    execution: &serde_json::Value,
+) {
+    let mut lane = FreshV30Lane::open_at(state).unwrap();
+    let (released, actor) = lane.released_handoff_for_root(root_id).unwrap();
+    let session = lane.read_session(&released.d_key).unwrap().unwrap();
+    let read = lane
+        .read_private_root_terminal(&released, &actor, &session)
+        .unwrap();
+    assert_eq!(read.terminal_state, "execution_completed");
+    assert_eq!(read.notification_state, "response_only");
+    assert_eq!(read.notification_origin, "child_set");
+    assert!(read.child_request_id.is_none());
+    assert!(read.unresolved_child_request_ids.is_empty());
+    assert!(read.late_child_request_ids.is_empty());
+    assert!(read.unknown_stages.is_empty(), "{:?}", read.unknown_stages);
+    assert_eq!(read.refusal, None);
+    let members: std::collections::BTreeSet<String> = read
+        .children
+        .iter()
+        .map(|child| {
+            assert_eq!(child.notification_state, "response_only");
+            assert_eq!(child.listener_policy.as_deref(), Some("response_only"));
+            assert_eq!(
+                child.selected_event.as_ref().unwrap().request_id,
+                child.request_id
+            );
+            child.request_id.clone()
+        })
+        .collect();
+    assert_eq!(&members, request_ids);
+    assert!(
+        !lane
+            .no_root_child_requests(&released, &actor, &session)
+            .unwrap()
+    );
+
+    let first = read.children[0].selected_event.as_ref().unwrap();
+    let mut late_actor = actor.clone();
+    late_actor.starttime_ticks += 1_000_000;
+    let late_id = uuid::Uuid::new_v4().to_string();
+    lane.admit_bash_child(
+        &late_id,
+        &released,
+        &actor,
+        &late_actor,
+        &first.parent_work_grant_id,
+        &first.parent_work_id,
+        oulipoly_state::mailbox::FreshBashListenerPolicy::ResponseOnly,
+    )
+    .unwrap();
+    let settled = lane
+        .settle_private_root_terminal(&released, &actor, &session)
+        .unwrap();
+    for late in [
+        settled,
+        lane.read_private_root_terminal(&released, &actor, &session)
+            .unwrap(),
+    ] {
+        assert_eq!(late.late_child_request_ids, vec![late_id.clone()]);
+        assert_eq!(late.unresolved_child_request_ids, vec![late_id.clone()]);
+        assert_eq!(
+            late.refusal.as_deref(),
+            Some("child_admission_after_freeze")
+        );
+        assert_eq!(
+            late.terminal_state,
+            "execution_completed_child_admission_pending"
+        );
+        assert!(
+            late.unknown_stages
+                .contains(&format!("child_c_after_freeze:{late_id}"))
+        );
+        assert_eq!(late.children.len(), request_ids.len());
+        assert_eq!(
+            serde_json::to_value(late.execution.as_ref().unwrap()).unwrap(),
+            *execution,
+            "frozen set changed after a late admission"
+        );
+    }
+}
+
 fn assert_real_bash_sync_child(
     state: &Path,
     fresh_db: &Path,
     root_id: &str,
     handoff: &serde_json::Value,
     output: &str,
-) {
+    children: usize,
+) -> (String, String) {
     let report: serde_json::Value = serde_json::from_str(output).unwrap();
     assert_eq!(report["schema_version"], 31);
     assert_eq!(report["dispatch_state"], "sync-child-result");
@@ -1360,7 +1568,10 @@ fn assert_real_bash_sync_child(
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(rows, 1, "{table} must hold exactly one C/W/response record");
+        assert_eq!(
+            rows, children as i64,
+            "{table} must hold exactly one C/W/response record per child"
+        );
         let stored: String = db
             .query_row(
                 &format!("SELECT {column} FROM {table} WHERE request_id=?1"),
@@ -1386,7 +1597,10 @@ fn assert_real_bash_sync_child(
                 .ends_with(".consumed.json")
         })
         .count();
-    assert_eq!(child_consumptions, 1, "exactly one Bash child K");
+    assert_eq!(
+        child_consumptions, children,
+        "exactly one Bash child K per child"
+    );
     let consumed: serde_json::Value = serde_json::from_slice(
         &fs::read(physical.join(format!("{grant_id}.consumed.json"))).unwrap(),
     )
@@ -1464,6 +1678,7 @@ fn assert_real_bash_sync_child(
             format!("{:x}", Sha256::digest(expected))
         );
     }
+    (request_id.to_owned(), grant_id.to_owned())
 }
 
 fn assert_real_bash_async_child(
