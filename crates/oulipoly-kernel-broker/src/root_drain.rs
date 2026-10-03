@@ -55,11 +55,14 @@ pub struct RootPhysicalCloseProof {
 /// The root's current child closure, read again on every inventory. A
 /// root without child C has none. An unreadable closure is a refusal.
 fn root_child_closure(
-    lane: Option<&FreshV30Lane>,
+    lane: Result<&FreshV30Lane, &String>,
     root_id: &str,
 ) -> (Option<String>, Vec<FreshRootMemberSettlement>) {
-    let Some(lane) = lane else {
-        return (None, Vec::new());
+    let lane = match lane {
+        Ok(lane) => lane,
+        Err(error) => {
+            return (Some(format!("child_closure_unknown: {error}")), Vec::new());
+        }
     };
     match lane.root_child_closure(root_id) {
         Ok(None) => (None, Vec::new()),
@@ -179,6 +182,7 @@ pub fn offline_no_effect(inventory: &RootDrainInventory) -> bool {
 /// The registries recheck the exact Q and both native ACK seals on every
 /// readback. These selected facts are stable across Broker restart.
 pub fn physical_close_proof(inventory: &RootDrainInventory) -> io::Result<RootPhysicalCloseProof> {
+    require_child_closure(inventory)?;
     let source_effect = inventory
         .source_effect
         .as_ref()
@@ -444,7 +448,9 @@ pub fn readback(
         .iter()
         .filter(|work| work.root_id == expected.root_id)
         .collect();
-    let lane = FreshV30Lane::open_at(works.broker_root()?).ok();
+    // Keep an unavailable current State distinct from a readable empty set.
+    let lane_read = FreshV30Lane::open_at(works.broker_root()?);
+    let lane = lane_read.as_ref().ok();
     let successor_ack_read = lane.as_ref().map_or(Ok(None), |lane| {
         exact_successor_ack_for_root(lane, &expected.root_id)
     });
@@ -456,7 +462,7 @@ pub fn readback(
     let original_receipt_unknown = original_receipt_read.is_err();
     let original_receipt = original_receipt_read.ok().flatten();
     let (child_closure_refusal, child_members) =
-        root_child_closure(lane.as_ref(), &expected.root_id);
+        root_child_closure(lane_read.as_ref(), &expected.root_id);
     let terminal_dir = works.broker_root()?.join("terminals");
     let mut work_retired = 0;
     let mut work_outstanding = 0;
@@ -479,7 +485,7 @@ pub fn readback(
                     grants,
                     sources,
                     sidecar,
-                    lane.as_ref(),
+                    lane,
                     grant,
                     &terminal_dir,
                 )
@@ -881,6 +887,7 @@ pub fn ready_for_owner_close_preflight(
     expected_root_id: &str,
     expected_owner_generation: &str,
 ) -> io::Result<()> {
+    require_child_closure(inventory)?;
     let owner = inventory
         .owner_close_inventory
         .as_ref()
@@ -975,6 +982,7 @@ pub fn ready_for_pid1_request(inventory: &RootDrainInventory) -> io::Result<()> 
 /// publication prerequisites as the PID1 request. The original caller's
 /// settlement must also be retained before autonomous progression begins.
 pub fn ready_for_normal_admission_fence(inventory: &RootDrainInventory) -> io::Result<()> {
+    require_child_closure(inventory)?;
     if inventory.normal.is_none() || inventory.entry_unsettled {
         return Err(io::Error::other(
             "normal caller settlement absent before fence",
@@ -991,6 +999,7 @@ pub fn ready_for_normal_admission_fence(inventory: &RootDrainInventory) -> io::R
 /// No-effect CLI roots have no provider K/Q or source/child grant. Their
 /// positive State return and exact empty registries select a separate fence.
 pub fn ready_for_offline_admission_fence(inventory: &RootDrainInventory) -> io::Result<()> {
+    require_child_closure(inventory)?;
     if !offline_no_effect(inventory) {
         return Err(io::Error::other("offline no-effect evidence absent"));
     }
@@ -1001,6 +1010,7 @@ fn ready_for_pid1_request_with_fence(
     inventory: &RootDrainInventory,
     require_fenced: bool,
 ) -> io::Result<()> {
+    require_child_closure(inventory)?;
     let normal = inventory.normal.as_ref().is_some_and(|normal| {
         normal.physical.state == "drained"
             && normal.physical.q.is_some()
@@ -1041,6 +1051,15 @@ fn ready_for_pid1_request_with_fence(
         ));
     }
     Ok(())
+}
+
+/// Current closure cannot be inferred from an unavailable State or an
+/// unsettled child set, even when all other drain evidence is complete.
+fn require_child_closure(inventory: &RootDrainInventory) -> io::Result<()> {
+    match &inventory.child_closure_refusal {
+        Some(refusal) => Err(io::Error::other(refusal.clone())),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -1252,6 +1271,109 @@ mod tests {
             },
         });
         inventory
+    }
+
+    /// Exercise inventory readback, then each drain consumer, on private
+    /// State. No Broker, provider or socket is started.
+    #[cfg(feature = "age319-private-broker-fixture")]
+    #[test]
+    fn current_state_absent_and_unreadable_refuse_drain_and_close() {
+        if unsafe { libc::geteuid() } != 0 {
+            let status = std::process::Command::new("unshare")
+                .arg("-Ur")
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "root_drain::tests::current_state_absent_and_unreadable_refuse_drain_and_close",
+                    "--nocapture",
+                ])
+                .status()
+                .expect("root-mapped private State fixture required");
+            assert!(status.success());
+            return;
+        }
+        let private = tempfile::tempdir().unwrap();
+        let root = private.path().join("broker");
+        oulipoly_state::mailbox::EmptyV30BootstrapIdentity::bootstrap_at(&root).unwrap();
+        let record = RootRecord {
+            version: 1,
+            root_id: uuid::Uuid::new_v4().to_string(),
+            boot_id: "fixture".into(),
+            owner_uid: 0,
+            init_host_pid: i32::MAX,
+            init_starttime_ticks: 1,
+            pidns_dev: 2,
+            pidns_ino: 3,
+        };
+        crate::json_artifact::create_new(&root, &format!("{}.json", record.root_id), &record)
+            .unwrap();
+        let roots = RootRegistry::open(&root).unwrap();
+        for directory in ["works", "entries", "grants", "sources"] {
+            std::fs::create_dir(root.join(directory)).unwrap();
+        }
+        let works = WorkRegistry::open(root.join("works"), &roots).unwrap();
+        let entries = EntryRegistry::open(root.join("entries")).unwrap();
+        let grants = GrantRegistry::open(root.join("grants")).unwrap();
+        let sources = SourcePhysicalRegistry::open(root.join("sources")).unwrap();
+        let state = root.join("v30/state.db");
+        let retained = root.join("v30/retained-state.db");
+        let read = || {
+            let inventory =
+                readback(&record, &roots, &entries, &works, &grants, &sources, None).unwrap();
+            (inventory.child_closure_refusal, inventory.child_members)
+        };
+        let positive = || {
+            let (refusal, members) = read();
+            assert_eq!(refusal, None);
+            assert!(members.is_empty());
+            let mut inventory = returned_offline_inventory();
+            inventory.child_closure_refusal = refusal;
+            inventory.child_members = members;
+            assert!(physical_close_proof(&inventory).is_ok());
+            assert!(ready_for_owner_close_preflight(&inventory, "root", "owner").is_ok());
+            inventory.pid1_exact_live = true;
+            inventory.pid1 = "live";
+            assert!(ready_for_pid1_request(&inventory).is_ok());
+            assert!(ready_for_offline_admission_fence(&inventory).is_ok());
+        };
+        positive();
+        std::fs::rename(&state, &retained).unwrap();
+        for condition in ["absent", "unreadable"] {
+            if condition == "unreadable" {
+                // Keep the bound inode, but remove read access. User-namespace
+                // root has no host DAC override, including for cached reads.
+                std::fs::rename(&retained, &state).unwrap();
+                std::fs::set_permissions(
+                    &state,
+                    std::os::unix::fs::PermissionsExt::from_mode(0o200),
+                )
+                .unwrap();
+            }
+            let (refusal, members) = read();
+            let refusal = refusal.expect("State unavailable must be classified");
+            assert!(
+                refusal.starts_with("child_closure_unknown: "),
+                "{condition}: {refusal}"
+            );
+            assert!(members.is_empty());
+            let mut inventory = returned_offline_inventory();
+            inventory.child_closure_refusal = Some(refusal.clone());
+            for error in [
+                physical_close_proof(&inventory).unwrap_err(),
+                ready_for_owner_close_preflight(&inventory, "root", "owner").unwrap_err(),
+                ready_for_pid1_request(&inventory).unwrap_err(),
+                ready_for_normal_admission_fence(&inventory).unwrap_err(),
+                ready_for_offline_admission_fence(&inventory).unwrap_err(),
+            ] {
+                assert_eq!(error.to_string(), refusal, "{condition}");
+            }
+            if condition == "absent" {
+                assert!(!state.exists(), "reader recreated missing State");
+            }
+        }
+        std::fs::set_permissions(&state, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
+        positive();
     }
 
     #[test]

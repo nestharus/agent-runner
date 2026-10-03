@@ -326,13 +326,17 @@ impl InstalledLaunchLedger {
             .directory
             .parent()
             .ok_or_else(|| io::Error::other("installed State root absent"))?;
+        // This is current acceptance, not a historical certificate lookup.
+        // An absent or unreadable State cannot establish an empty child set.
+        let unknown =
+            |error| io::Error::other(format!("installed_terminal_current_state_unknown: {error}"));
+        let lane = oulipoly_state::mailbox::FreshV30Lane::open_at(state_root).map_err(unknown)?;
         if certificate.original_receipt.is_some() {
-            let lane = oulipoly_state::mailbox::FreshV30Lane::open_at(state_root)
-                .map_err(io::Error::other)?;
             let current = crate::root_drain::exact_original_receipt_for_root(
                 &lane,
                 &certificate.physical.root_id,
-            )?;
+            )
+            .map_err(|error| unknown(error.to_string()))?;
             if current != certificate.original_receipt {
                 return Err(io::Error::other("installed original receipt changed"));
             }
@@ -340,20 +344,16 @@ impl InstalledLaunchLedger {
         // A certified close still agrees with the root's current child set:
         // a later C, or a changed member settlement, revokes the reader's
         // acceptance rather than leaving the certificate standing.
-        if state_root.join("v30/state.db").exists() {
-            let lane = oulipoly_state::mailbox::FreshV30Lane::open_at(state_root)
-                .map_err(io::Error::other)?;
-            match lane
-                .root_child_closure(&certificate.physical.root_id)
-                .map_err(io::Error::other)?
-            {
-                None if certificate.physical.child_members.is_empty() => {}
-                Some(closure)
-                    if closure.refusal.is_none()
-                        && closure.members == certificate.physical.child_members => {}
-                _ => {
-                    return Err(io::Error::other("installed terminal child closure changed"));
-                }
+        match lane
+            .root_child_closure(&certificate.physical.root_id)
+            .map_err(unknown)?
+        {
+            None if certificate.physical.child_members.is_empty() => {}
+            Some(closure)
+                if closure.refusal.is_none()
+                    && closure.members == certificate.physical.child_members => {}
+            _ => {
+                return Err(io::Error::other("installed terminal child closure changed"));
             }
         }
         Ok(Some(certificate))
@@ -572,6 +572,182 @@ mod tests {
     use crate::identity::PinnedProcess;
     use crate::installed_launch::{EntryKind, PROTOCOL as LAUNCH_PROTOCOL};
     use std::process::Command;
+
+    #[cfg(feature = "age319-private-broker-fixture")]
+    #[test]
+    fn current_state_absent_and_unreadable_refuse_saved_terminal() {
+        if unsafe { libc::geteuid() } != 0 {
+            let status = Command::new("unshare")
+                .arg("-Ur")
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "installed_launch_ledger::tests::current_state_absent_and_unreadable_refuse_saved_terminal",
+                    "--nocapture",
+                ])
+                .status()
+                .expect("root-mapped private State fixture required");
+            assert!(status.success());
+            return;
+        }
+        use oulipoly_state::mailbox::{
+            BoundStateFileIdentity, BrokerStateCloseCursor, EmptyV30BootstrapIdentity,
+            FreshRecipientIdentity, FreshRootEffect, FreshRootWorkIntent,
+        };
+        let private = tempfile::tempdir().unwrap();
+        let state_root = private.path().join("broker");
+        EmptyV30BootstrapIdentity::bootstrap_at(&state_root).unwrap();
+        let pair = uuid::Uuid::new_v4().to_string();
+        let source = uuid::Uuid::new_v4().to_string();
+        let ledger = InstalledLaunchLedger::open(&state_root, &pair, &source).unwrap();
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let root_id = uuid::Uuid::new_v4().to_string();
+        // Constructed certificate: this is a reader control, not evidence of
+        // a real provider, owner close, process wait, receipt or installed run.
+        let launcher = ProcessStamp {
+            host_pid: 10,
+            boot_id: "fixture".into(),
+            starttime_ticks: 1,
+            pidns_dev: 2,
+            pidns_ino: 3,
+        };
+        let request = RequestRecord {
+            protocol: ROOT_BOUND_PROTOCOL.into(),
+            request_id: request_id.clone(),
+            pair_generation: pair.clone(),
+            source_generation: source.clone(),
+            owner_uid: 0,
+            launcher: launcher.clone(),
+            spec_sha256: "a".repeat(64),
+            root_id: Some(root_id.clone()),
+        };
+        let mut control = launcher.clone();
+        control.host_pid = 11;
+        let control_exit = ControlExitRecord {
+            protocol: CONTROL_EXIT_PROTOCOL.into(),
+            request_id: request_id.clone(),
+            pair_generation: pair.clone(),
+            source_generation: source.clone(),
+            root_id: root_id.clone(),
+            launcher,
+            control,
+            e_consumed: true,
+            code: Some(0),
+            signal: None,
+        };
+        json_artifact::create_new(&ledger.directory, &format!("{request_id}.json"), &request)
+            .unwrap();
+        json_artifact::create_new(
+            &ledger.exit_directory,
+            &format!("{request_id}.json"),
+            &control_exit,
+        )
+        .unwrap();
+        let physical = RootPhysicalCloseProof {
+            root_id: root_id.clone(),
+            pid1: "terminal_echild_absent".into(),
+            pid1_echild_receipt: true,
+            pid1_terminal_proof: true,
+            pid1_parent_wait_proof: true,
+            entry_physical_settled: true,
+            entry_original_exited: true,
+            work_records: 0,
+            work_retired: 0,
+            source_physical_records: 0,
+            source_physical_retired: 0,
+            source_effect: Default::default(),
+            successor_ack: None,
+            original_receipt: None,
+            normal: None,
+            offline: Some(crate::root_drain::OfflineRootEvidence {
+                effect: FreshRootEffect {
+                    handoff_id: "fixture".into(),
+                    invocation_uuid: "fixture".into(),
+                    session_id: "fixture".into(),
+                    actor: FreshRecipientIdentity {
+                        host_pid: 12,
+                        boot_id: "fixture".into(),
+                        starttime_ticks: 1,
+                        pidns_dev: 2,
+                        pidns_ino: 3,
+                    },
+                    intent: FreshRootWorkIntent::CliHelp(vec!["--help".into()]),
+                    state: FreshRootEffectState::ReturnedSuccess,
+                },
+            }),
+            child_members: Vec::new(),
+        };
+        let owner = BrokerClosedOwner {
+            root_id: root_id.clone(),
+            source_generation: source.clone(),
+            owner_generation: "fixture".into(),
+            root_record_json: "{}".into(),
+            physical_proof_json: serde_json::to_string(&physical).unwrap(),
+            state_cursor: BrokerStateCloseCursor {
+                file: BoundStateFileIdentity {
+                    device: 1,
+                    inode: 2,
+                },
+                authority_ordinal: 0,
+                admission_id: "no-completion-continuity".into(),
+                continuity_digest: "0".repeat(64),
+                sidecar_generation: "fixture".into(),
+            },
+        };
+        let certificate = ledger
+            .publish_terminal(NormalTerminalCertificate {
+                protocol: String::new(),
+                request,
+                control_exit,
+                exit_code: 0,
+                physical,
+                owner,
+                successor_ack: None,
+                original_receipt: None,
+            })
+            .unwrap();
+        let terminal_path = ledger.terminal_directory.join(format!("{request_id}.json"));
+        let historical_bytes = fs::read(&terminal_path).unwrap();
+        let positive = || {
+            assert_eq!(
+                ledger.read_terminal(&request_id).unwrap(),
+                Some(certificate.clone())
+            );
+            assert_eq!(
+                ledger.terminal_for_root(&root_id).unwrap(),
+                Some(certificate.clone())
+            );
+            assert_eq!(fs::read(&terminal_path).unwrap(), historical_bytes);
+        };
+        positive();
+        let state = state_root.join("v30/state.db");
+        let retained = state_root.join("v30/retained-state.db");
+        fs::rename(&state, &retained).unwrap();
+        for condition in ["absent", "unreadable"] {
+            if condition == "unreadable" {
+                fs::rename(&retained, &state).unwrap();
+                fs::set_permissions(&state, std::os::unix::fs::PermissionsExt::from_mode(0o200))
+                    .unwrap();
+            }
+            for error in [
+                ledger.read_terminal(&request_id).unwrap_err(),
+                ledger.terminal_for_root(&root_id).unwrap_err(),
+            ] {
+                assert!(
+                    error
+                        .to_string()
+                        .starts_with("installed_terminal_current_state_unknown: "),
+                    "{condition}: {error}"
+                );
+            }
+            assert_eq!(fs::read(&terminal_path).unwrap(), historical_bytes);
+            if condition == "absent" {
+                assert!(!state.exists(), "reader recreated missing State");
+            }
+        }
+        fs::set_permissions(&state, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+        positive();
+    }
 
     fn peer() -> PeerIdentity {
         PeerIdentity {
