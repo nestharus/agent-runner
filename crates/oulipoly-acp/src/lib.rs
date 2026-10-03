@@ -6,7 +6,7 @@
 //!
 //! # Pinned schema
 //!
-//! Conformance is claimed only against the published draft schema pinned in
+//! This implements a consumed subset of the published draft schema pinned in
 //! [`pin`]. ACP v2 is a Draft; later `alpha` releases may change any shape
 //! used here. Nothing in this crate has been run against a real harness. Its
 //! end-to-end behaviour is exercised only against the deterministic
@@ -18,11 +18,12 @@
 //!   `messageId`. Per the pinned schema it means the agent inserted the user
 //!   message into its ACP conversation. It is **not** turn completion,
 //!   **not** physical drain of any queue, and **not** dedup.
-//! * **Turn completion.** An idle `state_update` session update, observed
-//!   separately with [`AcpClient::await_turn_end`]. It says foreground work
-//!   stopped; it is not physical drain either.
-//! * **Message identity.** The sender mints one [`MessageKey`] per
-//!   communication and carries it in the prompt's `_meta` under
+//! * **Session readiness.** An idle `state_update` observed after an attempt,
+//!   separately with [`AcpClient::await_session_idle`]. The draft provides no
+//!   message-completion correlation.
+//!   Another foreground task may have caused idle; this is not physical drain.
+//! * **Message identity.** [`OutboundMessage::fresh`] mints a Linux random
+//!   identity for one communication and carries it in the prompt's `_meta` under
 //!   [`MESSAGE_KEY_META`]. Retries reuse it; [`OutboundMessage`] has no way
 //!   to change it.
 //!
@@ -36,16 +37,36 @@
 //! 1. A complying agent advertises [`DEDUP_CONTRACT_META`] with
 //!    `{"version": 1}` in its `initialize` response `_meta`.
 //! 2. On a `session/prompt` whose `_meta` carries a message key it has already
-//!    inserted, it inserts nothing and returns the original `messageId`.
+//!    inserted **in that session**, it inserts nothing and returns the original
+//!    `messageId`. This promise lasts for the entire resumable session lifetime.
+//!    A receiver unable to retain that memory across restart/resume must not
+//!    advertise the contract for that session.
 //! 3. Every prompt response echoes the key under [`MESSAGE_KEY_META`] and
 //!    sets [`DUPLICATE_META`] to `true` when it returned an earlier
 //!    insertion.
 //!
-//! A complying receiver therefore inserts a given message identity **at most
-//! once**. That is the only at-most-once claim this crate makes. It makes no
-//! claim about arbitrary provider execution or effects. A retry after a lost
-//! acknowledgement to a receiver that does not demonstrably comply is labelled
-//! [`DeliveryOutcome::DuplicateUnknown`] and never treated as at-most-once.
+//! [`Acceptance::basis`] identifies either a single counted attempt for a
+//! fresh unforked identity, or a complete same-session history in which every
+//! attempt advertised the contract and the current answer echoes the key.
+//! Supplied/recreated/recovered/cloned keys have unknown history. Exporting a
+//! fresh key permits forks and abandons its complete-history claim. A current
+//! advertisement cannot repair earlier non-contract or unknown attempts.
+//! An insertion ACK without either basis is [`DeliveryOutcome::DuplicateUnknown`].
+//! A valid error stays distinct but counts as an insertion-uncertain attempt.
+//!
+//! These are contractual evidence labels, not measured receiver compliance.
+//! An advertisement says nothing about another receiver, session or store;
+//! same-session resume relies on the receiver's lifetime promise, not a
+//! client-invented continuity proof. No arbitrary provider-effects claim or
+//! durable history is supplied. Messages are bound to their first session.
+//!
+//! Empty `messageId` is conservatively refused (stricter than the schema).
+//! Unknown optional schema fields are ignored, not claimed fully validated.
+//!
+//! Transport limits accepted for this unused primitive: synchronous blocking
+//! reads, no deadline or line-size bound, read/UTF-8 errors reported as closed,
+//! and an unbounded event Vec. Reopen these at the first real-harness process
+//! or supervisor-loop slice. Readiness evidence is retained per session.
 //!
 //! # Not implemented
 //!
@@ -60,13 +81,13 @@ mod transport;
 pub mod wire;
 
 pub use client::{
-    Acceptance, AcpClient, ClientInfo, DeliveryOutcome, MessageKey, NegotiatedPeer,
-    NegotiationFailure, NoAckCause, OutboundMessage, RequestFailure, SessionEvent, TurnEnd,
-    TurnWaitFailure,
+    Acceptance, AcpClient, AtMostOnceBasis, ClientInfo, DeliveryOutcome, IdleWaitFailure,
+    MessageKey, NegotiatedPeer, NegotiationFailure, NoAckCause, OutboundMessage, RequestFailure,
+    SessionEvent, SessionIdle,
 };
 pub use transport::{Incoming, LineTransport, PeerClosed, Transport};
 
-/// Provenance of the ACP v2 draft schema this crate conforms to.
+/// Provenance of the ACP v2 draft schema subset implemented here.
 pub mod pin {
     /// Release tag in `agentclientprotocol/agent-client-protocol`.
     pub const SCHEMA_TAG: &str = "schema-v2.0.0-alpha.7";

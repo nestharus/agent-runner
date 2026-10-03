@@ -58,7 +58,7 @@ pub struct Store {
     sessions: HashSet<String>,
     next_session: u64,
     next_message: u64,
-    by_key: HashMap<String, String>,
+    by_key: HashMap<(String, String), String>,
     pub insertions: Vec<Insertion>,
     pub prompts_received: usize,
 }
@@ -92,7 +92,7 @@ pub enum PromptFault {
     WrongResponseId,
     /// Insert, then respond with `"messageId": null`.
     NullMessageId,
-    /// Respond normally, then exit before reporting turn completion.
+    /// Respond normally, then exit before reporting session idle.
     ExitAfterAck,
 }
 
@@ -105,7 +105,7 @@ pub struct PeerConfig {
     pub echo_wrong_key: bool,
     pub fault: PromptFault,
     /// When set, the peer acknowledges a prompt and then waits for a signal
-    /// before reporting turn completion.
+    /// before reporting session idle.
     pub hold_turn: Option<Receiver<()>>,
 }
 
@@ -251,7 +251,12 @@ fn handle_prompt(
             return PromptEnd::Exit;
         }
         let existing = if config.dedup {
-            key.as_ref().and_then(|key| store.by_key.get(key).cloned())
+            key.as_ref().and_then(|key| {
+                store
+                    .by_key
+                    .get(&(session_id.clone(), key.clone()))
+                    .cloned()
+            })
         } else {
             None
         };
@@ -261,7 +266,9 @@ fn handle_prompt(
                 store.next_message += 1;
                 let message_id = format!("msg-{}", store.next_message);
                 if let Some(key) = &key {
-                    store.by_key.insert(key.clone(), message_id.clone());
+                    store
+                        .by_key
+                        .insert((session_id.clone(), key.clone()), message_id.clone());
                 }
                 store.insertions.push(Insertion {
                     session_id: session_id.clone(),

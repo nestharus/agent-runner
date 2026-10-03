@@ -6,9 +6,9 @@ use std::io::Cursor;
 use std::sync::mpsc::channel;
 
 use oulipoly_acp::{
-    AcpClient, ClientInfo, DEDUP_CONTRACT_META, DeliveryOutcome, LineTransport, MESSAGE_KEY_META,
-    MessageKey, NegotiationFailure, NoAckCause, OutboundMessage, SessionEvent, Transport,
-    TurnWaitFailure,
+    AcpClient, AtMostOnceBasis, ClientInfo, DEDUP_CONTRACT_META, DeliveryOutcome, IdleWaitFailure,
+    LineTransport, MESSAGE_KEY_META, MessageKey, NegotiationFailure, NoAckCause, OutboundMessage,
+    SessionEvent, Transport,
 };
 use serde_json::{Value, json};
 use support::{PeerConfig, PromptFault, SharedStore, insertions_for, new_store, spawn_peer};
@@ -22,8 +22,20 @@ fn info() -> ClientInfo {
     }
 }
 
-fn message(key: &str) -> OutboundMessage {
-    OutboundMessage::new(MessageKey::new(key).unwrap(), "hello")
+fn message(_label: &str) -> OutboundMessage {
+    OutboundMessage::fresh("hello").unwrap()
+}
+
+// Assert repeated insertions use the original wire key, without exporting
+// the client's fresh identity (which would allow caller-side forks).
+fn original_key_insertions(store: &SharedStore) -> usize {
+    let key = store
+        .lock()
+        .unwrap()
+        .insertions
+        .first()
+        .and_then(|i| i.message_key.clone());
+    key.map_or(0, |key| insertions_for(store, &key))
 }
 
 /// Connects, negotiates and opens (or resumes) a session.
@@ -111,7 +123,7 @@ fn peer_without_session_capability_is_refused() {
     );
 }
 
-// (b) Insertion acknowledgement is distinct from turn completion.
+// (b) Insertion acknowledgement is distinct from session idle.
 
 #[test]
 fn acknowledgement_arrives_while_the_turn_is_still_running() {
@@ -125,23 +137,24 @@ fn acknowledgement_arrives_while_the_turn_is_still_running() {
     let mut msg = message("k-ack");
 
     // The peer will not report idle until released, so returning here
-    // shows the acknowledgement does not wait for turn completion.
+    // shows the acknowledgement does not wait for session idle.
     let DeliveryOutcome::Accepted(acceptance) = client.submit(&session, &mut msg) else {
         panic!("expected acceptance");
     };
     assert!(acceptance.at_most_once);
     assert!(!acceptance.recovered);
+    assert_eq!(acceptance.basis, Some(AtMostOnceBasis::SingleAttempt));
     assert!(!msg.is_owed());
     assert!(
         !client
             .events()
             .iter()
             .any(|event| matches!(event, SessionEvent::Idle { .. })),
-        "no turn completion may be observed before release"
+        "no session idle may be observed before release"
     );
 
     release.send(()).unwrap();
-    let end = client.await_turn_end(&session).unwrap();
+    let end = client.await_session_idle(&session).unwrap();
     assert_eq!(end.stop_reason.as_deref(), Some("end_turn"));
     assert!(client.events().contains(&SessionEvent::UserMessage {
         session_id: session.clone(),
@@ -161,8 +174,8 @@ fn peer_exit_after_acknowledgement_leaves_message_accepted_but_turn_unknown() {
     ));
     assert!(!msg.is_owed());
     assert_eq!(
-        client.await_turn_end(&session),
-        Err(TurnWaitFailure::PeerGone)
+        client.await_session_idle(&session),
+        Err(IdleWaitFailure::PeerGone)
     );
 }
 
@@ -190,7 +203,8 @@ fn resend_after_lost_ack_recovers_original_acceptance_with_one_insertion() {
     assert_eq!(acceptance.message_id, original);
     assert!(acceptance.recovered);
     assert!(acceptance.at_most_once);
-    assert_eq!(insertions_for(&store, "k-lost"), 1);
+    assert_eq!(acceptance.basis, Some(AtMostOnceBasis::SessionContract));
+    assert_eq!(original_key_insertions(&store), 1);
     assert_eq!(store.lock().unwrap().insertions.len(), 1);
 }
 
@@ -200,7 +214,7 @@ fn acknowledged_message_is_not_resent() {
     let (mut client, session) = connect(PeerConfig::v2().without_dedup(), &store, None);
     let mut msg = message("k-once");
     let first = client.submit(&session, &mut msg);
-    client.await_turn_end(&session).unwrap();
+    client.await_session_idle(&session).unwrap();
     assert_eq!(client.submit(&session, &mut msg), first);
     assert_eq!(store.lock().unwrap().prompts_received, 1);
 }
@@ -229,7 +243,7 @@ fn resend_after_lost_ack_without_dedup_is_duplicate_unknown() {
     assert!(!acceptance.recovered);
     assert!(!msg.acceptance().unwrap().at_most_once);
     // The receiver really did insert twice; the label must not hide that.
-    assert_eq!(insertions_for(&store, "k-nodedup"), 2);
+    assert_eq!(original_key_insertions(&store), 2);
 }
 
 #[test]
@@ -256,7 +270,7 @@ fn advertised_dedup_with_mismatched_key_echo_is_duplicate_unknown() {
         client.submit(&session, &mut msg),
         DeliveryOutcome::DuplicateUnknown(_)
     ));
-    assert_eq!(insertions_for(&store, "k-echo"), 2);
+    assert_eq!(original_key_insertions(&store), 2);
 }
 
 // (e) Peer exit before acknowledgement.
@@ -280,7 +294,7 @@ fn peer_exit_before_ack_leaves_message_owed() {
             .iter()
             .any(|event| matches!(event, SessionEvent::Idle { .. }))
     );
-    assert_eq!(insertions_for(&store, "k-exit"), 0);
+    assert_eq!(store.lock().unwrap().insertions.len(), 0);
 }
 
 // Response correlation and validation.
@@ -312,7 +326,7 @@ fn null_message_id_is_not_an_acknowledgement() {
 }
 
 #[test]
-fn rejected_prompt_is_owed_and_not_counted_as_unacknowledged() {
+fn rejected_prompt_is_owed_and_insertion_uncertain() {
     let store = new_store();
     let (mut client, _session) = connect(PeerConfig::v2(), &store, None);
     let mut msg = message("k-reject");
@@ -321,7 +335,7 @@ fn rejected_prompt_is_owed_and_not_counted_as_unacknowledged() {
         DeliveryOutcome::Rejected { code: -32002, .. }
     ));
     assert!(msg.is_owed());
-    assert_eq!(msg.unacknowledged_attempts(), 0);
+    assert_eq!(msg.unacknowledged_attempts(), 1);
 }
 
 #[test]
@@ -353,10 +367,10 @@ fn wire_requests_use_pinned_v2_field_names_and_meta_key() {
     let peer = client.initialize().unwrap();
     assert!(!peer.dedup_contract);
     let session = client.open_session(CWD).unwrap();
-    let mut msg = message("k-wire");
+    let mut msg = OutboundMessage::new(MessageKey::new("k-wire").unwrap(), "hello");
     assert!(matches!(
         client.submit(&session, &mut msg),
-        DeliveryOutcome::Accepted(_)
+        DeliveryOutcome::DuplicateUnknown(_)
     ));
 
     let (_, written) = client.into_transport().into_parts();

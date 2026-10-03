@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::io::Read;
+
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
@@ -53,7 +56,7 @@ pub enum RequestFailure {
     ProtocolViolation(String),
 }
 
-/// A sender-minted identity for one communication.
+/// A supplied identity for one communication; no history is implied.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MessageKey(String);
 
@@ -69,6 +72,17 @@ impl MessageKey {
     }
 }
 
+/// Evidence supporting a receiver-side at-most-once label. Neither basis is
+/// measured receiver compliance or a guarantee about provider effects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtMostOnceBasis {
+    /// A fresh, unforked identity with exactly one counted attempt.
+    SingleAttempt,
+    /// Complete history: every attempt advertised our contract in this
+    /// session, and the current response echoes the key.
+    SessionContract,
+}
+
 /// A recorded insertion of an [`OutboundMessage`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Acceptance {
@@ -80,31 +94,59 @@ pub struct Acceptance {
     /// Whether this identity is known to have been inserted at most once.
     /// `false` after [`DeliveryOutcome::DuplicateUnknown`].
     pub at_most_once: bool,
+    pub basis: Option<AtMostOnceBasis>,
 }
 
 /// One communication and its delivery history.
 ///
 /// The key is fixed at construction, so every retry carries the same
 /// identity. The message is owed until an attempt is acknowledged.
-#[derive(Debug, Clone)]
 pub struct OutboundMessage {
     key: MessageKey,
     text: String,
     unacknowledged_attempts: u32,
     acceptance: Option<Acceptance>,
+    complete_history: bool,
+    all_attempts_dedup: bool,
+    session_id: Option<String>,
 }
 
 impl OutboundMessage {
+    /// A supplied, recovered or cloned key has unknown history. Current
+    /// advertisements cannot recover that missing evidence.
     pub fn new(key: MessageKey, text: impl Into<String>) -> Self {
         Self {
             key,
             text: text.into(),
             unacknowledged_attempts: 0,
             acceptance: None,
+            complete_history: false,
+            all_attempts_dedup: true,
+            session_id: None,
         }
     }
 
-    pub fn key(&self) -> &MessageKey {
+    /// Mint a fresh Linux identity. Random-key uniqueness is the minting
+    /// assumption; no durable registry or restart history is maintained.
+    /// The message cannot be cloned, and exporting its key abandons the
+    /// complete-history claim because the caller could fork it.
+    pub fn fresh(text: impl Into<String>) -> std::io::Result<Self> {
+        let mut bytes = [0u8; 32];
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+        let key: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        let mut message = Self::new(MessageKey(key), text);
+        message.complete_history = true;
+        Ok(message)
+    }
+
+    /// Exporting the key permits re-supply/forking. Both future labels and
+    /// any cached acceptance are conservatively downgraded.
+    pub fn key(&mut self) -> &MessageKey {
+        self.complete_history = false;
+        if let Some(acceptance) = &mut self.acceptance {
+            acceptance.at_most_once = false;
+            acceptance.basis = None;
+        }
         &self.key
     }
 
@@ -113,8 +155,8 @@ impl OutboundMessage {
         self.acceptance.is_none()
     }
 
-    /// Attempts that were sent but never acknowledged. Each may or may not
-    /// have been inserted.
+    /// Attempts without an insertion ACK, including valid rejections. Each
+    /// may or may not have been inserted.
     pub fn unacknowledged_attempts(&self) -> u32 {
         self.unacknowledged_attempts
     }
@@ -139,19 +181,20 @@ pub enum NoAckCause {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeliveryOutcome {
     /// Inserted, and known to be inserted at most once: either this was the
-    /// first attempt, or a complying receiver returned the original
-    /// insertion. Not turn completion.
+    /// only counted attempt for a fresh unforked identity, or its complete
+    /// same-session history is contract-covered. See `Acceptance::basis`.
     Accepted(Acceptance),
-    /// Inserted by this attempt, but an earlier unacknowledged attempt may
-    /// also have been inserted, and the receiver did not demonstrably apply
-    /// the dedup contract. Never at-most-once.
+    /// An insertion ACK was received, but complete history is unknown or
+    /// includes a non-contract attempt. Never at-most-once.
     DuplicateUnknown(Acceptance),
     /// No acknowledgement; still owed.
     NotAcknowledged(NoAckCause),
-    /// The agent answered with a JSON-RPC error; not inserted, still owed.
+    /// A valid JSON-RPC error; insertion uncertain, still owed and counted.
     Rejected { code: i64, message: String },
     /// The client has no negotiated v2 peer, so nothing was sent.
     NotNegotiated,
+    /// This communication belongs to a different session; nothing sent.
+    SessionMismatch,
 }
 
 /// A `session/update` the client observed, in arrival order.
@@ -174,15 +217,17 @@ pub enum SessionEvent {
     },
 }
 
-/// The agent's foreground work stopped (an idle `state_update`). This is
-/// not physical drain.
+/// The session was observed idle after an attempt: readiness evidence,
+/// without message-completion correlation or physical-drain evidence.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TurnEnd {
+pub struct SessionIdle {
     pub stop_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TurnWaitFailure {
+pub enum IdleWaitFailure {
+    /// No prompt attempt has been tracked for this session; nothing read.
+    NoAttempt,
     /// The peer went away before reporting idle. Says nothing about whether
     /// an acknowledged message is still owed (it is not).
     PeerGone,
@@ -203,9 +248,8 @@ pub struct AcpClient<T> {
     next_id: u64,
     peer: Option<NegotiatedPeer>,
     events: Vec<SessionEvent>,
-    /// Index into `events` from which a turn end may be attributed to the
-    /// latest acknowledged prompt.
-    turn_start: usize,
+    /// Independent observation cursors; one session never consumes another.
+    idle_cursor: HashMap<String, usize>,
 }
 
 impl<T: Transport> AcpClient<T> {
@@ -216,7 +260,7 @@ impl<T: Transport> AcpClient<T> {
             next_id: 0,
             peer: None,
             events: Vec::new(),
-            turn_start: 0,
+            idle_cursor: HashMap::new(),
         }
     }
 
@@ -235,6 +279,7 @@ impl<T: Transport> AcpClient<T> {
 
     /// Offers protocol version 2 and accepts only version 2 back.
     pub fn initialize(&mut self) -> Result<NegotiatedPeer, NegotiationFailure> {
+        self.peer = None;
         let mut meta = Map::new();
         meta.insert(
             DEDUP_CONTRACT_META.to_owned(),
@@ -274,6 +319,16 @@ impl<T: Transport> AcpClient<T> {
         {
             return Err(NegotiationFailure::NoSessionSurface);
         }
+        if !response
+            .capabilities
+            .session
+            .as_ref()
+            .is_some_and(Value::is_object)
+        {
+            return Err(NegotiationFailure::ProtocolViolation(
+                "session capability must be an object".to_owned(),
+            ));
+        }
         let dedup_contract = response
             .meta
             .as_ref()
@@ -308,8 +363,13 @@ impl<T: Transport> AcpClient<T> {
             session_id: session_id.to_owned(),
             cwd: cwd.to_owned(),
         };
-        self.session_call(method::SESSION_RESUME, &request)
-            .map(|_| ())
+        let result = self.session_call(method::SESSION_RESUME, &request)?;
+        if !result.is_object() {
+            return Err(RequestFailure::ProtocolViolation(
+                "session/resume result must be an object".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// Sends one `session/prompt` attempt for `message` and returns at its
@@ -319,6 +379,13 @@ impl<T: Transport> AcpClient<T> {
     /// A message that is already acknowledged is not sent again; its
     /// recorded acceptance is returned.
     pub fn submit(&mut self, session_id: &str, message: &mut OutboundMessage) -> DeliveryOutcome {
+        if message
+            .session_id
+            .as_deref()
+            .is_some_and(|id| id != session_id)
+        {
+            return DeliveryOutcome::SessionMismatch;
+        }
         if let Some(acceptance) = &message.acceptance {
             return if acceptance.at_most_once {
                 DeliveryOutcome::Accepted(acceptance.clone())
@@ -342,10 +409,24 @@ impl<T: Transport> AcpClient<T> {
             }],
             meta,
         };
-        self.turn_start = self.events.len();
+        // Preserve already-observed readiness even across subsequent attempts.
+        self.idle_cursor
+            .entry(session_id.to_owned())
+            .or_insert(self.events.len());
+        message.session_id = Some(session_id.to_owned());
+        message.all_attempts_dedup &= peer.dedup_contract;
         let result = match self.call(method::SESSION_PROMPT, &request) {
             Reply::Result(result) => result,
-            Reply::Error { code, message } => return DeliveryOutcome::Rejected { code, message },
+            Reply::Error {
+                code,
+                message: reason,
+            } => {
+                message.unacknowledged_attempts += 1;
+                return DeliveryOutcome::Rejected {
+                    code,
+                    message: reason,
+                };
+            }
             Reply::Gone => {
                 message.unacknowledged_attempts += 1;
                 return DeliveryOutcome::NotAcknowledged(NoAckCause::PeerGone);
@@ -377,11 +458,21 @@ impl<T: Transport> AcpClient<T> {
             && meta.get(MESSAGE_KEY_META).and_then(Value::as_str) == Some(message.key.as_str());
         let recovered =
             dedup_confirmed && meta.get(DUPLICATE_META).and_then(Value::as_bool) == Some(true);
-        let at_most_once = message.unacknowledged_attempts == 0 || dedup_confirmed;
+        let basis = if !message.complete_history {
+            None
+        } else if message.unacknowledged_attempts == 0 {
+            Some(AtMostOnceBasis::SingleAttempt)
+        } else if message.all_attempts_dedup && dedup_confirmed {
+            Some(AtMostOnceBasis::SessionContract)
+        } else {
+            None
+        };
+        let at_most_once = basis.is_some();
         let acceptance = Acceptance {
             message_id: response.message_id,
             recovered,
             at_most_once,
+            basis,
         };
         message.acceptance = Some(acceptance.clone());
         if at_most_once {
@@ -391,26 +482,34 @@ impl<T: Transport> AcpClient<T> {
         }
     }
 
-    /// Waits for the first idle `state_update` on `session_id` observed
-    /// since the latest prompt attempt was sent.
-    pub fn await_turn_end(&mut self, session_id: &str) -> Result<TurnEnd, TurnWaitFailure> {
-        let mut scanned = self.turn_start;
+    /// Observe the next unconsumed idle for this session after an attempt.
+    /// This is session readiness, never completion of a particular message.
+    pub fn await_session_idle(&mut self, session_id: &str) -> Result<SessionIdle, IdleWaitFailure> {
+        let Some(&start) = self.idle_cursor.get(session_id) else {
+            return Err(IdleWaitFailure::NoAttempt);
+        };
+        let mut scanned = start;
         loop {
-            if let Some(stop_reason) = self.events[scanned..].iter().find_map(|event| match event {
-                SessionEvent::Idle {
-                    session_id: id,
-                    stop_reason,
-                } if id == session_id => Some(stop_reason.clone()),
-                _ => None,
-            }) {
-                self.turn_start = self.events.len();
-                return Ok(TurnEnd { stop_reason });
+            if let Some((next, stop_reason)) =
+                self.events[scanned..]
+                    .iter()
+                    .enumerate()
+                    .find_map(|(offset, event)| match event {
+                        SessionEvent::Idle {
+                            session_id: id,
+                            stop_reason,
+                        } if id == session_id => Some((scanned + offset + 1, stop_reason.clone())),
+                        _ => None,
+                    })
+            {
+                self.idle_cursor.insert(session_id.to_owned(), next);
+                return Ok(SessionIdle { stop_reason });
             }
             scanned = self.events.len();
             match self.transport.recv() {
-                Incoming::Closed => return Err(TurnWaitFailure::PeerGone),
+                Incoming::Closed => return Err(IdleWaitFailure::PeerGone),
                 Incoming::Malformed(line) => {
-                    return Err(TurnWaitFailure::ProtocolViolation(format!(
+                    return Err(IdleWaitFailure::ProtocolViolation(format!(
                         "malformed message: {line}"
                     )));
                 }
@@ -418,7 +517,7 @@ impl<T: Transport> AcpClient<T> {
                     if message.get("method").is_some() {
                         self.handle_inbound(&message);
                     } else {
-                        return Err(TurnWaitFailure::ProtocolViolation(
+                        return Err(IdleWaitFailure::ProtocolViolation(
                             "unsolicited response".to_owned(),
                         ));
                     }
@@ -475,14 +574,24 @@ impl<T: Transport> AcpClient<T> {
                     message.get("id").unwrap_or(&Value::Null)
                 ));
             }
+            if message.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+                return Reply::Violation("response jsonrpc must be 2.0".to_owned());
+            }
+            if message.get("result").is_some() == message.get("error").is_some() {
+                return Reply::Violation(
+                    "response must have exactly one of result/error".to_owned(),
+                );
+            }
             if let Some(error) = message.get("error") {
+                let (Some(code), Some(reason)) = (
+                    error.get("code").and_then(Value::as_i64),
+                    error.get("message").and_then(Value::as_str),
+                ) else {
+                    return Reply::Violation("invalid error object".to_owned());
+                };
                 return Reply::Error {
-                    code: error.get("code").and_then(Value::as_i64).unwrap_or(0),
-                    message: error
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned(),
+                    code,
+                    message: reason.to_owned(),
                 };
             }
             return match message.get("result") {
