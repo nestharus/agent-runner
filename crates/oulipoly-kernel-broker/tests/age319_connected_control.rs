@@ -960,6 +960,7 @@ printf '%s\n' "$response"
         }),
         "unexpected ordinary output: {output}"
     );
+    let mut late_set = None;
     if normal {
         let root: RootRecord =
             serde_json::from_slice(&fs::read(state.join(format!("{root_id}.json"))).unwrap())
@@ -999,7 +1000,7 @@ printf '%s\n' "$response"
             } else {
                 output.clone()
             };
-            assert_real_bash_sync_children(
+            late_set = assert_real_bash_sync_children(
                 &state,
                 &fresh_db,
                 &root_id,
@@ -1357,6 +1358,22 @@ printf '%s\n' "$response"
             .unwrap()
             .source_generation
     );
+    if let Some((request_ids, execution)) = late_set {
+        assert_child_set_readback_and_late_admission(&state, &root_id, &request_ids, &execution);
+        // State's retained refusal is not the only reader: the Broker asked
+        // again for the same close no longer certifies it.
+        let root: RootRecord =
+            serde_json::from_slice(&fs::read(state.join(format!("{root_id}.json"))).unwrap())
+                .unwrap();
+        if let Ok(reply) = protocol::root_drain_readback_at(&socket, &root, false) {
+            let read: serde_json::Value =
+                serde_json::from_str(reply.strip_prefix("root-drain-v1 ").unwrap()).unwrap();
+            assert!(
+                read["owner_close_proof"].is_null(),
+                "Broker still certifies close after a late C: {read}"
+            );
+        }
+    }
     broker.kill().unwrap();
     broker.wait().unwrap();
 }
@@ -1370,7 +1387,7 @@ fn assert_real_bash_sync_children(
     handoff: &serde_json::Value,
     output: &str,
     children: usize,
-) {
+) -> Option<(std::collections::BTreeSet<String>, serde_json::Value)> {
     let reports: Vec<&str> = if children == 1 {
         vec![output]
     } else {
@@ -1425,9 +1442,9 @@ fn assert_real_bash_sync_children(
             .collect()
     };
     assert_eq!(accounted, request_ids, "root terminal child set differs");
-    if children > 1 {
-        assert_child_set_readback_and_late_admission(state, root_id, &request_ids, &execution);
-    }
+    // The late admission is made only after the caller has read its own
+    // certified result; every closure reader revokes acceptance after it.
+    (children > 1).then_some((request_ids, execution))
 }
 
 /// Reads the closed root through the actual State API, then admits one more

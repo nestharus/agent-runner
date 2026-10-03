@@ -185,6 +185,19 @@ impl FreshV30Lane {
         recipient: &FreshRecipientIdentity,
         uid: u32,
     ) -> Result<FreshDeliverySubmission, String> {
+        self.submit_recipient_member_delivery(delivery_request_id, session, recipient, uid, None)
+    }
+
+    /// As `submit_recipient_delivery`, but a known member's own row only.
+    /// One member's delivery request can never be granted another's row.
+    pub fn submit_recipient_member_delivery(
+        &mut self,
+        delivery_request_id: &str,
+        session: &FreshV30Session,
+        recipient: &FreshRecipientIdentity,
+        uid: u32,
+        member_seq: Option<i64>,
+    ) -> Result<FreshDeliverySubmission, String> {
         validate_request_id(delivery_request_id)?;
         if self
             .read_recipient_delivery_by_request(delivery_request_id, recipient)?
@@ -202,7 +215,7 @@ impl FreshV30Lane {
         }
         let query = format!(
             "SELECT {MAILBOX_ROW_COLUMNS} FROM mailbox
-             WHERE session_id=?1 AND delivered_at IS NULL
+             WHERE session_id=?1 AND (?2 IS NULL OR seq=?2) AND delivered_at IS NULL
                AND (target_kind IS NULL OR (target_kind='session' AND target_id=?1))
                AND {DELIVERABLE_MAILBOX_ERROR_PREDICATE}
                AND NOT EXISTS (SELECT 1 FROM fresh_recipient_grant g
@@ -213,7 +226,7 @@ impl FreshV30Lane {
             .sidecar
             .mailbox()
             .conn
-            .query_row(&query, [&session.session_id], map_mailbox_row)
+            .query_row(&query, params![session.session_id, member_seq], map_mailbox_row)
             .optional()
             .map_err(|e| e.to_string())?
             .ok_or("no ungranted pending fresh recipient row")?;

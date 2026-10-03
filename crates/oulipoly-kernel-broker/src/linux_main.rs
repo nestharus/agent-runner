@@ -4323,8 +4323,7 @@ fn fence_root_from_terminal(
         .execution
         .as_ref()
         .ok_or_else(|| io::Error::other("root execution absent before drain fence"))?;
-    if read.execution_state == "unknown"
-        || !read.unresolved_child_request_ids.is_empty()
+    if read.closure_refusal().is_some()
         || execution.handoff_id != root.handoff_id
         || execution.d_key != root.d_key
         || execution.invocation_uuid != root.invocation_uuid
@@ -4368,8 +4367,7 @@ fn exact_entry_terminal_settlement(
         .execution
         .as_ref()
         .ok_or_else(|| io::Error::other("root terminal execution absent"))?;
-    if read.execution_state == "unknown"
-        || !read.unresolved_child_request_ids.is_empty()
+    if read.closure_refusal().is_some()
         || read.publication_state != "settled"
         || read.publication_sha256.is_none()
         || execution.root_id != read.root_id
@@ -8329,6 +8327,30 @@ fn bind_original_d(
     Ok((root, session))
 }
 
+/// The one pending notify member a targeted original F may carry.
+fn pending_member_seq(
+    lane: &FreshV30Lane,
+    d_key: &str,
+    actor: &FreshRecipientIdentity,
+    session: &oulipoly_state::mailbox::FreshV30Session,
+    member: &str,
+) -> Result<i64, String> {
+    let root = lane.released_handoff_for_child(d_key, actor)?;
+    let terminal = lane.read_private_root_terminal(&root, actor, session)?;
+    let member = terminal
+        .member(member)
+        .ok_or("recipient F member is not admitted under this root")?;
+    if member.listener_policy.as_deref() != Some("notify")
+        || member.notification_state != "pending_f"
+        || member.selected_event.is_none()
+    {
+        return Err("recipient member F requires its own selected pending W".into());
+    }
+    member
+        .mailbox_seq
+        .ok_or_else(|| "recipient member F row absent".into())
+}
+
 fn bind_original_grant(
     lane: &FreshV30Lane,
     grant: &oulipoly_state::mailbox::FreshDeliveryReadback,
@@ -8350,12 +8372,17 @@ fn bind_original_grant(
         return Err("recipient grant differs from released D/session/owner".into());
     }
     let terminal = lane.read_private_root_terminal(&root, actor, &session)?;
-    let event = terminal
-        .selected_child_event
+    // The grant binds to the one member whose own row it carries.
+    let member = terminal
+        .members()
+        .into_iter()
+        .find(|member| member.mailbox_seq == Some(grant.seq))
+        .ok_or("recipient original grant row is no member's W")?;
+    let event = member
+        .selected_event
         .as_ref()
         .ok_or("recipient original grant selected W absent")?;
-    if terminal.listener_policy.as_deref() != Some("notify")
-        || terminal.mailbox_seq != Some(grant.seq)
+    if member.listener_policy.as_deref() != Some("notify")
         || event.source_id != grant.source_id
         || event.attempt_id != grant.attempt_id
     {
@@ -8438,6 +8465,7 @@ fn bind_normal_recipient_request(
         }
         Submit {
             allocation_request_id,
+            child_request_id: None,
             ..
         } => {
             let (root, session) = bind_original_d(lane, allocation_request_id, actor)?;
@@ -8450,6 +8478,15 @@ fn bind_normal_recipient_request(
             {
                 return Err("recipient original F requires selected pending W".into());
             }
+        }
+        Submit {
+            allocation_request_id,
+            child_request_id: Some(member),
+            ..
+        } => {
+            let (_, session) = bind_original_d(lane, allocation_request_id, actor)?;
+            lane.recipient_binding(&session, actor)?;
+            pending_member_seq(lane, allocation_request_id, actor, &session, member)?;
         }
         Read {
             delivery_request_id,
@@ -10086,6 +10123,20 @@ fn fresh_v30_worker(
                         return Err(io::Error::other("normal publication actor changed"));
                     }
                     live.verify()?;
+                    // Caller publication accepts the root's closure: every
+                    // admitted child must be accounted and every notify
+                    // member settled before the first caller byte.
+                    let closure_refusal = lane
+                        .root_child_closure(&receipt.old_release.prepared.root_id)
+                        .map_err(io::Error::other)?
+                        .and_then(|closure| closure.refusal);
+                    if operation == 0x8c
+                        && let Some(refusal) = &closure_refusal
+                    {
+                        return Err(io::Error::other(format!(
+                            "normal publication root closure refused: {refusal}"
+                        )));
+                    }
                     let publication = if operation == 0x8c {
                         let (stdout, stderr) = descriptors.split_at_mut(1);
                         normal_physical::publish(
@@ -10109,6 +10160,11 @@ fn fresh_v30_worker(
                     };
                     live.verify()?;
                     if publication.state == "settled" {
+                        if let Some(refusal) = closure_refusal {
+                            return Err(io::Error::other(format!(
+                                "normal entry settlement root closure refused: {refusal}"
+                            )));
+                        }
                         let settlement = EntryTerminalSettlement {
                             d_key: receipt.d_key.clone(),
                             handoff_id: receipt.handoff_id.clone(),
@@ -11429,16 +11485,20 @@ fn fresh_v30_worker(
                             let terminal = lane
                                 .read_private_root_terminal(&root, &recipient, &session)
                                 .map_err(io::Error::other)?;
-                            if terminal.notification_state != "pending_f"
-                                || terminal.listener_policy.as_deref() != Some("notify")
+                            let member =
+                                terminal.member(&decision.wake_request_id).ok_or_else(|| {
+                                    io::Error::other("successor start W is no root member")
+                                })?;
+                            if member.notification_state != "pending_f"
+                                || member.listener_policy.as_deref() != Some("notify")
                                 || terminal.session_id != decision.obligation.session_id
-                                || terminal.mailbox_seq != Some(decision.obligation.seq)
-                                || terminal.delivery_payload_sha256.as_deref()
+                                || member.mailbox_seq != Some(decision.obligation.seq)
+                                || member.delivery_payload_sha256.as_deref()
                                     != Some(decision.obligation.payload_sha256.as_str())
-                                || terminal.delivery_grant_id.is_some()
-                                || terminal.original_receipt.is_some()
-                                || terminal.successor_ack.is_some()
-                                || terminal.ack_basis.is_some()
+                                || member.delivery_grant_id.is_some()
+                                || member.original_receipt.is_some()
+                                || member.successor_ack.is_some()
+                                || member.ack_basis.is_some()
                             {
                                 return Err(io::Error::other(
                                     "successor start requires one pending W without F/ACK",
@@ -12062,6 +12122,7 @@ fn fresh_v30_worker(
                         FreshRecipientRequest::Submit {
                             allocation_request_id,
                             delivery_request_id,
+                            child_request_id,
                         } => {
                             if instance.is_closed() {
                                 return Err(io::Error::other("fresh recipient entry gate closed"));
@@ -12075,17 +12136,31 @@ fn fresh_v30_worker(
                             let (root_id, _) = lane
                                 .recipient_binding(&session, &recipient)
                                 .map_err(io::Error::other)?;
+                            let member_seq = child_request_id
+                                .as_deref()
+                                .map(|member| {
+                                    pending_member_seq(
+                                        &lane,
+                                        &allocation_request_id,
+                                        &recipient,
+                                        &session,
+                                        member,
+                                    )
+                                })
+                                .transpose()
+                                .map_err(io::Error::other)?;
                             let _guard = lock_fences(&admission_fences)
                                 .map_err(|_| io::Error::other("root admission fence poisoned"))?;
                             if _guard.contains(&root_id) {
                                 return Err(io::Error::other("exact root admission fenced"));
                             }
                             let submitted = lane
-                                .submit_recipient_delivery(
+                                .submit_recipient_member_delivery(
                                     &delivery_request_id,
                                     &session,
                                     &recipient,
                                     peer.uid,
+                                    member_seq,
                                 )
                                 .map_err(io::Error::other)?;
                             let receipt_path = lane

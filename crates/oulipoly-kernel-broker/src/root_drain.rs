@@ -10,8 +10,8 @@ use crate::source_physical::SourcePhysicalRegistry;
 use crate::work_registry::{LiveWork, WorkRecord, WorkRegistry};
 use oulipoly_state::mailbox::{
     BrokerClosedOwner, BrokerOwnerCloseInventory, BrokerSidecar, BrokerSourceEffectObligations,
-    FreshRootEffect, FreshRootEffectState, FreshRootWorkIntent, FreshSuccessorTerminalAck,
-    FreshV30Lane, PreparedProcessStamp,
+    FreshRootEffect, FreshRootEffectState, FreshRootMemberSettlement, FreshRootWorkIntent,
+    FreshSuccessorTerminalAck, FreshV30Lane, PreparedProcessStamp,
 };
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -46,6 +46,26 @@ pub struct RootPhysicalCloseProof {
     pub normal: Option<NormalRootEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offline: Option<OfflineRootEvidence>,
+    /// Each member of a child-set root and its own settlement. A one-child
+    /// root keeps its scalar ACK or receipt above.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub child_members: Vec<FreshRootMemberSettlement>,
+}
+
+/// The root's current child closure, read again on every inventory. A
+/// root without child C has none. An unreadable closure is a refusal.
+fn root_child_closure(
+    lane: Option<&FreshV30Lane>,
+    root_id: &str,
+) -> (Option<String>, Vec<FreshRootMemberSettlement>) {
+    let Some(lane) = lane else {
+        return (None, Vec::new());
+    };
+    match lane.root_child_closure(root_id) {
+        Ok(None) => (None, Vec::new()),
+        Ok(Some(closure)) => (closure.refusal, closure.members),
+        Err(error) => (Some(format!("child_closure_unknown: {error}")), Vec::new()),
+    }
 }
 
 pub fn exact_successor_ack_for_root(
@@ -68,6 +88,10 @@ pub fn exact_successor_ack_for_root(
     let terminal = lane
         .read_private_root_terminal(&released, &actor, &session)
         .map_err(io::Error::other)?;
+    if !terminal.children.is_empty() {
+        // Per-member ACKs are named by the child-set closure, not here.
+        return Ok(None);
+    }
     if terminal.notification_origin != "admitted_successor"
         || terminal.notification_state != "acked"
         || terminal.ack_basis.as_deref() != Some("successor_receiver_receipt_ack")
@@ -98,6 +122,9 @@ pub fn exact_original_receipt_for_root(
     let terminal = lane
         .read_private_root_terminal(&released, &actor, &session)
         .map_err(io::Error::other)?;
+    if !terminal.children.is_empty() {
+        return Ok(None);
+    }
     if terminal.notification_state != "acked" || terminal.ack_basis.as_deref() != Some("manual_ack")
     {
         return Err(io::Error::other(
@@ -190,6 +217,7 @@ pub fn physical_close_proof(inventory: &RootDrainInventory) -> io::Result<RootPh
         || inventory.offline_uncertain
         || inventory.successor_ack_unknown
         || inventory.original_receipt_unknown
+        || inventory.child_closure_refusal.is_some()
         || inventory.normal.as_ref().is_some_and(|normal| {
             normal.physical.state != "drained"
                 || normal.physical.q.is_none()
@@ -216,6 +244,7 @@ pub fn physical_close_proof(inventory: &RootDrainInventory) -> io::Result<RootPh
         original_receipt: inventory.original_receipt.clone(),
         normal: inventory.normal.clone(),
         offline: inventory.offline.clone(),
+        child_members: inventory.child_members.clone(),
     })
 }
 
@@ -273,6 +302,13 @@ pub struct RootDrainInventory {
     pub original_receipt_unknown: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_receipt: Option<oulipoly_state::mailbox::FreshOriginalReceiptIdentity>,
+    /// Why the root's current child set does not yet accept closure: an
+    /// unresolved or late C, or a notify member not yet settled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_closure_refusal: Option<String>,
+    /// Carried into the close proof; the readback reply names the refusal.
+    #[serde(skip)]
+    pub child_members: Vec<FreshRootMemberSettlement>,
     pub normal: Option<NormalRootEvidence>,
     pub normal_uncertain: bool,
     /// The released U intent selects the no-effect route even before its
@@ -419,6 +455,8 @@ pub fn readback(
     });
     let original_receipt_unknown = original_receipt_read.is_err();
     let original_receipt = original_receipt_read.ok().flatten();
+    let (child_closure_refusal, child_members) =
+        root_child_closure(lane.as_ref(), &expected.root_id);
     let terminal_dir = works.broker_root()?.join("terminals");
     let mut work_retired = 0;
     let mut work_outstanding = 0;
@@ -788,6 +826,8 @@ pub fn readback(
         successor_ack,
         original_receipt_unknown,
         original_receipt,
+        child_closure_refusal,
+        child_members,
         normal,
         normal_uncertain,
         offline_intent,
@@ -901,6 +941,7 @@ pub fn ready_for_owner_close_preflight(
         || inventory.source_effect_readback_uncertain
         || inventory.successor_ack_unknown
         || inventory.original_receipt_unknown
+        || inventory.child_closure_refusal.is_some()
         || inventory.normal_uncertain
         || inventory.offline_uncertain
         || inventory.uncertain_registry_or_incarnation
@@ -938,6 +979,11 @@ pub fn ready_for_normal_admission_fence(inventory: &RootDrainInventory) -> io::R
         return Err(io::Error::other(
             "normal caller settlement absent before fence",
         ));
+    }
+    if let Some(refusal) = &inventory.child_closure_refusal {
+        return Err(io::Error::other(format!(
+            "root child closure refused before fence: {refusal}"
+        )));
     }
     ready_for_pid1_request_with_fence(inventory, false)
 }
@@ -1041,6 +1087,8 @@ mod tests {
             successor_ack: None,
             original_receipt_unknown: false,
             original_receipt: None,
+            child_closure_refusal: None,
+            child_members: Vec::new(),
             normal: None,
             normal_uncertain: false,
             offline_intent: false,
@@ -1077,6 +1125,49 @@ mod tests {
             owner_close_proof: None,
             close_eligible: false,
         }
+    }
+
+    /// The root's current child closure gates its owner close: an
+    /// unresolved, late or unsettled member refuses both the preflight and
+    /// the close proof. A child set's members enter the proof; a childless
+    /// or one-child root's proof keeps its earlier bytes.
+    #[test]
+    fn child_closure_refusal_blocks_close_and_members_enter_only_set_proofs() {
+        let settled = settled_owner_inventory();
+        let proof = physical_close_proof(&settled).unwrap();
+        let encoded = serde_json::to_string(&proof).unwrap();
+        assert!(!encoded.contains("child_members"));
+        assert_eq!(
+            serde_json::from_str::<RootPhysicalCloseProof>(&encoded).unwrap(),
+            proof
+        );
+        for refusal in [
+            "notification_unsettled",
+            "unresolved_child_admission",
+            "child_admission_after_freeze",
+            "child_closure_unknown: State unreadable",
+        ] {
+            let mut refused = settled.clone();
+            refused.child_closure_refusal = Some(refusal.into());
+            assert!(ready_for_owner_close_preflight(&refused, "root", "owner").is_err());
+            assert!(physical_close_proof(&refused).is_err(), "{refusal}");
+        }
+        let member = |id: &str| FreshRootMemberSettlement {
+            request_id: id.into(),
+            notification_state: "acked".into(),
+            evidence_sha256: id.repeat(64),
+        };
+        let mut set = settled.clone();
+        set.child_members = vec![member("a"), member("b")];
+        let set_proof = physical_close_proof(&set).unwrap();
+        assert_eq!(set_proof.child_members, set.child_members);
+        assert_ne!(
+            set_proof, proof,
+            "a changed member settlement changes the proof"
+        );
+        let mut changed = set.clone();
+        changed.child_members[1].evidence_sha256 = "c".repeat(64);
+        assert_ne!(physical_close_proof(&changed).unwrap(), set_proof);
     }
 
     #[test]

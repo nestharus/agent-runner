@@ -3057,10 +3057,28 @@ fn run_normal_model(
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     #[cfg(feature = "age319-private-broker-fixture")]
-    if private_userns_broker_socket().is_some()
-        && let Some(directory) = std::env::var_os("AGE319_CONNECTED_ASYNC_RECIPIENT_DIR_V1")
-    {
-        connected_async_bash_recipient(&socket, &receipt.d_key, &PathBuf::from(directory))?;
+    if private_userns_broker_socket().is_some() {
+        // A child set is delivered member by member by the installed
+        // recipient; the connected fixture recipient is one-child only.
+        let set = protocol::fresh_root_terminal_request_at(
+            &socket,
+            &protocol::FreshRecipientRequest::ReadRootTerminal {
+                d_key: receipt.d_key.clone(),
+            },
+        )
+        .map_err(|e| format!("normal recipient terminal read unknown: {e}"))?
+        .notification_origin
+            == "child_set";
+        if set {
+            crate::installed_async_recipient::settle_pending_original(
+                &socket,
+                &receipt.d_key,
+                true,
+            )?;
+        } else if let Some(directory) = std::env::var_os("AGE319_CONNECTED_ASYNC_RECIPIENT_DIR_V1")
+        {
+            connected_async_bash_recipient(&socket, &receipt.d_key, &PathBuf::from(directory))?;
+        }
     }
     #[cfg(not(feature = "age319-private-broker-fixture"))]
     crate::installed_async_recipient::settle_pending_original(
@@ -3096,6 +3114,11 @@ fn run_normal_model(
             .is_none_or(|execution| execution.parent.grant_id != admission.admission_id)
     {
         return Err("normal terminal settlement did not retain exact K/Q".into());
+    }
+    // Publication accepts the root's closure; a late, unresolved or
+    // unsettled member keeps it from the caller.
+    if let Some(refusal) = terminal.closure_refusal() {
+        return Err(format!("normal terminal closure refused: {refusal}"));
     }
     let publication =
         protocol::publish_fresh_normal_provider_at(
@@ -3389,6 +3412,7 @@ fn connected_async_bash_recipient(
             &FreshRecipientRequest::Submit {
                 allocation_request_id: d_key.into(),
                 delivery_request_id: uuid::Uuid::new_v4().to_string(),
+                child_request_id: None,
             },
         )
         .is_ok()
@@ -3425,6 +3449,7 @@ fn connected_async_bash_recipient(
         &FreshRecipientRequest::Submit {
             allocation_request_id: d_key.into(),
             delivery_request_id: delivery_request_id.clone(),
+            child_request_id: None,
         },
     )
     .map_err(|e| format!("connected async recipient F submit: {e}"))?;
@@ -4125,6 +4150,7 @@ fn private_resident_fence_pending_f(
         &FreshRecipientRequest::Submit {
             allocation_request_id: root_d.into(),
             delivery_request_id: delivery_request_id.clone(),
+            child_request_id: None,
         },
     )
     .map_err(|e| format!("original interactive F submission unknown: {e}"))?;
@@ -6639,6 +6665,7 @@ fn private_bash_recipient_probe(
         let request = FreshRecipientRequest::Submit {
             allocation_request_id: root_d.into(),
             delivery_request_id: delivery_request_id.clone(),
+            child_request_id: None,
         };
         let mut frame = vec![b'F'];
         frame.extend_from_slice(&challenge);
@@ -6689,6 +6716,7 @@ fn private_bash_recipient_probe(
             &FreshRecipientRequest::Submit {
                 allocation_request_id: root_d.into(),
                 delivery_request_id: delivery_request_id.clone(),
+                child_request_id: None,
             },
         )
         .map_err(|e| e.to_string())?
