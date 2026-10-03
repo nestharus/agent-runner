@@ -60,22 +60,77 @@ pub(crate) fn settle_pending_original(
     d_key: &str,
     disposable_fixture: bool,
 ) -> Result<(), String> {
-    let mut deadline = Instant::now() + Duration::from_secs(120);
+    let deadline = Instant::now() + Duration::from_secs(120);
     // A root with two or more admitted C reads back as a child set even
     // before any member's W is accepted.
     if read_terminal(socket, d_key)?.notification_origin != "child_set" {
         return settle_pending_scalar(socket, d_key, disposable_fixture, deadline);
     }
+    settle_pending_child_set(
+        deadline,
+        || read_terminal(socket, d_key),
+        |terminal, member| {
+            settle_member(
+                socket,
+                d_key,
+                Target {
+                    terminal,
+                    member,
+                    targeted: true,
+                },
+                disposable_fixture,
+            )
+        },
+        || {
+            protocol::fresh_root_terminal_request_at(
+                socket,
+                &FreshRecipientRequest::RepairRootTerminal {
+                    d_key: d_key.into(),
+                },
+            )
+            .map(|_| ())
+            .map_err(|e| format!("async original member repair unknown: {e}"))
+        },
+        Instant::now,
+        || std::thread::sleep(Duration::from_millis(50)),
+    )
+}
+
+// Keep the production loop testable with exact readbacks and a deterministic
+// clock; delivery, repair and wait still use the existing operations above.
+fn settle_pending_child_set(
+    mut deadline: Instant,
+    mut read: impl FnMut() -> Result<FreshRootTerminalReadback, String>,
+    mut settle: impl FnMut(
+        &FreshRootTerminalReadback,
+        FreshRootTerminalChildReadback,
+    ) -> Result<(), String>,
+    mut repair: impl FnMut() -> Result<(), String>,
+    mut now: impl FnMut() -> Instant,
+    mut wait: impl FnMut(),
+) -> Result<(), String> {
     // A child set: each notify member is delivered, receipted and ACKed on
     // its own. A member already settled is never sent again.
     loop {
-        let terminal = read_terminal(socket, d_key)?;
+        let terminal = read()?;
         // Before the freeze a member whose W is not yet accepted is listed
         // only as unresolved; the set is not settled while any C waits.
         let complete = terminal.unresolved_child_request_ids.is_empty();
         match terminal.notification_state.as_str() {
             "response_only" | "acked" if complete => return Ok(()),
             "response_only" | "acked" | "child_set_pending" => {}
+            // State aggregates no selected members as N/A. Before freeze it
+            // also reports execution_evidence_incomplete: that still refuses
+            // closure, but this admitted, unresolved notification set can wait.
+            "not_applicable"
+                if terminal.notification_origin == "child_set"
+                    && terminal.execution.is_none()
+                    && terminal.execution_state == "unknown"
+                    && terminal.terminal_state == "execution_unknown"
+                    && terminal.children.is_empty()
+                    && terminal.unresolved_child_request_ids.len() >= 2
+                    && terminal.late_child_request_ids.is_empty()
+                    && terminal.refusal.as_deref() == Some("execution_evidence_incomplete") => {}
             other => return Err(format!("async original child set state unknown: {other}")),
         }
         let mut progressed = false;
@@ -83,27 +138,12 @@ pub(crate) fn settle_pending_original(
             match member.notification_state.as_str() {
                 "not_applicable" | "response_only" | "acked" => {}
                 "pending_f" | "f_unknown" | "f_submitted_native_pending" => {
-                    settle_member(
-                        socket,
-                        d_key,
-                        Target {
-                            terminal: &terminal,
-                            member: member.clone(),
-                            targeted: true,
-                        },
-                        disposable_fixture,
-                    )?;
+                    settle(&terminal, member.clone())?;
                     progressed = true;
                     break;
                 }
                 "repair_required" => {
-                    protocol::fresh_root_terminal_request_at(
-                        socket,
-                        &FreshRecipientRequest::RepairRootTerminal {
-                            d_key: d_key.into(),
-                        },
-                    )
-                    .map_err(|e| format!("async original member repair unknown: {e}"))?;
+                    repair()?;
                 }
                 "awaiting_w" if member.listener_policy.as_deref() == Some("notify") => {}
                 other => {
@@ -117,13 +157,13 @@ pub(crate) fn settle_pending_original(
         if progressed {
             // The wait for a next deliverable member restarts after each
             // settled one; a set is not bounded by one member's budget.
-            deadline = Instant::now() + Duration::from_secs(120);
+            deadline = now() + Duration::from_secs(120);
             continue;
         }
-        if Instant::now() >= deadline {
+        if now() >= deadline {
             return Err("async original child set did not become deliverable".into());
         }
-        std::thread::sleep(Duration::from_millis(50));
+        wait();
     }
 }
 
@@ -806,6 +846,322 @@ mod intent_tests {
             "ack_basis": null
         }))
         .unwrap()
+    }
+
+    fn unselected_set() -> FreshRootTerminalReadback {
+        unselected_set_with_ids(vec!["a".into(), "b".into()])
+    }
+
+    fn unselected_set_with_ids(ids: Vec<String>) -> FreshRootTerminalReadback {
+        let mut readback = terminal();
+        readback.notification_state = "not_applicable".into();
+        // read_private_root_terminal records each unresolved C first, then
+        // terminal_commit_absent when parent Q is complete but freeze awaits W.
+        readback.unknown_stages = ids
+            .iter()
+            .map(|id| format!("child_c_unresolved:{id}"))
+            .collect();
+        readback
+            .unknown_stages
+            .push("terminal_commit_absent".into());
+        readback.unknown_stage = readback.unknown_stages.last().cloned();
+        readback.refusal = Some("execution_evidence_incomplete".into());
+        readback.artifacts = vec!["released-d:d".into(), "invocation-j:j".into()];
+        readback
+            .artifacts
+            .extend(ids.iter().map(|id| format!("unresolved-child-c:{id}")));
+        readback.unresolved_child_request_ids = ids;
+        readback
+    }
+
+    #[test]
+    fn pending_dto_tracks_state_producer_and_still_refuses_closure() {
+        // Source/DTO relationship control, not a native State/Broker run. Keep
+        // the scripted positive input tied to the actual producer's branches;
+        // a changed producer needs this fixture and its meaning reconsidered.
+        let state = include_str!("../../crates/oulipoly-state/src/mailbox/fresh_root_terminal.rs");
+        assert!(state.contains("if children.is_empty() {\n        \"not_applicable\""));
+        let producer = state
+            .split("pub fn read_private_root_terminal(")
+            .nth(1)
+            .unwrap()
+            .split("fn validate_frozen_child_set(")
+            .next()
+            .unwrap();
+        for source in [
+            "execution: None,",
+            "execution_state: \"unknown\".into(),",
+            "None => (set.selected.clone(), set.unresolved.clone(), Vec::new()),",
+            ".map_or(set.admitted() >= 2, |stored| !stored.children.is_empty());",
+            "format!(\"child_c_unresolved:{id}\")",
+            "result.unresolved_child_request_ids = unresolved;",
+            "_ => \"terminal_commit_absent\".into(),",
+            "(Err(e), _) => format!(\"parent_k_q:{e}\"),",
+            "result.notification_origin = \"child_set\".into();",
+            "result.notification_state = child_set_notification_state(&result.children).into();",
+            "result.terminal_state = if result.execution_state == \"unknown\" {\n            result.refusal = Some(\"execution_evidence_incomplete\".into());\n            \"execution_unknown\"",
+        ] {
+            assert!(
+                producer.contains(source),
+                "State producer changed: {source}"
+            );
+        }
+        let pending = unselected_set();
+        // Broker serializes this DTO; protocol deserializes it unchanged.
+        let decoded: FreshRootTerminalReadback =
+            serde_json::from_slice(&serde_json::to_vec(&pending).unwrap()).unwrap();
+        assert_eq!(decoded, pending);
+        assert_eq!(decoded.notification_state, "not_applicable");
+        assert_eq!(decoded.notification_origin, "child_set");
+        assert_eq!(
+            decoded.unknown_stages,
+            [
+                "child_c_unresolved:a",
+                "child_c_unresolved:b",
+                "terminal_commit_absent"
+            ]
+        );
+        assert_eq!(
+            decoded.unknown_stage.as_deref(),
+            Some("terminal_commit_absent")
+        );
+        assert_eq!(
+            decoded.refusal.as_deref(),
+            Some("execution_evidence_incomplete")
+        );
+        assert_eq!(
+            decoded.closure_refusal(),
+            Some("execution_evidence_incomplete")
+        );
+        let (result, settled, waits, _) = run_set(
+            vec![Ok(decoded.clone()), Ok(decoded)],
+            Duration::from_secs(120),
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            "async original child set did not become deliverable"
+        );
+        assert!(settled.is_empty());
+        assert_eq!(waits, 1);
+    }
+
+    // This drives the product loop, not a parallel classifier. Reads and time
+    // are explicit; settlement stands in for the unchanged F/receipt/ACK path.
+    fn run_set(
+        reads: Vec<Result<FreshRootTerminalReadback, String>>,
+        wait_step: Duration,
+    ) -> (Result<(), String>, Vec<String>, usize, usize) {
+        let start = Instant::now();
+        let clock = std::cell::Cell::new(start);
+        let waits = std::cell::Cell::new(0);
+        let mut reads = std::collections::VecDeque::from(reads);
+        let mut settled = Vec::new();
+        let result = settle_pending_child_set(
+            start + Duration::from_secs(120),
+            || reads.pop_front().expect("unexpected terminal read"),
+            |_, member| {
+                settled.push(member.request_id);
+                Ok(())
+            },
+            || panic!("unexpected repair"),
+            || clock.get(),
+            || {
+                waits.set(waits.get() + 1);
+                clock.set(clock.get() + wait_step);
+            },
+        );
+        (result, settled, waits.get(), reads.len())
+    }
+
+    #[test]
+    fn admitted_zero_selected_set_waits_then_settles_each_member_once() {
+        // Two is the C1 window; ten also exercises the historical member count
+        // without pretending to run the installed ten-root workload.
+        for count in [2, 10] {
+            let ids: Vec<String> = (0..count).map(|i| format!("child-{i}")).collect();
+            let pending = unselected_set_with_ids(ids.clone());
+            // The other producer branch records incomplete parent Q while
+            // the original remains live. It likewise cannot certify closure.
+            let mut parent_pending = pending.clone();
+            let stage = "parent_k_q:parent physical Q incomplete or changed".to_owned();
+            *parent_pending.unknown_stages.last_mut().unwrap() = stage.clone();
+            parent_pending.unknown_stage = Some(stage);
+            let mut reads = vec![Ok(parent_pending), Ok(pending)];
+            let mut selected = terminal();
+            selected.children = ids.iter().map(|id| member(id)).collect();
+            for index in 0..count {
+                reads.push(Ok(selected.clone()));
+                selected.children[index].notification_state = "acked".into();
+            }
+            selected.notification_state = "acked".into();
+            reads.push(Ok(selected));
+            let (result, settled, waits, remaining) = run_set(reads, Duration::from_secs(1));
+            assert_eq!(result, Ok(()));
+            assert_eq!(settled, ids);
+            assert_eq!(waits, 2);
+            assert_eq!(remaining, 0);
+        }
+    }
+
+    #[test]
+    fn unselected_set_fails_at_existing_deadline_without_delivery() {
+        let pending = unselected_set();
+        let (result, settled, waits, remaining) = run_set(
+            vec![Ok(pending.clone()), Ok(pending)],
+            Duration::from_secs(120),
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            "async original child set did not become deliverable"
+        );
+        assert!(settled.is_empty());
+        assert_eq!(waits, 1);
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn inapplicable_unknown_unbound_and_gone_sets_refuse_without_wait_or_delivery() {
+        let mut invalid = Vec::new();
+        for state in ["unknown", "awaiting_w", "gone", "execution_unknown"] {
+            let mut readback = unselected_set();
+            readback.notification_state = state.into();
+            invalid.push(Ok(readback));
+        }
+        for count in [0, 1] {
+            let mut readback = unselected_set();
+            readback.unresolved_child_request_ids.truncate(count);
+            invalid.push(Ok(readback));
+        }
+        let mut readback = unselected_set();
+        readback.notification_origin = "none".into();
+        invalid.push(Ok(readback));
+        let mut readback = unselected_set();
+        readback.children.push(member("selected"));
+        invalid.push(Ok(readback));
+        let mut readback = unselected_set();
+        readback.late_child_request_ids.push("a".into());
+        invalid.push(Ok(readback));
+        let mut readback = unselected_set();
+        readback.refusal = Some("original_gone".into());
+        invalid.push(Ok(readback));
+        for refusal in [
+            None,
+            Some("unresolved_child_admission"),
+            Some("child_admission_after_freeze"),
+        ] {
+            let mut readback = unselected_set();
+            readback.refusal = refusal.map(str::to_owned);
+            invalid.push(Ok(readback));
+        }
+        let mut readback = unselected_set();
+        readback.execution_state = "success".into();
+        invalid.push(Ok(readback));
+        let mut readback = unselected_set();
+        readback.terminal_state = "execution_completed".into();
+        invalid.push(Ok(readback));
+        let mut readback = unselected_set();
+        readback.execution = Some(
+            serde_json::from_value(serde_json::json!({
+                "handoff_id": "handoff", "d_key": "d", "invocation_uuid": "j",
+                "session_id": "session", "root_id": "root", "owner_generation": "owner",
+                "actor": readback.actor,
+                "parent": {
+                    "grant_id": "k", "work_id": "q", "plan_sha256": "plan",
+                    "wait_status": 0, "outcome": "success", "cancelled": false,
+                    "stdout_sha256": "stdout", "stdout_len": 0,
+                    "stderr_sha256": "stderr", "stderr_len": 0
+                },
+                "child_request_id": null, "child_event": null, "outcome": "success"
+            }))
+            .unwrap(),
+        );
+        invalid.push(Ok(readback));
+        // Binding/gone errors from the reader must propagate, never become N/A.
+        invalid.push(Err("root binding absent".into()));
+        invalid.push(Err("original gone".into()));
+        for readback in invalid {
+            let (result, settled, waits, remaining) = run_set(vec![readback], Duration::ZERO);
+            assert!(result.is_err());
+            assert!(settled.is_empty());
+            assert_eq!(waits, 0);
+            assert_eq!(remaining, 0);
+        }
+    }
+
+    #[test]
+    fn settled_members_do_not_complete_a_set_with_unresolved_admissions() {
+        for state in ["response_only", "acked"] {
+            let mut readback = terminal();
+            readback.notification_state = state.into();
+            let mut child = member("a");
+            child.notification_state = state.into();
+            readback.children.push(child);
+            readback.unresolved_child_request_ids.push("b".into());
+            let (result, settled, waits, _) = run_set(
+                vec![Ok(readback.clone()), Ok(readback)],
+                Duration::from_secs(120),
+            );
+            assert_eq!(
+                result.unwrap_err(),
+                "async original child set did not become deliverable"
+            );
+            assert!(settled.is_empty());
+            assert_eq!(waits, 1);
+        }
+    }
+
+    #[test]
+    fn next_member_keeps_its_existing_deadline_budget_after_progress() {
+        let mut first = terminal();
+        first.children.push(member("a"));
+        first.unresolved_child_request_ids.push("b".into());
+        let mut between = first.clone();
+        between.children[0].notification_state = "acked".into();
+        between.notification_state = "acked".into();
+        let mut second = between.clone();
+        second.children.push(member("b"));
+        second.unresolved_child_request_ids.clear();
+        second.notification_state = "child_set_pending".into();
+        let mut done = second.clone();
+        done.children[1].notification_state = "acked".into();
+        done.notification_state = "acked".into();
+        let (result, settled, waits, remaining) = run_set(
+            vec![
+                Ok(unselected_set()),
+                Ok(first),
+                Ok(between),
+                Ok(second),
+                Ok(done),
+            ],
+            Duration::from_secs(119),
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(settled, ["a", "b"]);
+        assert_eq!(waits, 2);
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn complete_quiet_sets_return_and_mixed_members_keep_their_delivery_path() {
+        for state in ["response_only", "acked"] {
+            let mut readback = terminal();
+            readback.notification_state = state.into();
+            let (result, settled, waits, _) = run_set(vec![Ok(readback)], Duration::ZERO);
+            assert_eq!(result, Ok(()));
+            assert!(settled.is_empty());
+            assert_eq!(waits, 0);
+        }
+        let mut readback = terminal();
+        readback.children = vec![member("quiet"), member("done"), member("notify")];
+        readback.children[0].notification_state = "response_only".into();
+        readback.children[1].notification_state = "acked".into();
+        let first = readback.clone();
+        readback.children[2].notification_state = "acked".into();
+        readback.notification_state = "acked".into();
+        let (result, settled, waits, _) = run_set(vec![Ok(first), Ok(readback)], Duration::ZERO);
+        assert_eq!(result, Ok(()));
+        assert_eq!(settled, ["notify"]);
+        assert_eq!(waits, 0);
     }
 
     fn write_0400(path: &Path, bytes: &[u8]) {
