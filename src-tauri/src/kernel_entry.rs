@@ -41,6 +41,8 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+mod held_join;
+
 #[cfg(feature = "age319-private-broker-fixture")]
 mod root_pty_control;
 
@@ -8412,12 +8414,7 @@ fn v30_host_entry() -> Result<ExitCode, String> {
             [0, 1, 2, cwd.as_raw_fd(), completion.as_raw_fd()],
         )
         .map_err(|e| format!("v30 held J uncertain: {e}"))?;
-        let child_pid: i32 = held
-            .strip_prefix(&format!("held-joined {root} "))
-            .and_then(|s| s.strip_suffix('\n'))
-            .ok_or("v30 held J refused")?
-            .parse()
-            .map_err(|_| "v30 held child PID invalid")?;
+        let child_pid = held_join::child_pid(&root, &held, &mut std::io::stderr())?;
         #[cfg(feature = "age319-private-broker-fixture")]
         if std::env::var_os("AGE319_PRIVATE_CONNECTED_J_REPLAY_V1").is_some() {
             let (_replay_receipt, replay_completion) =
