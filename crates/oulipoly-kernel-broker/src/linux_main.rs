@@ -6042,6 +6042,47 @@ fn capture_terminal_sources(
     }
 }
 
+/// Main's control connections, taken from the listener one queued batch at a
+/// time. Every connection already waiting when a batch is taken is served
+/// before the next synchronous advance pass, so a queued request waits for at
+/// most one pass, not one pass per request ahead of it. Connections arriving
+/// during a batch form the next one, after that pass, so advance still runs
+/// between batches under a sustained flood.
+#[derive(Default)]
+struct ControlIngress {
+    queued: std::collections::VecDeque<(UnixStream, phase_record::Request)>,
+}
+
+impl ControlIngress {
+    /// Advance waits for the current batch; its own poll interval still
+    /// applies between batches.
+    fn advance_due(&self, last_advance: Instant) -> bool {
+        self.queued.is_empty() && last_advance.elapsed() >= NORMAL_CLOSE_POLL_INTERVAL
+    }
+
+    /// The next queued connection with its record stamped at its actual
+    /// accept. An empty batch takes every connection the listener holds now;
+    /// `WouldBlock` means none is waiting. A drain error other than
+    /// `Interrupted` ends the batch and is met again by the next `accept`.
+    fn next(&mut self, listener: &UnixListener) -> io::Result<(UnixStream, phase_record::Request)> {
+        if let Some(queued) = self.queued.pop_front() {
+            return Ok(queued);
+        }
+        let (stream, _) = listener.accept()?;
+        let first = (stream, phase_record::Request::accepted("control"));
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => self
+                    .queued
+                    .push_back((stream, phase_record::Request::accepted("control"))),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+        Ok(first)
+    }
+}
+
 fn serve() -> io::Result<()> {
     if unsafe { libc::geteuid() } != 0 {
         return Err(io::Error::other("host root required"));
@@ -6534,6 +6575,7 @@ fn serve() -> io::Result<()> {
             .as_ref(),
     );
     let mut window = phase_record::MainWindow::new();
+    let mut ingress = ControlIngress::default();
     loop {
         let iteration_start = phase_record::mono_ns();
         control_grants.retain(|_, grant| match grant.reap_if_done() {
@@ -6615,7 +6657,7 @@ fn serve() -> io::Result<()> {
         window.untracked_waits();
         let advance_start = phase_record::mono_ns();
         window.bridge_ns += advance_start.saturating_sub(bridges_start);
-        if last_auto_normal.elapsed() >= NORMAL_CLOSE_POLL_INTERVAL {
+        if ingress.advance_due(last_auto_normal) {
             last_auto_normal = Instant::now();
             window.advance_n += 1;
             let advance_cpu = phase_record::thread_cpu_ns();
@@ -6649,8 +6691,8 @@ fn serve() -> io::Result<()> {
         }
         let accept_start = phase_record::mono_ns();
         window.advance_ns += accept_start.saturating_sub(advance_start);
-        let mut stream = match listener.accept() {
-            Ok((stream, _)) => stream,
+        let (mut stream, mut control_record) = match ingress.next(&listener) {
+            Ok(accepted) => accepted,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 let idle_cpu = phase_record::thread_cpu_ns();
                 if let Some(sidecar) = broker_sidecar.as_mut() {
@@ -6727,7 +6769,6 @@ fn serve() -> io::Result<()> {
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
         };
-        let mut control_record = phase_record::Request::accepted("control");
         phase_record::begin_request();
         stream.set_read_timeout(Some(BROKER_INGRESS_IO_TIMEOUT))?;
         stream.set_write_timeout(Some(BROKER_INGRESS_IO_TIMEOUT))?;
@@ -12719,6 +12760,152 @@ mod recipient_effect_tests;
 #[cfg(test)]
 #[path = "owner_close_scan_tests.rs"]
 mod owner_close_scan_tests;
+
+#[cfg(test)]
+mod control_ingress_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    /// Stands in for one synchronous advance pass under flat40 load.
+    const PASS: Duration = Duration::from_millis(300);
+
+    /// Main's loop order with `ControlIngress`: advance when due, then one
+    /// connection whose challenge is written before its handler runs.
+    /// `done` is asked every iteration, since a sustained flood may never
+    /// leave the listener empty. Returns the start of each advance pass.
+    fn drive(
+        listener: &UnixListener,
+        service: Duration,
+        mut done: impl FnMut(usize) -> bool,
+    ) -> Vec<Instant> {
+        let mut ingress = ControlIngress::default();
+        let mut last_advance = Instant::now() - NORMAL_CLOSE_POLL_INTERVAL;
+        let mut passes = Vec::new();
+        let mut served = 0;
+        while !done(served) {
+            if ingress.advance_due(last_advance) {
+                last_advance = Instant::now();
+                passes.push(last_advance);
+                std::thread::sleep(PASS);
+            }
+            match ingress.next(listener) {
+                Ok((mut stream, _)) => {
+                    let _ = stream.write_all(b"c");
+                    std::thread::sleep(service);
+                    served += 1;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("accept: {error}"),
+            }
+        }
+        passes
+    }
+
+    fn listener(dir: &tempfile::TempDir) -> UnixListener {
+        let listener = UnixListener::bind(dir.path().join("control.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        listener
+    }
+
+    #[test]
+    fn queued_controls_get_challenge_within_one_advance_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = listener(&dir);
+        let socket = dir.path().join("control.sock");
+        // Forty entry checks queue before Main reaches accept, each reading
+        // its challenge under the 5s ingress timeout.
+        let clients: Vec<_> = (0..40)
+            .map(|_| {
+                let mut stream = UnixStream::connect(&socket).unwrap();
+                let queued = Instant::now();
+                std::thread::spawn(move || {
+                    stream
+                        .set_read_timeout(Some(BROKER_INGRESS_IO_TIMEOUT))
+                        .unwrap();
+                    let mut challenge = [0u8; 1];
+                    stream.read_exact(&mut challenge).map(|_| queued.elapsed())
+                })
+            })
+            .collect();
+        let passes = drive(&listener, Duration::from_millis(1), |served| served == 40);
+        let waits: Vec<_> = clients.into_iter().map(|c| c.join().unwrap()).collect();
+        let worst = waits
+            .iter()
+            .map(|wait| {
+                *wait
+                    .as_ref()
+                    .expect("entry check timed out before challenge")
+            })
+            .max()
+            .unwrap();
+        // One pass plus forty trivial services, far below forty passes.
+        assert!(worst < PASS * 4, "worst challenge wait {worst:?}");
+        assert!(!passes.is_empty(), "advance never ran");
+    }
+
+    #[test]
+    fn advance_keeps_running_between_batches_under_control_overload() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = listener(&dir);
+        let socket = dir.path().join("control.sock");
+        let stop = Arc::new(AtomicBool::new(false));
+        let flood_stop = stop.clone();
+        // Requests arrive faster than Main serves them, so the listener is
+        // never empty while the flood lasts.
+        let flood = std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while !flood_stop.load(Ordering::Relaxed) {
+                held.push(UnixStream::connect(&socket).unwrap());
+                std::thread::sleep(Duration::from_millis(3));
+            }
+            held.len()
+        });
+        let started = Instant::now();
+        let mut stopped = None;
+        let passes = drive(&listener, Duration::from_millis(4), |_| {
+            if stopped.is_none() && started.elapsed() >= Duration::from_secs(3) {
+                stop.store(true, Ordering::Relaxed);
+                stopped = Some(Instant::now());
+            }
+            stopped.is_some() && flood.is_finished()
+        });
+        let connected = flood.join().unwrap();
+        assert!(connected > 500, "flood too thin: {connected}");
+        let stopped = stopped.unwrap();
+        let during = passes.iter().filter(|pass| **pass < stopped).count();
+        // Each batch is only what waited when it was taken, then a pass:
+        // nominally passes at 0s, ~0.7s and ~1.9s of the 3s flood. A batch
+        // that keeps absorbing arrivals never yields to advance.
+        assert!(during >= 3, "only {during} advance passes during the flood");
+    }
+
+    #[test]
+    fn a_batch_is_what_waited_when_it_was_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = listener(&dir);
+        let socket = dir.path().join("control.sock");
+        let due = Instant::now() - NORMAL_CLOSE_POLL_INTERVAL;
+        let connect = || UnixStream::connect(&socket).unwrap();
+        let _first: Vec<_> = (0..3).map(|_| connect()).collect();
+        let mut ingress = ControlIngress::default();
+        assert!(ingress.advance_due(due));
+        ingress.next(&listener).unwrap();
+        assert!(!ingress.advance_due(due), "advance ran inside a batch");
+        let _later: Vec<_> = (0..2).map(|_| connect()).collect();
+        ingress.next(&listener).unwrap();
+        ingress.next(&listener).unwrap();
+        // Later arrivals wait behind the next pass instead of extending this
+        // batch, and the interval still gates a pass between batches.
+        assert!(ingress.advance_due(due), "later arrivals joined the batch");
+        assert!(!ingress.advance_due(Instant::now()));
+        ingress.next(&listener).unwrap();
+        assert!(!ingress.advance_due(due));
+    }
+}
 
 #[cfg(test)]
 mod admission_fence_tests {
