@@ -74,13 +74,13 @@ pub use fresh_lane::{
     FreshNormalModelSelection, FreshNormalModelSource, FreshNormalProviderAdmission,
     FreshNormalProviderK, FreshNormalWorkPreparation, FreshOriginalReceiptIdentity,
     FreshOriginalReceiverReceipt, FreshPhysicalTerminal, FreshRecipientIdentity,
-    FreshReleasedHandoff, FreshRootCallerResult, FreshRootEffect, FreshRootEffectState,
-    FreshRootHConsumption, FreshRootHDelegation, FreshRootHSelectedK, FreshRootTerminalChild,
-    FreshRootTerminalChildReadback, FreshRootTerminalExecution, FreshRootTerminalReadback,
-    FreshRootWorkIntent, FreshSuccessorAdmission, FreshSuccessorDelivery,
-    FreshSuccessorDeliveryReadback, FreshSuccessorOffer, FreshSuccessorReceiverReceipt,
-    FreshSuccessorTerminalAck, FreshV30Lane, FreshV30LaneIdentity, FreshV30Session,
-    NormalProviderSelection, normal_root_arguments,
+    FreshReleasedHandoff, FreshRootCallerResult, FreshRootChildClosure, FreshRootEffect,
+    FreshRootEffectState, FreshRootHConsumption, FreshRootHDelegation, FreshRootHSelectedK,
+    FreshRootMemberSettlement, FreshRootTerminalChild, FreshRootTerminalChildReadback,
+    FreshRootTerminalExecution, FreshRootTerminalReadback, FreshRootWorkIntent,
+    FreshSuccessorAdmission, FreshSuccessorDelivery, FreshSuccessorDeliveryReadback,
+    FreshSuccessorOffer, FreshSuccessorReceiverReceipt, FreshSuccessorTerminalAck, FreshV30Lane,
+    FreshV30LaneIdentity, FreshV30Session, NormalProviderSelection, normal_root_arguments,
 };
 pub use native_publication::NativePublication;
 #[path = "mailbox/schema.rs"]

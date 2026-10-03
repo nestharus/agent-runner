@@ -211,6 +211,7 @@ fn socket_case(fixture: bool) {
         &FreshRecipientRequest::Submit {
             allocation_request_id: root.d_key.clone(),
             delivery_request_id: uuid(),
+            child_request_id: None,
         },
     )
     .unwrap_err();

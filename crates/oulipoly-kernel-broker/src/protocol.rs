@@ -1968,6 +1968,10 @@ pub enum FreshRecipientRequest {
     Submit {
         allocation_request_id: String,
         delivery_request_id: String,
+        /// The one member of a child-set root whose own row this F carries.
+        /// Absent for a one-child root, whose single row is selected.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        child_request_id: Option<String>,
     },
     Read {
         delivery_request_id: String,

@@ -171,6 +171,7 @@ fn private_fresh_recipient_delivery_ack_collision_and_restart() {
         &FreshRecipientRequest::Submit {
             allocation_request_id: allocation.clone(),
             delivery_request_id: first_request.clone(),
+            child_request_id: None,
         },
     );
     let first = fresh_recipient_request_at(
@@ -193,6 +194,7 @@ fn private_fresh_recipient_delivery_ack_collision_and_restart() {
             &FreshRecipientRequest::Submit {
                 allocation_request_id: allocation.clone(),
                 delivery_request_id: first_request.clone(),
+                child_request_id: None,
             }
         )
         .is_err()
@@ -728,6 +730,7 @@ fn private_fresh_recipient_delivery_ack_collision_and_restart() {
             &FreshRecipientRequest::Submit {
                 allocation_request_id: allocation.clone(),
                 delivery_request_id: uuid::Uuid::new_v4().to_string(),
+                child_request_id: None,
             },
         )
         .unwrap();
@@ -1077,6 +1080,7 @@ fn private_fresh_recipient_delivery_ack_collision_and_restart() {
             &FreshRecipientRequest::Submit {
                 allocation_request_id: allocation.clone(),
                 delivery_request_id: uuid::Uuid::new_v4().to_string(),
+                child_request_id: None,
             },
         )
         .unwrap();
@@ -1149,6 +1153,7 @@ fn private_fresh_recipient_delivery_ack_collision_and_restart() {
             &FreshRecipientRequest::Submit {
                 allocation_request_id: offline_allocation,
                 delivery_request_id: uuid::Uuid::new_v4().to_string(),
+                child_request_id: None,
             }
         )
         .is_err()
@@ -1222,6 +1227,7 @@ fn private_fresh_recipient_delivery_ack_collision_and_restart() {
             &FreshRecipientRequest::Submit {
                 allocation_request_id: missing_allocation,
                 delivery_request_id: uuid::Uuid::new_v4().to_string(),
+                child_request_id: None,
             }
         )
         .is_err()
@@ -1276,6 +1282,7 @@ fn private_fresh_recipient_delivery_ack_collision_and_restart() {
             &FreshRecipientRequest::Submit {
                 allocation_request_id: detached_allocation,
                 delivery_request_id: uuid::Uuid::new_v4().to_string(),
+                child_request_id: None,
             }
         )
         .is_err()
@@ -1389,6 +1396,7 @@ fn uid_1001_original_recipient_child() {
         &FreshRecipientRequest::Submit {
             allocation_request_id: std::env::var("AGE319_ORIGINAL_UID_ALLOCATION").unwrap(),
             delivery_request_id: request_id.clone(),
+            child_request_id: None,
         },
     )
     .unwrap();
@@ -1595,6 +1603,7 @@ fn wrong_recipient_child() {
             &FreshRecipientRequest::Submit {
                 allocation_request_id: allocation,
                 delivery_request_id: uuid::Uuid::new_v4().to_string(),
+                child_request_id: None,
             }
         )
         .is_err()

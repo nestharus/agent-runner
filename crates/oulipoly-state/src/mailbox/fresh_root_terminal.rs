@@ -193,6 +193,81 @@ impl FreshRootTerminalReadback {
         self.unknown_stage = Some(stage.clone());
         self.unknown_stages.push(stage);
     }
+
+    /// Every member with its own notification readback. A one-child root
+    /// keeps its scalar form; its one member is read from those fields.
+    pub fn members(&self) -> Vec<FreshRootTerminalChildReadback> {
+        if !self.children.is_empty() {
+            return self.children.clone();
+        }
+        let Some(request_id) = self.child_request_id.clone() else {
+            return Vec::new();
+        };
+        vec![FreshRootTerminalChildReadback {
+            request_id,
+            selected_event: self.selected_child_event.clone().or_else(|| {
+                self.execution
+                    .as_ref()
+                    .and_then(|execution| execution.child_event.clone())
+            }),
+            listener_policy: self.listener_policy.clone(),
+            notification_state: self.notification_state.clone(),
+            notification_origin: self.notification_origin.clone(),
+            mailbox_seq: self.mailbox_seq,
+            delivery_request_id: self.delivery_request_id.clone(),
+            delivery_grant_id: self.delivery_grant_id.clone(),
+            delivery_payload_sha256: self.delivery_payload_sha256.clone(),
+            delivery_payload_byte_len: self.delivery_payload_byte_len,
+            ack_basis: self.ack_basis.clone(),
+            original_receipt: self.original_receipt.clone(),
+            successor_ack: self.successor_ack.clone(),
+        }]
+    }
+
+    pub fn member(&self, request_id: &str) -> Option<FreshRootTerminalChildReadback> {
+        self.members()
+            .into_iter()
+            .find(|member| member.request_id == request_id)
+    }
+
+    /// The one acceptance predicate for the root's closure. Every consumer
+    /// that accepts or certifies closure asks it: an unknown execution, an
+    /// unresolved or late C, or an unsettled notify member refuses, whether
+    /// the execution succeeded or failed.
+    pub fn closure_refusal(&self) -> Option<&'static str> {
+        if self.execution.is_none() || self.execution_state == "unknown" {
+            Some("execution_evidence_incomplete")
+        } else if !self.late_child_request_ids.is_empty() {
+            Some("child_admission_after_freeze")
+        } else if !self.unresolved_child_request_ids.is_empty() {
+            Some("unresolved_child_admission")
+        } else if !matches!(
+            self.notification_state.as_str(),
+            "not_applicable" | "response_only" | "acked"
+        ) {
+            Some("notification_unsettled")
+        } else {
+            None
+        }
+    }
+}
+
+/// One member's settlement as an accepted closure names it. The digest
+/// covers the member's whole readback, receipt and ACK evidence included.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreshRootMemberSettlement {
+    pub request_id: String,
+    pub notification_state: String,
+    pub evidence_sha256: String,
+}
+
+/// The current closure of a root that admitted at least one child.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FreshRootChildClosure {
+    pub refusal: Option<String>,
+    /// Present only for a child set; a one-child root keeps its scalar proof.
+    pub members: Vec<FreshRootMemberSettlement>,
 }
 
 fn physical_root_outcome(
@@ -359,11 +434,8 @@ impl FreshV30Lane {
         offered: &FreshRootCallerResult,
     ) -> Result<FreshRootTerminalReadback, String> {
         let read = self.read_private_root_terminal(root, actor, session)?;
-        if !read.unresolved_child_request_ids.is_empty() {
-            return Err("root terminal has unresolved child C".into());
-        }
-        if read.execution_state == "unknown" {
-            return Err("root terminal execution unknown".into());
+        if let Some(refusal) = read.closure_refusal() {
+            return Err(format!("root terminal closure refused: {refusal}"));
         }
         let execution = read.execution.as_ref().ok_or("root terminal execution absent")?;
         let parent = &execution.parent;
@@ -651,6 +723,37 @@ impl FreshV30Lane {
             return Err("child W identity or root conflict".into());
         }
         Ok(Ok(event))
+    }
+
+    /// The closure a Broker consumer must agree with before it fences,
+    /// settles, closes or certifies a root. `None` means the root admitted
+    /// no child C, so there is no child obligation to account for.
+    pub fn root_child_closure(&self, root_id: &str) -> Result<Option<FreshRootChildClosure>, String> {
+        if self.root_child_set(root_id)?.admitted() == 0 {
+            return Ok(None);
+        }
+        let (root, actor) = self.released_handoff_for_root(root_id)?;
+        let session = self
+            .read_session(&root.d_key)?
+            .ok_or("root child closure D session absent")?;
+        let read = self.read_private_root_terminal(&root, &actor, &session)?;
+        let members = read
+            .children
+            .iter()
+            .map(|member| {
+                Ok(FreshRootMemberSettlement {
+                    request_id: member.request_id.clone(),
+                    notification_state: member.notification_state.clone(),
+                    evidence_sha256: sha256_hex(
+                        &serde_json::to_vec(member).map_err(|error| error.to_string())?,
+                    ),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(Some(FreshRootChildClosure {
+            refusal: read.closure_refusal().map(str::to_owned),
+            members,
+        }))
     }
 
     /// Offline CLI close has no parent K/Q. A child C or selected W under
@@ -1005,6 +1108,14 @@ impl FreshV30Lane {
             result.refusal = Some("unresolved_child_admission".into());
             "execution_completed_child_admission_pending"
         } else if result.execution_state == "failure" {
+            // A failure is reported as one, but it is not settled while a
+            // member's notification is still pending.
+            if !matches!(
+                result.notification_state.as_str(),
+                "not_applicable" | "response_only" | "acked"
+            ) {
+                result.refusal = Some("notification_unsettled".into());
+            }
             "execution_failed"
         } else if matches!(
             result.notification_state.as_str(),
@@ -1460,27 +1571,28 @@ impl FreshV30Lane {
         artifact: &[u8],
     ) -> Result<FreshRootTerminalReadback, String> {
         let read = self.read_private_root_terminal(root, actor, session)?;
-        if !read.unresolved_child_request_ids.is_empty() {
-            return Err("root terminal has unresolved child C".into());
+        if let Some(refusal) = read.closure_refusal() {
+            return Err(format!("root terminal closure refused: {refusal}"));
         }
-        if read.execution.is_none() || read.execution_state == "unknown" {
-            return Err("root terminal execution unknown".into());
-        }
+        let members = read
+            .execution
+            .as_ref()
+            .ok_or("root terminal execution absent")?
+            .child_request_ids();
         let sha = format!("{:x}", Sha256::digest(artifact));
         let len = i64::try_from(artifact.len()).map_err(|_| "caller artifact too large")?;
-        let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_WRITE)?;
-        state
-            .execute_batch("PRAGMA synchronous=FULL")
-            .map_err(|e| e.to_string())?;
-        state
-            .execute(
-                "INSERT OR IGNORE INTO fresh_root_publication VALUES(?1,?2,?3,'unknown',?4)",
-                params![root.handoff_id, sha, len, Utc::now().to_rfc3339()],
-            )
-            .map_err(|e| e.to_string())?;
+        self.insert_with_unchanged_children(
+            &read.root_id,
+            &members,
+            "INSERT OR IGNORE INTO fresh_root_publication VALUES(?1,?2,?3,'unknown',?4)",
+            params![root.handoff_id, sha, len, Utc::now().to_rfc3339()],
+        )?;
         let read = self.read_private_root_terminal(root, actor, session)?;
         if read.publication_sha256.as_deref() != Some(&sha) {
             return Err("caller publication artifact replay conflict".into());
+        }
+        if let Some(refusal) = read.closure_refusal() {
+            return Err(format!("root terminal closure refused after publication intent: {refusal}"));
         }
         Ok(read)
     }
@@ -1496,8 +1608,8 @@ impl FreshV30Lane {
         offered: &FreshRootCallerResult,
     ) -> Result<FreshRootTerminalReadback, String> {
         let read = self.begin_private_root_caller_result(root, actor, session, offered)?;
-        if read.execution_state == "unknown" || !read.unresolved_child_request_ids.is_empty() {
-            return Err("root caller settlement terminal unresolved".into());
+        if let Some(refusal) = read.closure_refusal() {
+            return Err(format!("root caller settlement closure refused: {refusal}"));
         }
         let sha = read
             .publication_sha256
@@ -1505,16 +1617,17 @@ impl FreshV30Lane {
             .ok_or("root caller publication absent")?;
         let artifact = self.caller_artifact(&read)?;
         let len = i64::try_from(artifact.len()).map_err(|_| "caller artifact too large")?;
-        let state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_WRITE)?;
-        state
-            .execute_batch("PRAGMA synchronous=FULL")
-            .map_err(|error| error.to_string())?;
-        state
-            .execute(
-                "INSERT OR IGNORE INTO fresh_root_caller_settlement VALUES(?1,?2,?3,?4)",
-                params![root.handoff_id, sha, len, Utc::now().to_rfc3339()],
-            )
-            .map_err(|error| error.to_string())?;
+        let members = read
+            .execution
+            .as_ref()
+            .ok_or("root terminal execution absent")?
+            .child_request_ids();
+        self.insert_with_unchanged_children(
+            &read.root_id,
+            &members,
+            "INSERT OR IGNORE INTO fresh_root_caller_settlement VALUES(?1,?2,?3,?4)",
+            params![root.handoff_id, sha, len, Utc::now().to_rfc3339()],
+        )?;
         let settled = self.read_private_root_terminal(root, actor, session)?;
         if settled.publication_state != "settled"
             || settled.publication_sha256.as_ref() != Some(sha)
@@ -1522,7 +1635,44 @@ impl FreshV30Lane {
         {
             return Err("root caller settlement readback changed".into());
         }
+        if let Some(refusal) = settled.closure_refusal() {
+            return Err(format!("root caller settlement closure refused: {refusal}"));
+        }
         Ok(settled)
+    }
+
+    /// Commits one acceptance row only while the root's admitted C are still
+    /// exactly its accepted members. C admission writes the same database, so
+    /// the immediate transaction orders the two: a C admitted first refuses
+    /// this commit, and one admitted after it surfaces as late at readback.
+    fn insert_with_unchanged_children(
+        &self,
+        root_id: &str,
+        members: &[String],
+        sql: &str,
+        values: impl rusqlite::Params,
+    ) -> Result<(), String> {
+        let mut state = self.state_connection(OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        state
+            .execute_batch("PRAGMA synchronous=FULL")
+            .map_err(|error| error.to_string())?;
+        let tx = state
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let current = tx
+            .prepare("SELECT request_id FROM fresh_bash_child WHERE root_id=?1 ORDER BY request_id")
+            .and_then(|mut rows| {
+                rows.query_map([root_id], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(|error| error.to_string())?;
+        let mut expected = members.to_vec();
+        expected.sort();
+        if current != expected {
+            return Err("root child set changed before acceptance commit".into());
+        }
+        tx.execute(sql, values).map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())
     }
 }
 
@@ -1697,6 +1847,124 @@ mod root_terminal_child_set_tests {
             assert_eq!(set(&["acked", pending]), "child_set_pending", "{pending}");
             assert_eq!(set(&[pending, "response_only"]), "child_set_pending", "{pending}");
         }
+    }
+
+    fn readback(execution_state: &str) -> FreshRootTerminalReadback {
+        FreshRootTerminalReadback {
+            handoff_id: "handoff".into(),
+            d_key: "d".into(),
+            invocation_uuid: "j".into(),
+            session_id: "session".into(),
+            root_id: "root".into(),
+            owner_generation: "owner".into(),
+            actor: identity(),
+            execution: (execution_state != "unknown").then(|| execution(None, &["a", "b"])),
+            execution_state: execution_state.into(),
+            terminal_state: "execution_completed".into(),
+            notification_state: "response_only".into(),
+            notification_origin: "child_set".into(),
+            native_receipt_state: "not_observed".into(),
+            listener_policy: None,
+            child_request_id: None,
+            selected_child_event: None,
+            unresolved_child_request_ids: Vec::new(),
+            mailbox_seq: None,
+            delivery_request_id: None,
+            delivery_grant_id: None,
+            delivery_payload_sha256: None,
+            delivery_payload_byte_len: None,
+            ack_basis: None,
+            original_receipt: None,
+            successor_ack: None,
+            publication_state: "not_started".into(),
+            publication_sha256: None,
+            unknown_stage: None,
+            unknown_stages: Vec::new(),
+            refusal: None,
+            artifacts: Vec::new(),
+            children: Vec::new(),
+            late_child_request_ids: Vec::new(),
+        }
+    }
+
+    /// Every closure consumer asks one predicate. It refuses an unknown
+    /// execution, an unresolved or late C, and any unsettled notify member,
+    /// and a physical failure does not bypass the notification check.
+    #[test]
+    fn closure_refuses_unresolved_late_and_unsettled_members_even_on_failure() {
+        for outcome in ["success", "failure"] {
+            for settled in ["not_applicable", "response_only", "acked"] {
+                let mut read = readback(outcome);
+                read.notification_state = settled.into();
+                assert_eq!(read.closure_refusal(), None, "{outcome} {settled}");
+            }
+            for pending in [
+                "child_set_pending",
+                "pending_f",
+                "f_unknown",
+                "f_submitted_native_pending",
+                "awaiting_w",
+                "repair_required",
+            ] {
+                let mut read = readback(outcome);
+                read.notification_state = pending.into();
+                assert_eq!(
+                    read.closure_refusal(),
+                    Some("notification_unsettled"),
+                    "{outcome} {pending}"
+                );
+            }
+            let mut unresolved = readback(outcome);
+            unresolved.unresolved_child_request_ids = vec!["c".into()];
+            assert_eq!(
+                unresolved.closure_refusal(),
+                Some("unresolved_child_admission")
+            );
+            let mut late = unresolved.clone();
+            late.late_child_request_ids = vec!["c".into()];
+            assert_eq!(late.closure_refusal(), Some("child_admission_after_freeze"));
+        }
+        assert_eq!(
+            readback("unknown").closure_refusal(),
+            Some("execution_evidence_incomplete")
+        );
+    }
+
+    /// A one-child root's single member is read from its scalar fields; a
+    /// set's members are its own rows. A member is found only by its own ID.
+    #[test]
+    fn members_cover_scalar_and_set_roots_by_their_own_identity() {
+        let mut scalar = readback("success");
+        scalar.notification_origin = "original_c_notify".into();
+        scalar.child_request_id = Some("a".into());
+        scalar.listener_policy = Some("notify".into());
+        scalar.notification_state = "pending_f".into();
+        scalar.mailbox_seq = Some(7);
+        let [member] = scalar.members().try_into().unwrap();
+        assert_eq!(member.request_id, "a");
+        assert_eq!(member.notification_state, "pending_f");
+        assert_eq!(member.mailbox_seq, Some(7));
+        assert!(readback("success").members().is_empty());
+
+        let mut set = readback("success");
+        set.children = ["a", "b"]
+            .iter()
+            .enumerate()
+            .map(|(seq, id)| {
+                let mut child = member_with_id(id, "pending_f");
+                child.mailbox_seq = Some(seq as i64);
+                child
+            })
+            .collect();
+        assert_eq!(set.member("b").unwrap().mailbox_seq, Some(1));
+        assert!(set.member("c").is_none());
+        assert_eq!(set.members(), set.children);
+    }
+
+    fn member_with_id(id: &str, state: &str) -> FreshRootTerminalChildReadback {
+        let mut member = member(state);
+        member.request_id = id.into();
+        member
     }
 
     /// The root succeeds only if its parent and every member exited cleanly.

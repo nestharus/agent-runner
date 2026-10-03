@@ -322,11 +322,11 @@ impl InstalledLaunchLedger {
         {
             return Err(io::Error::other("installed terminal identity mismatch"));
         }
+        let state_root = self
+            .directory
+            .parent()
+            .ok_or_else(|| io::Error::other("installed State root absent"))?;
         if certificate.original_receipt.is_some() {
-            let state_root = self
-                .directory
-                .parent()
-                .ok_or_else(|| io::Error::other("installed State root absent"))?;
             let lane = oulipoly_state::mailbox::FreshV30Lane::open_at(state_root)
                 .map_err(io::Error::other)?;
             let current = crate::root_drain::exact_original_receipt_for_root(
@@ -335,6 +335,25 @@ impl InstalledLaunchLedger {
             )?;
             if current != certificate.original_receipt {
                 return Err(io::Error::other("installed original receipt changed"));
+            }
+        }
+        // A certified close still agrees with the root's current child set:
+        // a later C, or a changed member settlement, revokes the reader's
+        // acceptance rather than leaving the certificate standing.
+        if state_root.join("v30/state.db").exists() {
+            let lane = oulipoly_state::mailbox::FreshV30Lane::open_at(state_root)
+                .map_err(io::Error::other)?;
+            match lane
+                .root_child_closure(&certificate.physical.root_id)
+                .map_err(io::Error::other)?
+            {
+                None if certificate.physical.child_members.is_empty() => {}
+                Some(closure)
+                    if closure.refusal.is_none()
+                        && closure.members == certificate.physical.child_members => {}
+                _ => {
+                    return Err(io::Error::other("installed terminal child closure changed"));
+                }
             }
         }
         Ok(Some(certificate))

@@ -4,7 +4,7 @@
 
 use base64::Engine as _;
 use oulipoly_kernel_broker::protocol::{self, FreshRecipientRequest};
-use oulipoly_state::mailbox::FreshRootTerminalReadback;
+use oulipoly_state::mailbox::{FreshRootTerminalChildReadback, FreshRootTerminalReadback};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::fs::{self, File, OpenOptions};
@@ -20,14 +20,119 @@ struct Intent {
     root_id: String,
     session_id: String,
     delivery_request_id: String,
+    /// A child-set member's own intent names it. A one-child root keeps the
+    /// original per-D file and form, so existing intents still recover.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    child_request_id: Option<String>,
 }
+
+/// One member's delivery: the root it answers to and the member's own row.
+/// `targeted` is set for a child-set member; a one-child root keeps its
+/// untargeted Submit and per-D intent.
+struct Target<'a> {
+    terminal: &'a FreshRootTerminalReadback,
+    member: FreshRootTerminalChildReadback,
+    targeted: bool,
+}
+
+impl Target<'_> {
+    fn intent_name(&self, d_key: &str) -> String {
+        if self.targeted {
+            format!("{d_key}.{}.intent.json", self.member.request_id)
+        } else {
+            format!("{d_key}.intent.json")
+        }
+    }
+
+    fn current(
+        &self,
+        terminal: &FreshRootTerminalReadback,
+    ) -> Option<FreshRootTerminalChildReadback> {
+        terminal.member(&self.member.request_id)
+    }
+}
+
+/// Disposable fixture only: members whose receipt this recipient certified.
+static RECEIPTS_CERTIFIED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub(crate) fn settle_pending_original(
     socket: &Path,
     d_key: &str,
     disposable_fixture: bool,
 ) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut deadline = Instant::now() + Duration::from_secs(120);
+    // A root with two or more admitted C reads back as a child set even
+    // before any member's W is accepted.
+    if read_terminal(socket, d_key)?.notification_origin != "child_set" {
+        return settle_pending_scalar(socket, d_key, disposable_fixture, deadline);
+    }
+    // A child set: each notify member is delivered, receipted and ACKed on
+    // its own. A member already settled is never sent again.
+    loop {
+        let terminal = read_terminal(socket, d_key)?;
+        // Before the freeze a member whose W is not yet accepted is listed
+        // only as unresolved; the set is not settled while any C waits.
+        let complete = terminal.unresolved_child_request_ids.is_empty();
+        match terminal.notification_state.as_str() {
+            "response_only" | "acked" if complete => return Ok(()),
+            "response_only" | "acked" | "child_set_pending" => {}
+            other => return Err(format!("async original child set state unknown: {other}")),
+        }
+        let mut progressed = false;
+        for member in &terminal.children {
+            match member.notification_state.as_str() {
+                "not_applicable" | "response_only" | "acked" => {}
+                "pending_f" | "f_unknown" | "f_submitted_native_pending" => {
+                    settle_member(
+                        socket,
+                        d_key,
+                        Target {
+                            terminal: &terminal,
+                            member: member.clone(),
+                            targeted: true,
+                        },
+                        disposable_fixture,
+                    )?;
+                    progressed = true;
+                    break;
+                }
+                "repair_required" => {
+                    protocol::fresh_root_terminal_request_at(
+                        socket,
+                        &FreshRecipientRequest::RepairRootTerminal {
+                            d_key: d_key.into(),
+                        },
+                    )
+                    .map_err(|e| format!("async original member repair unknown: {e}"))?;
+                }
+                "awaiting_w" if member.listener_policy.as_deref() == Some("notify") => {}
+                other => {
+                    return Err(format!(
+                        "async original member {} state unknown: {other}",
+                        member.request_id
+                    ));
+                }
+            }
+        }
+        if progressed {
+            // The wait for a next deliverable member restarts after each
+            // settled one; a set is not bounded by one member's budget.
+            deadline = Instant::now() + Duration::from_secs(120);
+            continue;
+        }
+        if Instant::now() >= deadline {
+            return Err("async original child set did not become deliverable".into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn settle_pending_scalar(
+    socket: &Path,
+    d_key: &str,
+    disposable_fixture: bool,
+    deadline: Instant,
+) -> Result<(), String> {
     let terminal = loop {
         let terminal = read_terminal(socket, d_key)?;
         match terminal.notification_state.as_str() {
@@ -54,15 +159,37 @@ pub(crate) fn settle_pending_original(
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    if terminal.listener_policy.as_deref() != Some("notify") {
+    let member = terminal
+        .members()
+        .into_iter()
+        .next()
+        .ok_or("selected async W request absent")?;
+    settle_member(
+        socket,
+        d_key,
+        Target {
+            terminal: &terminal,
+            member,
+            targeted: false,
+        },
+        disposable_fixture,
+    )
+}
+
+fn settle_member(
+    socket: &Path,
+    d_key: &str,
+    target: Target<'_>,
+    disposable_fixture: bool,
+) -> Result<(), String> {
+    let terminal = target.terminal;
+    let member = &target.member;
+    if member.listener_policy.as_deref() != Some("notify") {
         return Err("pending original F has no async notify listener".into());
     }
-    let wake_request_id = terminal
-        .child_request_id
-        .as_ref()
-        .ok_or("selected async W request absent")?;
-    let event = terminal
-        .selected_child_event
+    let wake_request_id = &member.request_id;
+    let event = member
+        .selected_event
         .as_ref()
         .ok_or("selected async W physical event absent")?;
     if event.request_id != *wake_request_id || event.root_id != terminal.root_id {
@@ -85,7 +212,7 @@ pub(crate) fn settle_pending_original(
         if prior["decision"]["wake_request_id"] != *wake_request_id
             || prior["decision"]["obligation"]["root_id"] != terminal.root_id
             || prior["decision"]["obligation"]["session_id"] != terminal.session_id
-            || prior["decision"]["obligation"]["seq"].as_i64() != terminal.mailbox_seq
+            || prior["decision"]["obligation"]["seq"].as_i64() != member.mailbox_seq
         {
             return Err("selected W prior decision changed terminal row".into());
         }
@@ -108,7 +235,7 @@ pub(crate) fn settle_pending_original(
             return settle_pending_successor(
                 socket,
                 d_key,
-                &terminal,
+                &target,
                 prior_offer,
                 disposable_fixture
                     && std::env::var_os("AGE319_TEST_FEATURELESS_DROP_START_REPLY_V1").is_some(),
@@ -128,11 +255,12 @@ pub(crate) fn settle_pending_original(
         _ => return Err("selected W provider lifecycle evidence malformed".into()),
     }
     let directory = receipt_directory()?;
-    let intent_path = directory.join(format!("{d_key}.intent.json"));
-    let intent = load_or_create_intent(&intent_path, d_key, &terminal)?;
+    let intent_path = directory.join(target.intent_name(d_key));
+    let intent = load_or_create_intent(&intent_path, d_key, &target)?;
     let request = FreshRecipientRequest::Submit {
         allocation_request_id: d_key.into(),
         delivery_request_id: intent.delivery_request_id.clone(),
+        child_request_id: intent.child_request_id.clone(),
     };
     let submitted = if disposable_fixture
         && std::env::var_os("AGE319_TEST_FEATURELESS_DROP_F_REPLY_V1").is_some()
@@ -158,7 +286,7 @@ pub(crate) fn settle_pending_original(
         .decode(encoded)
         .map_err(|e| e.to_string())?;
     let sha = format!("{:x}", Sha256::digest(&payload));
-    validate_payload(&terminal, grant, &payload, &sha)?;
+    validate_payload(&target, grant, &payload, &sha)?;
     let grant_id = grant["grant_id"]
         .as_str()
         .ok_or("async F grant ID absent")?;
@@ -189,6 +317,14 @@ pub(crate) fn settle_pending_original(
         || receipt_identity["receipt_sha256"].as_str().is_none()
     {
         return Err("async original receipt certification changed F".into());
+    }
+    let certified_members =
+        RECEIPTS_CERTIFIED.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    if disposable_fixture
+        && certified_members == 2
+        && std::env::var_os("AGE381_TEST_FEATURELESS_STOP_AFTER_SECOND_RECEIPT_V1").is_some()
+    {
+        return Err("disposable recipient stopped after a receipt, before its ACK".into());
     }
     let token = grant["delivery_token"]
         .as_str()
@@ -223,11 +359,13 @@ pub(crate) fn settle_pending_original(
     {
         return Err("async original F token accepted twice".into());
     }
-    let terminal = read_terminal(socket, d_key)?;
-    if terminal.notification_state != "acked"
-        || terminal.ack_basis.as_deref() != Some("manual_ack")
-        || terminal.delivery_grant_id.as_deref() != Some(grant_id)
-        || serde_json::to_value(&terminal.original_receipt).map_err(|e| e.to_string())?
+    let settled = target
+        .current(&read_terminal(socket, d_key)?)
+        .ok_or("async original member left its root")?;
+    if settled.notification_state != "acked"
+        || settled.ack_basis.as_deref() != Some("manual_ack")
+        || settled.delivery_grant_id.as_deref() != Some(grant_id)
+        || serde_json::to_value(&settled.original_receipt).map_err(|e| e.to_string())?
             != serde_json::json!(receipt_identity)
     {
         return Err("async original terminal did not join exact ACK".into());
@@ -240,15 +378,14 @@ pub(crate) fn settle_pending_original(
 fn settle_pending_successor(
     socket: &Path,
     d_key: &str,
-    terminal: &FreshRootTerminalReadback,
+    target: &Target<'_>,
     prior_offer: Option<&str>,
     drop_start_reply: bool,
     send_negatives: bool,
 ) -> Result<(), String> {
-    let wake_request_id = terminal
-        .child_request_id
-        .as_ref()
-        .ok_or("selected successor W request absent")?;
+    let terminal = target.terminal;
+    let member = &target.member;
+    let wake_request_id = &member.request_id;
     let offer_id = prior_offer
         .map(str::to_owned)
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -257,8 +394,24 @@ fn settle_pending_successor(
         wake_request_id: wake_request_id.clone(),
         offer_request_id: offer_id.clone(),
     };
-    let decision = protocol::fresh_recipient_request_at(socket, &decision_request)
-        .map_err(|e| format!("selected W decision refused: {e}"))?;
+    // The selected W's row is readable an instant before its wake
+    // obligation is recorded. The decision is one immutable choice per W
+    // with this same offer ID, so asking again only waits for that record.
+    let obligation_deadline = Instant::now() + Duration::from_secs(10);
+    let decision = loop {
+        match protocol::fresh_recipient_request_at(socket, &decision_request) {
+            Ok(decision) => break decision,
+            Err(error)
+                if error
+                    .to_string()
+                    .contains("selected Bash wake obligation absent")
+                    && Instant::now() < obligation_deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => return Err(format!("selected W decision refused: {error}")),
+        }
+    };
     let decision_read = protocol::fresh_recipient_request_at(
         socket,
         &FreshRecipientRequest::ReadBashWakeSuccessorDecision {
@@ -271,7 +424,7 @@ fn settle_pending_successor(
         || decision["decision"]["offer_request_id"] != offer_id
         || decision["decision"]["obligation"]["root_id"] != terminal.root_id
         || decision["decision"]["obligation"]["session_id"] != terminal.session_id
-        || decision["decision"]["obligation"]["seq"].as_i64() != terminal.mailbox_seq
+        || decision["decision"]["obligation"]["seq"].as_i64() != member.mailbox_seq
     {
         return Err("selected W decision changed terminal row".into());
     }
@@ -320,7 +473,9 @@ fn settle_pending_successor(
     {
         return Err("installed successor start changed exact W or original process".into());
     }
-    let before_approval = read_terminal(socket, d_key)?;
+    let before_approval = target
+        .current(&read_terminal(socket, d_key)?)
+        .ok_or("selected successor member left its root")?;
     if before_approval.notification_state != "pending_f"
         || before_approval.successor_ack.is_some()
         || before_approval.ack_basis.is_some()
@@ -362,7 +517,7 @@ fn settle_pending_successor(
     if offer["offer"]["successor_identity"]["host_pid"]
         != read_start["candidate"]["process"]["host_pid"]
         || offer["offer"]["root_id"] != terminal.root_id
-        || offer["offer"]["seq"].as_i64() != terminal.mailbox_seq
+        || offer["offer"]["seq"].as_i64() != member.mailbox_seq
     {
         return Err("installed successor offer differs from selected W/start".into());
     }
@@ -394,17 +549,19 @@ fn settle_pending_successor(
     }
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let terminal = read_terminal(socket, d_key)?;
-        if terminal.notification_state == "acked"
-            && terminal.ack_basis.as_deref() == Some("successor_receiver_receipt_ack")
-            && terminal.successor_ack.is_some()
+        let current = target
+            .current(&read_terminal(socket, d_key)?)
+            .ok_or("selected successor member left its root")?;
+        if current.notification_state == "acked"
+            && current.ack_basis.as_deref() == Some("successor_receiver_receipt_ack")
+            && current.successor_ack.is_some()
         {
             return Ok(());
         }
         if Instant::now() >= deadline {
             return Err(format!(
                 "installed successor F/ACK remains pending: {}",
-                terminal.notification_state
+                current.notification_state
             ));
         }
         std::thread::sleep(Duration::from_millis(30));
@@ -501,25 +658,27 @@ fn read_terminal(socket: &Path, d_key: &str) -> Result<FreshRootTerminalReadback
 }
 
 fn validate_payload(
-    terminal: &FreshRootTerminalReadback,
+    target: &Target<'_>,
     grant: &serde_json::Value,
     bytes: &[u8],
     sha: &str,
 ) -> Result<(), String> {
+    let terminal = target.terminal;
+    let member = &target.member;
     if grant["root_id"] != terminal.root_id
         || grant["owner_generation"] != terminal.owner_generation
         || grant["session_id"] != terminal.session_id
-        || grant["seq"].as_i64() != terminal.mailbox_seq
+        || grant["seq"].as_i64() != member.mailbox_seq
         || grant["payload_sha256"] != sha
         || grant["payload_byte_len"].as_u64() != Some(bytes.len() as u64)
-        || terminal.delivery_payload_sha256.as_deref() != Some(sha)
+        || member.delivery_payload_sha256.as_deref() != Some(sha)
     {
         return Err("async original F grant differs from selected terminal row".into());
     }
     let payload: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
     let source = &payload["source"];
     if payload["protocol"] != "fresh-bash-complete-v30"
-        || source["request_id"].as_str() != terminal.child_request_id.as_deref()
+        || source["request_id"].as_str() != Some(member.request_id.as_str())
         || source["root_id"] != terminal.root_id
         || source["source_id"] != grant["source_id"]
         || source["attempt_id"] != grant["attempt_id"]
@@ -554,16 +713,15 @@ fn receipt_directory() -> Result<PathBuf, String> {
     Ok(directory)
 }
 
-fn load_or_create_intent(
-    path: &Path,
-    d_key: &str,
-    terminal: &FreshRootTerminalReadback,
-) -> Result<Intent, String> {
+fn load_or_create_intent(path: &Path, d_key: &str, target: &Target<'_>) -> Result<Intent, String> {
+    let terminal = target.terminal;
+    let child_request_id = target.targeted.then(|| target.member.request_id.clone());
     let intended = Intent {
         d_key: d_key.into(),
         root_id: terminal.root_id.clone(),
         session_id: terminal.session_id.clone(),
         delivery_request_id: uuid::Uuid::new_v4().to_string(),
+        child_request_id: child_request_id.clone(),
     };
     match OpenOptions::new()
         .write(true)
@@ -585,6 +743,7 @@ fn load_or_create_intent(
             if existing.d_key != d_key
                 || existing.root_id != terminal.root_id
                 || existing.session_id != terminal.session_id
+                || existing.child_request_id != child_request_id
             {
                 return Err("async original persisted request changed D binding".into());
             }
@@ -612,4 +771,96 @@ fn read_exact<T: for<'a> Deserialize<'a>>(path: &Path) -> Result<T, String> {
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
     serde_json::from_slice(&bytes).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod intent_tests {
+    use super::*;
+
+    fn terminal() -> FreshRootTerminalReadback {
+        serde_json::from_value(serde_json::json!({
+            "handoff_id": "handoff", "d_key": "d", "invocation_uuid": "j",
+            "session_id": "session", "root_id": "root", "owner_generation": "owner",
+            "actor": {"host_pid": 10, "boot_id": "boot", "starttime_ticks": 20,
+                      "pidns_dev": 30, "pidns_ino": 40},
+            "execution": null, "execution_state": "unknown",
+            "terminal_state": "execution_unknown", "notification_state": "child_set_pending",
+            "notification_origin": "child_set", "native_receipt_state": "not_observed",
+            "listener_policy": null, "child_request_id": null,
+            "unresolved_child_request_ids": [], "mailbox_seq": null,
+            "delivery_request_id": null, "delivery_grant_id": null,
+            "delivery_payload_sha256": null, "delivery_payload_byte_len": null,
+            "ack_basis": null, "publication_state": "not_started",
+            "publication_sha256": null, "unknown_stage": null, "unknown_stages": [],
+            "refusal": null, "artifacts": []
+        }))
+        .unwrap()
+    }
+
+    fn member(request_id: &str) -> FreshRootTerminalChildReadback {
+        serde_json::from_value(serde_json::json!({
+            "request_id": request_id, "selected_event": null, "listener_policy": "notify",
+            "notification_state": "pending_f", "notification_origin": "original_c_notify",
+            "mailbox_seq": 1, "delivery_request_id": null, "delivery_grant_id": null,
+            "delivery_payload_sha256": null, "delivery_payload_byte_len": null,
+            "ack_basis": null
+        }))
+        .unwrap()
+    }
+
+    fn write_0400(path: &Path, bytes: &[u8]) {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o400)
+            .open(path)
+            .unwrap();
+        std::io::Write::write_all(&mut file, bytes).unwrap();
+    }
+
+    /// An intent written by the one-child recipient before child sets is
+    /// recovered unchanged, at its own path, with its own delivery request.
+    /// Each set member has its own intent, which no other member or the
+    /// one-child form can take over.
+    #[test]
+    fn one_child_intent_recovers_unchanged_and_member_intents_stay_their_own() {
+        let directory = tempfile::tempdir().unwrap();
+        let terminal = terminal();
+        let scalar = Target {
+            terminal: &terminal,
+            member: member("a"),
+            targeted: false,
+        };
+        assert_eq!(scalar.intent_name("d"), "d.intent.json");
+        let historical =
+            br#"{"d_key":"d","root_id":"root","session_id":"session","delivery_request_id":"r1"}"#;
+        let scalar_path = directory.path().join(scalar.intent_name("d"));
+        write_0400(&scalar_path, historical);
+        let recovered = load_or_create_intent(&scalar_path, "d", &scalar).unwrap();
+        assert_eq!(recovered.delivery_request_id, "r1");
+        assert_eq!(recovered.child_request_id, None);
+        assert_eq!(serde_json::to_vec(&recovered).unwrap(), historical);
+
+        let first = Target {
+            terminal: &terminal,
+            member: member("a"),
+            targeted: true,
+        };
+        let second = Target {
+            terminal: &terminal,
+            member: member("b"),
+            targeted: true,
+        };
+        assert_eq!(first.intent_name("d"), "d.a.intent.json");
+        assert_ne!(first.intent_name("d"), second.intent_name("d"));
+        let first_path = directory.path().join(first.intent_name("d"));
+        let created = load_or_create_intent(&first_path, "d", &first).unwrap();
+        assert_eq!(created.child_request_id.as_deref(), Some("a"));
+        assert_ne!(created.delivery_request_id, "r1");
+        assert!(load_or_create_intent(&first_path, "d", &first).unwrap() == created);
+        // Neither form can be recovered as another member's request.
+        assert!(load_or_create_intent(&first_path, "d", &second).is_err());
+        assert!(load_or_create_intent(&scalar_path, "d", &first).is_err());
+        assert!(load_or_create_intent(&first_path, "d", &scalar).is_err());
+    }
 }

@@ -66,10 +66,15 @@ impl FreshV30Lane {
         }
         let session = self.read_session(&root.d_key)?.ok_or("wake decision D absent")?;
         let terminal = self.read_private_root_terminal(&root, original, &session)?;
-        if terminal.notification_state != "pending_f"
-            || terminal.listener_policy.as_deref() != Some("notify")
-            || terminal.mailbox_seq != Some(obligation.seq)
-            || terminal.delivery_payload_sha256.as_deref()
+        // The exact member this W belongs to, whether the root has one child
+        // or a set; no other member's row can stand in for it.
+        let member = terminal
+            .member(wake_request_id)
+            .ok_or("selected Bash wake is not a member of its root")?;
+        if member.notification_state != "pending_f"
+            || member.listener_policy.as_deref() != Some("notify")
+            || member.mailbox_seq != Some(obligation.seq)
+            || member.delivery_payload_sha256.as_deref()
                 != Some(obligation.payload_sha256.as_str())
         {
             return Err("selected Bash wake is not pending one original F".into());
