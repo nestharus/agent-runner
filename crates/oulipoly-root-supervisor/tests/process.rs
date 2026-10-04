@@ -2221,3 +2221,168 @@ fn bash_run_survives_owner_death_and_requester_sees_unknown_not_success() {
         1
     );
 }
+
+/// A recover request naming its purpose.
+fn recover_for(dir: &Scratch, purpose: &str) -> Value {
+    json!({ "store": dir.store(), "recover": purpose })
+}
+
+/// A cancel recovery of a surviving root: the owner is SIGKILLed while one
+/// delivery is inserted but unanswered; the `cancel` recovery attaches the
+/// same root PID 1, has the survivor killed by its own work PID 1 and never
+/// connects to it, so nothing is resumed or resubmitted (the peer still has
+/// exactly one prompt) and nothing is launched. The message stays owed in
+/// the store. Root PID 1 is released and, not being this owner's child,
+/// only its exit is observed. A later `continue-attached` recovery then
+/// finds no root to attach and starts nothing: `root-absent`, the debt
+/// still reported.
+#[test]
+fn cancel_recovery_kills_the_survivor_and_delivers_nothing() {
+    let dir = Scratch::new("cancelrec");
+    let mut first = Run::start(
+        &dir,
+        &spec(
+            &dir,
+            3,
+            json!([{ "id": "h", "argv": quiet_until_reattach(&dir.state("h"), &[]), "messages": ["x"] }]),
+        ),
+    );
+    let root_pid = first.until("root pid1", |value| value["event"] == "root-pid1-started")["pid"]
+        .as_u64()
+        .unwrap();
+    let peer_pid = first.event("h", "launched")["pid"].as_u64().unwrap();
+    wait_state(&dir.state("h"), |state| {
+        state["insertions"].as_array().unwrap().len() == 1
+    });
+    first.kill();
+    assert!(
+        alive(root_pid) && alive(peer_pid),
+        "owner death kills nothing"
+    );
+
+    let (terminal, status, seen) = Run::start(&dir, &recover_for(&dir, "cancel")).terminal();
+    assert_eq!(custody(&seen)["outcome"], "attached");
+    let cancel = seen
+        .iter()
+        .find(|value| value["event"] == "cancel-requested")
+        .unwrap();
+    assert_eq!(cancel["by"], "recover-cancel");
+    assert_eq!(events(&seen, "h", "reattached").len(), 1);
+    for nothing in [
+        "endpoint-connected",
+        "negotiated",
+        "session-resumed",
+        "session-opened",
+        "ack",
+        "launched",
+    ] {
+        assert!(
+            events(&seen, "h", nothing).is_empty(),
+            "{nothing}: {seen:#?}"
+        );
+    }
+    assert!(roots_started(&seen).is_empty(), "no new incarnation");
+    assert_eq!(status.code(), Some(i32::from(2u8)), "{terminal}");
+    assert_eq!(terminal["status"], "cancelled");
+    assert_eq!(terminal["recover"], "cancel");
+    assert_eq!(terminal["all_harnesses_reaped"], true, "{terminal}");
+    let record = harness(&terminal, "h");
+    assert_eq!(record["exits"], json!(["signal:9"]), "{record}");
+    assert_eq!(record["messages"][0]["state"], "owed");
+    assert_eq!(record["messages"][0]["label"], "cancelled");
+    assert_eq!(record["messages"][0]["prior_unknown"], 1);
+    assert_eq!(
+        read_state(&dir.state("h"))["prompts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "nothing resubmitted under cancel"
+    );
+    assert!(!alive(peer_pid));
+    assert_eq!(
+        terminal["root_pid1"]["outcome"],
+        "released-exit-observed-by-pidfd"
+    );
+    assert_eq!(terminal["root_pid1"]["parent"], false);
+    assert!(terminal["root_pid1"]["status"].is_null());
+
+    let (terminal, status, seen) =
+        Run::start(&dir, &recover_for(&dir, "continue-attached")).terminal();
+    assert_eq!(status.code(), Some(6), "{terminal}");
+    assert_eq!(terminal["status"], "root-absent");
+    assert_eq!(terminal["new_incarnation"], "not-started");
+    assert_eq!(terminal["owed"], 1);
+    let limited = seen
+        .iter()
+        .find(|value| value["event"] == "recover-limited")
+        .unwrap();
+    assert_eq!(limited["custody"], "no-unended-incarnation", "{limited}");
+    assert!(roots_started(&seen).is_empty());
+    assert!(events(&seen, "h", "launched").is_empty());
+    assert_eq!(
+        harness(&terminal, "h")["messages"][0]["label"],
+        "root-absent"
+    );
+    let conn = db(&dir);
+    assert_eq!(count(&conn, "SELECT count(*) FROM incarnation"), 1);
+}
+
+/// A purposeful recovery whose recorded root PID 1 is gone (killed while
+/// no owner was attached) reports the absence as observed and the peer's
+/// end as unknown, launches nothing and starts no incarnation, unlike the
+/// plain recovery (see `root_pid1_death_while_owner_dead_is_unknown_not_fabricated`).
+#[test]
+fn purposeful_recovery_of_an_absent_root_starts_nothing() {
+    let dir = Scratch::new("absentrec");
+    let mut first = Run::start(
+        &dir,
+        &spec(
+            &dir,
+            3,
+            json!([{ "id": "h", "argv": quiet_until_reattach(&dir.state("h"), &[]), "messages": ["x"] }]),
+        ),
+    );
+    let root_pid = first.until("root pid1", |value| value["event"] == "root-pid1-started")["pid"]
+        .as_i64()
+        .unwrap();
+    wait_state(&dir.state("h"), |state| {
+        state["insertions"].as_array().unwrap().len() == 1
+    });
+    first.kill();
+    let status = kill_and_reap_root(&dir, i32::try_from(root_pid).unwrap());
+    assert!(libc::WIFSIGNALED(status));
+
+    let (terminal, status, seen) = Run::start(&dir, &recover_for(&dir, "cancel")).terminal();
+    assert_eq!(status.code(), Some(6), "{terminal}");
+    assert_eq!(terminal["status"], "root-absent");
+    assert_eq!(custody(&seen)["outcome"], "absent");
+    assert_eq!(custody(&seen)["observed"], "absent-exit-not-observed");
+    assert_eq!(events(&seen, "h", "prior-end-unknown").len(), 1);
+    assert!(events(&seen, "h", "launched").is_empty());
+    assert!(roots_started(&seen).is_empty());
+    assert!(
+        seen.iter()
+            .all(|value| value["event"] != "cancel-requested")
+    );
+    assert_eq!(terminal["cancel_requested"], false);
+    assert_eq!(terminal["owed"], 1);
+    assert!(terminal["root_pid1"]["outcome"] == "none", "{terminal}");
+    let conn = db(&dir);
+    assert_eq!(count(&conn, "SELECT count(*) FROM incarnation"), 1);
+}
+
+#[test]
+fn recover_purpose_with_an_intent_is_refused() {
+    let dir = Scratch::new("recintent");
+    let mut request = spec(
+        &dir,
+        1,
+        json!([{ "id": "h", "argv": ["x"], "messages": [] }]),
+    );
+    request["recover"] = json!("cancel");
+    let (terminal, status, _) = Run::start(&dir, &request).terminal();
+    assert_eq!(status.code(), Some(64), "{terminal}");
+    assert_eq!(terminal["status"], "spec-refused");
+    assert!(!dir.store().exists(), "nothing written");
+}

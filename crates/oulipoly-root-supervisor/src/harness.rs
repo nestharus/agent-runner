@@ -375,6 +375,14 @@ impl Worker {
         loop {
             let live = match prior.take() {
                 Some(Prior::Live(adopted)) => match self.adopt(adopted) {
+                    Some(live) if self.cancelled() => {
+                        // Stopped before or while this survivor was taken
+                        // over: it is killed (see `adopt`) and never
+                        // connected to, so nothing is resubmitted to it.
+                        let (end, observed) = self.finish_live(live, ConnEnd::Stop, "");
+                        let _ = self.after_drive(end, observed);
+                        return;
+                    }
                     Some(live) => live,
                     None => return,
                 },

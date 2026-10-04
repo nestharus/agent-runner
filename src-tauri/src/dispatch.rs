@@ -147,7 +147,11 @@ pub(crate) fn run_offline_entry(cli: &Cli) -> Result<Option<i32>, String> {
             ),
         },
         #[cfg(target_os = "linux")]
-        Some(Subcommands::NativeRoot { request }) => crate::commands::native_root::run(request),
+        Some(Subcommands::NativeRoot { request, recover }) => match (request, recover) {
+            (Some(request), _) => crate::commands::native_root::run(request),
+            (None, Some(recover)) => crate::commands::native_root::recover(recover),
+            (None, None) => Err("native-root needs --request or --recover".to_owned()),
+        },
         Some(Subcommands::Maintenance { command }) => match command {
             MaintenanceSubcommands::Status {
                 kind,

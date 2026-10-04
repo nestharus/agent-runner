@@ -1,15 +1,37 @@
-//! `native-root`: start one fresh native OpenCode ACP v2 root (Linux,
+//! `native-root`: start one fresh native OpenCode ACP v2 root, or recover
+//! one this entry started, for cancel or attached continuation (Linux,
 //! opt-in, source build).
 //!
-//! The request file names everything the root gets: a new launch directory
-//! and a new store, the native setup inputs, the messages, and **the whole
-//! environment** of the root. The per-root owner (`oulipoly-root-supervisor`,
-//! next to this binary) is started with only that environment; nothing of
-//! this process's environment passes through. Root PID 1 inherits it, and
-//! in-root Bash work runs in it unchanged. The native host gets it too, less
-//! what its launch argv removes or overrides (its own HOME and XDG
-//! directories, among others), plus the owner's ingress and socket
-//! variables. Stdout says which names reach where, never a value.
+//! `--request <file>` starts a root. The request file names everything the
+//! root gets: a new launch directory and a new store, the native setup
+//! inputs, the messages, and **the whole environment** of the root. The
+//! per-root owner (`oulipoly-root-supervisor`, next to this binary) is
+//! started with only that environment; nothing of this process's
+//! environment passes through. Root PID 1 inherits it, and in-root Bash
+//! work runs in it unchanged. The native host gets it too, less what its
+//! launch argv removes or overrides (its own HOME and XDG directories,
+//! among others), plus the owner's ingress and socket variables. Stdout
+//! says which names reach where, never a value.
+//!
+//! `--recover <file>` acts on an existing store: `{"store", "purpose",
+//! "env"}`, `purpose` being `cancel` or `continue-attached`. A new owner
+//! claims the store (the next owner generation; earlier unresolved
+//! attempts become `unknown-prior-owner`) and positively attaches the
+//! recorded root PID 1 if it is still that exact process. `cancel` then
+//! has the root's live work killed by its own waiters, connecting to
+//! nothing and delivering nothing; `continue-attached` reattaches the
+//! survivors and resubmits what is owed with its original keys (at best
+//! `duplicate-unknown`: not proof the native conversation continued).
+//! Neither starts a new root incarnation: with no root to attach, the
+//! owner reports `root-absent` and what the store still owes. `env` is the
+//! recovering owner's whole environment; attached work keeps the original
+//! root's environment, which nothing here sees or changes. A live owner is
+//! refused, never superseded, and nothing is signalled by a stored pid.
+//!
+//! The owner's life is tied to this entry's: if this entry dies, the
+//! kernel kills its owner (parent-death signal), so no unreachable owner
+//! keeps the store locked. Owner death kills no root work: root PID 1 and
+//! its work survive it, for a later `--recover`.
 //!
 //! Stdout carries JSON lines. This entry's own lines have an `entry` key;
 //! every other line is the owner's, relayed unchanged. Stdin lines after
@@ -19,37 +41,41 @@
 //! Exit status, one meaning each:
 //!
 //! * `0`: the owner ended (`ended`): every harness's end observed, nothing owed.
-//! * `82`, `83`, `84`, `85`: the owner's own class 2 to 5 (`cancelled`,
-//!   `ended-owed`, `incomplete` or `owned-unattached`, `authority-lost` or
-//!   `store-failed`). Owed work stays in the store, for an explicit recovery
-//!   by its owner, never by replaying this request.
+//! * `82` to `86`: the owner's own class 2 to 6 (`cancelled`, `ended-owed`,
+//!   `incomplete` or `owned-unattached`, `authority-lost` or
+//!   `store-failed`, `root-absent`). Owed work stays in the store, for an
+//!   explicit recovery, never by replaying a request.
 //! * `64`: the request was refused before any effect.
 //! * `73`: setup construction failed: the launch directory may hold partial
 //!   effects. Do not replay.
-//! * `66`: setup completed, then the owner refused the request or its store
-//!   (its 64 or 65): the launch directory stays. Do not replay.
-//! * `69`: setup completed, and the owner process could not be started.
-//! * `70`: the owner was started but ended without a known class (a signal
-//!   or another status): the store says what happened.
-//! * `74`: this entry could not write to its stdout: its lines, the owner's
-//!   included, were not all delivered, whatever the owner's end.
+//! * `66`: the owner refused the request or its store (its 64 or 65),
+//!   after setup's effects for a fresh root. Do not replay.
+//! * `69`: the owner process could not be started (after setup's effects
+//!   for a fresh root).
+//! * `70`: the owner was started, then its end is unknown to this entry: it
+//!   ended without a known class (a signal or another status), or waiting
+//!   for it failed. The store says what happened. Do not replay.
+//! * `74`: this entry could not write to its stdout, or lost the owner's
+//!   output: its lines, the owner's included, were not all delivered,
+//!   whatever the owner's end. Do not replay.
 //!
 //! An `ack` is insertion, an `idle` is readiness and a native error is a
 //! native result; none of them is completion of processing, and this entry
-//! adds no such claim. It does not recover, cancel by itself, retry or
-//! select accounts, and it touches no Runner state.
+//! adds no such claim. It does not cancel by itself, retry or select
+//! accounts, and it touches no Runner state.
 
 use std::collections::BTreeMap;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use oulipoly_root_supervisor::native::{
     OpenCodeSetup, OpenCodeSetupError, REMOVED_ENV, provision_opencode,
 };
-use oulipoly_root_supervisor::{Endpoint, HarnessSpec, Intent, Request};
+use oulipoly_root_supervisor::{Endpoint, HarnessSpec, Intent, Recover, Request};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -99,17 +125,42 @@ struct NativeSetup {
     provider: Option<Map<String, Value>>,
 }
 
+/// The recovery request file.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeRecoverRequest {
+    /// Absolute path of an existing root's store.
+    store: String,
+    /// `cancel` or `continue-attached`.
+    purpose: Recover,
+    /// The recovering owner's whole environment; attached work keeps the
+    /// original root's.
+    env: BTreeMap<String, String>,
+}
+
 /// Where this entry's own and relayed lines go.
 struct Out {
+    sink: Mutex<Box<dyn Write + Send>>,
+    /// A write to the sink failed: later lines are not attempted.
     failed: AtomicBool,
+    /// Owner output was read but could not be relayed, or could not be read.
+    lost: AtomicBool,
 }
 
 impl Out {
+    fn new(sink: Box<dyn Write + Send>) -> Self {
+        Self {
+            sink: Mutex::new(sink),
+            failed: AtomicBool::new(false),
+            lost: AtomicBool::new(false),
+        }
+    }
+
     fn line(&self, line: &str) {
         if self.failed.load(Ordering::SeqCst) {
             return;
         }
-        let mut out = io::stdout().lock();
+        let mut out = self.sink.lock().expect("entry output");
         if writeln!(out, "{line}").and_then(|()| out.flush()).is_err() {
             self.failed.store(true, Ordering::SeqCst);
         }
@@ -119,35 +170,42 @@ impl Out {
         self.line(&value.to_string());
     }
 
+    fn complete(&self) -> bool {
+        !self.failed.load(Ordering::SeqCst) && !self.lost.load(Ordering::SeqCst)
+    }
+
     fn exit(&self, code: i32) -> i32 {
-        if self.failed.load(Ordering::SeqCst) {
-            EXIT_RELAY_FAILED
-        } else {
+        if self.complete() {
             code
+        } else {
+            EXIT_RELAY_FAILED
         }
     }
 }
 
+fn stdout_out() -> Out {
+    Out::new(Box::new(io::stdout()))
+}
+
+fn refused(out: &Out, reason: String) -> i32 {
+    out.entry(json!({
+        "entry": "terminal",
+        "stage": "refused",
+        "reason": reason,
+        "effects": "none",
+    }));
+    out.exit(EXIT_REFUSED)
+}
+
 pub(crate) fn run(request_path: &Path) -> Result<i32, String> {
-    let out = Arc::new(Out {
-        failed: AtomicBool::new(false),
-    });
-    let refused = |reason: String| {
-        out.entry(json!({
-            "entry": "terminal",
-            "stage": "refused",
-            "reason": reason,
-            "effects": "none",
-        }));
-        Ok(out.exit(EXIT_REFUSED))
-    };
+    let out = stdout_out();
     let request = match read_request(request_path) {
         Ok(request) => request,
-        Err(reason) => return refused(reason),
+        Err(reason) => return Ok(refused(&out, reason)),
     };
     let owner = match owner_binary() {
         Ok(owner) => owner,
-        Err(reason) => return refused(reason),
+        Err(reason) => return Ok(refused(&out, reason)),
     };
     let setup = OpenCodeSetup {
         dir: request.launch_dir.clone(),
@@ -162,12 +220,12 @@ pub(crate) fn run(request_path: &Path) -> Result<i32, String> {
     // effects. They read only that the argv is non-empty; every
     // provisioned argv is.
     if let Err(reason) = owner_request(&request, vec!["/usr/bin/env".to_owned()]).validate() {
-        return refused(format!("owner request: {reason}"));
+        return Ok(refused(&out, format!("owner request: {reason}")));
     }
     let launch = match provision_opencode(&setup) {
         Ok(launch) => launch,
         Err(OpenCodeSetupError::InputInvalid(reason)) => {
-            return refused(format!("setup: {reason}"));
+            return Ok(refused(&out, format!("setup: {reason}")));
         }
         Err(OpenCodeSetupError::ConstructionFailed(reason)) => {
             out.entry(json!({
@@ -188,28 +246,101 @@ pub(crate) fn run(request_path: &Path) -> Result<i32, String> {
         "owner": owner,
         "env": env_reach(&request.env, &launch_names),
     }));
+    let context = json!({
+        "store": request.store,
+        "launch_dir": request.launch_dir,
+        "setup": "retained",
+        "retry": "do-not-replay",
+    });
     let owner_request = owner_request(&request, launch.argv.clone());
-    let line = serde_json::to_string(&owner_request).map_err(|error| error.to_string())?;
-    let mut child = match Command::new(&owner)
-        .env_clear()
-        .envs(&request.env)
-        .current_dir("/")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-    {
+    Ok(start_owner(
+        &out,
+        &owner,
+        &request.env,
+        &owner_request,
+        &context,
+    ))
+}
+
+/// `--recover`: one new owner for an existing store, for `cancel` or
+/// `continue-attached` only.
+pub(crate) fn recover(request_path: &Path) -> Result<i32, String> {
+    let out = stdout_out();
+    let request = match read_recover_request(request_path) {
+        Ok(request) => request,
+        Err(reason) => return Ok(refused(&out, reason)),
+    };
+    let owner = match owner_binary() {
+        Ok(owner) => owner,
+        Err(reason) => return Ok(refused(&out, reason)),
+    };
+    let owner_request = Request {
+        store: request.store.clone(),
+        intent: None,
+        recover: Some(request.purpose),
+    };
+    if let Err(reason) = owner_request.validate() {
+        return Ok(refused(&out, format!("owner request: {reason}")));
+    }
+    let purpose = serde_json::to_value(request.purpose).unwrap_or(Value::Null);
+    let names: Vec<&str> = request.env.keys().map(String::as_str).collect();
+    out.entry(json!({
+        "entry": "recovery",
+        "purpose": purpose,
+        "store": request.store,
+        "owner": owner,
+        "env": {
+            "declared": names,
+            "ambient": "none",
+            "recovering_owner": names,
+            "attached_work": "original-root-environment",
+            "new_incarnation": "never-started-by-this-recovery",
+        },
+    }));
+    let context = json!({
+        "store": request.store,
+        "purpose": purpose,
+        "retry": "explicit-recovery-only",
+    });
+    Ok(start_owner(
+        &out,
+        &owner,
+        &request.env,
+        &owner_request,
+        &context,
+    ))
+}
+
+/// Starts the owner with exactly `env`, hands it `request`, relays its
+/// output and control, and reports its end. Every outcome after the start
+/// keeps `context` (where the root's state is; how not to retry).
+fn start_owner(
+    out: &Out,
+    owner: &Path,
+    env: &BTreeMap<String, String>,
+    request: &Request,
+    context: &Value,
+) -> i32 {
+    let terminal = |fields: Value| {
+        let mut line = context.clone();
+        for (key, value) in fields.as_object().into_iter().flatten() {
+            line[key] = value.clone();
+        }
+        line["entry"] = json!("terminal");
+        out.entry(line);
+    };
+    let line = match serde_json::to_string(request) {
+        Ok(line) => line,
+        Err(error) => {
+            terminal(json!({ "stage": "owner-not-started", "reason": error.to_string() }));
+            return out.exit(EXIT_OWNER_NOT_STARTED);
+        }
+    };
+    let mut child = match spawn_owner(owner, env) {
         Ok(child) => child,
         Err(error) => {
-            out.entry(json!({
-                "entry": "terminal",
-                "stage": "owner-not-started",
-                "reason": error.to_string(),
-                "launch_dir": request.launch_dir,
-                "setup": "retained",
-                "retry": "do-not-replay",
-            }));
-            return Ok(out.exit(EXIT_OWNER_NOT_STARTED));
+            terminal(json!({ "stage": "owner-not-started", "reason": error.to_string() }));
+            return out.exit(EXIT_OWNER_NOT_STARTED);
         }
     };
     out.entry(json!({ "entry": "owner-started", "pid": child.id(), "store": request.store }));
@@ -233,35 +364,129 @@ pub(crate) fn run(request_path: &Path) -> Result<i32, String> {
     } else {
         drop(stdin);
     }
-    // Every owner line is read to its end, delivered or not: an undrained
-    // owner can delay its own cancel.
     let stdout = child.stdout.take().expect("owner stdout");
-    for line in BufReader::new(stdout).lines() {
-        match line {
-            Ok(line) => out.line(&line),
-            Err(_) => break,
+    relay(out, stdout);
+    let (fields, code) = owner_end(child.wait());
+    let mut fields = fields;
+    fields["relay"] = json!(if out.complete() {
+        "complete"
+    } else {
+        "incomplete"
+    });
+    terminal(fields);
+    out.exit(code)
+}
+
+/// Starts the owner with exactly `env`, its life tied to this entry's.
+/// The parent-death signal follows the thread that spawns it, so this runs
+/// on the thread that later waits for the owner.
+fn spawn_owner(owner: &Path, env: &BTreeMap<String, String>) -> io::Result<Child> {
+    let entry = libc::pid_t::try_from(std::process::id()).map_err(io::Error::other)?;
+    let mut command = Command::new(owner);
+    command
+        .env_clear()
+        .envs(env)
+        .current_dir("/")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    // SAFETY: only async-signal-safe calls between fork and exec.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // This entry may have died before the setting took effect.
+            if libc::getppid() != entry {
+                return Err(io::Error::from_raw_os_error(libc::ESRCH));
+            }
+            Ok(())
+        });
+    }
+    command.spawn()
+}
+
+/// Relays every owner line to its end, delivered or not: an undrained
+/// owner can delay its own cancel. A line that is not UTF-8 is lost (not
+/// relayed) and reading continues; a failed read ends reading. Either way
+/// the relay is incomplete, whatever the owner's end.
+fn relay(out: &Out, stdout: impl Read) {
+    let mut reader = BufReader::new(stdout);
+    let mut buffer = Vec::new();
+    loop {
+        buffer.clear();
+        match reader.read_until(b'\n', &mut buffer) {
+            Ok(0) => return,
+            Ok(_) => {
+                if buffer.last() == Some(&b'\n') {
+                    buffer.pop();
+                }
+                match std::str::from_utf8(&buffer) {
+                    Ok(line) => out.line(line),
+                    Err(_) => {
+                        out.lost.store(true, Ordering::SeqCst);
+                        out.entry(
+                            json!({ "entry": "relay-lost", "reason": "owner line not UTF-8" }),
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                out.lost.store(true, Ordering::SeqCst);
+                out.entry(
+                    json!({ "entry": "relay-lost", "reason": format!("owner output: {error}") }),
+                );
+                return;
+            }
         }
     }
-    let status = child
-        .wait()
-        .map_err(|error| format!("owner wait: {error}"))?;
+}
+
+/// The owner's end as this entry, its parent, observed it by its wait.
+fn owner_end(wait: io::Result<ExitStatus>) -> (Value, i32) {
+    let status = match wait {
+        Ok(status) => status,
+        Err(error) => {
+            return (
+                json!({
+                    "stage": "owner-wait-failed",
+                    "reason": error.to_string(),
+                    "owner_outcome": "unknown",
+                }),
+                EXIT_OWNER_UNKNOWN,
+            );
+        }
+    };
     let (stage, code) = match status.code() {
         Some(0) => ("owner-ended", 0),
-        Some(class @ 2..=5) => ("owner-ended", OWNER_CLASS_BASE + class),
+        Some(class @ 2..=6) => ("owner-ended", OWNER_CLASS_BASE + class),
         Some(64 | 65) => ("owner-refused", EXIT_OWNER_REFUSED),
         _ => ("owner-outcome-unknown", EXIT_OWNER_UNKNOWN),
     };
-    out.entry(json!({
-        "entry": "terminal",
-        "stage": stage,
-        "owner_exit": status.code(),
-        "owner_signal": std::os::unix::process::ExitStatusExt::signal(&status),
-        "store": request.store,
-        "launch_dir": request.launch_dir,
-        "setup": "retained",
-        "retry": "do-not-replay",
-    }));
-    Ok(out.exit(code))
+    (
+        json!({
+            "stage": stage,
+            "owner_exit": status.code(),
+            "owner_signal": std::os::unix::process::ExitStatusExt::signal(&status),
+        }),
+        code,
+    )
+}
+
+fn check_env(env: &BTreeMap<String, String>) -> Result<(), String> {
+    for (name, value) in env {
+        if name.is_empty() || name.contains(['=', '\0']) || value.contains('\0') {
+            return Err(format!(
+                "env name {name:?} or its value is not an environment entry"
+            ));
+        }
+        if name == oulipoly_root_supervisor::bash::BASH_ENV
+            || name == oulipoly_root_supervisor::SOCKET_ENV
+        {
+            return Err(format!("env {name} is the owner's to set"));
+        }
+    }
+    Ok(())
 }
 
 fn read_request(path: &Path) -> Result<NativeRootRequest, String> {
@@ -280,21 +505,31 @@ fn read_request(path: &Path) -> Result<NativeRootRequest, String> {
             return Err(format!("{name} exists; a root is started fresh only"));
         }
     }
-    for (name, value) in &request.env {
-        if name.is_empty() || name.contains(['=', '\0']) || value.contains('\0') {
-            return Err(format!(
-                "env name {name:?} or its value is not an environment entry"
-            ));
-        }
-        if name == oulipoly_root_supervisor::bash::BASH_ENV
-            || name == oulipoly_root_supervisor::SOCKET_ENV
-        {
-            return Err(format!("env {name} is the owner's to set"));
-        }
-    }
+    check_env(&request.env)?;
     if request.messages.is_empty() {
         return Err("messages names nothing to deliver".to_owned());
     }
+    Ok(request)
+}
+
+fn read_recover_request(path: &Path) -> Result<NativeRecoverRequest, String> {
+    let text = std::fs::read_to_string(path).map_err(|error| format!("request: {error}"))?;
+    let request: NativeRecoverRequest =
+        serde_json::from_str(&text).map_err(|error| format!("request: {error}"))?;
+    if !request.store.starts_with('/') {
+        return Err("store must be absolute".to_owned());
+    }
+    // Existing roots only: a claim would otherwise create a store.
+    match std::fs::symlink_metadata(&request.store) {
+        Ok(meta) if meta.is_dir() => {}
+        _ => {
+            return Err(
+                "store is not an existing directory; recovery is of an existing root only"
+                    .to_owned(),
+            );
+        }
+    }
+    check_env(&request.env)?;
     Ok(request)
 }
 
@@ -328,6 +563,7 @@ fn owner_request(request: &NativeRootRequest, argv: Vec<String>) -> Request {
                 messages: request.messages.clone(),
             }],
         }),
+        recover: None,
     }
 }
 
@@ -369,6 +605,146 @@ fn env_reach(declared: &BTreeMap<String, String>, launch: &[&str]) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::process::ExitStatusExt;
+    use std::sync::Arc;
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Captured {
+        fn lines(&self) -> Vec<Value> {
+            String::from_utf8(self.0.lock().unwrap().clone())
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        }
+    }
+
+    /// One good line, then a read error.
+    struct FailingRead(bool);
+
+    impl Read for FailingRead {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if std::mem::replace(&mut self.0, true) {
+                return Err(io::Error::other("injected read fault"));
+            }
+            let line = b"{\"event\":\"started\"}\n";
+            buffer[..line.len()].copy_from_slice(line);
+            Ok(line.len())
+        }
+    }
+
+    #[test]
+    fn lost_owner_line_is_incomplete_delivery_whatever_the_owner_end() {
+        let sink = Captured::default();
+        let out = Out::new(Box::new(sink.clone()));
+        relay(
+            &out,
+            &b"{\"event\":\"a\"}\n\xff\xfe\n{\"event\":\"terminal\"}\n"[..],
+        );
+        let lines = sink.lines();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(lines[0]["event"], "a");
+        assert_eq!(lines[1]["entry"], "relay-lost");
+        // Reading went on past the lost line.
+        assert_eq!(lines[2]["event"], "terminal");
+        assert!(!out.complete());
+        let (_, code) = owner_end(Ok(ExitStatus::from_raw(2 << 8)));
+        assert_eq!(code, 82);
+        assert_eq!(out.exit(code), EXIT_RELAY_FAILED);
+    }
+
+    #[test]
+    fn failed_owner_read_is_incomplete_delivery() {
+        let sink = Captured::default();
+        let out = Out::new(Box::new(sink.clone()));
+        relay(&out, FailingRead(false));
+        let lines = sink.lines();
+        assert_eq!(lines[0]["event"], "started");
+        assert_eq!(lines[1]["entry"], "relay-lost", "{lines:?}");
+        assert!(lines[1]["reason"].as_str().unwrap().contains("injected"));
+        assert_eq!(out.exit(0), EXIT_RELAY_FAILED);
+    }
+
+    #[test]
+    fn complete_relay_keeps_the_owner_class() {
+        let sink = Captured::default();
+        let out = Out::new(Box::new(sink.clone()));
+        relay(&out, &b"{\"event\":\"terminal\"}\n"[..]);
+        assert!(out.complete());
+        assert_eq!(out.exit(82), 82);
+    }
+
+    #[test]
+    fn failed_owner_wait_is_an_unknown_outcome_not_a_generic_error() {
+        let (fields, code) = owner_end(Err(io::Error::other("injected wait fault")));
+        assert_eq!(code, EXIT_OWNER_UNKNOWN);
+        assert_eq!(fields["stage"], "owner-wait-failed");
+        assert_eq!(fields["owner_outcome"], "unknown");
+        assert!(fields.get("owner_exit").is_none(), "{fields}");
+    }
+
+    #[test]
+    fn owner_classes_map_one_meaning_each() {
+        for (raw, stage, code) in [
+            (0, "owner-ended", 0),
+            (2 << 8, "owner-ended", 82),
+            (4 << 8, "owner-ended", 84),
+            (6 << 8, "owner-ended", 86),
+            (65 << 8, "owner-refused", 66),
+            (1 << 8, "owner-outcome-unknown", 70),
+            (9, "owner-outcome-unknown", 70),
+        ] {
+            let (fields, got) = owner_end(Ok(ExitStatus::from_raw(raw)));
+            assert_eq!(
+                (fields["stage"].as_str(), got),
+                (Some(stage), code),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_is_of_an_existing_store_with_a_named_purpose_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let read = |value: Value| {
+            let path = dir.path().join("recover.json");
+            std::fs::write(&path, value.to_string()).unwrap();
+            read_recover_request(&path)
+        };
+        let store = dir.path().join("s");
+        let base = |store: &Path, purpose: &str| json!({ "store": store, "purpose": purpose, "env": { "PATH": "/usr/bin" } });
+        let missing = read(base(&store, "cancel")).unwrap_err();
+        assert!(missing.contains("existing"), "{missing}");
+        assert!(!store.exists(), "refusal created the store");
+        std::fs::create_dir(&store).unwrap();
+        assert_eq!(
+            read(base(&store, "cancel")).unwrap().purpose,
+            Recover::Cancel
+        );
+        assert_eq!(
+            read(base(&store, "continue-attached")).unwrap().purpose,
+            Recover::ContinueAttached
+        );
+        assert!(read(base(&store, "continue")).is_err());
+        let mut extra = base(&store, "cancel");
+        extra["inherit_env"] = json!(true);
+        assert!(read(extra).unwrap_err().contains("unknown field"));
+        let owned = json!({ "store": store, "purpose": "cancel",
+            "env": { "OULIPOLY_ACP_V2_SOCKET": "/x" } });
+        assert!(read(owned).unwrap_err().contains("owner's to set"));
+    }
 
     #[test]
     fn env_reach_names_what_the_native_launch_replaces_and_never_values() {

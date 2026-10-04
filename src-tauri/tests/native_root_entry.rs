@@ -36,6 +36,7 @@ const ALLOWED: &str =
 const UNNAMED: &str =
     r#"printf %s:%s:%s "$OULIPOLY_WITNESS_DECLARED" "${OULIPOLY_WITNESS_AMBIENT-unset}" "$HOME" x"#;
 const ALLOW_ALL: &str = r#"{"permission":{"*":"allow","bash":"allow"}}"#;
+const RECOVER: &str = "oulipoly-recover-marker";
 
 fn var(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("{name} must be set"))
@@ -186,10 +187,34 @@ impl Root {
     fn start(&self) -> Run {
         let path = self.dir.join("request.json");
         std::fs::write(&path, self.request.to_string()).unwrap();
+        self.entry("--request", &path)
+    }
+
+    /// The recovering owner's whole declared environment.
+    fn recover_env(&self) -> Value {
+        json!({
+            "PATH": "/usr/bin:/bin",
+            "HOME": self.dir.join("recover-home"),
+            "OULIPOLY_WITNESS_RECOVER": RECOVER,
+        })
+    }
+
+    fn recover(&self, purpose: &str) -> Run {
+        let path = self.dir.join(format!("recover-{purpose}.json"));
+        let request = json!({
+            "store": self.request["store"],
+            "purpose": purpose,
+            "env": self.recover_env(),
+        });
+        std::fs::write(&path, request.to_string()).unwrap();
+        self.entry("--recover", &path)
+    }
+
+    fn entry(&self, form: &str, path: &Path) -> Run {
         // The Runner's own environment: ambient, never declared.
         let mut child = Command::new(RUNNER)
-            .args(["native-root", "--request"])
-            .arg(&path)
+            .args(["native-root", form])
+            .arg(path)
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", self.dir.join("owner-home"))
@@ -264,6 +289,35 @@ impl Run {
         let entry = self.entry("terminal");
         let status = self.child.wait().unwrap();
         (owner, entry, status.code())
+    }
+}
+
+impl Run {
+    /// SIGKILLs the entry itself and returns what it relayed.
+    fn kill_entry(mut self) -> Vec<Value> {
+        self.child.kill().unwrap();
+        let status = self.child.wait().unwrap();
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(9)
+        );
+        while let Ok(value) = self.lines.recv_timeout(Duration::from_secs(5)) {
+            self.seen.push(value);
+        }
+        std::mem::take(&mut self.seen)
+    }
+
+    /// The owner's and the entry's terminal lines and the entry's exit
+    /// code, without sending anything.
+    fn finish(mut self) -> (Value, Value, Option<i32>, Vec<Value>) {
+        let owner = self.event("terminal");
+        let entry = self.entry("terminal");
+        let status = self.child.wait().unwrap();
+        (owner, entry, status.code(), std::mem::take(&mut self.seen))
+    }
+
+    fn saw(&self, event: &str) -> bool {
+        self.seen.iter().any(|value| value["event"] == event)
     }
 }
 
@@ -487,4 +541,258 @@ fn native_root_entry_starts_fresh_roots_with_only_the_declared_environment() {
     assert_eq!(entry["effects"], "none", "{entry}");
     assert_eq!(code, Some(64), "{entry}");
     assert!(!Path::new(again.request["launch_dir"].as_str().unwrap()).exists());
+}
+
+/// Whether `pid` has ended (gone, or a zombie nobody reaped).
+fn ended(pid: u64) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Err(_) => true,
+        Ok(stat) => stat[stat.rfind(')').unwrap() + 2..].starts_with('Z'),
+    }
+}
+
+fn wait_ended(pid: u64, what: &str) {
+    let deadline = std::time::Instant::now() + WATCHDOG;
+    while !ended(pid) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "watchdog: {what} {pid} still running"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn event_in<'a>(seen: &'a [Value], event: &str) -> Option<&'a Value> {
+    seen.iter().find(|value| value["event"] == event)
+}
+
+/// Every live (not zombie) process whose command line names `path`.
+fn live_under(path: &Path) -> Vec<u64> {
+    let needle = path.display().to_string();
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u64>().ok())
+        .filter(|pid| u64::from(std::process::id()) != *pid)
+        .filter(|pid| {
+            std::fs::read(format!("/proc/{pid}/cmdline"))
+                .is_ok_and(|cmdline| String::from_utf8_lossy(&cmdline).contains(&needle))
+                && !ended(*pid)
+        })
+        .collect()
+}
+
+/// A recovery: the entry names the recovering owner's declared names, the
+/// owner gets exactly that environment, and the store's root is attached.
+fn recovering(run: &mut Run, root: &Root, purpose: &str) -> u64 {
+    let line = run.entry("recovery");
+    assert_eq!(line["purpose"], purpose, "{line}");
+    assert_eq!(line["env"]["ambient"], "none", "{line}");
+    assert_eq!(line["env"]["attached_work"], "original-root-environment");
+    assert!(!line.to_string().contains(RECOVER), "values echoed: {line}");
+    let owner = run.entry("owner-started")["pid"].as_u64().unwrap();
+    let declared: BTreeMap<String, String> = serde_json::from_value(root.recover_env()).unwrap();
+    assert_eq!(environ(owner), declared, "recovering owner environment");
+    owner
+}
+
+/// The entry dies during a held native run; its owner dies with it, while
+/// root PID 1 and the native host survive. A public `continue-attached`
+/// recovery attaches that same root PID 1 and delivers what was owed to the
+/// surviving host, whose work keeps the original environment. Its entry
+/// dies too; a public `cancel` recovery then ends the root's work without
+/// connecting to it, and a later recovery finds no root and starts none.
+/// A second root, its entry killed before delivery, is cancelled with its
+/// message still owed: nothing is delivered under cancel.
+#[test]
+#[ignore = "needs the root supervisor built beside the Runner, OULIPOLY_NATIVE_DEPS, OULIPOLY_AGENT_BASH_TOOL, AGENT_BASH_BIN, OULIPOLY_NATIVE_SCRATCH and loopback"]
+fn native_root_survives_entry_death_and_is_continued_or_cancelled_by_attachment() {
+    let scratch = PathBuf::from(var("OULIPOLY_NATIVE_SCRATCH"));
+    let base_url = scripted_model();
+
+    // A: entry killed once the native host is launched, before delivery.
+    let a = Root::new(&scratch, "ka", &base_url, &format!("RUN {ALLOWED}"));
+    let mut run = a.start();
+    let launch = run.entry("setup-completed")["launch"].clone();
+    let owner1 = run.entry("owner-started")["pid"].as_u64().unwrap();
+    let root_line = run.event("root-pid1-started");
+    assert_eq!(root_line["parent"], "this-owner", "{root_line}");
+    let root_pid1 = root_line["pid"].as_u64().unwrap();
+    let host = run.event("launched")["pid"].as_u64().unwrap();
+    let seen = run.kill_entry();
+    assert!(
+        event_in(&seen, "ack").is_none(),
+        "delivered before the kill: {seen:#?}"
+    );
+    assert!(event_in(&seen, "terminal").is_none());
+    wait_ended(owner1, "owner after its entry's death");
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(!ended(root_pid1), "root PID 1 survives its owner");
+    assert!(!ended(host), "the native host survives its owner");
+
+    // Continue by attachment: same root PID 1, same host, original env.
+    let mut cont = a.recover("continue-attached");
+    let owner2 = recovering(&mut cont, &a, "continue-attached");
+    let custody = cont.event("custody");
+    assert_eq!(custody["outcome"], "attached", "{custody}");
+    let reattached = cont.event("reattached");
+    assert_eq!(reattached["pid"].as_u64(), Some(host), "{reattached}");
+    cont.event("endpoint-connected");
+    let ack = cont.event("ack");
+    println!("continued ack label: {}", ack["label"]);
+    let accepted = cont.event("bash-accepted");
+    assert_eq!(
+        accepted["argv"],
+        json!(["bash", "-lc", ALLOWED]),
+        "{accepted}"
+    );
+    cont.event("bash-ended");
+    assert_eq!(cont.event("agent-message")["text"], "DONE");
+    let session = cont
+        .seen
+        .iter()
+        .find_map(|value| {
+            (value["event"] == "session-opened" || value["event"] == "session-resumed")
+                .then(|| value["session"].as_str().map(str::to_owned))
+                .flatten()
+        })
+        .expect("session");
+    assert!(
+        !cont.saw("launched") && !cont.saw("root-pid1-started"),
+        "{:#?}",
+        cont.seen
+    );
+    let host_env = environ(host);
+    assert_eq!(
+        host_env
+            .get("OULIPOLY_WITNESS_DECLARED")
+            .map(String::as_str),
+        Some(DECLARED)
+    );
+    assert!(!host_env.contains_key("OULIPOLY_WITNESS_RECOVER"));
+    // The held run's entry dies again: owner gone, work kept.
+    let seen = cont.kill_entry();
+    assert!(event_in(&seen, "terminal").is_none());
+    wait_ended(owner2, "continuing owner after its entry's death");
+    assert!(!ended(host) && !ended(root_pid1));
+
+    // Cancel by attachment: nothing connected, delivered or launched.
+    let mut cancel = a.recover("cancel");
+    recovering(&mut cancel, &a, "cancel");
+    assert_eq!(cancel.event("custody")["outcome"], "attached");
+    assert_eq!(cancel.event("cancel-requested")["by"], "recover-cancel");
+    let (owner, entry, code, seen) = cancel.finish();
+    for nothing in [
+        "endpoint-connected",
+        "session-resumed",
+        "session-opened",
+        "ack",
+        "launched",
+        "root-pid1-started",
+    ] {
+        assert!(
+            event_in(&seen, nothing).is_none(),
+            "{nothing} under cancel: {seen:#?}"
+        );
+    }
+    assert_eq!(owner["status"], "cancelled", "{owner}");
+    assert_eq!(owner["recover"], "cancel");
+    assert_eq!(owner["all_harnesses_reaped"], true, "{owner}");
+    assert_eq!(
+        owner["harnesses"][0]["exits"],
+        json!(["signal:9"]),
+        "{owner}"
+    );
+    assert_eq!(
+        owner["harnesses"][0]["messages"][0]["state"],
+        "acknowledged"
+    );
+    assert_eq!(
+        owner["root_pid1"]["outcome"], "released-exit-observed-by-pidfd",
+        "{owner}"
+    );
+    assert_eq!(owner["root_pid1"]["parent"], false);
+    assert!(owner["root_pid1"]["status"].is_null());
+    assert_eq!(owner["root_pid1"]["end_observed"], true);
+    assert_eq!(entry["stage"], "owner-ended", "{entry}");
+    assert_eq!(entry["owner_exit"], 2);
+    assert_eq!(entry["relay"], "complete");
+    assert_eq!(entry["retry"], "explicit-recovery-only");
+    assert_eq!(code, Some(82), "{entry}");
+    assert!(ended(host) && ended(root_pid1));
+    let parts = tool_parts(&launch, a.request["cwd"].as_str().unwrap(), &session);
+    println!("continued parts: {parts:?}");
+    let expected = format!(
+        "{DECLARED}:unset:{}",
+        a.request["env"]["HOME"].as_str().unwrap()
+    );
+    assert!(
+        parts.len() == 1 && parts[0].0 == "completed" && parts[0].2.ends_with(&expected),
+        "attached work ran in the original environment: {parts:?}"
+    );
+
+    // Nothing left to attach: no new incarnation.
+    let mut again = a.recover("continue-attached");
+    recovering(&mut again, &a, "continue-attached");
+    let (owner, entry, code, seen) = again.finish();
+    assert_eq!(owner["status"], "root-absent", "{owner}");
+    assert_eq!(owner["new_incarnation"], "not-started");
+    assert_eq!(owner["owed"], 0, "{owner}");
+    let limited = event_in(&seen, "recover-limited").expect("recover-limited");
+    assert_eq!(limited["custody"], "no-unended-incarnation", "{limited}");
+    assert!(
+        event_in(&seen, "launched").is_none() && event_in(&seen, "root-pid1-started").is_none()
+    );
+    assert_eq!(entry["owner_exit"], 6, "{entry}");
+    assert_eq!(code, Some(86), "{entry}");
+
+    // B: cancelled with its message owed; nothing delivered under cancel.
+    let b = Root::new(&scratch, "kb", &base_url, "RUN true");
+    let mut run = b.start();
+    let owner1 = run.entry("owner-started")["pid"].as_u64().unwrap();
+    let host = run.event("launched")["pid"].as_u64().unwrap();
+    let seen = run.kill_entry();
+    assert!(event_in(&seen, "ack").is_none(), "{seen:#?}");
+    wait_ended(owner1, "owner after its entry's death");
+    assert!(!ended(host));
+    let mut cancel = b.recover("cancel");
+    recovering(&mut cancel, &b, "cancel");
+    let (owner, entry, code, seen) = cancel.finish();
+    for nothing in [
+        "endpoint-connected",
+        "session-opened",
+        "ack",
+        "launched",
+        "root-pid1-started",
+    ] {
+        assert!(
+            event_in(&seen, nothing).is_none(),
+            "{nothing} under cancel: {seen:#?}"
+        );
+    }
+    assert_eq!(owner["status"], "cancelled", "{owner}");
+    let message = &owner["harnesses"][0]["messages"][0];
+    assert_eq!(message["state"], "owed", "{owner}");
+    assert_eq!(message["label"], "cancelled", "{owner}");
+    assert_eq!(code, Some(82), "{entry}");
+    assert!(ended(host));
+    let mut again = b.recover("continue-attached");
+    recovering(&mut again, &b, "continue-attached");
+    let (owner, _, code, _) = again.finish();
+    assert_eq!(owner["status"], "root-absent", "{owner}");
+    assert_eq!(owner["owed"], 1, "debt still reported: {owner}");
+    assert_eq!(code, Some(86));
+
+    // A missing store is refused before any effect.
+    let missing = Root::new(&scratch, "km", &base_url, "RUN true");
+    let mut run = missing.recover("cancel");
+    let entry = run.entry("terminal");
+    assert_eq!(entry["stage"], "refused", "{entry}");
+    assert_eq!(run.child.wait().unwrap().code(), Some(64));
+    assert!(!Path::new(missing.request["store"].as_str().unwrap()).exists());
+
+    let left = live_under(&scratch);
+    assert!(
+        left.is_empty(),
+        "processes left under the scratch: {left:?}"
+    );
 }
