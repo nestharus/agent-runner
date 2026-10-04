@@ -90,8 +90,10 @@
 //! each: `refused` (nothing recorded or run), or `accepted` (durably
 //! recorded, with the requesting harness, session and the owner inputs open
 //! on it; not a start), `started`, `output` (`b64`), `output-closed` (end of
-//! stream, not an end), then exactly one of `end` (status from its work
-//! PID 1's wait), `end-unknown`, `launch-failed` or `left-to-successor`.
+//! stream, not an end) or `output-failed`, then exactly one of `end` (status
+//! from its work PID 1's wait, with separate output state), `end-unknown`,
+//! `launch-failed` (positive no-start reply), `launch-unknown` (possible
+//! effects, no automatic retry), or `left-to-successor`.
 //! Each accepted run is its own work under root PID 1, so it is killed on
 //! cancel, survives owner death like any work, and the run does not end
 //! until its end (or why it is unknown) is reported. Delivery is in-band to
@@ -106,7 +108,9 @@
 //! and `turn-end` is reported for an input only from an idle the agent
 //! tagged with `oulipoly.ai/lastUserMessageId` at or after that input
 //! (native ids ascend), with `own_output` saying whether any output named
-//! it. An untagged idle is still only readiness. A Bash run's `accepted`
+//! it. This is idle-tag coverage, not proof of native processing; the
+//! changed native parent/multipart paths remain unwitnessed. An untagged
+//! idle is still only readiness. A Bash run's `accepted`
 //! says which inputs were open (`single-open-input`, `ambiguous-open-inputs`
 //! or `no-open-input`); nothing finer is known.
 //!
@@ -916,8 +920,12 @@ fn recover_custody(
                 work: run.work,
             }
         } else {
-            let _ = store.resolve_work(run.work, "never-launched", Some("root-pid1-record"));
-            continue;
+            // A missing first launch report can follow creation. Absence
+            // from attach is not a positive no-start reply for this intent.
+            bash::Prior::Unknown {
+                harness: run.harness,
+                work: run.work,
+            }
         };
         recovery.bash.push(prior);
     }

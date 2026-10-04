@@ -875,6 +875,7 @@ mod tests {
                 std::process::id(),
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ));
+            eprintln!("owned-fixture: {}", dir.display());
             Self(dir)
         }
     }

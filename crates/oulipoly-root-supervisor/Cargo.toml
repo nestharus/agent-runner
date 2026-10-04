@@ -24,7 +24,6 @@ test = false
 [[bin]]
 name = "oulipoly-root-bash"
 path = "src/bin/root_bash.rs"
-test = false
 
 # Deterministic ACP v2 peer used only as an owned harness in this crate's
 # process-level tests. It is not a real harness.

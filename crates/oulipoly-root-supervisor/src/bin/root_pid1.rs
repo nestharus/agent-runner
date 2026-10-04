@@ -402,22 +402,26 @@ impl Pid1 {
             merge_stderr: message["stderr"] == "stdout",
             null_stdin: message["stdin"] == "null",
         };
-        let refuse = |pid1: &Self, reason: String| {
+        let refuse = |pid1: &Self, reason: String, not_started: bool| {
             let _ = reply(
                 &pid1.owners[index].socket,
-                &json!({ "req": req, "event": "refused", "reason": reason }),
+                &json!({ "req": req, "event": "refused", "reason": reason, "not_started": not_started }),
                 &[],
             );
         };
+        if self.works.iter().any(|work| work.id == id) {
+            // The previous work can already have effects, despite no new spawn.
+            refuse(self, "work-already-exists".to_owned(), false);
+            return;
+        }
         if id.is_empty()
             || launch.argv.is_empty()
             || launch
                 .env
                 .iter()
                 .any(|(key, _)| key.is_empty() || key.contains('='))
-            || self.works.iter().any(|work| work.id == id)
         {
-            refuse(self, "bad-spawn".to_owned());
+            refuse(self, "bad-spawn".to_owned(), true);
             return;
         }
         let started = start_work(&launch);
@@ -428,6 +432,9 @@ impl Pid1 {
                     "spawn-failed: {}",
                     started.err().map(|e| e.to_string()).unwrap_or_default()
                 ),
+                // start_work can fail reading the first report after clone.
+                // Absence of a reply is not evidence of absence of effects.
+                false,
             );
             return;
         };

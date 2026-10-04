@@ -57,6 +57,21 @@ pub(crate) struct Spawned {
     pub(crate) exec_error: Option<String>,
 }
 
+/// Only a positive no-start reply proves absence of command effects.
+#[derive(Debug)]
+pub(crate) enum SpawnError {
+    NotStarted(String),
+    Unknown(String),
+}
+
+impl SpawnError {
+    pub(crate) fn reason(&self) -> &str {
+        match self {
+            Self::NotStarted(reason) | Self::Unknown(reason) => reason,
+        }
+    }
+}
+
 /// A surviving harness this owner attached to, with its stdio.
 pub(crate) struct Adopted {
     pub(crate) work: i64,
@@ -433,6 +448,19 @@ impl Root {
         cwd: &str,
         command: bool,
     ) -> Result<Spawned, String> {
+        self.spawn_observed(work, argv, env, cwd, command)
+            .map_err(|error| error.reason().to_owned())
+    }
+
+    /// Preserves possible creation when a request or its stdio reply is lost.
+    pub(crate) fn spawn_observed(
+        &self,
+        work: i64,
+        argv: &[String],
+        env: &serde_json::Map<String, Value>,
+        cwd: &str,
+        command: bool,
+    ) -> Result<Spawned, SpawnError> {
         let Some((reply, fds)) = self.request(json!({
             "op": "spawn",
             "work": work_name(work),
@@ -442,12 +470,20 @@ impl Root {
             "stdin": if command { "null" } else { "pipe" },
             "stderr": if command { "stdout" } else { "inherit" },
         })) else {
-            return Err("root-pid1-unreachable".to_owned());
+            return Err(SpawnError::Unknown("root-pid1-unreachable".to_owned()));
         };
         if reply["event"] != "spawned" {
-            return Err(format!("refused: {}", reply["reason"]));
+            let reason = format!("spawn reply: {}", reply["reason"]);
+            return Err(
+                if reply["event"] == "refused" && reply["not_started"] == true {
+                    SpawnError::NotStarted(reason)
+                } else {
+                    SpawnError::Unknown(reason)
+                },
+            );
         }
-        let stdio = WorkStdio::from_fds(fds).ok_or("spawned without stdio")?;
+        let stdio = WorkStdio::from_fds(fds)
+            .ok_or_else(|| SpawnError::Unknown("spawned without stdio".to_owned()))?;
         Ok(Spawned {
             stdio,
             harness_host_pid: reply["harness_host_pid"]

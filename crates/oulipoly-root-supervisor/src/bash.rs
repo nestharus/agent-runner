@@ -17,8 +17,10 @@
 //!   streamed back; its end comes only from its work PID 1's wait.
 //! * Each line to the requester is one stage: `accepted` (durable record,
 //!   not a start), `started`, `output`, `output-closed` (end of stream, not
-//!   an end), then exactly one of `end`, `end-unknown`, `launch-failed` or
-//!   `left-to-successor`. A requester that goes away does not stop the run;
+//!   an end) or `output-failed`, then exactly one of `end` (with separate
+//!   output state), `end-unknown`, `launch-failed` (proven no-start),
+//!   `launch-unknown` (possible effects) or `left-to-successor`.
+//!   Uncertain launches are never retried. A requester that goes away does not stop the run;
 //!   the owner still waits for its end and records it.
 
 use std::fs::File;
@@ -34,7 +36,7 @@ use std::thread;
 use serde_json::{Value, json};
 
 use crate::Event;
-use crate::custody::{Adopted, PidNs, ReceiptWait, Root, RootSlot};
+use crate::custody::{Adopted, PidNs, ReceiptWait, Root, RootSlot, SpawnError};
 use crate::live::Custody;
 use crate::store::Store;
 use crate::sys;
@@ -383,7 +385,7 @@ impl Ingress {
         let mut owner = json!({ "event": "bash-accepted", "work": work, "argv": request.argv });
         merge(&mut owner, &attribution);
         self.report(owner);
-        let spawned = root.spawn(
+        let spawned = root.spawn_observed(
             work,
             &request.argv,
             &serde_json::Map::new(),
@@ -394,16 +396,27 @@ impl Ingress {
             Ok(spawned) => spawned,
             Err(reason) => {
                 drop(custody);
-                let _ = self.store.lock().expect("store lock").resolve_work(
-                    work,
-                    "launch-refused",
-                    None,
-                );
-                sink.send(&json!({ "event": "launch-failed", "reason": reason }));
-                self.report(
-                    json!({ "event": "bash-launch-failed", "work": work, "reason": reason }),
-                );
-                self.leave(Outcome::NotRun);
+                let not_started = matches!(reason, SpawnError::NotStarted(_));
+                let event = if not_started {
+                    "launch-failed"
+                } else {
+                    "launch-unknown"
+                };
+                if not_started {
+                    let _ = self.store.lock().expect("store lock").resolve_work(
+                        work,
+                        "launch-refused",
+                        Some("root-pid1-no-start-reply"),
+                    );
+                }
+                // Unknown stays unresolved for a successor; never retry here.
+                sink.send(&json!({ "event": event, "reason": reason.reason(), "not_started": not_started }));
+                self.report(json!({ "event": format!("bash-{event}"), "work": work, "reason": reason.reason(), "not_started": not_started }));
+                self.leave(if not_started {
+                    Outcome::NotRun
+                } else {
+                    Outcome::Unknown
+                });
                 return;
             }
         };
@@ -432,29 +445,8 @@ impl Ingress {
     /// its end from its work PID 1's report, records it and says so.
     fn finish(&self, root: &Root, work: i64, token: u64, stdout: File, sink: Option<&mut Sink>) {
         let mut sink = sink;
-        let mut stdout = stdout;
-        let mut bytes = 0u64;
-        let mut buf = [0u8; 16 * 1024];
-        let mut detached = false;
-        loop {
-            if !transport::readable(&self.slot.stop, &stdout).unwrap_or(false) {
-                detached = transport::detached(&self.slot.stop);
-                break;
-            }
-            match stdout.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(read) => {
-                    bytes += read as u64;
-                    if let Some(sink) = sink.as_deref_mut() {
-                        sink.send(&json!({ "event": "output", "b64": base64(&buf[..read]) }));
-                    }
-                }
-            }
-        }
-        if !detached && let Some(sink) = sink.as_deref_mut() {
-            sink.send(&json!({ "event": "output-closed", "bytes": bytes }));
-        }
-        let (event, outcome) = match root.wait_receipt(work) {
+        let (bytes, output) = relay_output(&self.slot.stop, stdout, &mut sink);
+        let (mut event, outcome) = match root.wait_receipt(work) {
             ReceiptWait::Receipt(receipt) => match receipt["harness"].as_str() {
                 Some(status) => {
                     let _ = self.store.lock().expect("store lock").resolve_work(
@@ -494,6 +486,7 @@ impl Ingress {
             ),
             ReceiptWait::Detached => (json!({ "event": "left-to-successor" }), Outcome::Unknown),
         };
+        event["output"] = output;
         self.custody.lock().expect("custody lock").release(token);
         let caller = match sink {
             Some(sink) => {
@@ -586,6 +579,44 @@ impl Ingress {
             }
         });
     }
+}
+
+/// EOF, read failure and detach are different observations; none is a wait.
+fn relay_output(
+    stop: &transport::StopSignal,
+    mut stdout: File,
+    sink: &mut Option<&mut Sink>,
+) -> (u64, Value) {
+    let mut bytes = 0u64;
+    let mut buf = [0u8; 16 * 1024];
+    let output = loop {
+        match transport::readable(stop, &stdout) {
+            Ok(true) => {}
+            Ok(false) => break json!({ "state": "unknown", "reason": "detached" }),
+            Err(error) => break json!({ "state": "failed", "reason": error.to_string() }),
+        }
+        match stdout.read(&mut buf) {
+            Ok(0) => break json!({ "state": "closed", "bytes": bytes }),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => break json!({ "state": "failed", "reason": error.to_string() }),
+            Ok(read) => {
+                bytes += read as u64;
+                if let Some(sink) = sink.as_deref_mut() {
+                    sink.send(&json!({ "event": "output", "b64": base64(&buf[..read]) }));
+                }
+            }
+        }
+    };
+    if let Some(sink) = sink.as_deref_mut() {
+        match output["state"].as_str() {
+            Some("closed") => sink.send(&json!({ "event": "output-closed", "bytes": bytes })),
+            Some("failed") => {
+                sink.send(&json!({ "event": "output-failed", "reason": output["reason"] }))
+            }
+            _ => {}
+        }
+    }
+    (bytes, output)
 }
 
 struct Attributed {
@@ -707,14 +738,19 @@ pub fn unbase64(text: &str) -> Option<Vec<u8>> {
         return None;
     }
     let mut out = Vec::with_capacity(text.len() / 4 * 3);
-    for chunk in text.as_bytes().chunks(4) {
+    let chunks = text.as_bytes().chunks(4);
+    let count = chunks.len();
+    for (index, chunk) in chunks.enumerate() {
         let pad = chunk.iter().rev().take_while(|&&byte| byte == b'=').count();
-        if pad > 2 {
+        if pad > 2 || (pad > 0 && index + 1 != count) {
             return None;
         }
         let mut triple = 0u32;
         for (i, &byte) in chunk[..4 - pad].iter().enumerate() {
             triple |= u32::from(value(byte)?) << (18 - 6 * i);
+        }
+        if (pad == 2 && triple & 0xffff != 0) || (pad == 1 && triple & 0xff != 0) {
+            return None;
         }
         for i in 0..3 - pad {
             out.push((triple >> (16 - 8 * i)) as u8);
@@ -726,6 +762,191 @@ pub fn unbase64(text: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::StopSignal;
+    use crate::{Endpoint, HarnessSpec, Intent};
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+
+    // Configured custody peer, not a native root: faults occur after an
+    // actual deterministic command effect in a fresh private fixture.
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new() -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("bash-honesty-{}", sys::random_hex().unwrap()));
+            std::fs::create_dir(&dir).unwrap();
+            eprintln!("owned-fixture: {}", dir.display());
+            Self(dir)
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    fn fixture(dir: &Path) -> (Arc<Ingress>, Arc<Root>, OwnedFd) {
+        let intent = Intent {
+            outage_closure_cap: 1,
+            delivery_attempt_cap: 1,
+            cwd: dir.display().to_string(),
+            harnesses: vec![HarnessSpec {
+                id: "h".into(),
+                argv: vec!["peer".into()],
+                endpoint: Endpoint::Stdio,
+                session: None,
+                messages: vec!["one".into()],
+            }],
+        };
+        let mut claimed = Store::claim(&dir.join("store"), Some(&intent)).unwrap();
+        claimed
+            .store
+            .begin_incarnation("fixture", "fixture")
+            .unwrap();
+        let stop = Arc::new(StopSignal::new().unwrap());
+        let (root, far) = Root::seam(false, i32::try_from(std::process::id()).unwrap(), &stop);
+        let slot = Arc::new(RootSlot::new(
+            dir.join("store"),
+            1,
+            sys::Isolation::UnprivilegedUserns,
+            Arc::clone(&stop),
+            Some(Arc::clone(&root)),
+        ));
+        let (tx, _rx) = channel();
+        let ingress = Ingress::new(
+            dir.join("store"),
+            claimed.root_id,
+            slot,
+            Arc::new(Mutex::new(Custody::new(stop))),
+            Arc::new(Mutex::new(claimed.store)),
+            Arc::default(),
+            tx,
+        );
+        (ingress, root, far)
+    }
+
+    #[test]
+    fn spawn_reply_faults_keep_possible_effects_unknown_and_intent_open() {
+        for mode in ["lost-reply", "missing-stdio", "unproven-refusal", "refused"] {
+            let dir = Fixture::new();
+            let (ingress, _root, far) = fixture(&dir.0);
+            let marker = dir.0.join("effects");
+            let replier = thread::spawn(move || {
+                let (bytes, _) = sys::recv(&far).unwrap().unwrap();
+                let request: Value = serde_json::from_slice(&bytes).unwrap();
+                if mode != "refused" {
+                    let status = std::process::Command::new("/bin/sh")
+                        .args(["-c", "printf x >> effects"])
+                        .current_dir(marker.parent().unwrap())
+                        .status()
+                        .unwrap();
+                    assert!(status.success());
+                }
+                if mode != "lost-reply" {
+                    let reply = if mode == "refused" {
+                        json!({ "req": request["req"], "event": "refused", "reason": "fixture-no-start", "not_started": true })
+                    } else if mode == "unproven-refusal" {
+                        json!({ "req": request["req"], "event": "refused", "reason": "fixture-after-creation", "not_started": false })
+                    } else {
+                        json!({ "req": request["req"], "event": "spawned" })
+                    };
+                    sys::send(&far, reply.to_string().as_bytes(), &[]).unwrap();
+                }
+            });
+            let (near, far) = UnixStream::pair().unwrap();
+            far.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let who = Attributed {
+                position: 0,
+                harness: "h".into(),
+                harness_work: 0,
+                session: None,
+                open: vec![],
+            };
+            let request = RunRequest {
+                argv: vec!["fixture".into()],
+                cwd: dir.0.display().to_string(),
+            };
+            ingress.run(&who, 1, &request, &mut Sink(Some(near)));
+            replier.join().unwrap();
+            let events: Vec<Value> = BufReader::new(far)
+                .lines()
+                .map(|line| serde_json::from_str(&line.unwrap()).unwrap())
+                .collect();
+            assert_eq!(events[0]["event"], "accepted");
+            let conn = rusqlite::Connection::open(dir.0.join("store").join(crate::store::DB_FILE))
+                .unwrap();
+            let outcome: Option<String> = conn
+                .query_row("SELECT outcome FROM work WHERE kind = 'bash'", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            if mode == "refused" {
+                assert_eq!(events[1]["event"], "launch-failed");
+                assert_eq!(outcome.as_deref(), Some("launch-refused"));
+                assert!(!dir.0.join("effects").exists());
+                assert_eq!(ingress.summary()["not_run"], 1);
+            } else {
+                assert_eq!(
+                    std::fs::read(dir.0.join("effects")).unwrap(),
+                    b"x",
+                    "one effect, no retry"
+                );
+                assert_eq!(events[1]["event"], "launch-unknown");
+                assert_eq!(outcome, None, "retain unresolved durable intent");
+                assert_eq!(ingress.summary()["not_run"], 0);
+                assert_eq!(ingress.summary()["end_unknown"], 1);
+                assert!(ingress.ends_unproven());
+            }
+        }
+    }
+
+    #[test]
+    fn output_read_failure_preserves_wait_but_never_claims_eof() {
+        let dir = Fixture::new();
+        let (ingress, root, far) = fixture(&dir.0);
+        let work = ingress
+            .store
+            .lock()
+            .unwrap()
+            .begin_bash(0, 1, 1, "[]", &["fixture".into()], "/")
+            .unwrap();
+        assert!(ingress.enter());
+        let token = ingress
+            .custody
+            .lock()
+            .unwrap()
+            .register(Arc::clone(&root), work);
+        let receipt = json!({ "event": "receipt", "work": crate::custody::work_name(work), "harness": "code:0", "work_pid1": "code:0" });
+        sys::send(&far, receipt.to_string().as_bytes(), &[]).unwrap();
+        let (near, far) = UnixStream::pair().unwrap();
+        far.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut sink = Sink(Some(near));
+        // Linux directory read yields EISDIR; it is not EOF.
+        ingress.finish(
+            &root,
+            work,
+            token,
+            File::open(&dir.0).unwrap(),
+            Some(&mut sink),
+        );
+        drop(sink);
+        let events: Vec<Value> = BufReader::new(far)
+            .lines()
+            .map(|line| serde_json::from_str(&line.unwrap()).unwrap())
+            .collect();
+        assert_eq!(events[0]["event"], "output-failed");
+        assert_eq!(events[1]["event"], "end");
+        assert_eq!(events[1]["status"], "code:0");
+        assert_eq!(events[1]["output"]["state"], "failed");
+        assert!(events.iter().all(|event| event["event"] != "output-closed"));
+        assert_eq!(
+            ingress.summary()["ended"],
+            1,
+            "actual wait remains distinct"
+        );
+    }
 
     #[test]
     fn base64_round_trips_every_tail_length() {
@@ -735,5 +956,8 @@ mod tests {
         }
         assert_eq!(base64(b"hi\n"), "aGkK");
         assert!(unbase64("a").is_none());
+        for corrupt in ["aG==aGkK", "aGl=", "aH==", "!!!!"] {
+            assert!(unbase64(corrupt).is_none(), "{corrupt}");
+        }
     }
 }

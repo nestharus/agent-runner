@@ -87,7 +87,10 @@ fn stamp(pid: i32, start_time: i64) {
             .append(true)
             .open(path)
             .unwrap();
-        writeln!(file, "{pid} {start_time}").unwrap();
+        // One append buffer: concurrent fixture stamps must not interleave
+        // the pid and start time from different owned roots.
+        file.write_all(format!("{pid} {start_time}\n").as_bytes())
+            .unwrap();
     }
 }
 
@@ -123,6 +126,7 @@ impl Scratch {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
+        eprintln!("owned-fixture: {}", dir.display());
         Self(dir, Roots::default())
     }
 
