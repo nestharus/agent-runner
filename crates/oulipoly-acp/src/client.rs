@@ -230,6 +230,25 @@ pub enum SessionEvent {
         session_id: String,
         stop_reason: Option<String>,
     },
+    /// `agent_message`: the agent's output, its text blocks joined.
+    AgentMessage {
+        session_id: String,
+        message_id: String,
+        text: String,
+    },
+    /// `notice`, e.g. a turn's error or a refused permission.
+    Notice {
+        session_id: String,
+        severity: String,
+        title: String,
+        description: Option<String>,
+    },
+    /// An agent-initiated request (e.g. `session/request_permission`),
+    /// answered "method not found": this client grants nothing.
+    RequestRefused {
+        method: String,
+        session_id: Option<String>,
+    },
     Other {
         session_id: String,
         kind: String,
@@ -637,7 +656,15 @@ impl<T: Transport> AcpClient<T> {
     fn handle_inbound(&mut self, message: &Value) {
         let name = message.get("method").and_then(Value::as_str);
         if let Some(id) = message.get("id") {
-            // This client implements no client-side methods.
+            // This client implements no client-side methods, and keeps a
+            // record that it refused.
+            self.events.push(SessionEvent::RequestRefused {
+                method: name.unwrap_or_default().to_owned(),
+                session_id: message
+                    .pointer("/params/sessionId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            });
             let _ = self.transport.send(&json!({
                 "jsonrpc": "2.0",
                 "id": id,
@@ -685,6 +712,27 @@ fn session_event(notification: wire::UpdateSessionNotification) -> Option<Sessio
                 session_id,
                 kind: format!("state_update:{other}"),
             },
+        },
+        "agent_message" => SessionEvent::AgentMessage {
+            session_id,
+            message_id: update.get("messageId")?.as_str()?.to_owned(),
+            text: update
+                .get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .collect(),
+        },
+        "notice" => SessionEvent::Notice {
+            session_id,
+            severity: update.get("severity")?.as_str()?.to_owned(),
+            title: update.get("title")?.as_str()?.to_owned(),
+            description: update
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
         },
         _ => SessionEvent::Other { session_id, kind },
     })

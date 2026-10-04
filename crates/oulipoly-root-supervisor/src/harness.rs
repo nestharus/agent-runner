@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use oulipoly_acp::{
     AcpClient, AtMostOnceBasis, ClientInfo, DeliveryOutcome, IdleWaitFailure, NegotiationFailure,
-    NoAckCause, OutboundMessage, RequestFailure,
+    NoAckCause, OutboundMessage, RequestFailure, SessionEvent,
 };
 use serde_json::{Value, json};
 
@@ -867,6 +867,7 @@ impl Worker {
         }
         let session = self.session.clone().expect("session id");
         let position = self.position;
+        let mut seen = client.events().len();
         while let Some(index) = self.head() {
             // The attempt is durable before it is sent, so no successor can
             // miss an attempt that may have been inserted.
@@ -875,6 +876,7 @@ impl Worker {
             };
             self.tracked[index].attempts += 1;
             let outcome = client.submit(&session, &mut self.tracked[index].message);
+            self.report_turn(client, &mut seen);
             let (resolution, end) = match &outcome {
                 DeliveryOutcome::Accepted(acceptance)
                 | DeliveryOutcome::DuplicateUnknown(acceptance) => {
@@ -945,7 +947,9 @@ impl Worker {
         // Nothing owed on this connection. Keep reading through the client
         // until the harness ends its stream; acknowledgement is not an end.
         loop {
-            match client.await_session_idle(&session) {
+            let idle = client.await_session_idle(&session);
+            self.report_turn(client, &mut seen);
+            match idle {
                 Ok(idle) => self.report(json!({
                     "event": "idle",
                     "meaning": "readiness-since-first-attempt",
@@ -957,6 +961,44 @@ impl Worker {
                 }
             }
         }
+    }
+
+    /// Reports what the turn showed since `seen`: agent output, notices and
+    /// the agent requests this owner refused. None of it is an ACK.
+    fn report_turn(&self, client: &AcpClient<HarnessTransport>, seen: &mut usize) {
+        for event in &client.events()[*seen..] {
+            match event {
+                SessionEvent::AgentMessage {
+                    session_id,
+                    message_id,
+                    text,
+                } => self.report(json!({
+                    "event": "agent-message",
+                    "session": session_id,
+                    "message_id": message_id,
+                    "text": text,
+                })),
+                SessionEvent::Notice {
+                    session_id,
+                    severity,
+                    title,
+                    description,
+                } => self.report(json!({
+                    "event": "notice",
+                    "session": session_id,
+                    "severity": severity,
+                    "title": title,
+                    "description": description,
+                })),
+                SessionEvent::RequestRefused { method, session_id } => self.report(json!({
+                    "event": "request-refused",
+                    "method": method,
+                    "session": session_id,
+                })),
+                _ => {}
+            }
+        }
+        *seen = client.events().len();
     }
 
     fn gone_or_drained(&self) -> ConnEnd {
