@@ -17,13 +17,16 @@
 //! `unshare --user --map-current-user --net --pid --fork`, which also
 //! bounds cleanup: everything in that PID namespace ends with it.
 //!
-//! The third loads the actual agent-bash `bash` tool behind the native
-//! permission gate `native/opencode/bash-policy-tool.ts` and drives it with
-//! a scripted loopback stand-in for a model (no model, provider or
-//! credential): it also needs `OULIPOLY_AGENT_BASH_TOOL`, the matching
-//! agent-bash `integrations/opencode/tools/bash.ts`, and `AGENT_BASH_BIN`,
-//! that source's `agent-bash` binary. Its loopback must be up (in a new
-//! network namespace, `ip link set lo up` before dropping capabilities).
+//! The third launches a host provisioned only by the shipped owner setup
+//! entry (`oulipoly-native-opencode-setup`): its launch directory holds the
+//! actual agent-bash `bash` tool behind the native permission gate
+//! `native/opencode/bash-policy-tool.ts` and the root's deny-default
+//! policy, and its turns are driven by a scripted loopback stand-in for a
+//! model (no model, provider or credential). It also needs
+//! `OULIPOLY_AGENT_BASH_TOOL`, the matching agent-bash
+//! `integrations/opencode/tools/bash.ts`, and `AGENT_BASH_BIN`, that
+//! source's `agent-bash` binary. Its loopback must be up (in a new network
+//! namespace, `ip link set lo up` before dropping capabilities).
 //!
 //! The only timer is a test watchdog; on expiry the test cancels its
 //! supervisor and fails.
@@ -41,6 +44,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 const SUPERVISOR: &str = env!("CARGO_BIN_EXE_oulipoly-root-supervisor");
+const SETUP: &str = env!("CARGO_BIN_EXE_oulipoly-native-opencode-setup");
 const WATCHDOG: Duration = Duration::from_secs(150);
 
 /// A real configured model for the second test.
@@ -65,11 +69,11 @@ enum Host<'a> {
     InsertionOnly,
     /// Real configured model turns.
     Model(&'a Model),
-    /// Turns answered by a [`ScriptedModel`], with the agent-bash tool
-    /// behind the native permission gate and this permission config.
+    /// Provisioned by the owner setup entry with this root's allowed
+    /// commands; turns answered by a [`ScriptedModel`].
     ScriptedBash {
         base_url: &'a str,
-        permission: Value,
+        bash_allow: &'a [&'a str],
     },
 }
 
@@ -78,6 +82,10 @@ struct Fixture {
     opencode: PathBuf,
     project: PathBuf,
     env: Vec<(String, String)>,
+    /// The harness argv; `None`: the OpenCode binary itself.
+    argv: Option<Vec<String>>,
+    /// The environment `opencode export` reads the host's store with.
+    export_env: Vec<(String, String)>,
 }
 
 impl Fixture {
@@ -110,7 +118,12 @@ impl Fixture {
                 .create(path)
                 .unwrap();
         };
-        mkdir(&dir);
+        // A fresh directory: a PID namespace repeats pids across runs.
+        mkdir(&base);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .unwrap_or_else(|error| panic!("fixture {dir:?}: {error} (use a fresh scratch)"));
         let project = dir.join("project");
         for sub in [
             "home",
@@ -175,53 +188,80 @@ impl Fixture {
             }
             Host::ScriptedBash {
                 base_url,
-                permission,
+                bash_allow,
             } => {
-                // The global config directory holds the tools: the gate as
-                // `tool/bash.ts`, the unmodified agent-bash tool beside it,
-                // and the locked dependencies, so OpenCode's own dependency
-                // install there finds nothing to do and fetches nothing.
-                let tool = PathBuf::from(
-                    std::env::var("OULIPOLY_AGENT_BASH_TOOL")
+                // Only the shipped owner setup entry provisions this host.
+                let setup = json!({
+                    "dir": dir.join("launch"),
+                    "deps": deps,
+                    "agent_bash_tool": std::env::var("OULIPOLY_AGENT_BASH_TOOL")
                         .expect("OULIPOLY_AGENT_BASH_TOOL must be set"),
-                );
-                let bin = std::env::var("AGENT_BASH_BIN").expect("AGENT_BASH_BIN must be set");
-                let config_dir = dir.join("xdg/config/opencode");
-                mkdir(&config_dir.join("tool"));
-                mkdir(&config_dir.join("agent-bash"));
-                std::fs::copy(
-                    Path::new(env!("CARGO_MANIFEST_DIR"))
-                        .join("native/opencode/bash-policy-tool.ts"),
-                    config_dir.join("tool/bash.ts"),
-                )
-                .unwrap();
-                std::fs::copy(&tool, config_dir.join("agent-bash/bash.ts")).unwrap();
-                for file in ["package.json", "package-lock.json"] {
-                    std::fs::copy(deps.join(file), config_dir.join(file)).unwrap();
-                }
-                std::os::unix::fs::symlink(
-                    deps.join("node_modules"),
-                    config_dir.join("node_modules"),
-                )
-                .unwrap();
-                env.push(("AGENT_BASH_BIN", bin));
-                env.push(("OPENCODE_DISABLE_DEFAULT_PLUGINS", "1".to_owned()));
-                env.push(("OPENCODE_DISABLE_MODELS_FETCH", "1".to_owned()));
-                config["model"] = json!("fixture/scripted");
-                config["enabled_providers"] = json!(["fixture"]);
-                config["agent"] = json!({ "title": { "disable": true } });
-                config["permission"] = permission;
-                config["provider"] = json!({ "fixture": {
-                    "npm": "@ai-sdk/openai-compatible",
-                    "name": "fixture",
-                    // Not a credential: the stand-in reads no header.
-                    "options": { "baseURL": base_url, "apiKey": "fixture-not-a-credential" },
-                    "models": { "scripted": { "name": "scripted", "tool_call": true } },
-                }});
+                    "agent_bash_bin": std::env::var("AGENT_BASH_BIN")
+                        .expect("AGENT_BASH_BIN must be set"),
+                    "bash_allow": bash_allow,
+                    "model": "fixture/scripted",
+                    "provider": { "fixture": {
+                        "npm": "@ai-sdk/openai-compatible",
+                        "name": "fixture",
+                        // Not a credential: the stand-in reads no header.
+                        "options": { "baseURL": base_url, "apiKey": "fixture-not-a-credential" },
+                        "models": { "scripted": { "name": "scripted", "tool_call": true } },
+                    }},
+                });
+                let mut child = Command::new(SETUP)
+                    .env_clear()
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                writeln!(child.stdin.take().unwrap(), "{setup}").unwrap();
+                let output = child.wait_with_output().unwrap();
+                let launch: Value = serde_json::from_slice(&output.stdout).unwrap();
+                println!("setup: {launch}");
+                assert!(output.status.success(), "{launch}");
+                // The host's own HOME/XDG and policy come from its argv.
+                // The owner keeps its HOME: root v1 Bash work runs in the
+                // owner's environment, not the requester's.
+                env.retain(|(key, _)| {
+                    *key == "PATH" || *key == "HOME" || key.starts_with("OULIPOLY_")
+                });
+                let argv = launch["argv"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|arg| arg.as_str().unwrap().to_owned())
+                    .collect();
+                let launch_env: Vec<(String, String)> = launch["env"]
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.as_str().unwrap().to_owned()))
+                    .collect();
+                // A caller's inline config would join the policy; the
+                // launch removes it, which this one checks.
+                let mut env: Vec<(String, String)> = env
+                    .into_iter()
+                    .map(|(key, value)| (key.to_owned(), value))
+                    .collect();
+                env.push((
+                    "OPENCODE_CONFIG_CONTENT".to_owned(),
+                    json!({ "permission": { "*": "allow", "bash": "allow" } }).to_string(),
+                ));
+                return Self {
+                    export_env: launch_env
+                        .into_iter()
+                        .chain([("PATH".to_owned(), "/usr/bin:/bin".to_owned())])
+                        .collect(),
+                    dir,
+                    opencode,
+                    project,
+                    env,
+                    argv: Some(argv),
+                };
             }
         }
         env.push(("OPENCODE_CONFIG_CONTENT", config.to_string()));
-        let env = env
+        let env: Vec<(String, String)> = env
             .into_iter()
             .map(|(key, value)| (key.to_owned(), value))
             .collect();
@@ -229,7 +269,9 @@ impl Fixture {
             dir,
             opencode,
             project,
+            export_env: env.clone(),
             env,
+            argv: None,
         }
     }
 
@@ -247,7 +289,10 @@ impl Fixture {
                     // plugins, only per HTTP request; `acp` loads its cwd's
                     // at startup. Its own stdio ACP surface is never spoken
                     // to: the owner talks only to the endpoint's socket.
-                    "argv": [self.opencode, "acp", "--hostname", "127.0.0.1", "--port", "0"],
+                    "argv": self.argv.clone().map_or_else(
+                        || json!([self.opencode, "acp", "--hostname", "127.0.0.1", "--port", "0"]),
+                        |argv| json!(argv),
+                    ),
                     "endpoint": "unix-socket",
                     "session": session,
                     "messages": [message],
@@ -263,7 +308,7 @@ impl Fixture {
             .args(["export", "--pure", session])
             .current_dir(&self.project)
             .env_clear()
-            .envs(self.env.iter().map(|(key, value)| (key, value)))
+            .envs(self.export_env.iter().map(|(key, value)| (key, value)))
             .stdin(Stdio::null())
             .output()
             .unwrap();
@@ -301,7 +346,7 @@ impl Fixture {
             .args(["export", "--pure", session])
             .current_dir(&self.project)
             .env_clear()
-            .envs(self.env.iter().map(|(key, value)| (key, value)))
+            .envs(self.export_env.iter().map(|(key, value)| (key, value)))
             .stdin(Stdio::null())
             .output()
             .unwrap();
@@ -694,36 +739,53 @@ fn native_host_runs_a_configured_model_turn_over_the_owner_socket() {
     assert!(roles.contains(&"assistant"), "{exported:?}");
 }
 
-/// The native host loads the actual agent-bash `bash` tool behind the
-/// native permission gate, and each of the three dispositions of the
-/// configured `bash` permission takes its own route. The turns are driven
-/// by a [`ScriptedModel`], not a model; the tool, the permission
-/// evaluation, the owner's Bash ingress and the command are real.
+/// A host provisioned only by the owner setup entry loads the actual
+/// agent-bash `bash` tool behind the native permission gate, and the
+/// root's deny-default policy decides each command natively. The turns are
+/// driven by a [`ScriptedModel`], not a model; the setup, the launch, the
+/// tool, the permission evaluation, the owner's Bash ingress and the
+/// command are real. The supervisor's environment carries an inline config
+/// allowing everything, which the launch must remove.
 ///
-/// * allow: the command runs once through this root's own Bash ingress and
-///   its root v1 result returns to the native conversation.
-/// * deny: native denial; no permission request, nothing reaches the
-///   ingress.
-/// * ask (the default): the request reaches the owner, which refuses it
-///   (it grants nothing); native rejection, nothing reaches the ingress.
+/// * allowed (named in the setup): the command runs once through this
+///   root's own Bash ingress and its root v1 result returns to the native
+///   conversation.
+/// * not named (the allowed command plus a suffix): native denial, no
+///   permission request to the owner, nothing reaches the ingress.
 #[test]
 #[ignore = "needs OULIPOLY_NATIVE_DEPS, OULIPOLY_AGENT_BASH_TOOL, AGENT_BASH_BIN and loopback"]
-fn native_host_runs_the_agent_bash_tool_under_its_configured_permission() {
+fn owner_setup_launches_a_native_host_whose_policy_decides_the_agent_bash_tool() {
     const ALLOWED: &str = "printf oulipoly-native-allowed";
-    const DENIED: &str = "printf oulipoly-native-denied";
-    const ASKED: &str = "printf oulipoly-native-asked";
+    const UNNAMED: &str = "printf oulipoly-native-allowed-unnamed";
     let model = ScriptedModel::start();
     let fixture = Fixture::new(Host::ScriptedBash {
         base_url: &model.base_url,
-        // Every other tool is denied, so hidden; `bash` decides per exact
-        // command, asking the owner for anything not named.
-        permission: json!({
-            "*": "deny",
-            "bash": { "*": "ask", ALLOWED: "allow", DENIED: "deny" },
-        }),
+        bash_allow: &[ALLOWED],
     });
 
-    // allow
+    // The launch the setup provisioned: its own directory, removing
+    // inherited config, with the root's policy in its config file.
+    let argv = fixture.argv.clone().unwrap();
+    assert_eq!(argv[0], "/usr/bin/env");
+    assert!(
+        argv.windows(2)
+            .any(|pair| pair[0] == "-u" && pair[1] == "OPENCODE_CONFIG_CONTENT"),
+        "{argv:?}"
+    );
+    let config_dir = fixture.dir.join("launch/xdg/config/opencode");
+    let config = std::fs::read_to_string(config_dir.join("opencode.json")).unwrap();
+    println!("launch config: {config}");
+    assert!(
+        config.ends_with(&format!(
+            r#""permission":{{"*":"deny","bash":{{"*":"deny","{ALLOWED}":"allow"}}}}}}"#
+        )),
+        "{config}"
+    );
+    for file in ["tool/bash.ts", "agent-bash/bash.ts", "acp-v2-endpoint.ts"] {
+        assert!(config_dir.join(file).is_file(), "{file}");
+    }
+
+    // allowed
     let mut run = Run::start(
         &fixture,
         &fixture.spec("root-allow", None, &format!("RUN {ALLOWED}")),
@@ -741,7 +803,7 @@ fn native_host_runs_the_agent_bash_tool_under_its_configured_permission() {
         "{accepted}"
     );
     let ended = run.event("bash-ended");
-    println!("allow: {accepted}\n{ended}");
+    println!("allowed: {accepted}\n{ended}");
     let idle = run.event("idle");
     assert_eq!(idle["stop_reason"], "end_turn", "{idle}");
     assert_eq!(run.event("agent-message")["text"], "DONE");
@@ -753,22 +815,23 @@ fn native_host_runs_the_agent_bash_tool_under_its_configured_permission() {
         run.seen
     );
     let (terminal, code) = run.cancel();
+    println!("allowed terminal: {terminal}");
     assert_cancelled_and_reaped(&terminal, code);
     assert_eq!(terminal["bash"]["accepted"], 1, "{terminal}");
 
-    // deny
+    // not named
     let mut run = Run::start(
         &fixture,
-        &fixture.spec("root-deny", None, &format!("RUN {DENIED}")),
+        &fixture.spec("root-unnamed", None, &format!("RUN {UNNAMED}")),
     );
     run.event("endpoint-connected");
-    let denied_session = run.event("session-opened")["session"]
+    let unnamed_session = run.event("session-opened")["session"]
         .as_str()
         .unwrap()
         .to_owned();
     assert_eq!(run.event("ack")["label"], "accepted");
     let idle = run.event("idle");
-    println!("deny: {idle}");
+    println!("unnamed: {idle}");
     assert_eq!(idle["stop_reason"], "end_turn", "{idle}");
     assert_eq!(run.event("agent-message")["text"], "DONE");
     assert!(
@@ -779,38 +842,13 @@ fn native_host_runs_the_agent_bash_tool_under_its_configured_permission() {
         run.seen
     );
     let (terminal, code) = run.cancel();
-    assert_cancelled_and_reaped(&terminal, code);
-    assert_eq!(terminal["bash"]["accepted"], 0, "{terminal}");
-
-    // ask -> the owner refuses
-    let mut run = Run::start(
-        &fixture,
-        &fixture.spec("root-ask", None, &format!("RUN {ASKED}")),
-    );
-    run.event("endpoint-connected");
-    let asked_session = run.event("session-opened")["session"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    assert_eq!(run.event("ack")["label"], "accepted");
-    let refused = run.event("request-refused");
-    assert_eq!(refused["method"], "session/request_permission", "{refused}");
-    let notice = run.event("notice");
-    assert_eq!(
-        notice["title"],
-        format!("permission rejected: bash {ASKED}"),
-        "{notice}"
-    );
-    let idle = run.event("idle");
-    println!("ask: {refused}\n{notice}\n{idle}");
-    let (terminal, code) = run.cancel();
+    println!("unnamed terminal: {terminal}");
     assert_cancelled_and_reaped(&terminal, code);
     assert_eq!(terminal["bash"]["accepted"], 0, "{terminal}");
 
     // What the native host offered the stand-in: only the agent-bash tool,
-    // once, in place of the built-in, with its own arguments.
+    // in place of the built-in, with its own arguments.
     let requests = model.requests();
-    println!("stand-in requests: {}", requests.len());
     for request in &requests {
         let tools: Vec<&str> = request["body"]["tools"]
             .as_array()
@@ -823,7 +861,7 @@ fn native_host_runs_the_agent_bash_tool_under_its_configured_permission() {
             .unwrap_or_default();
         println!("request {} tools {tools:?}", request["path"]);
     }
-    assert_eq!(requests.len(), 5, "{requests:#?}");
+    assert_eq!(requests.len(), 4, "{requests:#?}");
     for request in &requests {
         let tools = request["body"]["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1, "{request}");
@@ -844,11 +882,11 @@ fn native_host_runs_the_agent_bash_tool_under_its_configured_permission() {
         );
     }
 
-    // The native store's own record of each tool call.
+    // The native store's own record of each tool call, read from the
+    // launch's own data directory.
     let allowed = fixture.tool_parts(&allowed_session);
-    let denied = fixture.tool_parts(&denied_session);
-    let asked = fixture.tool_parts(&asked_session);
-    println!("allowed: {allowed:?}\ndenied: {denied:?}\nasked: {asked:?}");
+    let unnamed = fixture.tool_parts(&unnamed_session);
+    println!("allowed: {allowed:?}\nunnamed: {unnamed:?}");
     assert_eq!(allowed.len(), 1, "{allowed:?}");
     assert_eq!(allowed[0].0, "bash");
     assert_eq!(allowed[0].1, "completed", "{allowed:?}");
@@ -857,11 +895,11 @@ fn native_host_runs_the_agent_bash_tool_under_its_configured_permission() {
         allowed[0]
             .3
             .starts_with("Root v1 work ended: exited with code 0")
+            && allowed[0].3.contains("output-closed(bytes=23)")
             && allowed[0].3.ends_with("oulipoly-native-allowed"),
         "{allowed:?}"
     );
-    assert_eq!(denied.len(), 1, "{denied:?}");
-    assert_eq!(denied[0].1, "error", "{denied:?}");
-    assert_eq!(asked.len(), 1, "{asked:?}");
-    assert_eq!(asked[0].1, "error", "{asked:?}");
+    assert_eq!(unnamed.len(), 1, "{unnamed:?}");
+    assert_eq!(unnamed[0].1, "error", "{unnamed:?}");
+    assert_eq!(unnamed[0].2["command"], UNNAMED);
 }
