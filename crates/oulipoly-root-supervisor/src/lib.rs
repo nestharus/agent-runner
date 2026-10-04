@@ -78,9 +78,41 @@
 //! learned from the root rather than from a store refusal (see Ending). Two
 //! roots share nothing.
 //!
-//! **Bash.** This lineage has no Bash entry and no brokerless path:
-//! nothing here routes a Bash request to the old Broker or accepts one.
-//! A positive Bash path is not implemented.
+//! **Bash.** Bash work started inside one of this owner's harness
+//! namespaces reaches this owner, and only this owner, through the root's
+//! Bash ingress (the [`bash`] module): `<store>/bash.sock`, named to every
+//! harness and its descendants in [`bash::BASH_ENV`]. A peer is accepted
+//! only by positive attribution (same uid, and a member of the exact PID
+//! namespace of one live harness work of this owner); anything else is
+//! refused and reported (`bash-refused`), never routed to the old Broker,
+//! another root or a fallback. One request per connection, one JSON line:
+//! `{"v":1,"op":"run","argv":[...],"cwd":"/abs"}`. Replies, one JSON line
+//! each: `refused` (nothing recorded or run), or `accepted` (durably
+//! recorded, with the requesting harness, session and the owner inputs open
+//! on it; not a start), `started`, `output` (`b64`), `output-closed` (end of
+//! stream, not an end) or `output-failed`, then exactly one of `end` (status
+//! from its work PID 1's wait, with separate output state), `end-unknown`,
+//! `launch-failed` (positive no-start reply), `launch-unknown` (possible
+//! effects, no automatic retry), or `left-to-successor`.
+//! Each accepted run is its own work under root PID 1, so it is killed on
+//! cancel, survives owner death like any work, and the run does not end
+//! until its end (or why it is unknown) is reported. Delivery is in-band to
+//! the requester only: no completion is supplied to any harness as a new
+//! input. Nested requests (from inside a Bash run's own namespace) are
+//! refused: they are not inside a harness namespace.
+//!
+//! **Per-input attribution.** Inputs are still submitted as soon as the
+//! previous one is acknowledged, so several can be open on one native
+//! session. Agent output names the input it answers only through the
+//! agent's own `oulipoly.ai/parentMessageId` tag (`input_attribution`),
+//! and `turn-end` is reported for an input only from an idle the agent
+//! tagged with `oulipoly.ai/lastUserMessageId` at or after that input
+//! (native ids ascend), with `own_output` saying whether any output named
+//! it. This is idle-tag coverage, not proof of native processing; the
+//! changed native parent/multipart paths remain unwitnessed. An untagged
+//! idle is still only readiness. A Bash run's `accepted`
+//! says which inputs were open (`single-open-input`, `ambiguous-open-inputs`
+//! or `no-open-input`); nothing finer is known.
 //!
 //! # Interface
 //!
@@ -315,6 +347,20 @@
 //! * Store growth and retention are unbounded; nothing is pruned.
 //! * Exit observation waits for protocol-read progress; a descendant holding
 //!   stdout can delay it. A caller that does not drain output can delay cancel.
+//! * Bash ingress: nothing in the Bash tool speaks it yet (the
+//!   `oulipoly-root-bash` binary is a prototype requester); no completion
+//!   is delivered to a harness as a new input; one thread per connection
+//!   and no deadline on reading a request; the peer is identified by its
+//!   `SO_PEERCRED` pid, so a requester that exits and whose pid is reused
+//!   before attribution is attributed by the reuser's namespace (still only
+//!   a harness namespace of this owner); a process that leaves its work's
+//!   PID namespace (e.g. a nested `unshare`) is refused, not followed.
+//!   Attribution assumes `/proc` shows the owner's own PID namespace. Output
+//!   is relayed unbounded and not retained. A requester that stays
+//!   connected but stops reading stalls the relay and then, once the pipe
+//!   fills, its own run; nothing times it out.
+//! * Turn-end attribution relies on the agent's tags and on its message ids
+//!   ascending; an agent that tags wrongly is believed.
 //! * Socket endpoints: the owner retries connecting every 50 ms without a
 //!   deadline until the socket listens or the harness ends. Nothing
 //!   authenticates the listener beyond the store directory's mode; a closed
@@ -322,6 +368,7 @@
 //!   or the caller cancels. While no owner is attached, nothing drains a
 //!   survivor's stdout.
 
+pub mod bash;
 mod custody;
 mod harness;
 mod live;
@@ -500,6 +547,8 @@ pub(crate) enum Event {
     Report(Value),
     Done(HarnessRecord),
     Control(String),
+    /// A Bash run's end (or why it is unknown) was reported.
+    BashDone,
 }
 
 /// Runs one supervisor to its terminal report and returns the exit code.
@@ -579,10 +628,11 @@ where
         }
     };
     let mut store = claimed.store;
-    let recovery = recover_custody(
+    let mut recovery = recover_custody(
         Path::new(&request.store),
         claimed.live_incarnation.as_ref(),
         &claimed.harnesses,
+        &claimed.open_bash,
         &mut store,
         &stop,
     );
@@ -603,6 +653,35 @@ where
     let custody = Arc::new(Mutex::new(live::Custody::new(Arc::clone(&stop))));
     let store = Arc::new(Mutex::new(store));
     let (tx, rx) = mpsc::channel();
+    let views: bash::Views = Arc::new(Mutex::new(
+        claimed
+            .harnesses
+            .iter()
+            .map(|_| bash::View::default())
+            .collect(),
+    ));
+    let ingress = bash::Ingress::new(
+        PathBuf::from(&request.store),
+        claimed.root_id.clone(),
+        Arc::clone(&slot),
+        Arc::clone(&custody),
+        Arc::clone(&store),
+        Arc::clone(&views),
+        tx.clone(),
+    );
+    match ingress.listen() {
+        Ok(path) => emit(
+            &mut out,
+            &json!({ "event": "bash-ingress", "listening": true, "path": path, "protocol": bash::PROTOCOL }),
+        ),
+        Err(reason) => emit(
+            &mut out,
+            &json!({ "event": "bash-ingress", "listening": false, "reason": reason }),
+        ),
+    }
+    for prior in recovery.bash.drain(..) {
+        ingress.recover(prior);
+    }
 
     let control_tx = tx.clone();
     thread::spawn(move || {
@@ -640,6 +719,7 @@ where
             slot: Arc::clone(&slot),
             prior: priors.remove(&position),
             tx: tx.clone(),
+            views: Arc::clone(&views),
         };
         thread::spawn(move || harness::run(assignment));
     }
@@ -647,11 +727,14 @@ where
 
     let mut records = Vec::new();
     let mut cancel_requested = false;
-    while records.len() < expected.len() {
+    // The run ends once every harness's end and every admitted Bash run's
+    // end (or why it is unknown) is reported; then the ingress is closed.
+    while records.len() < expected.len() || !ingress.close_if_idle() {
         let Ok(event) = rx.recv() else { break };
         match event {
             Event::Report(value) => emit(&mut out, &value),
             Event::Done(record) => records.push(record),
+            Event::BashDone => {}
             Event::Control(line) => {
                 let command = serde_json::from_str::<Value>(line.trim()).ok();
                 if command
@@ -693,6 +776,12 @@ where
         report["status"] = json!("incomplete");
         code = EXIT_INCOMPLETE;
     }
+    if ingress.ends_unproven() && matches!(code, EXIT_ENDED | EXIT_ENDED_OWED) {
+        // A Bash run may have run and its end is not known.
+        report["status"] = json!("incomplete");
+        code = EXIT_INCOMPLETE;
+    }
+    report["bash"] = ingress.summary();
     report["root_pid1"] = root_pid1;
     emit(&mut out, &report);
     code
@@ -702,6 +791,7 @@ where
 struct Recovery {
     root: Option<Arc<custody::Root>>,
     priors: HashMap<usize, harness::Prior>,
+    bash: Vec<bash::Prior>,
     unattached: Option<String>,
     outcome: &'static str,
     incarnation: Option<i64>,
@@ -733,12 +823,14 @@ fn recover_custody(
     store_dir: &Path,
     recorded: Option<&store::IncarnationRow>,
     harnesses: &[store::DurableHarness],
+    open_bash: &[store::OpenBash],
     store: &mut store::Store,
     stop: &Arc<transport::StopSignal>,
 ) -> Recovery {
     let mut recovery = Recovery {
         root: None,
         priors: HashMap::new(),
+        bash: Vec::new(),
         unattached: None,
         outcome: "fresh",
         incarnation: None,
@@ -802,6 +894,40 @@ fn recover_custody(
             };
             recovery.priors.insert(position, prior);
         }
+    }
+    for run in open_bash
+        .iter()
+        .filter(|run| run.incarnation == recorded.id)
+    {
+        let name = custody::work_name(run.work);
+        let prior = if let Some(index) = live.iter().position(|adopted| adopted.work == run.work) {
+            bash::Prior::Live {
+                harness: run.harness,
+                adopted: live.swap_remove(index),
+            }
+        } else if let Some(receipt) = receipts
+            .iter()
+            .find(|receipt| receipt["work"] == name.as_str())
+        {
+            bash::Prior::Exited {
+                harness: run.harness,
+                work: run.work,
+                receipt: receipt.clone(),
+            }
+        } else if absent {
+            bash::Prior::Unknown {
+                harness: run.harness,
+                work: run.work,
+            }
+        } else {
+            // A missing first launch report can follow creation. Absence
+            // from attach is not a positive no-start reply for this intent.
+            bash::Prior::Unknown {
+                harness: run.harness,
+                work: run.work,
+            }
+        };
+        recovery.bash.push(prior);
     }
     recovery
 }

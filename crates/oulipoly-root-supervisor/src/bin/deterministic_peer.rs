@@ -35,6 +35,14 @@
 //! stays alive until killed or `--exit-after-acks`. `close-stdin` is
 //! stdio-only.
 //!
+//! Message ids are `msg-NNNN`, ascending. Every idle after an
+//! acknowledgement carries `_meta` [`TURN_INPUT_META`] naming that message.
+//! A prompt whose text starts with `bash:` runs the rest with `/bin/sh -c`
+//! through `oulipoly-root-bash` (next to this binary), i.e. through the
+//! root's Bash ingress, after acknowledging it; its exit code and output
+//! come back as one `agent_message` tagged with [`PARENT_MESSAGE_META`],
+//! then the idle. `--untagged` sends neither tag.
+//!
 //! The peer sets no parent-death signal: whether it outlives its owner is
 //! decided by its custody, not by the peer.
 
@@ -42,7 +50,9 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 
-use oulipoly_acp::{DEDUP_CONTRACT_META, DUPLICATE_META, MESSAGE_KEY_META};
+use oulipoly_acp::{
+    DEDUP_CONTRACT_META, DUPLICATE_META, MESSAGE_KEY_META, PARENT_MESSAGE_META, TURN_INPUT_META,
+};
 use serde_json::{Value, json};
 
 struct Args {
@@ -53,6 +63,7 @@ struct Args {
     exit_after_acks: Option<u64>,
     on_reinit: Option<String>,
     exit_when_file: Option<PathBuf>,
+    tagged: bool,
 }
 
 fn parse_args() -> Args {
@@ -64,6 +75,7 @@ fn parse_args() -> Args {
         exit_after_acks: None,
         on_reinit: None,
         exit_when_file: None,
+        tagged: true,
     };
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
@@ -72,6 +84,7 @@ fn parse_args() -> Args {
             "--mode" => args.mode = iter.next().expect("--mode value"),
             "--launch-modes" => args.launch_modes = iter.next().expect("--launch-modes value"),
             "--no-dedup" => args.dedup = false,
+            "--untagged" => args.tagged = false,
             "--on-reinit" => args.on_reinit = Some(iter.next().expect("--on-reinit value")),
             "--exit-when-file" => {
                 args.exit_when_file = Some(iter.next().expect("--exit-when-file path").into());
@@ -268,7 +281,7 @@ impl Peer {
                     let duplicate = earlier.is_some();
                     let message_id = earlier.unwrap_or_else(|| {
                         let insertions = state["insertions"].as_array_mut().expect("insertions");
-                        let message_id = format!("msg-{}", insertions.len() + 1);
+                        let message_id = format!("msg-{:04}", insertions.len() + 1);
                         insertions.push(json!({
                             "session": session_id,
                             "key": key,
@@ -294,15 +307,42 @@ impl Peer {
                         out,
                         &json!({ "jsonrpc": "2.0", "id": id, "result": result }),
                     );
+                    let text = params["prompt"][0]["text"].as_str().unwrap_or_default();
+                    if let Some(command) = text.strip_prefix("bash:") {
+                        let result = run_bash(command);
+                        // Kept too, in case no owner is attached to read it.
+                        state["bash"]
+                            .as_array_mut()
+                            .map(|runs| runs.push(json!(result)))
+                            .unwrap_or_else(|| state["bash"] = json!([result]));
+                        save(&args.state, state);
+                        let mut update = json!({
+                            "sessionUpdate": "agent_message",
+                            "messageId": format!("reply-{}", message_id.as_str().unwrap_or_default()),
+                            "content": [{ "type": "text", "text": result }],
+                        });
+                        if args.tagged {
+                            update["_meta"] = json!({ PARENT_MESSAGE_META: message_id });
+                        }
+                        send(
+                            out,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "method": "session/update",
+                                "params": { "sessionId": session_id, "update": update },
+                            }),
+                        );
+                    }
+                    let mut idle = json!({ "sessionUpdate": "state_update", "state": "idle", "stopReason": "end_turn" });
+                    if args.tagged {
+                        idle["_meta"] = json!({ TURN_INPUT_META: message_id });
+                    }
                     send(
                         out,
                         &json!({
                             "jsonrpc": "2.0",
                             "method": "session/update",
-                            "params": {
-                                "sessionId": session_id,
-                                "update": { "sessionUpdate": "state_update", "state": "idle", "stopReason": "end_turn" },
-                            },
+                            "params": { "sessionId": session_id, "update": idle },
                         }),
                     );
                     *acks += 1;
@@ -316,5 +356,25 @@ impl Peer {
                 ),
             }
         }
+    }
+}
+
+/// Runs `command` through the root's Bash ingress via the prototype
+/// requester and describes what came back: its exit and its output.
+fn run_bash(command: &str) -> String {
+    let client = std::env::current_exe()
+        .expect("own path")
+        .with_file_name("oulipoly-root-bash");
+    match std::process::Command::new(client)
+        .args(["--", "/bin/sh", "-c", command])
+        .output()
+    {
+        Ok(output) => format!(
+            "exit={:?}\nstdout={}\nstderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        ),
+        Err(error) => format!("requester-not-run: {error}"),
     }
 }

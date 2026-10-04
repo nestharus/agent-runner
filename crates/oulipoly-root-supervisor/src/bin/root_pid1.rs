@@ -37,6 +37,9 @@ struct Work {
     receipt: Option<OwnedFd>,
     pending: Vec<u8>,
     harness_host_pid: Option<i32>,
+    /// `[st_dev, st_ino]` of the work's own PID namespace, as its per-work
+    /// PID 1 (that namespace's init) read it before starting the harness.
+    pidns: Value,
     harness: Option<String>,
 }
 
@@ -356,7 +359,7 @@ impl Pid1 {
         let works: Vec<Value> = self
             .works
             .iter()
-            .map(|work| json!({ "work": work.id, "harness_host_pid": work.harness_host_pid, "harness": work.harness }))
+            .map(|work| json!({ "work": work.id, "harness_host_pid": work.harness_host_pid, "pidns": work.pidns, "harness": work.harness }))
             .collect();
         let _ = reply(
             &owner.socket,
@@ -396,23 +399,29 @@ impl Pid1 {
                 })
                 .unwrap_or_default(),
             cwd: message["cwd"].as_str().map(str::to_owned),
+            merge_stderr: message["stderr"] == "stdout",
+            null_stdin: message["stdin"] == "null",
         };
-        let refuse = |pid1: &Self, reason: String| {
+        let refuse = |pid1: &Self, reason: String, not_started: bool| {
             let _ = reply(
                 &pid1.owners[index].socket,
-                &json!({ "req": req, "event": "refused", "reason": reason }),
+                &json!({ "req": req, "event": "refused", "reason": reason, "not_started": not_started }),
                 &[],
             );
         };
+        if self.works.iter().any(|work| work.id == id) {
+            // The previous work can already have effects, despite no new spawn.
+            refuse(self, "work-already-exists".to_owned(), false);
+            return;
+        }
         if id.is_empty()
             || launch.argv.is_empty()
             || launch
                 .env
                 .iter()
                 .any(|(key, _)| key.is_empty() || key.contains('='))
-            || self.works.iter().any(|work| work.id == id)
         {
-            refuse(self, "bad-spawn".to_owned());
+            refuse(self, "bad-spawn".to_owned(), true);
             return;
         }
         let started = start_work(&launch);
@@ -423,6 +432,9 @@ impl Pid1 {
                     "spawn-failed: {}",
                     started.err().map(|e| e.to_string()).unwrap_or_default()
                 ),
+                // start_work can fail reading the first report after clone.
+                // Absence of a reply is not evidence of absence of effects.
+                false,
             );
             return;
         };
@@ -430,6 +442,7 @@ impl Pid1 {
         work.harness_host_pid = first["harness_host_pid"]
             .as_i64()
             .and_then(|pid| i32::try_from(pid).ok());
+        work.pidns = first["pidns"].clone();
         let _ = reply(
             &self.owners[index].socket,
             &json!({
@@ -437,6 +450,7 @@ impl Pid1 {
                 "event": "spawned",
                 "work": id,
                 "harness_host_pid": work.harness_host_pid,
+                "pidns": work.pidns,
                 "exec_error": first["exec_error"],
             }),
             &[work.stdin.as_raw_fd(), work.stdout.as_raw_fd()],
@@ -537,12 +551,16 @@ fn parse_lines(work: &mut Work) {
 }
 
 /// How to start one harness: its program and arguments, environment
-/// entries added to (or replacing) root PID 1's own, and its working
-/// directory.
+/// entries added to (or replacing) root PID 1's own, its working
+/// directory, whether its stderr joins its stdout (otherwise it is root
+/// PID 1's own stderr), and whether its stdin is `/dev/null` (otherwise the
+/// pipe whose write end root PID 1 holds for the owner).
 struct Launch {
     argv: Vec<String>,
     env: Vec<(String, String)>,
     cwd: Option<String>,
+    merge_stderr: bool,
+    null_stdin: bool,
 }
 
 /// Starts one per-work PID 1 in a new PID namespace and returns its record
@@ -595,6 +613,7 @@ fn start_work(launch: &Launch) -> io::Result<(Work, Value)> {
             receipt: Some(OwnedFd::from(reader)),
             pending: Vec::new(),
             harness_host_pid: None,
+            pidns: Value::Null,
             harness: None,
         },
         first,
@@ -670,6 +689,16 @@ fn work_pid1(
         .cwd
         .as_ref()
         .and_then(|cwd| std::ffi::CString::new(cwd.as_bytes()).ok());
+    let merge_stderr = launch.merge_stderr;
+    let null_stdin = launch.null_stdin;
+    // This process is init of the work's new PID namespace, so its own
+    // namespace is the work's: every process of the work is in it or below.
+    let pidns = std::fs::metadata("/proc/self/ns/pid")
+        .map(|ns| {
+            use std::os::unix::fs::MetadataExt;
+            json!([ns.dev(), ns.ino()])
+        })
+        .unwrap_or(Value::Null);
     let (error_r, error_w) = sys::pipe().unwrap_or_else(|error| die("work pipe", &error));
     // SAFETY: fork of this single-threaded process.
     let harness = unsafe { libc::fork() };
@@ -680,8 +709,16 @@ fn work_pid1(
             libc::sigemptyset(&raw mut empty);
             libc::sigprocmask(libc::SIG_SETMASK, &raw const empty, std::ptr::null_mut());
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-            libc::dup2(stdin.as_raw_fd(), 0);
+            if null_stdin {
+                let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
+                libc::dup2(null, 0);
+            } else {
+                libc::dup2(stdin.as_raw_fd(), 0);
+            }
             libc::dup2(stdout.as_raw_fd(), 1);
+            if merge_stderr {
+                libc::dup2(stdout.as_raw_fd(), 2);
+            }
             libc::syscall(
                 libc::SYS_close_range,
                 3u32,
@@ -714,7 +751,7 @@ fn work_pid1(
     let host_pid = pidfd.as_ref().and_then(|fd| sys::pidfd_host_pid(fd).ok());
     write_line(
         &receipt,
-        &json!({ "harness_host_pid": host_pid, "exec_error": exec_error }),
+        &json!({ "harness_host_pid": host_pid, "pidns": pidns, "exec_error": exec_error }),
     );
     if harness <= 0 {
         write_line(&receipt, &json!({ "drained": true, "others_reaped": 0 }));

@@ -90,7 +90,7 @@ pub(crate) fn drain(file: File, stop: std::sync::Arc<StopSignal>) {
 
 /// Blocks until `file` is readable (`Ok(true)`) or the run detached
 /// (`Ok(false)`).
-fn readable(stop: &StopSignal, file: &File) -> io::Result<bool> {
+pub(crate) fn readable(stop: &StopSignal, file: &File) -> io::Result<bool> {
     let mut polls = [
         libc::pollfd {
             fd: stop.read.as_raw_fd(),

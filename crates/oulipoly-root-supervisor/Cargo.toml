@@ -19,6 +19,12 @@ name = "oulipoly-root-pid1"
 path = "src/bin/root_pid1.rs"
 test = false
 
+# Prototype requester for a root's Bash ingress (see `bash` module docs):
+# what a Bash entry inside a harness of this lineage does. Not the Bash tool.
+[[bin]]
+name = "oulipoly-root-bash"
+path = "src/bin/root_bash.rs"
+
 # Deterministic ACP v2 peer used only as an owned harness in this crate's
 # process-level tests. It is not a real harness.
 [[bin]]

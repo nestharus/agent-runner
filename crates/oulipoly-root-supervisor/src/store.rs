@@ -21,6 +21,11 @@
 //!   boot id), and how it was later found ended. `work` records each harness
 //!   launch under an incarnation, written before the launch is requested,
 //!   and the actual waiter's report of its end.
+//! * A `work` of kind `bash` is a Bash run accepted through this root's
+//!   Bash ingress; `bash_run` keeps who asked for it (the requesting
+//!   harness, as positively attributed, and the owner inputs open on that
+//!   harness then) and what it runs. It is committed before the requester
+//!   is told `accepted` and before the launch is requested.
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -38,7 +43,7 @@ pub(crate) const LOCK_FILE: &str = "owner.lock";
 pub(crate) const DB_FILE: &str = "intent.sqlite3";
 /// Version of this new per-root lineage. There is no migration chain: a
 /// store of any other version is refused.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 /// How long a write waits for a foreign SQLite lock before failing.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -109,7 +114,15 @@ CREATE TABLE work (
     harness_host_pid INTEGER,
     outcome TEXT,
     observer TEXT,
-    resolved_generation INTEGER
+    resolved_generation INTEGER,
+    kind TEXT NOT NULL DEFAULT 'harness' CHECK (kind IN ('harness', 'bash'))
+);
+CREATE TABLE bash_run (
+    work INTEGER PRIMARY KEY REFERENCES work(id),
+    requester_pid INTEGER NOT NULL,
+    inputs_open TEXT NOT NULL,
+    argv TEXT NOT NULL,
+    cwd TEXT NOT NULL
 );
 CREATE TABLE attempt (
     id INTEGER PRIMARY KEY,
@@ -216,6 +229,15 @@ pub(crate) struct DurableHarness {
     pub(crate) open_works: Vec<(i64, i64)>,
 }
 
+/// A Bash run with no recorded end.
+#[derive(Debug, Clone)]
+pub(crate) struct OpenBash {
+    pub(crate) work: i64,
+    pub(crate) incarnation: i64,
+    /// Position of the harness that asked for it.
+    pub(crate) harness: usize,
+}
+
 /// A root PID 1 incarnation not yet recorded as ended.
 #[derive(Debug, Clone)]
 pub(crate) struct IncarnationRow {
@@ -238,6 +260,7 @@ pub(crate) struct Claimed {
     pub(crate) root_id: String,
     /// The latest root PID 1 incarnation not recorded as ended, if any.
     pub(crate) live_incarnation: Option<IncarnationRow>,
+    pub(crate) open_bash: Vec<OpenBash>,
 }
 
 /// The current owner's handle on its root's store.
@@ -365,6 +388,19 @@ impl Store {
                 },
             )
             .optional()?;
+        let open_bash = tx
+            .prepare(
+                "SELECT id, incarnation, harness FROM work
+                 WHERE kind = 'bash' AND outcome IS NULL ORDER BY id",
+            )?
+            .query_map([], |row| {
+                Ok(OpenBash {
+                    work: row.get(0)?,
+                    incarnation: row.get(1)?,
+                    harness: usize::try_from(row.get::<_, i64>(2)?).unwrap_or(usize::MAX),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         tx.commit()?;
         // Make the directory entries of the store files durable too.
         File::open(dir)?.sync_all()?;
@@ -388,6 +424,7 @@ impl Store {
             classified_unknown: u32::try_from(classified_unknown).unwrap_or(u32::MAX),
             root_id,
             live_incarnation,
+            open_bash,
         })
     }
 
@@ -545,6 +582,35 @@ impl Store {
                 params![int(harness), incarnation, generation],
             )?;
             Ok(tx.last_insert_rowid())
+        })
+    }
+
+    /// Records an accepted Bash run and its launch under `incarnation`
+    /// before the launch is requested, in one transaction.
+    pub(crate) fn begin_bash(
+        &mut self,
+        harness: usize,
+        incarnation: i64,
+        requester_pid: i32,
+        inputs_open: &str,
+        argv: &[String],
+        cwd: &str,
+    ) -> Result<i64, StoreError> {
+        let generation = self.generation;
+        let argv = serde_json::to_string(argv).expect("argv serializes");
+        self.write(|tx| {
+            tx.execute(
+                "INSERT INTO work (harness, incarnation, generation, kind)
+                 VALUES (?1, ?2, ?3, 'bash')",
+                params![int(harness), incarnation, generation],
+            )?;
+            let work = tx.last_insert_rowid();
+            tx.execute(
+                "INSERT INTO bash_run (work, requester_pid, inputs_open, argv, cwd)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![work, requester_pid, inputs_open, argv, cwd],
+            )?;
+            Ok(work)
         })
     }
 
@@ -742,7 +808,8 @@ fn load_intent(tx: &Transaction<'_>, generation: i64) -> Result<Vec<DurableHarne
          FROM message m WHERE m.harness = ?1 ORDER BY m.idx",
     )?;
     let mut work_rows = tx.prepare(
-        "SELECT id, incarnation FROM work WHERE harness = ?1 AND outcome IS NULL ORDER BY id",
+        "SELECT id, incarnation FROM work
+         WHERE harness = ?1 AND kind = 'harness' AND outcome IS NULL ORDER BY id",
     )?;
     let mut harnesses = Vec::new();
     for (position, id, argv, endpoint, session) in rows {
@@ -808,6 +875,7 @@ mod tests {
                 std::process::id(),
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ));
+            eprintln!("owned-fixture: {}", dir.display());
             Self(dir)
         }
     }

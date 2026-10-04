@@ -87,7 +87,10 @@ fn stamp(pid: i32, start_time: i64) {
             .append(true)
             .open(path)
             .unwrap();
-        writeln!(file, "{pid} {start_time}").unwrap();
+        // One append buffer: concurrent fixture stamps must not interleave
+        // the pid and start time from different owned roots.
+        file.write_all(format!("{pid} {start_time}\n").as_bytes())
+            .unwrap();
     }
 }
 
@@ -123,6 +126,7 @@ impl Scratch {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
+        eprintln!("owned-fixture: {}", dir.display());
         Self(dir, Roots::default())
     }
 
@@ -1999,4 +2003,221 @@ fn work_pid1_end_without_harness_wait_is_unknown_not_a_closure() {
     assert_eq!(outcome, "ended-with-work-namespace-status-unknown");
     assert_eq!(observer, None);
     assert_eq!(harness(&terminal, "stays")["reattached"], 1);
+}
+
+fn owner_event<'a>(seen: &'a [Value], event: &str) -> Vec<&'a Value> {
+    seen.iter()
+        .filter(|value| value["event"] == event)
+        .collect()
+}
+
+/// U7: Bash work started inside a harness's own namespace reaches that
+/// root's owner through the ingress named in its environment, and only
+/// there. It is accepted only after a durable record, attributed to the
+/// requesting harness and the one owner input open on it, run as its own
+/// work under root PID 1 (pid 2 of a new namespace), and its output and its
+/// end, from its work PID 1's wait, come back to the requester; the
+/// harness's answer names that input as its native parent.
+#[test]
+fn in_root_bash_reaches_its_own_owner_with_attributed_output_and_waited_end() {
+    let dir = Scratch::new("bash-own");
+    let run = Run::start(
+        &dir,
+        &spec(
+            &dir,
+            3,
+            json!([{
+                "id": "a",
+                "argv": peer(&dir.state("a"), &["--exit-after-acks", "1"]),
+                "messages": ["bash:echo pid=$$; echo err >&2; exit 3"],
+            }]),
+        ),
+    );
+    let (terminal, status, seen) = run.terminal();
+    assert_eq!(terminal["status"], "ended", "{terminal}");
+    assert_eq!(status.code(), Some(0));
+    assert_eq!(
+        terminal["bash"],
+        json!({ "accepted": 1, "refused": 0, "not_run": 0, "ended": 1, "end_unknown": 0, "open": 0 })
+    );
+    let listening = owner_event(&seen, "bash-ingress")[0];
+    assert_eq!(listening["listening"], true);
+    let accepted = owner_event(&seen, "bash-accepted")[0];
+    assert_eq!(accepted["harness"], "a");
+    assert_eq!(
+        accepted["input_attribution"], "single-open-input",
+        "{accepted}"
+    );
+    assert_eq!(accepted["inputs_open"][0]["index"], 0);
+    assert_eq!(accepted["argv"][0], "/bin/sh");
+    let ended = owner_event(&seen, "bash-ended")[0];
+    assert_eq!(ended["bash"], "end", "{ended}");
+    assert_eq!(ended["status"], "code:3");
+    assert_eq!(ended["observer"], "work-pid1-wait");
+    assert_eq!(ended["requester"], "connected");
+    // What the requester got back: its own exit code and the output (stderr
+    // joined), from a process that is pid 2 of its own new namespace.
+    let answer = events(&seen, "a", "agent-message")[0];
+    let text = answer["text"].as_str().unwrap();
+    assert!(text.contains("exit=Some(3)"), "{text}");
+    assert!(text.contains("stdout=pid=2\nerr\n"), "{text}");
+    assert!(
+        text.contains("\"input_attribution\":\"single-open-input\""),
+        "{text}"
+    );
+    assert_eq!(answer["input"], 0);
+    assert_eq!(answer["input_attribution"], "native-parent");
+    let ack = events(&seen, "a", "ack")[0];
+    assert_eq!(answer["parent_message_id"], ack["message_id"]);
+    let turn = events(&seen, "a", "turn-end");
+    assert_eq!(turn.len(), 1);
+    assert_eq!(turn[0]["input"], 0);
+    assert_eq!(turn[0]["own_output"], true);
+    let conn = db(&dir);
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT count(*) FROM work w JOIN bash_run b ON b.work = w.id
+             WHERE w.kind = 'bash' AND w.outcome = 'code:3' AND w.observer = 'work-pid1-wait'"
+        ),
+        1
+    );
+}
+
+/// U7 refusal: a process outside every harness namespace of the root (this
+/// test) is refused visibly and nothing is recorded or run; there is no
+/// fallback. The refusal is reported by the owner.
+#[test]
+fn bash_from_outside_every_harness_namespace_is_refused_and_nothing_runs() {
+    let dir = Scratch::new("bash-out");
+    let mut run = Run::start(
+        &dir,
+        &spec(
+            &dir,
+            3,
+            json!([{ "id": "a", "argv": peer(&dir.state("a"), &["--mode", "silent"]), "messages": ["hi"] }]),
+        ),
+    );
+    let listening = run.until("bash ingress", |value| value["event"] == "bash-ingress");
+    run.event("a", "launched");
+    let marker = dir.0.join("ran");
+    let mut stream =
+        std::os::unix::net::UnixStream::connect(listening["path"].as_str().unwrap()).unwrap();
+    // The owner may refuse and close before reading this: not an error.
+    let _ = writeln!(
+        stream,
+        "{}",
+        json!({ "v": 1, "op": "run", "argv": ["/bin/touch", marker], "cwd": "/" })
+    );
+    let mut reply = String::new();
+    BufReader::new(&stream).read_line(&mut reply).unwrap();
+    let reply: Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(reply["event"], "refused");
+    assert_eq!(
+        reply["reason"],
+        "peer-unattributed: outside-every-harness-namespace"
+    );
+    let refused = run.until("bash refused", |value| value["event"] == "bash-refused");
+    assert_eq!(refused["peer"]["pid"], std::process::id());
+    run.cancel();
+    let (terminal, _, seen) = run.terminal();
+    assert_eq!(terminal["bash"]["refused"], 1, "{terminal}");
+    assert_eq!(terminal["bash"]["accepted"], 0);
+    assert!(owner_event(&seen, "bash-accepted").is_empty());
+    assert!(!marker.exists(), "a refused request runs nothing");
+    assert_eq!(
+        count(&db(&dir), "SELECT count(*) FROM work WHERE kind = 'bash'"),
+        0
+    );
+}
+
+/// Per-input attribution: with immediate supply, a turn end is reported for
+/// an input only from an idle the agent tagged at or after it, and says
+/// whether any output named it. An untagged idle stays readiness only.
+#[test]
+fn turn_end_is_per_input_only_from_tagged_idle() {
+    for tagged in [true, false] {
+        let dir = Scratch::new("turns");
+        let mut extra = vec!["--exit-after-acks", "2"];
+        if !tagged {
+            extra.push("--untagged");
+        }
+        let run = Run::start(
+            &dir,
+            &spec(
+                &dir,
+                3,
+                json!([{ "id": "a", "argv": peer(&dir.state("a"), &extra), "messages": ["one", "two"] }]),
+            ),
+        );
+        let (terminal, _, seen) = run.terminal();
+        assert_eq!(terminal["status"], "ended", "{terminal}");
+        let turns = events(&seen, "a", "turn-end");
+        assert!(!events(&seen, "a", "idle").is_empty());
+        if tagged {
+            let inputs: Vec<&Value> = turns.iter().map(|turn| &turn["input"]).collect();
+            assert_eq!(inputs, [&json!(0), &json!(1)]);
+            assert!(turns.iter().all(|turn| turn["own_output"] == false));
+        } else {
+            assert!(turns.is_empty(), "untagged idle is no input's end");
+        }
+    }
+}
+
+/// U7 across owner death: a Bash run is its own work under root PID 1, so
+/// the owner's death kills nothing. Its requester learns only that its end
+/// is unknown (never success). A restarted owner reattaches the run, waits
+/// for its end from its actual waiter and records it, with the requester
+/// reported lost with the earlier owner.
+#[test]
+fn bash_run_survives_owner_death_and_requester_sees_unknown_not_success() {
+    let dir = Scratch::new("bash-survive");
+    let gate = dir.0.join("gate");
+    let command = format!(
+        "bash:while [ ! -e {} ]; do sleep 0.05; done; echo done",
+        gate.display()
+    );
+    let mut first = Run::start(
+        &dir,
+        &spec(
+            &dir,
+            3,
+            json!([{ "id": "a", "argv": peer(&dir.state("a"), &["--exit-after-acks", "1"]), "messages": [command] }]),
+        ),
+    );
+    let started = first.until("bash started", |value| value["event"] == "bash-started");
+    let bash_pid = started["pid"].as_u64().unwrap();
+    let seen = first.kill();
+    assert!(owner_event(&seen, "bash-ended").is_empty());
+    // The requester saw its connection end without a final line.
+    wait_state(&dir.state("a"), |state| state["bash"].is_array());
+    let result = read_state(&dir.state("a"))["bash"][0].clone();
+    let result = result.as_str().unwrap();
+    assert!(result.contains("exit=Some(75)"), "{result}");
+    assert!(result.contains("accepted-end-unknown"), "{result}");
+    std::thread::sleep(QUIET_WINDOW);
+    assert!(alive(bash_pid), "a Bash run survives its owner");
+
+    let mut second = Run::start(&dir, &recover(&dir));
+    let reattached = second.until("bash reattached", |value| {
+        value["event"] == "bash-reattached"
+    });
+    assert_eq!(reattached["pid"].as_u64(), Some(bash_pid));
+    std::fs::write(&gate, b"").unwrap();
+    let (terminal, status, seen) = second.terminal();
+    assert_eq!(terminal["status"], "ended", "{terminal}");
+    assert_eq!(status.code(), Some(0));
+    let ended = owner_event(&seen, "bash-ended")[0];
+    assert_eq!(ended["bash"], "end", "{ended}");
+    assert_eq!(ended["status"], "code:0");
+    assert_eq!(ended["observer"], "work-pid1-wait");
+    assert_eq!(ended["requester"], "lost-with-prior-owner");
+    assert_eq!(terminal["bash"]["ended"], 1);
+    assert_eq!(
+        count(
+            &db(&dir),
+            "SELECT count(*) FROM work WHERE kind = 'bash' AND outcome = 'code:0'"
+        ),
+        1
+    );
 }
