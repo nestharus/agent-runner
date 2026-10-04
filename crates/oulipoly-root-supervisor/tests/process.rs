@@ -985,6 +985,68 @@ fn owner_killed_with_quiet_work_leaves_root_and_peers_alive_and_restart_reattach
     );
 }
 
+/// A socket-endpoint harness: the owner chooses its socket under the
+/// store, connects to it rather than to stdio, and a restarted owner takes
+/// the surviving harness back by connecting to the same socket again. The
+/// owner's death closed only its connection, not the harness's endpoint.
+#[test]
+fn socket_endpoint_survives_owner_and_restart_reconnects_to_it() {
+    let dir = Scratch::new("socket");
+    let mut first = Run::start(
+        &dir,
+        &spec(
+            &dir,
+            3,
+            json!([{
+                "id": "sock",
+                "argv": quiet_until_reattach(&dir.state("sock"), &[]),
+                "endpoint": "unix-socket",
+                "messages": ["hello"],
+            }]),
+        ),
+    );
+    let launched = first.event("sock", "launched");
+    let peer_pid = launched["pid"].as_u64().unwrap();
+    let work = launched["work"].as_i64().unwrap();
+    first.event("sock", "endpoint-connected");
+    let opened = first.event("sock", "session-opened");
+    wait_state(&dir.state("sock"), |state| {
+        state["insertions"].as_array().unwrap().len() == 1
+    });
+    let socket = dir.store().join("acp").join(format!("w{work}.sock"));
+    assert!(socket.exists(), "the owner-chosen socket path");
+
+    let seen = first.kill();
+    assert!(seen.iter().all(|value| value["event"] != "ack"));
+    std::thread::sleep(QUIET_WINDOW);
+    assert!(alive(peer_pid), "the harness survives its owner");
+
+    let mut second = Run::start(&dir, &recover(&dir));
+    let found = second.until("custody", |value| value["event"] == "custody");
+    assert_eq!(found["outcome"], "attached", "{found}");
+    assert_eq!(second.event("sock", "reattached")["pid"], peer_pid);
+    second.event("sock", "endpoint-connected");
+    let resumed = second.event("sock", "session-resumed");
+    assert_eq!(resumed["session"], opened["session"]);
+    let (terminal, status, seen) = second.terminal();
+    assert_eq!(terminal["status"], "ended", "{terminal}");
+    assert_eq!(status.code(), Some(0));
+    assert!(events(&seen, "sock", "launched").is_empty(), "no relaunch");
+    let record = harness(&terminal, "sock");
+    assert_eq!(record["exits"], json!(["code:0"]));
+    let message = &record["messages"][0];
+    assert_eq!(message["label"], "duplicate-unknown");
+    assert_eq!(message["recovered"], true);
+    let state = read_state(&dir.state("sock"));
+    assert_eq!(
+        state["launches"].as_array().unwrap().len(),
+        1,
+        "same process"
+    );
+    assert_eq!(state["insertions"].as_array().unwrap().len(), 1);
+    assert!(!socket.exists(), "removed after the harness's observed end");
+}
+
 /// (i) Observed closures persist across an owner kill, so the cap is
 /// reached across restarts and a further restart does not reset it. The
 /// second closure is the surviving harness's exit when the restarted owner

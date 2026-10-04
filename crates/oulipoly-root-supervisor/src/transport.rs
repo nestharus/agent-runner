@@ -1,7 +1,9 @@
-//! Stdio transport to one owned harness that records *why* it reported
-//! closed, so a send fault is never mistaken for an observed end of stream.
-//! The pipe ends come from root PID 1, which keeps its own copies, so this
-//! owner's death is not end of stream for the harness.
+//! Transport to one owned harness that records *why* it reported closed, so
+//! a send fault is never mistaken for an observed end of stream. Over stdio
+//! the pipe ends come from root PID 1, which keeps its own copies, so this
+//! owner's death is not end of stream for the harness. Over a Unix socket
+//! the harness listens and each owner connects anew; end of stream there is
+//! the end of that connection, never by itself the harness's end.
 
 use std::cell::Cell;
 use std::fs::File;
@@ -67,6 +69,64 @@ impl StopSignal {
     }
 }
 
+/// Discards a socket-endpoint harness's stdout on a thread, so its output
+/// never fills the pipe and blocks it. Ends at end of stream, a read error
+/// or the run's detach; it observes nothing about the harness.
+pub(crate) fn drain(file: File, stop: std::sync::Arc<StopSignal>) {
+    std::thread::spawn(move || {
+        let mut file = file;
+        let mut buf = [0u8; 8192];
+        loop {
+            if !readable(&stop, &file).unwrap_or(false) {
+                return;
+            }
+            match file.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+        }
+    });
+}
+
+/// Blocks until `file` is readable (`Ok(true)`) or the run detached
+/// (`Ok(false)`).
+fn readable(stop: &StopSignal, file: &File) -> io::Result<bool> {
+    let mut polls = [
+        libc::pollfd {
+            fd: stop.read.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: file.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    loop {
+        // SAFETY: poll over two valid pollfds.
+        if unsafe { libc::poll(polls.as_mut_ptr(), 2, -1) } >= 0 {
+            break;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+    Ok(polls[0].revents == 0)
+}
+
+/// Whether the run detached, without blocking.
+pub(crate) fn detached(stop: &StopSignal) -> bool {
+    let mut poll = libc::pollfd {
+        fd: stop.read.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: poll over one valid pollfd, without waiting.
+    unsafe { libc::poll(&raw mut poll, 1, 0) > 0 }
+}
+
 /// Reads the harness's stdout unless the run detached first.
 struct Polled {
     file: File,
@@ -76,29 +136,7 @@ struct Polled {
 
 impl Read for Polled {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let mut polls = [
-            libc::pollfd {
-                fd: self.stop.read.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: self.file.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
-        loop {
-            // SAFETY: poll over two valid pollfds.
-            if unsafe { libc::poll(polls.as_mut_ptr(), 2, -1) } >= 0 {
-                break;
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error);
-            }
-        }
-        if polls[0].revents != 0 {
+        if !readable(&self.stop, &self.file)? {
             self.observed.detached.set(true);
             return Err(io::Error::other("detached"));
         }

@@ -38,7 +38,7 @@ pub(crate) const LOCK_FILE: &str = "owner.lock";
 pub(crate) const DB_FILE: &str = "intent.sqlite3";
 /// Version of this new per-root lineage. There is no migration chain: a
 /// store of any other version is refused.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 /// How long a write waits for a foreign SQLite lock before failing.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -69,6 +69,7 @@ CREATE TABLE harness (
     position INTEGER PRIMARY KEY,
     id TEXT NOT NULL UNIQUE,
     argv TEXT NOT NULL,
+    endpoint TEXT NOT NULL,
     session TEXT
 );
 CREATE TABLE message (
@@ -82,6 +83,7 @@ CREATE TABLE message (
     ack_basis TEXT,
     ack_recovered INTEGER,
     ack_generation INTEGER,
+    ack_message_id TEXT,
     PRIMARY KEY (harness, idx)
 );
 CREATE TABLE root (
@@ -187,6 +189,8 @@ pub(crate) struct DurableAck {
     pub(crate) basis: Option<String>,
     pub(crate) recovered: bool,
     pub(crate) generation: i64,
+    /// The harness's `messageId` for the inserted user message.
+    pub(crate) message_id: Option<String>,
 }
 
 pub(crate) struct DurableMessage {
@@ -205,6 +209,7 @@ pub(crate) struct DurableMessage {
 pub(crate) struct DurableHarness {
     pub(crate) id: String,
     pub(crate) argv: Vec<String>,
+    pub(crate) endpoint: crate::Endpoint,
     pub(crate) session: Option<String>,
     pub(crate) messages: Vec<DurableMessage>,
     /// Launches with no recorded end, as `(work, incarnation)`.
@@ -463,14 +468,15 @@ impl Store {
             )?;
             tx.execute(
                 "UPDATE message SET ack_label = ?3, ack_basis = ?4, ack_recovered = ?5,
-                 ack_generation = ?6 WHERE harness = ?1 AND idx = ?2",
+                 ack_generation = ?6, ack_message_id = ?7 WHERE harness = ?1 AND idx = ?2",
                 params![
                     int(harness),
                     int(idx),
                     ack.label,
                     ack.basis,
                     ack.recovered,
-                    generation
+                    generation,
+                    ack.message_id
                 ],
             )
             .map(drop)
@@ -672,8 +678,15 @@ fn create_intent(
         let argv =
             serde_json::to_string(&spec.argv).map_err(|e| ClaimError::Store(e.to_string()))?;
         tx.execute(
-            "INSERT INTO harness (position, id, argv) VALUES (?1, ?2, ?3)",
-            params![int(position), spec.id, argv],
+            "INSERT INTO harness (position, id, argv, endpoint, session)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                int(position),
+                spec.id,
+                argv,
+                spec.endpoint.label(),
+                spec.session
+            ],
         )?;
         let mut messages = Vec::new();
         for (idx, text) in spec.messages.iter().enumerate() {
@@ -697,7 +710,8 @@ fn create_intent(
         harnesses.push(DurableHarness {
             id: spec.id.clone(),
             argv: spec.argv.clone(),
-            session: None,
+            endpoint: spec.endpoint,
+            session: spec.session.clone(),
             messages,
             open_works: Vec::new(),
         });
@@ -707,20 +721,21 @@ fn create_intent(
 
 fn load_intent(tx: &Transaction<'_>, generation: i64) -> Result<Vec<DurableHarness>, ClaimError> {
     let mut harness_rows =
-        tx.prepare("SELECT position, id, argv, session FROM harness ORDER BY position")?;
+        tx.prepare("SELECT position, id, argv, endpoint, session FROM harness ORDER BY position")?;
     let rows = harness_rows
         .query_map([], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut message_rows = tx.prepare(
         "SELECT m.key, m.text, m.closures, m.stop, m.ack_label, m.ack_basis,
-                m.ack_recovered, m.ack_generation,
+                m.ack_recovered, m.ack_generation, m.ack_message_id,
                 (SELECT count(*) FROM attempt a WHERE a.harness = m.harness AND a.idx = m.idx),
                 (SELECT count(*) FROM attempt a WHERE a.harness = m.harness AND a.idx = m.idx
                     AND a.outcome = ?2 AND a.resolved_generation = ?3)
@@ -730,7 +745,9 @@ fn load_intent(tx: &Transaction<'_>, generation: i64) -> Result<Vec<DurableHarne
         "SELECT id, incarnation FROM work WHERE harness = ?1 AND outcome IS NULL ORDER BY id",
     )?;
     let mut harnesses = Vec::new();
-    for (position, id, argv, session) in rows {
+    for (position, id, argv, endpoint, session) in rows {
+        let endpoint = crate::Endpoint::parse(&endpoint)
+            .ok_or_else(|| ClaimError::Store(format!("unknown endpoint {endpoint}")))?;
         let open_works = work_rows
             .query_map(params![position], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<rusqlite::Result<Vec<(i64, i64)>>>()?;
@@ -755,17 +772,19 @@ fn load_intent(tx: &Transaction<'_>, generation: i64) -> Result<Vec<DurableHarne
                             basis: row.get(5)?,
                             recovered: row.get::<_, Option<bool>>(6)?.unwrap_or(false),
                             generation: row.get::<_, Option<i64>>(7)?.unwrap_or(0),
+                            message_id: row.get(8)?,
                         }),
                         None => None,
                     },
-                    attempts: row.get(8)?,
-                    prior_unknown: row.get(9)?,
+                    attempts: row.get(9)?,
+                    prior_unknown: row.get(10)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         harnesses.push(DurableHarness {
             id,
             argv,
+            endpoint,
             session,
             messages,
             open_works,
@@ -807,6 +826,8 @@ mod tests {
             harnesses: vec![HarnessSpec {
                 id: "h".into(),
                 argv: vec!["peer".into()],
+                endpoint: crate::Endpoint::Stdio,
+                session: None,
                 messages: vec!["one".into()],
             }],
         }

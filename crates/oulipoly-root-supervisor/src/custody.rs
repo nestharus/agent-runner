@@ -399,10 +399,22 @@ impl Root {
         })
     }
 
-    pub(crate) fn spawn(&self, work: i64, argv: &[String]) -> Result<Spawned, String> {
-        let Some((reply, fds)) =
-            self.request(json!({ "op": "spawn", "work": work_name(work), "argv": argv }))
-        else {
+    /// Asks root PID 1 to start `argv` as the harness of `work`, in `cwd`,
+    /// with `env` added to root PID 1's environment.
+    pub(crate) fn spawn(
+        &self,
+        work: i64,
+        argv: &[String],
+        env: &serde_json::Map<String, Value>,
+        cwd: &str,
+    ) -> Result<Spawned, String> {
+        let Some((reply, fds)) = self.request(json!({
+            "op": "spawn",
+            "work": work_name(work),
+            "argv": argv,
+            "env": env,
+            "cwd": cwd,
+        })) else {
             return Err("root-pid1-unreachable".to_owned());
         };
         if reply["event"] != "spawned" {
@@ -416,6 +428,15 @@ impl Root {
                 .and_then(|pid| i32::try_from(pid).ok()),
             exec_error: reply["exec_error"].as_str().map(str::to_owned),
         })
+    }
+
+    /// Whether root PID 1 already reported the work's end, or this owner can
+    /// no longer hear it. Does not consume the report.
+    pub(crate) fn end_known(&self, work: i64) -> bool {
+        let name = work_name(work);
+        let (lock, _) = &*self.shared;
+        let shared = lock.lock().expect("custody lock");
+        shared.receipts.contains_key(&name) || shared.lost || shared.detached
     }
 
     /// Asks root PID 1 to have the work's PID 1 kill its harness.

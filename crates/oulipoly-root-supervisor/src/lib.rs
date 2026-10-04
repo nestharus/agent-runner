@@ -13,7 +13,9 @@
 //! agent. It is **unwired**: nothing on the installed route launches it,
 //! and it touches no Broker State, opcode, admission record, global debt or
 //! fence, guardian, driver or Bash path. Its harnesses in this crate's tests
-//! are the deterministic peer binary, not a real harness.
+//! are the deterministic peer binary, not a real harness, except one
+//! ignored-by-default test (`tests/native_opencode.rs`) that owns a real,
+//! model-less OpenCode host (see Endpoints).
 //!
 //! Absorption target: later slices make this lineage the root's
 //! harness-delivery owner, replacing the resume-plus-prompt path for the
@@ -90,6 +92,34 @@
 //! `"event":"terminal"` report. Exit codes: [`EXIT_ENDED`],
 //! [`EXIT_ENDED_OWED`], [`EXIT_CANCELLED`], [`EXIT_INCOMPLETE`],
 //! [`EXIT_STORE_LOST`], [`EXIT_SPEC_REFUSED`], [`EXIT_STORE_REFUSED`].
+//!
+//! # Endpoints
+//!
+//! Each harness speaks ACP v2 either on its stdio (`"endpoint": "stdio"`,
+//! the default) or on a Unix socket it listens on itself
+//! (`"unix-socket"`), so a native host serves ACP from inside the process
+//! that owns its conversations, with no bridge process. The owner chooses
+//! the socket path per work (`<store>/acp/w<work>.sock`, refused at intent
+//! validation if the store path is too long for it) and passes it as
+//! `OULIPOLY_ACP_V2_SOCKET`; root PID 1 starts every harness in the
+//! intent's `cwd`. Custody is unchanged: the harness is still the child of
+//! its work PID 1, its end is still known only from that wait, and its
+//! stdout (drained, not parsed) still passes through root PID 1. The owner
+//! connects when the socket listens; a harness that never listens is waited
+//! for like a silent one. End of stream on the socket is the connection's
+//! end (`connection-closed`), never the harness's. A restarted owner
+//! reconnects to a survivor's socket. The socket file is removed once the
+//! harness's end is observed.
+//!
+//! A harness may name an existing native conversation (`"session"`): the
+//! owner resumes it instead of opening one; the harness decides whether it
+//! has it. `session-opened` / `session-resumed` report the session id and
+//! `ack` the harness's `messageId`, which the store also keeps.
+//!
+//! `native/opencode/acp-v2-endpoint.ts` is such an endpoint for OpenCode, as
+//! a server plugin. In OpenCode 1.18.30 only `opencode acp` loads its
+//! directory's instance, and so the plugin, at startup (`serve` does so per
+//! HTTP request); its own stdio ACP surface is then present but unused.
 //!
 //! # Durable store and ownership
 //!
@@ -285,6 +315,12 @@
 //! * Store growth and retention are unbounded; nothing is pruned.
 //! * Exit observation waits for protocol-read progress; a descendant holding
 //!   stdout can delay it. A caller that does not drain output can delay cancel.
+//! * Socket endpoints: the owner retries connecting every 50 ms without a
+//!   deadline until the socket listens or the harness ends. Nothing
+//!   authenticates the listener beyond the store directory's mode; a closed
+//!   connection to a live harness holds the worker until that harness ends
+//!   or the caller cancels. While no owner is attached, nothing drains a
+//!   survivor's stdout.
 
 mod custody;
 mod harness;
@@ -345,7 +381,8 @@ pub struct Intent {
     /// generation, before it stops as `attempts-exhausted`. Must be at least
     /// 1. Counts attempts whatever their outcome, including unknown ones.
     pub delivery_attempt_cap: u32,
-    /// Absolute working directory given to `session/new` and `session/resume`.
+    /// Absolute working directory each harness is started in and that is
+    /// given to `session/new` and `session/resume`.
     pub cwd: String,
     pub harnesses: Vec<HarnessSpec>,
 }
@@ -356,17 +393,75 @@ pub struct Intent {
 pub struct HarnessSpec {
     /// Label used in reports.
     pub id: String,
-    /// Program and arguments. The harness speaks ACP v2 over stdio.
+    /// Program and arguments, started in [`Intent::cwd`].
     pub argv: Vec<String>,
+    /// Where the harness speaks ACP v2.
+    #[serde(default)]
+    pub endpoint: Endpoint,
+    /// An existing native conversation to resume (`session/resume`) instead
+    /// of opening a new one. Trusted scope: the harness decides whether it
+    /// names a conversation it has.
+    #[serde(default)]
+    pub session: Option<String>,
     pub messages: Vec<String>,
 }
+
+/// How the owner reaches one harness's ACP v2 endpoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Endpoint {
+    /// ND-JSON over the harness's stdin/stdout.
+    #[default]
+    Stdio,
+    /// ND-JSON over a Unix socket the harness itself listens on, inside the
+    /// process that owns its native conversations (no bridge process). The
+    /// owner chooses the path, `<store>/acp/w<work>.sock`, and passes it as
+    /// `OULIPOLY_ACP_V2_SOCKET`; the harness's stdout is drained, not read.
+    UnixSocket,
+}
+
+impl Endpoint {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Stdio => "stdio",
+            Self::UnixSocket => "unix-socket",
+        }
+    }
+
+    pub(crate) fn parse(label: &str) -> Option<Self> {
+        match label {
+            "stdio" => Some(Self::Stdio),
+            "unix-socket" => Some(Self::UnixSocket),
+            _ => None,
+        }
+    }
+}
+
+/// Longest Unix socket path (`sun_path` less its terminating NUL).
+const SOCKET_PATH_MAX: usize = 107;
 
 impl Request {
     fn validate(&self) -> Result<(), String> {
         if !self.store.starts_with('/') {
             return Err("store must be absolute".to_owned());
         }
-        self.intent.as_ref().map_or(Ok(()), Intent::validate)
+        let Some(intent) = &self.intent else {
+            return Ok(());
+        };
+        intent.validate()?;
+        let longest = harness::socket_path(Path::new(&self.store), i64::MAX);
+        if intent
+            .harnesses
+            .iter()
+            .any(|harness| harness.endpoint == Endpoint::UnixSocket)
+            && longest.as_os_str().len() > SOCKET_PATH_MAX
+        {
+            return Err(format!(
+                "store path too long for harness sockets ({} > {SOCKET_PATH_MAX} bytes)",
+                longest.as_os_str().len()
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -391,6 +486,9 @@ impl Intent {
             }
             if !ids.insert(harness.id.as_str()) {
                 return Err(format!("duplicate harness id {}", harness.id));
+            }
+            if harness.session.as_deref().is_some_and(str::is_empty) {
+                return Err(format!("harness {}: session is empty", harness.id));
             }
         }
         Ok(())
@@ -533,6 +631,7 @@ where
         let assignment = harness::Assignment {
             position,
             harness,
+            store_dir: PathBuf::from(&request.store),
             cap: claimed.outage_closure_cap,
             attempt_cap: claimed.delivery_attempt_cap,
             cwd: claimed.cwd.clone(),
@@ -867,6 +966,42 @@ fn emit<W: Write>(out: &mut W, value: &Value) {
 mod tests {
     use super::*;
 
+    fn request(store: &str, harness: Value) -> Result<(), String> {
+        let line = json!({
+            "store": store,
+            "intent": {
+                "outage_closure_cap": 1,
+                "delivery_attempt_cap": 1,
+                "cwd": "/",
+                "harnesses": [harness],
+            },
+        });
+        serde_json::from_value::<Request>(line)
+            .map_err(|error| error.to_string())?
+            .validate()
+    }
+
+    #[test]
+    fn socket_endpoint_needs_a_store_short_enough_for_every_socket_path() {
+        let long = format!("/{}", "s".repeat(80));
+        let harness = |endpoint: &str| json!({ "id": "h", "argv": ["x"], "endpoint": endpoint, "messages": [] });
+        assert!(request(&long, harness("stdio")).is_ok());
+        let refused = request(&long, harness("unix-socket")).unwrap_err();
+        assert!(refused.contains("too long"), "{refused}");
+        assert!(request("/tmp/root", harness("unix-socket")).is_ok());
+        assert!(request("/tmp/root", harness("tcp")).is_err());
+    }
+
+    #[test]
+    fn empty_resume_session_is_refused() {
+        let refused = request(
+            "/tmp/root",
+            json!({ "id": "h", "argv": ["x"], "session": "", "messages": [] }),
+        )
+        .unwrap_err();
+        assert!(refused.contains("session is empty"), "{refused}");
+    }
+
     fn expected(messages: usize) -> Vec<(String, usize)> {
         vec![("test".into(), messages)]
     }
@@ -966,6 +1101,8 @@ mod tests {
             harnesses: vec![HarnessSpec {
                 id: "test".into(),
                 argv: vec!["x".into()],
+                endpoint: crate::Endpoint::Stdio,
+                session: None,
                 messages: vec![],
             }],
         };
