@@ -27,10 +27,10 @@
 //! `opencode.auth` (opt-in, with a model) names a private OpenCode
 //! `auth.json` that setup checks before any effect and places in the
 //! launch's own data directory. Such a launch enables OpenCode's built-in
-//! plugins and gets a fresh loopback server password that only the native
-//! host's environment receives (see the root supervisor's `native` module).
-//! Neither value is in the root's environment, an argv or stdout; both are
-//! reachable by the work identity, which in-root Bash also runs as. This
+//! plugins and a loopback password inherited by the native host's requester.
+//! Required auth fields are checked, not the full native schema. Setup adds
+//! neither value to the root environment; caller-declared credentials can
+//! reach mediated Bash. Both files are reachable by the work identity. This
 //! entry does not refresh, copy back or remove them: the caller owns the
 //! source file and the launch directory's copy after the root ends.
 //!

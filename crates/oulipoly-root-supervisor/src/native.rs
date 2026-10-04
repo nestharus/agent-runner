@@ -36,21 +36,28 @@
 //! * **Authentication** (`auth`, opt-in per request, with a model). The
 //!   caller names one private OpenCode `auth.json` (provider id to one
 //!   `oauth`, `api` or `wellknown` entry; the model's provider must have
-//!   one). It is read once, checked and refused before any setup writes,
+//!   one). Its required fields are checked before any setup writes;
+//!   optional field types and the full native schema are not validated.
+//!   It is read once and refused for invalid required fields,
 //!   with no part of its contents in a reason, and written as the native
 //!   data directory's `opencode/auth.json` (`0600`). Never into
 //!   `opencode.json`, argv, an event or the root's environment. Both
 //!   secrets below are reachable by the work identity, the principal the
 //!   host and every in-root Bash run as: this keeps them out of group-
-//!   readable config, argv, events and ambient environments, not hidden
-//!   from that user. In-root Bash does not inherit either. OpenCode may
-//!   rewrite its own `auth.json` (a refresh, if the entry allows one).
+//!   readable config, argv and setup events, not hidden from that user.
+//!   Setup adds neither value to the root's declared environment; caller-
+//!   supplied credential variables can still reach mediated Bash.
+//!   OpenCode may rewrite its own `auth.json` (a refresh, if the entry
+//!   allows one).
 //!   Such a launch also:
 //!   - enables OpenCode's built-in plugins, all of them: the release has
 //!     one switch, and its OpenAI (Codex subscription) auth is one of them;
 //!   - gets a fresh random loopback server password, written only to
 //!     `secret/server-password` (`0600`) and read from there into the host's
-//!     own environment as it starts (`OPENCODE_SERVER_PASSWORD`), so the
+//!     environment as it starts (`OPENCODE_SERVER_PASSWORD`). Its native
+//!     agent-bash requester inherits that password in the host lineage;
+//!     owner-spawned mediated Bash has the separate root environment.
+//!     With the launch password, the
 //!     host's HTTP API refuses requests without it and its internal clients
 //!     (the endpoint plugin's included) send it. No argv carries the value.
 //! * **Work identity.** Without one, everything is the caller's (`0700` /
@@ -91,6 +98,9 @@ const OPENCODE: &str = "node_modules/opencode-linux-x64/bin/opencode";
 /// Inherited variables that would add config or credentials beside the
 /// launch's own: auth comes only from the launch's data directory, and a
 /// server password only from its own `secret` file.
+/// Removal applies to the native host, not to the caller's declared root
+/// environment or mediated Bash. A declared default-plugin override is
+/// also not unset by auth opt-in.
 pub const REMOVED_ENV: [&str; 7] = [
     "OPENCODE_CONFIG",
     "OPENCODE_CONFIG_DIR",
@@ -424,7 +434,8 @@ fn read_auth(path: &Path, provider: &str) -> Result<String, String> {
     let entries = value
         .as_object()
         .ok_or("auth is not a JSON object of provider entries")?;
-    // OpenCode silently drops an entry it cannot decode: refuse it here.
+    // Check required fields; optional types and the full native schema
+    // are not validated here, so native decoding may still drop an entry.
     let string = |entry: &Value, field: &str| entry.get(field).is_some_and(Value::is_string);
     for entry in entries.values() {
         let known = match entry.get("type").and_then(Value::as_str) {
