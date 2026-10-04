@@ -128,8 +128,9 @@ impl OutboundMessage {
 
     /// Mint a fresh Linux identity. Random-key uniqueness is the minting
     /// assumption; no durable registry or restart history is maintained.
-    /// The message cannot be cloned, and exporting its key abandons the
-    /// complete-history claim because the caller could fork it.
+    /// The message cannot be cloned. Calling [`Self::key`] abandons its
+    /// complete-history claim; callers/transports must not re-supply keys
+    /// captured from the wire, which bypass that downgrade.
     pub fn fresh(text: impl Into<String>) -> std::io::Result<Self> {
         let mut bytes = [0u8; 32];
         std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
@@ -139,8 +140,9 @@ impl OutboundMessage {
         Ok(message)
     }
 
-    /// Exporting the key permits re-supply/forking. Both future labels and
-    /// any cached acceptance are conservatively downgraded.
+    /// This accessor permits re-supply/forking. Both future labels and any
+    /// cached acceptance are conservatively downgraded. Wire capture does
+    /// not call this accessor or reconcile fork attempts with this history.
     pub fn key(&mut self) -> &MessageKey {
         self.complete_history = false;
         if let Some(acceptance) = &mut self.acceptance {
@@ -217,8 +219,8 @@ pub enum SessionEvent {
     },
 }
 
-/// The session was observed idle after an attempt: readiness evidence,
-/// without message-completion correlation or physical-drain evidence.
+/// The next unconsumed idle since the session's first tracked attempt:
+/// readiness evidence, without latest-message completion or physical drain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionIdle {
     pub stop_reason: Option<String>,
@@ -308,6 +310,19 @@ impl<T: Transport> AcpClient<T> {
             return Err(NegotiationFailure::UnsupportedVersion {
                 agent_version: version.protocol_version,
             });
+        }
+        if !result.get("info").is_some_and(Value::is_object) {
+            return Err(NegotiationFailure::ProtocolViolation(
+                "initialize info must be an object".to_owned(),
+            ));
+        }
+        if result
+            .get("capabilities")
+            .is_some_and(|value| !value.is_object())
+        {
+            // alpha7 defaults invalid capabilities to {}; positional struct
+            // deserialization must never turn them into session support.
+            return Err(NegotiationFailure::NoSessionSurface);
         }
         let response: wire::InitializeResponse = parse(&result)
             .map_err(|why| NegotiationFailure::ProtocolViolation(format!("initialize: {why}")))?;
@@ -482,8 +497,9 @@ impl<T: Transport> AcpClient<T> {
         }
     }
 
-    /// Observe the next unconsumed idle for this session after an attempt.
-    /// This is session readiness, never completion of a particular message.
+    /// Observe the next unconsumed idle since this session's first tracked
+    /// attempt. Later attempts do not reset the cursor; already-observed idle
+    /// may precede the latest message. This is readiness, never its completion.
     pub fn await_session_idle(&mut self, session_id: &str) -> Result<SessionIdle, IdleWaitFailure> {
         let Some(&start) = self.idle_cursor.get(session_id) else {
             return Err(IdleWaitFailure::NoAttempt);
@@ -615,6 +631,9 @@ impl<T: Transport> AcpClient<T> {
         if name != Some(method::SESSION_UPDATE) {
             return;
         }
+        if message.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+            return;
+        }
         let Some(Ok(notification)) = message
             .get("params")
             .map(parse::<wire::UpdateSessionNotification>)
@@ -655,5 +674,10 @@ fn session_event(notification: wire::UpdateSessionNotification) -> Option<Sessio
 }
 
 fn parse<D: DeserializeOwned>(value: &Value) -> Result<D, String> {
+    // Serde-derived structs also accept positional arrays. ACP's consumed
+    // response/notification structs require actual JSON objects on the wire.
+    if !value.is_object() {
+        return Err("expected an object".to_owned());
+    }
     D::deserialize(value).map_err(|error| error.to_string())
 }
