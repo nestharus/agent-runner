@@ -27,7 +27,7 @@ use crate::transport::{self, HarnessTransport, Observed};
 use crate::{Endpoint, Event};
 
 /// Environment variable naming the socket a `unix-socket` harness listens on.
-pub(crate) const SOCKET_ENV: &str = "OULIPOLY_ACP_V2_SOCKET";
+pub const SOCKET_ENV: &str = "OULIPOLY_ACP_V2_SOCKET";
 /// How often a worker retries connecting to a socket not yet listening.
 const CONNECT_RETRY: Duration = Duration::from_millis(50);
 

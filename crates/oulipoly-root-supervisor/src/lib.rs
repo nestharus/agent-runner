@@ -15,7 +15,11 @@
 //! fence, guardian, driver or Bash path. Its harnesses in this crate's tests
 //! are the deterministic peer binary, not a real harness, except one
 //! ignored-by-default test (`tests/native_opencode.rs`) that owns a real,
-//! model-less OpenCode host (see Endpoints).
+//! model-less OpenCode host (see Endpoints). Its one caller is the Runner's
+//! opt-in `native-root` entry (Linux, source build), which provisions a
+//! native OpenCode host with [`native::provision_opencode`] and starts this
+//! process for one fresh root with only the environment the request
+//! declares.
 //!
 //! Absorption target: later slices make this lineage the root's
 //! harness-delivery owner, replacing the resume-plus-prompt path for the
@@ -391,10 +395,10 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-pub use harness::{HarnessRecord, MessageRecord};
+pub use harness::{HarnessRecord, MessageRecord, SOCKET_ENV};
 pub use transport::MAX_LINE_BYTES;
 
 /// Every owned harness exited and was reaped; nothing is owed.
@@ -415,17 +419,18 @@ pub const EXIT_SPEC_REFUSED: u8 = 64;
 pub const EXIT_STORE_REFUSED: u8 = 65;
 
 /// The first stdin line.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
     /// Absolute path of this root's private store directory.
     pub store: String,
     /// Present to create the root's intent; absent to recover it.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub intent: Option<Intent>,
 }
 
 /// What one root's supervisor owes.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Intent {
     /// Observed no-acknowledgement closures of one message before it is
@@ -442,7 +447,7 @@ pub struct Intent {
 }
 
 /// One owned harness: how to launch it and what to deliver to it, in order.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HarnessSpec {
     /// Label used in reports.
@@ -455,13 +460,13 @@ pub struct HarnessSpec {
     /// An existing native conversation to resume (`session/resume`) instead
     /// of opening a new one. Trusted scope: the harness decides whether it
     /// names a conversation it has.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
     pub messages: Vec<String>,
 }
 
 /// How the owner reaches one harness's ACP v2 endpoint.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Endpoint {
     /// ND-JSON over the harness's stdin/stdout.
@@ -495,7 +500,10 @@ impl Endpoint {
 const SOCKET_PATH_MAX: usize = 107;
 
 impl Request {
-    fn validate(&self) -> Result<(), String> {
+    /// The checks this owner applies to a request before writing anything
+    /// (its own refusal, [`EXIT_SPEC_REFUSED`]). A launching caller may
+    /// apply them first, before effects of its own.
+    pub fn validate(&self) -> Result<(), String> {
         if !self.store.starts_with('/') {
             return Err("store must be absolute".to_owned());
         }

@@ -272,6 +272,18 @@ pub(crate) enum Subcommands {
         #[arg(long)]
         output: bool,
     },
+    /// Linux, opt-in: start one fresh native OpenCode ACP v2 root from a
+    /// JSON request file whose `env` is the root's whole environment. Needs
+    /// `oulipoly-root-supervisor` built next to this binary. Stdout: JSON
+    /// lines; stdin lines go to the root's owner. See `native_root` docs
+    /// for the exit statuses.
+    #[cfg(target_os = "linux")]
+    #[command(name = "native-root")]
+    NativeRoot {
+        /// The request file (JSON).
+        #[arg(long)]
+        request: PathBuf,
+    },
     /// Run chain-table backfill explicitly.
     MigrateDb,
     /// Run the session ownership migration harness.

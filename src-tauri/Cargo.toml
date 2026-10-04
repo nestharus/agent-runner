@@ -56,6 +56,9 @@ oulipoly-agent-messenger = { path = "../crates/oulipoly-agent-messenger" }
 rusqlite.workspace = true
 serde_yaml_ng.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+oulipoly-root-supervisor = { path = "../crates/oulipoly-root-supervisor" }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_JobObjects", "Win32_Security", "Win32_System_Threading"] }
 

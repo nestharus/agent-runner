@@ -146,6 +146,8 @@ pub(crate) fn run_offline_entry(cli: &Cli) -> Result<Option<i32>, String> {
                 *json,
             ),
         },
+        #[cfg(target_os = "linux")]
+        Some(Subcommands::NativeRoot { request }) => crate::commands::native_root::run(request),
         Some(Subcommands::Maintenance { command }) => match command {
             MaintenanceSubcommands::Status {
                 kind,
@@ -474,6 +476,10 @@ fn dispatch_subcommand(
         Subcommands::Notify { command } => dispatch_notify_subcommand(command),
         Subcommands::Mailbox { command } => dispatch_mailbox_subcommand(command),
         Subcommands::Diagnostics { .. } | Subcommands::Maintenance { .. } => {
+            unreachable!("offline commands must execute through run_offline_entry")
+        }
+        #[cfg(target_os = "linux")]
+        Subcommands::NativeRoot { .. } => {
             unreachable!("offline commands must execute through run_offline_entry")
         }
         Subcommands::ResumeList { uuid } => crate::commands::resume_list::run_resume_list(&uuid),
