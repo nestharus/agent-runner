@@ -94,7 +94,12 @@ pub(crate) struct Release {
     pub(crate) outcome: &'static str,
     /// `code:N` / `signal:N`, only from this owner's own wait as its parent.
     pub(crate) status: Option<String>,
+    /// Work root PID 1 itself said is still live. Empty is not proof of no
+    /// live work unless `ended` is true.
     pub(crate) live: Vec<String>,
+    /// Root PID 1's end was actually observed (its parent's wait, or its
+    /// pidfd). Only then may its incarnation be recorded as ended.
+    pub(crate) ended: bool,
 }
 
 #[derive(Default)]
@@ -446,54 +451,99 @@ impl Root {
     /// Asks root PID 1 to exit (it refuses while it has live work), then
     /// observes its end: its exit status only by this owner's own wait as
     /// its parent; otherwise only that it exited, through the pidfd.
+    ///
+    /// A missing reply says nothing about root PID 1's work: it is neither
+    /// an empty live list nor an end. Without a `releasing` reply this owner
+    /// only observes, for a bounded time, whether root PID 1 has exited, and
+    /// never blocks in a wait on a root that may still hold live work.
     pub(crate) fn release(&self) -> Release {
         let reply = self.request(json!({ "op": "release" }));
-        let live = match &reply {
-            Some((value, _)) if value["event"] == "refused" => value["live"]
+        let event = reply.as_ref().map(|(value, _)| value["event"].clone());
+        if event.as_ref().is_some_and(|event| event == "refused")
+            && let Some((value, _)) = &reply
+        {
+            let live: Vec<String> = value["live"]
                 .as_array()
                 .map(|live| {
                     live.iter()
                         .filter_map(|work| work.as_str().map(str::to_owned))
                         .collect()
                 })
-                .unwrap_or_default(),
-            _ => Vec::new(),
-        };
-        if !live.is_empty() {
+                .unwrap_or_default();
+            if !live.is_empty() {
+                return Release {
+                    outcome: "retained-live-work",
+                    status: None,
+                    live,
+                    ended: false,
+                };
+            }
+        }
+        if event.as_ref().is_some_and(|event| event == "releasing") {
+            // Root PID 1 said it has no live work and is exiting.
+            if self.parent {
+                return match sys::wait_child(self.host_pid) {
+                    Ok(status) => Release {
+                        outcome: "released-exit-waited",
+                        status: Some(sys::describe_status(status)),
+                        live: Vec::new(),
+                        ended: true,
+                    },
+                    Err(_) => Release {
+                        outcome: "wait-failed",
+                        status: None,
+                        live: Vec::new(),
+                        ended: false,
+                    },
+                };
+            }
+            let exited = sys::pidfd_exited(&self.pidfd, EXIT_OBSERVATION_MS).unwrap_or(false);
             return Release {
-                outcome: "retained-live-work",
+                outcome: if exited {
+                    "released-exit-observed-by-pidfd"
+                } else {
+                    "exit-not-observed"
+                },
                 status: None,
-                live,
+                live: Vec::new(),
+                ended: exited,
             };
         }
-        let released = matches!(&reply, Some((value, _)) if value["event"] == "releasing");
+        // No `releasing` reply: root PID 1 may still be running its work.
+        if !sys::pidfd_exited(&self.pidfd, EXIT_OBSERVATION_MS).unwrap_or(false) {
+            return Release {
+                outcome: if self.stop.superseded() {
+                    "left-to-successor"
+                } else {
+                    "release-unanswered"
+                },
+                status: None,
+                live: Vec::new(),
+                ended: false,
+            };
+        }
         if self.parent {
+            // It has exited, so this wait of our own child does not block.
             return match sys::wait_child(self.host_pid) {
                 Ok(status) => Release {
-                    outcome: if released {
-                        "released-exit-waited"
-                    } else {
-                        "lost-exit-waited"
-                    },
+                    outcome: "lost-exit-waited",
                     status: Some(sys::describe_status(status)),
-                    live,
+                    live: Vec::new(),
+                    ended: true,
                 },
                 Err(_) => Release {
                     outcome: "wait-failed",
                     status: None,
-                    live,
+                    live: Vec::new(),
+                    ended: false,
                 },
             };
         }
-        let exited = sys::pidfd_exited(&self.pidfd, EXIT_OBSERVATION_MS).unwrap_or(false);
         Release {
-            outcome: match (released, exited) {
-                (true, true) => "released-exit-observed-by-pidfd",
-                (false, true) => "lost-exit-observed-by-pidfd",
-                (_, false) => "exit-not-observed",
-            },
+            outcome: "lost-exit-observed-by-pidfd",
             status: None,
-            live,
+            live: Vec::new(),
+            ended: true,
         }
     }
 }
@@ -512,9 +562,10 @@ fn read_loop(socket: &OwnedFd, shared: &Arc<(Mutex<Shared>, Condvar)>, stop: &St
                         state.receipts.insert(work.to_owned(), value);
                     }
                 } else if value["event"] == "superseded" {
-                    // A newer owner attached: this one may no longer act.
+                    // A newer owner attached: this one may no longer act,
+                    // and its whole run has lost authority over this root.
                     state.detached = true;
-                    stop.trigger();
+                    stop.supersede();
                 }
             }
             Ok(None) | Err(_) => {
@@ -613,5 +664,146 @@ impl RootSlot {
             "parent": "this-owner",
         })));
         Ok(root)
+    }
+}
+
+#[cfg(test)]
+impl Root {
+    /// CONFIGURED SEAM for tests: incarnation 1 over a connection whose far
+    /// end the caller holds and plays root PID 1 on, naming `pid`.
+    pub(crate) fn seam(parent: bool, pid: i32, stop: &Arc<StopSignal>) -> (Arc<Self>, OwnedFd) {
+        let (near, far) = sys::seqpacket_pair().unwrap();
+        let pidfd = sys::pidfd_open(pid).unwrap();
+        let root = Self::connected(near, 1, pid, pidfd, parent, Arc::clone(stop)).unwrap();
+        (root, far)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! CONFIGURED SEAMS: each `Root` here is a connection whose far end this
+    //! test holds and plays root PID 1 on; no root PID 1 or harness exists.
+    //! They exercise this owner's side of custody only.
+
+    use super::*;
+    use crate::live::Custody;
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+
+    const BOUND: Duration = Duration::from_secs(10);
+
+    fn root(parent: bool, pid: i32, stop: &Arc<StopSignal>) -> (Arc<Root>, OwnedFd) {
+        Root::seam(parent, pid, stop)
+    }
+
+    /// O1 late registration: a survivor registered after this owner's
+    /// authority loss is already known is left to the successor, so
+    /// waiting for its end returns `Detached` instead of blocking.
+    #[test]
+    fn survivor_registered_after_authority_loss_is_left_not_awaited() {
+        let stop = Arc::new(StopSignal::new().unwrap());
+        let (root, _far) = root(false, i32::try_from(std::process::id()).unwrap(), &stop);
+        let mut custody = Custody::new(Arc::clone(&stop));
+        assert_eq!(custody.stop("authority-lost"), 0);
+        custody.register(Arc::clone(&root), 7);
+        let (tx, rx) = channel();
+        thread::spawn(move || {
+            let _ = tx.send(matches!(root.wait_receipt(7), ReceiptWait::Detached));
+        });
+        assert_eq!(
+            rx.recv_timeout(BOUND),
+            Ok(true),
+            "late-registered survivor must be left to the successor, not awaited"
+        );
+    }
+
+    /// O1 run level: root PID 1's `superseded` is authority loss for the
+    /// whole run, so a later cancel kills nothing (the request would reach
+    /// the successor's work) and the run ends as authority loss.
+    #[test]
+    fn supersession_is_run_level_authority_loss() {
+        let stop = Arc::new(StopSignal::new().unwrap());
+        let (root, far) = root(false, i32::try_from(std::process::id()).unwrap(), &stop);
+        let mut custody = Custody::new(Arc::clone(&stop));
+        custody.register(Arc::clone(&root), 7);
+        request_json(&far, &json!({ "event": "superseded", "by": 2 })).unwrap();
+        let (tx, rx) = channel();
+        let waiter = Arc::clone(&root);
+        thread::spawn(move || {
+            let _ = tx.send(matches!(waiter.wait_receipt(7), ReceiptWait::Detached));
+        });
+        assert_eq!(rx.recv_timeout(BOUND), Ok(true));
+        assert_eq!(custody.reason(), Some("authority-lost"));
+        assert_eq!(custody.cancel(), 0, "no kill after supersession");
+        assert_eq!(custody.reason(), Some("authority-lost"));
+    }
+
+    /// O3: a release with no reply is neither an empty live list nor an
+    /// end. As the actual parent of a still-running child, this owner does
+    /// not block in its wait; it reports the release unanswered, no status,
+    /// end not observed.
+    #[test]
+    fn unanswered_release_neither_blocks_on_a_running_child_nor_claims_its_end() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("600")
+            .spawn()
+            .unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+        let stop = Arc::new(StopSignal::new().unwrap());
+        let (root, far) = root(true, pid, &stop);
+        drop(far);
+        let (tx, rx) = channel();
+        let releasing = Arc::clone(&root);
+        thread::spawn(move || {
+            let release = releasing.release();
+            let _ = tx.send((release.outcome, release.status, release.live, release.ended));
+        });
+        let released = rx.recv_timeout(BOUND);
+        // Exact cleanup of this test's own child, whatever happened above.
+        let _ = child.kill();
+        let _ = child.wait();
+        let (outcome, status, live, ended) =
+            released.expect("parent owner blocked in a wait on a running root after no reply");
+        assert_eq!(outcome, "release-unanswered");
+        assert_eq!(status, None);
+        assert!(live.is_empty());
+        assert!(!ended, "no end was observed");
+    }
+
+    /// O3, not the parent: the same missing reply with the process still
+    /// running is not an observed end.
+    #[test]
+    fn unanswered_release_of_running_root_is_not_an_end() {
+        let stop = Arc::new(StopSignal::new().unwrap());
+        let (root, far) = root(false, i32::try_from(std::process::id()).unwrap(), &stop);
+        drop(far);
+        let release = root.release();
+        assert_eq!(release.outcome, "release-unanswered");
+        assert!(!release.ended);
+    }
+
+    /// Counter-control: an explicit `releasing` reply followed by the
+    /// actual parent's wait is a positively observed end, with its status.
+    #[test]
+    fn answered_release_waited_by_parent_is_an_observed_end() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+        let stop = Arc::new(StopSignal::new().unwrap());
+        let (root, far) = root(true, pid, &stop);
+        let replier = thread::spawn(move || {
+            let (request, _) = recv_json(&far).unwrap().unwrap();
+            request_json(
+                &far,
+                &json!({ "req": request["req"], "event": "releasing" }),
+            )
+            .unwrap();
+            far
+        });
+        let release = root.release();
+        drop(replier.join().unwrap());
+        let _ = child.try_wait();
+        assert_eq!(release.outcome, "released-exit-waited");
+        assert_eq!(release.status.as_deref(), Some("code:0"));
+        assert!(release.ended);
     }
 }

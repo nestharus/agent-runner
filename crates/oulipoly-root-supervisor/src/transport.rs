@@ -9,6 +9,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::rc::Rc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use oulipoly_acp::{Incoming, PeerClosed, Transport};
 
@@ -36,6 +37,9 @@ pub(crate) struct Observed {
 pub(crate) struct StopSignal {
     read: OwnedFd,
     write: Mutex<Option<OwnedFd>>,
+    /// Root PID 1 said a newer owner attached: this run's authority over
+    /// its root is lost, whatever the store says.
+    superseded: AtomicBool,
 }
 
 impl StopSignal {
@@ -44,11 +48,22 @@ impl StopSignal {
         Ok(Self {
             read,
             write: Mutex::new(Some(write)),
+            superseded: AtomicBool::new(false),
         })
     }
 
     pub(crate) fn trigger(&self) {
         self.write.lock().expect("stop lock").take();
+    }
+
+    /// Records that a newer owner superseded this one, then triggers.
+    pub(crate) fn supersede(&self) {
+        self.superseded.store(true, Ordering::SeqCst);
+        self.trigger();
+    }
+
+    pub(crate) fn superseded(&self) -> bool {
+        self.superseded.load(Ordering::SeqCst)
     }
 }
 

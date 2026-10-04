@@ -54,8 +54,9 @@ pub struct HarnessRecord {
     /// Ends of earlier owners' harnesses that happened while no owner was
     /// attached, as their actual waiters reported them.
     pub prior_exits: Vec<String>,
-    /// Earlier owners' harnesses whose root PID 1 is gone without a report:
-    /// they ended with its namespace, status unknown.
+    /// Earlier owners' harnesses that ended with their root's or their
+    /// work's namespace without their own wait being reported: status
+    /// unknown, not closures.
     pub prior_unknown_ends: u32,
     /// Missing waiter reports are unknown ends, never exits.
     pub wait_failures: Vec<String>,
@@ -120,7 +121,8 @@ enum ConnEnd {
 pub(crate) enum Prior {
     /// Still running under the attached root PID 1.
     Live(Adopted),
-    /// Ended while no owner was attached; its waiter's report.
+    /// Ended while no owner was attached; root PID 1's receipt for it,
+    /// which may lack the harness's own wait status.
     Exited { work: i64, receipt: Value },
     /// Its root PID 1 is gone and left no report for it.
     Unknown { work: i64 },
@@ -294,7 +296,7 @@ impl Worker {
                     let _ = (end, observed);
                 }
                 Some(Prior::Exited { work, receipt }) => {
-                    self.observe_prior_exit(work, &receipt);
+                    let _ = self.observe_prior_exit(work, &receipt);
                 }
                 Some(Prior::Unknown { work }) => self.observe_prior_unknown(work),
                 None => {}
@@ -310,8 +312,11 @@ impl Worker {
                 Some(Prior::Exited { work, receipt }) => {
                     // An end its waiter observed while no owner was attached:
                     // a closure of whatever was owed, like any observed exit.
-                    self.observe_prior_exit(work, &receipt);
-                    if !self.after_drive(ConnEnd::Gone, "exit-observed-while-owner-absent") {
+                    // Without the harness's own wait it is an unknown end:
+                    // not a closure, so launch again.
+                    if self.observe_prior_exit(work, &receipt)
+                        && !self.after_drive(ConnEnd::Gone, "exit-observed-while-owner-absent")
+                    {
                         return;
                     }
                     continue;
@@ -363,8 +368,25 @@ impl Worker {
         })
     }
 
-    fn observe_prior_exit(&mut self, work: i64, receipt: &Value) {
-        let status = receipt["harness"].as_str().map(str::to_owned);
+    /// Records an end reported while no owner was attached. Returns whether
+    /// it is the harness's own wait status. A receipt with only its work
+    /// PID 1's status (that PID 1 ended before reporting the harness) shows
+    /// the work's namespace is gone, not how the harness ended: an unknown
+    /// end, never charged as a closure.
+    fn observe_prior_exit(&mut self, work: i64, receipt: &Value) -> bool {
+        let Some(status) = receipt["harness"].as_str().map(str::to_owned) else {
+            self.report(json!({
+                "event": "prior-end-unknown",
+                "work": work,
+                "meaning": "ended-with-work-namespace-status-unknown",
+                "work_pid1": receipt["work_pid1"],
+            }));
+            self.durable(|store| {
+                store.resolve_work(work, "ended-with-work-namespace-status-unknown", None)
+            });
+            self.prior_unknown_ends += 1;
+            return false;
+        };
         self.report(json!({
             "event": "prior-exit",
             "work": work,
@@ -372,12 +394,9 @@ impl Worker {
             "observer": receipt["harness_observer"],
             "work_pid1": receipt["work_pid1"],
         }));
-        let outcome = status
-            .clone()
-            .unwrap_or_else(|| "status-unknown".to_owned());
-        let observer = status.as_ref().map(|_| "work-pid1-wait");
-        self.durable(|store| store.resolve_work(work, &outcome, observer));
-        self.prior_exits.push(outcome);
+        self.durable(|store| store.resolve_work(work, &status, Some("work-pid1-wait")));
+        self.prior_exits.push(status);
+        true
     }
 
     fn observe_prior_unknown(&mut self, work: i64) {
