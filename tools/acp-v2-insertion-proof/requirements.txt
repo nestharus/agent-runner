@@ -1,0 +1,3 @@
+# Python-only wheels; install with --platform any --only-binary=:all:.
+pyte==0.8.2 --hash=sha256:85db42a35798a5aafa96ac4d8da78b090b2c933248819157fc0e6f78876a0135
+wcwidth==0.9.1 --hash=sha256:e0c3a1c45c5b9550c6919a4449e95f5b177f6e165786376981db8f1addae9b21

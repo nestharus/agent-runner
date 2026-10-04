@@ -1,0 +1,3 @@
+564879c68da8cae10598200e9d993d70d25a27b72ed682e05565b827e0e8a993  tools/acp-v2-insertion-proof/run_proof.py
+399481bb7937b214eb869ec9b8a5cbca897993df1527eb2bac4bbc7c33d5ec43  tools/acp-v2-insertion-proof/acp-v2-endpoint.ts
+65456caa5adfea38ba4f082e6f12c8682fc118e0b04de6fa448f511c4751dd65  crates/oulipoly-acp/examples/v2_socket_submit.rs
