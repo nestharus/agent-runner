@@ -1,9 +1,17 @@
 //! One worker thread per owned harness. Each worker blocks only on its own
 //! harness, so a silent harness never holds up delivery to another.
 
+use std::fs::{self, File};
+use std::io;
+use std::os::fd::OwnedFd;
+use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use oulipoly_acp::{
     AcpClient, AtMostOnceBasis, ClientInfo, DeliveryOutcome, IdleWaitFailure, NegotiationFailure,
@@ -11,11 +19,33 @@ use oulipoly_acp::{
 };
 use serde_json::{Value, json};
 
-use crate::Event;
-use crate::custody::{Adopted, ReceiptWait, Root, RootSlot, WorkStdio};
+use crate::custody::{self, Adopted, ReceiptWait, Root, RootSlot, WorkStdio};
 use crate::live::Custody;
 use crate::store::{DurableAck, DurableHarness, Store, StoreError};
-use crate::transport::{HarnessTransport, Observed};
+use crate::transport::{self, HarnessTransport, Observed};
+use crate::{Endpoint, Event};
+
+/// Environment variable naming the socket a `unix-socket` harness listens on.
+pub(crate) const SOCKET_ENV: &str = "OULIPOLY_ACP_V2_SOCKET";
+/// How often a worker retries connecting to a socket not yet listening.
+const CONNECT_RETRY: Duration = Duration::from_millis(50);
+
+/// The socket path this root's owner chooses for one work's harness.
+pub(crate) fn socket_path(store: &Path, work: i64) -> PathBuf {
+    store
+        .join("acp")
+        .join(format!("{}.sock", custody::work_name(work)))
+}
+
+/// Why no connection to a socket endpoint was made.
+enum Unconnected {
+    /// The run detached; the harness is left to a successor.
+    Detached,
+    /// The harness's end was reported (or can no longer be heard) first.
+    Ended,
+    /// Connecting failed other than by the socket not listening yet.
+    Failed(String),
+}
 
 /// Final state of one message, as reported in the terminal report.
 #[derive(Debug, Clone)]
@@ -139,6 +169,8 @@ struct Live {
 struct Worker {
     id: String,
     argv: Vec<String>,
+    endpoint: Endpoint,
+    store_dir: PathBuf,
     position: usize,
     cap: u32,
     attempt_cap: u32,
@@ -163,6 +195,7 @@ struct Worker {
 pub(crate) struct Assignment {
     pub(crate) position: usize,
     pub(crate) harness: DurableHarness,
+    pub(crate) store_dir: PathBuf,
     pub(crate) cap: u32,
     pub(crate) attempt_cap: u32,
     pub(crate) cwd: String,
@@ -177,6 +210,7 @@ pub(crate) fn run(assignment: Assignment) {
     let Assignment {
         position,
         harness,
+        store_dir,
         cap,
         attempt_cap,
         cwd,
@@ -203,6 +237,8 @@ pub(crate) fn run(assignment: Assignment) {
     let mut worker = Worker {
         id: harness.id,
         argv: harness.argv,
+        endpoint: harness.endpoint,
+        store_dir,
         position,
         cap,
         attempt_cap,
@@ -360,12 +396,68 @@ impl Worker {
                 root.kill(adopted.work);
             }
         }
-        Some(Live {
+        let live = Live {
             work: adopted.work,
             stdio: adopted.stdio,
             root,
             token,
-        })
+        };
+        self.discard_output(&live);
+        Some(live)
+    }
+
+    /// A socket-endpoint harness's stdout is not its protocol stream:
+    /// drain it so it never blocks the harness.
+    fn discard_output(&self, live: &Live) {
+        if self.endpoint == Endpoint::UnixSocket
+            && let Ok(stdout) = live.stdio.stdout.try_clone()
+        {
+            transport::drain(stdout, Arc::clone(&self.slot.stop));
+        }
+    }
+
+    /// What the harness of `work` is started with beyond root PID 1's own
+    /// environment: for a socket endpoint, the socket the owner chose.
+    fn launch_env(&self, work: i64) -> Result<serde_json::Map<String, Value>, String> {
+        let mut env = serde_json::Map::new();
+        if self.endpoint == Endpoint::UnixSocket {
+            let path = socket_path(&self.store_dir, work);
+            let dir = path.parent().expect("socket directory");
+            match fs::DirBuilder::new().mode(0o700).create(dir) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(format!("socket-directory: {error}")),
+            }
+            let path = path.to_str().ok_or("socket path is not UTF-8")?;
+            env.insert(SOCKET_ENV.to_owned(), Value::String(path.to_owned()));
+        }
+        Ok(env)
+    }
+
+    /// Connects to the socket the harness of `live` listens on, waiting for
+    /// it to start listening. Like a silent stdio harness, one that never
+    /// listens is waited for until it ends, the run detaches or the caller
+    /// cancels: no timer gives up on it or kills it.
+    fn connect(&self, live: &Live) -> Result<UnixStream, Unconnected> {
+        let path = socket_path(&self.store_dir, live.work);
+        loop {
+            if transport::detached(&self.slot.stop) {
+                return Err(Unconnected::Detached);
+            }
+            match UnixStream::connect(&path) {
+                Ok(stream) => return Ok(stream),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                    ) => {}
+                Err(error) => return Err(Unconnected::Failed(error.to_string())),
+            }
+            if live.root.end_known(live.work) {
+                return Err(Unconnected::Ended);
+            }
+            thread::sleep(CONNECT_RETRY);
+        }
     }
 
     /// Records an end reported while no owner was attached. Returns whether
@@ -496,7 +588,10 @@ impl Worker {
                 return None;
             }
         };
-        let spawned = match root.spawn(work, &self.argv) {
+        let spawned = match self
+            .launch_env(work)
+            .and_then(|env| root.spawn(work, &self.argv, &env, &self.cwd))
+        {
             Ok(spawned) => spawned,
             Err(reason) => {
                 drop(custody);
@@ -522,6 +617,7 @@ impl Worker {
             root,
             token,
         };
+        self.discard_output(&live);
         if self
             .durable(|store| store.record_work_spawned(work, spawned.harness_host_pid))
             .is_none()
@@ -543,11 +639,38 @@ impl Worker {
     /// connection end as possible closure/relaunch evidence.
     fn drive(&mut self, live: Live) -> (ConnEnd, &'static str) {
         let observed = Rc::new(Observed::default());
-        let stdin = live.stdio.stdin.try_clone().expect("stdin descriptor");
-        let stdout = live.stdio.stdout.try_clone().expect("stdout descriptor");
+        let (reader, writer) = match self.endpoint {
+            Endpoint::Stdio => (
+                live.stdio.stdout.try_clone().expect("stdout descriptor"),
+                live.stdio.stdin.try_clone().expect("stdin descriptor"),
+            ),
+            Endpoint::UnixSocket => match self.connect(&live) {
+                Ok(stream) => {
+                    self.report(json!({ "event": "endpoint-connected", "work": live.work }));
+                    let reader = stream.try_clone().expect("socket descriptor");
+                    (
+                        File::from(OwnedFd::from(reader)),
+                        File::from(OwnedFd::from(stream)),
+                    )
+                }
+                Err(Unconnected::Detached) => return self.finish_live(live, ConnEnd::Stop, ""),
+                Err(Unconnected::Ended) => {
+                    // Nothing was sent: like a stdio harness that ended
+                    // before answering, a closure once its exit is reported.
+                    self.report(json!({ "event": "ended-before-endpoint", "work": live.work }));
+                    let end = self.gone_or_drained();
+                    return self.finish_live(live, end, "exit-before-endpoint");
+                }
+                Err(Unconnected::Failed(reason)) => {
+                    self.report(json!({ "event": "endpoint-failed", "reason": reason }));
+                    self.label_remaining("endpoint-failed");
+                    return self.finish_live(live, ConnEnd::Stop, "");
+                }
+            },
+        };
         let transport = HarnessTransport::new(
-            stdout,
-            stdin,
+            reader,
+            writer,
             Rc::clone(&observed),
             Arc::clone(&self.slot.stop),
         );
@@ -565,7 +688,13 @@ impl Worker {
         }
         let cause = match end {
             ConnEnd::Gone if observed.eof.get() => {
-                self.report(json!({ "event": "peer-gone", "observed": "eof" }));
+                // Over a socket, end of stream is the connection's end; the
+                // harness's own end is still awaited below.
+                let event = match self.endpoint {
+                    Endpoint::Stdio => "peer-gone",
+                    Endpoint::UnixSocket => "connection-closed",
+                };
+                self.report(json!({ "event": event, "observed": "eof" }));
                 "eof-then-exit"
             }
             ConnEnd::Gone if observed.send_fault.get() => {
@@ -623,6 +752,10 @@ impl Worker {
         let work = live.work;
         if let Ok((status, _)) = &exit {
             self.durable(|store| store.resolve_work(work, status, Some("work-pid1-wait")));
+        }
+        if self.endpoint == Endpoint::UnixSocket && exit.is_ok() {
+            // Its listener ended with it; the path is never reused.
+            let _ = fs::remove_file(socket_path(&self.store_dir, work));
         }
         self.finish_drive(end, cause, exit)
     }
@@ -713,9 +846,13 @@ impl Worker {
                 {
                     return ConnEnd::Stop;
                 }
+                self.report(json!({ "event": "session-opened", "session": id }));
                 self.session = Some(id);
             }
-            Ok(None) => self.report(json!({ "event": "session-resumed" })),
+            Ok(None) => self.report(json!({
+                "event": "session-resumed",
+                "session": self.session,
+            })),
             Err(RequestFailure::PeerGone) => return self.gone_or_drained(),
             Err(failure) => {
                 let label = match failure {
@@ -751,6 +888,7 @@ impl Worker {
                         basis: acceptance.basis.map(|basis| basis_label(basis).to_owned()),
                         recovered: acceptance.recovered,
                         generation: self.store.lock().expect("store lock").generation(),
+                        message_id: Some(acceptance.message_id.clone()),
                     };
                     // Reported only once durable: an unrecorded ACK leaves
                     // the attempt unresolved for a successor to classify.
@@ -766,6 +904,7 @@ impl Worker {
                         "label": ack.label,
                         "basis": ack.basis,
                         "recovered": ack.recovered,
+                        "message_id": ack.message_id,
                         "durable": true,
                     }));
                     self.tracked[index].ack = Some(ack);
@@ -904,6 +1043,8 @@ mod tests {
             harnesses: vec![crate::HarnessSpec {
                 id: "test".into(),
                 argv: vec![],
+                endpoint: crate::Endpoint::Stdio,
+                session: None,
                 messages: vec!["x".into()],
             }],
         };
@@ -914,6 +1055,8 @@ mod tests {
             Worker {
                 id: "test".into(),
                 argv: vec![],
+                endpoint: Endpoint::Stdio,
+                store_dir: dir.0.clone(),
                 position: 0,
                 cap: 3,
                 attempt_cap: 10,

@@ -385,6 +385,18 @@ impl Pid1 {
                     .collect()
             })
             .unwrap_or_default();
+        let launch = Launch {
+            argv,
+            env: message["env"]
+                .as_object()
+                .map(|env| {
+                    env.iter()
+                        .filter_map(|(key, value)| Some((key.clone(), value.as_str()?.to_owned())))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            cwd: message["cwd"].as_str().map(str::to_owned),
+        };
         let refuse = |pid1: &Self, reason: String| {
             let _ = reply(
                 &pid1.owners[index].socket,
@@ -392,11 +404,18 @@ impl Pid1 {
                 &[],
             );
         };
-        if id.is_empty() || argv.is_empty() || self.works.iter().any(|work| work.id == id) {
+        if id.is_empty()
+            || launch.argv.is_empty()
+            || launch
+                .env
+                .iter()
+                .any(|(key, _)| key.is_empty() || key.contains('='))
+            || self.works.iter().any(|work| work.id == id)
+        {
             refuse(self, "bad-spawn".to_owned());
             return;
         }
-        let started = start_work(&argv);
+        let started = start_work(&launch);
         let Ok((mut work, first)) = started else {
             refuse(
                 self,
@@ -517,9 +536,18 @@ fn parse_lines(work: &mut Work) {
     }
 }
 
+/// How to start one harness: its program and arguments, environment
+/// entries added to (or replacing) root PID 1's own, and its working
+/// directory.
+struct Launch {
+    argv: Vec<String>,
+    env: Vec<(String, String)>,
+    cwd: Option<String>,
+}
+
 /// Starts one per-work PID 1 in a new PID namespace and returns its record
 /// and its first report (the harness's host pid, or an exec error).
-fn start_work(argv: &[String]) -> io::Result<(Work, Value)> {
+fn start_work(launch: &Launch) -> io::Result<(Work, Value)> {
     let (stdin_r, stdin_w) = sys::pipe()?;
     let (stdout_r, stdout_w) = sys::pipe()?;
     let (control_r, control_w) = sys::pipe()?;
@@ -546,7 +574,7 @@ fn start_work(argv: &[String]) -> io::Result<(Work, Value)> {
             receipt_w.as_raw_fd(),
         ];
         close_all_except(&keep);
-        work_pid1(argv, &stdin_r, &stdout_w, &control_r, receipt_w);
+        work_pid1(launch, &stdin_r, &stdout_w, &control_r, receipt_w);
     }
     let pid = i32::try_from(pid).map_err(|_| io::Error::other("pid out of range"))?;
     drop((stdin_r, stdout_w, control_r, receipt_w));
@@ -603,19 +631,45 @@ fn write_line(fd: &OwnedFd, value: &Value) {
 /// Reports the harness's host pid, then the harness's own wait status,
 /// then reaps any other process left in the namespace before exiting.
 fn work_pid1(
-    argv: &[String],
+    launch: &Launch,
     stdin: &OwnedFd,
     stdout: &OwnedFd,
     control: &OwnedFd,
     receipt: OwnedFd,
 ) -> ! {
+    use std::os::unix::ffi::OsStrExt;
+
     let signals = block_sigchld().unwrap_or_else(|error| die("work signalfd", &error));
-    let args: Vec<std::ffi::CString> = argv
+    let args: Vec<std::ffi::CString> = launch
+        .argv
         .iter()
         .filter_map(|arg| std::ffi::CString::new(arg.as_bytes()).ok())
         .collect();
     let mut pointers: Vec<*const libc::c_char> = args.iter().map(|arg| arg.as_ptr()).collect();
     pointers.push(std::ptr::null());
+    let inherited = std::env::vars_os().filter(|(key, _)| {
+        !launch
+            .env
+            .iter()
+            .any(|(added, _)| added.as_bytes() == key.as_bytes())
+    });
+    let environment: Vec<std::ffi::CString> = inherited
+        .map(|(key, value)| [key.as_bytes(), b"=", value.as_bytes()].concat())
+        .chain(
+            launch
+                .env
+                .iter()
+                .map(|(key, value)| format!("{key}={value}").into_bytes()),
+        )
+        .filter_map(|entry| std::ffi::CString::new(entry).ok())
+        .collect();
+    let mut env_pointers: Vec<*const libc::c_char> =
+        environment.iter().map(|entry| entry.as_ptr()).collect();
+    env_pointers.push(std::ptr::null());
+    let cwd = launch
+        .cwd
+        .as_ref()
+        .and_then(|cwd| std::ffi::CString::new(cwd.as_bytes()).ok());
     let (error_r, error_w) = sys::pipe().unwrap_or_else(|error| die("work pipe", &error));
     // SAFETY: fork of this single-threaded process.
     let harness = unsafe { libc::fork() };
@@ -634,7 +688,12 @@ fn work_pid1(
                 u32::MAX,
                 libc::CLOSE_RANGE_CLOEXEC,
             );
-            libc::execvp(pointers[0], pointers.as_ptr());
+            if cwd
+                .as_ref()
+                .is_none_or(|cwd| libc::chdir(cwd.as_ptr()) == 0)
+            {
+                libc::execvpe(pointers[0], pointers.as_ptr(), env_pointers.as_ptr());
+            }
             let errno = *libc::__errno_location();
             libc::write(error_w.as_raw_fd(), (&raw const errno).cast(), 4);
             libc::_exit(127);

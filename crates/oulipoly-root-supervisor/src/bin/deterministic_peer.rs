@@ -29,10 +29,17 @@
 //! `normal`, or exit with status 1 without answering. `--exit-when-file P`
 //! makes the state's first launch exit with status 7 once file `P` exists.
 //!
+//! With `OULIPOLY_ACP_V2_SOCKET` set, the peer speaks on a Unix socket it
+//! listens on at that path instead of stdio, one connection at a time; a
+//! closed connection is not its end (it accepts the next one), and it
+//! stays alive until killed or `--exit-after-acks`. `close-stdin` is
+//! stdio-only.
+//!
 //! The peer sets no parent-death signal: whether it outlives its owner is
 //! decided by its custody, not by the peer.
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 
 use oulipoly_acp::{DEDUP_CONTRACT_META, DUPLICATE_META, MESSAGE_KEY_META};
@@ -133,150 +140,181 @@ fn main() {
             std::process::exit(7);
         });
     }
-    let mut initializations = 0u32;
+    let mut peer = Peer {
+        args,
+        state,
+        initializations: 0,
+        acks: 0,
+    };
+    if let Some(path) = std::env::var_os("OULIPOLY_ACP_V2_SOCKET") {
+        let listener = UnixListener::bind(path).expect("listen");
+        loop {
+            let (stream, _) = listener.accept().expect("accept");
+            let reader = BufReader::new(stream.try_clone().expect("clone"));
+            peer.serve(reader, stream);
+        }
+    }
+    peer.serve(std::io::stdin().lock(), std::io::stdout().lock());
+}
 
-    let stdin = std::io::stdin();
-    let mut out = std::io::stdout().lock();
-    let mut acks = 0u64;
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else { return };
-        let Ok(request) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        let id = request.get("id").cloned().unwrap_or(Value::Null);
-        let params = request.get("params").cloned().unwrap_or(Value::Null);
-        match request.get("method").and_then(Value::as_str) {
-            Some("initialize") => {
-                initializations += 1;
-                if initializations > 1 {
-                    match args.on_reinit.as_deref() {
-                        Some("exit") => std::process::exit(1),
-                        Some(mode) => args.mode = mode.to_owned(),
-                        None => {}
+struct Peer {
+    args: Args,
+    state: Value,
+    initializations: u32,
+    acks: u64,
+}
+
+impl Peer {
+    /// Answers one connection until it ends.
+    fn serve(&mut self, input: impl BufRead, mut out: impl Write) {
+        let Self {
+            args,
+            state,
+            initializations,
+            acks,
+        } = self;
+        let out = &mut out;
+        for line in input.lines() {
+            let Ok(line) = line else { return };
+            let Ok(request) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            let id = request.get("id").cloned().unwrap_or(Value::Null);
+            let params = request.get("params").cloned().unwrap_or(Value::Null);
+            match request.get("method").and_then(Value::as_str) {
+                Some("initialize") => {
+                    *initializations += 1;
+                    if *initializations > 1 {
+                        match args.on_reinit.as_deref() {
+                            Some("exit") => std::process::exit(1),
+                            Some(mode) => args.mode = mode.to_owned(),
+                            None => {}
+                        }
                     }
-                }
-                let mut result = json!({
-                    "protocolVersion": 2,
-                    "info": { "name": "deterministic-peer", "version": "1" },
-                    "capabilities": { "session": {} },
-                });
-                if args.dedup {
-                    result["_meta"] = json!({ DEDUP_CONTRACT_META: { "version": 1 } });
-                }
-                send(
-                    &mut out,
-                    &json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-                );
-            }
-            Some("session/new") => {
-                let sessions = state["sessions"].as_array_mut().expect("sessions");
-                let session_id = format!("sess-{}", sessions.len() + 1);
-                sessions.push(Value::String(session_id.clone()));
-                save(&args.state, &state);
-                if args.mode == "close-stdin" {
-                    // SAFETY: closing our own stdin descriptor.
-                    unsafe {
-                        libc::close(0);
+                    let mut result = json!({
+                        "protocolVersion": 2,
+                        "info": { "name": "deterministic-peer", "version": "1" },
+                        "capabilities": { "session": {} },
+                    });
+                    if args.dedup {
+                        result["_meta"] = json!({ DEDUP_CONTRACT_META: { "version": 1 } });
                     }
                     send(
-                        &mut out,
+                        out,
+                        &json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+                    );
+                }
+                Some("session/new") => {
+                    let sessions = state["sessions"].as_array_mut().expect("sessions");
+                    let session_id = format!("sess-{}", sessions.len() + 1);
+                    sessions.push(Value::String(session_id.clone()));
+                    save(&args.state, state);
+                    if args.mode == "close-stdin" {
+                        // SAFETY: closing our own stdin descriptor.
+                        unsafe {
+                            libc::close(0);
+                        }
+                        send(
+                            out,
+                            &json!({ "jsonrpc": "2.0", "id": id, "result": { "sessionId": session_id } }),
+                        );
+                        linger();
+                    }
+                    send(
+                        out,
                         &json!({ "jsonrpc": "2.0", "id": id, "result": { "sessionId": session_id } }),
                     );
-                    linger();
                 }
-                send(
-                    &mut out,
-                    &json!({ "jsonrpc": "2.0", "id": id, "result": { "sessionId": session_id } }),
-                );
+                Some("session/resume") => {
+                    let wanted = params["sessionId"].clone();
+                    let known = state["sessions"]
+                        .as_array()
+                        .expect("sessions")
+                        .contains(&wanted);
+                    let reply = if known {
+                        json!({ "jsonrpc": "2.0", "id": id, "result": {} })
+                    } else {
+                        json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32002, "message": "unknown session" } })
+                    };
+                    send(out, &reply);
+                }
+                Some("session/prompt") => {
+                    let session_id = params["sessionId"].as_str().unwrap_or_default().to_owned();
+                    let key = params["_meta"][MESSAGE_KEY_META].clone();
+                    state["prompts"]
+                        .as_array_mut()
+                        .expect("prompts")
+                        .push(json!({ "session": session_id, "key": key }));
+                    save(&args.state, state);
+                    match args.mode.as_str() {
+                        "silent" => continue,
+                        "exit-before-ack-always" => std::process::exit(1),
+                        _ => {}
+                    }
+                    let earlier = args
+                        .dedup
+                        .then(|| {
+                            state["insertions"]
+                                .as_array()
+                                .expect("insertions")
+                                .iter()
+                                .find(|insertion| {
+                                    insertion["session"] == session_id.as_str()
+                                        && insertion["key"] == key
+                                })
+                                .map(|insertion| insertion["messageId"].clone())
+                        })
+                        .flatten();
+                    let duplicate = earlier.is_some();
+                    let message_id = earlier.unwrap_or_else(|| {
+                        let insertions = state["insertions"].as_array_mut().expect("insertions");
+                        let message_id = format!("msg-{}", insertions.len() + 1);
+                        insertions.push(json!({
+                            "session": session_id,
+                            "key": key,
+                            "messageId": message_id,
+                        }));
+                        Value::String(message_id)
+                    });
+                    save(&args.state, state);
+                    if args.mode == "insert-then-silent" {
+                        continue;
+                    }
+                    if args.mode == "exit-before-ack-once" && state["fault_used"] == false {
+                        state["fault_used"] = Value::Bool(true);
+                        save(&args.state, state);
+                        std::process::exit(0);
+                    }
+                    let mut result = json!({ "messageId": message_id });
+                    if args.dedup {
+                        result["_meta"] =
+                            json!({ MESSAGE_KEY_META: key, DUPLICATE_META: duplicate });
+                    }
+                    send(
+                        out,
+                        &json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+                    );
+                    send(
+                        out,
+                        &json!({
+                            "jsonrpc": "2.0",
+                            "method": "session/update",
+                            "params": {
+                                "sessionId": session_id,
+                                "update": { "sessionUpdate": "state_update", "state": "idle", "stopReason": "end_turn" },
+                            },
+                        }),
+                    );
+                    *acks += 1;
+                    if args.exit_after_acks == Some(*acks) {
+                        std::process::exit(0);
+                    }
+                }
+                _ => send(
+                    out,
+                    &json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": "method not found" } }),
+                ),
             }
-            Some("session/resume") => {
-                let wanted = params["sessionId"].clone();
-                let known = state["sessions"]
-                    .as_array()
-                    .expect("sessions")
-                    .contains(&wanted);
-                let reply = if known {
-                    json!({ "jsonrpc": "2.0", "id": id, "result": {} })
-                } else {
-                    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32002, "message": "unknown session" } })
-                };
-                send(&mut out, &reply);
-            }
-            Some("session/prompt") => {
-                let session_id = params["sessionId"].as_str().unwrap_or_default().to_owned();
-                let key = params["_meta"][MESSAGE_KEY_META].clone();
-                state["prompts"]
-                    .as_array_mut()
-                    .expect("prompts")
-                    .push(json!({ "session": session_id, "key": key }));
-                save(&args.state, &state);
-                match args.mode.as_str() {
-                    "silent" => continue,
-                    "exit-before-ack-always" => std::process::exit(1),
-                    _ => {}
-                }
-                let earlier = args
-                    .dedup
-                    .then(|| {
-                        state["insertions"]
-                            .as_array()
-                            .expect("insertions")
-                            .iter()
-                            .find(|insertion| {
-                                insertion["session"] == session_id.as_str()
-                                    && insertion["key"] == key
-                            })
-                            .map(|insertion| insertion["messageId"].clone())
-                    })
-                    .flatten();
-                let duplicate = earlier.is_some();
-                let message_id = earlier.unwrap_or_else(|| {
-                    let insertions = state["insertions"].as_array_mut().expect("insertions");
-                    let message_id = format!("msg-{}", insertions.len() + 1);
-                    insertions.push(json!({
-                        "session": session_id,
-                        "key": key,
-                        "messageId": message_id,
-                    }));
-                    Value::String(message_id)
-                });
-                save(&args.state, &state);
-                if args.mode == "insert-then-silent" {
-                    continue;
-                }
-                if args.mode == "exit-before-ack-once" && state["fault_used"] == false {
-                    state["fault_used"] = Value::Bool(true);
-                    save(&args.state, &state);
-                    std::process::exit(0);
-                }
-                let mut result = json!({ "messageId": message_id });
-                if args.dedup {
-                    result["_meta"] = json!({ MESSAGE_KEY_META: key, DUPLICATE_META: duplicate });
-                }
-                send(
-                    &mut out,
-                    &json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-                );
-                send(
-                    &mut out,
-                    &json!({
-                        "jsonrpc": "2.0",
-                        "method": "session/update",
-                        "params": {
-                            "sessionId": session_id,
-                            "update": { "sessionUpdate": "state_update", "state": "idle", "stopReason": "end_turn" },
-                        },
-                    }),
-                );
-                acks += 1;
-                if args.exit_after_acks == Some(acks) {
-                    std::process::exit(0);
-                }
-            }
-            _ => send(
-                &mut out,
-                &json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": "method not found" } }),
-            ),
         }
     }
 }
