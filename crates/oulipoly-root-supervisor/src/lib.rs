@@ -26,7 +26,8 @@
 //! commands; `{"cmd":"cancel"}` is the only one. Stdin EOF is not a cancel.
 //! Stdout carries one JSON object per line: progress events, then exactly
 //! one `"event":"terminal"` report. Exit codes: [`EXIT_ENDED`],
-//! [`EXIT_ENDED_OWED`], [`EXIT_CANCELLED`], [`EXIT_SPEC_REFUSED`].
+//! [`EXIT_ENDED_OWED`], [`EXIT_CANCELLED`], [`EXIT_INCOMPLETE`],
+//! [`EXIT_SPEC_REFUSED`].
 //!
 //! A missing terminal report (this process died) means every message it
 //! owed is **unknown / owed lost**. Nothing is persisted, so a new instance
@@ -37,11 +38,12 @@
 //! * `accepted` / `duplicate-unknown`: an insertion acknowledgement from the
 //!   harness, with or without an at-most-once basis. Insertion only: not
 //!   turn completion, not drain, and never an end condition by itself.
-//! * `retained-undelivered`: still owed when the harness stopped, with a
-//!   reason: `cancelled` (explicit cancel), `outage` (the closure cap was
-//!   reached), `rejected`, `not-negotiated:*`, `session-*`,
-//!   `invalid-response`, `launch-failed` or `not-attempted`. None of these is
-//!   delivery or closure.
+//! * Undelivered messages and their private keys/history are retained only
+//!   in the live worker's memory. At terminal process exit the owner is lost:
+//!   each owed message is `undelivered-owner-lost`, with its original reason
+//!   (`cancelled`, `outage`, `rejected`, `not-negotiated:*`, `session-*`,
+//!   `invalid-response`, `launch-failed`, `wait-unproven`, `not-attempted`).
+//!   This is neither delivery, closure of debt, nor recoverable retention.
 //! * A **closure** is a no-acknowledgement end of an attempt whose harness
 //!   exit this process observed by reaping that exact child. Only closures
 //!   count toward [`Spec::outage_closure_cap`]. Rejections and negotiation
@@ -59,11 +61,25 @@
 //!
 //! * `ended`: every owned harness exited and was reaped by exact child
 //!   identity, and nothing is owed.
-//! * `ended-owed`: every owned harness exited and was reaped, and some
-//!   messages are retained undelivered (an outage, for example).
-//! * `cancelled`: the caller cancelled. Each live owned harness is sent
-//!   `SIGKILL` through a pidfd taken at spawn, its exit is observed, and
-//!   every owed message is reported `retained-undelivered` / `cancelled`.
+//! * `ended-owed`: every actually spawned direct child exited and was
+//!   successfully reaped, no further attempt is authorized, and debt remains.
+//!   Exit 3 labels loss of the in-memory owner/history, not successful drain.
+//! * `cancelled`: explicit cancellation is visible at run level. Admitted
+//!   live children are sent `SIGKILL` by pidfd; successful waits alone prove
+//!   exits/reaping. Earlier refusal/outage causes survive cancellation.
+//!   Owed history is lost at process exit, with no restart continuity.
+//! * `incomplete`: records or successful exit/reaping observations are
+//!   missing (exit 4). A failed wait reports `wait-failed` / `unproven`,
+//!   never an exit, closure count or relaunch authorization. Even a cancelled
+//!   terminal may have `all_harnesses_reaped:false`; cancellation is not proof.
+//! * `launches` counts actual OS spawns, including custody-open failures.
+//!   Before admission, a failed custody acquisition permits exact owned-child
+//!   launch cleanup; its signal result and wait observation are separate.
+//! * `records_complete` checks every configured harness and message record;
+//!   `all_harnesses_reaped` also requires one successful wait per spawn and no
+//!   failed wait. Incomplete records report `owed:null` and `known_owed` as a
+//!   partial count; `owed_history:unknown-lost-at-process-exit` is no zero-debt
+//!   claim. Complete records use `lost-at-process-exit` or `nothing-owed`.
 //!
 //! No root PID1 terminal or Broker settlement is visible here, and neither
 //! is inferred.
@@ -77,6 +93,9 @@
 //! * If this process dies, its harnesses are not signalled by it (the test
 //!   peer arranges its own parent-death signal).
 //! * In-memory only: no recovery after this process restarts.
+//! * Exit observation waits for protocol-read progress; a descendant holding
+//!   stdout can delay it. A caller that does not drain output can delay cancel.
+//!   Neither topology is repaired or exercised by this direct-peer slice.
 
 mod harness;
 mod pidfd;
@@ -96,10 +115,12 @@ pub use transport::MAX_LINE_BYTES;
 
 /// Every owned harness exited and was reaped; nothing is owed.
 pub const EXIT_ENDED: u8 = 0;
-/// The caller cancelled; owed messages are retained undelivered.
+/// The caller cancelled; owed in-memory owner/history is lost at exit.
 pub const EXIT_CANCELLED: u8 = 2;
-/// Every owned harness exited and was reaped, but messages are still owed.
+/// All spawned direct children were reaped; owed owner/history is lost at exit.
 pub const EXIT_ENDED_OWED: u8 = 3;
+/// Worker records or successful exit/reaping observations are incomplete.
+pub const EXIT_INCOMPLETE: u8 = 4;
 /// The spec line was missing or invalid; nothing was launched.
 pub const EXIT_SPEC_REFUSED: u8 = 64;
 
@@ -246,33 +267,154 @@ where
             .position(|harness| harness.id == record.id)
     });
 
-    let owed = records
+    let (report, code) = terminal_report(&spec, &records, cancel_requested);
+    emit(&mut out, &report);
+    code
+}
+
+fn terminal_report(spec: &Spec, records: &[HarnessRecord], cancel_requested: bool) -> (Value, u8) {
+    let records_complete = records.len() == spec.harnesses.len()
+        && spec.harnesses.iter().all(|harness| {
+            let mut matches = records.iter().filter(|record| record.id == harness.id);
+            let Some(record) = matches.next() else {
+                return false;
+            };
+            matches.next().is_none()
+                && record.messages.len() == harness.messages.len()
+                && record
+                    .messages
+                    .iter()
+                    .enumerate()
+                    .all(|(index, message)| message.index == index)
+        });
+    let all_reaped = records_complete
+        && records.iter().all(|record| {
+            record.wait_failures.is_empty()
+                && usize::try_from(record.launches).ok() == Some(record.exits.len())
+        });
+    let known_owed = records
         .iter()
         .flat_map(|record| &record.messages)
         .filter(|message| message.owed)
         .count();
     let (status, code) = if cancel_requested {
         ("cancelled", EXIT_CANCELLED)
-    } else if owed > 0 {
+    } else if !all_reaped {
+        ("incomplete", EXIT_INCOMPLETE)
+    } else if known_owed > 0 {
         ("ended-owed", EXIT_ENDED_OWED)
     } else {
         ("ended", EXIT_ENDED)
     };
-    emit(
-        &mut out,
-        &json!({
-            "event": "terminal",
-            "status": status,
-            "owed": owed,
-            "all_harnesses_reaped": records.len() == spec.harnesses.len(),
-            "harnesses": records.iter().map(HarnessRecord::to_json).collect::<Vec<_>>(),
-        }),
-    );
-    code
+    let report = json!({
+        "event": "terminal",
+        "status": status,
+        "cancel_requested": cancel_requested,
+        "owed": records_complete.then_some(known_owed),
+        "known_owed": known_owed,
+        "owed_history": if !records_complete { "unknown-lost-at-process-exit" }
+            else if known_owed > 0 { "lost-at-process-exit" } else { "nothing-owed" },
+        "records_complete": records_complete,
+        "all_harnesses_reaped": all_reaped,
+        "harnesses": records.iter().map(HarnessRecord::to_json).collect::<Vec<_>>(),
+    });
+    (report, code)
 }
 
 fn emit<W: Write>(out: &mut W, value: &Value) {
     // A caller that stopped reading cannot be told anything; the owning
     // loop continues so that owned children are still reaped.
     let _ = writeln!(out, "{value}").and_then(|()| out.flush());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec() -> Spec {
+        Spec {
+            outage_closure_cap: 3,
+            cwd: "/".into(),
+            harnesses: vec![HarnessSpec {
+                id: "test".into(),
+                argv: vec!["peer".into()],
+                messages: vec![],
+            }],
+        }
+    }
+
+    fn record() -> HarnessRecord {
+        HarnessRecord {
+            id: "test".into(),
+            launches: 1,
+            exits: vec![],
+            wait_failures: vec![],
+            messages: vec![],
+        }
+    }
+
+    #[test]
+    fn terminal_done_without_reap_is_not_normal_or_complete() {
+        let (report, code) = terminal_report(&spec(), &[record()], false);
+        assert_ne!(code, EXIT_ENDED);
+        assert_ne!(report["status"], "ended");
+        assert_eq!(report["all_harnesses_reaped"], false);
+    }
+
+    #[test]
+    fn missing_record_is_unknown_not_zero_debt_normal_end() {
+        let (report, code) = terminal_report(&spec(), &[], false);
+        assert_ne!(code, EXIT_ENDED);
+        assert_ne!(report["status"], "ended");
+        assert_eq!(report["records_complete"], false);
+        assert!(report["owed"].is_null());
+        assert_eq!(report["all_harnesses_reaped"], false);
+    }
+
+    #[test]
+    fn missing_message_record_is_not_positive_completeness() {
+        let mut spec = spec();
+        spec.harnesses[0].messages.push("x".into());
+        let mut record = record();
+        record.exits.push("code:0".into());
+        let (report, code) = terminal_report(&spec, &[record], false);
+        assert_ne!(code, EXIT_ENDED);
+        assert_eq!(report["records_complete"], false);
+        assert_eq!(report["all_harnesses_reaped"], false);
+    }
+
+    #[test]
+    fn terminal_debt_labels_owner_history_loss_including_cancel() {
+        let mut spec = spec();
+        spec.harnesses[0].messages.push("x".into());
+        let mut record = record();
+        record.exits.push("code:0".into());
+        record.messages.push(MessageRecord {
+            index: 0,
+            owed: true,
+            label: "outage".into(),
+            at_most_once: false,
+            basis: None,
+            recovered: false,
+            unacknowledged_attempts: 1,
+            closures: 1,
+        });
+        for cancelled in [false, true] {
+            let (report, code) = terminal_report(&spec, &[record.clone()], cancelled);
+            assert_eq!(
+                code,
+                if cancelled {
+                    EXIT_CANCELLED
+                } else {
+                    EXIT_ENDED_OWED
+                }
+            );
+            assert_eq!(
+                report["harnesses"][0]["messages"][0]["state"],
+                "undelivered-owner-lost"
+            );
+            assert_eq!(report["harnesses"][0]["messages"][0]["label"], "outage");
+            assert_eq!(report["owed_history"], "lost-at-process-exit");
+        }
+    }
 }

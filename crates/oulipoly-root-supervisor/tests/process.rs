@@ -170,15 +170,30 @@ fn harness<'a>(terminal: &'a Value, id: &str) -> &'a Value {
 }
 
 fn alive(pid: u64) -> bool {
-    // A zombie still answers kill(0); read its state instead.
-    std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .ok()
-        .and_then(|stat| {
-            stat.rsplit_once(')')
-                .map(|(_, rest)| rest.trim_start().chars().next())
-        })
-        .flatten()
-        .is_some_and(|state| state != 'Z' && state != 'X')
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    // Only called for a child launched by this test's supervisor. pidfd
+    // readiness distinguishes an exited child (including a zombie).
+    let pid = libc::pid_t::try_from(pid).unwrap();
+    // SAFETY: open an observation fd for this test's owned child.
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if raw < 0 {
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        return false;
+    }
+    // SAFETY: the new fd has no other owner.
+    let fd = unsafe { OwnedFd::from_raw_fd(i32::try_from(raw).unwrap()) };
+    let mut poll = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: poll receives one valid pollfd and never waits.
+    let result = unsafe { libc::poll(&mut poll, 1, 0) };
+    assert!(result >= 0, "pidfd poll failed");
+    result == 0
 }
 
 fn events<'a>(seen: &'a [Value], harness: &str, event: &str) -> Vec<&'a Value> {
@@ -208,6 +223,8 @@ fn separate_process_owns_two_harnesses_and_ends_after_exact_reaping() {
     assert_eq!(terminal["status"], "ended", "{terminal}");
     assert_eq!(status.code(), Some(0));
     assert_eq!(terminal["owed"], 0);
+    assert_eq!(terminal["all_harnesses_reaped"], true);
+    assert_eq!(terminal["records_complete"], true);
     for id in ["a", "b"] {
         let record = harness(&terminal, id);
         assert_eq!(record["launches"], 1);
@@ -296,7 +313,7 @@ fn exit_before_ack_relaunches_with_same_key() {
 
 /// (c) A silent harness does not block another harness's delivery, is not
 /// killed, and stays alive and owed until explicit cancel. (d) Cancel
-/// reports it retained-undelivered and observes its termination exit.
+/// reports undelivered owner/history loss and observes its termination exit.
 #[test]
 fn silent_harness_stays_owed_while_other_delivers_until_cancel() {
     let dir = Scratch::new("silent");
@@ -329,7 +346,7 @@ fn silent_harness_stays_owed_while_other_delivers_until_cancel() {
     assert_eq!(status.code(), Some(2));
     let quiet = harness(&terminal, "quiet");
     assert_eq!(quiet["exits"], json!(["signal:9"]));
-    assert_eq!(quiet["messages"][0]["state"], "retained-undelivered");
+    assert_eq!(quiet["messages"][0]["state"], "undelivered-owner-lost");
     assert_eq!(quiet["messages"][0]["label"], "cancelled");
     assert_eq!(quiet["messages"][0]["closures"], 0);
     assert!(events(&seen, "quiet", "relaunch").is_empty());
@@ -354,6 +371,9 @@ fn closure_cap_declares_outage_on_observed_closures() {
     let (terminal, status, seen) = run.terminal();
     assert_eq!(terminal["status"], "ended-owed", "{terminal}");
     assert_eq!(status.code(), Some(3));
+    assert_eq!(terminal["all_harnesses_reaped"], true);
+    assert_eq!(terminal["records_complete"], true);
+    assert_eq!(terminal["owed_history"], "lost-at-process-exit");
     let flaky = harness(&terminal, "flaky");
     assert_eq!(flaky["launches"], 3);
     assert_eq!(flaky["exits"], json!(["code:1", "code:1", "code:1"]));
@@ -366,7 +386,7 @@ fn closure_cap_declares_outage_on_observed_closures() {
     );
     assert_eq!(flaky["messages"][0]["label"], "outage");
     assert_eq!(flaky["messages"][0]["closures"], 3);
-    assert_eq!(flaky["messages"][0]["state"], "retained-undelivered");
+    assert_eq!(flaky["messages"][0]["state"], "undelivered-owner-lost");
     assert_eq!(flaky["messages"][1]["label"], "not-attempted");
     let outage = events(&seen, "flaky", "outage");
     assert_eq!(outage.len(), 1);
@@ -432,6 +452,8 @@ fn acknowledgement_alone_does_not_end_before_reaping() {
     assert_eq!(terminal["status"], "cancelled", "{terminal}");
     assert_eq!(status.code(), Some(2));
     assert_eq!(terminal["owed"], 0);
+    assert_eq!(terminal["all_harnesses_reaped"], true);
+    assert_eq!(terminal["records_complete"], true);
     let stays = harness(&terminal, "stays");
     assert_eq!(stays["messages"][0]["state"], "acknowledged");
     assert_eq!(stays["exits"], json!(["signal:9"]));
