@@ -20,6 +20,12 @@
 //! (the last entry repeats), so one test can script successive launches,
 //! including launches by a restarted supervisor.
 //!
+//! `--no-idle` acknowledges prompts but never reports idle (a turn that
+//! never ends). `--silent-after-acks N` records later prompts but never
+//! answers them once it has acknowledged N.
+//! `--turn-before-ack` sends an echo reply and idle before the insertion
+//! response, exercising the ordering allowed by the native endpoint.
+//!
 //! `--no-dedup` disables the local dedup contract. `--exit-after-acks N`
 //! exits normally after the Nth acknowledgement and its idle update;
 //! otherwise the peer stays alive until stdin ends.
@@ -64,6 +70,9 @@ struct Args {
     on_reinit: Option<String>,
     exit_when_file: Option<PathBuf>,
     tagged: bool,
+    idle: bool,
+    silent_after_acks: Option<u64>,
+    turn_before_ack: bool,
 }
 
 fn parse_args() -> Args {
@@ -76,6 +85,9 @@ fn parse_args() -> Args {
         on_reinit: None,
         exit_when_file: None,
         tagged: true,
+        idle: true,
+        silent_after_acks: None,
+        turn_before_ack: false,
     };
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
@@ -85,6 +97,16 @@ fn parse_args() -> Args {
             "--launch-modes" => args.launch_modes = iter.next().expect("--launch-modes value"),
             "--no-dedup" => args.dedup = false,
             "--untagged" => args.tagged = false,
+            "--no-idle" => args.idle = false,
+            "--turn-before-ack" => args.turn_before_ack = true,
+            "--silent-after-acks" => {
+                args.silent_after_acks = Some(
+                    iter.next()
+                        .expect("--silent-after-acks value")
+                        .parse()
+                        .expect("number"),
+                );
+            }
             "--on-reinit" => args.on_reinit = Some(iter.next().expect("--on-reinit value")),
             "--exit-when-file" => {
                 args.exit_when_file = Some(iter.next().expect("--exit-when-file path").into());
@@ -259,6 +281,9 @@ impl Peer {
                         .expect("prompts")
                         .push(json!({ "session": session_id, "key": key }));
                     save(&args.state, state);
+                    if args.silent_after_acks.is_some_and(|limit| *acks >= limit) {
+                        continue;
+                    }
                     match args.mode.as_str() {
                         "silent" => continue,
                         "exit-before-ack-always" => std::process::exit(1),
@@ -303,11 +328,30 @@ impl Peer {
                         result["_meta"] =
                             json!({ MESSAGE_KEY_META: key, DUPLICATE_META: duplicate });
                     }
-                    send(
-                        out,
-                        &json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-                    );
+                    if !args.turn_before_ack {
+                        send(
+                            out,
+                            &json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+                        );
+                    }
                     let text = params["prompt"][0]["text"].as_str().unwrap_or_default();
+                    if args.turn_before_ack {
+                        let mut update = json!({
+                            "sessionUpdate": "agent_message",
+                            "messageId": format!("reply-{}", message_id.as_str().unwrap()),
+                            "content": [{ "type": "text", "text": text }],
+                        });
+                        if args.tagged {
+                            update["_meta"] = json!({ PARENT_MESSAGE_META: message_id });
+                        }
+                        send(
+                            out,
+                            &json!({
+                                "jsonrpc": "2.0", "method": "session/update",
+                                "params": { "sessionId": session_id, "update": update },
+                            }),
+                        );
+                    }
                     if let Some(command) = text.strip_prefix("bash:") {
                         let result = run_bash(command);
                         // Kept too, in case no owner is attached to read it.
@@ -337,14 +381,22 @@ impl Peer {
                     if args.tagged {
                         idle["_meta"] = json!({ TURN_INPUT_META: message_id });
                     }
-                    send(
-                        out,
-                        &json!({
-                            "jsonrpc": "2.0",
-                            "method": "session/update",
-                            "params": { "sessionId": session_id, "update": idle },
-                        }),
-                    );
+                    if args.idle {
+                        send(
+                            out,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "method": "session/update",
+                                "params": { "sessionId": session_id, "update": idle },
+                            }),
+                        );
+                    }
+                    if args.turn_before_ack {
+                        send(
+                            out,
+                            &json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+                        );
+                    }
                     *acks += 1;
                     if args.exit_after_acks == Some(*acks) {
                         std::process::exit(0);

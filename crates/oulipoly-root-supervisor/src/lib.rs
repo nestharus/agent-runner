@@ -127,13 +127,58 @@
 //! acts only on the surviving recorded root PID 1 it positively attaches,
 //! never starts a new incarnation, and finding none reports
 //! `root-absent` ([`EXIT_ROOT_ABSENT`]) with what the store still owes.
-//! Later stdin lines are control commands;
-//! `{"cmd":"cancel"}` is the only one. Stdin EOF is not a cancel. Stdout
-//! carries one JSON object per line: progress events, then exactly one
-//! `"event":"terminal"` report. Exit codes: [`EXIT_ENDED`],
-//! [`EXIT_ENDED_OWED`], [`EXIT_CANCELLED`], [`EXIT_INCOMPLETE`],
-//! [`EXIT_STORE_LOST`], [`EXIT_ROOT_ABSENT`], [`EXIT_SPEC_REFUSED`],
-//! [`EXIT_STORE_REFUSED`].
+//! Later stdin lines are control commands, numbered from 1 in arrival order
+//! (`control`, every line counted): `{"cmd":"cancel"}`, `{"cmd":"send",
+//! "text":..., "harness"?:..., "ref"?:...}` and `{"cmd":"close"}` (see
+//! Live conversation). Anything else is `control-refused`. Stdin EOF is
+//! neither a cancel nor a close. Stdout carries one JSON object per line:
+//! progress events, then exactly one `"event":"terminal"` report. Exit
+//! codes: [`EXIT_ENDED`], [`EXIT_ENDED_OWED`], [`EXIT_CANCELLED`],
+//! [`EXIT_INCOMPLETE`], [`EXIT_STORE_LOST`], [`EXIT_ROOT_ABSENT`],
+//! [`EXIT_CLOSED`], [`EXIT_SPEC_REFUSED`], [`EXIT_STORE_REFUSED`].
+//!
+//! # Live conversation
+//!
+//! While an owner drives a harness's session, the caller may address
+//! further input to it (`send`; `harness` names it unless the root has
+//! one). Follow-up admission is bounded and sequential:
+//!
+//! * The control reader answers at once with `follow-up-refused`
+//!   (`malformed`, `cancelled`, `input-closed`, `harness-required`,
+//!   `unknown-harness`, `not-in-conversation`) or `follow-up-received`
+//!   (`queued-not-admitted`, not durable). Neither is an admission.
+//! * The harness's worker takes queued input while waiting for the agent's
+//!   next idle. It admits one only when nothing is
+//!   owed or open on that harness: every earlier input acknowledged and its
+//!   turn ended (`turn-end`, idle-tag coverage). Otherwise it is refused
+//!   (`input-open`) at that check. Receipt during an open turn can remain
+//!   provisional until the turn ends; it is not an arrival-time overlap
+//!   refusal. Queued inputs checked after cancel or close are refused, as
+//!   are inputs the worker leaves its conversation without taking
+//!   (`conversation-ended`). Store loss may leave queued controls without
+//!   individual dispositions; the terminal store-loss report qualifies them.
+//! * Admission is `follow-up-admitted` with its `input` index, emitted only
+//!   after the message, a freshly minted key, the control number and the
+//!   caller's `ref` have committed to the store (`origin` `follow-up`). From
+//!   then on it is owed debt like an intent message: attempt, `ack`
+//!   (insertion readback), `agent-message` and `turn-end` name the same
+//!   `input`, and a later recovery resubmits it with its original key.
+//! * `close` refuses new input for the whole root (`close-requested`). An
+//!   admission whose check already passed can still commit and be reported
+//!   after this request; that input remains part of the admitted work. Each
+//!   worker, once every admitted input on its harness is acknowledged and
+//!   its turn ended, attempts to stop its harness through its work PID 1
+//!   (`close-stopping`, with whether the request was sent). The harness's
+//!   actual end is reported separately by that waiter (typically `signal:9`).
+//!   An input without a tagged turn end holds this stop attempt while the
+//!   harness lives. A harness that ends naturally and is waited can also
+//!   close with no owed insertion, without a tagged idle or owner stop.
+//!   A close is not durable: a recovery after owner death knows nothing of it.
+//! * `cancel` stays what it was, and outranks a close.
+//!
+//! None of this observes processing: a turn's end is the agent's tag, and
+//! `completion` stays `not-observed`. Queued but unadmitted input exists
+//! only in this owner's memory.
 //!
 //! # Endpoints
 //!
@@ -283,6 +328,11 @@
 //! * `ended`: every launched or reattached harness's end was reported by
 //!   its waiter, and nothing is owed. Root PID 1 is then released, and its
 //!   end observed; if its end is not observed the run is `incomplete`.
+//! * `closed`: the caller's `close` was followed through: every launched
+//!   or reattached harness's end was reported (those stopped for the close
+//!   by their work PID 1's kill, with `close` saying so), and nothing is
+//!   owed (exit 7). It says how the run ended, not that any input was
+//!   processed: a harness stopped for the close ended by a signal.
 //! * `ended-owed`: every launched or reattached harness's end was reported,
 //!   no further attempt is authorized in this instance, and debt remains,
 //!   retained in the store (exit 3).
@@ -394,6 +444,7 @@
 //!   survivor's stdout.
 
 pub mod bash;
+mod conversation;
 mod custody;
 mod harness;
 mod live;
@@ -430,6 +481,11 @@ pub const EXIT_STORE_LOST: u8 = 5;
 /// A recovery naming its purpose found no root PID 1 to attach: nothing was
 /// launched and no incarnation started; owed messages stay in the store.
 pub const EXIT_ROOT_ABSENT: u8 = 6;
+/// The caller requested input closure, all harness ends were waited, and
+/// nothing is owed. A live harness's close stop requires tagged turn ends;
+/// a naturally ending harness need not report them. Stop attempts and
+/// actual waited exits are separate. Not a cancel or processing success.
+pub const EXIT_CLOSED: u8 = 7;
 /// The request line was missing or invalid; nothing was written or launched.
 pub const EXIT_SPEC_REFUSED: u8 = 64;
 /// The store could not be claimed (live owner, missing or existing intent,
@@ -618,6 +674,8 @@ pub(crate) enum Event {
     Control(String),
     /// A Bash run's end (or why it is unknown) was reported.
     BashDone,
+    /// The harness at this position durably admitted a follow-up.
+    Admitted(usize),
 }
 
 /// Runs one supervisor to its terminal report and returns the exit code.
@@ -679,7 +737,7 @@ where
             }),
         );
     }
-    let expected: Vec<(String, usize)> = claimed
+    let mut expected: Vec<(String, usize)> = claimed
         .harnesses
         .iter()
         .map(|harness| (harness.id.clone(), harness.messages.len()))
@@ -721,6 +779,20 @@ where
         recovery.root,
     ));
     let custody = Arc::new(Mutex::new(live::Custody::new(Arc::clone(&stop))));
+    let inboxes = match (0..expected.len())
+        .map(|_| conversation::Inbox::new().map(Arc::new))
+        .collect::<std::io::Result<Vec<_>>>()
+    {
+        Ok(inboxes) => inboxes,
+        Err(error) => {
+            emit(
+                &mut out,
+                &json!({ "event": "terminal", "status": "incomplete", "reason": format!("inbox: {error}") }),
+            );
+            return EXIT_INCOMPLETE;
+        }
+    };
+    let closing = Arc::new(conversation::Closing::default());
     // A purposeful recovery's limits hold before any survivor is taken over
     // or anything launched: with no attached root, nothing may start one;
     // under cancel, nothing is delivered.
@@ -825,12 +897,15 @@ where
             prior: priors.remove(&position),
             tx: tx.clone(),
             views: Arc::clone(&views),
+            inbox: Arc::clone(&inboxes[position]),
+            closing: Arc::clone(&closing),
         };
         thread::spawn(move || harness::run(assignment));
     }
     drop(tx);
 
     let mut records = Vec::new();
+    let mut controls = 0u64;
     // The run ends once every harness's end and every admitted Bash run's
     // end (or why it is unknown) is reported; then the ingress is closed.
     while records.len() < expected.len() || !ingress.close_if_idle() {
@@ -839,24 +914,78 @@ where
             Event::Report(value) => emit(&mut out, &value),
             Event::Done(record) => records.push(record),
             Event::BashDone => {}
+            Event::Admitted(position) => {
+                if let Some((_, messages)) = expected.get_mut(position) {
+                    *messages += 1;
+                }
+            }
             Event::Control(line) => {
+                controls += 1;
                 let command = serde_json::from_str::<Value>(line.trim()).ok();
-                if command
+                match command
                     .as_ref()
                     .and_then(|value| value.get("cmd"))
                     .and_then(Value::as_str)
-                    == Some("cancel")
                 {
-                    if !cancel_requested {
-                        cancel_requested = true;
-                        let signalled = custody.lock().expect("custody lock").cancel();
-                        emit(
-                            &mut out,
-                            &json!({ "event": "cancel-requested", "signalled": signalled }),
-                        );
+                    Some("cancel") => {
+                        if !cancel_requested {
+                            cancel_requested = true;
+                            let signalled = custody.lock().expect("custody lock").cancel();
+                            emit(
+                                &mut out,
+                                &json!({ "event": "cancel-requested", "signalled": signalled }),
+                            );
+                            // Wake workers between turns so that queued
+                            // follow-ups are answered as not admitted.
+                            inboxes.iter().for_each(|inbox| inbox.ring());
+                        }
                     }
-                } else {
-                    emit(&mut out, &json!({ "event": "control-refused" }));
+                    Some("send") => {
+                        let control = Control {
+                            number: controls,
+                            command: command.as_ref().expect("parsed"),
+                            cancelled: cancel_requested,
+                            closing: &closing,
+                            harnesses: &expected,
+                            inboxes: &inboxes,
+                        };
+                        emit(&mut out, &control.send());
+                    }
+                    Some("close") => {
+                        let refused = if cancel_requested {
+                            Some("cancelled")
+                        } else if !closing.request() {
+                            Some("close-already-requested")
+                        } else {
+                            None
+                        };
+                        match refused {
+                            Some(reason) => emit(
+                                &mut out,
+                                &json!({ "event": "control-refused", "control": controls, "cmd": "close", "reason": reason }),
+                            ),
+                            None => {
+                                emit(
+                                    &mut out,
+                                    &json!({
+                                        "event": "close-requested",
+                                        "control": controls,
+                                        "input": "closed",
+                                        "meaning": "new input is refused; an admission already past its check may still commit; live harness stop is attempted after admitted turns end, with request and waited exit reported separately; a naturally ending harness may close without tagged idle; not a cancel or processing success",
+                                    }),
+                                );
+                                inboxes.iter().for_each(|inbox| inbox.ring());
+                            }
+                        }
+                    }
+                    _ => emit(
+                        &mut out,
+                        &json!({
+                            "event": "control-refused",
+                            "control": controls,
+                            "reason": if command.is_some() { "unknown-command" } else { "malformed" },
+                        }),
+                    ),
                 }
             }
         }
@@ -873,7 +1002,13 @@ where
         (custody.lock().expect("custody lock").reason() == Some("authority-lost"))
             .then_some("authority-lost")
     });
-    let (mut report, mut code) = terminal_report(&expected, &records, cancel_requested, store_lost);
+    let (mut report, mut code) = terminal_report(
+        &expected,
+        &records,
+        cancel_requested,
+        closing.requested(),
+        store_lost,
+    );
     if root_absent && store_lost.is_none() {
         // Nothing was attached or launched: not an end of what the earlier
         // root held, whatever the records say about this instance.
@@ -884,13 +1019,15 @@ where
     if let Some(purpose) = request.recover {
         report["recover"] = json!(purpose.label());
     }
-    if root_pid1["end_observed"] == false && matches!(code, EXIT_ENDED | EXIT_ENDED_OWED) {
+    if root_pid1["end_observed"] == false
+        && matches!(code, EXIT_ENDED | EXIT_ENDED_OWED | EXIT_CLOSED)
+    {
         // Every harness's end was reported, but root PID 1's was not
         // observed: it may still be running, so this is not an end.
         report["status"] = json!("incomplete");
         code = EXIT_INCOMPLETE;
     }
-    if ingress.ends_unproven() && matches!(code, EXIT_ENDED | EXIT_ENDED_OWED) {
+    if ingress.ends_unproven() && matches!(code, EXIT_ENDED | EXIT_ENDED_OWED | EXIT_CLOSED) {
         // A Bash run may have run and its end is not known.
         report["status"] = json!("incomplete");
         code = EXIT_INCOMPLETE;
@@ -1134,6 +1271,7 @@ fn terminal_report(
     expected: &[(String, usize)],
     records: &[HarnessRecord],
     cancel_requested: bool,
+    close_requested: bool,
     store_lost: Option<&str>,
 ) -> (Value, u8) {
     let records_complete = records.len() == expected.len()
@@ -1170,6 +1308,8 @@ fn terminal_report(
         ("incomplete", EXIT_INCOMPLETE)
     } else if known_owed > 0 {
         ("ended-owed", EXIT_ENDED_OWED)
+    } else if close_requested {
+        ("closed", EXIT_CLOSED)
     } else {
         ("ended", EXIT_ENDED)
     };
@@ -1186,6 +1326,7 @@ fn terminal_report(
         "event": "terminal",
         "status": status,
         "cancel_requested": cancel_requested,
+        "close_requested": close_requested,
         "owed": records_complete.then_some(known_owed),
         "known_owed": known_owed,
         "owed_history": owed_history,
@@ -1194,6 +1335,91 @@ fn terminal_report(
         "harnesses": records.iter().map(HarnessRecord::to_json).collect::<Vec<_>>(),
     });
     (report, code)
+}
+
+/// One `send` control line, answered by the control reader: refused, or
+/// queued for its harness's worker, which alone admits it.
+struct Control<'a> {
+    number: u64,
+    command: &'a Value,
+    cancelled: bool,
+    closing: &'a conversation::Closing,
+    harnesses: &'a [(String, usize)],
+    inboxes: &'a [Arc<conversation::Inbox>],
+}
+
+impl Control<'_> {
+    fn send(&self) -> Value {
+        let caller_ref = self.command.get("ref").and_then(Value::as_str);
+        let refused = |reason: &str, harness: Option<&str>| {
+            json!({
+                "event": "follow-up-refused",
+                "control": self.number,
+                "ref": caller_ref,
+                "harness": harness,
+                "reason": reason,
+                "admitted": false,
+            })
+        };
+        let Some((text, harness)) = self.parse() else {
+            return refused("malformed", None);
+        };
+        if self.cancelled {
+            return refused("cancelled", harness);
+        }
+        if self.closing.requested() {
+            return refused("input-closed", harness);
+        }
+        let position = match harness {
+            Some(id) => self.harnesses.iter().position(|(known, _)| known == id),
+            None if self.harnesses.len() == 1 => Some(0),
+            None => return refused("harness-required", None),
+        };
+        let Some(position) = position else {
+            return refused("unknown-harness", harness);
+        };
+        let id = self.harnesses[position].0.as_str();
+        let follow_up = conversation::FollowUp {
+            control: self.number,
+            caller_ref: caller_ref.map(str::to_owned),
+            text: text.to_owned(),
+        };
+        match self.inboxes[position].offer(follow_up) {
+            Ok(()) => json!({
+                "event": "follow-up-received",
+                "control": self.number,
+                "ref": caller_ref,
+                "harness": id,
+                "stage": "queued-not-admitted",
+                "durable": false,
+            }),
+            Err(_) => refused("not-in-conversation", Some(id)),
+        }
+    }
+
+    /// `{"cmd":"send","text":"...","harness"?:"id","ref"?:"..."}`, with a
+    /// non-empty text and nothing else.
+    fn parse(&self) -> Option<(&str, Option<&str>)> {
+        let fields = self.command.as_object()?;
+        if fields
+            .keys()
+            .any(|key| !matches!(key.as_str(), "cmd" | "text" | "harness" | "ref"))
+        {
+            return None;
+        }
+        let text = fields
+            .get("text")?
+            .as_str()
+            .filter(|text| !text.is_empty())?;
+        let optional = |name: &str| match fields.get(name) {
+            None => Some(None),
+            Some(Value::String(value)) => Some(Some(value.as_str())),
+            Some(_) => None,
+        };
+        let harness = optional("harness")?;
+        optional("ref")?;
+        Some((text, harness))
+    }
 }
 
 fn emit<W: Write>(out: &mut W, value: &Value) {
@@ -1256,13 +1482,14 @@ mod tests {
             prior_unknown_ends: 0,
             wait_failures: vec![],
             detached: 0,
+            close_stop_attempted: false,
             messages: vec![],
         }
     }
 
     #[test]
     fn terminal_done_without_reap_is_not_normal_or_complete() {
-        let (report, code) = terminal_report(&expected(0), &[record()], false, None);
+        let (report, code) = terminal_report(&expected(0), &[record()], false, false, None);
         assert_ne!(code, EXIT_ENDED);
         assert_ne!(report["status"], "ended");
         assert_eq!(report["all_harnesses_reaped"], false);
@@ -1270,7 +1497,7 @@ mod tests {
 
     #[test]
     fn missing_record_is_unknown_not_zero_debt_normal_end() {
-        let (report, code) = terminal_report(&expected(0), &[], false, None);
+        let (report, code) = terminal_report(&expected(0), &[], false, false, None);
         assert_ne!(code, EXIT_ENDED);
         assert_ne!(report["status"], "ended");
         assert_eq!(report["records_complete"], false);
@@ -1282,7 +1509,7 @@ mod tests {
     fn missing_message_record_is_not_positive_completeness() {
         let mut record = record();
         record.exits.push("code:0".into());
-        let (report, code) = terminal_report(&expected(1), &[record], false, None);
+        let (report, code) = terminal_report(&expected(1), &[record], false, false, None);
         assert_ne!(code, EXIT_ENDED);
         assert_eq!(report["records_complete"], false);
         assert_eq!(report["all_harnesses_reaped"], false);
@@ -1302,6 +1529,7 @@ mod tests {
             attempts: 1,
             prior_unknown: 0,
             closures: 1,
+            follow_up: false,
         });
         record
     }
@@ -1309,7 +1537,8 @@ mod tests {
     #[test]
     fn terminal_debt_is_retained_in_store_including_cancel() {
         for cancelled in [false, true] {
-            let (report, code) = terminal_report(&expected(1), &[owed_record()], cancelled, None);
+            let (report, code) =
+                terminal_report(&expected(1), &[owed_record()], cancelled, false, None);
             assert_eq!(
                 code,
                 if cancelled {
@@ -1376,8 +1605,13 @@ mod tests {
 
     #[test]
     fn lost_store_authority_outranks_cancel_and_claims_no_retention() {
-        let (report, code) =
-            terminal_report(&expected(1), &[owed_record()], true, Some("authority-lost"));
+        let (report, code) = terminal_report(
+            &expected(1),
+            &[owed_record()],
+            true,
+            false,
+            Some("authority-lost"),
+        );
         assert_eq!(code, EXIT_STORE_LOST);
         assert_eq!(report["status"], "authority-lost");
         assert_eq!(report["owed_history"], "store-holds-authoritative-state");

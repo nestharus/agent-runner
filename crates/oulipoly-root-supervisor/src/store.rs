@@ -26,6 +26,13 @@
 //!   harness, as positively attributed, and the owner inputs open on that
 //!   harness then) and what it runs. It is committed before the requester
 //!   is told `accepted` and before the launch is requested.
+//! * A `message` is either part of the intent (`origin` `intent`) or a
+//!   caller's further input to the live conversation (`follow-up`),
+//!   committed with its minted key, the control line that carried it and
+//!   the caller's reference before it is reported admitted. Once admitted
+//!   it is owed like any intent message, and a recovery resubmits it the
+//!   same way. Version 5 added this; a version 4 store is refused like any
+//!   other version (no migration).
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -43,7 +50,7 @@ pub(crate) const LOCK_FILE: &str = "owner.lock";
 pub(crate) const DB_FILE: &str = "intent.sqlite3";
 /// Version of this new per-root lineage. There is no migration chain: a
 /// store of any other version is refused.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 /// How long a write waits for a foreign SQLite lock before failing.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -89,6 +96,10 @@ CREATE TABLE message (
     ack_recovered INTEGER,
     ack_generation INTEGER,
     ack_message_id TEXT,
+    origin TEXT NOT NULL DEFAULT 'intent' CHECK (origin IN ('intent', 'follow-up')),
+    control INTEGER,
+    caller_ref TEXT,
+    admitted_generation INTEGER,
     PRIMARY KEY (harness, idx)
 );
 CREATE TABLE root (
@@ -210,6 +221,8 @@ pub(crate) struct DurableMessage {
     /// Origin messages keep complete history; restored ones have unknown
     /// history (see [`OutboundMessage::fresh_recorded`]).
     pub(crate) message: OutboundMessage,
+    /// Whether it came with the intent or as a caller's follow-up.
+    pub(crate) follow_up: bool,
     pub(crate) closures: u32,
     pub(crate) stop: Option<String>,
     pub(crate) ack: Option<DurableAck>,
@@ -520,6 +533,46 @@ impl Store {
         })
     }
 
+    /// Commits a caller's follow-up as the harness's next owed message,
+    /// with a freshly minted key, before anything reports it admitted.
+    /// Returns its index and the message to deliver.
+    pub(crate) fn admit_follow_up(
+        &mut self,
+        harness: usize,
+        control: u64,
+        caller_ref: Option<&str>,
+        text: &str,
+    ) -> Result<(usize, OutboundMessage), StoreError> {
+        let generation = self.generation;
+        self.write(|tx| {
+            let idx: i64 = tx.query_row(
+                "SELECT coalesce(max(idx) + 1, 0) FROM message WHERE harness = ?1",
+                params![int(harness)],
+                |row| row.get(0),
+            )?;
+            let message = OutboundMessage::fresh_recorded(text, |key: &MessageKey| {
+                tx.execute(
+                    "INSERT INTO message (harness, idx, key, text, origin, control, caller_ref,
+                                          admitted_generation)
+                     VALUES (?1, ?2, ?3, ?4, 'follow-up', ?5, ?6, ?7)",
+                    params![
+                        int(harness),
+                        idx,
+                        key.as_str(),
+                        text,
+                        int(control),
+                        caller_ref,
+                        generation
+                    ],
+                )
+                .map(drop)
+                .map_err(|error| io::Error::other(error.to_string()))
+            })
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            Ok((usize::try_from(idx).unwrap_or(usize::MAX), message))
+        })
+    }
+
     /// Records a root PID 1 incarnation before it is started, so that a
     /// successor knows of it even if this owner dies while starting it.
     pub(crate) fn begin_incarnation(
@@ -766,6 +819,7 @@ fn create_intent(
             })?;
             messages.push(DurableMessage {
                 message,
+                follow_up: false,
                 closures: 0,
                 stop: None,
                 ack: None,
@@ -804,7 +858,8 @@ fn load_intent(tx: &Transaction<'_>, generation: i64) -> Result<Vec<DurableHarne
                 m.ack_recovered, m.ack_generation, m.ack_message_id,
                 (SELECT count(*) FROM attempt a WHERE a.harness = m.harness AND a.idx = m.idx),
                 (SELECT count(*) FROM attempt a WHERE a.harness = m.harness AND a.idx = m.idx
-                    AND a.outcome = ?2 AND a.resolved_generation = ?3)
+                    AND a.outcome = ?2 AND a.resolved_generation = ?3),
+                m.origin
          FROM message m WHERE m.harness = ?1 ORDER BY m.idx",
     )?;
     let mut work_rows = tx.prepare(
@@ -831,6 +886,7 @@ fn load_intent(tx: &Transaction<'_>, generation: i64) -> Result<Vec<DurableHarne
                         MessageKey::new(key).ok_or(rusqlite::Error::InvalidQuery)?,
                         text,
                     ),
+                    follow_up: row.get::<_, String>(11)? == "follow-up",
                     closures: row.get(2)?,
                     stop: row.get(3)?,
                     ack: match ack_label {
@@ -978,6 +1034,74 @@ mod tests {
             Store::claim(&dir.0, Some(&intent())),
             Err(ClaimError::IntentExists)
         ));
+    }
+
+    /// A follow-up is the harness's next owed message, durable with its
+    /// origin, and a recovery loads it like an intent message.
+    #[test]
+    fn follow_up_is_durable_owed_debt_with_its_origin() {
+        let dir = Dir::new("follow");
+        let mut store = Store::claim(&dir.0, Some(&intent())).unwrap().store;
+        let (idx, mut message) = store.admit_follow_up(0, 4, Some("r1"), "again").unwrap();
+        assert_eq!(idx, 1);
+        assert!(message.is_owed());
+        let key = message.key().as_str().to_owned();
+        drop(store);
+        // Loaded as a recovery loads it, without a second claim: a forked
+        // child of a parallel test can briefly hold the dropped lock.
+        let mut conn = Connection::open(dir.0.join(DB_FILE)).unwrap();
+        let tx = conn.transaction().unwrap();
+        let harnesses = load_intent(&tx, 2).unwrap();
+        drop(tx);
+        let messages = &harnesses[0].messages;
+        assert_eq!(messages.len(), 2);
+        assert!(!messages[0].follow_up);
+        assert!(messages[1].follow_up);
+        assert!(messages[1].ack.is_none());
+        let row: (String, String, i64, String, i64) = conn
+            .query_row(
+                "SELECT key, origin, control, caller_ref, admitted_generation
+                 FROM message WHERE idx = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(row, (key, "follow-up".into(), 4, "r1".into(), 1));
+    }
+
+    /// Fresh-only schema: a store of the previous version is refused, not
+    /// migrated, and no current-schema tables are added. Claim may create
+    /// a lock file and configure WAL before it checks the version.
+    #[test]
+    fn previous_store_version_is_refused() {
+        let dir = Dir::new("v4");
+        fs::DirBuilder::new().mode(0o700).create(&dir.0).unwrap();
+        let conn = Connection::open(dir.0.join(DB_FILE)).unwrap();
+        conn.execute_batch("CREATE TABLE marker (x INTEGER); PRAGMA user_version = 4;")
+            .unwrap();
+        drop(conn);
+        let refused = Store::claim(&dir.0, None).err().unwrap().reason();
+        assert_eq!(refused, "store-error: unknown store version 4");
+        let conn = Connection::open(dir.0.join(DB_FILE)).unwrap();
+        let tables: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            tables, 1,
+            "no current-schema tables added to a refused store"
+        );
     }
 
     #[test]

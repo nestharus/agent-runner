@@ -35,15 +35,22 @@
 //!
 //! Stdout carries JSON lines. This entry's own lines have an `entry` key;
 //! every other line is the owner's, relayed unchanged. Stdin lines after
-//! start go to the owner unchanged (its controls; `{"cmd":"cancel"}`), and
-//! stdin EOF closes the owner's stdin, which is not a cancel.
+//! start go to the owner unchanged: its controls, `{"cmd":"cancel"}`,
+//! `{"cmd":"send","text":...,"ref"?:...}` (further input to the same live
+//! native session, one turn at a time: `follow-up-admitted` only once it is
+//! durable owed debt, else `follow-up-refused`) and `{"cmd":"close"}` (no
+//! more input; the native host is stopped once the admitted inputs' turns
+//! have ended). See the owner crate's Live conversation docs. Stdin EOF
+//! closes the owner's stdin, which is neither a cancel nor a close.
 //!
 //! Exit status, one meaning each:
 //!
 //! * `0`: the owner ended (`ended`): every harness's end observed, nothing owed.
-//! * `82` to `86`: the owner's own class 2 to 6 (`cancelled`, `ended-owed`,
+//! * `82` to `87`: the owner's own class 2 to 7 (`cancelled`, `ended-owed`,
 //!   `incomplete` or `owned-unattached`, `authority-lost` or
-//!   `store-failed`, `root-absent`). Owed work stays in the store, for an
+//!   `store-failed`, `root-absent`, `closed`). `87` (`closed`) says the
+//!   caller's close was followed through, its host ended by a kill: not
+//!   that anything was processed. Owed work stays in the store, for an
 //!   explicit recovery, never by replaying a request.
 //! * `64`: the request was refused before any effect.
 //! * `73`: setup construction failed: the launch directory may hold partial
@@ -459,7 +466,7 @@ fn owner_end(wait: io::Result<ExitStatus>) -> (Value, i32) {
     };
     let (stage, code) = match status.code() {
         Some(0) => ("owner-ended", 0),
-        Some(class @ 2..=6) => ("owner-ended", OWNER_CLASS_BASE + class),
+        Some(class @ 2..=7) => ("owner-ended", OWNER_CLASS_BASE + class),
         Some(64 | 65) => ("owner-refused", EXIT_OWNER_REFUSED),
         _ => ("owner-outcome-unknown", EXIT_OWNER_UNKNOWN),
     };
@@ -702,6 +709,8 @@ mod tests {
             (2 << 8, "owner-ended", 82),
             (4 << 8, "owner-ended", 84),
             (6 << 8, "owner-ended", 86),
+            (7 << 8, "owner-ended", 87),
+            (8 << 8, "owner-outcome-unknown", 70),
             (65 << 8, "owner-refused", 66),
             (1 << 8, "owner-outcome-unknown", 70),
             (9, "owner-outcome-unknown", 70),
